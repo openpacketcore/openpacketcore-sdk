@@ -23,9 +23,11 @@ from collections import deque
 from pathlib import Path
 
 
+OPENRAFT_REV = "72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
+FROZEN_SESSION_HA_OPENRAFT_REV = "f607e636406b16bd0ad7925dbb631da1b7a4cd96"
 OPENRAFT_GIT_SOURCE = (
     "git+https://github.com/openpacketcore/openraft"
-    "?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+    f"?rev={OPENRAFT_REV}"
 )
 FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY = {
     "opc-alarm",
@@ -105,20 +107,18 @@ def main() -> int:
     if (
         openraft is None
         or openraft.get("source") != OPENRAFT_GIT_SOURCE
-        or openraft.get("req") != "=0.9.24"
+        or openraft.get("req") != "=0.9.25"
     ):
         errors.append(
             "opc-consensus: Openraft is not pinned to the approved version and full git rev"
         )
-    resolved_fork_source = (
-        f"{OPENRAFT_GIT_SOURCE}#f607e636406b16bd0ad7925dbb631da1b7a4cd96"
-    )
+    resolved_fork_source = f"{OPENRAFT_GIT_SOURCE}#{OPENRAFT_REV}"
     fork_packages = {
         (package["name"], package["version"])
         for package in meta["packages"]
         if package.get("source") == resolved_fork_source
     }
-    if fork_packages != {("openraft", "0.9.24"), ("openraft-macros", "0.9.24")}:
+    if fork_packages != {("openraft", "0.9.25"), ("openraft-macros", "0.9.25")}:
         errors.append("resolved Openraft fork package set/version/source is not exact")
 
     computed_source_closure = {"opc-consensus", "opc-persist", "opc-session-store"}
@@ -150,8 +150,11 @@ def main() -> int:
         != FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY
     ):
         errors.append("frozen v2 session HA profile source-build crate closure drifted")
-    if source_gate.get("openraft_rev") != OPENRAFT_GIT_SOURCE.rsplit("=", 1)[-1]:
-        errors.append("session HA profile Openraft revision is not exact")
+    # The historical profile binds its original engine, not the current
+    # source-build candidate. Never rewrite that evidence when repairing the
+    # engine; current Cargo source/package checks above bind the new revision.
+    if source_gate.get("openraft_rev") != FROZEN_SESSION_HA_OPENRAFT_REV:
+        errors.append("frozen session HA profile Openraft revision is not exact")
     if source_gate.get("removal_condition") != SOURCE_BUILD_REMOVAL_CONDITION:
         errors.append("session HA profile source-build removal condition drifted")
     if source_gate.get("crates_io_check_date") != "2026-07-13":

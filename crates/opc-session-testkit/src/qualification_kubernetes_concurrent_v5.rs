@@ -312,7 +312,7 @@ impl FixedWorkload {
         hasher.update(WORKLOAD_SCOPE_DOMAIN);
         hasher.update([0]);
         hasher.update(history_id.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = hex::encode(hasher.finalize());
         let retained = WORKLOAD_SCOPE_HEX_BYTES
             .checked_mul(2)
             .ok_or(QualificationConcurrentV5Error::Overflow)?;
@@ -2125,7 +2125,7 @@ pub(crate) mod tests {
         let checker_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/check-session-ha-concurrent-history-v5.py");
         let checker_bytes = fs::read(&checker_path).expect("checker bytes");
-        let exact_sha256 = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
+        let exact_sha256 = |bytes: &[u8]| format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
         let schedule = history.fault_schedule();
         let contract = history.contract();
         let mut evidence: serde_json::Value = serde_json::from_str(include_str!(

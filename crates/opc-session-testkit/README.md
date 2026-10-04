@@ -50,6 +50,34 @@ async fn partition_and_recover() {
   or a second consensus implementation.
 - Used by AMF-lite, IPsec ownership, cache, and session-store tests.
 
+## Authenticated consumer fixture
+
+The `consumer-fixture` feature exposes
+`AuthenticatedPreparedFencedTransitionFixture`. Its fixed durable mode uses
+three file-backed voters, authenticated persistent consumer connections and
+local payload encryption. Consensus transport remains in-process.
+
+`open_local_aead_pair` opens the original exclusive prepared journal and pairs
+the ordinary backend with its prepared-fenced facade. The pair's
+`protected_general_backend` clones that same encrypted backend for APIs requiring
+`ProtectedSessionBackend`; it does not reopen the journal. Protected-clone calls
+do not enter the ordinary accounting wrapper's mutation counters.
+
+For independent consumers on the same voters, provision each with
+`create_local_aead_pair` before offering its workload. Each pair retains a
+separate private journal and a reopener for that exact journal. Keep encryption
+configuration coherent and application ownership scopes distinct. Reopening
+recovers status only; it does not replay a prepared mutation. These APIs do not
+increase journal limits or authorize discarding history after rejection.
+
+With `test-control`, `consensus_rpc_observation` reports fixed-family counts,
+outcomes, in-flight/lifetime peaks and duration buckets for actual consensus
+peer calls. It includes background heartbeats and retries, and distinguishes
+ordinary read-index traffic from readiness/capability probes. It neither issues
+requests nor exposes payloads or voter identities. These round-trip counts are
+separate from client calls, Raft proposals and local WAL operations. Snapshot
+fields are sampled independently.
+
 ## Production-mTLS Candidate Harness
 
 The private `opc-session-quorum-node` binary now has a default production-mTLS
@@ -190,7 +218,7 @@ MemoryKeyProvider wrapper check, not remote-HKMS qualification. Openraft remains
 the only commit authority and the `EncryptingSessionBackend` remains outside it.
 
 Two additional non-ignored cases run serialized single-host three- and
-five-process fleets through bounded fault and expiry recovery. First, a
+five-process fleets through fault and expiry recovery. First, a
 test-only consensus-RPC admission gate makes one stable nonzero follower
 unavailable while node 0, a different member, atomically publishes malformed
 trust. The malformed candidate never perturbs the active controller epoch:
@@ -219,15 +247,27 @@ directions on every edge incident to that member, and restores all-voter
 readiness and canary progress without changing that process's PID. Unrelated
 survivors must not record an explicit or local-material-epoch retirement from
 this member-only recovery. A prepublication common-key survivor pulse primes
-conservative 13-second progress checkpoints. The 86-second recovery
-clock and 60-second two-stage server idle/handler tail begin only after the
-atomic projected-data rename; every publication, existing-generation incident
-path, readiness, and canary checkpoint must observe one common active key on
-every survivor observer. Requiring that pulse in every half-SLO observation
+conservative 13-second progress checkpoints. Every publication,
+existing-generation incident path, readiness, and canary checkpoint must
+observe one common active key on every survivor observer. Requiring that pulse in every half-SLO observation
 interval bounds its worst-case actual event gap to the 26-second availability
 SLO. A separate 26-second checkpoint requires every active key on every
-observer and is never reset by a faster key. The attempt/terminal
-ledger must remain unchanged for the final 2.5-second
+observer and is never reset by a faster key.
+
+Snapshot catch-up records its elapsed time and each voter's applied frontier;
+it does not inherit the 86-second connection-settlement deadline. Each voter
+must become ready with the original quorum witnesses and cover the committed
+frontier observed when catch-up began. An applied frontier must not regress,
+and survivor progress alone cannot complete recovery. RPC deadlines and the
+rolling survivor-traffic checks still apply. A run that never reaches actual
+readiness remains incomplete and is bounded by the integration job watchdog;
+it cannot pass by reporting progress. These fleets share host storage, so
+their recovery duration is not an isolated-disk or deployment recovery SLO.
+
+After actual readiness and canary verification, the connection-settlement
+phase observes the full original 60-second two-stage server idle/handler tail
+and retains its 86-second deadline. The attempt/terminal ledger must remain
+unchanged for the final 2.5-second
 cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
 one availability episode while the expired member rejoins; that episode must
 recover inside the existing 26-second SLO and be fully settled before the
@@ -238,19 +278,33 @@ cadence and independent full-key coverage clock resume immediately after
 recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
 outcomes have settled does it capture the clean member-scoped reauthentication
-baseline. Fault-era new attempts and reconnects retain the fixed 85/161
-per-node bound: the ordinary 24/40 allowance, no more than fifteen five-second
+baseline. The fixed fault/path-proof and settlement phases share one 85/161
+per-node bound for new attempts and reconnects: the ordinary 24/40 allowance,
+no more than fifteen five-second
 refresh rounds over four/eight incident directed paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved
 node. The reverse probe fails local material preflight without dialing. Terminal
 outcomes may additionally include only the exact attempts already outstanding
-at the interval baseline, with interval conservation enforced. The schedule
-binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
+at each measured interval's baseline, with interval conservation enforced.
+A passive lifecycle snapshot after the existing-generation path proof ends
+the fixed fault interval. The first settlement snapshot ends catch-up. Both
+fixed intervals spend the same allowance; taking the second baseline does not
+grant another 85/161 attempts. Variable-duration catch-up records its actual
+attempts, terminal outcomes, and reconnects separately. Every phase and the
+complete interval must conserve attempts and live owners with monotonic
+counters. Catch-up cannot spend a total-count allowance derived from a finite
+expiry schedule: real caller deadlines can expire while snapshot installation
+holds a consensus lane, requiring a fresh connection for a later RPC.
+The functional audit reports this phase accounting as
+`fixed-fault-and-settlement-with-catchup-conservation/v2`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
-The private Schedule v6 binds this procedure as
+The frozen private Schedule v6 keeps its historical accounting profile
+`new-attempts-plus-baseline-outstanding/v1` and binds the timed procedure as
 `member-scoped-reauth-settled-baseline/v4` with progress profile
-`common-key-pulse-all-active-key-coverage/v1`. Every epoch-changing interval
+`common-key-pulse-all-active-key-coverage/v1`; its descriptors and historical
+results remain unchanged. Passing these functional catch-up checks does not
+qualify that historical timing profile. Every epoch-changing interval
 allows `superseded` only up to the existing per-node connection-attempt bound
 `8 * (member_count - 1) + 8`; non-epoch intervals require zero. Actual timeout,
 transport, protocol, backend, reconnect failure, and `abandoned` deltas remain
@@ -273,7 +327,39 @@ same-owner authority at a strictly higher fence, and validate the exact
 scheduled record. Read-only get, restore-scan, and readiness outcomes retain
 the already-proven guard and validate that same exact record without minting
 unnecessary fencing authority. Evidence binds this routing as
-`stage-aware-known-authority/v1`. The private schedule drops one successful
+`stage-aware-known-authority-readiness-and-scan-reproof/v2`.
+After a readiness failure, the retained-authority checkpoint also requires a
+fresh durable-readiness proof. An exact get uses a logical-time proposal and
+cannot certify the separate read-index path. Every completed not-ready proof
+and proof timeout consumes the existing interruption budget, bounded by the
+remaining original episode deadline. Recovery closes only after both the
+exact record and readiness are proven. After a restore-scan failure, recovery
+repeats the complete scan and requires the same exact record, durable cursor
+profile, count and page bounds. An exact get cannot certify scan availability.
+The scan uses that same original deadline and interruption allowance;
+malformed pages and terminal scan errors remain terminal.
+
+Before every acquisition, the synthetic caller syncs its exact consumer request
+ID, body, scope, identity and original absolute deadline into a private,
+single-writer journal beside its database. The complete image is bounded to
+4096 bytes. Uncertainty is reconciled through the existing consumer receipt
+API; `NotFound` permits only an explicit retry of that identical live request,
+never a distinct successor. At restart, a recorded terminal acquisition is
+retired before fresh authority. Expired unknown requests stay fenced, and
+retries never extend their deadlines. Missing or mismatched journal custody
+beside an existing database fails closed. This trusted local qualification
+caller adds no consumer-mTLS or production persistence claim and changes no
+ordinary lease API. Its acquisition profile is
+`retained-consumer-id-receipt-before-successor/v1`.
+
+The current `opc-session-ha/traffic-resource/v10` schedule binds both behaviors.
+Historical v6, v7, v8 and v9 retain their original meanings: v7 added retained
+acquisitions, v8 added readiness reproof, and v9 added complete scan reproof.
+The combined schedule changes no numeric workload, timeout, interruption or
+resource bound. Current 3/5-voter traffic and mTLS candidate digests bind the
+combined algorithm.
+
+The private schedule drops one successful
 release response
 per mutator to exercise that path, and is bound to eight outcomes per node, a
 fixed 26-second two-election-plus-operation transition envelope per episode,
@@ -298,7 +384,8 @@ readiness round: 10 seconds for the backend operation and 1 second for bounded
 local result delivery), 25 seconds for journal reconciliation, and 26 seconds
 for higher-fence mutation resume. Those sequential stages compose to a
 164-second crash-to-resume ceiling; each stage still fails at its own bound and
-cannot borrow from the total. Schedule v6 binds the count, profile, recovery
+cannot borrow from the total. The current schedule binds exact-request acquisition
+recovery and its journal version/size, alongside the count, profile, recovery
 envelope, delivery allowance, final observation reserve, six bounds, and total
 so old results cannot masquerade as this evidence. This retains the v1
 deadline-composition fix and corrects v2's free-running readiness loop, which
@@ -400,6 +487,12 @@ the last successfully proven linearizable replication head and perform no new
 backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
+Reconciliation starts with the original maximum page size. After a typed
+backend-unavailable read, it reduces the requested page size so a reader's work
+or memory bound cannot force repeated attempts at the same oversized page.
+Each returned page must still be complete and pass every sequence, generation,
+fence and record check. The original total-entry and reconciliation deadlines
+remain; no cursor or replacement watch is published from a partial recovery.
 
 `qualification/v6/session-ha-profile.json` and its schema are the published,
 byte-for-byte frozen stateless-consumer contract: consumer transport revision
@@ -422,7 +515,7 @@ revision. It records the compiled revision and bounded generic harness counters
 without claiming conformance to the frozen v7 revision-2 profile or any
 downstream production SLO.
 
-Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
+The current schedule also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains
 failed and reports only the closed deadline code, the terminal operation stage,
 and elapsed milliseconds. It does not replace the failure with the earlier
@@ -951,7 +1044,28 @@ independent-checker, and tamper tests with:
 
 ## Verification
 
+- The `isolated_scale::` controls in `qualification_mtls_multiprocess` run
+  three separate voter processes and an external mTLS client for each explicit
+  Async/Durable mode. They check a public exact receipt, joined shutdown of
+  every live voter, and reconstruction from the same storage in three fresh
+  processes. Both modes must return the recorded receipt, an identical replay,
+  and a successful new operation under the original deadlines. Async uses the
+  one-use evidence of completed shutdown on new-format roots; this does not
+  qualify unclean loss or already-fenced legacy roots. These small controls do
+  not establish full-cardinality memory or throughput qualification. Legacy
+  configurations omit `isolated_scale` and retain their existing behavior.
 - Source checked: `Cargo.toml`, `src/lib.rs`, and dependent session tests.
+- `isolated_scale::majority_recovery` uses the explicit
+  `retained_recovery_control` workload: ordinary fixed-quorum authority without
+  a protected-roster trust root, configured that way from initial creation.
+  It abruptly kills two voters or all three, reopens the exact retained roots
+  and addresses, and requires initialization, traffic readiness, a higher-fence
+  lease and a successful subsequent mutation. The two-voter case preserves the
+  original survivor process and rejects its still-unexpired old lease. Recovery
+  uses the production mTLS adapters and the original operation and transition
+  deadlines. The existing protected-roster workloads retain their original
+  configuration. These controls qualify new-format SDK recovery, not legacy
+  storage migration, protected-roster retirement or deployed product recovery.
 - Run production-mTLS qualification with:
   `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features -- --test-threads=1`.
 - Run the non-ignored three- and five-process fault/expiry cases exactly with:
@@ -965,6 +1079,72 @@ independent-checker, and tamper tests with:
   `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`.
 - Run the historical plaintext foundation explicitly with:
   `cargo test -p opc-session-testkit --features foundation-insecure --test qualification_multiprocess`.
+
+
+The ignored `isolated_scale::original::isolated_async_original_workload` and
+`isolated_scale::original::isolated_durable_original_workload` tests use the
+original 50,000 sessions and 1,010,000 exact encrypted outcomes in separate
+voter processes. They retain the original 500 operations/s for 1,800 seconds,
+1,000 operations/s for 60 seconds, 800ms batch deadline, 25ms/100ms item
+percentile limits, eight history epochs and disk/capacity limits. Latency starts
+at each item's scheduled arrival and includes producer delay and batching.
+The paced burst is not a measurement of maximum capacity or proof of a strict
+sustained 1,000 successful DURABLE operations/s floor.
+
+Run one mode at a time inside the authorized build allocation. Supply an
+existing fs-verity directory, a short existing temporary directory, and a new
+evidence directory. No mounts or host settings are created by the runner:
+
+```bash
+OPC_FS_VERITY_QUALIFICATION=required \
+OPC_FS_VERITY_SNAPSHOT_ROOT=/path/to/existing/fs-verity/fresh-run \
+TMPDIR=/short/owned/tmp \
+python3 scripts/observe-session-store-live-memory.py \
+  --workspace-root /short/owned/tmp \
+  --evidence-directory /path/to/new/evidence \
+  -- cargo test --locked --release -p opc-session-testkit --all-features \
+     --test qualification_mtls_multiprocess \
+     isolated_scale::original::isolated_async_original_workload \
+     -- --ignored --exact --nocapture --test-threads=1
+```
+
+For Durable, replace the final test name with
+`isolated_scale::original::isolated_durable_original_workload`. The observer
+keeps actual PID/start-time identities, executable and configuration hashes,
+per-process RSS/PSS/peak estimates, sampling gaps, test output and result hashes.
+It acknowledges the final sample only after all three voters and the external
+driver have been sampled while still alive. Missing coverage fails the run;
+a successful command that ran no qualifying workload also fails. The small
+capture controls can be exercised by setting
+`OPC_SESSION_ISOLATED_FINAL_CAPTURE_CONTROL=1` and selecting `isolated_scale::`
+without `--ignored`. Parser rejection controls run with
+`python3 scripts/test-observe-session-store-live-memory.py`.
+
+These diagnostics do not establish a deployment RAM budget, a quiet-host
+performance qualification, or allocation ownership within each process.
+A process exit is not a zero-memory sample. Full live cardinality is separate
+from the small cold-reconstruction controls and the retained cold-image probe.
+All voters join their shutdown paths after the driver classifies submitted
+effects; failure evidence retains exact requests and classified results.
+
+The small original wire controls retain their failed result before collecting
+failure-only diagnostics. A transport failure reports its closed error cause,
+synthetic ordinal and elapsed time. The driver then records client counters,
+passive voter progress/health and bounded native-WAL timing summaries before
+making any diagnostic receipt reads. These summaries follow the verbose WAL
+history so they remain in the harness's bounded stderr tail.
+
+After failure, a separate five-second diagnostic window reads only the exact
+original attempted requests. Its output contains outcome counts, never request
+bodies or identifiers, and explicitly reports `performance_acceptance:false`.
+It does not retry a mutation, extend the original 800 ms bound, or turn a failed
+qualification into a pass. With `test-control`, the delayed-response negative
+control withholds a real committed batch reply, requires the original deadline
+failure, and recovers all eight original receipts without replay. Removing the
+bounded voter summaries or changing the diagnostic request bodies must fail
+that control. This diagnoses the controlled fault only: the historical hosted
+failures tracked in [SDK #923](https://github.com/openpacketcore/openpacketcore-sdk/issues/923)
+remain unexplained until their cause is reproduced or independently established.
 
 ## License
 

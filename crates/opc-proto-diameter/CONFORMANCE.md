@@ -1202,6 +1202,15 @@ permanent-failure fallback. The profile always requires the base Result-Code;
 generic E-bit answers may additionally preserve one structurally validated
 Experimental-Result, while ordinary STA rejects that combination.
 
+The ordinary STA extension surface accepts singleton `User-Name` and
+`Auth-Application-Id`. The latter is not a request-only AVP: RFC 6733 section
+6.8 requires its value, when present outside capability exchange, to match the
+header application. Both decode and encode enforce that equality along with
+the dictionary's Unsigned32 width and flag rules. Destination-Host,
+Destination-Realm, Termination-Cause and Route-Record remain forbidden on STA.
+Accepting an extension does not grant correlation authority; session,
+transaction, connection and configured logical-Origin checks still apply.
+
 TS 29.273 V19.2.0 section 7.1.2.3.1 table 7.1.2.3.1/1 classifies the permanent
 user identity carried in User-Name as mandatory, and section 7.1.2.3.2 requires
 session lookup against both Session-Id and User-Name. Section 7.2.2.2.1's
@@ -1321,6 +1330,12 @@ duplicate core and extension singletons, wrong
 role/vendor/type/command/application, malformed dictionary values, OC/Load
 group semantics, unknown mandatory AVPs, exact 129th-entry count bounds, and
 redacted diagnostics.
+
+The independent six-AVP STA fixture covers Session-Id, User-Name, Result-Code,
+Origin-Host, Origin-Realm and Auth-Application-Id with Mandatory flags and no
+Vendor flags. Strict fixtures vary optional presence and non-fixed order,
+reject application mismatch, duplicate singletons, malformed widths, flags,
+padding and trailing chains, and require exact correlation after parsing.
 
 #### SWm Abort-Session scope
 

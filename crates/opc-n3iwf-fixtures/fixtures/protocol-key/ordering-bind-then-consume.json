@@ -1,0 +1,51 @@
+{
+  "encoding": "scenario-label",
+  "validation_scope": "handle-lifecycle-contract",
+  "context": {
+    "bound_generation": 1,
+    "requested_generation": 1,
+    "purpose": "K_N3IWF",
+    "max_label_bytes": 64,
+    "actions": [
+      "bind",
+      "consume"
+    ],
+    "expected_state": "consumed"
+  },
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.ordering-bind-then-consume",
+  "subset": "protocol-key",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Bind must precede consume",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Same generation-1 label documents bind-before-consume order"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-bind-then-consume.hex",
+    "digest_sha256": "3c936bcd5edfa0bd93dc5b970cb8c9639b3d66bbdc578ea51479f411d830b81e"
+  },
+  "semantic_assertions": [
+    "order=bind-then-consume"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

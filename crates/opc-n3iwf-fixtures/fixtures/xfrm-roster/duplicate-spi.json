@@ -1,0 +1,47 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.duplicate-spi",
+  "subset": "xfrm-roster",
+  "case_class": "duplicate",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Inbound and outbound SPI must differ unless explicitly overlapped",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Two generations claim the same inbound SPI in one receiver namespace"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-spi.hex",
+    "digest_sha256": "5b81a085a82317c848b4cdfc70f06d61257285e55bf57ce6223f94c25936f70f"
+  },
+  "semantic_assertions": [
+    "duplicate_spi=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

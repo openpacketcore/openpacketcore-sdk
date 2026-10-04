@@ -27,6 +27,24 @@ tar -xOf dimpl-0.7.2.crate dimpl-0.7.2/.cargo_vcs_info.json
 OpenPacketCore carries a security-scoped patch with the following intentional
 changes:
 
+- The explicit mutual-certificate SCTP profile supports a bounded RFC 6066
+  server name. It emits and validates a single host_name/empty acknowledgement,
+  keeps the configured name through rekey, and rejects missing, malformed,
+  duplicate, unsolicited or mismatched negotiation. The embedding SDK adds
+  independent certificate DNS SAN checks; the engine's SNI alone is not peer
+  authentication. Names and errors are redacted. Independent extension and
+  protected-Hello fixtures exercise both production receive call sites.
+  See [named SDK endpoints](../../docs/rfc6083-server-name.md).
+
+- Explicitly armed RFC 6083 rekey uses RFC 5746 previous-Finished bindings,
+  retains old record keys/sequence/AEAD budgets through ChangeCipherSpec,
+  derives fresh handshake keys and exporters, and buffers new-epoch records
+  until peer Finished. The opt-in profile requires mutual certificates.
+  Independent extension and protected-Hello fixtures exercise both Hello
+  validation call sites; real handshake tests cover successive transitions,
+  queued old plaintext, old-epoch rejection and cross-stream reordering.
+  See [the SDK rekey contract](../../docs/rfc6083-rekey-transport.md).
+
 - DTLS 1.2 RFC 6083 mode disables record replay detection and DTLS flight
   retransmission, fixes the DTLS record budget at 16,384 bytes, and rejects
   configurations that retain any DTLS 1.3 cipher suite. Every output SCTP
@@ -69,6 +87,14 @@ changes:
 - Diagnostic formatting redacts PSK identities and hints, RNG seeds, session
   identifiers, cookies, certificates, application data, and exported keying
   material.
+- `Dtls::poll_output_with_record` pairs RFC 6083 application plaintext with
+  its exact decrypted DTLS epoch and 48-bit sequence. The record number is
+  taken from the same queue entry as the plaintext, after the output-capacity
+  check. Control events and other DTLS profiles return no identity. The
+  existing `poll_output` API discards the optional metadata and preserves its
+  output shape and behavior. This enables later SCTP stream correlation;
+  neither the record number nor the engine alone attests peer certificate
+  policy or authenticated SCTP delivery (Refs SDK #794).
 - The vendored manifest is marked `publish = false`, adds `zeroize`, and keeps
   the upstream integration-test targets and development dependencies.
 
@@ -102,6 +128,15 @@ The expected changed paths are `tests/auto/main.rs`, `tests/dtls12/common.rs`,
 `tests/dtls12/main.rs`, `tests/dtls12/ossl.rs`, `tests/dtls12/psk.rs`,
 `tests/dtls12/retransmit.rs`, `tests/dtls12/rfc6083.rs`, and
 `tests/dtls13/main.rs`, plus `tests/ossl/io_buf.rs`.
+
+The additional `tests/dtls12/rfc6083_record_reference.py` and `.tsv` contain
+six synthetic record-layer vectors reproduced with Python `cryptography`
+AES-GCM, independent of the Rust providers. They initialize the same fixed
+test key schedule as the engine unit tests; they are not certificate or
+SCTP-AUTH handshake evidence. Regenerate with the Python script, or pass
+`--check` to detect drift. See the SDK's
+[`RFC 6083 record-correlation scope`](../../docs/rfc6083-record-correlation.md)
+for the remaining generic-transport work.
 
 Packaging and repository-development metadata that does not participate in the
 vendored build is deliberately omitted: `.cargo/`, `.github/`, `.vscode/`,

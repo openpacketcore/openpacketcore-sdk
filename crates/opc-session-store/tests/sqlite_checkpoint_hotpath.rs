@@ -39,6 +39,7 @@ struct LoopbackPeer {
     target: SessionConsensusNodeId,
     identity: ConsensusIdentity,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    call_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl LoopbackPeer {
@@ -47,6 +48,7 @@ impl LoopbackPeer {
             target,
             identity,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
+            call_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -79,6 +81,7 @@ impl SessionConsensusPeer for LoopbackPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let _call_gate = self.call_gate.read().await;
         let handler = self
             .handler
             .read()
@@ -328,6 +331,58 @@ async fn wait_for_all_voters_to_apply(stores: &[ConsensusSessionStore], target_a
     .expect("every voter applies the cadence prefill within the operation deadline");
 }
 
+fn exact_applied_index(path: &Path) -> u64 {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open durable applied frontier for checkpoint setup");
+    connection
+        .query_row(
+            "SELECT log_index FROM consensus_applied WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read durable applied frontier for checkpoint setup")
+}
+
+async fn prefill_proactive_checkpoint_cadence(
+    stores: &[ConsensusSessionStore],
+    leader: usize,
+    database_paths: &[PathBuf],
+) -> usize {
+    // Establish the initial frontier from the actual committed SQLite row;
+    // Openraft's asynchronously published status can trail a client response.
+    let mut target_applied_index = exact_applied_index(&database_paths[leader]);
+    wait_for_all_voters_to_apply(stores, target_applied_index).await;
+    let cadence_batch = reset_proactive_checkpoint_cadence(stores);
+    const DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION: usize = 3;
+    assert_eq!(
+        (cadence_batch - 1) % DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION,
+        0,
+        "the fixed cadence retains an exact logical-time prefill boundary"
+    );
+    let operations = (cadence_batch - 1) / DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION;
+    for _ in 0..operations {
+        write_proactive_checkpoint_operations(stores, leader, 1).await;
+        target_applied_index = target_applied_index
+            .checked_add(1)
+            .expect("bounded checkpoint prefill index");
+        // A quorum response leaves the final follower free to batch multiple
+        // requests into fewer durable writes. Drain each setup request on all
+        // voters before the next one, so append, committed-index advance and
+        // apply each contribute exactly one signal per voter. This observes
+        // in-memory progress and performs no extra durable operation.
+        wait_for_all_voters_to_apply(stores, target_applied_index).await;
+    }
+    for store in stores {
+        assert_eq!(
+            store.proactive_checkpoint_cadence_remaining_for_test(),
+            Some(1),
+            "each voter is exactly one durable write from proactive checkpoint admission"
+        );
+    }
+    cadence_batch
+}
+
 async fn shutdown_fixed_quorum(stores: &[ConsensusSessionStore], peers: &[Arc<LoopbackPeer>]) {
     for peer in peers {
         peer.clear().await;
@@ -408,7 +463,6 @@ async fn green_proactive_checkpoint_main_sync_does_not_block_accepted_fixed_quor
     let (stores, backends, peers, database_paths) =
         start_fixed_quorum_with_main_sync_vfs(directory.path()).await;
     let leader = ready_leader(&stores).await;
-    let cadence_batch = reset_proactive_checkpoint_cadence(&stores);
 
     for backend in &backends {
         assert_eq!(
@@ -423,37 +477,11 @@ async fn green_proactive_checkpoint_main_sync_does_not_block_accepted_fixed_quor
     let attempts_before = checkpoint_attempts(&stores);
     let completions_before = checkpoint_completions(&stores);
 
-    // One committed logical-time operation produces the same three durable
-    // write signals on every voter: log append, committed-index advance, and
-    // state-machine apply. Establish the exact one-signal-before-expiry state
-    // before arming the two-second VFS observation. The observed window then
-    // contains only the threshold-crossing operation, not 64 serial consensus
-    // round trips whose admission time is unrelated to checkpoint behavior.
-    const DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION: usize = 3;
-    assert_eq!(
-        (cadence_batch - 1) % DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION,
-        0,
-        "the fixed cadence retains an exact logical-time prefill boundary"
-    );
-    let prefill_operations = (cadence_batch - 1) / DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION;
-    write_proactive_checkpoint_operations(&stores, leader, prefill_operations).await;
-    // A successful Openraft client response proves a quorum has applied the
-    // write, not that the final follower has already applied it. Observe that
-    // follower's in-memory progress within the existing operation deadline;
-    // this adds no durable write signal and makes the exact per-voter cadence
-    // precondition explicit under scheduler contention.
-    let target_applied_index = stores[leader]
-        .status()
-        .applied_index
-        .expect("the accepted prefill has a leader applied index");
-    wait_for_all_voters_to_apply(&stores, target_applied_index).await;
-    for store in &stores {
-        assert_eq!(
-            store.proactive_checkpoint_cadence_remaining_for_test(),
-            Some(1),
-            "each voter is exactly one durable write from proactive checkpoint admission"
-        );
-    }
+    // Reach the exact one-signal-before-expiry state before arming the
+    // unchanged two-second VFS observation. The measured window contains
+    // only the threshold-crossing operation, with its original deadline.
+    let cadence_batch =
+        prefill_proactive_checkpoint_cadence(&stores, leader, &database_paths).await;
 
     let mut main_sync = block_test_main_sync();
     let stores_for_response = stores.clone();
@@ -510,6 +538,82 @@ async fn green_proactive_checkpoint_main_sync_does_not_block_accepted_fixed_quor
         "restart reads the exact committed consensus state after checkpoint drain"
     );
     drop(reopened);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_prefill_waits_for_the_lagging_voter_before_issuing_another_write() {
+    let _vfs_test_gate = main_sync_vfs_test_gate().lock().await;
+    install_test_main_sync_block_vfs().expect("register main-sync blocking VFS");
+    let directory = tempfile::tempdir().expect("checkpoint prefill follower directory");
+    let (stores, _backends, peers, database_paths) =
+        start_fixed_quorum_with_main_sync_vfs(directory.path()).await;
+    let leader = ready_leader(&stores).await;
+    let initial_applied_index = exact_applied_index(&database_paths[leader]);
+    wait_for_all_voters_to_apply(&stores, initial_applied_index).await;
+
+    let held_index = (leader + 1) % VOTERS;
+    let held_voter = stores[held_index].status().node_id;
+    let mut held_calls = Vec::new();
+    for peer in &peers {
+        if peer.target == held_voter {
+            held_calls.push(peer.call_gate.clone().write_owned().await);
+        }
+    }
+    assert_eq!(
+        held_calls.len(),
+        VOTERS - 1,
+        "hold every route to one voter"
+    );
+    let prefill_stores = stores.clone();
+    let prefill_paths = database_paths.clone();
+    let mut prefill = tokio::spawn(async move {
+        prefill_proactive_checkpoint_cadence(&prefill_stores, leader, &prefill_paths).await
+    });
+    let first_applied_index = initial_applied_index
+        .checked_add(1)
+        .expect("first prefill index");
+    wait_for_all_voters_to_apply(std::slice::from_ref(&stores[leader]), first_applied_index).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), &mut prefill)
+            .await
+            .is_err(),
+        "prefill must retain the outstanding follower before issuing another logical write"
+    );
+    assert_eq!(
+        exact_applied_index(&database_paths[leader]),
+        first_applied_index
+    );
+    assert_eq!(
+        exact_applied_index(&database_paths[held_index]),
+        initial_applied_index
+    );
+    assert_eq!(
+        stores[leader].proactive_checkpoint_cadence_remaining_for_test(),
+        Some(61)
+    );
+    assert_eq!(
+        stores[held_index].proactive_checkpoint_cadence_remaining_for_test(),
+        Some(64)
+    );
+
+    drop(held_calls);
+    let cadence_batch = tokio::time::timeout(FIXED_QUORUM_OPERATION_TIMEOUT, prefill)
+        .await
+        .expect("released follower permits the exact prefill")
+        .expect("prefill task succeeds");
+    assert_eq!(cadence_batch, 64, "the production cadence is unchanged");
+    for (store, path) in stores.iter().zip(&database_paths) {
+        assert_eq!(
+            store.proactive_checkpoint_cadence_remaining_for_test(),
+            Some(1)
+        );
+        assert_eq!(
+            exact_machine_state(path).0,
+            21,
+            "all exact logical writes are durable"
+        );
+    }
+    shutdown_fixed_quorum(&stores, &peers).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

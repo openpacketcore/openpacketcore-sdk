@@ -1,5 +1,14 @@
 # opc-ipsec-xfrm
 
+Caller-selected traffic classes can use the immutable
+[`child_sa` selection contract](CHILD_SA_SELECTION.md) to name exact outbound
+SPIs, retain inbound identities during rekey overlap, and select one explicit
+default. These are validated intentions. The optional
+[installed-roster contract](../../docs/n3-installed-child-sa-roster.md) binds
+those intentions to whole-roster readback and an actor-fenced publication,
+with distinct exact marks and concrete outbound SPIs. Sealed inbound packet
+provenance and authenticated whole-roster relocation remain separate work.
+
 ## Purpose
 
 `opc-ipsec-xfrm` is the safe Rust control surface for Linux XFRM IPsec state in
@@ -1414,3 +1423,12 @@ sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 carg
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'
 ```
+
+## Authenticated complete Child-SA relocation
+
+The namespace actor can consume a live NWu MOBIKE permit for one associated
+installed roster, move all directional and rekey members under one durable
+record, and publish only after complete readback. Interrupted moves stay gated
+for exact-target reconciliation. This bounded profile requires the upstream
+MIGRATE_STATE capability and has no delete/reinstall fallback. See the
+[public contract and supported-kernel evidence](../../docs/n3-child-sa-mobike.md).

@@ -1,5 +1,5 @@
 use crate::{
-    build_identity_state, parse_certs_pem, parse_key_pem, spawn_expiry_monitor,
+    build_identity_state, parse_certs_pem, parse_key_pem, spawn_expiry_monitor_until,
     IdentityReloadError, IdentityReloadEvent, IdentityState, TrustBundle, TrustBundleSet,
     TrustDomain,
 };
@@ -16,20 +16,48 @@ struct FileSnapshot {
     hash: String,
 }
 
+/// A file-source background task failed while shutting down.
+///
+/// The error identifies failed tasks without retaining panic payloads, paths,
+/// or identity material. Both task joins have completed when this is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FileSvidShutdownError {
+    /// The file poller panicked or was cancelled unexpectedly.
+    #[error("file SVID poller failed to join")]
+    PollerFailed,
+    /// The expiry monitor panicked or was cancelled unexpectedly.
+    #[error("file SVID expiry monitor failed to join")]
+    ExpiryMonitorFailed,
+    /// Both background tasks panicked or were cancelled unexpectedly.
+    #[error("both file SVID tasks failed to join")]
+    BothFailed,
+}
+
 /// Loads X.509 SVID cert chain, private key, and trust bundles from PEM files
 /// on disk and polls for changes.
 ///
 /// Re-emits the same reload-event stream the socket-based [`crate::SvidWatcher`]
 /// produces, making it a drop-in alternative for environments where a SPIRE
 /// workload socket is not available.
+///
+/// Call [`Self::shutdown`] while the Tokio runtime is running to stop polling
+/// and await both owned tasks. Dropping the source only requests their
+/// cancellation: it cannot await their completion. In particular, blocking
+/// filesystem operations started by `tokio::fs` can outlive that cancellation.
 pub struct FileSvidSource {
     state_rx: watch::Receiver<Option<IdentityState>>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
     _task_handle: tokio::task::JoinHandle<()>,
     _expiry_task_handle: tokio::task::JoinHandle<()>,
+    stop_tx: watch::Sender<bool>,
+    // Poller first, then expiry monitor. Keep consumed results across retries.
+    task_joined: [bool; 2],
+    task_failed: [bool; 2],
 }
 
 impl FileSvidSource {
+    /// Start loading and polling independently managed PEM files.
     pub fn new(
         cert_path: impl AsRef<Path>,
         key_path: impl AsRef<Path>,
@@ -47,12 +75,20 @@ impl FileSvidSource {
         let (state_tx, state_rx) = watch::channel(None);
         let (event_tx, _) = broadcast::channel(32);
         let event_tx_clone = event_tx.clone();
-        let expiry_task_handle = spawn_expiry_monitor(state_tx.clone(), event_tx.clone());
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let mut expiry_stop_rx = stop_rx.clone();
+        let expiry_task_handle =
+            spawn_expiry_monitor_until(state_tx.clone(), event_tx.clone(), async move {
+                stop_requested(&mut expiry_stop_rx).await;
+            });
 
         let task_handle = tokio::spawn(async move {
             let mut snapshots: HashMap<PathBuf, FileSnapshot> = HashMap::new();
 
             loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
                 let mut current_snapshots = HashMap::new();
                 let mut read_error = false;
 
@@ -99,7 +135,10 @@ impl FileSvidSource {
                     }
                 }
 
-                tokio::time::sleep(poll_interval).await;
+                tokio::select! {
+                    () = stop_requested(&mut stop_rx) => break,
+                    () = tokio::time::sleep(poll_interval) => {}
+                }
             }
         });
 
@@ -108,17 +147,64 @@ impl FileSvidSource {
             event_tx,
             _task_handle: task_handle,
             _expiry_task_handle: expiry_task_handle,
+            stop_tx,
+            task_joined: [false; 2],
+            task_failed: [false; 2],
         }
     }
 
+    /// Stop background work and await both owned async tasks.
+    ///
+    /// On its first poll, this future signals a permanent stop. The poller
+    /// finishes any current polling pass, which may publish one final update,
+    /// and the expiry monitor stops. A return, including an error, means both
+    /// task joins were observed. Every join is attempted even if another fails.
+    /// Repeated calls return the same result without restarting work.
+    ///
+    /// Cancelling this future leaves the handles and completed join results in
+    /// the source. Call `shutdown` again to resume waiting. Dropping the source
+    /// instead invokes its cancellation fallback without awaiting completion.
+    ///
+    /// There is no completion deadline: a filesystem operation may block
+    /// indefinitely. Aborting an async task does not drain the blocking work
+    /// used by `tokio::fs`; an error therefore proves async task termination,
+    /// not completion of every underlying filesystem operation.
+    ///
+    /// State subscriptions close after both tasks finish and retain their last
+    /// value. That value is a snapshot; expiry is no longer monitored. The
+    /// event channel stays open until the source itself is dropped.
+    pub async fn shutdown(&mut self) -> Result<(), FileSvidShutdownError> {
+        self.stop_tx.send_replace(true);
+        if !self.task_joined[0] {
+            self.task_failed[0] = (&mut self._task_handle).await.is_err();
+            self.task_joined[0] = true;
+        }
+        if !self.task_joined[1] {
+            self.task_failed[1] = (&mut self._expiry_task_handle).await.is_err();
+            self.task_joined[1] = true;
+        }
+        match self.task_failed {
+            [false, false] => Ok(()),
+            [true, false] => Err(FileSvidShutdownError::PollerFailed),
+            [false, true] => Err(FileSvidShutdownError::ExpiryMonitorFailed),
+            [true, true] => Err(FileSvidShutdownError::BothFailed),
+        }
+    }
+
+    /// Subscribe to the latest identity snapshot and subsequent updates.
     pub fn subscribe(&self) -> watch::Receiver<Option<IdentityState>> {
         self.state_rx.clone()
     }
 
+    /// Subscribe to identity reload events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<IdentityReloadEvent> {
         self.event_tx.subscribe()
     }
 
+    /// Return a published identity, or fail on timeout or a closed empty stream.
+    ///
+    /// A retained identity can still be returned after shutdown. Its validity
+    /// must be checked by the consumer because expiry monitoring has stopped.
     pub async fn wait_for_initial_identity(
         &self,
         timeout: Duration,
@@ -128,16 +214,37 @@ impl FileSvidSource {
             if let Some(state) = rx.borrow().clone() {
                 return Ok(state);
             }
-            if tokio::time::timeout(timeout, rx.changed()).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(timeout, rx.changed()).await,
+                Ok(Ok(()))
+            ) {
                 return Err(IdentityReloadError::IoError);
             }
         }
     }
 }
 
+impl Drop for FileSvidSource {
+    fn drop(&mut self) {
+        self.stop_tx.send_replace(true);
+        if !self.task_joined[0] {
+            self._task_handle.abort();
+        }
+        if !self.task_joined[1] {
+            self._expiry_task_handle.abort();
+        }
+    }
+}
+
+async fn stop_requested(stop_rx: &mut watch::Receiver<bool>) {
+    if !*stop_rx.borrow() {
+        let _ = stop_rx.changed().await;
+    }
+}
+
 async fn snapshot_file(path: &Path, previous: Option<&FileSnapshot>) -> Option<FileSnapshot> {
     let content = tokio::fs::read(path).await.ok()?;
-    let hash = format!("{:x}", Sha256::digest(&content));
+    let hash = hex::encode(Sha256::digest(&content));
     if let Some(prev) = previous {
         if prev.hash == hash {
             return Some(prev.clone());
@@ -698,3 +805,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "file_svid_lifecycle_tests.rs"]
+mod lifecycle_tests;

@@ -23,7 +23,7 @@
 //!   decapsulated by the tc ingress program and *forwarded through the ePDG
 //!   stack* (the position where XFRM policy applies) to the UE netns, which
 //!   receives the inner UDP payload on an ordinary socket. Sequence-numbered
-//!   G-PDUs (S flag) must decapsulate too; unknown TEIDs must be dropped;
+//!   G-PDUs (S flag) must decapsulate too; unknown TEIDs must never decapsulate;
 //!   GTP-U echo requests must pass through to the local control plane.
 //!   The production-boundary case installs disjoint default and dedicated
 //!   XFRM OUT policies/SAs; a marked dedicated G-PDU must leave under the
@@ -41,6 +41,23 @@
 //!   datapath keeps forwarding.
 
 #![cfg(target_os = "linux")]
+
+#[path = "ebpf_gtpu_privileged/backend_inner_fragmentation.rs"]
+mod backend_inner_fragmentation;
+#[path = "ebpf_gtpu_privileged/backend_packet_too_big.rs"]
+mod backend_packet_too_big;
+#[path = "ebpf_gtpu_privileged/backend_reassembly.rs"]
+mod backend_reassembly;
+#[path = "ebpf_gtpu_privileged/n3_end_marker.rs"]
+mod n3_end_marker;
+#[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
+mod n3_fixed_flow;
+#[path = "ebpf_gtpu_privileged/packet_too_big_baseline.rs"]
+mod packet_too_big_baseline;
+#[path = "ebpf_gtpu_privileged/tft_classifier_removal.rs"]
+mod tft_classifier_removal;
+#[path = "ebpf_gtpu_privileged/tft_nohz_full.rs"]
+mod tft_nohz_full;
 
 use std::cell::RefCell;
 use std::env;
@@ -351,6 +368,37 @@ fn parse_link_address(value: &str) -> [u8; 6] {
         "link address must have six octets"
     );
     address
+}
+
+/// Resolve the harness IPv6 gateway neighbour on `s2bu` before an exact
+/// inner-IPv6 uplink assertion.
+///
+/// The kernel routes an inner IPv6 packet toward `2001:db8:2::10` and must
+/// resolve that neighbour before the frame reaches tc egress. On the el9 5.14
+/// kernel the Neighbor Solicitation is withheld until `s2bu`'s link-local
+/// address completes DAD (about two seconds after link up), so a first packet
+/// sent earlier is held in the neighbour queue past a two-second receive. Wait,
+/// bounded, for DAD to finish and then resolve the neighbour, so every later
+/// send is a single-packet assertion on the tc datapath itself.
+fn resolve_s2bu_ipv6_gateway_neighbour() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = Command::new("ip")
+            .args(["-6", "addr", "show", "dev", "s2bu", "tentative"])
+            .output()
+            .expect("read s2bu tentative IPv6 addresses");
+        assert!(output.status.success(), "ip -6 addr show dev s2bu failed");
+        if output.stdout.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "s2bu IPv6 DAD did not complete: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
 }
 
 fn main_link_address(interface: &str) -> [u8; 6] {
@@ -2024,6 +2072,7 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         bearer_mark: None,
         egress_dscp: None,
         uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     }
 }
 
@@ -2084,6 +2133,7 @@ fn grouped_entry(
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         },
         local_outer,
     )
@@ -4532,6 +4582,14 @@ fn expect_no_reassembled_datagram(socket: &GtpuReassemblySocket) {
     }
 }
 
+fn expect_no_control_datagram(port: &dyn opc_gtpu_dataplane::control_port::GtpuControlPort) {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        assert!(port.try_receive_datagram(2048).unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 const IPFRAG_TIME_PATH: &str = "/proc/sys/net/ipv4/ipfrag_time";
 const IPFRAG_HIGH_THRESH_PATH: &str = "/proc/sys/net/ipv4/ipfrag_high_thresh";
 const IPFRAG_LOW_THRESH_PATH: &str = "/proc/sys/net/ipv4/ipfrag_low_thresh";
@@ -6158,6 +6216,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_COUNTERS,
                 MAP_SESSION_GROUPS,
                 MAP_SESSION_DOWNLINK_INDEX,
+                MAP_CONFIG,
                 MAP_CONFIG_IPV6,
                 GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -6871,7 +6930,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     .expect("sequence-numbered downlink G-PDU must decapsulate");
     assert_eq!(&buffer[..len], b"opc-downlink-seq");
 
-    // Unknown TEID must be dropped, not forwarded.
+    // An unknown TEID may reach control, but must never forward its inner packet.
     let gpdu_unknown = build_gpdu(0xDEAD_BEEF, None, &inner_downlink);
     pgw_socket.send_to(&gpdu_unknown, (EPDG_S2BU_IP, GTPU_PORT))?;
     expect_no_datagram(&ue_socket);
@@ -8223,6 +8282,7 @@ fn capture_gtpu_outer_flags(capture: &OwnedFd) -> u8 {
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let nohz_full = tft_nohz_full::require_requested_profile();
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return Ok(());
@@ -8366,6 +8426,9 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
         ],
     )
     .expect("canonical shared-PAA TFT classifier");
+    if nohz_full {
+        tft_nohz_full::require_aya_available(&backend);
+    }
     assert_eq!(
         backend
             .reconcile_tft_uplink_classifier(main_classifier.clone())
@@ -8511,12 +8574,22 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
         ],
     )
     .expect("no-default TFT classifier");
+    let retained_bank = nohz_full.then(|| tft_nohz_full::retained_inactive_bank(&pin_dir));
     assert_eq!(
         backend
-            .reconcile_tft_uplink_classifier(no_default_classifier)
+            .reconcile_tft_uplink_classifier(no_default_classifier.clone())
             .await?,
         TftUplinkClassifierReconcileOutcome::Replaced
     );
+    if let Some(bank) = retained_bank {
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(device.ifindex, IpAddr::V4(UE_PAA))
+                .await?,
+            TftUplinkClassifierReadback::Present(no_default_classifier)
+        );
+        tft_nohz_full::require_reused_bank(&pin_dir, bank);
+    }
     let no_match_before = pinned_per_cpu_u64_values(
         &pin_dir,
         MAP_TFT_CLASSIFIER_COUNTERS,
@@ -8707,7 +8780,24 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
     drop(backend);
     drop(net);
     eprintln!("OPC_GTPU_TFT_IPV4_LIVE_PROVEN");
+    if nohz_full {
+        eprintln!("OPC_GTPU_TFT_NOHZ_LIFECYCLE_PROVEN");
+    }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_classifier_removal::qualify_fence().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_classifier_removal::qualify_continuity().await
 }
 
 #[tokio::test]
@@ -9027,6 +9117,55 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
 
     drop(net);
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_decapsulates_outer_fragmented_downlink(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_ordinary().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_packet_too_big_is_signalled_in_tunnel(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_packet_too_big::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_packet_too_big_baseline_without_opt_in(
+) -> Result<(), Box<dyn std::error::Error>> {
+    packet_too_big_baseline::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_inner_fragmentation::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_decapsulates_grouped_outer_fragmented_downlink(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_grouped().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_decapsulates_ordinary_inner_ipv6_fragments(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_ordinary_ipv6().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_drains_shared_queue_under_pdp_churn(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_churn().await
 }
 
 #[tokio::test]
@@ -9687,10 +9826,10 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         capabilities.uplink_checksum_offload,
         GtpuUplinkChecksumOffloadContract::MaterializedOnly
     );
-    assert_eq!(
+    assert!(matches!(
         capabilities.downlink_outer_ipv4_fragment_handling,
-        GtpuDownlinkFragmentContract::Unsupported
-    );
+        GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+    ));
     assert_eq!(
         capabilities.downlink_outer_ipv6_fragment_handling,
         GtpuDownlinkFragmentContract::Unsupported
@@ -9708,6 +9847,38 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     let pgw_v4 = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind initial PGW IPv4 GTP-U socket")
     });
+    // A grouped attachment exposes the same IPv4 queue without granting
+    // any grouped selector authority or changing its forwarding generation.
+    let grouped_control = backend.open_gtpu_control_port(&device).await?;
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x31, 0x42, 0, 0];
+    pgw_v4.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let event = loop {
+        if let Some(event) = grouped_control.try_receive_datagram(2048)? {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grouped control receive deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(event.bytes(), echo);
+    assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+    let plan = event
+        .echo_response(opc_gtpu_dataplane::control_port::GtpuControlResponseBudget::new(14, 2)?)?;
+    grouped_control.send_control_response(plan)?;
+    pgw_v4.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut echo_response = [0_u8; 64];
+    let (length, source) = pgw_v4.recv_from(&mut echo_response)?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        &echo_response[..length],
+        &[0x32, 2, 0, 6, 0, 0, 0, 0, 0x31, 0x42, 0, 0, 14, 0]
+    );
+    eprintln!(
+        "OPC_GTPU_BACKEND_GROUPED_CONTROL_PROVEN: exact IPv4 tuple and Echo on grouped attachment"
+    );
     let pgw_v6 = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IPV6, GTPU_PORT)).expect("bind initial PGW IPv6 GTP-U socket")
     });
@@ -10023,7 +10194,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     // retirement/republication remains the separately tracked RFC 017 work.
     drop(initial_active);
     drop(backend);
-    let adopted_backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config));
+    let adopted_backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config.clone()));
     let adopted = adopted_backend
         .create_device_with_endpoints(grouped_device_request(policy))
         .await?;
@@ -10129,6 +10300,50 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         RawChecksumMetadata::Unverified,
     );
     expect_no_datagram(&ue_v6);
+
+    // Ordinary removal deletes the pins required by this protected retired
+    // history. The explicit restart operation detaches both owned hooks while
+    // keeping all of those same objects available to the next process.
+    let pins = grouped_pin_directory(&net.pin_root, grouped_device_id());
+    let retained_ids = exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES);
+    adopted_backend.suspend_grouped_device(&adopted).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    assert_eq!(
+        exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES),
+        retained_ids
+    );
+    assert!(adopted_backend.managed_device_inventory().await?.is_empty());
+    assert!(matches!(
+        adopted_backend.suspend_grouped_device(&adopted).await,
+        Err(GtpuError::NotFound)
+    ));
+    drop(adopted_backend);
+    let restarted = Arc::new(EbpfGtpuDataplaneBackend::with_config(config));
+    let restarted_device = restarted
+        .create_device_with_endpoints(grouped_device_request(policy))
+        .await?;
+    assert_eq!(
+        exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES),
+        retained_ids
+    );
+    drop(
+        selector_namespace
+            .recover_retired(restarted.clone(), initial.clone())
+            .await?,
+    );
+    assert!(selector_namespace
+        .reconcile_fresh(restarted.clone(), initial)
+        .await
+        .is_err());
+    restarted.suspend_grouped_device(&restarted_device).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    assert_eq!(
+        exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES),
+        retained_ids
+    );
+    println!("OPC_GTPU_GROUPED_RETAINED_RESTART_PROVEN");
     drop(net);
     Ok(())
 }
@@ -10327,6 +10542,23 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
     let mut create = CreateGtpDeviceRequest::new("s2bu");
     create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let old_device = owner.create_device(create).await?;
+    // The ordinary owner once carried an inner-IPv6 context and drained it.
+    // Recovery of that drained graph must succeed exactly as for a graph that
+    // never carried inner IPv6.
+    let drained_ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
+        ..session_context(old_device.ifindex)
+    };
+    assert_eq!(
+        owner
+            .install_pdp_context_classified(drained_ipv6.clone())
+            .await?,
+        PdpContextInstallOutcome::Installed
+    );
+    assert_eq!(
+        owner.remove_pdp_context_exact(drained_ipv6).await?,
+        PdpContextRemovalOutcome::Removed
+    );
     let pin_dir = net.pin_root.join("s2bu");
     let recovery = EbpfGtpuDataplaneBackend::with_config(config.clone());
     let legacy_request = CurrentEbpfGraphRecoveryRequest::new(
@@ -11066,6 +11298,297 @@ async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
         PdpContextInstallOutcome::Installed
     );
 
+    // Activation restores packet effects, not only the hooks: a fresh context
+    // forwards in both directions and every datapath counter moves.
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW IPv4 GTP-U socket")
+    });
+    let ue = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind UE IPv4 socket")
+    });
+    let ue_capture = packet_capture_socket(&net.ue_ns);
+    let before = recovered.datapath_snapshot(&device).await?;
+    let uplink_payload = b"cleanup-activated-uplink";
+    ue.send_to(uplink_payload, (REMOTE_HOST, 53))?;
+    let uplink_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        uplink_payload,
+    );
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &uplink_inner,
+    );
+    let downlink_payload = b"cleanup-activated-downlink";
+    let downlink = build_outer_gtpu_frame(
+        main_link_address("s2bu"),
+        net.pgw_link_address("s2bup"),
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, downlink_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(&ue, SocketAddr::from((REMOTE_HOST, 53)), downlink_payload);
+    let after = recovered.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after.counters.uplink_encapsulated,
+        before.counters.uplink_encapsulated + 1,
+        "activated cleanup recovery must encapsulate uplink: {after:?}"
+    );
+    assert_eq!(
+        after.counters.downlink_decapsulated,
+        before.counters.downlink_decapsulated + 1,
+        "activated cleanup recovery must decapsulate downlink: {after:?}"
+    );
+
+    // Inner IPv6 on the same activated ordinary attachment forwards too: the
+    // re-enabled gate covers the family-tagged authority path.
+    let ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
+        ..session_context(device.ifindex)
+    };
+    assert_eq!(
+        recovered.install_pdp_context_classified(ipv6).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    resolve_s2bu_ipv6_gateway_neighbour();
+    let ue_v6 = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA_IPV6, 5601)).expect("bind UE IPv6 socket")
+    });
+    let before_v6 = recovered.datapath_snapshot(&device).await?;
+    let uplink_v6 = build_inner_udp_v6(
+        UE_PAA_IPV6,
+        REMOTE_HOST_IPV6,
+        5601,
+        53,
+        b"cleanup-activated-v6",
+    );
+    send_raw_ipv6_packet(&net.ue_ns, &uplink_v6);
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &forwarded_ipv6_packet(uplink_v6),
+    );
+    let downlink_v6_payload = b"cleanup-activated-downlink-v6";
+    let downlink_v6 = build_outer_gtpu_frame(
+        main_link_address("s2bu"),
+        net.pgw_link_address("s2bup"),
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp_v6(REMOTE_HOST_IPV6, UE_PAA_IPV6, 53, 5601, downlink_v6_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &downlink_v6,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v6,
+        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
+        downlink_v6_payload,
+    );
+    let after_v6 = recovered.datapath_snapshot(&device).await?;
+    assert!(
+        after_v6.counters != before_v6.counters,
+        "activated cleanup recovery must move datapath counters for inner IPv6: {after_v6:?}"
+    );
+    eprintln!("OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN: IPv4 and IPv6 uplink and downlink after cleanup-only activation");
+
+    drop(net);
+    Ok(())
+}
+
+/// A cleanup-only activation that fails after its hooks are attached is
+/// rolled back completely (SDK issue 1010).
+///
+/// Acquisition proved an executable PMTU policy slot. Corrupting it afterwards
+/// is invisible to every activation step except the re-proof of the attached
+/// graph, which requires an executable slot. That failure must leave both
+/// hooks detached and the traffic gate even, and the backend must still hold
+/// the device cleanup-only, agreeing with the runtime. Once the graph is exact
+/// again, a retry activates it: the device forwards in both directions and is
+/// removable. A commit before that re-proof would instead leave a forwarding
+/// datapath recorded as cleanup-only, with every retry refused as already
+/// active.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_activation_failure_leaves_the_device_fenced_and_retryable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let stale = session_context(device.ifindex);
+    assert_eq!(
+        owner.install_pdp_context_classified(stale.clone()).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+    drop(owner);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(RetainedGraphCleanupRequest::new(
+                device.clone(),
+                EPDG_S2BU_IP,
+                CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            ))
+            .await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+    assert_eq!(
+        recovered.remove_pdp_context_exact(stale.clone()).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+    let traffic_gate = |pin_dir: &std::path::Path| {
+        pinned_u64_array_values(
+            pin_dir,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+        )[GTPU_TRAFFIC_OBSERVATION_GATE_INDEX as usize]
+    };
+
+    let executable = pinned_pmtu_policy(&pin_dir);
+    replace_pinned_pmtu_policy(&pin_dir, [0, 0, 0, 1]);
+    let failed = recovered.activate_cleanup_recovery(&device).await;
+    assert!(
+        matches!(failed, Err(GtpuError::StateIndeterminate { .. })),
+        "a failed graph re-proof must fail activation: {failed:?}"
+    );
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            !filters.contains("opc_gtpu"),
+            "a failed activation must leave no SDK hook on {direction}: {filters}"
+        );
+    }
+    let gate = traffic_gate(&pin_dir);
+    assert!(
+        gate != 0 && gate % 2 == 0,
+        "a failed activation must leave the traffic gate packet-inert: {gate}"
+    );
+    // With the graph exact again, the backend still holds the device
+    // cleanup-only, agreeing with the runtime: installation stays fenced.
+    replace_pinned_pmtu_policy(&pin_dir, executable);
+    assert_eq!(
+        recovered
+            .install_pdp_context_classified(stale.clone())
+            .await?,
+        PdpContextInstallOutcome::Indeterminate(
+            PdpContextIndeterminateReason::AuthorityUnavailable
+        ),
+        "the backend must still hold the device cleanup-only"
+    );
+
+    recovered.activate_cleanup_recovery(&device).await?;
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            filters.contains("opc_gtpu"),
+            "a retried activation must attach the SDK hook on {direction}: {filters}"
+        );
+    }
+    let gate = traffic_gate(&pin_dir);
+    assert!(
+        gate % 2 == 1,
+        "a retried activation must enable the traffic gate: {gate}"
+    );
+    assert_eq!(
+        recovered.install_pdp_context_classified(stale).await?,
+        PdpContextInstallOutcome::Installed
+    );
+
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW IPv4 GTP-U socket")
+    });
+    let ue = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind UE IPv4 socket")
+    });
+    let ue_capture = packet_capture_socket(&net.ue_ns);
+    let uplink_payload = b"cleanup-retried-uplink";
+    ue.send_to(uplink_payload, (REMOTE_HOST, 53))?;
+    let uplink_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        uplink_payload,
+    );
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &uplink_inner,
+    );
+    let downlink_payload = b"cleanup-retried-downlink";
+    let downlink = build_outer_gtpu_frame(
+        main_link_address("s2bu"),
+        net.pgw_link_address("s2bup"),
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, downlink_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(&ue, SocketAddr::from((REMOTE_HOST, 53)), downlink_payload);
+
+    recovered.remove_device(&device).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    eprintln!(
+        "OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN: failed re-proof rolled back, retry forwards"
+    );
     drop(net);
     Ok(())
 }
@@ -11871,6 +12394,7 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_DOWNLINK_BINDING_COUNTERS,
             MAP_SESSION_GROUPS,
             MAP_SESSION_DOWNLINK_INDEX,
+            MAP_CONFIG,
             MAP_CONFIG_IPV6,
             GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
             GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -12297,6 +12821,1166 @@ async fn ebpf_gtpu_snapshot_publishes_every_counter_map_identity(
     drop(retained_counter_maps);
     drop(rebuilt_owner);
 
+    drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use opc_gtpu_dataplane::control_port::{GtpuControlDatagramKind, GtpuControlResponseBudget};
+    use opc_proto_gtpu::GtpuExtensionHeaderTypeList;
+
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        fs::read_link("/proc/self/ns/net")?,
+        fs::read_link("/proc/1/ns/net")?
+    );
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    backend
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    let control = backend.open_gtpu_control_port(&device).await?;
+    let control_v6 = UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?;
+    control_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let peer = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
+    });
+    peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let ue = in_netns(&net.ue_ns, || UdpSocket::bind((UE_PAA, 5000)).unwrap());
+    let destination_mac = main_link_address("s2bu");
+    let source_mac = net.pgw_link_address("s2bup");
+    let inner = build_inner_udp(
+        REMOTE_HOST,
+        UE_PAA,
+        53,
+        5000,
+        b"required-extension-no-decap",
+    );
+    let before = backend.datapath_snapshot(&device).await?;
+    let receive_control = || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = control.try_receive_datagram(2048).unwrap() {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "required extension missed control queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let mut received = [0_u8; 2048];
+    let mut required_count = 0;
+    // All endpoint-required unknown identifiers, including the SGW-only 0xc0
+    // exception, are required for this endpoint profile. PSC is known framing.
+    for kind in 128_u8..=255 {
+        if kind == 0x85 {
+            continue;
+        }
+        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
+        gpdu[11] = kind;
+        let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &frame,
+            RawChecksumMetadata::Unverified,
+        );
+        let event = receive_control();
+        assert_eq!(
+            event.kind(),
+            GtpuControlDatagramKind::UnsupportedRequiredExtension
+        );
+        assert_eq!(event.bytes(), gpdu);
+        assert_eq!(event.peer(), std::net::SocketAddrV4::new(PGW_IP, GTPU_PORT));
+        assert_eq!(
+            event.local(),
+            std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+        );
+        assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+        let plan = event.extension_notification(
+            GtpuExtensionHeaderTypeList::new([])?,
+            GtpuControlResponseBudget::new(14, 1)?,
+        )?;
+        assert_eq!(control.send_control_response(plan)?, 14);
+        let (length, source) = peer.recv_from(&mut received)?;
+        assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+        assert_eq!(
+            &received[..length],
+            &[0x32, 31, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0]
+        );
+
+        // The same committed IPv6 parser must hand the unchanged packet to
+        // the host before any grouped owner lookup. IPv6 typed socket support
+        // remains separate: this checks the actual raw UDP receive boundary.
+        let frame6 = build_outer_ipv6_gtpu_frame(
+            destination_mac,
+            source_mac,
+            PGW_IPV6,
+            EPDG_S2BU_IPV6,
+            &gpdu,
+            OuterIpv6Extension::None,
+        );
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &frame6,
+            RawChecksumMetadata::Unverified,
+        );
+        let (length, source) = control_v6.recv_from(&mut received)?;
+        assert_eq!(source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+        assert_eq!(&received[..length], gpdu);
+        required_count += 1;
+    }
+    assert_eq!(required_count, 127);
+    expect_no_datagram(&ue);
+    let after_required = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after_required.counters.downlink_decapsulated,
+        before.counters.downlink_decapsulated
+    );
+    assert_eq!(
+        after_required.counters.downlink_unknown_teid,
+        before.counters.downlink_unknown_teid
+    );
+    assert_eq!(
+        after_required.counters.downlink_malformed,
+        before.counters.downlink_malformed
+    );
+
+    // Unknown optional types are skipped at this endpoint, with their next
+    // pointer followed. The exact inner UDP packet still reaches the UE.
+    for kind in 1_u8..=127 {
+        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
+        gpdu[11] = kind;
+        let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &frame,
+            RawChecksumMetadata::Unverified,
+        );
+        receive_raw_downlink(&ue, b"required-extension-no-decap");
+        assert!(control.try_receive_datagram(2048)?.is_none());
+    }
+    let after_optional = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after_optional.counters.downlink_decapsulated,
+        before.counters.downlink_decapsulated + 127
+    );
+    // Validate the whole chain before handing it to the host. A required
+    // first header must not bypass a malformed second header in either family.
+    for length in [0, 255] {
+        let mut gpdu = vec![
+            0x34, 0xff, 0, 12, 0x10, 0, 0, 1, 0, 0, 0, 0x80, 1, 0, 0, 0x20, length, 0, 0, 0,
+        ];
+        for ipv6 in [false, true] {
+            let frame = if ipv6 {
+                build_outer_ipv6_gtpu_frame(
+                    destination_mac,
+                    source_mac,
+                    PGW_IPV6,
+                    EPDG_S2BU_IPV6,
+                    &gpdu,
+                    OuterIpv6Extension::None,
+                )
+            } else {
+                build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0)
+            };
+            send_raw_gtpu_frame(
+                &net.pgw_ns,
+                "s2bup",
+                &frame,
+                RawChecksumMetadata::Unverified,
+            );
+        }
+        gpdu.fill(0);
+    }
+    expect_no_control_datagram(control.as_ref());
+    expect_no_datagram(&control_v6);
+    expect_no_datagram(&ue);
+    let after_malformed = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after_malformed.counters.downlink_malformed,
+        before.counters.downlink_malformed + 4
+    );
+    assert_eq!(
+        after_malformed.counters.downlink_decapsulated,
+        after_optional.counters.downlink_decapsulated
+    );
+    drop(control);
+    drop(control_v6);
+    drop(peer);
+    drop(ue);
+    backend.remove_device(&device).await?;
+    drop(backend);
+    drop(net);
+    eprintln!("OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN: 127 required types, both outer families, 127 optional types, 4 malformed chains");
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use opc_gtpu_dataplane::control_port::{
+        GtpuControlDatagramKind, GtpuControlPort, GtpuControlPortError, GtpuControlResponseBudget,
+    };
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        fs::read_link("/proc/self/ns/net")?,
+        fs::read_link("/proc/1/ns/net")?
+    );
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let backend = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request.clone()).await?;
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    // An external legacy queue is never replaced or joined using reuseport.
+    let external = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    assert!(backend.open_gtpu_control_port(&device).await.is_err());
+    drop(external);
+    let first = backend.open_gtpu_control_port(&device).await?;
+    let second = backend.open_gtpu_control_port(&device).await?;
+    assert!(GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu").is_err());
+    let peer = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IP, 0)).unwrap());
+    peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let peer_address = peer.local_addr()?;
+    let receive = |port: &dyn GtpuControlPort| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = port.try_receive_datagram(2048).unwrap() {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backend control receive deadline"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Independent canonical Echo wire: dynamic peer port, nonzero sequence.
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x91, 0x73, 0, 0];
+    let response = [0x32, 2, 0, 6, 0, 0, 0, 0, 0x91, 0x73, 0, 0, 14, 0];
+    let budget = GtpuControlResponseBudget::new(14, 2)?;
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let event = receive(second.as_ref());
+    assert_eq!(event.kind(), GtpuControlDatagramKind::Control);
+    assert_eq!(SocketAddr::from(event.peer()), peer_address);
+    assert_eq!(
+        event.local(),
+        std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+    );
+    assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+    assert_eq!(event.bytes(), echo);
+    assert_eq!(
+        first.send_control_response(event.echo_response(budget)?)?,
+        response.len()
+    );
+    let mut bytes = [0_u8; 2048];
+    let (length, source) = peer.recv_from(&mut bytes)?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(&bytes[..length], response);
+    expect_no_control_datagram(first.as_ref());
+    expect_no_control_datagram(second.as_ref());
+    assert_eq!(format!("{first:?}"), "EbpfGtpuControlPort(<redacted>)");
+
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let old_plan = receive(first.as_ref()).echo_response(budget)?;
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let foreign_plan = receive(first.as_ref()).echo_response(budget)?;
+    // Prove the datagram is in this socket's kernel queue before removal;
+    // send completion alone would not exclude delayed network delivery.
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let local_hex = format!(
+        "{:08X}:{GTPU_PORT:04X}",
+        u32::from_ne_bytes(EPDG_S2BU_IP.octets())
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let table = fs::read_to_string("/proc/net/udp")?;
+        let queued = table.lines().skip(1).any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.get(1) == Some(&local_hex.as_str())
+                && fields
+                    .get(4)
+                    .and_then(|queues| queues.split_once(':'))
+                    .and_then(|(_, rx)| u64::from_str_radix(rx, 16).ok())
+                    .is_some_and(|rx| rx > 0)
+        });
+        if queued {
+            break;
+        }
+        assert!(Instant::now() < deadline, "old socket never queued receive");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    backend.remove_device(&device).await?;
+    assert_eq!(
+        first.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    let mut ipv6_request = CreateGtpDeviceRequest::new("s2bu");
+    ipv6_request.uplink_mtu_policy = Some(grouped_mtu_policy());
+    let ipv6_request = CreateGtpDeviceEndpointSetRequest::new(
+        ipv6_request,
+        grouped_device_id(),
+        GtpuLocalEndpointSet::new(IpAddr::V6(EPDG_S2BU_IPV6), None)?,
+    )?;
+    let ipv6_only = backend.create_device_with_endpoints(ipv6_request).await?;
+    assert!(matches!(
+        backend.open_gtpu_control_port(&ipv6_only).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_control_port_ipv6"
+        })
+    ));
+    backend.remove_device(&ipv6_only).await?;
+    let replacement = backend.create_device(request).await?;
+    assert_eq!(replacement.ifindex, device.ifindex);
+    let fresh = backend.open_gtpu_control_port(&replacement).await?;
+    assert_eq!(
+        first.send_control_response(old_plan).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        second.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        fresh.send_control_response(foreign_plan).unwrap_err(),
+        GtpuControlPortError::SocketMismatch
+    );
+    expect_no_control_datagram(fresh.as_ref());
+    expect_no_datagram(&peer);
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let event = receive(fresh.as_ref());
+    fresh.send_control_response(event.echo_response(budget)?)?;
+    let (length, source) = peer.recv_from(&mut bytes)?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(&bytes[..length], response);
+
+    // Dropping the final backend closes its queue despite retained ports.
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let backend_loss_plan = receive(fresh.as_ref()).echo_response(budget)?;
+    drop(backend);
+    assert_eq!(
+        fresh.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        fresh.send_control_response(backend_loss_plan).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    let released = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    drop(released);
+    let backend = EbpfGtpuDataplaneBackend::with_config(config);
+    let replacement = backend.resolve_device("s2bu").await?;
+    let fresh = backend.open_gtpu_control_port(&replacement).await?;
+
+    // Missing live hooks retire the socket. Returning the same interface
+    // alone cannot authorize a queued response or keep a private FD alive.
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let lost_hook_plan = receive(fresh.as_ref()).echo_response(budget)?;
+    run("tc", &["qdisc", "del", "dev", "s2bu", "clsact"]);
+    assert_eq!(
+        fresh.send_control_response(lost_hook_plan).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert!(matches!(
+        backend.open_gtpu_control_port(&replacement).await,
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_control_port_attachment"
+        })
+    ));
+    let released = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    drop(released);
+    drop(backend);
+    assert_eq!(
+        fresh.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    expect_no_datagram(&peer);
+    drop(peer);
+    drop(net);
+    eprintln!("OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN: shared queue, dynamic Echo, removal/reinstall, exact hooks, backend loss");
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use opc_gtpu_dataplane::control_port::{GtpuControlDatagramKind, GtpuControlResponseBudget};
+
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        fs::read_link("/proc/self/ns/net")?,
+        fs::read_link("/proc/1/ns/net")?
+    );
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    for grouped in [false, true] {
+        let net = TestNet::provision();
+        let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(
+            EbpfGtpuDataplaneBackendConfig {
+                bpffs_pin_root: net.pin_root.clone(),
+                ..EbpfGtpuDataplaneBackendConfig::default()
+            },
+        ));
+        let device = if grouped {
+            backend
+                .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
+                .await?
+        } else {
+            let mut request = CreateGtpDeviceRequest::new("s2bu");
+            request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+            backend.create_device(request).await?
+        };
+        let grouped_authority = if grouped {
+            Some(
+                reconcile_fresh_grouped(backend.clone(), initial_grouped_session(device.ifindex))
+                    .await?,
+            )
+        } else {
+            backend
+                .install_pdp_context(session_context(device.ifindex))
+                .await?;
+            None
+        };
+        let pin_dir = if grouped {
+            grouped_pin_directory(&net.pin_root, grouped_device_id())
+        } else {
+            net.pin_root.join("s2bu")
+        };
+        run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+        run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+        run("ip", &["addr", "add", "192.0.2.90/24", "dev", "s2bu"]);
+        run(
+            "ip",
+            &[
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:2::90/64",
+                "dev",
+                "s2bu",
+                "nodad",
+            ],
+        );
+        let control = backend.open_gtpu_control_port(&device).await?;
+        let control_v6 = UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?;
+        control_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let foreign_v4 = UdpSocket::bind((Ipv4Addr::new(192, 0, 2, 90), GTPU_PORT))?;
+        let foreign_v6 = UdpSocket::bind(("2001:db8:2::90".parse::<Ipv6Addr>()?, GTPU_PORT))?;
+        let trigger = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IP, 50001)).unwrap());
+        let peer_service = in_netns(&net.pgw_ns, || {
+            UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
+        });
+        peer_service.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let ue = in_netns(&net.ue_ns, || UdpSocket::bind((UE_PAA, 5000)).unwrap());
+        let destination_mac = main_link_address("s2bu");
+        let source_mac = net.pgw_link_address("s2bup");
+        let inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"unknown-teid-no-decap");
+        let receive = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(event) = control.try_receive_datagram(2048).unwrap() {
+                    break event;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "unknown TEID missed control queue"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let before = backend.datapath_snapshot(&device).await?;
+        let mut bytes = [0_u8; 2048];
+        for sequence in [None, Some(0x1357)] {
+            let gpdu = build_gpdu(0xdead_beef, sequence, &inner);
+            trigger.send_to(&gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+            let event = receive();
+            assert_eq!(event.kind(), GtpuControlDatagramKind::Gpdu);
+            assert_eq!(event.bytes(), gpdu);
+            assert_eq!(event.peer(), std::net::SocketAddrV4::new(PGW_IP, 50001));
+            assert_eq!(
+                event.local(),
+                std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+            );
+            assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+            // This synthetic test owns the complete installed roster above.
+            // Receiving a G-PDU is not itself an absence or response authority.
+            let plan = event.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 1)?)?;
+            assert_eq!(control.send_control_response(plan)?, 28);
+            let (length, source) = peer_service.recv_from(&mut bytes)?;
+            assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+            // Independent TS 29.281 literal: zero header TEID/sequence, UDP
+            // Port extension 50001, triggering TEID, original destination IE.
+            assert_eq!(
+                &bytes[..length],
+                &[
+                    0x36, 26, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0xc3, 0x51, 0, 16, 0xde, 0xad,
+                    0xbe, 0xef, 133, 0, 4, 192, 0, 2, 1,
+                ]
+            );
+            if grouped {
+                // IPv6 typed responses remain unsupported. This receiver
+                // proves only the exact native parser's raw UDP handoff.
+                let frame = build_outer_ipv6_gtpu_frame(
+                    destination_mac,
+                    source_mac,
+                    PGW_IPV6,
+                    EPDG_S2BU_IPV6,
+                    &gpdu,
+                    OuterIpv6Extension::None,
+                );
+                send_raw_gtpu_frame(
+                    &net.pgw_ns,
+                    "s2bup",
+                    &frame,
+                    RawChecksumMetadata::Unverified,
+                );
+                let (length, source) = control_v6.recv_from(&mut bytes)?;
+                assert_eq!(&bytes[..length], gpdu);
+                assert_eq!(source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+            }
+        }
+        expect_no_datagram(&trigger);
+        expect_no_datagram(&ue);
+        let after = backend.datapath_snapshot(&device).await?;
+        assert_eq!(
+            after.counters.downlink_decapsulated,
+            before.counters.downlink_decapsulated
+        );
+        assert_eq!(
+            after.counters.downlink_unknown_teid,
+            before.counters.downlink_unknown_teid + if grouped { 4 } else { 2 }
+        );
+
+        // Local addresses outside this attachment must not receive the outer
+        // datagram, even when an ordinary host socket could accept it.
+        let gpdu = build_gpdu(0xdead_beef, None, &inner);
+        let mut foreign = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        foreign[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&[192, 0, 2, 90]);
+        refresh_outer_ipv4_checksum(&mut foreign);
+        refresh_outer_udp_checksum(&mut foreign);
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &foreign,
+            RawChecksumMetadata::Unverified,
+        );
+        let foreign = build_outer_ipv6_gtpu_frame(
+            destination_mac,
+            source_mac,
+            PGW_IPV6,
+            "2001:db8:2::90".parse()?,
+            &gpdu,
+            OuterIpv6Extension::None,
+        );
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &foreign,
+            RawChecksumMetadata::Unverified,
+        );
+        expect_no_datagram(&foreign_v4);
+        expect_no_datagram(&foreign_v6);
+
+        // Zero TEID, truncated GTP framing and a corrupt UDP checksum must
+        // not acquire a control plan or become a forwarded inner packet.
+        let zero = build_gpdu(0, None, &inner);
+        let mut truncated = gpdu.clone();
+        truncated.pop();
+        for rejected in [&zero, &truncated] {
+            let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], rejected, true, 0);
+            send_raw_gtpu_frame(
+                &net.pgw_ns,
+                "s2bup",
+                &frame,
+                RawChecksumMetadata::Unverified,
+            );
+            let frame = build_outer_ipv6_gtpu_frame(
+                destination_mac,
+                source_mac,
+                PGW_IPV6,
+                EPDG_S2BU_IPV6,
+                rejected,
+                OuterIpv6Extension::None,
+            );
+            send_raw_gtpu_frame(
+                &net.pgw_ns,
+                "s2bup",
+                &frame,
+                RawChecksumMetadata::Unverified,
+            );
+        }
+        let mut corrupt = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        let udp = outer_udp_offset(&corrupt);
+        corrupt[udp + 6] ^= 0x80;
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &corrupt,
+            RawChecksumMetadata::Unverified,
+        );
+        let mut corrupt = build_outer_ipv6_gtpu_frame(
+            destination_mac,
+            source_mac,
+            PGW_IPV6,
+            EPDG_S2BU_IPV6,
+            &gpdu,
+            OuterIpv6Extension::None,
+        );
+        corrupt[ETH_HDR_LEN + 40 + 6] ^= 0x80;
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &corrupt,
+            RawChecksumMetadata::Unverified,
+        );
+        expect_no_control_datagram(control.as_ref());
+        expect_no_datagram(&control_v6);
+        expect_no_datagram(&ue);
+
+        // An installed context still decapsulates normally and never produces
+        // an unknown-tunnel event. Retaining its selector while invalidating
+        // authority must remain a drop, not be reclassified as a true miss.
+        let known_teid = if grouped {
+            GROUP_LOCAL_TEID_V4_INITIAL
+        } else {
+            LOCAL_TEID
+        };
+        let known = build_gpdu(known_teid, None, &inner);
+        peer_service.send_to(&known, (EPDG_S2BU_IP, GTPU_PORT))?;
+        receive_raw_downlink(&ue, b"unknown-teid-no-decap");
+        expect_no_control_datagram(control.as_ref());
+        if grouped {
+            let map = Map::from_map_data(MapData::from_pin(pin_dir.join(MAP_SESSION_GROUPS))?)?;
+            let mut groups = BpfHashMap::<
+                _,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+            >::try_from(map)?;
+            let original = groups.get(&grouped_group_id().to_bytes(), 0)?;
+            groups.remove(&grouped_group_id().to_bytes())?;
+            peer_service.send_to(&known, (EPDG_S2BU_IP, GTPU_PORT))?;
+            let inner_v6 = build_inner_udp_v6(
+                REMOTE_HOST_IPV6,
+                UE_PAA_IPV6,
+                53,
+                5000,
+                b"retained-group-no-control",
+            );
+            let known_v6 = build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &inner_v6);
+            let frame = build_outer_ipv6_gtpu_frame(
+                destination_mac,
+                source_mac,
+                PGW_IPV6,
+                EPDG_S2BU_IPV6,
+                &known_v6,
+                OuterIpv6Extension::None,
+            );
+            let before_refusal = pinned_counter(&pin_dir, COUNTER_DL_DECAP);
+            send_raw_gtpu_frame(
+                &net.pgw_ns,
+                "s2bup",
+                &frame,
+                RawChecksumMetadata::Unverified,
+            );
+            expect_no_control_datagram(control.as_ref());
+            expect_no_datagram(&control_v6);
+            expect_no_datagram(&ue);
+            assert_eq!(pinned_counter(&pin_dir, COUNTER_DL_DECAP), before_refusal);
+            groups.insert(grouped_group_id().to_bytes(), original, 0)?;
+        } else {
+            // A retained endpoint binding with a missing PDR is inconsistent
+            // state, not evidence that this TEID has no owner.
+            let map = Map::from_map_data(MapData::from_pin(pin_dir.join(MAP_DOWNLINK_PDR))?)?;
+            let mut pdrs = BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(map)?;
+            let original = pdrs.get(&known_teid.to_be_bytes(), 0)?;
+            pdrs.remove(&known_teid.to_be_bytes())?;
+            peer_service.send_to(&known, (EPDG_S2BU_IP, GTPU_PORT))?;
+            expect_no_control_datagram(control.as_ref());
+            expect_no_datagram(&ue);
+            pdrs.insert(known_teid.to_be_bytes(), original, 0)?;
+        }
+        peer_service.send_to(&known, (EPDG_S2BU_IP, GTPU_PORT))?;
+        receive_raw_downlink(&ue, b"unknown-teid-no-decap");
+        expect_no_control_datagram(control.as_ref());
+        expect_no_datagram(&peer_service);
+        drop(grouped_authority);
+        backend.remove_device(&device).await?;
+        drop(backend);
+        drop(net);
+    }
+    eprintln!("OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN: legacy/grouped IPv4 Error Indication, grouped IPv6 handoff, exact local endpoints, retained-state refusal");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root, a fresh netns, and bpffs"]
+async fn ebpf_gtpu_n3_fixed_flow_live_contract() -> Result<(), Box<dyn std::error::Error>> {
+    n3_fixed_flow::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_n3_end_marker_retirement_ordering() -> Result<(), Box<dyn std::error::Error>> {
+    n3_end_marker::qualify().await
+}
+
+/// An ordinary (non-grouped) attachment carries an IPv4v6 PDN connection as
+/// two family-scoped PDP contexts that share the bearer's TEIDs. The IPv6
+/// context names its /64 prefix: every uplink source inside that prefix
+/// (including a temporary interface identifier) is encapsulated over the
+/// attachment's IPv4 S2b-U transport, and a downlink G-PDU is decapsulated
+/// only toward a destination inside the prefix. Removing one family leaves the
+/// other forwarding, and restart adoption retains the IPv6 context.
+#[tokio::test(flavor = "multi_thread")]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_ordinary_inner_ipv6_live_contract() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let policy = GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::SignalPacketTooBig)
+        .expect("canonical ordinary PMTU policy");
+    let backend = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    request.uplink_mtu_policy = Some(policy);
+    let device = backend.create_device(request.clone()).await?;
+
+    let ipv4 = session_context(device.ifindex);
+    let prefix = Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0);
+    let ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(prefix),
+        ..ipv4.clone()
+    };
+    for context in [&ipv4, &ipv6] {
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(context.clone())
+                .await?,
+            PdpContextInstallOutcome::Installed
+        );
+    }
+    for context in [&ipv4, &ipv6] {
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(context).expect("local selector"),
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone())
+        );
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::Uplink(
+                    PdpContextUplinkSelector::from_context(context).expect("uplink selector"),
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone())
+        );
+    }
+    // The IPv4 context keeps its byte-exact v5 graph.
+    let pin_dir = net.pin_root.join("s2bu");
+    assert_eq!(pinned_config(&pin_dir), EPDG_S2BU_IP.octets());
+
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    resolve_s2bu_ipv6_gateway_neighbour();
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW IPv4 GTP-U socket")
+    });
+    let ue_v4 = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind UE IPv4 socket")
+    });
+    let ue_v6 = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA_IPV6, 5601)).expect("bind UE IPv6 socket")
+    });
+    let ue_capture = packet_capture_socket(&net.ue_ns);
+
+    // Uplink: the assigned address and a temporary address in the same /64
+    // both select the IPv6 context and leave over IPv4 GTP-U.
+    let temporary = Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0x7a3c, 0x19e2, 0x0c55, 0x81d4);
+    for (source, payload) in [
+        (UE_PAA_IPV6, &b"ordinary-v6-inner-v4-outer"[..]),
+        (temporary, &b"ordinary-v6-temporary-address"[..]),
+    ] {
+        let before = backend.datapath_snapshot(&device).await?;
+        let sent = build_inner_udp_v6(source, REMOTE_HOST_IPV6, 5601, 53, payload);
+        send_raw_ipv6_packet(&net.ue_ns, &sent);
+        receive_grouped_uplink(
+            &pgw,
+            SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+            PEER_TEID,
+            &forwarded_ipv6_packet(sent),
+        );
+        let after = backend.datapath_snapshot(&device).await?;
+        assert_eq!(
+            after.counters.uplink_encapsulated,
+            before.counters.uplink_encapsulated + 1
+        );
+    }
+    // A source outside the /64 is never encapsulated for this context.
+    let outside = Ipv6Addr::new(0x2001, 0xdb8, 0x46, 0, 0, 0, 0, 2);
+    send_raw_ipv6_packet(
+        &net.ue_ns,
+        &build_inner_udp_v6(outside, REMOTE_HOST_IPV6, 5601, 53, b"outside-prefix"),
+    );
+    expect_no_datagram(&pgw);
+
+    // The IPv4 context shares the bearer TEIDs.
+    let v4_payload = b"ordinary-v4-inner-v4-outer";
+    ue_v4.send_to(v4_payload, (REMOTE_HOST, 53))?;
+    let v4_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        v4_payload,
+    );
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &v4_inner,
+    );
+
+    // Downlink: one TEID decapsulates each inner family to its own context.
+    let destination_mac = main_link_address("s2bu");
+    let source_mac = net.pgw_link_address("s2bup");
+    let v6_downlink_payload = b"ordinary-downlink-v6";
+    let v6_downlink = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp_v6(REMOTE_HOST_IPV6, UE_PAA_IPV6, 53, 5601, v6_downlink_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &v6_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v6,
+        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
+        v6_downlink_payload,
+    );
+    let v4_downlink_payload = b"ordinary-downlink-v4";
+    let v4_downlink = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, v4_downlink_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &v4_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v4,
+        SocketAddr::from((REMOTE_HOST, 53)),
+        v4_downlink_payload,
+    );
+    // A downlink destination outside the /64 is never delivered.
+    let decap_before = backend.datapath_snapshot(&device).await?;
+    let outside_downlink = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp_v6(REMOTE_HOST_IPV6, outside, 53, 5601, b"outside-downlink"),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &outside_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+    assert_eq!(
+        backend
+            .datapath_snapshot(&device)
+            .await?
+            .counters
+            .downlink_decapsulated,
+        decap_before.counters.downlink_decapsulated
+    );
+
+    // Outer-IPv4 PMTU boundary for an inner IPv6 packet: 1500 - 36 bytes.
+    let pmtu_before = backend.datapath_snapshot(&device).await?;
+    let exact = build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, &[b'6'; 1416]);
+    assert_eq!(exact.len(), 1500 - 36);
+    send_raw_ipv6_packet(&net.ue_ns, &exact);
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &forwarded_ipv6_packet(exact),
+    );
+    send_raw_ipv6_packet(
+        &net.ue_ns,
+        &build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, &[b'x'; 1417]),
+    );
+    expect_no_datagram(&pgw);
+    assert_eq!(
+        backend
+            .datapath_snapshot(&device)
+            .await?
+            .counters
+            .uplink_mtu_rejected,
+        pmtu_before.counters.uplink_mtu_rejected + 1
+    );
+
+    // Restart adoption keeps the IPv6 context forwarding.
+    drop(backend);
+    let adopted = EbpfGtpuDataplaneBackend::with_config(config);
+    assert_eq!(adopted.resolve_device("s2bu").await?, device);
+    assert_eq!(
+        adopted
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&ipv6).expect("local selector"),
+            ))
+            .await?,
+        PdpContextReadback::Present(ipv6.clone())
+    );
+    let adopted_sent = build_inner_udp_v6(
+        temporary,
+        REMOTE_HOST_IPV6,
+        5601,
+        53,
+        b"ordinary-v6-adopted",
+    );
+    send_raw_ipv6_packet(&net.ue_ns, &adopted_sent);
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &forwarded_ipv6_packet(adopted_sent),
+    );
+
+    // Family-scoped removal: IPv6 stops, IPv4 keeps forwarding.
+    assert_eq!(
+        adopted.remove_pdp_context_exact(ipv6.clone()).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+    // The last inner-IPv6 context retires the family-tagged authority, so the
+    // drained graph is identical to one that never carried inner IPv6.
+    let authority_pin_dir = net.pin_root.join("s2bu");
+    assert_eq!(
+        pinned_array_values::<GTPU_SESSION_CONFIG_VALUE_LEN>(
+            &authority_pin_dir,
+            MAP_CONFIG_IPV6,
+            1
+        ),
+        vec![[0; GTPU_SESSION_CONFIG_VALUE_LEN]],
+        "the last inner-IPv6 removal must retire GTPU_CONFIG6"
+    );
+    assert_eq!(
+        pinned_array_values::<GTPU_SESSION_SCHEMA_MARKER_LEN>(
+            &authority_pin_dir,
+            MAP_SESSION_SCHEMA,
+            1
+        ),
+        vec![[0; GTPU_SESSION_SCHEMA_MARKER_LEN]],
+        "the last inner-IPv6 removal must retire GTPU_SCHEMA6"
+    );
+    send_raw_ipv6_packet(
+        &net.ue_ns,
+        &build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, b"removed-v6"),
+    );
+    expect_no_datagram(&pgw);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &v6_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &v4_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v4,
+        SocketAddr::from((REMOTE_HOST, 53)),
+        v4_downlink_payload,
+    );
+    assert_eq!(
+        adopted.remove_pdp_context_exact(ipv4.clone()).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+    for (context, family) in [(&ipv4, "IPv4"), (&ipv6, "IPv6")] {
+        assert_eq!(
+            adopted
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(context).expect("local selector"),
+                ))
+                .await?,
+            PdpContextReadback::Absent,
+            "{family} context must be absent after exact removal"
+        );
+    }
+    assert_eq!(
+        adopted.pdp_inner_ipv6_capability(),
+        GtpuCapability::Available
+    );
+    adopted.remove_device(&device).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    println!("OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+/// Restart cleanup of an ordinary attachment that carried an IPv4v6 PDN.
+/// The attachment's own family-tagged authority (its IPv4 endpoint, no IPv6
+/// endpoint, no grouped journal) is cleanup authority: acquisition fences both
+/// retained hooks, the stale IPv6 context reads back and is removed exactly,
+/// and activation re-admits a fresh IPv6 context.
+#[tokio::test(flavor = "multi_thread")]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_removes_stale_ordinary_ipv6_contexts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let ipv4 = session_context(device.ifindex);
+    let ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
+        ..ipv4.clone()
+    };
+    for stale in [&ipv4, &ipv6] {
+        assert_eq!(
+            owner.install_pdp_context_classified(stale.clone()).await?,
+            PdpContextInstallOutcome::Installed
+        );
+    }
+    drop(owner);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    let request = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            !filters.contains("opc_gtpu"),
+            "cleanup-only acquisition must fence the {direction} hook: {filters}"
+        );
+    }
+    let selector = PdpContextSelector::LocalTeid(
+        PdpContextLocalTeidSelector::from_context(&ipv6).expect("local TEID selector"),
+    );
+    assert_eq!(
+        recovered.read_pdp_context(selector.clone()).await?,
+        PdpContextReadback::Present(ipv6.clone())
+    );
+    for stale in [&ipv6, &ipv4] {
+        assert_eq!(
+            recovered.remove_pdp_context_exact(stale.clone()).await?,
+            PdpContextRemovalOutcome::Removed
+        );
+    }
+    assert_eq!(
+        recovered.read_pdp_context(selector).await?,
+        PdpContextReadback::Absent
+    );
+
+    recovered.activate_cleanup_recovery(&device).await?;
+    assert_eq!(
+        recovered
+            .install_pdp_context_classified(ipv6.clone())
+            .await?,
+        PdpContextInstallOutcome::Installed
+    );
+    println!("OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN");
     drop(net);
     Ok(())
 }

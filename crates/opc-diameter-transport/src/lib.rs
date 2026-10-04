@@ -1,6 +1,6 @@
 //! Mutually authenticated Diameter-over-TLS/TCP and DTLS/SCTP transports.
 //!
-//! A connection is exposed only after both peers have been authenticated, the
+//! A Diameter connection is exposed only after both peers have been authenticated, the
 //! configured exact SPIFFE identity has matched, coherent credential material
 //! has been admitted, and the exact `opc-proto-diameter` peer-protection
 //! attempt has been attested. TLS/TCP uses `opc-tls` (rustls); DTLS/SCTP uses
@@ -11,6 +11,11 @@
 //! DTLS/SCTP connection can then be consumed into a bounded full-duplex peer
 //! runtime that owns watchdog and disconnect procedures while delivering only
 //! admitted application messages.
+//!
+//! [`rfc6083`] also exposes the shared direct DTLS/SCTP boundary without
+//! Diameter procedure state. Its opaque connection admits the protected PPIDs
+//! 47 and 66 on ordered stream zero after mutual authentication and SCTP-AUTH
+//! key transitions. It does not implement the complete NGAP stream profile.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +26,9 @@ mod runtime;
 mod tls;
 
 mod dtls;
+
+/// Reusable direct RFC 6083 transport, independent of Diameter procedure state.
+pub use dtls::rfc6083;
 mod election;
 
 #[cfg(test)]

@@ -62,7 +62,7 @@ fn run_concurrent_checker() -> Output {
 }
 
 fn exact_sha256(raw: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(raw))
+    format!("sha256:{}", hex::encode(Sha256::digest(raw)))
 }
 
 fn manifest_value() -> Value {
@@ -709,6 +709,6 @@ fn pre_v4_contract_bytes_remain_frozen() {
     ];
 
     for (bytes, expected) in frozen {
-        assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
+        assert_eq!(hex::encode(Sha256::digest(bytes)), expected);
     }
 }

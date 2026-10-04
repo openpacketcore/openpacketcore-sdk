@@ -38,6 +38,12 @@ pub enum PersistErrorKind {
     /// The requested committed config cursor predates retained history.
     #[error("committed config history cursor was compacted")]
     ConfigHistoryCompacted,
+    /// Retained configuration data reached its explicitly admitted bound.
+    #[error("config history capacity reached")]
+    ConfigHistoryFull,
+    /// The requested prefix still owns a pending or rollback reference.
+    #[error("config history has unresolved references")]
+    ConfigHistoryProtected,
     /// A write may have committed but its authoritative acknowledgement was
     /// lost; callers must resolve it by durable request identity before retry.
     #[error("durable write outcome is unknown")]
@@ -254,6 +260,16 @@ impl PersistError {
     /// Construct a typed compacted committed-config-history failure.
     pub fn config_history_compacted() -> Self {
         Self::new(PersistErrorKind::ConfigHistoryCompacted)
+    }
+
+    /// Construct a bounded history-capacity rejection.
+    pub fn config_history_full() -> Self {
+        Self::new(PersistErrorKind::ConfigHistoryFull)
+    }
+
+    /// Construct an unresolved history-reference rejection.
+    pub fn config_history_protected() -> Self {
+        Self::new(PersistErrorKind::ConfigHistoryProtected)
     }
 
     /// Construct an ambiguous durable-write result.

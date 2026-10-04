@@ -1,0 +1,47 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.truncated-wrapper",
+  "subset": "ngap",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Only the PDU choice and procedure code are present"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/truncated-wrapper.hex",
+    "digest_sha256": "cc08d3882726102fb4e66705442b987ebaeca2ea8d9dea101229cd1dff302b06"
+  },
+  "semantic_assertions": [
+    "truncated=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

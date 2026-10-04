@@ -44,6 +44,7 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
         egress_dscp: None,
         uplink_source_port_policy:
             opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     };
 
     let result = async {
@@ -162,6 +163,7 @@ async fn mixed_inner_outer_families_read_back_and_reconcile_in_current_netns(
             egress_dscp: None,
             uplink_source_port_policy:
                 opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
 
         let result = async {
@@ -222,6 +224,7 @@ fn privileged_recovery_context(device: &GtpDevice) -> Result<GtpPdpContext, &'st
         egress_dscp: None,
         uplink_source_port_policy:
             opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     })
 }
 

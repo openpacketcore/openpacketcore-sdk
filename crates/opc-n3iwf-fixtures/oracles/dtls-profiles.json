@@ -1,0 +1,5608 @@
+{
+  "schema_version": 1,
+  "scope": "rfc6083-profile-evidence-reference",
+  "execution_claim": false,
+  "external_interoperability": false,
+  "families": {
+    "certificate-profile": {
+      "kind": "independent-vector-projection",
+      "reference": {
+        "path": "crates/opc-diameter-transport/tests/fixtures/rfc6083/nds_certificates.tsv",
+        "sha256": "1a9968c0889344ec64f8ef30d2ff1d3f2ec50c60ed13a98c3cb1856795ea6f09",
+        "corpus_cases": 146
+      },
+      "cases": [
+        {
+          "row": 1,
+          "role": "client",
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 2,
+          "role": "client",
+          "case": "single-role-eku",
+          "expected": "admit"
+        },
+        {
+          "row": 3,
+          "role": "client",
+          "case": "opposite-role-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 4,
+          "role": "client",
+          "case": "anchor-expiry",
+          "expected": "admit"
+        },
+        {
+          "row": 5,
+          "role": "client",
+          "case": "p384",
+          "expected": "admit"
+        },
+        {
+          "row": 6,
+          "role": "client",
+          "case": "stronger-issuer",
+          "expected": "admit"
+        },
+        {
+          "row": 7,
+          "role": "client",
+          "case": "sha384",
+          "expected": "admit"
+        },
+        {
+          "row": 8,
+          "role": "client",
+          "case": "country-name",
+          "expected": "admit"
+        },
+        {
+          "row": 9,
+          "role": "client",
+          "case": "domain-name",
+          "expected": "admit"
+        },
+        {
+          "row": 10,
+          "role": "client",
+          "case": "optional-eku-absent",
+          "expected": "admit"
+        },
+        {
+          "row": 11,
+          "role": "client",
+          "case": "direct-tls-anchor",
+          "expected": "admit"
+        },
+        {
+          "row": 12,
+          "role": "client",
+          "case": "root-unlimited",
+          "expected": "admit"
+        },
+        {
+          "row": 13,
+          "role": "client",
+          "case": "issuer-too-weak",
+          "expected": "refuse"
+        },
+        {
+          "row": 14,
+          "role": "client",
+          "case": "root-too-weak",
+          "expected": "refuse"
+        },
+        {
+          "row": 15,
+          "role": "client",
+          "case": "leaf-p224",
+          "expected": "refuse"
+        },
+        {
+          "row": 16,
+          "role": "client",
+          "case": "leaf-p521",
+          "expected": "refuse"
+        },
+        {
+          "row": 17,
+          "role": "client",
+          "case": "leaf-no-digital-signature",
+          "expected": "refuse"
+        },
+        {
+          "row": 18,
+          "role": "client",
+          "case": "leaf-wrong-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 19,
+          "role": "client",
+          "case": "leaf-any-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 20,
+          "role": "client",
+          "case": "tls-ca-unlimited",
+          "expected": "refuse"
+        },
+        {
+          "row": 21,
+          "role": "client",
+          "case": "tls-ca-depth-one",
+          "expected": "refuse"
+        },
+        {
+          "row": 22,
+          "role": "client",
+          "case": "root-depth-zero",
+          "expected": "refuse"
+        },
+        {
+          "row": 23,
+          "role": "client",
+          "case": "revoked-leaf",
+          "expected": "refuse"
+        },
+        {
+          "row": 24,
+          "role": "client",
+          "case": "ambiguous-anchor",
+          "expected": "refuse"
+        },
+        {
+          "row": 25,
+          "role": "client",
+          "case": "leaf-missing-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 26,
+          "role": "client",
+          "case": "leaf-noncritical-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 27,
+          "role": "client",
+          "case": "leaf-critical-ski",
+          "expected": "refuse"
+        },
+        {
+          "row": 28,
+          "role": "client",
+          "case": "leaf-critical-aki",
+          "expected": "refuse"
+        },
+        {
+          "row": 29,
+          "role": "client",
+          "case": "leaf-missing-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 30,
+          "role": "client",
+          "case": "leaf-printable-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 31,
+          "role": "client",
+          "case": "leaf-extra-name",
+          "expected": "refuse"
+        },
+        {
+          "row": 32,
+          "role": "client",
+          "case": "leaf-wrong-name-order",
+          "expected": "refuse"
+        },
+        {
+          "row": 33,
+          "role": "client",
+          "case": "leaf-sha512",
+          "expected": "refuse"
+        },
+        {
+          "row": 34,
+          "role": "client",
+          "case": "leaf-expired",
+          "expected": "refuse"
+        },
+        {
+          "row": 35,
+          "role": "client",
+          "case": "leaf-future",
+          "expected": "refuse"
+        },
+        {
+          "row": 36,
+          "role": "client",
+          "case": "leaf-unknown-critical",
+          "expected": "refuse"
+        },
+        {
+          "row": 37,
+          "role": "client",
+          "case": "ca-missing-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 38,
+          "role": "client",
+          "case": "ca-noncritical-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 39,
+          "role": "client",
+          "case": "ca-critical-ski",
+          "expected": "refuse"
+        },
+        {
+          "row": 40,
+          "role": "client",
+          "case": "ca-critical-aki",
+          "expected": "refuse"
+        },
+        {
+          "row": 41,
+          "role": "client",
+          "case": "ca-missing-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 42,
+          "role": "client",
+          "case": "ca-printable-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 43,
+          "role": "client",
+          "case": "ca-extra-name",
+          "expected": "refuse"
+        },
+        {
+          "row": 44,
+          "role": "client",
+          "case": "ca-wrong-name-order",
+          "expected": "refuse"
+        },
+        {
+          "row": 45,
+          "role": "client",
+          "case": "ca-sha512",
+          "expected": "refuse"
+        },
+        {
+          "row": 46,
+          "role": "client",
+          "case": "ca-expired",
+          "expected": "refuse"
+        },
+        {
+          "row": 47,
+          "role": "client",
+          "case": "ca-future",
+          "expected": "refuse"
+        },
+        {
+          "row": 48,
+          "role": "client",
+          "case": "ca-unknown-critical",
+          "expected": "refuse"
+        },
+        {
+          "row": 49,
+          "role": "client",
+          "case": "root-missing-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 50,
+          "role": "client",
+          "case": "root-noncritical-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 51,
+          "role": "client",
+          "case": "root-critical-ski",
+          "expected": "refuse"
+        },
+        {
+          "row": 52,
+          "role": "client",
+          "case": "root-critical-aki",
+          "expected": "refuse"
+        },
+        {
+          "row": 53,
+          "role": "client",
+          "case": "root-missing-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 54,
+          "role": "client",
+          "case": "root-printable-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 55,
+          "role": "client",
+          "case": "root-extra-name",
+          "expected": "refuse"
+        },
+        {
+          "row": 56,
+          "role": "client",
+          "case": "root-wrong-name-order",
+          "expected": "refuse"
+        },
+        {
+          "row": 57,
+          "role": "client",
+          "case": "root-sha512",
+          "expected": "refuse"
+        },
+        {
+          "row": 58,
+          "role": "client",
+          "case": "root-expired",
+          "expected": "refuse"
+        },
+        {
+          "row": 59,
+          "role": "client",
+          "case": "root-future",
+          "expected": "refuse"
+        },
+        {
+          "row": 60,
+          "role": "client",
+          "case": "root-unknown-critical",
+          "expected": "refuse"
+        },
+        {
+          "row": 61,
+          "role": "client",
+          "case": "ca-missing-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 62,
+          "role": "client",
+          "case": "ca-noncritical-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 63,
+          "role": "client",
+          "case": "ca-missing-cert-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 64,
+          "role": "client",
+          "case": "ca-missing-crl-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 65,
+          "role": "client",
+          "case": "root-missing-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 66,
+          "role": "client",
+          "case": "root-noncritical-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 67,
+          "role": "client",
+          "case": "root-missing-cert-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 68,
+          "role": "client",
+          "case": "root-missing-crl-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 69,
+          "role": "client",
+          "case": "missing-crldp",
+          "expected": "refuse"
+        },
+        {
+          "row": 70,
+          "role": "client",
+          "case": "critical-crldp",
+          "expected": "refuse"
+        },
+        {
+          "row": 71,
+          "role": "client",
+          "case": "critical-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 72,
+          "role": "client",
+          "case": "critical-san",
+          "expected": "refuse"
+        },
+        {
+          "row": 73,
+          "role": "client",
+          "case": "critical-leaf-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 74,
+          "role": "server",
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 75,
+          "role": "server",
+          "case": "single-role-eku",
+          "expected": "admit"
+        },
+        {
+          "row": 76,
+          "role": "server",
+          "case": "opposite-role-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 77,
+          "role": "server",
+          "case": "anchor-expiry",
+          "expected": "admit"
+        },
+        {
+          "row": 78,
+          "role": "server",
+          "case": "p384",
+          "expected": "admit"
+        },
+        {
+          "row": 79,
+          "role": "server",
+          "case": "stronger-issuer",
+          "expected": "admit"
+        },
+        {
+          "row": 80,
+          "role": "server",
+          "case": "sha384",
+          "expected": "admit"
+        },
+        {
+          "row": 81,
+          "role": "server",
+          "case": "country-name",
+          "expected": "admit"
+        },
+        {
+          "row": 82,
+          "role": "server",
+          "case": "domain-name",
+          "expected": "admit"
+        },
+        {
+          "row": 83,
+          "role": "server",
+          "case": "optional-eku-absent",
+          "expected": "admit"
+        },
+        {
+          "row": 84,
+          "role": "server",
+          "case": "direct-tls-anchor",
+          "expected": "admit"
+        },
+        {
+          "row": 85,
+          "role": "server",
+          "case": "root-unlimited",
+          "expected": "admit"
+        },
+        {
+          "row": 86,
+          "role": "server",
+          "case": "issuer-too-weak",
+          "expected": "refuse"
+        },
+        {
+          "row": 87,
+          "role": "server",
+          "case": "root-too-weak",
+          "expected": "refuse"
+        },
+        {
+          "row": 88,
+          "role": "server",
+          "case": "leaf-p224",
+          "expected": "refuse"
+        },
+        {
+          "row": 89,
+          "role": "server",
+          "case": "leaf-p521",
+          "expected": "refuse"
+        },
+        {
+          "row": 90,
+          "role": "server",
+          "case": "leaf-no-digital-signature",
+          "expected": "refuse"
+        },
+        {
+          "row": 91,
+          "role": "server",
+          "case": "leaf-wrong-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 92,
+          "role": "server",
+          "case": "leaf-any-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 93,
+          "role": "server",
+          "case": "tls-ca-unlimited",
+          "expected": "refuse"
+        },
+        {
+          "row": 94,
+          "role": "server",
+          "case": "tls-ca-depth-one",
+          "expected": "refuse"
+        },
+        {
+          "row": 95,
+          "role": "server",
+          "case": "root-depth-zero",
+          "expected": "refuse"
+        },
+        {
+          "row": 96,
+          "role": "server",
+          "case": "revoked-leaf",
+          "expected": "refuse"
+        },
+        {
+          "row": 97,
+          "role": "server",
+          "case": "ambiguous-anchor",
+          "expected": "refuse"
+        },
+        {
+          "row": 98,
+          "role": "server",
+          "case": "leaf-missing-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 99,
+          "role": "server",
+          "case": "leaf-noncritical-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 100,
+          "role": "server",
+          "case": "leaf-critical-ski",
+          "expected": "refuse"
+        },
+        {
+          "row": 101,
+          "role": "server",
+          "case": "leaf-critical-aki",
+          "expected": "refuse"
+        },
+        {
+          "row": 102,
+          "role": "server",
+          "case": "leaf-missing-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 103,
+          "role": "server",
+          "case": "leaf-printable-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 104,
+          "role": "server",
+          "case": "leaf-extra-name",
+          "expected": "refuse"
+        },
+        {
+          "row": 105,
+          "role": "server",
+          "case": "leaf-wrong-name-order",
+          "expected": "refuse"
+        },
+        {
+          "row": 106,
+          "role": "server",
+          "case": "leaf-sha512",
+          "expected": "refuse"
+        },
+        {
+          "row": 107,
+          "role": "server",
+          "case": "leaf-expired",
+          "expected": "refuse"
+        },
+        {
+          "row": 108,
+          "role": "server",
+          "case": "leaf-future",
+          "expected": "refuse"
+        },
+        {
+          "row": 109,
+          "role": "server",
+          "case": "leaf-unknown-critical",
+          "expected": "refuse"
+        },
+        {
+          "row": 110,
+          "role": "server",
+          "case": "ca-missing-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 111,
+          "role": "server",
+          "case": "ca-noncritical-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 112,
+          "role": "server",
+          "case": "ca-critical-ski",
+          "expected": "refuse"
+        },
+        {
+          "row": 113,
+          "role": "server",
+          "case": "ca-critical-aki",
+          "expected": "refuse"
+        },
+        {
+          "row": 114,
+          "role": "server",
+          "case": "ca-missing-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 115,
+          "role": "server",
+          "case": "ca-printable-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 116,
+          "role": "server",
+          "case": "ca-extra-name",
+          "expected": "refuse"
+        },
+        {
+          "row": 117,
+          "role": "server",
+          "case": "ca-wrong-name-order",
+          "expected": "refuse"
+        },
+        {
+          "row": 118,
+          "role": "server",
+          "case": "ca-sha512",
+          "expected": "refuse"
+        },
+        {
+          "row": 119,
+          "role": "server",
+          "case": "ca-expired",
+          "expected": "refuse"
+        },
+        {
+          "row": 120,
+          "role": "server",
+          "case": "ca-future",
+          "expected": "refuse"
+        },
+        {
+          "row": 121,
+          "role": "server",
+          "case": "ca-unknown-critical",
+          "expected": "refuse"
+        },
+        {
+          "row": 122,
+          "role": "server",
+          "case": "root-missing-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 123,
+          "role": "server",
+          "case": "root-noncritical-ku",
+          "expected": "refuse"
+        },
+        {
+          "row": 124,
+          "role": "server",
+          "case": "root-critical-ski",
+          "expected": "refuse"
+        },
+        {
+          "row": 125,
+          "role": "server",
+          "case": "root-critical-aki",
+          "expected": "refuse"
+        },
+        {
+          "row": 126,
+          "role": "server",
+          "case": "root-missing-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 127,
+          "role": "server",
+          "case": "root-printable-organization",
+          "expected": "refuse"
+        },
+        {
+          "row": 128,
+          "role": "server",
+          "case": "root-extra-name",
+          "expected": "refuse"
+        },
+        {
+          "row": 129,
+          "role": "server",
+          "case": "root-wrong-name-order",
+          "expected": "refuse"
+        },
+        {
+          "row": 130,
+          "role": "server",
+          "case": "root-sha512",
+          "expected": "refuse"
+        },
+        {
+          "row": 131,
+          "role": "server",
+          "case": "root-expired",
+          "expected": "refuse"
+        },
+        {
+          "row": 132,
+          "role": "server",
+          "case": "root-future",
+          "expected": "refuse"
+        },
+        {
+          "row": 133,
+          "role": "server",
+          "case": "root-unknown-critical",
+          "expected": "refuse"
+        },
+        {
+          "row": 134,
+          "role": "server",
+          "case": "ca-missing-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 135,
+          "role": "server",
+          "case": "ca-noncritical-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 136,
+          "role": "server",
+          "case": "ca-missing-cert-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 137,
+          "role": "server",
+          "case": "ca-missing-crl-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 138,
+          "role": "server",
+          "case": "root-missing-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 139,
+          "role": "server",
+          "case": "root-noncritical-bc",
+          "expected": "refuse"
+        },
+        {
+          "row": 140,
+          "role": "server",
+          "case": "root-missing-cert-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 141,
+          "role": "server",
+          "case": "root-missing-crl-sign",
+          "expected": "refuse"
+        },
+        {
+          "row": 142,
+          "role": "server",
+          "case": "missing-crldp",
+          "expected": "refuse"
+        },
+        {
+          "row": 143,
+          "role": "server",
+          "case": "critical-crldp",
+          "expected": "refuse"
+        },
+        {
+          "row": 144,
+          "role": "server",
+          "case": "critical-eku",
+          "expected": "refuse"
+        },
+        {
+          "row": 145,
+          "role": "server",
+          "case": "critical-san",
+          "expected": "refuse"
+        },
+        {
+          "row": 146,
+          "role": "server",
+          "case": "critical-leaf-bc",
+          "expected": "refuse"
+        }
+      ]
+    },
+    "coordinated-rekey": {
+      "kind": "authored-runtime-test-obligations",
+      "reference": {
+        "path": "crates/opc-diameter-transport/src/dtls_tests/generic/rekey.rs",
+        "sha256": "2aa4a2c17b9acf361532bd86eda3473865d8a96c516f876ea05623676d0f9e8a",
+        "functions": [
+          "coordinated_rekey_preserves_queued_streams_and_rotates_each_auth_boundary",
+          "rekey_requires_opt_in_and_cancellation_closes_the_association",
+          "rekey_never_renews_the_absolute_association_lifetime",
+          "credential_withdrawal_interrupts_a_pending_rekey_in_both_roles"
+        ]
+      },
+      "cases": [
+        {
+          "role": "connector",
+          "case": "aes128-gcm-epoch-2",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "aes128-gcm-epoch-3",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "aes128-gcm-epoch-4",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "aes256-gcm-epoch-2",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "aes256-gcm-epoch-3",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "aes256-gcm-epoch-4",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "chacha20-poly1305-epoch-2",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "chacha20-poly1305-epoch-3",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "chacha20-poly1305-epoch-4",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "connector",
+          "case": "no-opt-in",
+          "steps": [
+            "mutual-handshake",
+            "attempt-rekey",
+            "readback-both-roles"
+          ],
+          "expected": "policy-rejected;both-connections-closed"
+        },
+        {
+          "role": "connector",
+          "case": "polled-cancellation",
+          "steps": [
+            "mutual-handshake",
+            "poll-blocked-rekey",
+            "drop-rekey",
+            "readback-both-roles"
+          ],
+          "expected": "both-connections-closed"
+        },
+        {
+          "role": "connector",
+          "case": "original-lifetime",
+          "steps": [
+            "mutual-handshake",
+            "advance-six-seconds",
+            "coordinate-rekey",
+            "advance-five-seconds",
+            "readback"
+          ],
+          "expected": "retired-at-original-ten-second-age"
+        },
+        {
+          "role": "connector",
+          "case": "credential-withdrawal",
+          "steps": [
+            "mutual-handshake",
+            "poll-blocked-rekey",
+            "withdraw-credentials",
+            "await-rekey",
+            "readback-both-roles"
+          ],
+          "expected": "local-retired;peer-connection-closed"
+        },
+        {
+          "role": "acceptor",
+          "case": "aes128-gcm-epoch-2",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "aes128-gcm-epoch-3",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "aes128-gcm-epoch-4",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "aes256-gcm-epoch-2",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "aes256-gcm-epoch-3",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "aes256-gcm-epoch-4",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "chacha20-poly1305-epoch-2",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "chacha20-poly1305-epoch-3",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "chacha20-poly1305-epoch-4",
+          "steps": [
+            "mutual-handshake",
+            "queue-streams-1-15-0",
+            "coordinate-rekey",
+            "receive-queued",
+            "send-stream-2"
+          ],
+          "expected": "same-material-and-peer;old-key-ccs;new-key-finished;exact-queued-streams"
+        },
+        {
+          "role": "acceptor",
+          "case": "polled-cancellation",
+          "steps": [
+            "mutual-handshake",
+            "poll-blocked-rekey",
+            "drop-rekey",
+            "readback-both-roles"
+          ],
+          "expected": "both-connections-closed"
+        },
+        {
+          "role": "acceptor",
+          "case": "original-lifetime",
+          "steps": [
+            "mutual-handshake",
+            "advance-six-seconds",
+            "coordinate-rekey",
+            "advance-five-seconds",
+            "readback"
+          ],
+          "expected": "retired-at-original-ten-second-age"
+        },
+        {
+          "role": "acceptor",
+          "case": "credential-withdrawal",
+          "steps": [
+            "mutual-handshake",
+            "poll-blocked-rekey",
+            "withdraw-credentials",
+            "await-rekey",
+            "readback-both-roles"
+          ],
+          "expected": "local-retired;peer-connection-closed"
+        }
+      ]
+    },
+    "crl-profile": {
+      "kind": "independent-vector-projection",
+      "reference": {
+        "path": "crates/opc-diameter-transport/tests/fixtures/rfc6083/revocation.tsv",
+        "sha256": "52869f0cb4242bce8d2e49d06b63042637a8536b49cdc0a636537dbb247a8f2c",
+        "corpus_cases": 52
+      },
+      "cases": [
+        {
+          "row": 1,
+          "role": "client",
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 2,
+          "role": "client",
+          "case": "revoked-leaf",
+          "expected": "authentication"
+        },
+        {
+          "row": 3,
+          "role": "client",
+          "case": "revoked-intermediate",
+          "expected": "authentication"
+        },
+        {
+          "row": 4,
+          "role": "client",
+          "case": "missing-root",
+          "expected": "authentication"
+        },
+        {
+          "row": 5,
+          "role": "client",
+          "case": "missing-intermediate",
+          "expected": "authentication"
+        },
+        {
+          "row": 6,
+          "role": "client",
+          "case": "wrong-issuer",
+          "expected": "authentication"
+        },
+        {
+          "row": 7,
+          "role": "client",
+          "case": "wrong-key",
+          "expected": "authentication"
+        },
+        {
+          "row": 8,
+          "role": "client",
+          "case": "wrong-aki",
+          "expected": "authentication"
+        },
+        {
+          "row": 9,
+          "role": "client",
+          "case": "stale",
+          "expected": "profile"
+        },
+        {
+          "row": 10,
+          "role": "client",
+          "case": "future",
+          "expected": "profile"
+        },
+        {
+          "row": 11,
+          "role": "client",
+          "case": "signature-corrupt",
+          "expected": "authentication"
+        },
+        {
+          "row": 12,
+          "role": "client",
+          "case": "truncated",
+          "expected": "profile"
+        },
+        {
+          "row": 13,
+          "role": "client",
+          "case": "trailing",
+          "expected": "profile"
+        },
+        {
+          "row": 14,
+          "role": "client",
+          "case": "duplicate-issuer",
+          "expected": "profile"
+        },
+        {
+          "row": 15,
+          "role": "client",
+          "case": "conflicting-issuer",
+          "expected": "profile"
+        },
+        {
+          "row": 16,
+          "role": "client",
+          "case": "delta",
+          "expected": "profile"
+        },
+        {
+          "row": 17,
+          "role": "client",
+          "case": "indirect",
+          "expected": "profile"
+        },
+        {
+          "row": 18,
+          "role": "client",
+          "case": "unknown-critical",
+          "expected": "profile"
+        },
+        {
+          "row": 19,
+          "role": "client",
+          "case": "missing-aki",
+          "expected": "profile"
+        },
+        {
+          "row": 20,
+          "role": "client",
+          "case": "missing-number",
+          "expected": "profile"
+        },
+        {
+          "row": 21,
+          "role": "client",
+          "case": "duplicate-serial",
+          "expected": "profile"
+        },
+        {
+          "row": 22,
+          "role": "client",
+          "case": "unrelated-revoked",
+          "expected": "admit"
+        },
+        {
+          "row": 23,
+          "role": "client",
+          "case": "reversed-order",
+          "expected": "admit"
+        },
+        {
+          "row": 24,
+          "role": "client",
+          "case": "newer",
+          "expected": "admit"
+        },
+        {
+          "row": 25,
+          "role": "client",
+          "case": "issuer-no-crl-sign",
+          "expected": "authentication"
+        },
+        {
+          "row": 26,
+          "role": "client",
+          "case": "root-no-crl-sign",
+          "expected": "authentication"
+        },
+        {
+          "row": 27,
+          "role": "server",
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 28,
+          "role": "server",
+          "case": "revoked-leaf",
+          "expected": "authentication"
+        },
+        {
+          "row": 29,
+          "role": "server",
+          "case": "revoked-intermediate",
+          "expected": "authentication"
+        },
+        {
+          "row": 30,
+          "role": "server",
+          "case": "missing-root",
+          "expected": "authentication"
+        },
+        {
+          "row": 31,
+          "role": "server",
+          "case": "missing-intermediate",
+          "expected": "authentication"
+        },
+        {
+          "row": 32,
+          "role": "server",
+          "case": "wrong-issuer",
+          "expected": "authentication"
+        },
+        {
+          "row": 33,
+          "role": "server",
+          "case": "wrong-key",
+          "expected": "authentication"
+        },
+        {
+          "row": 34,
+          "role": "server",
+          "case": "wrong-aki",
+          "expected": "authentication"
+        },
+        {
+          "row": 35,
+          "role": "server",
+          "case": "stale",
+          "expected": "profile"
+        },
+        {
+          "row": 36,
+          "role": "server",
+          "case": "future",
+          "expected": "profile"
+        },
+        {
+          "row": 37,
+          "role": "server",
+          "case": "signature-corrupt",
+          "expected": "authentication"
+        },
+        {
+          "row": 38,
+          "role": "server",
+          "case": "truncated",
+          "expected": "profile"
+        },
+        {
+          "row": 39,
+          "role": "server",
+          "case": "trailing",
+          "expected": "profile"
+        },
+        {
+          "row": 40,
+          "role": "server",
+          "case": "duplicate-issuer",
+          "expected": "profile"
+        },
+        {
+          "row": 41,
+          "role": "server",
+          "case": "conflicting-issuer",
+          "expected": "profile"
+        },
+        {
+          "row": 42,
+          "role": "server",
+          "case": "delta",
+          "expected": "profile"
+        },
+        {
+          "row": 43,
+          "role": "server",
+          "case": "indirect",
+          "expected": "profile"
+        },
+        {
+          "row": 44,
+          "role": "server",
+          "case": "unknown-critical",
+          "expected": "profile"
+        },
+        {
+          "row": 45,
+          "role": "server",
+          "case": "missing-aki",
+          "expected": "profile"
+        },
+        {
+          "row": 46,
+          "role": "server",
+          "case": "missing-number",
+          "expected": "profile"
+        },
+        {
+          "row": 47,
+          "role": "server",
+          "case": "duplicate-serial",
+          "expected": "profile"
+        },
+        {
+          "row": 48,
+          "role": "server",
+          "case": "unrelated-revoked",
+          "expected": "admit"
+        },
+        {
+          "row": 49,
+          "role": "server",
+          "case": "reversed-order",
+          "expected": "admit"
+        },
+        {
+          "row": 50,
+          "role": "server",
+          "case": "newer",
+          "expected": "admit"
+        },
+        {
+          "row": 51,
+          "role": "server",
+          "case": "issuer-no-crl-sign",
+          "expected": "authentication"
+        },
+        {
+          "row": 52,
+          "role": "server",
+          "case": "root-no-crl-sign",
+          "expected": "authentication"
+        }
+      ]
+    },
+    "native-path-loss": {
+      "kind": "authored-runtime-test-obligations",
+      "reference": {
+        "path": "crates/opc-diameter-transport/src/dtls_tests/generic/paths.rs",
+        "sha256": "ced2020f9bb5748cd32ed54be61d4174cfaddd8db1aa1747a1e1cd70f14d05ea",
+        "functions": [
+          "generic_kernel_multihoming_preserves_protection_and_bounds_total_path_loss"
+        ]
+      },
+      "cases": [
+        {
+          "role": "connector",
+          "case": "non-data-control",
+          "steps": [
+            "block-one-path",
+            "observe-no-ppid66-data"
+          ],
+          "expected": "does-not-qualify-protected-path-loss"
+        },
+        {
+          "role": "connector",
+          "case": "one-active-path",
+          "steps": [
+            "mutual-handshake",
+            "block-active-destination",
+            "require-ppid66-data-drops",
+            "exchange-streams-0-1-2-15"
+          ],
+          "expected": "delivered;protection-readback-unchanged"
+        },
+        {
+          "role": "connector",
+          "case": "all-paths",
+          "steps": [
+            "block-all-four-destinations",
+            "send-both-directions",
+            "require-ppid66-data-drops",
+            "absolute-receive-deadline"
+          ],
+          "expected": "no-plaintext;both-readbacks-terminal"
+        },
+        {
+          "role": "connector",
+          "case": "restored-paths",
+          "steps": [
+            "remove-fault",
+            "old-send",
+            "old-receive",
+            "new-association",
+            "new-mutual-handshake",
+            "exchange",
+            "reciprocal-close"
+          ],
+          "expected": "old-connection-closed;new-delivery-and-close"
+        },
+        {
+          "role": "acceptor",
+          "case": "non-data-control",
+          "steps": [
+            "block-one-path",
+            "observe-no-ppid66-data"
+          ],
+          "expected": "does-not-qualify-protected-path-loss"
+        },
+        {
+          "role": "acceptor",
+          "case": "one-active-path",
+          "steps": [
+            "mutual-handshake",
+            "block-active-destination",
+            "require-ppid66-data-drops",
+            "exchange-streams-0-1-2-15"
+          ],
+          "expected": "delivered;protection-readback-unchanged"
+        },
+        {
+          "role": "acceptor",
+          "case": "all-paths",
+          "steps": [
+            "block-all-four-destinations",
+            "send-both-directions",
+            "require-ppid66-data-drops",
+            "absolute-receive-deadline"
+          ],
+          "expected": "no-plaintext;both-readbacks-terminal"
+        },
+        {
+          "role": "acceptor",
+          "case": "restored-paths",
+          "steps": [
+            "remove-fault",
+            "old-send",
+            "old-receive",
+            "new-association",
+            "new-mutual-handshake",
+            "exchange",
+            "reciprocal-close"
+          ],
+          "expected": "old-connection-closed;new-delivery-and-close"
+        }
+      ]
+    },
+    "native-process-restart": {
+      "kind": "authored-runtime-test-obligations",
+      "reference": {
+        "path": "crates/opc-diameter-transport/src/dtls_tests/generic/restart.rs",
+        "sha256": "9c0c8d95612550b06ce6017e3c998d465a7afb42f477b9a9f8441215007e342c",
+        "functions": [
+          "generic_kernel_process_restart_requires_fresh_mutual_authentication"
+        ]
+      },
+      "cases": [
+        {
+          "role": "connector",
+          "case": "crash",
+          "steps": [
+            "separate-peer-process",
+            "mutual-handshake",
+            "exchange",
+            "queue-record",
+            "sigkill",
+            "require-signal-9",
+            "observe-carrier-without-receive"
+          ],
+          "expected": "connection-closed;queued-record-not-delivered"
+        },
+        {
+          "role": "connector",
+          "case": "wrong-replacement",
+          "steps": [
+            "new-pid",
+            "same-listener",
+            "valid-chain-wrong-exact-peer",
+            "new-mutual-handshake"
+          ],
+          "expected": "authentication-refused"
+        },
+        {
+          "role": "connector",
+          "case": "correct-replacement",
+          "steps": [
+            "new-pid",
+            "same-listener",
+            "new-credentials-same-peer",
+            "new-mutual-handshake",
+            "exchange-new-generation",
+            "reciprocal-close"
+          ],
+          "expected": "new-delivery;old-readback-and-send-refused"
+        },
+        {
+          "role": "acceptor",
+          "case": "crash",
+          "steps": [
+            "separate-peer-process",
+            "mutual-handshake",
+            "exchange",
+            "queue-record",
+            "sigkill",
+            "require-signal-9",
+            "observe-carrier-without-receive"
+          ],
+          "expected": "connection-closed;queued-record-not-delivered"
+        },
+        {
+          "role": "acceptor",
+          "case": "wrong-replacement",
+          "steps": [
+            "new-pid",
+            "same-listener",
+            "valid-chain-wrong-exact-peer",
+            "new-mutual-handshake"
+          ],
+          "expected": "authentication-refused"
+        },
+        {
+          "role": "acceptor",
+          "case": "correct-replacement",
+          "steps": [
+            "new-pid",
+            "same-listener",
+            "new-credentials-same-peer",
+            "new-mutual-handshake",
+            "exchange-new-generation",
+            "reciprocal-close"
+          ],
+          "expected": "new-delivery;old-readback-and-send-refused"
+        }
+      ]
+    },
+    "publication-retirement": {
+      "kind": "authored-runtime-test-obligations",
+      "reference": {
+        "path": "crates/opc-diameter-transport/src/dtls_tests/generic/revocation.rs",
+        "sha256": "8020ee31dd384d6c76d5227bc31d116219691ec95e98ac2dd392f21742c8753a",
+        "functions": [
+          "publication_changes_retire_readback_and_queued_delivery_synchronously",
+          "withdrawn_crls_interrupt_an_in_place_rekey_in_both_roles"
+        ]
+      },
+      "cases": [
+        {
+          "role": "connector",
+          "case": "replace",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "replace",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "identical",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "identical",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "withdraw",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "withdraw",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "drop",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "drop",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "malformed",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "malformed",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "rollback",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "rollback",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "credential",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "credential",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "connector",
+          "case": "withdraw-during-rekey",
+          "steps": [
+            "required-crls",
+            "pending-rekey",
+            "withdraw"
+          ],
+          "expected": "retired;association-closed"
+        },
+        {
+          "role": "acceptor",
+          "case": "replace",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "replace",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "identical",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "identical",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "withdraw",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "withdraw",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "drop",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "drop",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "malformed",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "malformed",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "rollback",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "rollback",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "credential",
+          "steps": [
+            "required-crls",
+            "queue-records",
+            "consume-one",
+            "credential",
+            "readback-without-yield",
+            "receive",
+            "send",
+            "republish"
+          ],
+          "expected": "retired;no-further-delivery;no-revival"
+        },
+        {
+          "role": "acceptor",
+          "case": "withdraw-during-rekey",
+          "steps": [
+            "required-crls",
+            "pending-rekey",
+            "withdraw"
+          ],
+          "expected": "retired;association-closed"
+        }
+      ]
+    },
+    "rekey-binding": {
+      "kind": "independent-vector-projection",
+      "reference": {
+        "path": "vendor/dimpl/tests/dtls12/rfc5746_binding_reference.tsv",
+        "sha256": "5fd96cca2217123dbe4e9157761366882785557f18b1125ca6bdad27260f5d1e",
+        "corpus_cases": 100
+      },
+      "cases": [
+        {
+          "row": 1,
+          "role": "client",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "admit"
+        },
+        {
+          "row": 2,
+          "role": "client",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 3,
+          "role": "client",
+          "phase": "initial",
+          "scsv": true,
+          "expected": "reject"
+        },
+        {
+          "row": 4,
+          "role": "client",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 5,
+          "role": "client",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 6,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "admit"
+        },
+        {
+          "row": 7,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": true,
+          "expected": "reject"
+        },
+        {
+          "row": 8,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 9,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 10,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 11,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 12,
+          "role": "client",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 13,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 14,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 15,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 16,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 17,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 18,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 19,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 20,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 21,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 22,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 23,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 24,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 25,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 26,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 27,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 28,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 29,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 30,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 31,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 32,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 33,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 34,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 35,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 36,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 37,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 38,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 39,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 40,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 41,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 42,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 43,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 44,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 45,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 46,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 47,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 48,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 49,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 50,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 51,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 52,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 53,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 54,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 55,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 56,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 57,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 58,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 59,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 60,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 61,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 62,
+          "role": "client",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 63,
+          "role": "server",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "admit"
+        },
+        {
+          "row": 64,
+          "role": "server",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 65,
+          "role": "server",
+          "phase": "initial",
+          "scsv": true,
+          "expected": "admit"
+        },
+        {
+          "row": 66,
+          "role": "server",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 67,
+          "role": "server",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 68,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "admit"
+        },
+        {
+          "row": 69,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": true,
+          "expected": "reject"
+        },
+        {
+          "row": 70,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 71,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 72,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 73,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 74,
+          "role": "server",
+          "phase": "initial",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 75,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 76,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 77,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 78,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 79,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 80,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 81,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 82,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 83,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 84,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 85,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 86,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 87,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 88,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 89,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 90,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 91,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 92,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 93,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 94,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 95,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 96,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 97,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 98,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 99,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        },
+        {
+          "row": 100,
+          "role": "server",
+          "phase": "rekey",
+          "scsv": false,
+          "expected": "reject"
+        }
+      ]
+    },
+    "rekey-hello": {
+      "kind": "independent-vector-projection",
+      "reference": {
+        "path": "vendor/dimpl/tests/dtls12/rfc5746_hello_reference.tsv",
+        "sha256": "c309c45f83cf4c442de014e29ad3049c10998daa1883866f5f6549a01b527ab0",
+        "corpus_cases": 13
+      },
+      "cases": [
+        {
+          "row": 1,
+          "role": "client",
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 2,
+          "role": "client",
+          "case": "wrong-finished",
+          "expected": "reject"
+        },
+        {
+          "row": 3,
+          "role": "client",
+          "case": "missing",
+          "expected": "reject"
+        },
+        {
+          "row": 4,
+          "role": "client",
+          "case": "initial-empty",
+          "expected": "reject"
+        },
+        {
+          "row": 5,
+          "role": "client",
+          "case": "duplicate",
+          "expected": "reject"
+        },
+        {
+          "row": 6,
+          "role": "client",
+          "case": "wrong-length",
+          "expected": "reject"
+        },
+        {
+          "row": 7,
+          "role": "server",
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 8,
+          "role": "server",
+          "case": "wrong-finished",
+          "expected": "reject"
+        },
+        {
+          "row": 9,
+          "role": "server",
+          "case": "missing",
+          "expected": "reject"
+        },
+        {
+          "row": 10,
+          "role": "server",
+          "case": "initial-empty",
+          "expected": "reject"
+        },
+        {
+          "row": 11,
+          "role": "server",
+          "case": "duplicate",
+          "expected": "reject"
+        },
+        {
+          "row": 12,
+          "role": "server",
+          "case": "wrong-length",
+          "expected": "reject"
+        },
+        {
+          "row": 13,
+          "role": "server",
+          "case": "renegotiation-scsv",
+          "expected": "reject"
+        }
+      ]
+    },
+    "server-name": {
+      "kind": "independent-vector-projection",
+      "reference": {
+        "path": "vendor/dimpl/tests/dtls12/rfc6066_reference.tsv",
+        "sha256": "987802915ffc4be74421a2c770f1d17253e1cc8a2db9699710e3741ba2a10517",
+        "corpus_cases": 109
+      },
+      "cases": [
+        {
+          "row": 1,
+          "role": "client",
+          "configured": true,
+          "case": "missing",
+          "expected": "reject"
+        },
+        {
+          "row": 2,
+          "role": "client",
+          "configured": true,
+          "case": "empty-ack",
+          "expected": "admit"
+        },
+        {
+          "row": 3,
+          "role": "client",
+          "configured": true,
+          "case": "nonempty-ack",
+          "expected": "reject"
+        },
+        {
+          "row": 4,
+          "role": "client",
+          "configured": true,
+          "case": "name-in-ack",
+          "expected": "reject"
+        },
+        {
+          "row": 5,
+          "role": "client",
+          "configured": true,
+          "case": "duplicate",
+          "expected": "reject"
+        },
+        {
+          "row": 6,
+          "role": "client",
+          "configured": false,
+          "case": "missing",
+          "expected": "admit"
+        },
+        {
+          "row": 7,
+          "role": "client",
+          "configured": false,
+          "case": "empty-ack",
+          "expected": "reject"
+        },
+        {
+          "row": 8,
+          "role": "client",
+          "configured": false,
+          "case": "nonempty-ack",
+          "expected": "reject"
+        },
+        {
+          "row": 9,
+          "role": "client",
+          "configured": false,
+          "case": "name-in-ack",
+          "expected": "reject"
+        },
+        {
+          "row": 10,
+          "role": "client",
+          "configured": false,
+          "case": "duplicate",
+          "expected": "reject"
+        },
+        {
+          "row": 11,
+          "role": "server",
+          "configured": true,
+          "case": "missing",
+          "expected": "reject"
+        },
+        {
+          "row": 12,
+          "role": "server",
+          "configured": true,
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 13,
+          "role": "server",
+          "configured": true,
+          "case": "mixed-case",
+          "expected": "admit"
+        },
+        {
+          "row": 14,
+          "role": "server",
+          "configured": true,
+          "case": "other-name",
+          "expected": "reject"
+        },
+        {
+          "row": 15,
+          "role": "server",
+          "configured": true,
+          "case": "duplicate",
+          "expected": "reject"
+        },
+        {
+          "row": 16,
+          "role": "server",
+          "configured": true,
+          "case": "duplicate-host",
+          "expected": "reject"
+        },
+        {
+          "row": 17,
+          "role": "server",
+          "configured": true,
+          "case": "unknown-second-type",
+          "expected": "reject"
+        },
+        {
+          "row": 18,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-0",
+          "expected": "reject"
+        },
+        {
+          "row": 19,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-1",
+          "expected": "reject"
+        },
+        {
+          "row": 20,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-2",
+          "expected": "reject"
+        },
+        {
+          "row": 21,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-3",
+          "expected": "reject"
+        },
+        {
+          "row": 22,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-4",
+          "expected": "reject"
+        },
+        {
+          "row": 23,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-5",
+          "expected": "reject"
+        },
+        {
+          "row": 24,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-6",
+          "expected": "reject"
+        },
+        {
+          "row": 25,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-7",
+          "expected": "reject"
+        },
+        {
+          "row": 26,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-8",
+          "expected": "reject"
+        },
+        {
+          "row": 27,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-9",
+          "expected": "reject"
+        },
+        {
+          "row": 28,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-10",
+          "expected": "reject"
+        },
+        {
+          "row": 29,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-11",
+          "expected": "reject"
+        },
+        {
+          "row": 30,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-12",
+          "expected": "reject"
+        },
+        {
+          "row": 31,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-13",
+          "expected": "reject"
+        },
+        {
+          "row": 32,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-14",
+          "expected": "reject"
+        },
+        {
+          "row": 33,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-15",
+          "expected": "reject"
+        },
+        {
+          "row": 34,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-16",
+          "expected": "reject"
+        },
+        {
+          "row": 35,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-17",
+          "expected": "reject"
+        },
+        {
+          "row": 36,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-18",
+          "expected": "reject"
+        },
+        {
+          "row": 37,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-19",
+          "expected": "reject"
+        },
+        {
+          "row": 38,
+          "role": "server",
+          "configured": true,
+          "case": "truncated-20",
+          "expected": "reject"
+        },
+        {
+          "row": 39,
+          "role": "server",
+          "configured": true,
+          "case": "field-0",
+          "expected": "reject"
+        },
+        {
+          "row": 40,
+          "role": "server",
+          "configured": true,
+          "case": "field-1",
+          "expected": "reject"
+        },
+        {
+          "row": 41,
+          "role": "server",
+          "configured": true,
+          "case": "field-2",
+          "expected": "reject"
+        },
+        {
+          "row": 42,
+          "role": "server",
+          "configured": true,
+          "case": "field-3",
+          "expected": "reject"
+        },
+        {
+          "row": 43,
+          "role": "server",
+          "configured": true,
+          "case": "field-4",
+          "expected": "reject"
+        },
+        {
+          "row": 44,
+          "role": "server",
+          "configured": true,
+          "case": "trailing",
+          "expected": "reject"
+        },
+        {
+          "row": 45,
+          "role": "server",
+          "configured": true,
+          "case": "empty-host",
+          "expected": "reject"
+        },
+        {
+          "row": 46,
+          "role": "server",
+          "configured": true,
+          "case": "wildcard",
+          "expected": "reject"
+        },
+        {
+          "row": 47,
+          "role": "server",
+          "configured": true,
+          "case": "ipv4",
+          "expected": "reject"
+        },
+        {
+          "row": 48,
+          "role": "server",
+          "configured": true,
+          "case": "ipv6",
+          "expected": "reject"
+        },
+        {
+          "row": 49,
+          "role": "server",
+          "configured": true,
+          "case": "trailing-dot",
+          "expected": "reject"
+        },
+        {
+          "row": 50,
+          "role": "server",
+          "configured": true,
+          "case": "empty-label",
+          "expected": "reject"
+        },
+        {
+          "row": 51,
+          "role": "server",
+          "configured": true,
+          "case": "leading-hyphen",
+          "expected": "reject"
+        },
+        {
+          "row": 52,
+          "role": "server",
+          "configured": true,
+          "case": "trailing-hyphen",
+          "expected": "reject"
+        },
+        {
+          "row": 53,
+          "role": "server",
+          "configured": true,
+          "case": "underscore",
+          "expected": "reject"
+        },
+        {
+          "row": 54,
+          "role": "server",
+          "configured": true,
+          "case": "nul",
+          "expected": "reject"
+        },
+        {
+          "row": 55,
+          "role": "server",
+          "configured": true,
+          "case": "non-ascii",
+          "expected": "reject"
+        },
+        {
+          "row": 56,
+          "role": "server",
+          "configured": true,
+          "case": "space",
+          "expected": "reject"
+        },
+        {
+          "row": 57,
+          "role": "server",
+          "configured": true,
+          "case": "long-label",
+          "expected": "reject"
+        },
+        {
+          "row": 58,
+          "role": "server",
+          "configured": true,
+          "case": "long-name",
+          "expected": "reject"
+        },
+        {
+          "row": 59,
+          "role": "server",
+          "configured": false,
+          "case": "missing",
+          "expected": "admit"
+        },
+        {
+          "row": 60,
+          "role": "server",
+          "configured": false,
+          "case": "valid",
+          "expected": "admit"
+        },
+        {
+          "row": 61,
+          "role": "server",
+          "configured": false,
+          "case": "mixed-case",
+          "expected": "admit"
+        },
+        {
+          "row": 62,
+          "role": "server",
+          "configured": false,
+          "case": "other-name",
+          "expected": "admit"
+        },
+        {
+          "row": 63,
+          "role": "server",
+          "configured": false,
+          "case": "duplicate",
+          "expected": "reject"
+        },
+        {
+          "row": 64,
+          "role": "server",
+          "configured": false,
+          "case": "duplicate-host",
+          "expected": "reject"
+        },
+        {
+          "row": 65,
+          "role": "server",
+          "configured": false,
+          "case": "unknown-second-type",
+          "expected": "reject"
+        },
+        {
+          "row": 66,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-0",
+          "expected": "reject"
+        },
+        {
+          "row": 67,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-1",
+          "expected": "reject"
+        },
+        {
+          "row": 68,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-2",
+          "expected": "reject"
+        },
+        {
+          "row": 69,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-3",
+          "expected": "reject"
+        },
+        {
+          "row": 70,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-4",
+          "expected": "reject"
+        },
+        {
+          "row": 71,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-5",
+          "expected": "reject"
+        },
+        {
+          "row": 72,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-6",
+          "expected": "reject"
+        },
+        {
+          "row": 73,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-7",
+          "expected": "reject"
+        },
+        {
+          "row": 74,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-8",
+          "expected": "reject"
+        },
+        {
+          "row": 75,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-9",
+          "expected": "reject"
+        },
+        {
+          "row": 76,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-10",
+          "expected": "reject"
+        },
+        {
+          "row": 77,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-11",
+          "expected": "reject"
+        },
+        {
+          "row": 78,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-12",
+          "expected": "reject"
+        },
+        {
+          "row": 79,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-13",
+          "expected": "reject"
+        },
+        {
+          "row": 80,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-14",
+          "expected": "reject"
+        },
+        {
+          "row": 81,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-15",
+          "expected": "reject"
+        },
+        {
+          "row": 82,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-16",
+          "expected": "reject"
+        },
+        {
+          "row": 83,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-17",
+          "expected": "reject"
+        },
+        {
+          "row": 84,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-18",
+          "expected": "reject"
+        },
+        {
+          "row": 85,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-19",
+          "expected": "reject"
+        },
+        {
+          "row": 86,
+          "role": "server",
+          "configured": false,
+          "case": "truncated-20",
+          "expected": "reject"
+        },
+        {
+          "row": 87,
+          "role": "server",
+          "configured": false,
+          "case": "field-0",
+          "expected": "reject"
+        },
+        {
+          "row": 88,
+          "role": "server",
+          "configured": false,
+          "case": "field-1",
+          "expected": "reject"
+        },
+        {
+          "row": 89,
+          "role": "server",
+          "configured": false,
+          "case": "field-2",
+          "expected": "reject"
+        },
+        {
+          "row": 90,
+          "role": "server",
+          "configured": false,
+          "case": "field-3",
+          "expected": "reject"
+        },
+        {
+          "row": 91,
+          "role": "server",
+          "configured": false,
+          "case": "field-4",
+          "expected": "reject"
+        },
+        {
+          "row": 92,
+          "role": "server",
+          "configured": false,
+          "case": "trailing",
+          "expected": "reject"
+        },
+        {
+          "row": 93,
+          "role": "server",
+          "configured": false,
+          "case": "empty-host",
+          "expected": "reject"
+        },
+        {
+          "row": 94,
+          "role": "server",
+          "configured": false,
+          "case": "wildcard",
+          "expected": "reject"
+        },
+        {
+          "row": 95,
+          "role": "server",
+          "configured": false,
+          "case": "ipv4",
+          "expected": "reject"
+        },
+        {
+          "row": 96,
+          "role": "server",
+          "configured": false,
+          "case": "ipv6",
+          "expected": "reject"
+        },
+        {
+          "row": 97,
+          "role": "server",
+          "configured": false,
+          "case": "trailing-dot",
+          "expected": "reject"
+        },
+        {
+          "row": 98,
+          "role": "server",
+          "configured": false,
+          "case": "empty-label",
+          "expected": "reject"
+        },
+        {
+          "row": 99,
+          "role": "server",
+          "configured": false,
+          "case": "leading-hyphen",
+          "expected": "reject"
+        },
+        {
+          "row": 100,
+          "role": "server",
+          "configured": false,
+          "case": "trailing-hyphen",
+          "expected": "reject"
+        },
+        {
+          "row": 101,
+          "role": "server",
+          "configured": false,
+          "case": "underscore",
+          "expected": "reject"
+        },
+        {
+          "row": 102,
+          "role": "server",
+          "configured": false,
+          "case": "nul",
+          "expected": "reject"
+        },
+        {
+          "row": 103,
+          "role": "server",
+          "configured": false,
+          "case": "non-ascii",
+          "expected": "reject"
+        },
+        {
+          "row": 104,
+          "role": "server",
+          "configured": false,
+          "case": "space",
+          "expected": "reject"
+        },
+        {
+          "row": 105,
+          "role": "server",
+          "configured": false,
+          "case": "long-label",
+          "expected": "reject"
+        },
+        {
+          "row": 106,
+          "role": "server",
+          "configured": false,
+          "case": "long-name",
+          "expected": "reject"
+        },
+        {
+          "row": 107,
+          "role": "server",
+          "configured": true,
+          "case": "accepted-boundary",
+          "expected": "admit"
+        },
+        {
+          "row": 108,
+          "role": "server",
+          "configured": true,
+          "case": "accepted-boundary",
+          "expected": "admit"
+        },
+        {
+          "row": 109,
+          "role": "server",
+          "configured": true,
+          "case": "accepted-boundary",
+          "expected": "admit"
+        }
+      ]
+    },
+    "stream-framing": {
+      "kind": "independent-vector-projection",
+      "reference": {
+        "path": "crates/opc-diameter-transport/tests/fixtures/rfc6083/streams.tsv",
+        "sha256": "9d6bf635d944770d97d6577691cf9a5cbebf4287c015dbfad87f085f9a9b7369",
+        "corpus_cases": 18560
+      },
+      "cases": [
+        {
+          "row": 1,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 5,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 17,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 21,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 25,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 29,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4609,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4613,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4617,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4621,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4625,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4629,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4633,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4637,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4638,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4639,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4640,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4669,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4670,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4671,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4672,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4701,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4702,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4703,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4704,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4733,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4734,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4735,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4736,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4765,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4893,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 4894,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4895,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4896,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4925,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4926,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4927,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4928,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4957,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4958,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4959,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4960,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4989,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4990,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4991,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 4992,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5021,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5917,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5918,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5919,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5920,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5949,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5950,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5951,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5952,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "payload",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5981,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5982,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5983,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 5984,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "control",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 6013,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 6014,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "short",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 6015,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "trailing",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 6016,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "notification",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "oversized",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 6045,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "65535",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 6173,
+          "stream_count": "2",
+          "ppid": "47",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 6301,
+          "stream_count": "2",
+          "ppid": "47",
+          "stream": "0",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 6429,
+          "stream_count": "2",
+          "ppid": "47",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 6557,
+          "stream_count": "2",
+          "ppid": "47",
+          "stream": "1",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 7453,
+          "stream_count": "2",
+          "ppid": "47",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 7581,
+          "stream_count": "2",
+          "ppid": "47",
+          "stream": "65535",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 7709,
+          "stream_count": "2",
+          "ppid": "60",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 7837,
+          "stream_count": "2",
+          "ppid": "60",
+          "stream": "0",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 7965,
+          "stream_count": "2",
+          "ppid": "60",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 8093,
+          "stream_count": "2",
+          "ppid": "60",
+          "stream": "1",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 8989,
+          "stream_count": "2",
+          "ppid": "60",
+          "stream": "65535",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 9117,
+          "stream_count": "2",
+          "ppid": "60",
+          "stream": "65535",
+          "order": "unordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "rfc6083_cleartext_rejected"
+        },
+        {
+          "row": 9217,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9221,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9225,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9229,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9233,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9237,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9241,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9245,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9501,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 9757,
+          "stream_count": "16",
+          "ppid": "66",
+          "stream": "15",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13825,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13829,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13833,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13837,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13841,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13845,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13849,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 13853,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 14109,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 14365,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "15",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 14621,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "16",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 14877,
+          "stream_count": "65535",
+          "ppid": "66",
+          "stream": "65534",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18433,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18434,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18435,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18436,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18437,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18438,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18439,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18440,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18441,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18442,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18443,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18444,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18445,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18446,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18447,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18448,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18449,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18450,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18451,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18452,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18453,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18454,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18455,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18456,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18457,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18458,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18459,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18460,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18461,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18462,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18463,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18464,
+          "stream_count": "1",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18497,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18498,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18499,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18500,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18501,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "20",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18505,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18506,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18507,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18508,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18509,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "21",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18513,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18514,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18515,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18516,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18517,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "22",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18521,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18522,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18523,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18524,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "0",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18525,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18526,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 18527,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 18528,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "0",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 18557,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefd",
+          "expected": "framing-admitted"
+        },
+        {
+          "row": 18558,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "feff",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 18559,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "fefc",
+          "expected": "rfc6083_transport_failed"
+        },
+        {
+          "row": 18560,
+          "stream_count": "2",
+          "ppid": "66",
+          "stream": "1",
+          "order": "ordered",
+          "fault": "none",
+          "record_type": "23",
+          "epoch": "1",
+          "shape": "complete",
+          "version": "0303",
+          "expected": "rfc6083_transport_failed"
+        }
+      ]
+    }
+  }
+}

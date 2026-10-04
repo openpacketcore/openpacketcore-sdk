@@ -24,8 +24,15 @@ GTP-U encapsulation/classification helpers.
   sequence for legacy uplink encapsulation. The grouped ABI also defines the
   56-byte outer-IPv6 overhead and family-neutral session entry used by the tc
   program's mandatory IPv6 UDP-checksum path.
+- The fixed-flow N3 profile adds eight bytes (optional GTP-U fields and one
+  uplink PSC) to either outer family. `n3_uplink_extension` emits its bounded
+  canonical bytes; `n3_downlink_psc_matches` checks the supported downlink PSC
+  prefix after the caller validates the complete extension envelope.
 - `classify_gtpu` classifies a mandatory GTP-U header as `NotGtpV1`,
   `NotGpdu`, or `Gpdu { teid, length, has_opt, has_ext }`.
+- `gtpu_endpoint_requires_extension_control` shares the endpoint unknown-required
+  extension rule between both tc parsers and the host reassembly parser. The
+  complete chain must validate before a control-plane handoff.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
 - `Ipv4EnvelopeBounds`, `UdpEnvelopeBounds`, and `GtpuEnvelopeBounds` validate
   the exact nested downlink boundary with checked arithmetic while retaining
@@ -47,6 +54,9 @@ GTP-U encapsulation/classification helpers.
   `/32` or `/128` endpoints, generation/slot index candidates, one normal HASH
   authority value, exact device configuration, and a bounded in-flight
   transaction journal.
+  Entry version 2 binds one six-bit N3 QFI at byte 72; version 1 retains its
+  exact legacy encoding. Both occupy 80 bytes inside the same 208-byte group
+  authority, and typed/zero-copy readers enforce the same canonical contract.
 
 All multi-byte wire and map fields are network byte order unless noted in the
 Rust docs.

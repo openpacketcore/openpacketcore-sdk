@@ -5,12 +5,23 @@
 //! metadata; it never owns an HKMS/KMS provider, key handle, or plaintext
 //! configuration value.
 
+mod audit;
+#[cfg(test)]
+pub(crate) use audit::{applied_receipt_sync, apply_sync, read_sync, write_sync, AuditCommand};
+mod audit_mutation;
+pub use audit_mutation::PreparedAuditedMutation;
+pub(crate) mod history;
 mod raft_adapter;
 mod snapshot_file;
 mod sqlite;
+pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
 mod store;
 mod types;
+
+pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
+
+pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};
 
 pub use store::{
     ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,

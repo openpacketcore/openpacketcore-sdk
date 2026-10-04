@@ -86,6 +86,7 @@ spec:
           emptydir:
             medium: HugePages
             sizelimit: null
+            mode: null
           gcepersistentdisk: null
           awselasticblockstore: null
           gitrepo: null
@@ -156,6 +157,7 @@ spec:
           subpath: ""
           mountpropagation: null
           subpathexpr: ""
+          bindmountoptions: []
         - name: hugepages-2mi
           readonly: false
           recursivereadonly: null
@@ -163,6 +165,7 @@ spec:
           subpath: ""
           mountpropagation: null
           subpathexpr: ""
+          bindmountoptions: []
         volumedevices: []
         livenessprobe:
           probehandler:
@@ -176,6 +179,7 @@ spec:
               host: ""
               scheme: ""
               httpheaders: []
+              protocol: null
             tcpsocket: null
             grpc: null
           initialdelayseconds: 10
@@ -196,6 +200,7 @@ spec:
               host: ""
               scheme: ""
               httpheaders: []
+              protocol: null
             tcpsocket: null
             grpc: null
           initialdelayseconds: 5
@@ -216,6 +221,7 @@ spec:
               host: ""
               scheme: ""
               httpheaders: []
+              protocol: null
             tcpsocket: null
             grpc: null
           initialdelayseconds: 5
@@ -315,6 +321,7 @@ spec:
       resources: null
       hostnameoverride: null
       schedulinggroup: null
+      evictionresponders: []
   strategy:
     type: ""
     rollingupdate: null

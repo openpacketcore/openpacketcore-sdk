@@ -29,7 +29,7 @@ use crate::{
     },
     fenced_transition_journal::{
         FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
-        PreparedFencedTransitionJournal,
+        FencedTransitionV2RecoveryJournal, PreparedFencedTransitionJournal,
     },
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, Generation, OwnerId, SessionKey},
@@ -45,6 +45,11 @@ use crate::{
     SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
     SessionConsumerScope, SessionConsumerStoreError,
 };
+
+mod protected_v2_recovery;
+
+pub use protected_v2_recovery::ProtectedFencedTransitionV2Backend;
+use protected_v2_recovery::{reject_v1_id_retained_by_recovery_journal, ProtectedV2RecoveryParts};
 
 /// Per-watcher buffer size for replication watch streams.
 ///
@@ -2525,6 +2530,7 @@ pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
     fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
     fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
+    fenced_transition_v2_recovery_journal: Option<Arc<FencedTransitionV2RecoveryJournal>>,
 }
 
 impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
@@ -2536,11 +2542,17 @@ impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
             fenced_transition_journal: self.fenced_transition_journal.clone(),
             fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
             fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
+            fenced_transition_v2_recovery_journal: self
+                .fenced_transition_v2_recovery_journal
+                .clone(),
         }
     }
 }
 
 impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
+    const PROTECTED_V2_JOURNAL_MODE: ProtectedFencedTransitionV2JournalMode =
+        ProtectedFencedTransitionV2JournalMode::LocalAead;
+
     /// Wrap `inner` so every record payload is sealed with keys from
     /// `provider` before persistence and unsealed on reads.
     ///
@@ -2556,6 +2568,7 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
             fenced_transition_journal: None,
             fenced_transition_v2_journal: None,
             fenced_transition_v2_journal_scope: None,
+            fenced_transition_v2_recovery_journal: None,
         }
     }
 
@@ -2596,6 +2609,35 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
     ) -> Self {
         self.fenced_transition_v2_journal_scope = Some(scope);
         self
+    }
+
+    /// Enable protected V2 transitions recoverable by caller-stable identity
+    /// (#982) with their separate SDK-owned recovery journal.
+    ///
+    /// The journal binds to this wrapper's protection mode, payload
+    /// namespace, and the explicit scope supplied through
+    /// [`Self::with_fenced_transition_v2_journal_scope`]; both are required.
+    /// Reopen the journal with the same path and key after a restart. When a
+    /// #701 journal is also configured, each protected composition rejects a
+    /// caller ID retained by the other.
+    #[must_use]
+    pub fn with_fenced_transition_v2_recovery_journal(
+        mut self,
+        journal: Arc<FencedTransitionV2RecoveryJournal>,
+    ) -> Self {
+        self.fenced_transition_v2_recovery_journal = Some(journal);
+        self
+    }
+
+    fn v2_recovery_parts(&self) -> ProtectedV2RecoveryParts<'_, B> {
+        ProtectedV2RecoveryParts {
+            inner: self.inner.as_ref(),
+            recovery_journal: self.fenced_transition_v2_recovery_journal.as_ref(),
+            legacy_journal: self.fenced_transition_journal.as_ref(),
+            configured_scope: self.fenced_transition_v2_journal_scope,
+            backend_namespace: &self.backend_namespace,
+            mode: Self::PROTECTED_V2_JOURNAL_MODE,
+        }
     }
 
     /// The key provider used to resolve the tenant's active session key for
@@ -3160,6 +3202,14 @@ where
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
         require_fenced_transition_capability(self.inner.as_ref()).await?;
         journal.ensure_absent(request.request_id()).await?;
+        let _recovery_admission = reject_v1_id_retained_by_recovery_journal(
+            self.fenced_transition_v2_recovery_journal.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            Self::PROTECTED_V2_JOURNAL_MODE,
+            request.request_id(),
+        )
+        .await?;
         if let Some(record) = request.mutation().record() {
             let preflight = RecordExpiryPreflight::from_record(record);
             self.inner
@@ -3915,6 +3965,7 @@ pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
     fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
     fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
+    fenced_transition_v2_recovery_journal: Option<Arc<FencedTransitionV2RecoveryJournal>>,
 }
 
 impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
@@ -3926,11 +3977,17 @@ impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
             fenced_transition_journal: self.fenced_transition_journal.clone(),
             fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
             fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
+            fenced_transition_v2_recovery_journal: self
+                .fenced_transition_v2_recovery_journal
+                .clone(),
         }
     }
 }
 
 impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
+    const PROTECTED_V2_JOURNAL_MODE: ProtectedFencedTransitionV2JournalMode =
+        ProtectedFencedTransitionV2JournalMode::RemoteSeal;
+
     /// Wrap `inner` so every record payload is sealed by `provider` before
     /// persistence and unsealed on reads.
     pub fn new(inner: Arc<B>, provider: Arc<S>, backend_namespace: impl Into<String>) -> Self {
@@ -3941,6 +3998,7 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
             fenced_transition_journal: None,
             fenced_transition_v2_journal: None,
             fenced_transition_v2_journal_scope: None,
+            fenced_transition_v2_recovery_journal: None,
         }
     }
 
@@ -3981,6 +4039,35 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
     ) -> Self {
         self.fenced_transition_v2_journal_scope = Some(scope);
         self
+    }
+
+    /// Enable protected V2 transitions recoverable by caller-stable identity
+    /// (#982) with their separate SDK-owned recovery journal.
+    ///
+    /// The journal binds to this wrapper's protection mode, payload
+    /// namespace, and the explicit scope supplied through
+    /// [`Self::with_fenced_transition_v2_journal_scope`]; both are required.
+    /// Reopen the journal with the same path and key after a restart. When a
+    /// #701 journal is also configured, each protected composition rejects a
+    /// caller ID retained by the other.
+    #[must_use]
+    pub fn with_fenced_transition_v2_recovery_journal(
+        mut self,
+        journal: Arc<FencedTransitionV2RecoveryJournal>,
+    ) -> Self {
+        self.fenced_transition_v2_recovery_journal = Some(journal);
+        self
+    }
+
+    fn v2_recovery_parts(&self) -> ProtectedV2RecoveryParts<'_, B> {
+        ProtectedV2RecoveryParts {
+            inner: self.inner.as_ref(),
+            recovery_journal: self.fenced_transition_v2_recovery_journal.as_ref(),
+            legacy_journal: self.fenced_transition_journal.as_ref(),
+            configured_scope: self.fenced_transition_v2_journal_scope,
+            backend_namespace: &self.backend_namespace,
+            mode: Self::PROTECTED_V2_JOURNAL_MODE,
+        }
     }
 
     /// The remote seal provider used for payload seal/unseal.
@@ -4265,6 +4352,14 @@ where
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
         require_fenced_transition_capability(self.inner.as_ref()).await?;
         journal.ensure_absent(request.request_id()).await?;
+        let _recovery_admission = reject_v1_id_retained_by_recovery_journal(
+            self.fenced_transition_v2_recovery_journal.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            Self::PROTECTED_V2_JOURNAL_MODE,
+            request.request_id(),
+        )
+        .await?;
         if let Some(record) = request.mutation().record() {
             let preflight = RecordExpiryPreflight::from_record(record);
             self.inner

@@ -1,0 +1,53 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.overlap-rekey",
+  "subset": "xfrm-roster",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Caller-selected overlapping Child SAs",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Generation 2 adds a second inbound SPI while generation 1 remains"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/overlap-rekey.hex",
+    "digest_sha256": "2b5f418ad1832a521bff368e48dd236b8078b7c1354dda08645ddaaf1f5d47e1"
+  },
+  "semantic_assertions": [
+    "overlap=true",
+    "ike_notify_parsing=out-of-scope"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

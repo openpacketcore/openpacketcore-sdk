@@ -32,6 +32,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   RUST_BACKTRACE: "1"
 
@@ -44,7 +45,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -68,18 +69,21 @@ jobs:
           set -euo pipefail
           ordinary_timing_contracts=(
             persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
-            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
             persistent_three_voter_first_transition_has_one_leader_activation_proof
             persistent_three_voter_protected_roster_survives_real_os_process_loss
           )
-          optimized_roster_contracts=(
+          # Keep the original bounds and debug/overflow assertions. Optimize
+          # the protected request and snapshot fixtures, matching the core lane.
+          optimized_timing_contracts=(
+            protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
+            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
             persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal
             persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart
             persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
             persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running
             persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
           )
-          timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_roster_contracts[@]}")
+          timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_timing_contracts[@]}")
           skips=()
           for timing_contract in "${timing_contracts[@]}"; do
             skips+=(--skip "stateless_quorum_consumer::$timing_contract")
@@ -105,7 +109,7 @@ jobs:
               --exact \
               "stateless_quorum_consumer::$timing_contract"
           done
-          for timing_contract in "${optimized_roster_contracts[@]}"; do
+          for timing_contract in "${optimized_timing_contracts[@]}"; do
             env CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
               -p opc-session-net \
               --all-features \
@@ -125,7 +129,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
@@ -142,7 +146,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2

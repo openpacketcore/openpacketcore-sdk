@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,6 +135,48 @@ class ManifestTestSourceAuditTests(unittest.TestCase):
 class QuiescentShardPlanTests(unittest.TestCase):
     """The protected private-lib contracts must remain total and disjoint."""
 
+    def test_plan_stdout_contains_only_executable_commands(self) -> None:
+        for shard in TEST_SHARDS.shard_ids(TEST_SHARDS.load_plan()):
+            with self.subTest(shard=shard):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "plan", "--shard", shard],
+                    cwd=SCRIPT.parent.parent,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                commands = result.stdout.splitlines()
+                self.assertTrue(commands, "CI must receive a nonempty plan")
+                for command in commands:
+                    self.assertIn(shlex.split(command)[0], {"cargo", "env"})
+                self.assertIn("manifest test-source audit ok:", result.stderr)
+
+    def test_selector_contract_keeps_one_exact_ordinary_profile_run(self) -> None:
+        name = (
+            "ebpf::tests::remote_selector_regression::"
+            "singleton_public_protected_flow_preserves_durable_state"
+        )
+        commands = TEST_SHARDS.commands(
+            {"heavy": {"target": "fixture", "shards": []}}, "misc", []
+        )
+        mentions = [command for command in commands if name in command]
+
+        # The broad process excludes exactly this test; the following command
+        # executes it once, with the same packages, features and test profile.
+        self.assertEqual(len(mentions), 2)
+        self.assertEqual(mentions[0], commands[0])
+        self.assertEqual(mentions[0].count(name), 1)
+        self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
+        self.assertIn("--exact", mentions[0])
+        self.assertEqual(
+            mentions[1],
+            [
+                "cargo", "test", "--locked", "--workspace", "--exclude",
+                "opc-persist", "--all-features", "--quiet", "--lib", "--",
+                "--test-threads=1", "--exact", name,
+            ],
+        )
+
     def test_optimized_contracts_have_a_dedicated_shard(self) -> None:
         ordinary = TEST_SHARDS.quiescent_lib_tests_for_shard("misc")
         optimized = TEST_SHARDS.quiescent_lib_tests_for_shard(
@@ -142,6 +187,32 @@ class QuiescentShardPlanTests(unittest.TestCase):
         self.assertEqual(set(ordinary) & set(optimized), set())
         self.assertEqual(
             set(optimized), TEST_SHARDS.OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+
+    def test_protected_transition_runs_once_in_the_optimized_shard(self) -> None:
+        name = (
+            "stateless_quorum_consumer::"
+            "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls"
+        )
+        plan = {"heavy": {"target": "fixture", "shards": []}}
+        ordinary = TEST_SHARDS.commands(plan, "misc", [])
+        optimized = TEST_SHARDS.commands(
+            plan, TEST_SHARDS.OPTIMIZED_QUIESCENT_SHARD, []
+        )
+        mentions = [command for command in ordinary + optimized if name in command]
+
+        self.assertEqual(len(mentions), 2)
+        self.assertEqual(mentions[0], ordinary[0])
+        self.assertEqual(mentions[0].count(name), 1)
+        self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
+        self.assertEqual(
+            mentions[1],
+            [
+                "env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", "cargo", "test",
+                "--locked", "--workspace", "--exclude", "opc-persist",
+                "--all-features", "--quiet", "--lib", "--",
+                "--test-threads=1", "--exact", name,
+            ],
         )
 
     def test_optimized_shard_preserves_exact_o1_commands(self) -> None:

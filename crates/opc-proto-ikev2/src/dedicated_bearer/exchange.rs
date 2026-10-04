@@ -1236,7 +1236,7 @@ fn validate_proposal_spi(
         })
 }
 
-fn validate_ke_view(
+pub(crate) fn validate_ke_view(
     sa: &Ikev2SaPayload<'_>,
     key_exchange: Option<&Ikev2KeyExchangePayload<'_>>,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {

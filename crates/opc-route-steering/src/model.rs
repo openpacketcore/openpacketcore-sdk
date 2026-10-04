@@ -4,6 +4,8 @@ use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 
+use crate::collection::RouteSteeringIpFamily;
+
 /// IP prefix used by routes and rules.
 ///
 /// Construction preserves the supplied address. Route convergence uses the
@@ -75,7 +77,11 @@ impl fmt::Debug for RouteRequest {
 }
 
 /// Rule installation/removal request.
-#[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+///
+/// Equality, ordering, and hashing compare the [`Self::effective_family`]
+/// rather than the literal [`Self::family`] field, so `None` and an explicit
+/// family equal to the one it implies identify the same kernel rule.
+#[derive(Clone)]
 pub struct RuleRequest {
     /// Optional source prefix selector.
     ///
@@ -89,14 +95,86 @@ pub struct RuleRequest {
     pub destination: Option<IpPrefix>,
     /// Optional firewall mark and nonzero mask selector.
     ///
-    /// A mark-only rule uses Linux's IPv4 default family. Legacy mutation and
-    /// readback accept a zero mark value, while conflict-safe convergence
-    /// rejects it because Linux deletion treats it as a wildcard.
+    /// A mark-only rule uses Linux's IPv4 default family unless
+    /// [`Self::family`] selects IPv6. Legacy mutation and readback accept a
+    /// zero mark value, while conflict-safe convergence rejects it because
+    /// Linux deletion treats it as a wildcard.
     pub fwmark: Option<FirewallMark>,
     /// Linux route table to look up.
     pub table: u32,
     /// Rule priority.
     pub priority: u32,
+    /// Explicit rule address family.
+    ///
+    /// Linux keeps separate IPv4 and IPv6 rule lists, so a rule only ever
+    /// matches packets of its own family. `None` derives the family from the
+    /// source or destination prefix, or selects IPv4 for a rule without a
+    /// prefix, exactly as before this field existed. `Some` is required to
+    /// create a mark-only IPv6 rule; with a prefix it must equal the prefix
+    /// family, and a conflicting value is rejected as invalid configuration.
+    pub family: Option<RouteSteeringIpFamily>,
+}
+
+impl RuleRequest {
+    /// Address family of the kernel rule this request identifies.
+    ///
+    /// A source or destination prefix determines the family. Otherwise the
+    /// explicit [`Self::family`] applies, defaulting to IPv4.
+    #[must_use]
+    pub fn effective_family(&self) -> RouteSteeringIpFamily {
+        match self.source.or(self.destination) {
+            Some(prefix) if prefix.is_ipv4() => RouteSteeringIpFamily::Ipv4,
+            Some(_) => RouteSteeringIpFamily::Ipv6,
+            None => self.family.unwrap_or(RouteSteeringIpFamily::Ipv4),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn identity(
+        &self,
+    ) -> (
+        Option<IpPrefix>,
+        Option<IpPrefix>,
+        Option<FirewallMark>,
+        u32,
+        u32,
+        RouteSteeringIpFamily,
+    ) {
+        (
+            self.source,
+            self.destination,
+            self.fwmark,
+            self.table,
+            self.priority,
+            self.effective_family(),
+        )
+    }
+}
+
+impl PartialEq for RuleRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for RuleRequest {}
+
+impl std::hash::Hash for RuleRequest {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
+}
+
+impl PartialOrd for RuleRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RuleRequest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity().cmp(&other.identity())
+    }
 }
 
 impl fmt::Debug for RuleRequest {
@@ -107,6 +185,7 @@ impl fmt::Debug for RuleRequest {
             .field("fwmark", &self.fwmark.map(|_| "<redacted>"))
             .field("table", &self.table)
             .field("priority", &self.priority)
+            .field("family", &self.effective_family())
             .finish()
     }
 }
@@ -535,6 +614,7 @@ mod tests {
             }),
             table: 100,
             priority: 1000,
+            family: None,
         };
 
         let route_debug = format!("{route:?}");

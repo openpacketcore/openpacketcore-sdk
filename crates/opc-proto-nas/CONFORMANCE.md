@@ -1,7 +1,8 @@
 # NAS-5GS Protocol Conformance
 
 This document defines the conformance of the `opc-proto-nas` crate against
-3GPP TS 24.501.
+3GPP TS 24.501, with a separate bounded NAS-over-TCP envelope subset of
+TS 24.502 V18.8.0 clause 9.4.
 
 ## Specification Baseline
 
@@ -13,6 +14,31 @@ This document defines the conformance of the `opc-proto-nas` crate against
   NF crates.
 
 ## Supported Features
+
+### NAS-over-TCP Envelopes (TS 24.502 §9.4)
+
+The `tcp` module reads/writes a two-octet big-endian length that counts NAS
+payload octets only. Borrowed receive and incremental stream receive preserve
+every payload octet, including protected or unrecognized NAS. They do not call
+the TS 24.501 content or security decoder described below.
+
+| Operation | Implemented contract |
+| --- | --- |
+| Construct | Exact envelope for 1–65,535 payload octets within the caller's bound; output untouched on refusal |
+| Borrowed receive | First complete frame and unread tail; partial prefix/body needs more input |
+| Incremental receive | Arbitrary segmentation; at most one frame per call; coalesced tail remains caller-owned |
+| Finalize | Clean boundary succeeds permanently; partial prefix/body becomes sticky truncation |
+| Refuse | Invalid caller bound, empty/above-bound length, insufficient output, bounded allocation failure, or input after termination |
+
+Zero-length refusal, the inclusive caller bound, sticky terminal states and
+single-frame buffering are SDK policy. Length validation precedes allocation;
+the decoder requests only the declared payload size. TCP lifecycle, reconnect
+selection, security termination, SA provenance and UE lifecycle are outside
+this module. No live TCP/N3IWF/AMF interoperability is claimed.
+
+The nine reviewed `nas-tcp` fixtures and 174 independent streams exercise both
+receive APIs and exact construction. [TCP.md](TCP.md) records source revisions,
+digests, allocation measurements, fuzz scope and reproduction commands.
 
 ### 1. Message Framing (§9.1.1)
 - EPD dispatch: `0x7E` (5GMM) and `0x2E` (5GSM); all other EPDs rejected.
@@ -134,8 +160,10 @@ Decodes IE *content* (caller strips IEI/length framing):
 
 ## Robustness & Fuzzing
 
-Decode paths carry no `unsafe`, use checked length arithmetic, and never
-preallocate from a wire-declared length. Three layers guard them:
+Decode paths carry no `unsafe` and use bounded length arithmetic. The inner NAS
+decoders do not preallocate from a wire-declared length; the separate incremental
+TCP decoder allocates only after validating its prefix against the caller's
+bound. Three layers guard the inner decoders:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   corpus entry, byte-truncations of each, and hostile constant inputs through the
@@ -146,3 +174,9 @@ preallocate from a wire-declared length. Three layers guard them:
   registered in `.github/workflows/fuzz.yml` and run weekly.
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~32M
   executions with no crash, leak, or OOM.
+
+The separate `nas_tcp` fuzz target compares segmented input with an independent
+length/cursor model, checks exact payloads, caller-owned tails, terminal states,
+encoding and redaction. A 61-second run completed 8,110,190 executions with no
+failure, using a 4,096-byte input cap. Ordinary tests cover the 65,535-byte wire
+maximum. The existing NAS fuzz workflow discovers both targets automatically.

@@ -785,7 +785,7 @@ static SESSION_TERMINATION_ANSWER_AVP_RULES: [CommandAvpRule; 18] = [
     ),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID),
-        AvpCardinality::Forbidden,
+        AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_TERMINATION_CAUSE),
@@ -3876,7 +3876,6 @@ fn parse_answer_parts(
                 ));
             } else if key == AvpKey::ietf(base::AVP_DESTINATION_REALM)
                 || key == AvpKey::ietf(base::AVP_DESTINATION_HOST)
-                || key == AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID)
                 || key == AvpKey::ietf(base::AVP_TERMINATION_CAUSE)
                 || key == AvpKey::ietf(base::AVP_ROUTE_RECORD)
             {
@@ -4353,6 +4352,22 @@ fn validate_known_value(
         value_offset,
         role.section(),
     )?;
+    if role == LifecycleRole::TerminationAnswer
+        && avp.header.key() == AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID)
+    {
+        // The STA extension point admits this known base AVP. RFC 6733 6.8
+        // still requires its value to match the SWm header, which the typed
+        // parser has validated and the typed builder fixes to APPLICATION_ID.
+        let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.8")?;
+        if value != APPLICATION_ID.get() {
+            return Err(forbidden_rfc_error(
+                value_offset,
+                "SWm STA Auth-Application-Id differs from the header application",
+                "RFC6733",
+                "6.8",
+            ));
+        }
+    }
     if avp.header.key() == AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE) {
         let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.13")?;
         if value > 6 {

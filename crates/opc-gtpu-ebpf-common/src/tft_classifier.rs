@@ -340,8 +340,11 @@ impl TftClassifierMeta {
     /// Convert an active selector into its durable exact-removal fence.
     ///
     /// The fingerprint and all publication identity remain unchanged. The tc
-    /// datapath rejects this state, while userspace can prove and finish the
-    /// exact cleanup after acknowledgement loss or process restart.
+    /// datapath classifies a fence with a default bearer as absent, the
+    /// state its removal publishes last, so unmarked packets keep the
+    /// default bearer without any row being read; it rejects a fence without
+    /// one. Userspace can prove and finish the exact cleanup after
+    /// acknowledgement loss or process restart.
     #[must_use]
     pub const fn removing(mut self) -> Option<Self> {
         if !self.is_valid() {

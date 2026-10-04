@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::consensus::snapshot::{rename_exchange_in_directory, rename_noreplace_in_directory};
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use opc_consensus::engine::LogId;
 use opc_types::Timestamp;
 use rusqlite::backup::Backup;
@@ -971,6 +971,29 @@ fn inspect_replica_from_pinned_with<T>(
     snapshot_file: Option<&mut PinnedSnapshotFile>,
     proof: impl FnOnce(&RecoveryReplicaEvidence, &Connection) -> Result<T, RecoveryError>,
 ) -> Result<(RecoveryReplicaEvidence, T), RecoveryError> {
+    inspect_replica_from_pinned_with_budget(
+        input,
+        paths,
+        database_file,
+        snapshot_file,
+        |evidence, conn, _budget| proof(evidence, conn),
+    )
+}
+
+/// Finalization may read a physical predecessor masked by a purge floor.
+/// Keep that added read on the original inspection's remaining work and time
+/// budget, while preserving the existing callback surface for other proofs.
+fn inspect_replica_from_pinned_with_budget<T>(
+    input: InspectionInput<'_>,
+    paths: CanonicalReplicaPaths,
+    database_file: &PinnedSnapshotFile,
+    snapshot_file: Option<&mut PinnedSnapshotFile>,
+    proof: impl FnOnce(
+        &RecoveryReplicaEvidence,
+        &Connection,
+        &mut InspectionBudget,
+    ) -> Result<T, RecoveryError>,
+) -> Result<(RecoveryReplicaEvidence, T), RecoveryError> {
     let mut budget = InspectionBudget::new(input.limits);
     let path_binding = recovery_path_binding(input.key, &paths)?;
     let database_path = paths.database.clone();
@@ -990,7 +1013,8 @@ fn inspect_replica_from_pinned_with<T>(
     run_pinned_inspection_path_swap_hook(true, &database_path);
     let started = budget.started;
     let max_duration = input.limits.max_duration();
-    conn.progress_handler(1_000, Some(move || started.elapsed() >= max_duration));
+    conn.progress_handler(1_000, Some(move || started.elapsed() >= max_duration))
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     validate_database_snapshot(&conn, &budget)?;
     let evidence = if table_exists(&conn, "consensus_identity")? {
         inspect_current(
@@ -1011,7 +1035,7 @@ fn inspect_replica_from_pinned_with<T>(
     // transaction that produced `evidence`.  In particular, do not create a
     // nested transaction here: the existing `BEGIN DEFERRED` transaction is
     // the single snapshot whose identity was bound above.
-    let result = proof(&evidence, &conn)?;
+    let result = proof(&evidence, &conn, &mut budget)?;
     database_file
         .verify_path_identity(&database_path)
         .map_err(|_| RecoveryError::SourceChanged)?;
@@ -7186,7 +7210,6 @@ fn verify_legacy_target_installed_evidence(
     evidence: &RecoveryReplicaEvidence,
     predecessor: &FinalizationPredecessorCapsule,
 ) -> Result<(), RecoveryError> {
-    let baseline = predecessor.baseline_log_id;
     if evidence.pending_recovery_epoch != Some(plan.body.next_recovery_epoch)
         || evidence.pending_plan_digest != Some(plan.plan_digest)
         || evidence.recovery_epoch != predecessor.recovery_epoch
@@ -7199,7 +7222,6 @@ fn verify_legacy_target_installed_evidence(
         || evidence.authority_commitment != predecessor.authority_commitment
         || evidence.recovery_v2_invariant_state_digest
             != predecessor.recovery_v2_invariant_state_digest
-        || evidence.applied_log_id != Some(baseline)
         || evidence.finalize_log_id.is_some()
         || evidence.authority_profile != plan.body.source_authority_profile
         || evidence.fixed_placement_policy != plan.body.source_fixed_placement_policy
@@ -7974,7 +7996,7 @@ fn verify_untargeted_installed_evidence(
     planned: &RecoveryReplicaEvidence,
     evidence: &RecoveryReplicaEvidence,
     conn: &Connection,
-    limits: RecoveryLimits,
+    budget: &mut InspectionBudget,
 ) -> Result<UnappliedRecoveryFinalizePhase, RecoveryError> {
     let source = plan
         .body
@@ -8002,7 +8024,6 @@ fn verify_untargeted_installed_evidence(
         || evidence.watch_cursor_invalidation_floor != planned.watch_cursor_invalidation_floor
         || evidence.application_sequence != planned.application_sequence
         || evidence.watch_sequence != planned.watch_sequence
-        || evidence.applied_log_id != planned.applied_log_id
         || evidence.fence_high_water != planned.fence_high_water
         || evidence.credential_high_water != planned.credential_high_water
         || evidence.logical_state_digest != planned.logical_state_digest
@@ -8012,142 +8033,161 @@ fn verify_untargeted_installed_evidence(
     {
         return Err(RecoveryError::BackupCorrupt);
     }
-    verify_exact_unapplied_recovery_finalize_suffix(plan, planned, evidence, conn, limits)
+    verify_exact_unapplied_recovery_finalize_suffix(plan, planned, evidence, conn, budget)
 }
 
-/// An epoch command may be committed in the Raft log before any voter applies
-/// it.  This must not be collapsed into the installed predecessor: retrying a
-/// proposal under the same deterministic request ID would allocate different
-/// command bytes (notably a later logical time) and turn a recoverable apply
-/// lag into a durable request conflict.
+/// Even an uncommitted exact V2 reserves the deterministic request ID. A
+/// retry must wait for that command rather than allocate new timing bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnappliedRecoveryFinalizePhase {
     NoFinalize,
     ExactFinalizeInFlight,
 }
 
-/// Prove the only physical advancement an untouched voter may have while the
-/// finalization command has committed but has not yet reached its state
-/// machine. Planning requires its old head to be clean and equal to the
-/// source committed branch; this scan therefore admits harmless Raft blanks
-/// and exactly one authenticated recovery-finalize command, never an
-/// arbitrary valid suffix from another campaign.
-fn verify_exact_unapplied_recovery_finalize_suffix(
-    plan: &RecoveryPlan,
-    planned: &RecoveryReplicaEvidence,
-    evidence: &RecoveryReplicaEvidence,
-    conn: &Connection,
-    limits: RecoveryLimits,
-) -> Result<UnappliedRecoveryFinalizePhase, RecoveryError> {
-    let planned_head = planned
-        .local_head_log_id
-        .ok_or(RecoveryError::BackupCorrupt)?;
-    if planned.committed_log_id != Some(planned_head)
-        || planned.applied_log_id != Some(planned_head)
-    {
-        return Err(RecoveryError::BackupCorrupt);
-    }
-    let observed_head = evidence
-        .local_head_log_id
-        .ok_or(RecoveryError::BackupCorrupt)?;
-    let observed_committed = evidence
-        .committed_log_id
-        .ok_or(RecoveryError::BackupCorrupt)?;
-    if observed_head.index < planned_head.index
-        || observed_committed != observed_head
-        || evidence.applied_log_id != Some(planned_head)
-    {
-        return Err(RecoveryError::BackupCorrupt);
-    }
-    let start = planned_head
-        .index
-        .checked_add(1)
-        .ok_or(RecoveryError::BackupCorrupt)?;
-    let end = observed_head
-        .index
-        .checked_add(1)
-        .ok_or(RecoveryError::BackupCorrupt)?;
-    let count = end.checked_sub(start).ok_or(RecoveryError::BackupCorrupt)?;
-    if count > limits.max_rows() {
-        return Err(RecoveryError::BackupCorrupt);
-    }
-    // Before the leader proposes the epoch entry an untouched agreeing voter
-    // has no suffix at all.  It may also contain only inert Raft blanks; both
-    // are still the exact installed predecessor rather than corruption.
-    if count == 0 {
-        return Ok(UnappliedRecoveryFinalizePhase::NoFinalize);
-    }
-    let limit = usize::try_from(count).map_err(|_| RecoveryError::WorkLimitExceeded)?;
-    let entries = consensus::read_log_range_for_recovery_sync(
-        conn,
-        plan.body.identity,
-        start,
-        Some(end),
-        Some(limit),
-    )
-    .map_err(|_| RecoveryError::BackupCorrupt)?;
-    if entries.len() != limit {
-        return Err(RecoveryError::BackupCorrupt);
-    }
-    let mut expected_index = start;
-    let mut finalize_index = None;
-    let mut expected_request_id = [0_u8; 16];
-    expected_request_id.copy_from_slice(&plan.plan_digest.as_bytes()[..16]);
-    for entry in entries {
-        if entry.log_id.index != expected_index {
-            return Err(RecoveryError::BackupCorrupt);
-        }
-        expected_index = expected_index
-            .checked_add(1)
-            .ok_or(RecoveryError::BackupCorrupt)?;
-        match entry.payload {
-            opc_consensus::engine::EntryPayload::Blank => {}
-            opc_consensus::engine::EntryPayload::Normal(command)
-                if finalize_index.is_none()
-                    && command.schema_version == SESSION_CONSENSUS_SCHEMA_VERSION
-                    && command.identity == plan.body.identity
-                    && command.request_id.as_bytes() == &expected_request_id
-                    && matches!(&command.intent,
-                    SessionMutationIntent::FinalizeOperatorRecoveryV2(payload)
-                    if recovery_v2_payload_matches_plan(
-                        payload.as_ref(), plan, planned, planned_head,
-                    )) =>
-            {
-                finalize_index = Some(entry.log_id.index);
-            }
-            _ => return Err(RecoveryError::BackupCorrupt),
-        }
-    }
-    if finalize_index.is_some_and(|index| index > observed_committed.index) {
-        return Err(RecoveryError::BackupCorrupt);
-    }
-    Ok(match finalize_index {
-        None => UnappliedRecoveryFinalizePhase::NoFinalize,
-        Some(_) => UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight,
-    })
+/// Blank entries need only their full identity. Retain the complete V2
+/// command, including logical_time, because the intent digest omits timing.
+#[derive(PartialEq)]
+struct RecoveryProgressEntry {
+    log_id: LogId<SessionConsensusNodeId>,
+    command: Option<Box<crate::consensus::SessionConsensusCommand>>,
 }
 
-/// Legacy recovery uses a MACed bootstrap capsule rather than the immutable
-/// legacy plan as its current-format Raft predecessor.  The exact physical
-/// suffix rules remain identical: no advancement, blanks, or exactly the one
-/// deterministic V2 marker waiting for state-machine application.
-fn verify_legacy_exact_unapplied_recovery_finalize_suffix(
-    plan: &RecoveryPlan,
-    predecessor: &FinalizationPredecessorCapsule,
-    evidence: &RecoveryReplicaEvidence,
+struct RecoveryProgressSuffix {
+    history: Vec<RecoveryProgressEntry>,
+    finalize_log_id: Option<LogId<SessionConsensusNodeId>>,
+}
+
+impl RecoveryProgressSuffix {
+    fn unapplied_phase(
+        &self,
+        evidence: &RecoveryReplicaEvidence,
+    ) -> Result<UnappliedRecoveryFinalizePhase, RecoveryError> {
+        let applied = evidence
+            .applied_log_id
+            .ok_or(RecoveryError::BackupCorrupt)?;
+        // A larger applied pointer is inert only when every entry through
+        // it is Blank. An applied V2 requires its separate exact effect proof.
+        if evidence.finalize_log_id.is_some()
+            || self
+                .finalize_log_id
+                .is_some_and(|id| id.index <= applied.index)
+        {
+            return Err(RecoveryError::BackupCorrupt);
+        }
+        Ok(if self.finalize_log_id.is_some() {
+            UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight
+        } else {
+            UnappliedRecoveryFinalizePhase::NoFinalize
+        })
+    }
+}
+
+fn merge_compatible_recovery_history<T: PartialEq>(
+    longest: &mut Vec<T>,
+    observed: Vec<T>,
+) -> Result<(), RecoveryError> {
+    if longest
+        .iter()
+        .zip(&observed)
+        .any(|(left, right)| left != right)
+    {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    if observed.len() > longest.len() {
+        *longest = observed;
+    }
+    Ok(())
+}
+
+/// Once applied moves past the immutable predecessor, current durable
+/// pointers no longer prove that older LogId. Match the same physical kind
+/// and exact snapshot/purge coverage admitted by V2 apply, on this WAL snapshot.
+fn verify_recovery_progress_baseline(
     conn: &Connection,
-    limits: RecoveryLimits,
-) -> Result<UnappliedRecoveryFinalizePhase, RecoveryError> {
-    let baseline = predecessor.baseline_log_id;
-    let observed_head = evidence
-        .local_head_log_id
+    identity: SessionConsensusIdentity,
+    baseline: &LogId<SessionConsensusNodeId>,
+    membership_digest: Option<RecoveryDigest>,
+    budget: &mut InspectionBudget,
+) -> Result<(), RecoveryError> {
+    budget.check()?;
+    let purged =
+        consensus::read_purged_sync(conn, identity).map_err(|_| RecoveryError::BackupCorrupt)?;
+    if purged
+        .as_ref()
+        .is_some_and(|floor| !full_log_id_not_after(floor, baseline))
+    {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    // Logical inspection deliberately excludes retained cleanup at or below
+    // purge. Bound this exact physical value before the kind reader allocates
+    // it, including bytes already spent deriving this snapshot's evidence.
+    let length: Option<i64> = conn.query_row(
+        "SELECT length(entry_json) FROM consensus_log WHERE configuration_epoch = ?1 AND log_index = ?2",
+        rusqlite::params![identity.configuration_epoch().get(), baseline.index],
+        |row| row.get(0),
+    ).optional().map_err(|error| inspection_sql_error(error, budget))?;
+    if let Some(length) = length {
+        budget.consume_row()?;
+        budget.consume_value(usize::try_from(length).map_err(|_| RecoveryError::BackupCorrupt)?)?;
+    }
+    let kind = consensus::operator_recovery_v2_predecessor_kind_sync(conn, identity, baseline);
+    budget.check()?;
+    let matches = match kind.map_err(|_| RecoveryError::BackupCorrupt)? {
+        consensus::OperatorRecoveryV2PredecessorKind::RetainedMembership(digest) => {
+            membership_digest == Some(RecoveryDigest::from_bytes(digest))
+        }
+        consensus::OperatorRecoveryV2PredecessorKind::RetainedNonMembership => {
+            membership_digest.is_none()
+        }
+        consensus::OperatorRecoveryV2PredecessorKind::NotRetained => {
+            let snapshot = consensus::read_current_snapshot_sync(conn, identity)
+                .map_err(|_| RecoveryError::BackupCorrupt)?;
+            membership_digest.is_none()
+                && (purged.as_ref() == Some(baseline)
+                    || snapshot
+                        .as_ref()
+                        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref())
+                        == Some(baseline))
+        }
+    };
+    if !matches {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    Ok(())
+}
+
+/// This additional scan uses the semantic inspector's pinned WAL snapshot
+/// and remaining row, byte and time budget. Charge each actual encoded range
+/// before materializing it; a previous valid scan cannot authorize more work.
+fn observe_recovery_progress_suffix(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    baseline: LogId<SessionConsensusNodeId>,
+    membership_digest: Option<RecoveryDigest>,
+    evidence: &RecoveryReplicaEvidence,
+    inspection_budget: &mut InspectionBudget,
+    command_matches: impl Fn(&crate::consensus::SessionConsensusCommand) -> bool,
+) -> Result<RecoveryProgressSuffix, RecoveryError> {
+    let limits = inspection_budget.limits;
+    verify_recovery_progress_baseline(
+        conn,
+        identity,
+        &baseline,
+        membership_digest,
+        inspection_budget,
+    )?;
+    let applied = evidence
+        .applied_log_id
         .ok_or(RecoveryError::BackupCorrupt)?;
-    let observed_committed = evidence
+    let committed = evidence
         .committed_log_id
         .ok_or(RecoveryError::BackupCorrupt)?;
-    if observed_head.index < baseline.index
-        || observed_committed != observed_head
-        || evidence.applied_log_id != Some(baseline)
+    let head = evidence
+        .local_head_log_id
+        .ok_or(RecoveryError::BackupCorrupt)?;
+    if !full_log_id_not_after(&baseline, &applied)
+        || !full_log_id_not_after(&applied, &committed)
+        || !full_log_id_not_after(&committed, &head)
     {
         return Err(RecoveryError::BackupCorrupt);
     }
@@ -8155,63 +8195,152 @@ fn verify_legacy_exact_unapplied_recovery_finalize_suffix(
         .index
         .checked_add(1)
         .ok_or(RecoveryError::BackupCorrupt)?;
-    let end = observed_head
+    let end = head
         .index
         .checked_add(1)
         .ok_or(RecoveryError::BackupCorrupt)?;
     let count = end.checked_sub(start).ok_or(RecoveryError::BackupCorrupt)?;
     if count > limits.max_rows() {
-        return Err(RecoveryError::BackupCorrupt);
+        return Err(RecoveryError::WorkLimitExceeded);
     }
     if count == 0 {
-        return Ok(UnappliedRecoveryFinalizePhase::NoFinalize);
+        // The exact baseline and pointer proof is complete. Avoid a range
+        // call that would only repeat the lower reader's highest-row audit.
+        return Ok(RecoveryProgressSuffix {
+            history: vec![RecoveryProgressEntry {
+                log_id: baseline,
+                command: None,
+            }],
+            finalize_log_id: None,
+        });
     }
     let limit = usize::try_from(count).map_err(|_| RecoveryError::WorkLimitExceeded)?;
-    let entries = consensus::read_log_range_for_recovery_sync(
-        conn,
-        plan.body.identity,
-        start,
-        Some(end),
-        Some(limit),
-    )
-    .map_err(|_| RecoveryError::BackupCorrupt)?;
+    inspection_budget.check()?;
+    let (rows, maximum, total, head_length): (i64, i64, i64, Option<i64>) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(length(entry_json)), 0), COALESCE(SUM(length(entry_json)), 0), MAX(CASE WHEN log_index = ?3 THEN length(entry_json) END) FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2",
+            rusqlite::params![start, end, head.index],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| inspection_sql_error(error, inspection_budget))?;
+    let rows = u64::try_from(rows).map_err(|_| RecoveryError::BackupCorrupt)?;
+    let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::BackupCorrupt)?;
+    let total = u64::try_from(total).map_err(|_| RecoveryError::BackupCorrupt)?;
+    if rows != count {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    inspection_budget.consume_table_scan(rows, maximum, total)?;
+    // The lower reader audits the highest retained row before returning the
+    // range. The nonempty suffix and purge <= baseline proof make that row
+    // exactly head, above purge. Baseline <= applied also makes its unapplied
+    // prefix replay empty. Charge that additional encoded head allocation.
+    let head_length = head_length.ok_or(RecoveryError::BackupCorrupt)?;
+    inspection_budget.consume_row()?;
+    inspection_budget
+        .consume_value(usize::try_from(head_length).map_err(|_| RecoveryError::BackupCorrupt)?)?;
+    let entries =
+        consensus::read_log_range_for_recovery_sync(conn, identity, start, Some(end), Some(limit));
+    inspection_budget.check()?;
+    let entries = entries.map_err(|_| RecoveryError::BackupCorrupt)?;
     if entries.len() != limit {
         return Err(RecoveryError::BackupCorrupt);
     }
-    let expected_intent = recovery_v2_intent_from_predecessor(plan, predecessor);
-    let expected_request_id = recovery_v2_request_id(plan);
-    let mut expected_index = start;
-    let mut saw_finalize = false;
+    let mut history = vec![RecoveryProgressEntry {
+        log_id: baseline,
+        command: None,
+    }];
+    let mut previous = baseline;
+    let mut finalize_log_id = None;
     for entry in entries {
-        if entry.log_id.index != expected_index {
+        inspection_budget.check()?;
+        if previous.index.checked_add(1) != Some(entry.log_id.index)
+            || !full_log_id_not_after(&previous, &entry.log_id)
+        {
             return Err(RecoveryError::BackupCorrupt);
         }
-        expected_index = expected_index
-            .checked_add(1)
-            .ok_or(RecoveryError::BackupCorrupt)?;
-        match entry.payload {
-            opc_consensus::engine::EntryPayload::Blank => {}
+        previous = entry.log_id;
+        let command = match entry.payload {
+            opc_consensus::engine::EntryPayload::Blank => None,
             opc_consensus::engine::EntryPayload::Normal(command)
-                if !saw_finalize
-                    && command.schema_version == SESSION_CONSENSUS_SCHEMA_VERSION
-                    && command.identity == plan.body.identity
-                    && command.request_id == expected_request_id
-                    && matches!(
-                        &command.intent,
-                        SessionMutationIntent::FinalizeOperatorRecoveryV2(payload)
-                            if payload.as_ref() == &expected_intent
-                    ) =>
+                if finalize_log_id.is_none() && command_matches(&command) =>
             {
-                saw_finalize = true;
+                finalize_log_id = Some(entry.log_id);
+                Some(Box::new(command))
             }
             _ => return Err(RecoveryError::BackupCorrupt),
-        }
+        };
+        history.push(RecoveryProgressEntry {
+            log_id: entry.log_id,
+            command,
+        });
     }
-    Ok(if saw_finalize {
-        UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight
-    } else {
-        UnappliedRecoveryFinalizePhase::NoFinalize
+    if previous != head {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    Ok(RecoveryProgressSuffix {
+        history,
+        finalize_log_id,
     })
+}
+
+fn verify_exact_unapplied_recovery_finalize_suffix(
+    plan: &RecoveryPlan,
+    planned: &RecoveryReplicaEvidence,
+    evidence: &RecoveryReplicaEvidence,
+    conn: &Connection,
+    budget: &mut InspectionBudget,
+) -> Result<UnappliedRecoveryFinalizePhase, RecoveryError> {
+    let baseline = planned
+        .local_head_log_id
+        .ok_or(RecoveryError::BackupCorrupt)?;
+    if planned.committed_log_id != Some(baseline) || planned.applied_log_id != Some(baseline) {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    observe_recovery_progress_suffix(conn, plan.body.identity, baseline, planned.predecessor_bootstrap_membership_digest, evidence, budget, |command| {
+        command.schema_version == SESSION_CONSENSUS_SCHEMA_VERSION
+            && command.identity == plan.body.identity
+            && command.request_id == recovery_v2_request_id(plan)
+            && matches!(&command.intent, SessionMutationIntent::FinalizeOperatorRecoveryV2(payload)
+                if recovery_v2_payload_matches_plan(payload, plan, planned, baseline))
+    })?.unapplied_phase(evidence)
+}
+
+/// Legacy recovery uses the MACed bootstrap capsule as its immutable
+/// predecessor. Applied Blanks and uncommitted V2 use the same suffix proof.
+fn verify_legacy_exact_unapplied_recovery_finalize_suffix(
+    plan: &RecoveryPlan,
+    predecessor: &FinalizationPredecessorCapsule,
+    evidence: &RecoveryReplicaEvidence,
+    conn: &Connection,
+    budget: &mut InspectionBudget,
+) -> Result<UnappliedRecoveryFinalizePhase, RecoveryError> {
+    observe_finalization_progress_suffix(plan, predecessor, evidence, conn, budget)?
+        .unapplied_phase(evidence)
+}
+
+fn observe_finalization_progress_suffix(
+    plan: &RecoveryPlan,
+    predecessor: &FinalizationPredecessorCapsule,
+    evidence: &RecoveryReplicaEvidence,
+    conn: &Connection,
+    budget: &mut InspectionBudget,
+) -> Result<RecoveryProgressSuffix, RecoveryError> {
+    let expected = recovery_v2_intent_from_predecessor(plan, predecessor);
+    observe_recovery_progress_suffix(
+        conn,
+        plan.body.identity,
+        predecessor.baseline_log_id,
+        predecessor.bootstrap_membership_digest,
+        evidence,
+        budget,
+        |command| {
+            command.schema_version == SESSION_CONSENSUS_SCHEMA_VERSION
+                && command.identity == plan.body.identity
+                && command.request_id == recovery_v2_request_id(plan)
+                && matches!(&command.intent, SessionMutationIntent::FinalizeOperatorRecoveryV2(payload)
+                if payload.as_ref() == &expected)
+        },
+    )
 }
 
 fn recovery_v2_payload_matches_plan(
@@ -9727,7 +9856,16 @@ pub(super) fn legacy_finalization_predecessor(
         pins.legacy_predecessor = Some(sealed.clone());
         return Ok(Some(sealed.clone()));
     }
-    let observed = capture_legacy_bootstrap_predecessor(key, plan, pins, limits)?;
+    let allow_audit_pending = match (workflow.state, workflow.audit_resume_state) {
+        (RecoveryExecutionState::AwaitingEpochCommit, None) => false,
+        (
+            RecoveryExecutionState::AuditPending,
+            Some(RecoveryExecutionState::AwaitingEpochCommit),
+        ) => true,
+        _ => return Err(RecoveryError::BackupCorrupt),
+    };
+    let observed =
+        capture_legacy_bootstrap_predecessor(key, plan, pins, limits, allow_audit_pending)?;
     // This is the durable retry boundary.  A process loss after the write
     // reuses these exact fields; one before it simply re-captures only if the
     // same held descriptors still prove the canonical bootstrap state.
@@ -9837,13 +9975,18 @@ fn capture_legacy_bootstrap_predecessor(
     plan: &RecoveryPlan,
     pins: &mut FinalizationPins<'_>,
     limits: RecoveryLimits,
+    allow_audit_pending: bool,
 ) -> Result<FinalizationPredecessorCapsule, RecoveryError> {
     if pins.latches.len() != plan.body.evidence.len()
         || pins.latches.iter().any(|pin| !pin.target_install)
     {
         return Err(RecoveryError::BackupCorrupt);
     }
-    let mut captured = None;
+    let sidecars = bootstrap_active_latches(plan, pins, allow_audit_pending)?;
+    let mut captured: Option<FinalizationPredecessorCapsule> = None;
+    let mut common_state = None;
+    let mut history = Vec::new();
+    let mut converged = true;
     for pin in &mut pins.latches {
         if pinned_file_identity(key, &pin.database)? != pin.database_identity {
             return Err(RecoveryError::BackupCorrupt);
@@ -9866,14 +10009,76 @@ fn capture_legacy_bootstrap_predecessor(
             |evidence, conn| {
                 legacy_bootstrap_predecessor_from_evidence(conn, plan, evidence, limits)
             },
-        )?;
-        match &captured {
-            Some(expected) if expected != &candidate => return Err(RecoveryError::BackupCorrupt),
+        )
+        .map_err(|error| match error {
+            RecoveryError::CorruptReplica => RecoveryError::BackupCorrupt,
+            error => error,
+        })?;
+        // Only the head-derived capsule fields can differ after proving the
+        // entire bootstrap-only history. Compare all other facts exactly.
+        let mut state = candidate.predecessor.clone();
+        let bootstrap = state
+            .legacy_bootstrap_membership
+            .as_ref()
+            .ok_or(RecoveryError::BackupCorrupt)?;
+        state.baseline_log_id = bootstrap.log_id;
+        state.bootstrap_membership_digest = Some(bootstrap.digest);
+        match &common_state {
+            Some(expected) if expected != &state => return Err(RecoveryError::BackupCorrupt),
             Some(_) => {}
-            None => captured = Some(candidate),
+            None => common_state = Some(state),
         }
+        converged &= candidate.caught_up
+            && captured
+                .as_ref()
+                .is_none_or(|first| first.baseline_log_id == candidate.predecessor.baseline_log_id);
+        merge_compatible_recovery_history(&mut history, candidate.history)?;
+        captured.get_or_insert(candidate.predecessor);
+    }
+    if bootstrap_active_latches(plan, pins, allow_audit_pending)? != sidecars {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    // Availability is authorized only after every retained voter and both
+    // exact sidecar observations passed. This path never writes a capsule.
+    if !converged {
+        return Err(RecoveryError::ConsensusUnavailable);
     }
     captured.ok_or(RecoveryError::BackupCorrupt)
+}
+
+fn bootstrap_active_latches(
+    plan: &RecoveryPlan,
+    pins: &FinalizationPins<'_>,
+    allow_audit_pending: bool,
+) -> Result<Vec<consensus::OperatorRecoveryLatch>, RecoveryError> {
+    pins.latches
+        .iter()
+        .map(|pin| {
+            let observed = consensus::active_operator_recovery_latch_sync(&pin.database_path)
+                .map_err(|_| RecoveryError::BackupCorrupt)?
+                .ok_or(RecoveryError::BackupCorrupt)?;
+            if observed != expected_latch(plan, observed.audit_pending)
+                || (observed.audit_pending && !allow_audit_pending)
+                || consensus::operator_recovery_latch_phase_sync(
+                    &pin.database_path,
+                    observed,
+                    &pin.database.file,
+                    None,
+                )
+                .map_err(|_| RecoveryError::BackupCorrupt)?
+                    != consensus::OperatorRecoveryLatchPhase::Active
+            {
+                return Err(RecoveryError::BackupCorrupt);
+            }
+            Ok(observed)
+        })
+        .collect()
+}
+
+struct LegacyBootstrapObservation {
+    predecessor: FinalizationPredecessorCapsule,
+    history: Vec<LogId<SessionConsensusNodeId>>,
+    caught_up: bool,
 }
 
 fn legacy_bootstrap_predecessor_from_evidence(
@@ -9881,14 +10086,31 @@ fn legacy_bootstrap_predecessor_from_evidence(
     plan: &RecoveryPlan,
     evidence: &RecoveryReplicaEvidence,
     limits: RecoveryLimits,
-) -> Result<FinalizationPredecessorCapsule, RecoveryError> {
+) -> Result<LegacyBootstrapObservation, RecoveryError> {
+    verify_target_installed_evidence(plan, evidence)?;
+    let source = plan
+        .body
+        .evidence
+        .iter()
+        .find(|item| item.replica_token == plan.body.source_token)
+        .ok_or(RecoveryError::StalePlan)?;
     let baseline = evidence
+        .local_head_log_id
+        .ok_or(RecoveryError::BackupCorrupt)?;
+    let applied = evidence
+        .applied_log_id
+        .ok_or(RecoveryError::BackupCorrupt)?;
+    let committed = evidence
         .committed_log_id
         .ok_or(RecoveryError::BackupCorrupt)?;
-    if evidence.applied_log_id != Some(baseline)
-        || evidence.local_head_log_id != Some(baseline)
-        || evidence.pending_recovery_epoch != Some(plan.body.next_recovery_epoch)
-        || evidence.pending_plan_digest != Some(plan.plan_digest)
+    if !full_log_id_not_after(&applied, &committed)
+        || !full_log_id_not_after(&committed, &baseline)
+        || evidence.recovery_epoch != source.recovery_epoch
+        || evidence.last_plan_digest != source.last_plan_digest
+        || evidence.machine_last_digest != plan.body.source_branch_digest
+        || evidence.fence_high_water != source.fence_high_water
+        || evidence.credential_high_water != source.credential_high_water
+        || evidence.finalize_log_id.is_some()
         || consensus::read_purged_sync(conn, plan.body.identity)
             .map_err(|_| RecoveryError::BackupCorrupt)?
             .is_some()
@@ -9916,10 +10138,18 @@ fn legacy_bootstrap_predecessor_from_evidence(
     }
     let mut expected_index = 0_u64;
     let mut bootstrap_membership = None;
+    let mut history = Vec::with_capacity(entries.len());
+    let mut budget = InspectionBudget::new(limits);
     for entry in entries {
-        if entry.log_id.index != expected_index {
+        budget.consume_row()?;
+        if entry.log_id.index != expected_index
+            || history
+                .last()
+                .is_some_and(|previous| !full_log_id_not_after(previous, &entry.log_id))
+        {
             return Err(RecoveryError::BackupCorrupt);
         }
+        history.push(entry.log_id);
         expected_index = expected_index
             .checked_add(1)
             .ok_or(RecoveryError::BackupCorrupt)?;
@@ -9986,19 +10216,23 @@ fn legacy_bootstrap_predecessor_from_evidence(
     {
         return Err(RecoveryError::BackupCorrupt);
     }
-    Ok(FinalizationPredecessorCapsule {
-        recovery_epoch: evidence.recovery_epoch,
-        last_plan_digest: evidence.last_plan_digest,
-        watch_cursor_invalidation_floor: evidence.watch_cursor_invalidation_floor,
-        baseline_log_id: baseline,
-        application_sequence: evidence.application_sequence,
-        machine_last_digest: evidence.machine_last_digest,
-        machine_logical_time: evidence.machine_logical_time,
-        watch_sequence: evidence.watch_sequence,
-        authority_commitment: evidence.authority_commitment,
-        recovery_v2_invariant_state_digest: evidence.recovery_v2_invariant_state_digest,
-        bootstrap_membership_digest: predecessor_bootstrap_membership_digest,
-        legacy_bootstrap_membership: Some(bootstrap_membership),
+    Ok(LegacyBootstrapObservation {
+        predecessor: FinalizationPredecessorCapsule {
+            recovery_epoch: evidence.recovery_epoch,
+            last_plan_digest: evidence.last_plan_digest,
+            watch_cursor_invalidation_floor: evidence.watch_cursor_invalidation_floor,
+            baseline_log_id: baseline,
+            application_sequence: evidence.application_sequence,
+            machine_last_digest: evidence.machine_last_digest,
+            machine_logical_time: evidence.machine_logical_time,
+            watch_sequence: evidence.watch_sequence,
+            authority_commitment: evidence.authority_commitment,
+            recovery_v2_invariant_state_digest: evidence.recovery_v2_invariant_state_digest,
+            bootstrap_membership_digest: predecessor_bootstrap_membership_digest,
+            legacy_bootstrap_membership: Some(bootstrap_membership),
+        },
+        history,
+        caught_up: applied == baseline && committed == baseline,
     })
 }
 
@@ -10075,6 +10309,20 @@ fn classify_finalization_pins_with_phase(
     // still unconsumed.
     let sidecar_phases = finalization_fleet_latch_sidecar_phases(plan, &pins.latches)?;
     let fleet_phase = finalization_fleet_proof_phase(&sidecar_phases, terminal_proof.as_ref())?;
+    let strict_predecessor = if matches!(
+        fleet_phase,
+        FinalizedRecoveryV2ProofPhase::PreTerminalStrict
+    ) {
+        Some(
+            legacy_predecessor
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| finalization_predecessor_from_plan(plan))?,
+        )
+    } else {
+        None
+    };
+    let mut fleet_history = Vec::new();
     let mut saw_installed = false;
     let mut saw_inflight = false;
     let mut saw_finalized = false;
@@ -10123,7 +10371,7 @@ fn classify_finalization_pins_with_phase(
                 .iter()
                 .find(|item| item.replica_token == latch.replica_token)
                 .ok_or(RecoveryError::StalePlan)?;
-            let (_evidence, proof) = inspect_replica_from_pinned_with(
+            let (_evidence, (proof, history)) = inspect_replica_from_pinned_with_budget(
                 InspectionInput {
                     key,
                     replica: latch.replica,
@@ -10135,9 +10383,25 @@ fn classify_finalization_pins_with_phase(
                 canonical_replica_paths(latch.replica, false)?,
                 &latch.database,
                 latch.snapshot.as_mut(),
-                |evidence, conn| {
-                    if let Some(predecessor) = legacy_predecessor.as_ref() {
-                        match verify_legacy_bootstrap_membership_capsule_in_snapshot(
+                |evidence, conn, budget| {
+                    // Preserve the complete overlapping history in the same
+                    // snapshot as the semantic proof, including finalized voters.
+                    // Historical traffic/compaction permissions remain unchanged.
+                    let history = if let Some(predecessor) = strict_predecessor.as_ref() {
+                        observe_finalization_progress_suffix(
+                            plan,
+                            predecessor,
+                            evidence,
+                            conn,
+                            budget,
+                        )?
+                        .history
+                    } else {
+                        Vec::new()
+                    };
+                    let proof = (|| {
+                        if let Some(predecessor) = legacy_predecessor.as_ref() {
+                            match verify_legacy_bootstrap_membership_capsule_in_snapshot(
                             plan,
                             predecessor,
                             terminal_proof.as_ref(),
@@ -10151,31 +10415,36 @@ fn classify_finalization_pins_with_phase(
                                 return Ok(FinalizationReplicaProof::Finalized);
                             }
                         }
-                    }
-                    if verify_exact_finalized_recovery_v2(
-                        plan,
-                        evidence,
-                        conn,
-                        limits,
-                        fleet_phase,
-                        legacy_predecessor.as_ref(),
-                        terminal_proof.as_ref(),
-                    )
-                    .is_ok()
-                    {
-                        return Ok(FinalizationReplicaProof::Finalized);
-                    }
-                    match verify_untargeted_installed_evidence(
-                        plan, planned, evidence, conn, limits,
-                    ) {
-                        Ok(UnappliedRecoveryFinalizePhase::NoFinalize) => {
-                            Ok(FinalizationReplicaProof::Installed)
                         }
-                        Ok(UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight) => {
-                            Ok(FinalizationReplicaProof::ExactFinalizeInFlight)
+                        if verify_exact_finalized_recovery_v2(
+                            plan,
+                            evidence,
+                            conn,
+                            limits,
+                            fleet_phase,
+                            legacy_predecessor.as_ref(),
+                            terminal_proof.as_ref(),
+                        )
+                        .is_ok()
+                        {
+                            return Ok(FinalizationReplicaProof::Finalized);
                         }
-                        Err(_) => Err(RecoveryError::BackupCorrupt),
-                    }
+                        match verify_untargeted_installed_evidence(
+                            plan, planned, evidence, conn, budget,
+                        ) {
+                            Ok(UnappliedRecoveryFinalizePhase::NoFinalize) => {
+                                Ok(FinalizationReplicaProof::Installed)
+                            }
+                            Ok(UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight) => {
+                                Ok(FinalizationReplicaProof::ExactFinalizeInFlight)
+                            }
+                            Err(RecoveryError::WorkLimitExceeded) => {
+                                Err(RecoveryError::WorkLimitExceeded)
+                            }
+                            Err(_) => Err(RecoveryError::BackupCorrupt),
+                        }
+                    })()?;
+                    Ok((proof, history))
                 },
             )
             .map_err(|error| match error {
@@ -10186,6 +10455,7 @@ fn classify_finalization_pins_with_phase(
                 RecoveryError::CorruptReplica => RecoveryError::BackupCorrupt,
                 error => error,
             })?;
+            merge_compatible_recovery_history(&mut fleet_history, history)?;
             match proof {
                 FinalizationReplicaProof::Finalized => saw_finalized = true,
                 FinalizationReplicaProof::Installed => saw_installed = true,
@@ -10231,7 +10501,7 @@ fn classify_finalization_pins_with_phase(
             .iter()
             .find(|item| item.replica_token == plan.body.source_token)
             .ok_or(RecoveryError::StalePlan)?;
-        let (_evidence, proof) = inspect_replica_from_pinned_with(
+        let (_evidence, (proof, history)) = inspect_replica_from_pinned_with_budget(
             InspectionInput {
                 key,
                 replica: target.replica,
@@ -10243,45 +10513,72 @@ fn classify_finalization_pins_with_phase(
             canonical_replica_paths(target.replica, false)?,
             &target.database,
             target.snapshot.as_mut(),
-            |evidence, conn| {
-                if let Some(predecessor) = legacy_predecessor.as_ref() {
-                    match verify_legacy_bootstrap_membership_capsule_in_snapshot(
+            |evidence, conn, budget| {
+                // Preserve the complete overlapping history in the same
+                // snapshot as the semantic proof, including finalized voters.
+                // Historical traffic/compaction permissions remain unchanged.
+                let history = if let Some(predecessor) = strict_predecessor.as_ref() {
+                    observe_finalization_progress_suffix(plan, predecessor, evidence, conn, budget)?
+                        .history
+                } else {
+                    Vec::new()
+                };
+                let proof = (|| {
+                    if let Some(predecessor) = legacy_predecessor.as_ref() {
+                        match verify_legacy_bootstrap_membership_capsule_in_snapshot(
+                            plan,
+                            predecessor,
+                            terminal_proof.as_ref(),
+                            evidence,
+                            conn,
+                            limits,
+                            fleet_phase,
+                        )? {
+                            LegacyBootstrapMembershipProof::Retained => {}
+                            LegacyBootstrapMembershipProof::AuthenticatedPostTerminalCompaction => {
+                                return Ok(FinalizationReplicaProof::Finalized);
+                            }
+                        }
+                    }
+                    if verify_exact_finalized_recovery_v2(
                         plan,
-                        predecessor,
-                        terminal_proof.as_ref(),
                         evidence,
                         conn,
                         limits,
                         fleet_phase,
-                    )? {
-                        LegacyBootstrapMembershipProof::Retained => {}
-                        LegacyBootstrapMembershipProof::AuthenticatedPostTerminalCompaction => {
-                            return Ok(FinalizationReplicaProof::Finalized);
-                        }
+                        legacy_predecessor.as_ref(),
+                        terminal_proof.as_ref(),
+                    )
+                    .is_ok()
+                    {
+                        return Ok(FinalizationReplicaProof::Finalized);
                     }
-                }
-                if verify_exact_finalized_recovery_v2(
-                    plan,
-                    evidence,
-                    conn,
-                    limits,
-                    fleet_phase,
-                    legacy_predecessor.as_ref(),
-                    terminal_proof.as_ref(),
-                )
-                .is_ok()
-                {
-                    return Ok(FinalizationReplicaProof::Finalized);
-                }
-                if let Some(predecessor) = legacy_predecessor.as_ref() {
-                    verify_legacy_target_installed_evidence(plan, evidence, predecessor)
+                    if let Some(predecessor) = legacy_predecessor.as_ref() {
+                        verify_legacy_target_installed_evidence(plan, evidence, predecessor)
+                            .map_err(|_| RecoveryError::BackupCorrupt)?;
+                        return match verify_legacy_exact_unapplied_recovery_finalize_suffix(
+                            plan,
+                            predecessor,
+                            evidence,
+                            conn,
+                            budget,
+                        ) {
+                            Ok(UnappliedRecoveryFinalizePhase::NoFinalize) => {
+                                Ok(FinalizationReplicaProof::Installed)
+                            }
+                            Ok(UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight) => {
+                                Ok(FinalizationReplicaProof::ExactFinalizeInFlight)
+                            }
+                            Err(RecoveryError::WorkLimitExceeded) => {
+                                Err(RecoveryError::WorkLimitExceeded)
+                            }
+                            Err(_) => Err(RecoveryError::BackupCorrupt),
+                        };
+                    }
+                    verify_target_installed_evidence(plan, evidence)
                         .map_err(|_| RecoveryError::BackupCorrupt)?;
-                    return match verify_legacy_exact_unapplied_recovery_finalize_suffix(
-                        plan,
-                        predecessor,
-                        evidence,
-                        conn,
-                        limits,
+                    match verify_exact_unapplied_recovery_finalize_suffix(
+                        plan, source, evidence, conn, budget,
                     ) {
                         Ok(UnappliedRecoveryFinalizePhase::NoFinalize) => {
                             Ok(FinalizationReplicaProof::Installed)
@@ -10289,28 +10586,20 @@ fn classify_finalization_pins_with_phase(
                         Ok(UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight) => {
                             Ok(FinalizationReplicaProof::ExactFinalizeInFlight)
                         }
+                        Err(RecoveryError::WorkLimitExceeded) => {
+                            Err(RecoveryError::WorkLimitExceeded)
+                        }
                         Err(_) => Err(RecoveryError::BackupCorrupt),
-                    };
-                }
-                verify_target_installed_evidence(plan, evidence)
-                    .map_err(|_| RecoveryError::BackupCorrupt)?;
-                match verify_exact_unapplied_recovery_finalize_suffix(
-                    plan, source, evidence, conn, limits,
-                ) {
-                    Ok(UnappliedRecoveryFinalizePhase::NoFinalize) => {
-                        Ok(FinalizationReplicaProof::Installed)
                     }
-                    Ok(UnappliedRecoveryFinalizePhase::ExactFinalizeInFlight) => {
-                        Ok(FinalizationReplicaProof::ExactFinalizeInFlight)
-                    }
-                    Err(_) => Err(RecoveryError::BackupCorrupt),
-                }
+                })()?;
+                Ok((proof, history))
             },
         )
         .map_err(|error| match error {
             RecoveryError::CorruptReplica => RecoveryError::BackupCorrupt,
             error => error,
         })?;
+        merge_compatible_recovery_history(&mut fleet_history, history)?;
         match proof {
             FinalizationReplicaProof::Finalized => saw_finalized = true,
             FinalizationReplicaProof::Installed => saw_installed = true,

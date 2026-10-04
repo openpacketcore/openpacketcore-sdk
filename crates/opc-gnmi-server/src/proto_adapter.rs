@@ -47,6 +47,10 @@ pub fn path_from_proto(path: &gnmi::Path) -> Result<GnmiPath, GnmiError> {
 }
 
 /// Converts a generated gNMI `TypedValue` into the crate's bounded value model.
+#[expect(
+    deprecated,
+    reason = "retain the existing gNMI legacy-value wire policy"
+)]
 pub fn typed_value_from_proto(value: &gnmi::TypedValue) -> Result<TypedValue, GnmiError> {
     use gnmi::typed_value::Value;
     let Some(value) = value.value.as_ref() else {

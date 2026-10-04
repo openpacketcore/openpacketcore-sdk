@@ -118,6 +118,10 @@ position but grants no success or authority. Cancellation, timeout, EOF,
 framing, `Protocol`, `Authentication`, `ScopeMismatch`, `Rejected`, evidence
 mismatch, lifecycle retirement, or any uncertain stream position drops it, so
 a late or partial response cannot be consumed by another Openraft RPC. The
+discarded socket shares the existing per-peer reconnect cooldown, including
+when a complete correlated response carries a typed error that forbids reuse.
+This preserves the original returned error and uses the connection's admitted
+epoch, so a late predecessor cannot delay newly published credentials. The
 client applies one absolute logical deadline to lane acquisition, waiting for a
 usable connection, bounded encoding, request write, and response read. Cold
 DNS/TCP/TLS/identity/bootstrap work admitted while that caller is waiting may
@@ -148,7 +152,13 @@ extend either caller's logical deadline. The reserved final third carries the
 first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
 successful handshake before the connection sends useful work. A cached lane
 resets shared reconnect backoff only after a complete validated reusable
-response proves the connection usable.
+response proves the connection usable. Successful cold bootstrap releases its
+setup permit without resetting that backoff, so repeated handshakes followed
+by RPC timeouts retain the existing retry escalation.
+Failure or cancellation during a negotiated call publishes one shared
+reconnect cooldown using the existing lifecycle policy. The loss retains the
+connection's admitted epoch, so a late predecessor cannot delay a newer epoch.
+A complete correlated semantic response does not count as transport loss.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side
@@ -275,6 +285,15 @@ exactly one ALPN. `/3` accepts only its roster operation set and exact
 tenant/scope/fence authority, never shares a lane or fallback path with `/1`
 or `/2`, and is excluded from `/2` capacity accounting and idle reclaim.
 
+For a recovered mutation roster, the first provider-authenticated Applied
+observation from status or adoption becomes conclusive under the current
+authority. It does not restore prepare/execute permission. Direct compensation
+still requires a complete conclusive roster with an irreversible abort result.
+An Applied observation retained before a genuinely ambiguous compensation is
+different: subsequent status/adoption cannot authorize another inverse. That
+attempt remains recovery-only until exact compensation is proved. Neither an
+incomplete roster nor an all-Applied roster grants compensation authority.
+
 This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
 retains #696's generic, single-record atomic fenced-transition capability,
@@ -317,7 +336,15 @@ separately implement `SessionBackend`. This lets the fenced router compose the r
 `SessionConsumerFencedTransitionBackend` without inventing lease authority.
 `SessionConsumerPreparedCheckpointBackend` remains the separate full
 protected-session composite for prepared CAS and lease operations, which do
-require `ProtectedSessionBackend` and its lease surface.
+require `ProtectedSessionBackend` and its lease surface. Each prepared CAS or
+lease acquire starts at a rotating origin voter. It moves the identical
+request to the next voter after a proven pre-write failure or a complete
+closed `Rejected(Unavailable)` reply, which a server returns only before the
+operation reaches the consensus state machine. It ends `NotTransmitted` when
+every voter rejects or is unreachable. Scope, topology, authorization and
+validation rejections are terminal. The persistent client counts a closed
+`Rejected(Unavailable)` reply as a not-transmitted completion, not as an
+unsafe failure.
 
 `prepare_fenced_transition` keeps the exact outer protected journal token
 private in a move-only `SessionConsumerPreparedFencedTransition` handle. The
@@ -331,6 +358,10 @@ still pre-dispatch, cancellation is safe and retryable because no application
 bytes can cross the transport boundary. Once dispatch starts, any possible send
 (`OutcomeUnknown`) or cancellation makes the affine handle permanently
 receipt-only; it can never dispatch the mutation again.
+A complete closed `Rejected(Unavailable)` reply proves that the voter did not
+dispatch the transition. Because the call was already written, the handle
+returns a terminal `NotTransmitted` result and does not advance to another
+voter.
 An authenticated-scope `BeforeCallWrite` failure is topology revocation, not a
 rotatable `NotTransmitted` result, and terminalizes the handle.
 
@@ -877,6 +908,23 @@ interval. No retained encoded-JSON byte store can exceed the budget. Deadline
 expiry terminates the connection and releases its handler/connection permit,
 so an authenticated slow reader cannot retain a server slot indefinitely.
 
+The bounded encoder checks control at entry to every serializer write and
+between retained chunk copies. The entry check covers the first copy; a second
+probe immediately before that same copy adds no cooperative cancellation
+boundary. Post-serialization and pre-prefix checks still reject expiration or
+cancellation without emitting bytes. Chunk sizes, retained-byte ceilings, wire
+bytes and the original absolute deadline are unchanged.
+
+The synthetic `consumer::payload_profile::encrypted_get_response_local_stage_profile`
+test reports separate local encode, strict decode and payload-crypto samples.
+Set `OPC_CONSUMER_PAYLOAD_PROFILE_CYCLES=100` and run it alone with
+`cargo test --release --locked -p opc-session-net --lib --features test-control consumer::payload_profile::encrypted_get_response_local_stage_profile -- --exact --nocapture --test-threads=1`.
+Record the optimization profile and host conditions when comparing revisions.
+The default is one cycle for correctness gates. These local stages exclude TLS
+and quorum; strict decoding includes parsing and canonical reserialization, so
+nested stage times must not be added. They do not establish request latency or
+deployment capacity.
+
 Response families use these fail-closed rules:
 
 | Family | Oversize backend/output behavior |
@@ -987,10 +1035,10 @@ authenticated connection, bound to the immutable consensus/configuration
 identity, remote node, admitted TLS material epoch, and explicit
 reauthentication generation. It is monitored for evidence changes, lifecycle
 retirement, and pool shutdown. If a change races with a claim, the claimant
-revalidates and records retirement before dispatch. A connection whose
-authenticated evidence matches the current local generation/material epoch and
-is still dispatch-usable resets the gate. If reconnect cooldown extends beyond
-the admitted cold deadline, that caller returns `Timeout` without dialing or
+revalidates and records retirement before dispatch. A complete reusable RPC
+response on a connection whose authenticated evidence matches the current
+local generation/material epoch resets the consensus gate. If reconnect
+cooldown extends beyond the admitted cold deadline, that caller returns `Timeout` without dialing or
 spinning; a later RPC may retry. Publishing a newer material epoch or requesting
 explicit reauthentication supersedes old cooldowns and cancels an old-epoch
 handshake; the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope,
@@ -1437,6 +1485,15 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   conservative maximum-payload round trips, fixed redaction-safe fallbacks,
   slow-reader deadline reaping, connection-slot recovery, and deterministic
   shutdown while a write is blocked.
+- The three-voter fixtures in `tests/stateless_quorum_consumer.rs` await
+  listener and engine quiescence on normal return, keeping their original
+  fixture binding alive until later service/transport clones drop. Restart
+  transfers the same isolation guards without a release/reacquire gap.
+  Detectors check real clone-wide engine shutdown and a queued restart waiter;
+  normal Drop rejects an unjoined fixture. The panic fallback only aborts
+  listeners, and intentional OS process-loss exits still bypass destructors.
+  This test isolation does not reserve production apply headroom or guarantee
+  progress under arbitrary verifier pressure (Refs #815).
 - Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License

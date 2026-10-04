@@ -1,0 +1,71 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "installed-child-sa-evidence-reference",
+  "context": {
+    "source_vector": {
+      "path": "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json",
+      "sha256": "b092689801a0f85e2d32580ee5ab66b9a103291aa5db36baaf55d815504b3f55",
+      "case": "relocation-foreign-member"
+    },
+    "cases": 56,
+    "evidence_kind": "independent-obligation-projection",
+    "public_sdk": {
+      "base": "58acdfe9afc1cd0b5c7d2fc9a0d1f01bed4325d6",
+      "head": "1c7012e6667a29f27d1100f3492dff5cc2c05d34",
+      "tree": "1de2e42f567031052e26322d0f581b87993180b2"
+    },
+    "execution_claim": false,
+    "requires_separate_runtime_qualification": true,
+    "grants_authority": false,
+    "external_interoperability": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-foreign-member",
+  "subset": "xfrm-roster",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 4301, RFC 4303, RFC 4555 and bounded SDK profile",
+    "release": "Published RFCs",
+    "clauses": [
+      "RFC 4301 4.4",
+      "RFC 4303 3.3 and 3.4",
+      "RFC 4555 3.3, 3.5, 4 and 5",
+      "SDK installed Child-SA and ordered relocation contracts"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Caller-owned established IKE association, namespace writer/send exclusion and separately qualified bounded backend; loading this record admits no effect",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json#relocation-foreign-member",
+    "notes": "Independent contract-model projections and authored obligations for separately qualified public SDK tests. No packet capture, kernel execution, subscriber trust or live authority is produced by this record."
+  },
+  "sanitized_fields": [
+    {
+      "name": "cases",
+      "treatment": "synthetic-ordinals-phases-and-outcomes",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "test-material",
+      "treatment": "source-digests-only-no-key-packet-or-endpoint-values",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/child-sa-relocation-foreign-member.hex",
+    "digest_sha256": "3480e99948399648d20d2f612001354634bd4fbea658188dc4230cf60e99e9cc"
+  },
+  "semantic_assertions": [
+    "family=relocation-foreign-member",
+    "cases=56",
+    "execution_claim=false",
+    "requires_separate_runtime_qualification=true",
+    "grants_authority=false",
+    "external_interoperability=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

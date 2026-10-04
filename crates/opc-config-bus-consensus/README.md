@@ -45,6 +45,31 @@ Authoritative buses use `RaftManagedDatastore::new_local_authority`, which
 rejects a mutation after deposition instead of forwarding it. The existing
 `new` constructor retains forwarding for non-authoritative SDK clients.
 
+For required replicated management audit, explicitly initialize the same
+store's audit authority and instead use
+`RaftManagedDatastore::new_audited_local_authority(store, ConfigAuditPolicy)`.
+Keep encryption and the local projection gate in the positions shown above.
+Every configuration append then requires an acknowledged Intent and atomically
+retains its authoritative outcome plus a reserved terminal obligation. A
+terminal-recording failure cannot change a known successful result. The
+management supervisor must run `reconcile_audit_obligations` at startup and
+during bounded maintenance. Missing audit authority, invalid privacy projection
+or exhausted capacity never falls back to an unaudited write; a deposed local
+writer never forwards a mutation. See the
+[replicated management audit contract](../../docs/replicated-management-audit.md)
+for protocol-sink scope, caller privacy, response-loss recovery and the separate
+external-checkpoint composition.
+
+For gNMI, obtain `bus.required_config_audit()?` from that same encrypted bus,
+pass its `observation_sink()` to the server constructor, and install the
+capability with `server.with_required_config_audit(audit)?`. The server rejects
+a capability from another bus worker. Set transfers its original protocol
+intent and request together; the encrypted append admits one effect-bound
+intent before mutation. The observation sink refuses standalone Intents, so
+it cannot silently authorize a legacy Set path. Plain and unaudited encryption
+wrappers expose no capability, and the distinct required-append method has no
+ordinary-append fallback. NETCONF keeps its existing contract.
+
 `RaftManagedDatastore::config_authority()` returns a
 `ConsensusConfigAuthority` over that exact `ConsensusConfigStore`. The adapter
 uses its local-only Openraft read-index/apply barrier, never a second leader
@@ -90,6 +115,15 @@ Composing `EncryptingManagedDatastore` outside this adapter propagates the
 marker and decrypts the locally applied head and history pages. The marker is
 not available for arbitrary `ManagedDatastore` implementations, so a Shadow
 `ConfigBus` cannot accidentally be restored from an unproven feed.
+
+## Durable non-voting consumers
+
+`DurableConfigConsumer<C>` composes the authenticated watch with an SDK-owned
+sealed checkpoint and a product-owned apply/readback port. It persists the accepted
+floor and complete apply intent, and requires actual runtime readback after restart
+or ambiguity. It does not manufacture local config commits or become a voter.
+See the [consumer checkpoint contract](CONSUMER_CHECKPOINT.md) for composition,
+limits, lifecycle evidence and the separate global-freshness obligation.
 
 ## Authenticated remote recovery and watch
 
@@ -138,7 +172,7 @@ still receive only the sealed representation. Decryption occurs in the local
 `EncryptingManagedDatastore` before the trusted Shadow bus serves an authorized
 consumer, just as it does for local config readers.
 
-Minimal composition:
+Transport-only composition (durable consumers use the checkpoint contract above):
 
 ```rust,ignore
 use std::sync::Arc;
@@ -210,10 +244,16 @@ Strict operational requirements:
   SPIFFE identities and the product schema digest, and set the config candidate
   byte admission limit so one complete revision fits the response-frame
   contract;
-- for command/RPC revision 3, drain config writers, stop the complete config
-  voter set, upgrade every member, and restart the set together. Revisions 1
-  and 2 remain replayable only under their original semantics; there is no
-  mixed-revision downgrade.
+- command/RPC revision 4 and storage/snapshot representation 2 require an exact
+  matching configuration-authority set. Persisted command revisions 1 through 3
+  retain their original semantics; there is no mixed-revision downgrade.
+  Representation-1 files are refused. A coordinated binary restart is not a
+  conversion, and this change supplies no existing-authority format conversion;
+- retention is an explicit privileged authority operation. Resolve outstanding
+  work and references before acknowledging a prefix, preserve capacity for
+  required mutations, and recover a compacted watch through a complete snapshot.
+  See [ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for bounds,
+  protected references, authenticated floors and the format cutover limitation.
 
 The broader multi-group failure and restart qualification tracked by
 `GAP-001-006` remains required before this crate's source-build-only status can

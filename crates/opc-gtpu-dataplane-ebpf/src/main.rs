@@ -34,7 +34,7 @@ use aya_ebpf::{
         __sk_buff, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, bpf_spin_lock as BpfSpinLock,
         BPF_CSUM_LEVEL_QUERY, BPF_F_ADJ_ROOM_DECAP_L3_IPV4, BPF_F_ADJ_ROOM_DECAP_L3_IPV6,
         BPF_F_ADJ_ROOM_ENCAP_L3_IPV4, BPF_F_ADJ_ROOM_ENCAP_L3_IPV6, BPF_F_ADJ_ROOM_ENCAP_L4_UDP,
-        TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
+        BPF_F_MARK_MANGLED_0, TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
     btf_maps::Array as BtfArray,
     cty::c_void,
@@ -46,19 +46,19 @@ use aya_ebpf::{
     maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::TcContext,
 };
-use opc_gtpu_ebpf_common::classify_ipv6_extension_step;
 use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
     GtpuTrafficObservationRegistration, GtpuTrafficObservationRegistrationWireView,
 };
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
-    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end,
+    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_exceeds_inner_mtu,
     downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
-    marked_owner_wire_authorizes_uplink, pack_downlink_parse_result,
-    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
-    pdp_commit_wire_authorizes_graph, select_gtpu_session_entry_wire,
+    marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
+    pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
+    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
+    pdp_commit_wire_downlink_inner_mtu, select_gtpu_session_entry_wire,
     tft_classifier_filter_matches, tft_classifier_schema_is_current,
     uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
     DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
@@ -75,14 +75,14 @@ use opc_gtpu_ebpf_common::{
     COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
     COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
-    ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN, GTPU_MANDATORY_HDR_LEN,
-    GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN, GTPU_SESSION_CONFIG_KEY,
-    GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
-    GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
+    ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
+    GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
+    GTPU_PACKET_TOO_BIG_QUEUE_PORT, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
     GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
-    GTPU_SESSION_UPLINK_KEY_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
-    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
@@ -90,12 +90,15 @@ use opc_gtpu_ebpf_common::{
     GTPU_TRAFFIC_OBSERVATION_RING_BYTES, GTPU_UDP_PORT, IPV4_MIN_HDR_LEN, IPV6_HDR_LEN,
     IPV6_MAX_EXT_HEADERS, IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS,
     IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, TFT_CLASSIFIER_COUNTER_SLOTS,
-    TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_MAX_FILTERS,
-    TFT_CLASSIFIER_META_MAP_MAX_ENTRIES, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, N3_UPLINK_EXTENSION_LEN,
+    TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
+    TFT_CLASSIFIER_MAX_FILTERS, TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
+    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+};
+use opc_gtpu_ebpf_common::{
+    classify_ipv6_extension_step, gtpu_endpoint_requires_extension_control,
 };
 #[cfg(test)]
 use opc_gtpu_ebpf_common::{internet_checksum, udp_ipv6_checksum};
@@ -1138,11 +1141,15 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
         ETH_P_IPV6 => ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN,
         _ => return,
     };
+    let Some(extra) = uplink_gpdu_extension_length(ctx, inner_offset - GTPU_MANDATORY_HDR_LEN)
+    else {
+        return;
+    };
     emit_grouped_observation(
         ctx,
         Some(authority),
         publication_id,
-        inner_offset,
+        inner_offset + extra,
         GtpuTrafficObservationDirection::AccessToCore,
     );
 }
@@ -1369,7 +1376,9 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
 /// reader observes either bank and constructs every lookup key from that
 /// metadata's owner, generations, bank, and dense precedence rank. The old
 /// bank remains intact until a later pre-publication staging pass, so readers
-/// never race post-publication record cleanup.
+/// never race post-publication record cleanup. A removal fence whose
+/// classifier has a default bearer classifies as absent, the state its
+/// removal publishes last; any other fence drops.
 #[inline(never)]
 fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     let Ok(local_address) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
@@ -1389,7 +1398,17 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     // the all-byte ABI has alignment one and userspace publishes whole values.
     let meta = unsafe { *meta_ptr };
     // SAFETY: the single-slot marker is read-only for this invocation.
-    if !tft_classifier_schema_is_current(unsafe { &*schema_ptr }) || !meta.is_valid() {
+    if !tft_classifier_schema_is_current(unsafe { &*schema_ptr }) {
+        count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+        return TftClassifierUplinkResult::Drop;
+    }
+    // Exact removal deletes rows only under a durable fence. A fence with a
+    // default bearer forwards as its absent successor does, on mark zero,
+    // without reading a row the removal may already have deleted.
+    if meta.has_default() && meta.is_valid_removal_fence() {
+        return TftClassifierUplinkResult::Absent;
+    }
+    if !meta.is_valid() {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
         return TftClassifierUplinkResult::Drop;
     }
@@ -1456,10 +1475,25 @@ fn outer_envelope_is_uplink_gpdu(ctx: &TcContext, l4_offset: usize) -> bool {
     if u16::from_be(destination_port) != GTPU_UDP_PORT {
         return false;
     }
-    let Ok(header) = ctx.load::<[u8; 2]>(l4_offset + UDP_HDR_LEN) else {
-        return false;
-    };
-    header == [GTPU_FLAGS_V1_GPDU, GTPU_MSG_TYPE_GPDU]
+    uplink_gpdu_extension_length(ctx, l4_offset + UDP_HDR_LEN).is_some()
+}
+
+#[inline(always)]
+fn uplink_gpdu_extension_length(ctx: &TcContext, gtp_offset: usize) -> Option<usize> {
+    let header = ctx.load::<[u8; 2]>(gtp_offset).ok()?;
+    if header == [GTPU_FLAGS_V1_GPDU, GTPU_MSG_TYPE_GPDU] {
+        return Some(0);
+    }
+    if header != [GTPU_FLAGS_V1_GPDU | GTPU_FLAG_E, GTPU_MSG_TYPE_GPDU] {
+        return None;
+    }
+    let extension = ctx
+        .load::<[u8; N3_UPLINK_EXTENSION_LEN]>(gtp_offset + GTPU_MANDATORY_HDR_LEN)
+        .ok()?;
+    if n3_uplink_extension(extension[6])? != extension {
+        return None;
+    }
+    Some(N3_UPLINK_EXTENSION_LEN)
 }
 
 /// Return whether `address` is one of this attachment's local S2b-U IPv4
@@ -1486,6 +1520,39 @@ fn local_outer_endpoint_is_ipv4(ctx: &TcContext, address: &[u8; 4]) -> bool {
     // SAFETY: single-slot array value written only by the loader; borrowed
     // read-only for this canonicality check.
     gtpu_session_config_wire_owns_local_ipv4(unsafe { &*config_ptr }, packet_ifindex(ctx), address)
+}
+
+#[inline(always)]
+fn local_outer_endpoint_is_ipv6(ctx: &TcContext, address: &[u8; 16]) -> bool {
+    let Some(config_ptr) = GTPU_CONFIG6.get_ptr(GTPU_SESSION_CONFIG_KEY) else {
+        return false;
+    };
+    // SAFETY: single-slot array value written only by the loader; borrowed
+    // read-only for this canonicality check.
+    gtpu_session_config_wire_owns_local_ipv6(unsafe { &*config_ptr }, packet_ifindex(ctx), address)
+}
+
+/// Preserve an unselected G-PDU for the local control consumer. The caller
+/// has validated its full envelope and excluded retained invalid ownership.
+/// This is an observed lookup miss, not an absence receipt or permission to
+/// respond: the consumer must establish current absence and peer/rate policy.
+#[inline(never)]
+fn unknown_teid_control(ctx: &TcContext, family: GtpuSessionIpFamily) -> i32 {
+    count(COUNTER_DL_UNKNOWN_TEID);
+    let local = match family {
+        GtpuSessionIpFamily::Ipv4 => ctx
+            .load::<[u8; 4]>(ETH_HDR_LEN + 16)
+            .is_ok_and(|address| local_outer_endpoint_is_ipv4(ctx, &address)),
+        GtpuSessionIpFamily::Ipv6 => ctx
+            .load::<[u8; 16]>(ETH_HDR_LEN + 24)
+            .is_ok_and(|address| local_outer_endpoint_is_ipv6(ctx, &address)),
+    };
+    if !local {
+        return binding_drop(DownlinkBindingMismatch::LocalAddress);
+    }
+    // TC_ACT_OK keeps the original outer packet. Never decapsulate the inner
+    // payload or send an automatic Error Indication from the packet path.
+    TC_ACT_OK
 }
 
 /// Return whether this frame is one of this datapath's own re-emitted outer
@@ -1568,16 +1635,7 @@ fn uplink_frame_is_redirect_reentry(ctx: &TcContext, mark: u32, eth_proto: u16) 
             let Ok(source) = ctx.load::<[u8; 16]>(ETH_HDR_LEN + 8) else {
                 return false;
             };
-            let Some(config_ptr) = GTPU_CONFIG6.get_ptr(GTPU_SESSION_CONFIG_KEY) else {
-                return false;
-            };
-            // SAFETY: single-slot array value written only by the loader;
-            // borrowed read-only for this canonicality check.
-            gtpu_session_config_wire_owns_local_ipv6(
-                unsafe { &*config_ptr },
-                packet_ifindex(ctx),
-                &source,
-            )
+            local_outer_endpoint_is_ipv6(ctx, &source)
         }
         _ => false,
     }
@@ -1744,9 +1802,72 @@ fn grouped_downlink_authority<'a>(
     {
         return None;
     }
+    if let Some(qfi) = entry.n3_qfi() {
+        if !grouped_n3_downlink_matches(ctx, l4_offset, payload_offset, qfi) {
+            return None;
+        }
+    }
     *observation_authority = Some(authority);
     *status = GROUPED_LOOKUP_AUTHORIZED;
     Some(entry)
+}
+
+/// Apply the installed flow's PSC constraint only after selecting one exact
+/// atomic group. The envelope parser already bounded this entire chain; repeat
+/// its four-extension bound so optional headers cannot hide a second PSC.
+#[inline(never)]
+fn grouped_n3_downlink_matches(
+    ctx: &TcContext,
+    l4_offset: usize,
+    payload_offset: usize,
+    qfi: u8,
+) -> bool {
+    let gtp_offset = l4_offset + UDP_HDR_LEN;
+    let Ok(flags) = ctx.load::<u8>(gtp_offset) else {
+        return false;
+    };
+    if flags & GTPU_FLAG_E == 0 {
+        return false;
+    }
+    let mut cursor = gtp_offset + GTPU_MANDATORY_HDR_LEN + GTPU_OPT_LEN;
+    if cursor > payload_offset {
+        return false;
+    }
+    let Ok(mut next) = ctx.load::<u8>(cursor - 1) else {
+        return false;
+    };
+    let mut found = false;
+    let mut walked = 0;
+    while next != 0 {
+        if walked == GTPU_MAX_EXT_HEADERS || cursor >= payload_offset {
+            return false;
+        }
+        let Ok(units) = ctx.load::<u8>(cursor) else {
+            return false;
+        };
+        let end = cursor + usize::from(units) * 4;
+        if units == 0 || end > payload_offset {
+            return false;
+        }
+        if next == 0x85 {
+            let Ok(prefix) = ctx.load::<[u8; 3]>(cursor) else {
+                return false;
+            };
+            if found || !n3_downlink_psc_matches(prefix, qfi) {
+                return false;
+            }
+            found = true;
+        } else if gtpu_endpoint_requires_extension_control(next) {
+            return false;
+        }
+        let Ok(following) = ctx.load::<u8>(end - 1) else {
+            return false;
+        };
+        next = following;
+        cursor = end;
+        walked += 1;
+    }
+    found && cursor == payload_offset
 }
 
 #[inline(always)]
@@ -1914,7 +2035,13 @@ fn prepare_grouped_ipv6_encapsulation(
 ) -> Option<u32> {
     let peer = entry.peer_outer_wire();
     let local = entry.local_outer_wire();
-    let udp_length = inner_len.checked_add(16)?;
+    let extra = if entry.n3_qfi().is_some() {
+        N3_UPLINK_EXTENSION_LEN as u16
+    } else {
+        0
+    };
+    let gtp_length = inner_len.checked_add(extra)?;
+    let udp_length = gtp_length.checked_add(16)?;
     let source_port = entry.uplink_source_port();
     if source_port == 0 {
         return None;
@@ -1930,9 +2057,9 @@ fn prepare_grouped_ipv6_encapsulation(
     encap[40..42].copy_from_slice(&source_port.to_be_bytes());
     encap[42..44].copy_from_slice(&GTPU_UDP_PORT.to_be_bytes());
     encap[44..46].copy_from_slice(&udp_length.to_be_bytes());
-    encap[48] = GTPU_FLAGS_V1_GPDU;
+    encap[48] = GTPU_FLAGS_V1_GPDU | if extra != 0 { GTPU_FLAG_E } else { 0 };
     encap[49] = GTPU_MSG_TYPE_GPDU;
-    encap[50..52].copy_from_slice(&inner_len.to_be_bytes());
+    encap[50..52].copy_from_slice(&gtp_length.to_be_bytes());
     encap[52..56].copy_from_slice(&entry.peer_teid());
 
     let mut pseudo_header = [0_u8; 40];
@@ -1968,6 +2095,20 @@ fn prepare_grouped_ipv6_encapsulation(
     if fixed_sum < 0 {
         return None;
     }
+    if let Some(qfi) = entry.n3_qfi() {
+        let mut extension = n3_uplink_extension(qfi)?;
+        // SAFETY: the initialized eight-byte PSC block is a multiple of four.
+        let sum = unsafe {
+            bpf_csum_diff(
+                core::ptr::null_mut(),
+                0,
+                extension.as_mut_ptr().cast::<u32>(),
+                N3_UPLINK_EXTENSION_LEN as u32,
+                fixed_sum as u32,
+            )
+        };
+        return if sum < 0 { None } else { Some(sum as u32) };
+    }
     Some(fixed_sum as u32)
 }
 
@@ -1979,9 +2120,17 @@ fn encapsulate_grouped_ipv6(
     inner_len: u16,
     authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> i32 {
+    let extra = if entry.n3_qfi().is_some() {
+        N3_UPLINK_EXTENSION_LEN as u16
+    } else {
+        0
+    };
+    let Some(accounted_len) = inner_len.checked_add(extra) else {
+        return TC_ACT_SHOT;
+    };
     if entry.outer_family() != GtpuSessionIpFamily::Ipv6
         || !checksum_bytes_are_materialized(ctx)
-        || !ipv6_uplink_pmtu_allows(inner_len, entry.inner_family())
+        || !ipv6_uplink_pmtu_allows(accounted_len, entry.inner_family())
     {
         return TC_ACT_SHOT;
     }
@@ -1996,7 +2145,7 @@ fn encapsulate_grouped_ipv6(
     if ctx
         .skb
         .adjust_room(
-            encap.len() as i32,
+            encap.len() as i32 + i32::from(extra),
             BPF_ADJ_ROOM_MAC,
             u64::from(BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 | BPF_F_ADJ_ROOM_ENCAP_L4_UDP),
         )
@@ -2004,6 +2153,17 @@ fn encapsulate_grouped_ipv6(
         || ctx.store(ETH_HDR_LEN, &encap, 0).is_err()
     {
         return TC_ACT_SHOT;
+    }
+    if let Some(qfi) = entry.n3_qfi() {
+        let Some(extension) = n3_uplink_extension(qfi) else {
+            return TC_ACT_SHOT;
+        };
+        if ctx
+            .store(ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN, &extension, 0)
+            .is_err()
+        {
+            return TC_ACT_SHOT;
+        }
     }
     complete_grouped_uplink(ctx, mark, ETH_P_IPV6, authority)
 }
@@ -2019,6 +2179,14 @@ fn encapsulate_grouped_ipv4(
     if entry.outer_family() != GtpuSessionIpFamily::Ipv4 {
         return TC_ACT_SHOT;
     }
+    let extra = if entry.n3_qfi().is_some() {
+        N3_UPLINK_EXTENSION_LEN as u16
+    } else {
+        0
+    };
+    let Some(accounted_len) = inner_len.checked_add(extra) else {
+        return TC_ACT_SHOT;
+    };
     let peer = entry.peer_outer_wire();
     let local = entry.local_outer_wire();
     let far = UplinkFar {
@@ -2028,12 +2196,15 @@ fn encapsulate_grouped_ipv4(
     };
     let Some(mut encap) = build_uplink_encap_with_dscp_and_source_port(
         &far,
-        inner_len,
+        accounted_len,
         entry.egress_dscp(),
         entry.uplink_source_port(),
     ) else {
         return TC_ACT_SHOT;
     };
+    if extra != 0 {
+        encap[28] |= GTPU_FLAG_E;
+    }
     if let Some(policy_ptr) = GTPU_PMTU_CFG.get_ptr(0) {
         // SAFETY: one aligned four-byte map value is read atomically.
         let bytes = unsafe { (policy_ptr as *const u32).read_unaligned() }.to_ne_bytes();
@@ -2056,7 +2227,7 @@ fn encapsulate_grouped_ipv4(
     if ctx
         .skb
         .adjust_room(
-            encap.len() as i32,
+            encap.len() as i32 + i32::from(extra),
             BPF_ADJ_ROOM_MAC,
             u64::from(BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 | BPF_F_ADJ_ROOM_ENCAP_L4_UDP),
         )
@@ -2064,6 +2235,17 @@ fn encapsulate_grouped_ipv4(
         || ctx.store(ETH_HDR_LEN, &encap, 0).is_err()
     {
         return TC_ACT_SHOT;
+    }
+    if let Some(qfi) = entry.n3_qfi() {
+        let Some(extension) = n3_uplink_extension(qfi) else {
+            return TC_ACT_SHOT;
+        };
+        if ctx
+            .store(ETH_HDR_LEN + GTPU_ENCAP_LEN, &extension, 0)
+            .is_err()
+        {
+            return TC_ACT_SHOT;
+        }
     }
     complete_grouped_uplink(ctx, mark, ETH_P_IPV4, authority)
 }
@@ -2195,9 +2377,13 @@ const IPV6_EXTENSION_FLAGS_MASK: u32 = IPV6_EXTENSION_FLAG_FRAGMENT
     | IPV6_EXTENSION_FLAG_FINAL_DESTINATION;
 // Observation begins after a proven outer GTP-U envelope, while the existing
 // downlink parser starts at Ethernet. Bound both positions so bpf_loop state
-// remains verifier-friendly without assuming a fixed inner IPv6 offset.
-const IPV6_PACKET_MAX_END: u32 =
-    (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN + IPV6_HDR_LEN + u16::MAX as usize) as u32;
+// remains verifier-friendly without assuming a fixed inner IPv6 offset. The
+// largest envelope includes the optional block and uplink N3 PSC. Retaining
+// the pre-PSC 70-byte bound also lets EL9 prune the callback's success path
+// after admitting the new 78-byte observation offset in its caller.
+const IPV6_PACKET_MAX_START: u32 =
+    (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN + N3_UPLINK_EXTENSION_LEN) as u32;
+const IPV6_PACKET_MAX_END: u32 = IPV6_PACKET_MAX_START + IPV6_HDR_LEN as u32 + u16::MAX as u32;
 const IPV6_OPTIONS_MAX_BYTES: u32 = (u8::MAX as u32 + 1) * 8 - 2;
 const IPV6_TERMINAL_UDP: u32 = 0;
 const IPV6_TERMINAL_OBSERVATION: u32 = 1;
@@ -2242,9 +2428,7 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
     // `bpf_loop` revisits this callback with caller-stack scalars. Reassert
     // every protocol bound so imprecise merged states cannot turn a bounded
     // packet cursor or state field into an unbounded branch.
-    if context.ip_start < ETH_HDR_LEN as u32
-        || context.ip_start > (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN) as u32
-    {
+    if context.ip_start < ETH_HDR_LEN as u32 || context.ip_start > IPV6_PACKET_MAX_START {
         context.state = IPV6_EXTENSION_STATE_FAILED;
         return 1;
     }
@@ -2728,6 +2912,7 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
     let Some(mut payload_offset) = gtp_offset.checked_add(GTPU_MANDATORY_HDR_LEN) else {
         return IPV6_PARSE_DROP;
     };
+    let mut requires_control = false;
     if has_opt {
         let Some(optional_end) = payload_offset.checked_add(GTPU_OPT_LEN) else {
             return IPV6_PARSE_DROP;
@@ -2764,11 +2949,17 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
                 let Ok(following) = ctx.load::<u8>(extension_end - 1) else {
                     return IPV6_PARSE_DROP;
                 };
+                requires_control |= gtpu_endpoint_requires_extension_control(next_extension);
                 payload_offset = extension_end;
                 next_extension = following;
                 walked += 1;
             }
         }
+    }
+    // Validate the entire chain before handing the original packet to the
+    // shared control queue, without any PDR lookup or decapsulation.
+    if requires_control {
+        return IPV6_PARSE_PASS;
     }
     if payload_offset >= gtp_end
         || payload_offset
@@ -2853,9 +3044,9 @@ fn handle_downlink_ipv6(ctx: &mut TcContext) -> i32 {
         None if status == GROUPED_LOOKUP_ERROR => binding_drop(DownlinkBindingMismatch::Invalid),
         None => {
             // The frozen v5 schema has no outer-IPv6 selector. A valid G-PDU
-            // with no grouped owner is therefore unknown, never pass-through.
-            count(COUNTER_DL_UNKNOWN_TEID);
-            TC_ACT_SHOT
+            // with no grouped selector can reach only the configured local
+            // control endpoint; retained invalid grouped state was refused.
+            unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv6)
         }
     }
 }
@@ -3948,6 +4139,7 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
     let Some(mut payload_offset) = gtp_offset.checked_add(GTPU_MANDATORY_HDR_LEN) else {
         return u64::from(malformed_downlink() as u32);
     };
+    let mut requires_control = false;
     if has_opt {
         let Some(optional_end) = payload_offset.checked_add(GTPU_OPT_LEN) else {
             return u64::from(malformed_downlink() as u32);
@@ -3984,11 +4176,17 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
                 let Ok(next) = ctx.load::<u8>(ext_end - 1) else {
                     return u64::from(malformed_downlink() as u32);
                 };
+                requires_control |= gtpu_endpoint_requires_extension_control(next_ext);
                 payload_offset = ext_end;
                 next_ext = next;
                 walked += 1;
             }
         }
+    }
+    // Validate the entire chain before handing the original packet to the
+    // shared control queue, without any PDR lookup or decapsulation.
+    if requires_control {
+        return u64::from(TC_ACT_OK as u32);
     }
     if payload_offset >= gtp_end {
         return u64::from(malformed_downlink() as u32);
@@ -4004,6 +4202,58 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
         return u64::from(malformed_downlink() as u32);
     };
     pack_downlink_parse_result(u16::from_be(total_length), payload_offset, teid)
+}
+
+/// Return whether an authorized inner IPv4 packet exceeds its Active commit's
+/// optional downlink inner MTU with Don't Fragment set.
+#[inline(never)]
+fn downlink_inner_exceeds_session_mtu(
+    ctx: &TcContext,
+    commit: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    payload_offset: usize,
+) -> bool {
+    let mtu = pdp_commit_wire_downlink_inner_mtu(commit);
+    if mtu == 0 {
+        return false;
+    }
+    let Ok(total_length) = ctx.load::<u16>(payload_offset + 2) else {
+        return false;
+    };
+    let Ok(flags_fragment) = ctx.load::<u16>(payload_offset + 6) else {
+        return false;
+    };
+    downlink_ipv4_exceeds_inner_mtu(
+        mtu,
+        u16::from_be(total_length),
+        u16::from_be(flags_fragment),
+    )
+}
+
+/// Steer one authorized over-MTU G-PDU, undecapsulated, to the backend-owned
+/// packet-too-big queue by rewriting only its UDP destination port.
+///
+/// The UDP checksum is updated incrementally (a zero checksum stays zero), so
+/// the port change and its compensation cancel in any complete-checksum
+/// state. A flood of such packets can then fill only the dedicated queue,
+/// never the shared UDP/2152 queue carrying Echo and reassembled G-PDUs.
+#[inline(never)]
+fn hand_off_packet_too_big(ctx: &mut TcContext, l4_offset: usize) -> i32 {
+    let from = u16::from_ne_bytes(GTPU_UDP_PORT.to_be_bytes());
+    let to = u16::from_ne_bytes(GTPU_PACKET_TOO_BIG_QUEUE_PORT.to_be_bytes());
+    if ctx
+        .l4_csum_replace(
+            l4_offset + 6,
+            u64::from(from),
+            u64::from(to),
+            u64::from(BPF_F_MARK_MANGLED_0) | 2,
+        )
+        .is_err()
+        || ctx.store(l4_offset + 2, &to, 0).is_err()
+    {
+        count(COUNTER_DL_MALFORMED);
+        return TC_ACT_SHOT as i32;
+    }
+    TC_ACT_OK as i32
 }
 
 /// Authorize the complete downlink forwarding identity and perform decap.
@@ -4023,8 +4273,12 @@ fn authorize_and_decap_legacy_downlink(
     let marked_pdr = GTPU_DLM_PDR.get_ptr(&teid);
     let (pdr, output_mark, owner_selector) = match (legacy_pdr, marked_pdr) {
         (None, None) => {
-            count(COUNTER_DL_UNKNOWN_TEID);
-            return TC_ACT_SHOT as i32;
+            if GTPU_DL_BIND.get_ptr(&teid).is_some() {
+                // A partially removed graph is not an unowned tunnel. Keep
+                // its retained binding fail-closed until reconciliation.
+                return binding_drop(DownlinkBindingMismatch::Invalid);
+            }
+            return unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv4);
         }
         (Some(_), Some(_)) => {
             // A TEID must exist in exactly one schema. Treat externally
@@ -4159,6 +4413,17 @@ fn authorize_and_decap_legacy_downlink(
         count(COUNTER_DL_DST_MISMATCH);
         return TC_ACT_SHOT as i32;
     }
+    if downlink_inner_exceeds_session_mtu(ctx, commit, payload_offset) {
+        // The session's optional downlink inner MTU cannot carry this DF
+        // packet after access-side encapsulation. Hand the exact authorized
+        // G-PDU, undecapsulated, to the backend-owned packet-too-big queue.
+        // Its consumer fragments the inner packet by default (RFC 4459
+        // section 3.4), or signals the originator inside the UE's
+        // default-bearer uplink tunnel when the session opted in (RFC 1191).
+        // Decapsulating here would let the host emit an unroutable,
+        // plaintext-quoting ICMP error instead.
+        return hand_off_packet_too_big(ctx, l4_offset);
+    }
 
     // Strip outer IPv4 + UDP + GTP-U (+ optional block and extension
     // headers), leaving `[Ethernet][inner IPv4 ...]`.
@@ -4181,6 +4446,68 @@ fn authorize_and_decap_legacy_downlink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_ipv6_observation_context(
+        ip_start: u32,
+        payload_len: u32,
+    ) -> Ipv6ExtensionLoopContext {
+        Ipv6ExtensionLoopContext {
+            // These tests terminate at the already-read ICMPv6 selector or a
+            // scalar bound. Neither path reads skb bytes or calls a helper.
+            skb: core::ptr::null_mut(),
+            ip_start,
+            ip_end: ip_start + 40 + payload_len,
+            cursor: ip_start + 40,
+            option_remaining: 0,
+            walked: 0,
+            options_walked: 0,
+            next_header: 58,
+            flags: 0,
+            state: IPV6_EXTENSION_STATE_WALK,
+            terminal: IPV6_TERMINAL_OBSERVATION,
+            reject_fragments: 1,
+        }
+    }
+
+    #[test]
+    fn ipv6_observation_walker_admits_ordinary_and_psc_payload_offsets() {
+        // Literal Ethernet + IPv4/IPv6 + UDP + mandatory/PSC GTP-U extents.
+        // Include the unencapsulated downlink position and the maximum legal
+        // IPv6 payload so both cursor and declared-end bounds are exercised.
+        for ip_start in [14, 50, 58, 70, 78] {
+            for payload_len in [40, 65_535] {
+                let mut context = terminal_ipv6_observation_context(ip_start, payload_len);
+                // SAFETY: the complete live context is uniquely borrowed. Its
+                // terminal selector takes the callback's helper-free path.
+                let stopped = unsafe {
+                    walk_ipv6_extension_step(
+                        0,
+                        (&mut context as *mut Ipv6ExtensionLoopContext).cast(),
+                    )
+                };
+                assert_eq!(stopped, 1);
+                assert_eq!(
+                    context.state, IPV6_EXTENSION_STATE_DONE,
+                    "offset {ip_start}"
+                );
+                assert_eq!(context.cursor, ip_start + 40);
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_observation_walker_rejects_out_of_profile_scalar_bounds() {
+        for (ip_start, payload_len) in [(13, 40), (79, 40), (78, 65_536)] {
+            let mut context = terminal_ipv6_observation_context(ip_start, payload_len);
+            // SAFETY: this complete live context is uniquely borrowed; the
+            // invalid scalar bound returns before any skb/helper access.
+            let stopped = unsafe {
+                walk_ipv6_extension_step(0, (&mut context as *mut Ipv6ExtensionLoopContext).cast())
+            };
+            assert_eq!(stopped, 1);
+            assert_eq!(context.state, IPV6_EXTENSION_STATE_FAILED);
+        }
+    }
 
     // The pre-#655 generic tuple-correlation host model is deliberately kept
     // out of the test graph. It describes a producer contract that must never
@@ -5588,12 +5915,12 @@ mod tests {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         for (classifier, terminator, first_packet_read) in [
             (
-                "pub fn opc_gtpu_uplink(mut ctx: TcContext)",
+                "pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32",
                 "#[classifier]\npub fn opc_gtpu_downlink",
                 "let mark = packet_mark(&ctx);",
             ),
             (
-                "pub fn opc_gtpu_downlink(mut ctx: TcContext)",
+                "pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32",
                 "/// Uplink: inner IPv4 packet",
                 "let Ok(ether_type) = ctx.load::<u16>(12)",
             ),
@@ -5720,6 +6047,41 @@ mod tests {
             .expect("post-loop selected mark lookup is present");
         assert!(loop_call < selected_mark);
         assert!(classifier.contains("u32::from(meta.filter_count())"));
+    }
+
+    #[test]
+    fn default_removal_fence_classifies_as_absent_before_any_row_is_read() {
+        // The host test cannot run tc; the privileged
+        // `ebpf_gtpu_tft_classifier_removal_*` proofs do. Retain the order
+        // they depend on: the schema is checked first, and a default fence
+        // returns before the active-selector check, the packet parse, and
+        // the row loop.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, classifier) = source
+            .split_once("fn classify_owned_tft_uplink(ctx: &TcContext)")
+            .expect("owned TFT classifier is present");
+        let schema = classifier
+            .find("if !tft_classifier_schema_is_current(")
+            .expect("schema check is present");
+        let fence = classifier
+            .find(
+                "if meta.has_default() && meta.is_valid_removal_fence() {\n        \
+                 return TftClassifierUplinkResult::Absent;",
+            )
+            .expect("a default removal fence classifies as absent");
+        let selector = classifier
+            .find("if !meta.is_valid() {")
+            .expect("active-selector check is present");
+        let parse = classifier
+            .find("parse_owned_tft_ipv4(ctx, local_address)")
+            .expect("packet parse is present");
+        let loop_call = classifier
+            .find("bpf_loop(")
+            .expect("bounded TFT loop is present");
+        assert!(schema < fence);
+        assert!(fence < selector);
+        assert!(selector < parse);
+        assert!(parse < loop_call);
     }
 
     #[test]

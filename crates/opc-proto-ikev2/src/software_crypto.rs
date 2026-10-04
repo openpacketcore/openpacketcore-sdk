@@ -35,7 +35,7 @@ use rand::{rngs::SysRng, TryRng};
 #[cfg(feature = "rsa-signing")]
 use rsa::{traits::PublicKeyParts, RsaPrivateKey};
 use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::{Digest, Sha256, Sha384};
+use sha2::{Sha256, Sha384};
 use zeroize::Zeroizing;
 
 #[cfg(feature = "rsa-signing")]

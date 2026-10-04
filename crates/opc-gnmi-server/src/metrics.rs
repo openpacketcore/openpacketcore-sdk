@@ -5,6 +5,15 @@ use std::time::Duration;
 use opc_mgmt_errors::MgmtStatus;
 use opc_redaction::metrics::{metrics_label_safe, LatencyHistogram, METRICS};
 
+/// Records a failed terminal audit write without request or principal labels.
+pub(crate) fn record_terminal_audit_failure() {
+    let _ = METRICS.gnmi_terminal_audit_failures_total.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    );
+}
+
 /// Low-cardinality gNMI RPC labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GnmiOperation {

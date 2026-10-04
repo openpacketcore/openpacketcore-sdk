@@ -1,41 +1,40 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    # The example uses path dependencies from the root workspace. Keep both
+    # lockfiles in the same update so inherited manifest changes stay buildable.
+    directories:
+      - /
+      - /examples/smf-reference
     schedule:
       interval: weekly
     groups:
       rust-minor-and-patch:
+        patterns:
+          - "*"
         update-types:
           - minor
           - patch
-
-  - package-ecosystem: cargo
-    directory: /examples/smf-reference
-    schedule:
-      interval: weekly
-    groups:
-      rust-minor-and-patch:
+      # Breaking upgrades still need both lockfiles updated in the same PR.
+      # Keep each dependency separate so its migration can be reviewed alone.
+      rust-major:
+        group-by: dependency-name
+        patterns:
+          - "*"
         update-types:
-          - minor
-          - patch
+          - major
 
   - package-ecosystem: gomod
-    directory: /operators/operator-sdk-go
+    # The reference operator replaces the SDK module with the local directory.
+    directories:
+      - /operators/operator-sdk-go
+      - /operators/sdk-reference-operator
     schedule:
       interval: weekly
     groups:
       go-minor-and-patch:
-        update-types:
-          - minor
-          - patch
-
-  - package-ecosystem: gomod
-    directory: /operators/sdk-reference-operator
-    schedule:
-      interval: weekly
-    groups:
-      go-minor-and-patch:
+        patterns:
+          - "*"
         update-types:
           - minor
           - patch
@@ -44,3 +43,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

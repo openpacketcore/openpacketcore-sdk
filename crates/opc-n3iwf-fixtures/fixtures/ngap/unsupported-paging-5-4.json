@@ -1,0 +1,52 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.unsupported-paging-5-4",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.4.1",
+      "TS 29.413 5.4"
+    ]
+  },
+  "direction": "amf-to-n3iwf",
+  "role": "amf",
+  "prerequisite": "Issue 493 empty-IE wrapper helper; IE values remain unsupported",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::empty_ie_pdu",
+    "notes": "Paging empty ProtocolIE-Container. TS 29.413 V18.5.0 clause 5.4. Constructed N3IWF send is unsupported."
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unsupported-paging-5-4.hex",
+    "digest_sha256": "cd03b6779e93bd097bab101241779c6a7177761d186be2690e4c0a9697cda3bd"
+  },
+  "semantic_assertions": [
+    "procedure=24",
+    "outcome=initiating",
+    "ts29413=5.4",
+    "matrix=paging",
+    "constructed_typed_encode=unsupported"
+  ],
+  "expected_outcome": "unsupported",
+  "runtime_claim": false
+}

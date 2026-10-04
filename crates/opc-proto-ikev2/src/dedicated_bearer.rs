@@ -27,7 +27,7 @@ mod exchange;
 mod qos;
 
 pub(crate) use exchange::{
-    traffic_selector_payload_is_narrowed, validate_sa_build, validate_sa_view,
+    traffic_selector_payload_is_narrowed, validate_ke_view, validate_sa_build, validate_sa_view,
     validate_selected_key_exchange, validate_selected_proposal, Ikev2SelectedKeyExchangeError,
 };
 

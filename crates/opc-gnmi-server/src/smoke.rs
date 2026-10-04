@@ -22,12 +22,12 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use tonic::client::Grpc;
-use tonic::codec::ProstCodec;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::codegen::http::Uri;
 use tonic::codegen::Service;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
+use tonic_prost::ProstCodec;
 
 use crate::get::yang_path_to_proto;
 use crate::proto::gnmi;
@@ -1060,6 +1060,10 @@ fn extract_leaf_json(response: &gnmi::GetResponse, leaf_path: &str) -> Option<St
     })
 }
 
+#[expect(
+    deprecated,
+    reason = "retain the existing gNMI legacy-value wire policy"
+)]
 fn typed_json(value: &gnmi::TypedValue) -> Option<String> {
     match value.value.as_ref()? {
         gnmi::typed_value::Value::JsonIetfVal(bytes) | gnmi::typed_value::Value::JsonVal(bytes) => {

@@ -1,0 +1,69 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "rfc6083-profile-evidence-reference",
+  "context": {
+    "source_vector": {
+      "path": "crates/opc-n3iwf-fixtures/oracles/dtls-profiles.json",
+      "sha256": "6d5dc50a0cf8e6a797ee878f1398475ec818ddf70dfea2ba6af2fcf82ae7fe3f",
+      "case": "coordinated-rekey"
+    },
+    "cases": 25,
+    "evidence_kind": "authored-runtime-test-obligations",
+    "execution_claim": false,
+    "requires_separate_runtime_qualification": true,
+    "protected_ppid": 66,
+    "external_interoperability": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.profile-coordinated-rekey",
+  "subset": "n2-dtls",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 6083 and bounded SDK profile",
+    "release": "RFC 6083",
+    "clauses": [
+      "4.1",
+      "4.4",
+      "4.5",
+      "4.6",
+      "4.7",
+      "4.8",
+      "4.9",
+      "SDK evidence-reference contract"
+    ]
+  },
+  "direction": "local-transport",
+  "role": "dtls-sctp-endpoint",
+  "prerequisite": "The explicitly selected SDK profile and separate runtime qualification; catalog loading does not execute a transport",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/dtls-profiles.json#coordinated-rekey",
+    "notes": "Digest-bound projections of independent public vectors or authored obligations for separately qualified tests. No capture, handshake, kernel or external interoperability claim from this record."
+  },
+  "sanitized_fields": [
+    {
+      "name": "cases",
+      "treatment": "synthetic-roles-indices-and-outcomes",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "transport-material",
+      "treatment": "digests-only-no-key-certificate-record-or-endpoint-values",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/profile-coordinated-rekey.hex",
+    "digest_sha256": "cbe6a512ede9dfb0526300098ea0808b4c9525556c98807f4c98aed07a3ad665"
+  },
+  "semantic_assertions": [
+    "family=coordinated-rekey",
+    "cases=25",
+    "execution_claim=false",
+    "requires_separate_runtime_qualification=true",
+    "external_interoperability=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

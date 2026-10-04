@@ -122,8 +122,9 @@ impl ExtensionType {
     }
 
     /// Supported extension types that this implementation handles.
-    pub const fn supported() -> &'static [ExtensionType; 8] {
+    pub const fn supported() -> &'static [ExtensionType; 9] {
         &[
+            ExtensionType::ServerName,
             ExtensionType::SupportedGroups,
             ExtensionType::EcPointFormats,
             ExtensionType::SignatureAlgorithms,

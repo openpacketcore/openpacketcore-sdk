@@ -1,0 +1,338 @@
+{
+  "schema_version": 1,
+  "source_sha256": "21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2",
+  "reference_tools": {
+    "pycrate": "0.8.1",
+    "pypdf": "6.1.0"
+  },
+  "scope": "Root NGAP-PDU and ProtocolIE-Container APER framing only; no semantic admission",
+  "ie_id": 65535,
+  "ie_criticality": "ignore",
+  "value_recipe": "octet[i] = (i * 17 + 3) % 256",
+  "cases": [
+    {
+      "message": "NGSetupRequest",
+      "value_len": 0,
+      "wire_len": 11,
+      "wire_sha256": "636c7034aaa49098388baedb79757b48ded80290a81703ff914f1d26334831c4"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 1,
+      "wire_len": 12,
+      "wire_sha256": "126f5ee409f5740a7a08564389b65ff47f48bbd9a069bfc67262b52623e8f66b"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 120,
+      "wire_len": 131,
+      "wire_sha256": "7dfeabf5971a0b83672ff2abdb19f33b09f666dc639441e5d051d30827fb2139"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 121,
+      "wire_len": 133,
+      "wire_sha256": "0588d11c2efe26cc9687c23789951efc520c3a5c734ecea7cfd9d2fd0b0c4f13"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 127,
+      "wire_len": 139,
+      "wire_sha256": "f28a2d3009724cf71b140c30a1d72182742e48c8944618073a7972abfd51cd97"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 128,
+      "wire_len": 141,
+      "wire_sha256": "c2f3248b0f634978cd4647d85bea5c36573b80400a9b93cb272c6d26519a6ccb"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 16375,
+      "wire_len": 16388,
+      "wire_sha256": "1fa2f8dec1de0c532a22be012699f6c82089b77126812e8805c25dc7d805a052"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 16376,
+      "wire_len": 16389,
+      "wire_sha256": "d368d2684061096104d9e5366f94319b4da701076adf2cab598c178f355e5415"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 16383,
+      "wire_len": 16396,
+      "wire_sha256": "e6ca7109a970dec0247292414fb093c4e365dd42aa3c68f304c168942c0c727b"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 16384,
+      "wire_len": 16397,
+      "wire_sha256": "9e001da4867004f73f38243039513bd1ae76c325977c733be8bf8ec2aa47eba2"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 16385,
+      "wire_len": 16398,
+      "wire_sha256": "9ddfa77262fbaf5cdd4a489c8be0c8ca0ccce739820bb20701fc51fb660d2fd8"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 32767,
+      "wire_len": 32781,
+      "wire_sha256": "d51754089b0f4e3bc8ad8b16c048bb7a3e73806011654e29bc217deb1627cec0"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 32768,
+      "wire_len": 32781,
+      "wire_sha256": "6d5827d966cd46f2b743a2cafc562723bbdd49b6b9596cbc4b50336863b7e73f"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 49152,
+      "wire_len": 49165,
+      "wire_sha256": "5c3dd917057a9d78a535baf9e3f7dc21c4ee816d3bada7564d9acdc027ec5a2b"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 65535,
+      "wire_len": 65549,
+      "wire_sha256": "015d6d9033e969a73c1412d46e64ddb0408ffd03a5bb661240cfbd70e522ad50"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 65536,
+      "wire_len": 65549,
+      "wire_sha256": "0bb1fe090fe4a24618abf7ab028f719008b95cba1cc1ddb36d611de6139c9783"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 65537,
+      "wire_len": 65550,
+      "wire_sha256": "8287e5654ebbdee7bb83ebc589814f21e915f1d0a230d9ab7522d244e05d920f"
+    },
+    {
+      "message": "NGSetupRequest",
+      "value_len": 131072,
+      "wire_len": 131087,
+      "wire_sha256": "d735dc9eefc2780b34719c43cc609acd6587b295e5ee31e47f7155689428ac89"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 0,
+      "wire_len": 11,
+      "wire_sha256": "e7053abdc94c9d5b705780c8f5e752c088b99ecbae1ccca42842e2cc9d37ee01"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 1,
+      "wire_len": 12,
+      "wire_sha256": "2795d483cda802a187c6e35eec09c3f7b63d79582414a33131bfe5b1a764ac48"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 120,
+      "wire_len": 131,
+      "wire_sha256": "50fb852bf6df5c1b40510e6539f861b68dbd0d8e3b2651910a4025cffe521379"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 121,
+      "wire_len": 133,
+      "wire_sha256": "329ab39b5250bfd90e2142b98a0458e21bc1a709616da9dbcc01f57bb6629ea0"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 127,
+      "wire_len": 139,
+      "wire_sha256": "972ed4af4bf9f5ca816988d6511b3bea0ba1308178c3faf69bb6f2dda5edc601"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 128,
+      "wire_len": 141,
+      "wire_sha256": "b5109fa6c38c3a675e6788b2556dcbfd0ca1915fc129c8d9171346f33ad0516a"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 16375,
+      "wire_len": 16388,
+      "wire_sha256": "db2c971cb35b635fc1cf4f7d70ebc4994f1c4c82c71c9968b5d5bdf0ef8b5c4c"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 16376,
+      "wire_len": 16389,
+      "wire_sha256": "2381f1a2361dbe8453a6cddb18ca83842c3282392f51f8413df1c74543e9b90d"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 16383,
+      "wire_len": 16396,
+      "wire_sha256": "eab413fa149ac5e416b7f3dfc41b88750e18b807b4b0f11fddb84f0215804e1a"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 16384,
+      "wire_len": 16397,
+      "wire_sha256": "735d562a60c3e6435aad482f6ac5ea9cfe657d1df42740df4c7dab18bbcbfb48"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 16385,
+      "wire_len": 16398,
+      "wire_sha256": "96cb7d1272df4007bb511a82bdd61e9777516bd94918b3130d003e548806e12b"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 32767,
+      "wire_len": 32781,
+      "wire_sha256": "c55f46b6d2f5ec25105c3e9da6b4826d15e63b89b43ea9616cea4217f300bcb9"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 32768,
+      "wire_len": 32781,
+      "wire_sha256": "3a445c9165d65f0f7b0a48fd2dd29315e37cc0c7bd5a43318fa92122b04d801c"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 49152,
+      "wire_len": 49165,
+      "wire_sha256": "23890e343f5170c9fdb36d583c651e239d449ee0854ce6bde674190d1ed52ed5"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 65535,
+      "wire_len": 65549,
+      "wire_sha256": "16296a663860d8ecfd6ac2a1733599b0853d12267e5e4611334177aebd272315"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 65536,
+      "wire_len": 65549,
+      "wire_sha256": "c5c9e580be74b1479696f3fb70c84175f6e6f0d467cf916381531121b1cf21f7"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 65537,
+      "wire_len": 65550,
+      "wire_sha256": "803e67e48b32f42186dffb8b91f8ac8e475f725366886f8acd6717d348ebeea7"
+    },
+    {
+      "message": "NGSetupResponse",
+      "value_len": 131072,
+      "wire_len": 131087,
+      "wire_sha256": "742e1a0cbaef81a5167442cf94a9d1bf3fa26b9ba959dc244b30ff2751c68da4"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 0,
+      "wire_len": 11,
+      "wire_sha256": "965290f4d93a0436fd530f54847461173f97d7d557fff86c06c39be476d2f544"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 1,
+      "wire_len": 12,
+      "wire_sha256": "e095cb1082b75070522cf28df2df54c92b046bd41f455a750548d5b839d82710"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 120,
+      "wire_len": 131,
+      "wire_sha256": "bd8b02945eef487328c997efe4fc52d943a51cf8734b7d1a4572ddfceeae2d2b"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 121,
+      "wire_len": 133,
+      "wire_sha256": "10330710f3727247f385b65311c28b709f5f671691af3ac086d89b00ef2bebee"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 127,
+      "wire_len": 139,
+      "wire_sha256": "1a17a19a944dba23545d253814e3af1c09c514c23fa0d866e09da8e90d4edde8"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 128,
+      "wire_len": 141,
+      "wire_sha256": "d44b77996ef3e911d6d3dd4f1fe07a014646376187fb6e525d9e5c16a1d13d6d"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 16375,
+      "wire_len": 16388,
+      "wire_sha256": "0b4e2d390e4b52a0e5b5b9f31dee3d4d87d527743d9223335d9be51e84ebc5d7"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 16376,
+      "wire_len": 16389,
+      "wire_sha256": "140f2335b297f63b964261fee9fcb41da3232d81e2dc8e005c56f05daa7fbc45"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 16383,
+      "wire_len": 16396,
+      "wire_sha256": "dfb54654d0ec2dd21a3989131d9cba6dfdd119e6cdebfe42705c4c4cb17da96e"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 16384,
+      "wire_len": 16397,
+      "wire_sha256": "2d492ee6843e23bc40617d06dd4cb75dbf0aeab0158fe663303336dd718f4878"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 16385,
+      "wire_len": 16398,
+      "wire_sha256": "65c37f1e0f123d79a677ea98ac35b09e822a1237c49261d41284731eb2ebf36f"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 32767,
+      "wire_len": 32781,
+      "wire_sha256": "f0f499eaea46958fcf82a3aabd2f8973a6d5b6c4dbb1ce36d8901708ab40f40e"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 32768,
+      "wire_len": 32781,
+      "wire_sha256": "889ae7bf63bd9eeda5fd0ca49b921c1be8bcea9391eec93f0462112dbb0219f1"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 49152,
+      "wire_len": 49165,
+      "wire_sha256": "a5b7c716b1dca3b5c3f7f92cf31d2d6efba95bce4f96e4915ec5d45de73da0db"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 65535,
+      "wire_len": 65549,
+      "wire_sha256": "5b8f5444ba658600b996e6a7f59893068c66d25b9de563b785e46b1c353e8c1d"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 65536,
+      "wire_len": 65549,
+      "wire_sha256": "bad1a9076a586bde29efa27a140b3b8c95aacb28c9a4ea5196772fe9951d815b"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 65537,
+      "wire_len": 65550,
+      "wire_sha256": "d6f02b586f803d3c2bc7ba26e27146a4b0973ca476701b9407672a661c8d7d18"
+    },
+    {
+      "message": "NGSetupFailure",
+      "value_len": 131072,
+      "wire_len": 131087,
+      "wire_sha256": "41e53f3dbc098180f948a7bec3f2b3b4e04dc4810aa4bf33456afaf047697a0c"
+    }
+  ]
+}

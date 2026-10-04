@@ -1,0 +1,48 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "eap-envelope",
+  "context": {
+    "max_an_bytes": 1024
+  },
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.positive-start",
+  "subset": "eap5g",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "7.3",
+      "9.3.2.2.1"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "IKE_AUTH request without AUTH; EAP-5G session not started",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Hand-authored from TS 24.502 V18.8.0 figure 9.3.2.2.1-1"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-start.hex",
+    "digest_sha256": "f89309c9f3e0c46ce41dd958bbff94bc30b63d928538cfefc6f570fd099d7684"
+  },
+  "semantic_assertions": [
+    "eap_code=request",
+    "expanded_type=254",
+    "vendor_id=10415",
+    "vendor_type=3",
+    "message_id=1"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

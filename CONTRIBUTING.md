@@ -6,7 +6,7 @@ Thank you for your interest in contributing to the OpenPacketCore SDK. This docu
 
 ### Required toolchain
 
-- **Rust** ≥ 1.88 (install via [rustup](https://rustup.rs/))
+- **Rust** ≥ 1.89 (install via [rustup](https://rustup.rs/))
 - **Go** ≥ 1.26.6
 - **kubectl**
 - **kustomize**
@@ -34,6 +34,13 @@ kubectl kustomize operators/sdk-reference-operator/config/default > /dev/null
 
 All pull requests must be green on the following commands before review:
 
+On Linux, set `TMPDIR` to an existing private directory on disk before running
+the test gates. Check its filesystem with `findmnt -T "$TMPDIR"`. The selector's
+one-second durable request test rejects `tmpfs` and `ramfs`: file-backed databases
+on those filesystems do not exercise disk-sync latency. Setting
+`OPC_FS_VERITY_SNAPSHOT_ROOT` places immutable snapshots only; it does not move
+the mutable databases or WALs out of `TMPDIR`.
+
 ```bash
 cargo fmt --all --check
 git diff --check
@@ -50,6 +57,73 @@ cargo test --workspace --all-features --quiet -- --test-threads=4
 ( cd operators/sdk-reference-operator && go vet ./... && go test ./... )
 kubectl kustomize operators/sdk-reference-operator/config/default > /dev/null
 ```
+
+For CI qualification, replace the broad workspace test command above with
+`cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1`
+and all CI shard plans. This preserves CI's test isolation and profile choices.
+Run the commands produced by
+`python3 ci/test-shards.py plan --shard ID` for every ID from
+`python3 ci/test-shards.py ids`; first run `precheck --shard ID` for each shard.
+Use the same Rust version as the CI run and set `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
+
+The native IPsec, i686 session-net, and egress host-source jobs are separate
+profiles: use `CARGO_INCREMENTAL=0` and their workflow commands, but leave
+`CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` unset, as those jobs do.
+Run the protected prepared-transition functional test alone with
+`CARGO_PROFILE_TEST_OPT_LEVEL=1` in the core, native, and i686 lanes. Debug
+assertions and overflow checks remain enabled. The selector functional test
+retains its ordinary test profile.
+
+The separate **Rust GTP-U unsupported-platform cfg tests** job in
+[ci.yml](.github/workflows/ci.yml) also uses
+`RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
+`--no-default-features`. The ordinary workspace run does not cover that profile.
+Its selector functional test must resolve exactly once and run alone after
+the other cfg tests finish. Use a separate `CARGO_TARGET_DIR` for this profile,
+as the workflow does.
+
+### CNF performance qualification
+
+Required CI checks durable completion, exact receipts/readback, quorum and
+wire-call counts, recovery, and authority expiry. The two composed latency
+scenarios also have explicit performance tests: the protected prepared
+transition must complete within **100 ms**, and the complete selector request
+within **one second**. Their functional counterparts run the same scenario
+with a ten-second hang guard; passing those tests does not qualify latency.
+Production deadlines, lease bounds, disk syncs, and durability checks are
+unchanged. Deadline-accounting and cancellation regression tests still run in
+required CI.
+
+The latency tests are marked `#[ignore]` so ordinary Cargo and required CI runs
+do not depend on shared-runner performance. Run them explicitly with:
+
+```bash
+python3 ci/performance-tests.py --profile core-protected
+python3 ci/performance-tests.py --profile core-selector
+python3 ci/performance-tests.py --profile native-protected
+python3 ci/performance-tests.py --profile i686-protected
+python3 ci/performance-tests.py --profile unsupported-selector
+```
+
+Use a separate `CARGO_TARGET_DIR` per profile and the same toolchain/storage
+setup as its CI lane; i686 also needs the 32-bit target and system toolchain.
+The script selects each ignored test exactly once, retains the original
+deadline, and fails on any failed measurement. Logs and a JSON result are
+written under `target/performance/PROFILE` (or `--output DIRECTORY`).
+
+Run the **CNF performance** workflow manually in Actions. It defaults to the
+existing GitHub-hosted `ubuntu-latest` runners. Set repository variable
+`OPC_PERFORMANCE_RUNNER` to an available Linux x64 runner label to qualify a
+different runner; the manual `runner` input overrides that variable. Set
+`OPC_PERFORMANCE_GATES=true` to run qualification automatically after pushes to
+`main`. It is separate from required PR checks and fails normally when a limit
+is missed. Do not make it a required merge check until the chosen runner is
+qualified. Each profile uploads its raw logs, host details, and result.
+
+Do not replace the performance deadlines or use RAM-backed database storage.
+A local timing pass qualifies only that local host/storage observation; it does
+not establish that the GitHub-hosted runner meets the limit.
 
 If the pull request touches operator-sdk-go or the Helm chart, also run:
 
@@ -83,7 +157,7 @@ Before requesting review, please confirm:
 
 - [ ] Tests added or updated for the change.
 - [ ] Documentation updated (`README.md`, crate-level rustdoc, or `docs/` as appropriate).
-- [ ] No new dependencies without justification in the PR description (must be Apache-2.0/MIT/BSD-compatible and build on Rust 1.88).
+- [ ] No new dependencies without justification in the PR description (must be Apache-2.0/MIT/BSD-compatible and build on Rust 1.89).
 - [ ] RFC or ADR updated if the change alters a behavior contract.
 - [ ] All validation gates pass locally.
 - [ ] Commits are signed-off (`git commit -s`).
@@ -157,7 +231,9 @@ eligibility.
 | `opc-session-net` | experimental | A stable wire-format contract with a documented compatibility policy and soak evidence across at least one minor version bump. See `crates/opc-session-net/README.md`. |
 | `opc-sa-mirror` | experimental | A stable keymat wire-format contract with a documented compatibility policy (graduation criteria decided together with `opc-session-net`'s), plus downstream CNF evidence that a live-mirrored takeover passes the fenced re-pin on real owner loss. See `docs/rfc/015-live-sa-mirror.md`. |
 | `opc-key-vault` | experimental | A production-readiness review covering Vault policy scoping, secret-zero handling, lease rotation, and an integration test against a real or containerized Vault Transit instance. |
+| `opc-gtpu-dataplane` N3 module | experimental packet/intent subset | Qualified N3 forwarding, exact selector-authority integration, control-datagram lifecycle ordering and independent live-peer evidence. All shipped N3 capability results remain `Missing`; see `crates/opc-gtpu-dataplane/CONFORMANCE.md`. |
 | `opc-proto-nas` | experimental | Structured parsing of the remaining 5GMM and 5GSM message bodies listed as out-of-scope in `crates/opc-proto-nas/CONFORMANCE.md`, with spec-byte fixtures for each message. |
+| `opc-proto-gre` | experimental NWu profile | Independent review, peer interoperability, and downstream evidence for authenticated session/direction scoping and caller-owned SA selection. See `crates/opc-proto-gre/CONFORMANCE.md`. |
 | `opc-proto-ngap` | experimental | A working canonical (typed) APER encoder path, verified by external fixtures for `NGSetupResponse` and `NGSetupFailure`, after the upstream `rasn` APER encoder misalignment is resolved or replaced. See `crates/opc-proto-ngap/CONFORMANCE.md`. |
 | `opc-proto-gtpv2c` | experimental S2b subset | Independent-peer interoperability and completion of the declared compatibility and negative-evidence matrix. Any future coverage expansion must also add mandatory-IE validation and spec-authored fixtures. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
 | `opc-proto-diameter` | experimental base + Rf/SWm dictionaries | ADR 0015 conformance claim for the base header/AVP layer, typed helpers and independently sourced fixtures for at least the remaining `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` skeleton dictionaries, and downstream product integration evidence. See `crates/opc-proto-diameter/CONFORMANCE.md`. |

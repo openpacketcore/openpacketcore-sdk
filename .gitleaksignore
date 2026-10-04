@@ -9,3 +9,10 @@ ae4a66adf24cfdcbf5b5c504d28d7cb363473b69:crates/opc-ipsec-xfrm/src/ikev2.rs:gene
 130b82f39bd5d139e338cfa5bed3ad7d77c3c252:crates/opc-sdk-integration/tests/fault_injection.rs:generic-api-key:97
 633f1803b0730fd53898ce0951883be08da16cbc:crates/opc-proto-ikev2/src/dedicated_bearer/exchange.rs:generic-api-key:1144
 633f1803b0730fd53898ce0951883be08da16cbc:crates/opc-proto-ikev2/src/dedicated_bearer/exchange.rs:generic-api-key:1153
+
+# Public-source SHA-256 provenance in the N3IWF custody oracle and generator.
+# Each exception pins the original commit, file, rule and line; no path/rule allowlist.
+3214d6090bfd889af0f55353aebf6d589a863d9b:crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json:generic-api-key:6
+3214d6090bfd889af0f55353aebf6d589a863d9b:crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json:generic-api-key:8
+3214d6090bfd889af0f55353aebf6d589a863d9b:scripts/n3iwf_key_lifecycle_reference.py:generic-api-key:18
+3214d6090bfd889af0f55353aebf6d589a863d9b:scripts/n3iwf_key_lifecycle_reference.py:generic-api-key:20

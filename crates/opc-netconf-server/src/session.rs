@@ -935,16 +935,6 @@ mod tests {
         assert!(!sessions.contains_session_for_test(79));
     }
 
-    async fn wait_until_registered(sessions: &SessionRegistry, session_id: u64) {
-        for _ in 0..100 {
-            if sessions.contains_session_for_test(session_id) {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("session {session_id} was not registered");
-    }
-
     #[tokio::test]
     async fn invalid_local_session_id_is_rejected_before_hello() {
         let server = server_fixture().await;
@@ -1215,9 +1205,10 @@ mod tests {
         let sessions = SessionRegistry::new();
         let target_sessions = sessions.clone();
         let controller_sessions = sessions.clone();
-        let (_target_client, mut target_io) = tokio::io::duplex(1);
+        let (mut target_client, mut target_io) = tokio::io::duplex(1);
         let (mut controller_client, mut controller_io) = tokio::io::duplex(64 * 1024);
 
+        let termination_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let target_task = tokio::spawn(async move {
             run_read_only_session_with_registry(
                 &target_server,
@@ -1229,7 +1220,22 @@ mod tests {
             )
             .await
         });
-        wait_until_registered(&sessions, 431).await;
+        // Observe protocol progress after async registration. Reading only one
+        // byte leaves the longer hello blocked by the one-byte duplex capacity.
+        // Readiness shares the existing termination allowance; it cannot extend it.
+        let mut hello_prefix = [0_u8; 1];
+        tokio::time::timeout_at(
+            termination_deadline,
+            target_client.read_exact(&mut hello_prefix),
+        )
+        .await
+        .expect("target server-hello readiness timeout")
+        .expect("target server-hello prefix");
+        assert!(hello_prefix == *b"<", "target server hello did not begin");
+        assert!(
+            sessions.contains_session_for_test(431),
+            "target session missing at server hello"
+        );
 
         let controller_task = tokio::spawn(async move {
             run_read_only_session_with_registry(
@@ -1271,7 +1277,7 @@ mod tests {
         assert!(reply.contains(r#"message-id="304""#));
         assert!(reply.contains("<ok/>"));
 
-        let target_result = tokio::time::timeout(Duration::from_secs(5), target_task)
+        let target_result = tokio::time::timeout_at(termination_deadline, target_task)
             .await
             .expect("target server-hello write termination timeout")
             .expect("target join")

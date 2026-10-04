@@ -361,6 +361,65 @@ impl ConfirmedCommitResolution {
     }
 }
 
+/// Private request metadata carried only to the encrypted datastore's audit
+/// projector. It is never serialized into a consensus command or diagnostics.
+/// The encrypted request fingerprint remains the durable replay authority.
+#[derive(Clone)]
+pub struct CommitAuditContext {
+    request_id: RequestId,
+    transport: TransportType,
+    operation: ConfigOperation,
+}
+
+impl CommitAuditContext {
+    fn from_record<C: OpcConfig>(record: &StoredConfig<C>) -> Option<Self> {
+        match (record.request_id, record.request_fingerprint.as_ref()) {
+            (Some(request_id), Some(fingerprint)) => Some(Self {
+                request_id,
+                transport: fingerprint.transport,
+                operation: fingerprint.operation,
+            }),
+            (None, None)
+                if matches!(
+                    record.source,
+                    RequestSource::Internal | RequestSource::StartupRecovery
+                ) =>
+            {
+                Some(Self {
+                    request_id: RequestId::new(),
+                    transport: TransportType::Internal,
+                    operation: if record.source == RequestSource::StartupRecovery {
+                        ConfigOperation::Rollback
+                    } else {
+                        ConfigOperation::Replace
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Original request identity, for keyed audit projection only.
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+    /// Original authenticated request transport.
+    pub const fn transport(&self) -> TransportType {
+        self.transport
+    }
+    /// Original mutation shape. The full mode and content are bound by the
+    /// authenticated encrypted commit, not inferred from this classification.
+    pub const fn operation(&self) -> ConfigOperation {
+        self.operation
+    }
+}
+
+impl std::fmt::Debug for CommitAuditContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommitAuditContext(<redacted>)")
+    }
+}
+
 /// One atomic durable config write with an applied-state compare condition.
 ///
 /// The record's `parent_tx_id` is the expected current durable transaction.
@@ -368,10 +427,12 @@ impl ConfirmedCommitResolution {
 /// any [`ConfirmedCommitResolution`] as one indivisible state-machine update.
 /// This prevents two leaders from committing sibling versions or deciding a
 /// pending commit in opposite ways.
+/// Ephemeral audit context accompanies the write only until keyed projection.
 #[derive(Clone)]
 pub struct CommitWrite<C: OpcConfig> {
     record: StoredConfig<C>,
     confirmed_resolution: Option<ConfirmedCommitResolution>,
+    audit_context: Option<CommitAuditContext>,
 }
 
 /// Metadata attested by a datastore after one commit write succeeds.
@@ -402,6 +463,7 @@ impl<C: OpcConfig> CommitWrite<C> {
     /// `parent_tx_id` is used as the expected current transaction.
     pub fn new(record: StoredConfig<C>) -> Self {
         Self {
+            audit_context: CommitAuditContext::from_record(&record),
             record,
             confirmed_resolution: None,
         }
@@ -424,9 +486,22 @@ impl<C: OpcConfig> CommitWrite<C> {
             ));
         }
         Ok(Self {
+            audit_context: CommitAuditContext::from_record(&record),
             record,
             confirmed_resolution: Some(resolution),
         })
+    }
+
+    /// Ephemeral metadata for the required audit projector. Missing context
+    /// must fail closed in an audited profile; a sealed Northbound record must
+    /// never infer a request identity or transport from its source enum.
+    pub fn audit_context(&self) -> Option<&CommitAuditContext> {
+        self.audit_context.as_ref()
+    }
+
+    pub(crate) fn with_audit_context(mut self, context: Option<CommitAuditContext>) -> Self {
+        self.audit_context = context;
+        self
     }
 
     /// Returns the config record to append.

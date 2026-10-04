@@ -1,0 +1,49 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "eap-envelope",
+  "context": {
+    "max_an_bytes": 1024
+  },
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.ordering-an-parameters",
+  "subset": "eap5g",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.2"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "Same as positive NAS response",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Establishment cause precedes selected PLMN; order is not significant"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-an-parameters.hex",
+    "digest_sha256": "20d284e321412092b4412545bf117bff40c272c33b5c3d10658ff72920b89a24"
+  },
+  "semantic_assertions": [
+    "an_parameter_order=cause-then-plmn",
+    "receive=permitted"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

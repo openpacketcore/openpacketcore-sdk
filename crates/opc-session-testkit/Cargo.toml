@@ -9,8 +9,11 @@ description = "Chaos and failure testing testkit for OpenPacketCore session repl
 default = []
 foundation-insecure = ["opc-session-net/insecure-test"]
 consumer-fixture = ["dep:rcgen", "dep:rustls-pki-types"]
+# Passive, redacted engine/storage observations for qualification diagnostics.
+test-control = ["opc-session-store/test-control"]
 
 [dependencies]
+hex = "0.4.3"
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
@@ -45,6 +48,9 @@ rustls-pki-types = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["event", "fs", "net", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [[test]]
 name = "qualification_multiprocess"

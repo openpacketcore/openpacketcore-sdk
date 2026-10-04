@@ -64,13 +64,21 @@ HARNESS = ["--test-threads=4"]
 # module. It exercises raw physical adapters which must not be public merely
 # to keep an old integration target compiling. Its sensitive contracts remain
 # isolated, but use their libtest-qualified names below.
+# The composed selector request also has one literal end-to-end budget. Its
+# module serializes its own durable labs, but unrelated lib tests still compete
+# with that request unless it runs in a separate process like these contracts.
 QUIESCENT_LIB_MODULE = "stateless_quorum_consumer"
+QUIESCENT_SELECTOR_LIB_MODULE = "ebpf::tests::remote_selector_regression"
+QUIESCENT_SELECTOR_LIB_TEST = (
+    "singleton_public_protected_flow_preserves_durable_state"
+)
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
-    "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
+    QUIESCENT_SELECTOR_LIB_TEST,
+    "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
     "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
@@ -81,9 +89,11 @@ QUIESCENT_CONSENSUS_OPENRAFT_TARGET = "consensus_openraft"
 QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
     "lagging_replica_installs_compacted_snapshot_without_losing_committed_state",
     "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
+    "compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart",
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
+        "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
         "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
@@ -93,7 +103,10 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 )
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
-# Keep O1 confined to the snapshot/restart roster proofs.
+# Keep O1 confined to the protected-transition and snapshot/restart proofs.
+# Its functional counterpart uses the same optimized execution, debug
+# assertions, and overflow checks as the separate 100 ms performance gate.
+# Match the IPsec/i686 lanes.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
 # and would no longer qualify the repository's ordinary test profile.
 OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"
@@ -194,7 +207,8 @@ def verify_manifest_test_sources(packages: list[dict]) -> None:
         sys.exit("\n".join(errors))
     print(
         "manifest test-source audit ok: every direct tests/*.rs source is a "
-        "Cargo target or one explicit crate-private module"
+        "Cargo target or one explicit crate-private module",
+        file=sys.stderr,
     )
 
 
@@ -261,6 +275,8 @@ def shard_ids(plan: dict) -> list[str]:
 
 
 def qualified_quiescent_lib_test(name: str) -> str:
+    if name == QUIESCENT_SELECTOR_LIB_TEST:
+        return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 
