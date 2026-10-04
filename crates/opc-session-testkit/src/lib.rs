@@ -2,6 +2,9 @@
 //!
 //! Provides clock skew, network partition, and fault injection fixtures.
 //! This is an internal testkit crate and is not published.
+//! With `consumer-fixture`, ordinary tests require direct protected V2
+//! successes through authenticated real voters and bound how many nominal
+//! transitions may resolve by receipt instead.
 //!
 //! The Linux mTLS qualification harness reads Git provenance through bounded
 //! pipes. Interrupted reads retain accumulated output and byte limits while

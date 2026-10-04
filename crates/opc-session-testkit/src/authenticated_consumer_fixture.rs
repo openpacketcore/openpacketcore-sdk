@@ -768,6 +768,9 @@ impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
 
     /// Number of physical V2 receipt-status requests observed by the real
     /// listener fleet on the `/2` lane.
+    ///
+    /// One ambiguous transition may require multiple status requests. Tests
+    /// that bound receipt recovery must also count transitions resolved by it.
     pub const fn fenced_transition_v2_status_calls(self) -> usize {
         self.fenced_transition_v2_status_calls
     }

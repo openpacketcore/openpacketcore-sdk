@@ -207,6 +207,100 @@ async fn committed_v1(
     outcome
 }
 
+/// Count every nominal sample: an occasional host stall may need a receipt,
+/// but receipt recovery must not mask a broken direct-success path. The
+/// fixture has already established quorum readiness and prewarmed `/2`.
+#[tokio::test]
+async fn fixture_v2_facade_nominal_commits_require_direct_success() {
+    const TRANSITIONS: usize = 6;
+    const MAX_RECEIPT_RESOLUTIONS: usize = 1;
+
+    let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
+        .await
+        .expect("start durable authenticated three-voter fixture");
+    let provider = CountingProvider::new();
+    let facade = fixture
+        .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-direct-success")
+        .await
+        .expect("activate every real voter's /2 lane");
+    let mut direct_successes = 0;
+    let mut receipt_resolutions = 0;
+    for ordinal in 0..TRANSITIONS {
+        let label = 0x5000 + ordinal as u64;
+        let request = create(request_id(label), label, PAYLOAD);
+        let deadline = soon();
+        let mut prepared = facade
+            .prepare_fenced_transition(request.clone(), budget(deadline))
+            .await
+            .expect("prepare a fresh nominal transition");
+        let status_calls_before = fixture.diagnostics().fenced_transition_v2_status_calls();
+        let started = std::time::Instant::now();
+        let result = prepared.execute_once().await;
+        eprintln!(
+            "nominal V2 transition {ordinal}: execute_once={result:?}, elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_v2_status_calls(),
+            status_calls_before,
+            "execute_once must return its result without receipt recovery"
+        );
+        let outcome = match result {
+            Ok(outcome) => {
+                direct_successes += 1;
+                outcome
+            }
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }) => {
+                assert_eq!(request_id, prepared.request_id());
+                receipt_resolutions += 1;
+                match prepared.status_until_terminal(deadline).await {
+                    Ok(FencedTransitionV2Status::Recorded(result)) => {
+                        (*result).expect("the ambiguous nominal transition committed")
+                    }
+                    other => panic!("a nominal possible send must resolve by receipt: {other:?}"),
+                }
+            }
+            Err(error) => panic!("unexpected nominal V2 execution result: {error:?}"),
+        };
+        assert!(outcome.matches_request(&request));
+        let observed = facade
+            .observe_fenced_transition(&session_key(label))
+            .await
+            .expect("read back the real committed head");
+        let record = observed.record().expect("committed record");
+        assert_eq!(record.generation, Generation::new(1));
+        assert_eq!(record.payload.as_bytes(), PAYLOAD);
+        prepared
+            .release_resolved()
+            .await
+            .expect("release the exact committed outcome");
+    }
+
+    let diagnostics = fixture.diagnostics();
+    eprintln!(
+        "nominal V2 commits: {direct_successes} direct, {receipt_resolutions} resolved by receipt, \
+         {} physical receipt reads",
+        diagnostics.fenced_transition_v2_status_calls()
+    );
+    assert_eq!(diagnostics.fenced_transition_v2_calls(), TRANSITIONS);
+    assert_eq!(diagnostics.fenced_transition_calls(), 0);
+    assert!(
+        direct_successes > 0,
+        "nominal real-voter commits must include a direct Ok from execute_once"
+    );
+    assert!(
+        receipt_resolutions <= MAX_RECEIPT_RESOLUTIONS,
+        "receipt recovery is exceptional: {receipt_resolutions}/{TRANSITIONS} nominal transitions \
+         required it (maximum {MAX_RECEIPT_RESOLUTIONS}); inspect execute_once results and timings"
+    );
+    assert_eq!(
+        facade.retained_fenced_transitions().await.expect("count"),
+        0
+    );
+    drop(facade);
+    fixture.shutdown().await.expect("shut down fixture");
+}
+
 #[tokio::test]
 async fn fixture_v2_facade_commits_releases_and_readmits_one_caller_id() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])

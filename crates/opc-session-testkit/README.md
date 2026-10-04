@@ -57,6 +57,15 @@ The `consumer-fixture` feature exposes
 three file-backed voters, authenticated persistent consumer connections and
 local payload encryption. Consensus transport remains in-process.
 
+The non-ignored V2 facade nominal test commits six fresh transitions through
+this fixed durable fixture and requires direct `execute_once` successes. At
+most one transition may need same-handle receipt recovery under the unchanged
+250 ms physical-attempt cap; all six samples count, with exact outcomes,
+plaintext readback and one mutation dispatch each. Individual results and
+elapsed times diagnose failures, while receipt resolutions and physical status
+reads are counted separately. This bound detects a broken direct-success path
+or persistently slow commits; it does not qualify shared-runner latency.
+
 `open_local_aead_pair` opens the original exclusive prepared journal and pairs
 the ordinary backend with its prepared-fenced facade. The pair's
 `protected_general_backend` clones that same encrypted backend for APIs requiring

@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-testkit`: require direct protected V2 facade successes in a
+  non-ignored authenticated three-voter test. Six nominal transitions permit
+  at most one receipt resolution, with exact outcomes, readback and mutation
+  counts, so receipt fallback cannot hide a broken direct-success path or
+  persistent physical-attempt timeouts. Fixes #1012.
+
 - `opc-proto-diameter`: tolerate received successful SWm emergency
   Diameter-EAP answers carrying subscription APN-Configuration and/or
   APN-OI-Replacement, following the GTPv2-based S2b receiver rule in TS 29.273
