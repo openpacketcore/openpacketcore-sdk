@@ -60,7 +60,8 @@ server = SessionQuorumConsumerServer::new(service.clone(), tls, authorizer)
 The ingress signer selects only topology-provisioned transport-ingress
 authority for the request's authenticated scope. It cannot use one
 listener-global leaf as cross-tenant authority. The V2 worker constructs its
-one persistent pool and provider adapter at startup:
+persistent pools and provider adapter at startup. The original single-pool
+composition remains available:
 
 ```text
 pool = PersistentSessionConsumerClient::from_fenced_mutation_roster_v2_stateless(
@@ -74,14 +75,23 @@ adapter = pool.into_fenced_mutation_roster_v2_provider_adapter(
 )?
 ```
 
+To opt into publication authority-read failover, use
+`into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters` with
+the complete startup-fixed set of authenticated V2 voter pools, including the
+primary voter exactly once. Composition validates the exact scope, roster,
+attestation root, profile and caller identity before claiming the executor.
+The original pool remains the primary even if the set supplies another pool
+for that voter. Alternates are retained only as authority readers.
+
 The adapter, its persistent connections, and both providers are reused for
 every roster in that exact scope. Constructing the pool, TLS material,
 resolver, provider, attestor, or network connection inside a roster call is
 outside this contract.
 
 The V2 client and provider adapter are startup-owned persistent composition,
-with one bounded pool, one member provider, one publication provider, one
-executor attestor, and one authenticated scope for their lifetime. There is no
+with one bounded primary pool, optional fixed alternate reader pools, one
+member provider, one publication provider, one executor attestor, and one
+authenticated scope for their lifetime. There is no
 per-subscriber V2 adapter, raw store constructor, generic consensus client, or
 ad hoc compatibility bridge. V1 `/3` and V2 `/4` use distinct durable
 admission, reservation, activation, and canonical-record lanes. A V1 replay,
@@ -380,21 +390,51 @@ unavailable. Earlier provider operations in the same outer call may already
 have run. The caller may retry only the same retained capsule and its current
 state within the caller's existing deadline. This error does not restore
 fresh execution or direct intent-admission permission after ambiguity.
-Conclusive expiry, successor, binding, authentication, scope, and protocol
-rejections remain fail-closed. An unavailable post-provider check remains
+Conclusive expiry, successor, binding, authenticated identity, scope and
+protocol rejections remain fail-closed. The single-pool constructors also reject
+local TLS authentication failures. An unavailable post-provider check remains
 `RecoveryRequired`, including after a direct `NotTransmitted` reply; it cannot
 acknowledge an effect or restore direct retry authority.
 
-Both roster profiles preserve known read unavailability using the existing
-generic `Rejected(Unavailable)` consumer response, including server request
-timeouts and V2's activation read barrier. The `Current` and `Rejected`
-publication response tags, transport revision, and profile negotiation remain
-unchanged. Older readers already decode this generic rejection and fail
-closed; their publication adapter does not gain the new retry distinction.
-A new reader also treats an older server's undifferentiated publication
-`Rejected` response as a rejection. Unknown response shapes remain protocol
-failures. Opaque storage and traffic-authority failures are not reclassified
-as proven temporary failures.
+The opt-in V2 constructor reads the primary first and then the remaining
+fixed voters in canonical node-ID order. Each read gets an equal share of the
+remaining barrier time per untried voter, with the last voter receiving what
+is left. Pool waits, connection setup and responses share one absolute budget.
+Reads are sequential; an abandoned read's late response cannot authorize
+publication. Client pool shutdown, local certificate/trust or peer-authentication
+setup failure, explicit ALPN `no_application_protocol` refusal, I/O failure,
+unavailability, deadline and overload permit advancement. Other TLS protocol
+failures, missing or different ALPN after a completed handshake, and an
+authenticated peer with a different identity stop traversal. Every server
+rejection, including during Hello, also stops traversal. This includes an
+opaque storage or traffic-authority failure. A voter
+answering while being retired also ends traversal: the combined rejection
+cannot distinguish retirement from durable membership or activation failure.
+A restarting voter's connection failure permits the next reader to be tried.
+
+Both server profiles can encode known read unavailability using generic
+`Rejected(Unavailable)`, including request timeouts and V2's activation read
+barrier. The existing single-pool constructors preserve their interpretation
+of that response as unavailability. The opt-in multi-voter reader also returns
+`AuthorityUnavailable` before a provider operation, while stopping the current
+traversal without asking another voter. Authority, scope and protocol verdicts
+remain `AuthorityRejected`. An unavailable post-provider check still requires
+recovery. The `Current` and `Rejected` publication response tags, transport
+revision and profile negotiation remain unchanged. Older readers already decode
+the generic rejection and fail closed; they retain their existing retry
+classification and do not gain multi-voter traversal. A new reader treats an
+older server's undifferentiated publication `Rejected` response as a rejection.
+Unknown response shapes remain protocol failures. Opaque server failures are
+not reclassified as proven temporary failures; confirmed retirement needs
+separate store-side classification.
+
+Alternate reads share each pool's lanes, pending admission and counters with
+other users. `diagnostics_with_pool` covers the primary only;
+`publication_pool_diagnostics` covers all readers in traversal order and
+includes their other users' operations. Retain caller-owned client clones to
+shut down the shared pools. Neither failover nor these diagnostics change the
+local permit ledger, provider scheduler, capsule or provider-effect rules.
+Begin-retry restoration remains deferred.
 
 V1 and Profile V2 share one ledger-global capacity and terminal-retention
 order while keeping their canonical payload rows and wire profiles disjoint.

@@ -2,6 +2,9 @@
 
 #![cfg(feature = "test-control")]
 
+#[path = "stateless_quorum_consumer/publication_authority_failover.rs"]
+mod publication_authority_failover;
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -1981,6 +1984,7 @@ impl SessionQuorumConsumer for RecordingCompareAndSetConsumer {
 struct CommitThenLoseConsumerResponse {
     inner: Arc<dyn SessionQuorumConsumer>,
     roster_ingress: Option<Arc<dyn SessionQuorumRosterIngress>>,
+    publication_reads: publication_authority_failover::PublicationReadControl,
     lose_transition: AtomicBool,
     lose_status: AtomicBool,
     lose_lease_acquire: AtomicBool,
@@ -2026,6 +2030,7 @@ impl CommitThenLoseConsumerResponse {
         Self {
             inner,
             roster_ingress: None,
+            publication_reads: Default::default(),
             lose_transition: AtomicBool::new(true),
             lose_status: AtomicBool::new(false),
             lose_lease_acquire: AtomicBool::new(false),
@@ -2070,6 +2075,7 @@ impl CommitThenLoseConsumerResponse {
         Self {
             inner,
             roster_ingress: None,
+            publication_reads: Default::default(),
             lose_transition: AtomicBool::new(false),
             lose_status: AtomicBool::new(true),
             lose_lease_acquire: AtomicBool::new(false),
@@ -2149,6 +2155,7 @@ impl CommitThenLoseConsumerResponse {
         Self {
             inner,
             roster_ingress: Some(roster_ingress),
+            publication_reads: Default::default(),
             lose_transition: AtomicBool::new(false),
             lose_status: AtomicBool::new(false),
             lose_lease_acquire: AtomicBool::new(false),
@@ -2488,6 +2495,9 @@ impl SessionQuorumRosterIngress for CommitThenLoseConsumerResponse {
         attestation: RosterIngressAttestation,
         admission_provenance: Option<RosterCompactAdmissionProvenance>,
     ) -> SessionConsumerResponse {
+        if let Some(response) = self.publication_reads.intercept(&request).await {
+            return response;
+        }
         let admission = matches!(
             request.operation(),
             SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
