@@ -8,6 +8,11 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use opc_gtpu_ebpf_common::{
+    select_tft_classifier_ipv4, TftClassifierFilter, TftClassifierIpv4Packet, TftClassifierKey,
+    TftClassifierMeta, TftClassifierSelection, TftFragmentBucket, TftFragmentDisposition,
+    TftFragmentKey, TftIpv4Fragment, TFT_FRAGMENT_BUCKETS,
+};
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, TftOperation, TrafficFlowTemplate,
 };
@@ -476,18 +481,222 @@ impl fmt::Debug for TftUplinkClassifier {
     }
 }
 
+/// Immutable IPv4 classifier and authority used by [`TftUplinkFragmentTable`].
+///
+/// Construction uses the native classifier encoder, including canonical filter
+/// ordering and its fingerprint. Callers cannot combine a classifier with
+/// unrelated metadata. Only the native IPv4 TFT subset is supported.
+#[derive(Clone)]
+pub struct TftUplinkFragmentSnapshot {
+    classifier: TftUplinkClassifier,
+    key: TftClassifierKey,
+    meta: TftClassifierMeta,
+    filters: Vec<TftClassifierFilter>,
+}
+
+impl TftUplinkFragmentSnapshot {
+    /// Bind a complete classifier to its current nonzero owner and generations.
+    ///
+    /// The authority provider must assign a new snapshot generation on every
+    /// replacement or reinstall, including reinstalling identical filters, and
+    /// retain the owner and owner generation while that attachment exists.
+    /// The native backend derives them from the namespace, interface index and
+    /// pinned map IDs; it has no in-place owner-revocation transition. Native
+    /// replacement changes snapshot generation, bank and fingerprint. Keep this
+    /// snapshot (or its clone) while that exact publication is current.
+    /// These identities model classifier authority; selected marks still require
+    /// the existing downstream bearer/F-TEID authority lookup.
+    pub fn new(
+        classifier: &TftUplinkClassifier,
+        owner: [u8; 16],
+        owner_generation: u64,
+        snapshot_generation: u64,
+    ) -> Result<Self, GtpuError> {
+        let (key, meta, filters) = crate::EbpfGtpuDataplaneBackend::encode_tft_fragment_snapshot(
+            classifier,
+            owner,
+            owner_generation,
+            snapshot_generation,
+        )?;
+        Ok(Self {
+            classifier: classifier.clone(),
+            key,
+            meta,
+            filters,
+        })
+    }
+}
+
+impl fmt::Debug for TftUplinkFragmentSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TftUplinkFragmentSnapshot(<redacted>)")
+    }
+}
+
+/// Persistent bounded IPv4 fragment-affinity state for one attachment.
+///
+/// Retain this table across classifier replacement and removal.
+/// Dropping and recreating it is safe only when the attachment is destroyed and
+/// can no longer receive packets. The shared TC transition retains stale and
+/// poisoned entries until their immutable two-second deadline. It admits at
+/// most four datagrams in each of 16,384 buckets, with at most 64 fragment ranges
+/// per datagram; a full bucket never evicts a live entry. The host allocation
+/// is approximately 24.5 MiB. The shared budget has no per-subscriber reservation:
+/// one subscriber can occupy every slot and deny admission to others.
+///
+/// This host model supplies classifier decisions, not forwarding authority.
+/// Every selected mark must still pass the ordinary exact bearer/F-TEID lookup.
+pub struct TftUplinkFragmentTable {
+    link_ifindex: u32,
+    buckets: Box<[TftFragmentBucket]>,
+    last_now_ns: u64,
+}
+
+impl TftUplinkFragmentTable {
+    /// Allocate empty state for one nonzero attachment interface index.
+    pub fn new(link_ifindex: u32) -> Result<Self, GtpuError> {
+        if link_ifindex == 0 {
+            return Err(GtpuError::invalid_config(
+                "tft_fragment_table.link_ifindex",
+                "ifindex must be nonzero",
+            ));
+        }
+        Ok(Self {
+            link_ifindex,
+            buckets: vec![TftFragmentBucket::new(); TFT_FRAGMENT_BUCKETS as usize]
+                .into_boxed_slice(),
+            last_now_ns: 0,
+        })
+    }
+
+    /// Classify one inner packet using the exact current PAA publication.
+    ///
+    /// The caller owns the current authority lookup: `current` must be the
+    /// snapshot for this table's interface and `paa`, or `None` only when that
+    /// exact classifier is absent. `paa` is trusted lookup context and must equal
+    /// the inner source, as in TC's source-derived lookup. A mismatched snapshot
+    /// or packet source drops before fallback. Removing a classifier does not
+    /// clear retained keys.
+    ///
+    /// Supply monotonic boot-time nanoseconds from one clock origin throughout
+    /// this table's lifetime. Backwards times drop; neither duplicate fragments
+    /// nor completion refreshes the fixed deadline. Explicit times allow host
+    /// tests to exercise expiry without sleeps.
+    ///
+    /// For IPv4, `None` preserves ordinary lookup when no classifier applies
+    /// and no live fragment key remains. A returned drop must never fall through
+    /// to default lookup. Unfragmented packets retain [`TftUplinkClassifier::classify`]
+    /// behavior; only a fully classifiable fragment zero may establish affinity.
+    /// A non-IPv4 version nibble bypasses this IPv4 table and returns `None`
+    /// without changing affinity state, as in the tc uplink dispatch.
+    #[must_use]
+    pub fn classify(
+        &mut self,
+        paa: Ipv4Addr,
+        current: Option<&TftUplinkFragmentSnapshot>,
+        packet: &[u8],
+        now_ns: u64,
+    ) -> Option<TftUplinkClassification> {
+        if packet.first().is_some_and(|version| version >> 4 != 4) {
+            return None;
+        }
+        let invalid = Some(TftUplinkClassification::Drop(
+            TftUplinkDropReason::InvalidState,
+        ));
+        if now_ns < self.last_now_ns {
+            return invalid;
+        }
+        self.last_now_ns = now_ns;
+        let Some(key) = TftClassifierKey::new(self.link_ifindex, paa.octets()) else {
+            return invalid;
+        };
+        if current.is_some_and(|snapshot| snapshot.key != key) {
+            return invalid;
+        }
+        if packet.len() < 20 {
+            return current.map(|snapshot| snapshot.classifier.classify(packet));
+        }
+        let source = [packet[12], packet[13], packet[14], packet[15]];
+        if source != paa.octets() {
+            return Some(TftUplinkClassification::Drop(
+                TftUplinkDropReason::PaaMismatch,
+            ));
+        }
+        if u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff == 0 {
+            return current.map(|snapshot| snapshot.classifier.classify(packet));
+        }
+        let fragment_key = TftFragmentKey::new(
+            key,
+            source,
+            [packet[16], packet[17], packet[18], packet[19]],
+            packet[9],
+            u16::from_be_bytes([packet[4], packet[5]]),
+        );
+        let fragment = TftIpv4Fragment::parse(packet);
+        let parsed = current.and_then(|_| {
+            fragment
+                .filter(|fragment| fragment.is_first())
+                .and_then(|_| TftClassifierIpv4Packet::parse_first_fragment(packet))
+        });
+        let selection = current.zip(parsed).map(|(snapshot, packet)| {
+            select_tft_classifier_ipv4(snapshot.key, snapshot.meta, &snapshot.filters, packet)
+        });
+        let first = parsed.as_ref().and_then(|packet| match selection {
+            Some(TftClassifierSelection::Selected(mark)) => Some((packet, mark)),
+            Some(TftClassifierSelection::Default) => Some((packet, 0)),
+            _ => None,
+        });
+        let disposition = self.buckets[fragment_key.bucket() as usize].apply(
+            fragment_key,
+            fragment,
+            current.map(|snapshot| &snapshot.meta),
+            first,
+            now_ns,
+        );
+        // A failed first decision still reaches the bucket to poison any old
+        // live key. Preserve the matcher reason just as the TC counter path does.
+        let failed = match selection {
+            Some(TftClassifierSelection::NoMatch) => Some(TftUplinkDropReason::NoMatch),
+            Some(TftClassifierSelection::PaaMismatch) => Some(TftUplinkDropReason::PaaMismatch),
+            Some(TftClassifierSelection::Invalid) => Some(TftUplinkDropReason::InvalidState),
+            _ => None,
+        };
+        if let Some(reason) = failed {
+            return Some(TftUplinkClassification::Drop(reason));
+        }
+        match disposition {
+            TftFragmentDisposition::Absent => None,
+            TftFragmentDisposition::Selected(mark) => {
+                Some(TftUplinkClassification::Selected(GtpBearerMark::new(mark)))
+            }
+            TftFragmentDisposition::Malformed => Some(TftUplinkClassification::Drop(
+                TftUplinkDropReason::MalformedOrUnsupportedPacket,
+            )),
+            TftFragmentDisposition::Drop => invalid,
+        }
+    }
+}
+
+impl fmt::Debug for TftUplinkFragmentTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TftUplinkFragmentTable(<redacted>)")
+    }
+}
+
 /// Value-independent reason an unmarked packet was not classified.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TftUplinkDropReason {
-    /// The input was malformed, truncated, fragmented, or unsafe to parse.
+    /// The input was malformed, truncated, or unsupported by the parsing path.
     MalformedOrUnsupportedPacket,
     /// The packet's source is neither the owned IPv4 PAA nor inside the owned
     /// IPv6 `/64` prefix.
     PaaMismatch,
     /// No filter matched and there is no unfiltered/default bearer.
     NoMatch,
-    /// Readback or in-memory state contradicted the validated desired object.
+    /// Classifier state was inconsistent, or bounded fragment affinity refused
+    /// the packet: orphan, stale or expired identity, full bucket, conflicting
+    /// or overlapping ranges, range exhaustion, or a backwards clock.
     InvalidState,
 }
 
@@ -928,6 +1137,111 @@ mod tests {
             GtpBearerMark::new(mark).unwrap(),
             TrafficFlowTemplate::create_new(vec![filter(precedence, components)], vec![]).unwrap(),
         )
+    }
+
+    #[test]
+    fn stateful_fragment_host_matches_common_with_the_native_canonical_snapshot() {
+        let paa = Ipv4Addr::new(192, 0, 2, 10);
+        let remote = [198, 51, 100, 20];
+        let classifier = TftUplinkClassifier::new(
+            7,
+            IpAddr::V4(paa),
+            vec![
+                TftUplinkBearer::default_bearer(),
+                dedicated(
+                    11,
+                    10,
+                    vec![
+                        PacketFilterComponent::ProtocolIdentifierNextHeader(50),
+                        PacketFilterComponent::SecurityParameterIndex(0x1020_3040),
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+        let snapshot = TftUplinkFragmentSnapshot::new(&classifier, [1; 16], 2, 3).unwrap();
+        let mut host = TftUplinkFragmentTable::new(7).unwrap();
+        let mut common = TftFragmentBucket::new();
+        let key = TftFragmentKey::new(snapshot.key, paa.octets(), remote, 50, 1);
+        let mut first = [0; 44];
+        first[0] = 0x45;
+        first[2..4].copy_from_slice(&44_u16.to_be_bytes());
+        first[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        first[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+        first[9] = 50;
+        first[12..16].copy_from_slice(&paa.octets());
+        first[16..20].copy_from_slice(&remote);
+        first[20..24].copy_from_slice(&0x1020_3040_u32.to_be_bytes());
+        let mut last = first;
+        last[6..8].copy_from_slice(&3_u16.to_be_bytes());
+        let expiry = 100 + opc_gtpu_ebpf_common::TFT_FRAGMENT_LIFETIME_NS;
+        for (packet, now, current, expected) in [
+            (
+                &first,
+                100,
+                Some(&snapshot),
+                TftFragmentDisposition::Selected(11),
+            ),
+            (
+                &first,
+                101,
+                Some(&snapshot),
+                TftFragmentDisposition::Selected(11),
+            ),
+            (
+                &last,
+                102,
+                Some(&snapshot),
+                TftFragmentDisposition::Selected(11),
+            ),
+            (&last, 103, Some(&snapshot), TftFragmentDisposition::Drop),
+            (&first, 104, Some(&snapshot), TftFragmentDisposition::Drop),
+            (
+                &first,
+                expiry,
+                Some(&snapshot),
+                TftFragmentDisposition::Selected(11),
+            ),
+            (&last, expiry + 1, None, TftFragmentDisposition::Drop),
+            (
+                &last,
+                expiry + 2,
+                Some(&snapshot),
+                TftFragmentDisposition::Drop,
+            ),
+        ] {
+            // These are the exact native encoder's private metadata and rows,
+            // never a separately supplied classifier/metadata pairing.
+            let parsed = TftClassifierIpv4Packet::parse_first_fragment(packet);
+            let decision = parsed.as_ref().map(|packet| {
+                select_tft_classifier_ipv4(snapshot.key, snapshot.meta, &snapshot.filters, *packet)
+            });
+            let first = match (parsed.as_ref(), decision) {
+                (Some(packet), Some(TftClassifierSelection::Selected(mark))) => {
+                    Some((packet, mark))
+                }
+                (Some(packet), Some(TftClassifierSelection::Default)) => Some((packet, 0)),
+                _ => None,
+            };
+            let actual = common.apply(
+                key,
+                TftIpv4Fragment::parse(packet),
+                current.map(|snapshot| &snapshot.meta),
+                first,
+                now,
+            );
+            assert_eq!(actual, expected);
+            let expected_host = match expected {
+                TftFragmentDisposition::Selected(mark) => {
+                    Some(TftUplinkClassification::Selected(GtpBearerMark::new(mark)))
+                }
+                TftFragmentDisposition::Drop => Some(TftUplinkClassification::Drop(
+                    TftUplinkDropReason::InvalidState,
+                )),
+                _ => panic!("the explicit parity matrix contains only forwarding or stale drops"),
+            };
+            assert_eq!(host.classify(paa, current, packet, now), expected_host);
+        }
     }
 
     #[test]

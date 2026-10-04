@@ -38,7 +38,7 @@ pub const CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION: u16 = 1;
 /// current-graph terminal evidence.  A legacy outcome alone is never a
 /// terminal receipt.
 pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID: &str =
-    "opc.gtpu.current-ebpf-recovery-terminal-wal.r2";
+    "opc.gtpu.current-ebpf-recovery-terminal-wal.r3";
 
 /// Stable codec identity of the redaction-safe current terminal receipt
 /// commitment used by an external broker's retired-to-new authority CAS.
@@ -67,7 +67,7 @@ pub const CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN: usize = 416
 ///
 /// The `HistoricalR5Handoff` variant is deliberately separate from the
 /// current graph commitment: its 25-map commitment is never interpreted as a
-/// current 34-map inventory. The terminal WAL retains the sealed R5 record
+/// current 35-map inventory. The terminal WAL retains the sealed R5 record
 /// codec/KAT binding and revalidates that source receipt under the same
 /// target locks before it can issue this projection.
 #[non_exhaustive]
@@ -7527,8 +7527,9 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         };
+        // Receipt/transfer encoding remains r2; its commitment binds WAL r3.
         const EXPECTED_RECEIPT: &str =
-            "12de6a11ffbd257e646c71e73edfaf1a8401537db00a26d7f8e263020fdad38f";
+            "b22faccb2e0fe0eed4303ee2180bcce3c5c00793d949015b98381f26e5f8a35c";
         const EXPECTED_TRANSFER: &str = concat!(
             "4f504354525852320001000000000000",
             "5151515151515151515151515151515151515151515151515151515151515151",
@@ -7538,11 +7539,11 @@ mod tests {
             "5454545454545454545454545454545454545454545454545454545454545454",
             "5555555555555555555555555555555555555555555555555555555555555555",
             "5656565656565656565656565656565656565656565656565656565656565656",
-            "12de6a11ffbd257e646c71e73edfaf1a8401537db00a26d7f8e263020fdad38f",
-            "9af15c8bfce72de4d271ac331ae946b5e29fd6ebda5e08b37cfce67340773e14",
+            "b22faccb2e0fe0eed4303ee2180bcce3c5c00793d949015b98381f26e5f8a35c",
+            "271906914ffb84b5692251eaf56681ac1174799240dc5a8ae21f417b79abba49",
         );
         const EXPECTED_BASIS: &str =
-            "08e77c78b6df941304ca8599d5315e304f0574a3fe680098826b321291f1eadb";
+            "185008eb08ecb81478415a18ca971ae27d82caeda13c5de39fe7a51db8ed9a33";
         assert_eq!(
             kat_hex(&transfer.prior_terminal_receipt_commitment().as_bytes()),
             EXPECTED_RECEIPT,

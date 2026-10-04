@@ -192,9 +192,12 @@ contexts must be drained before an SDK downgrade. See
   uplink-capable TFT snapshots and packet-filter components the
   backend-neutral parser can represent (including IPv4 and IPv6 semantics),
   and returns a pre-existing bearer mark or a silent drop. The unfiltered
-  bearer is the explicit default fallback; absent one, no-match, malformed,
-  fragmented, unsafe-to-parse, and foreign-PAA packets drop. Its typed
-  `TftUplinkPaaSet` holds at most one IPv4 `/32` and one canonical IPv6
+  bearer is the explicit default fallback for a valid no-match; absent one,
+  no-match packets drop. The stateless packet-only classifier always rejects
+  malformed, fragmented, unsafe-to-parse, and foreign-PAA packets. The native
+  unmarked IPv4 path additionally supports
+  [bounded fragment affinity](#bounded-inner-ipv4-tft-fragment-affinity).
+  Its typed `TftUplinkPaaSet` holds at most one IPv4 `/32` and one canonical IPv6
   `/64`; any inner source inside the IPv6 prefix matches, and an IPv4v6 PDN
   uses one classifier for both families. The native eBPF ABI remains
   IPv4-only and rejects an IPv6 or dual-family set.
@@ -209,12 +212,14 @@ contexts must be drained before an SDK downgrade. See
   metadata tombstone, removes only canonical rows under the current
   authority, and removes the tombstone last. The tc program classifies a
   tombstone whose classifier has a default bearer as absent, so default-bearer
-  uplink continues through removal without any row being read; it rejects a
-  tombstone without a default bearer. Before deleting any row, each removal
-  attempt waits for every tc invocation that could have copied the active
-  selector before the tombstone. The adapter prefers the qualified GLOBAL
-  membarrier grace. If GLOBAL is unavailable, including on `nohz_full`, TFT
-  uses a successful userspace update of a private, unpinned ARRAY_OF_MAPS.
+  uplink continues through removal without any row being read. A fragment with
+  retained affinity instead drops on the now-stale identity; it cannot use
+  that default fallback. A tombstone without a default bearer drops. Before
+  deleting any row, each removal attempt waits for every tc invocation that
+  could have copied the active selector before the tombstone. The adapter
+  prefers the qualified GLOBAL membarrier grace. If GLOBAL is unavailable,
+  including on `nohz_full`, TFT uses a successful userspace update of a private,
+  unpinned ARRAY_OF_MAPS.
   The reviewed kernel path waits for a full RCU grace for non-sleepable TC
   readers. This fallback requires the recognized non-realtime SMP build
   profile and Linux 6.8–6.19, 7.0–7.2, or `5.14.0-427.*el9_4*`; object
@@ -241,12 +246,13 @@ contexts must be drained before an SDK downgrade. See
   Retries also prove the exact fingerprint. This fingerprint is a consistency proof, not
   authentication against a privileged raw map writer. Native eBPF TFT
   adoption rejects partial pin graphs and promotes an all-zero schema marker
-  only after both behavior-bearing maps are proven empty before hook mutation
-  and rechecked empty immediately before publication. Native eBPF TFT
-  classifier ABI/schema v4 remains IPv4-only: filter-map keys include the
-  current owner and snapshot generations, and each value carries its dense
-  precedence rank. TC therefore finds only rows named by validated metadata;
-  exact userspace readback verifies the redundant value identity and rank.
+  only after the metadata, filter, and fragment-affinity maps are proven empty
+  before hook mutation and rechecked empty immediately before publication.
+  Native eBPF TFT classifier ABI/schema v5 remains IPv4-only: filter-map keys
+  include the current owner and snapshot generations, and each value carries
+  its dense precedence rank. TC therefore finds only rows named by validated
+  metadata; exact userspace readback verifies the redundant value identity and
+  rank.
   This is a consistency boundary, not protection from a privileged actor that
   can co-mutate raw maps. IPv6 PAA, IPv6 components, and flow-label filters
   are rejected before any map mutation. This contract does not claim IPv6
@@ -369,6 +375,12 @@ all of those dimensions plus the exact device attachment, backend incarnation,
 observation-source epoch, and monotonic-clock origin. Validation repeats the
 live readback under the adapter's writer authority; equality of a previously
 read object is not sufficient.
+
+Native traffic observation and fragment-namespace empty proofs assume the
+backend runs without a time namespace: userspace `CLOCK_BOOTTIME` must share
+the kernel boot-clock origin used by tc. Time-namespace offsets are unsupported.
+In particular, a positive offset can make live fragment slots appear expired
+to an empty proof, while a negative offset can delay acceptance of expired slots.
 
 When reconciliation changes the exact desired group, callers consume a lease
 from the canonical store with
@@ -1100,6 +1112,92 @@ the explicit `Any` policy, rejects narrower policies with
 `UnsupportedFeature`, and reports this capability as `Missing` because its
 kernel interface cannot prove the same per-PDR endpoint binding.
 
+### Bounded inner IPv4 TFT fragment affinity
+
+The native unmarked uplink path keeps a bounded bearer decision for inner IPv4
+fragments. It forwards each original fragment independently; it does not
+buffer payloads or reassemble a datagram. Only fragment zero (offset zero,
+`MF=1`) with a valid envelope and all required visible transport fields may
+establish affinity. TCP requires its complete declared header, UDP its complete
+header and a larger declared datagram length, and ESP its complete eight-byte
+header. ESP matches address, protocol 50, SPI, and supported traffic-class
+filters; its bytes are never interpreted as TCP/UDP ports. A valid first
+fragment may select a dedicated bearer or the classifier's explicit default.
+
+The key is the exact `(ifindex, PAA, source, destination, protocol, IPv4 ID)`.
+The retained mark is bound to the classifier owner, owner generation, snapshot
+generation, and fingerprint. A later fragment must find that live key and the
+same current classifier identity. Every selected mark still goes through the
+existing exact downstream peer/F-TEID authority lookup. Affinity does not grant
+forwarding authority or introduce a protocol Recovery-event API. Native owner
+and owner generation derive from namespace identity, interface index and pinned
+map IDs, so they remain fixed for the fragment map's lifetime. Replacement and
+reinstall change snapshot generation and fingerprint; replacement also changes
+the bank, while reinstall after removal starts at bank 0. Removal makes the
+current classifier absent. These transitions invalidate entries without a
+userspace scan. PDP/bearer revocation is enforced by the downstream authority
+lookup; it does not change the TFT owner generation. A stale retained entry drops even when the
+removed classifier had a default bearer. When neither a classifier nor a live
+entry exists, the previous ordinary forwarding behavior remains.
+
+The per-attachment table has 16,384 independently locked buckets with four
+slots each, for at most 65,536 concurrent datagram identities. A full bucket
+refuses a new datagram even if another bucket is free. Each entry tracks at
+most 64 fragment ranges, including the first, and expires exactly two seconds
+after admission in boot-time nanoseconds. No live entry is evicted, including
+poisoned or completed entries. Expired slots are reused in place; neither a
+successful later fragment nor a duplicate first fragment extends the deadline.
+This is a concurrent-datagram budget shared by the attachment, not a reserved
+slot per subscriber; hash collisions can exhaust a bucket before the global
+limit is reached. There is no per-subscriber admission bound: one subscriber
+can keep all slots occupied and deny new fragmented datagrams to every other
+classified subscriber on the attachment. The host `TftUplinkFragmentTable`
+allocates approximately 24.5 MiB per attachment.
+
+A duplicate first fragment is accepted only when its parsed classifier fields,
+selected mark, header length, and first range agree. A conflicting first
+fragment, overlap (including a duplicate later fragment), inconsistent final
+range, or range-limit exhaustion poisons the entry until its original expiry.
+Malformed envelopes (including DF or reserved flags on a fragment), a UDP
+length contradiction and a stale classifier identity also poison a retained
+entry. A version nibble other than four bypasses IPv4 classification on both
+host and tc and leaves affinity untouched.
+Later fragments received before their first fragment, or after its expiry,
+drop while a classifier owns the PAA. Valid non-overlapping later fragments
+may arrive in either order after admission. IPv4 ID reuse requires expiry;
+replacement does not clear the old key early. Rejections use the existing
+aggregate TFT malformed, no-match, and invalid-state counters without packet
+values or per-datagram labels. Invalid-state includes ordinary fragment events
+such as orphan, expiry, capacity refusal and overlap, as well as inconsistent
+classifier state; capacity refusal has no distinct slot in the pinned counter
+map.
+
+`GTPU_TFT_FRAG` is a pinned BTF ARRAY with one spin lock per bucket. Each slot
+is 392 bytes; four slots occupy 1,568 bytes, and the lock makes the BTF value
+1,572 bytes. The kernel's eight-byte stride alignment makes value storage
+1,576 bytes per bucket, or 24.625 MiB per attachment before map metadata.
+The ARRAY is preallocated per attachment, independently of registered UE
+count; registration does not allocate fragment slots.
+
+Admission or lookup examines at most four slots and 64 ranges. Fragment zero
+also runs the existing classifier, bounded to 256 filters. Packet reads,
+classification, clock reads, counters, and forwarding lookups occur outside the
+lock; the protected state mutation performs no allocation or helper call.
+Userspace does not delete or refresh packet entries. Exact graph teardown
+removes the affinity map with the other owned pins.
+
+The stateless `TftUplinkClassifier::classify` and shared packet parser retain
+their strict fragment rejection. For the host model, construct a
+`TftUplinkFragmentSnapshot` from the complete classifier and its owner and
+publication generations. Keep one `TftUplinkFragmentTable` per attachment
+across replacement, removal, and revocation, and supply nondecreasing boot-time
+nanoseconds to `classify`. Snapshot construction derives the native canonical
+rows and fingerprint; callers cannot pair a classifier with unrelated metadata.
+The model returns a classifier decision, which still requires the existing
+downstream authority lookup. Native TFT fragment affinity remains IPv4-only.
+See the [upgrade and rollback contract](#tft-fragment-affinity-upgrade-and-rollback)
+before adopting or replacing retained maps.
+
 ### Per-bearer packet marks
 
 The eBPF backend can install a default bearer and multiple dedicated bearers
@@ -1549,6 +1647,66 @@ are unchanged.
 
 ### Pinned-map and live-program migration
 
+#### TFT fragment-affinity upgrade and rollback
+
+The current attachment requires all 35 named maps, including the pinned
+`GTPU_TFT_FRAG` BTF ARRAY, and TFT marker `OPC-TFT-IPv4-v5`. An old 34-map graph
+without this map, a retained v4 TFT marker, or any partial TFT graph is refused
+before attachment mutation. The loader does not fill in the new map beside an
+old classifier. Fresh creation initializes the map to zero. Promotion of an
+all-zero TFT marker requires a complete current TFT graph with empty metadata,
+filters, and affinity state, checked before hook mutation and again before
+marker publication. The independent PMTU-v5 and grouped-session markers do
+not establish TFT compatibility.
+
+Upgrade requires stopping new traffic and producers, draining represented
+sessions and in-flight traffic, then using the prior version's exact device
+removal or authorized graph-recovery procedure to remove its owned hooks and
+pins. The destination version then needs a fresh attachment and reinstallation
+of classifier/session state in an authorized namespace that passes its
+creation checks. Graph cleanup alone does not establish namespace eligibility.
+Retaining pins with `suspend_grouped_device` does not perform this migration.
+Rollback follows the same sequence using this version to clean up its 35-map
+graph before the older version creates its own graph. Neither direction
+supports an in-place live schema change or packet continuity across the
+drained replacement.
+
+The wider map identity changes current recovery proof magic from `OPCCURR7` to
+`OPCCURR8` and terminal WAL codec from
+`opc.gtpu.current-ebpf-recovery-terminal-wal.r2` to
+`opc.gtpu.current-ebpf-recovery-terminal-wal.r3`. Older proofs/WALs are not
+converted, and an older binary cannot consume the new ones. Finish pending
+recovery with the version that wrote its records. Terminal recovery retains
+`GTPU_CURRENT_RECOVERY_TERMINAL_V1` even after graph removal; recovery to a
+current successor persists `GTPU_CURRENT_RECOVERY_FINALIZED_RECEIPT_V1`.
+Finishing old recovery therefore does not necessarily make that namespace
+reusable. These retained records have the old width and codec commitments,
+and this version rejects them, including finalized receipts. If any
+incompatible proof, WAL, or finalized receipt remains, preserve it and use a
+separate, freshly authorized namespace. Do not delete or rewrite authority
+evidence to force attachment. Rollback has the same constraint in the opposite
+direction; no cross-version record conversion is implemented.
+
+Ordinary fresh creation in a previously used namespace requires exact graph
+cleanup, no selector-authority markers, no recovery proof, terminal WAL, or
+finalized receipt, and successful pristine-namespace checks. Adoption of a
+present current graph also validates any finalized receipt. Completing graph
+cleanup with an older binary cannot bypass either check.
+
+Receipt and transfer codec names remain r2, but their commitments bind the WAL
+codec. The maintenance-only shipped-25 graph retains its frozen TFT v4
+recognition and separate recovery authority; it is not an adoption route for
+the former 34-map graph.
+
+The new map participates in exact pin identity checks, program/map references,
+cleanup-only acquisition, ordinary teardown, current recovery, and fresh-attach
+rollback. Failed attachment removes only exactly owned fresh resources when
+the existing rollback proof permits it; indeterminate or pre-existing graphs
+remain retained for reconciliation. Classifier replacement/removal invalidates
+affinity by identity, while physical map removal belongs to graph teardown.
+
+#### Earlier endpoint and MTU schema transitions
+
 The endpoint-bound v3 schema keeps the legacy default FAR, DSCP, and PDR
 names/layouts and the v2 marked FAR/DSCP/PDR names. It adds
 `GTPU_DL_BIND` for the canonical per-TEID endpoint identity and
@@ -1650,7 +1808,7 @@ removed, the eBPF backend:
 - acquires a nonblocking exclusive `flock` on a permanent control-directory
   inode keyed only by the validated pin namespace below the canonical shared
   bpffs root;
-- validates the canonical graph directory and the exact current 34-map names,
+- validates the canonical graph directory and the exact current 35-map names,
   ABIs, schema markers, configuration, PMTU state, and kernel map IDs;
 - loads the committed current classifier artifacts against those exact maps
   only after the read-only inventory succeeds, derives their exact program
@@ -1727,7 +1885,7 @@ loop {
 ```
 
 The first authorized mutation publishes a checksummed proof map bound to the
-namespace hash, canonical graph device/inode, all 34 exact map IDs, populated
+namespace hash, canonical graph device/inode, all 35 exact map IDs, populated
 state authorization, and the proof map's own kernel ID. Normal create/adopt
 fences on that reserved proof. Every surviving map and the proof remain open by
 FD during cleanup. An ordinary unlink or final directory-removal failure
@@ -1906,14 +2064,14 @@ recovery:
 
 Before granting authority the backend proves the expected name/ifindex pair,
 then performs a complete read-only inventory and ABI/capacity validation of all
-34 current map pins before binding CONFIG or any other typed map. Only the exact
-current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
-pin, migrates an older schema, or advances a schema marker. A canonical nonzero
-endpoint is then compared with the caller's configured local S2b-U address. The
-independent grouped authority must still be uninitialized: `GTPU_CONFIG6` and
-`GTPU_SCHEMA6` must both be all-zero and all four grouped hash maps must be
-empty. A committed, populated, or malformed grouped state is refused as
-`NotCurrentSchema`; this legacy IPv4 recovery path never adopts grouped
+35 current map pins before binding CONFIG or any other typed map. Only the exact
+current PMTU-v5 and TFT-v5 graph is accepted: cleanup acquisition never creates
+a missing pin, migrates an older schema, or advances a schema marker. A
+canonical nonzero endpoint is then compared with the caller's configured local
+S2b-U address. The independent grouped authority must still be uninitialized:
+`GTPU_CONFIG6` and `GTPU_SCHEMA6` must both be all-zero and all four grouped
+hash maps must be empty. A committed, populated, or malformed grouped state is
+refused as `NotCurrentSchema`; this legacy IPv4 recovery path never adopts grouped
 authority. Identity and retained pin/config/schema structural refusals happen
 before graph mutation. Acquisition then holds the host-global namespace lease,
 fences any retained live hook it owns, and recovers interrupted current-schema

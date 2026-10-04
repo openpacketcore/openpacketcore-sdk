@@ -34,6 +34,17 @@ GTP-U encapsulation/classification helpers.
   extension rule between both tc parsers and the host reassembly parser. The
   complete chain must validate before a control-plane handoff.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
+- The TFT v5 ABI defines classifier metadata and precedence-ranked filters for
+  the IPv4 uplink path. `TftClassifierIpv4Packet::parse` remains a strict
+  packet-only parser that rejects fragments. `parse_first_fragment` accepts a
+  fully visible fragment-zero header solely for stateful affinity; ESP exposes
+  its SPI and never TCP/UDP ports.
+- `TftFragmentKey`, `TftIpv4Fragment`, `TftFragmentBucket`, and
+  `TftFragmentDisposition` share the bounded fragment-affinity transition
+  between host and tc. The caller supplies validated current classifier
+  metadata, a classified first-fragment decision, exclusive bucket access, and
+  boot-time nanoseconds. A selected mark still requires the downstream exact
+  bearer/peer/F-TEID authority lookup.
 - `Ipv4EnvelopeBounds`, `UdpEnvelopeBounds`, and `GtpuEnvelopeBounds` validate
   the exact nested downlink boundary with checked arithmetic while retaining
   legal layer-2 padding outside the IPv4 packet.
@@ -121,6 +132,35 @@ authority-store lease API from `opc-gtpu-dataplane`.
 - `#![no_std]`, `#![forbid(unsafe_code)]`, and dependency-free.
 - Contains no map access, loader code, tc hooks, kernel syscalls, or product
   policy.
+- Fragment affinity binds the exact interface, PAA, source, destination,
+  protocol, and IPv4 ID to the first decision's owner, owner generation,
+  snapshot generation, and fingerprint. Later fragments require the same
+  current identity. Stale entries fail closed after replacement or removal;
+  absence of both classifier and live entry preserves ordinary forwarding.
+  The model stores ranges and classifier fields, not payloads for reassembly.
+- `GTPU_TFT_FRAG` has 16,384 four-way buckets (65,536 slots), at most 64 ranges
+  per datagram, and an immutable two-second boot-time expiry. A full bucket
+  refuses admission without live eviction. Matching duplicate first fragments
+  refresh nothing; conflicting first fragments, overlaps, and range-limit
+  exhaustion poison the entry until its original deadline. Expired slots are
+  reused in place. Work under the caller's lock is bounded to four slot checks
+  and 64 range checks, without helpers or allocations.
+- Each fragment slot is 392 bytes; a bucket is 1,568 bytes, or 1,572 bytes with
+  the tc BTF spin lock. The kernel ARRAY uses a 1,576-byte aligned stride,
+  totaling 24.625 MiB of value storage per attachment before map metadata. These
+  limits are shared by all datagrams on an attachment, with no per-PAA capacity
+  guarantee. Classifier replacement invalidates identities; it does not
+  delete live slots or extend their deadlines.
+- The additional pinned map advances the current graph to 35 maps and TFT
+  marker to `OPC-TFT-IPv4-v5`. The loader refuses retained TFT v4 or incomplete
+  TFT graphs before attachment mutation; current recovery proof/WAL formats
+  also advance. Upgrade and rollback require a drain, compatible-version exact
+  cleanup, and fresh attachment. Incompatible retained proofs, WALs, or
+  finalized receipts continue to fence the namespace after graph cleanup. No
+  record conversion is implemented: preserve them and use a separate, freshly
+  authorized namespace. See the
+  [loader lifecycle contract](../opc-gtpu-dataplane/README.md#tft-fragment-affinity-upgrade-and-rollback).
+  The separate frozen shipped-25 ABI retains its literal TFT v4 recognition.
 - The grouped-session ABI is used by the current loader and tc programs without
   changing legacy key bytes. The independent `GTPU_SCHEMA6` marker prevents a
   v5 graph from being mistaken for the grouped schema. Each attachment owns

@@ -148,7 +148,7 @@ pub const DEFAULT_TC_PRIORITY: u16 = 50;
 /// The Linux manifest uses this constant as its array length, so changing the
 /// manifest without changing the cross-platform fake is a compile-time error.
 #[cfg(any(target_os = "linux", test))]
-const CURRENT_EBPF_GRAPH_PIN_COUNT: usize = 34;
+const CURRENT_EBPF_GRAPH_PIN_COUNT: usize = 35;
 /// Maximum number of managed-device identities returned by one inventory.
 ///
 /// The backend always returns the identities with the lowest interface
@@ -4858,6 +4858,54 @@ impl EbpfGtpuDataplaneBackend {
         Ok(digest.finalize().into())
     }
 
+    /// Build the immutable host fragment model from the same canonical native
+    /// rows and fingerprint as the publisher. Callers cannot pair independently
+    /// supplied filter contents with unrelated authority metadata.
+    pub(crate) fn encode_tft_fragment_snapshot(
+        classifier: &TftUplinkClassifier,
+        owner: [u8; 16],
+        owner_generation: u64,
+        snapshot_generation: u64,
+    ) -> Result<
+        (
+            TftClassifierKey,
+            TftClassifierMeta,
+            Vec<TftClassifierFilter>,
+        ),
+        GtpuError,
+    > {
+        let owner = TftClassifierOwnerId::new(owner).ok_or_else(|| {
+            GtpuError::invalid_config("tft_fragment_snapshot.owner", "owner must be nonzero")
+        })?;
+        if owner_generation == 0 || snapshot_generation == 0 {
+            return Err(GtpuError::invalid_config(
+                "tft_fragment_snapshot.generations",
+                "owner and snapshot generations must be nonzero",
+            ));
+        }
+        let authority = EbpfTftAuthority {
+            owner: owner.into_bytes(),
+            owner_generation,
+        };
+        let encoded = Self::encode_tft_classifier(classifier, authority, snapshot_generation)?;
+        let meta = TftClassifierMeta::new(
+            0,
+            encoded.has_default,
+            owner,
+            owner_generation,
+            snapshot_generation,
+            encoded.filters.len() as u16,
+            Self::tft_classifier_fingerprint(&encoded, 0, authority, snapshot_generation)?,
+        )
+        .ok_or_else(|| {
+            GtpuError::invalid_config(
+                "tft_fragment_snapshot",
+                "snapshot authority must be canonical and generations nonzero",
+            )
+        })?;
+        Ok((encoded.key, meta, encoded.filters))
+    }
+
     fn tft_record_to_packet_filter(record: TftClassifierFilter) -> Result<PacketFilter, GtpuError> {
         let spec = record.spec();
         let mut components = Vec::with_capacity(spec.component_count());
@@ -5103,7 +5151,9 @@ impl EbpfGtpuDataplaneBackend {
         observed: Option<&ObservedTftClassifier>,
     ) -> Result<u64, GtpuError> {
         match observed {
-            None => Ok(1),
+            None => traffic_random_u64().ok_or(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_snapshot_generation",
+            }),
             Some(observed) => observed
                 .meta
                 .snapshot_generation()
@@ -5709,8 +5759,8 @@ impl EbpfGtpuDataplaneBackend {
         authority: EbpfTftAuthority,
         key: TftClassifierKey,
     ) -> TftUplinkClassifierRemovalOutcome {
-        // A TC invocation that copied the active selector before the fence
-        // may still read its rows; one that copies the fence reads none. Wait
+        // A TC invocation that captured active metadata before the fence may
+        // still read rows bound to that snapshot; a fence snapshot reads none. Wait
         // out the former once, before this attempt deletes any row, even when
         // an earlier attempt published the fence. Without a completed wait no
         // row is deleted: the fence and every row stay for a retry.
@@ -15970,15 +16020,16 @@ mod aya_runtime {
         MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS,
         MAP_SESSION_SCHEMA, MAP_SESSION_SELECTOR_STAMPS, MAP_SESSION_TRANSACTIONS,
         MAP_SESSION_UPLINK_INDEX, MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS,
-        MAP_TFT_CLASSIFIER_META, MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-        MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
-        MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
-        MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_BANKS,
-        TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
-        TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_FILTER_VALUE_LEN,
-        TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_MAX_FILTERS, TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
-        TFT_CLASSIFIER_META_VALUE_LEN, TFT_CLASSIFIER_SCHEMA_MARKER_VALUE,
-        TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+        MAP_TFT_CLASSIFIER_META, MAP_TFT_CLASSIFIER_SCHEMA, MAP_TFT_FRAGMENT_AFFINITY,
+        MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
+        MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+        PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_BANKS, TFT_CLASSIFIER_COUNTER_SLOTS,
+        TFT_CLASSIFIER_FILTER_KEY_LEN, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
+        TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_MAX_FILTERS,
+        TFT_CLASSIFIER_META_MAP_MAX_ENTRIES, TFT_CLASSIFIER_META_VALUE_LEN,
+        TFT_CLASSIFIER_SCHEMA_MARKER_VALUE, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, TFT_FRAGMENT_BUCKETS,
+        TFT_FRAGMENT_BUCKET_VALUE_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
         UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
         UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
         UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
@@ -16856,6 +16907,7 @@ mod aya_runtime {
         MAP_TFT_CLASSIFIER_META,
         MAP_TFT_CLASSIFIER_FILTERS,
         MAP_TFT_CLASSIFIER_COUNTERS,
+        MAP_TFT_FRAGMENT_AFFINITY,
         GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
         GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
         GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -16866,7 +16918,7 @@ mod aya_runtime {
         GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
     ];
 
-    const CURRENT_UPLINK_PROGRAM_MAP_NAMES: [&str; 29] = [
+    const CURRENT_UPLINK_PROGRAM_MAP_NAMES: [&str; 30] = [
         MAP_UPLINK_FAR,
         MAP_UPLINK_MARK_FAR,
         MAP_UPLINK_DSCP,
@@ -16888,6 +16940,7 @@ mod aya_runtime {
         MAP_TFT_CLASSIFIER_META,
         MAP_TFT_CLASSIFIER_FILTERS,
         MAP_TFT_CLASSIFIER_COUNTERS,
+        MAP_TFT_FRAGMENT_AFFINITY,
         GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
         GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
         GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -17117,6 +17170,13 @@ mod aya_runtime {
             max_entries: TFT_CLASSIFIER_COUNTER_SLOTS,
         },
         CurrentMapSpec {
+            name: MAP_TFT_FRAGMENT_AFFINITY,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: TFT_FRAGMENT_BUCKET_VALUE_LEN as u32,
+            max_entries: TFT_FRAGMENT_BUCKETS,
+        },
+        CurrentMapSpec {
             name: GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: GTPU_SESSION_GROUP_ID_LEN as u32,
@@ -17184,7 +17244,7 @@ mod aya_runtime {
     // unreleased and intentionally does not decode: its historical source
     // projection bound only a graph subset and could be satisfied by a later
     // R5 terminal adoption.
-    const CURRENT_RECOVERY_MAGIC: [u8; 8] = *b"OPCCURR7";
+    const CURRENT_RECOVERY_MAGIC: [u8; 8] = *b"OPCCURR8";
     // This is a second pin of the immutable current recovery proof map in
     // the authority leaf, not a synthetic marker. It is published and
     // fsynced before the in-graph proof pin is unlinked, so a retry can
@@ -18131,6 +18191,7 @@ mod aya_runtime {
         tft_meta: u32,
         tft_filters: u32,
         tft_counters: u32,
+        tft_fragments: u32,
         traffic_observation_registration: u32,
         traffic_observation_redirect: u32,
         traffic_observation_events: u32,
@@ -18767,7 +18828,7 @@ mod aya_runtime {
     ///
     /// `HistoricalR5Handoff` is deliberately a distinct source domain. Its
     /// sealed 25-map commitment is retained as provenance for the namespace,
-    /// never as a fabricated current 34-map inventory.
+    /// never as a fabricated current 35-map inventory.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(u8)]
     enum CurrentRecoveryTerminalSourceKind {
@@ -19732,7 +19793,7 @@ mod aya_runtime {
         /// Construct the current-domain terminal WAL that authenticates one
         /// already completed shipped-R5 handoff. This is deliberately not a
         /// current graph record: the zero current identity fields prevent the
-        /// 25-map source from being interpreted as a fabricated 34-map graph.
+        /// 25-map source from being interpreted as a fabricated 35-map graph.
         fn terminal_from_historical_handoff(
             namespace_hash: [u8; 32],
             authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
@@ -20365,7 +20426,7 @@ mod aya_runtime {
         fn encode(self) -> [u8; CURRENT_RECOVERY_PROOF_LEN] {
             let mut encoded = [0_u8; CURRENT_RECOVERY_PROOF_LEN];
             encoded[..8].copy_from_slice(&CURRENT_RECOVERY_MAGIC);
-            encoded[8] = 7;
+            encoded[8] = 8;
             encoded[9] = u8::from(self.allow_populated);
             encoded[10] = self.phase as u8;
             encoded[16..48].copy_from_slice(&self.namespace_hash);
@@ -20470,7 +20531,7 @@ mod aya_runtime {
                     .map(u32::from_ne_bytes)
             };
             if encoded[..8] != CURRENT_RECOVERY_MAGIC
-                || encoded[8] != 7
+                || encoded[8] != 8
                 || encoded[9] > 1
                 || CurrentRecoveryPhase::decode(encoded[10]).is_none()
                 || encoded[11..16] != [0; 5]
@@ -26116,7 +26177,13 @@ mod aya_runtime {
                 [u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN],
                 [u8; GTPU_SESSION_GROUP_ID_LEN]
             );
-            Ok(true)
+            let fragments = device
+                .ebpf
+                .map(MAP_TFT_FRAGMENT_AFFINITY)
+                .ok_or_else(|| state_indeterminate("ebpf_selector_binding_required_map"))?;
+            let now_ns = u64::try_from(super::traffic_boottime_duration()?.as_nanos())
+                .map_err(|_| state_indeterminate("ebpf_tft_fragment_clock"))?;
+            Self::tft_fragment_map_is_empty(fragments, Some(now_ns))
         }
 
         fn selector_namespace_fresh_provisioning_is_exact(
@@ -27855,6 +27922,10 @@ mod aya_runtime {
             EbpfLoader::new()
                 .default_map_pin_directory(pin_dir)
                 .map_pin_path(
+                    MAP_TFT_FRAGMENT_AFFINITY,
+                    pin_dir.join(MAP_TFT_FRAGMENT_AFFINITY),
+                )
+                .map_pin_path(
                     GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
                     pin_dir.join(GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME),
                 )
@@ -27949,12 +28020,14 @@ mod aya_runtime {
                     .maps
                     .get(spec.name)
                     .ok_or_else(|| state_indeterminate("ebpf_current_object_identity"))?;
-                let expected_pinning =
-                    if spec.name == GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME {
-                        PinningType::None
-                    } else {
-                        PinningType::ByName
-                    };
+                let expected_pinning = if matches!(
+                    spec.name,
+                    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME | MAP_TFT_FRAGMENT_AFFINITY
+                ) {
+                    PinningType::None
+                } else {
+                    PinningType::ByName
+                };
                 if map.map_type() != spec.map_type
                     || map.key_size() != spec.key_size
                     || map.value_size() != spec.value_size
@@ -30690,6 +30763,14 @@ mod aya_runtime {
             Ok(!forwarding_state_present)
         }
 
+        /// Frozen TFT schema of the shipped 25-map graph. This identity must
+        /// never follow the current classifier ABI when it changes.
+        fn historical_25_tft_schema_is_canonical(
+            schema: &[u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN],
+        ) -> bool {
+            *schema == [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] || *schema == *b"OPC-TFT-IPv4-v4\0"
+        }
+
         /// Validate every fixed-array value that participates in identifying
         /// the frozen graph. Shape alone cannot name the historical generation:
         /// malformed durable configuration remains indeterminate.
@@ -30712,9 +30793,7 @@ mod aya_runtime {
             {
                 return Err(LegacyV2IdentityError::Mismatch);
             }
-            if tft_schema != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]
-                && !tft_classifier_schema_is_current(&tft_schema)
-            {
+            if !Self::historical_25_tft_schema_is_canonical(&tft_schema) {
                 return Err(LegacyV2IdentityError::Mismatch);
             }
             Ok(())
@@ -31167,9 +31246,7 @@ mod aya_runtime {
                     .map_err(|_| LegacyV2IdentityError::Mismatch)?
                     .get(&0, 0)
                     .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
-                if schema != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]
-                    && !tft_classifier_schema_is_current(&schema)
-                {
+                if !Self::historical_25_tft_schema_is_canonical(&schema) {
                     return Err(LegacyV2IdentityError::Mismatch);
                 }
             }
@@ -31577,6 +31654,7 @@ mod aya_runtime {
                     MAP_TFT_CLASSIFIER_META,
                     MAP_TFT_CLASSIFIER_FILTERS,
                     MAP_TFT_CLASSIFIER_COUNTERS,
+                    MAP_TFT_FRAGMENT_AFFINITY,
                 ] {
                     if pin_dir
                         .join(other_pin)
@@ -31841,6 +31919,7 @@ mod aya_runtime {
                 MAP_TFT_CLASSIFIER_META,
                 MAP_TFT_CLASSIFIER_FILTERS,
                 MAP_TFT_CLASSIFIER_COUNTERS,
+                MAP_TFT_FRAGMENT_AFFINITY,
             ];
             let present = tft_pins
                 .iter()
@@ -31906,6 +31985,9 @@ mod aya_runtime {
                 [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
                 [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN]
             );
+            let fragments = Self::current_map(pin_dir, MAP_TFT_FRAGMENT_AFFINITY)
+                .map_err(|_| state_indeterminate("ebpf_tft_schema"))?;
+            Self::require_empty_tft_fragment_map(&fragments)?;
             Ok(())
         }
 
@@ -36532,6 +36614,7 @@ mod aya_runtime {
                 tft_meta: id(MAP_TFT_CLASSIFIER_META)?,
                 tft_filters: id(MAP_TFT_CLASSIFIER_FILTERS)?,
                 tft_counters: id(MAP_TFT_CLASSIFIER_COUNTERS)?,
+                tft_fragments: id(MAP_TFT_FRAGMENT_AFFINITY)?,
                 traffic_observation_registration: id(
                     GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
                 )?,
@@ -36577,6 +36660,7 @@ mod aya_runtime {
                 identity.tft_meta,
                 identity.tft_filters,
                 identity.tft_counters,
+                identity.tft_fragments,
                 identity.traffic_observation_registration,
                 identity.traffic_observation_redirect,
                 identity.traffic_observation_events,
@@ -36738,6 +36822,11 @@ mod aya_runtime {
                 ebpf.map(MAP_TFT_CLASSIFIER_COUNTERS).ok_or_else(missing)?,
             )
             .map_err(|error| map_error("ebpf_map_identity", error))?;
+            // BTF lock-bearing values are identified without reading or replacing data.
+            let tft_fragments = match ebpf.map(MAP_TFT_FRAGMENT_AFFINITY).ok_or_else(missing)? {
+                Map::Array(map) => info_id(map)?,
+                _ => return Err(state_indeterminate("ebpf_map_identity")),
+            };
             // Inspect the ring buffer through the loader's immutable map
             // handle. Constructing a `RingBuf` would establish a consumer and
             // could advance it while an identity check is in progress.
@@ -36824,6 +36913,7 @@ mod aya_runtime {
                 tft_meta: info_id(tft_meta.map())?,
                 tft_filters: info_id(tft_filters.map())?,
                 tft_counters: info_id(tft_counters.map())?,
+                tft_fragments,
                 traffic_observation_registration,
                 traffic_observation_redirect,
                 traffic_observation_events,
@@ -37354,10 +37444,36 @@ mod aya_runtime {
                 .map_err(|error| map_error("ebpf_tft_schema_get", error))
         }
 
-        /// Re-check the behavior-bearing maps held by this exact loader before
-        /// committing a zero schema marker. The pinned preflight catches
-        /// retained state before mutation; this second check also closes the
-        /// interval in which the loader materializes an absent additive graph.
+        /// Read coherent bucket occupancy without clearing retained bytes.
+        /// Namespace proofs accept expired slots using one boot-clock sample
+        /// taken before the scan. Zero-schema initialization passes no clock
+        /// and still requires all-zero data. Only TC ever mutates the array.
+        fn tft_fragment_map_is_empty(map: &Map, now_ns: Option<u64>) -> Result<bool, GtpuError> {
+            let array = Array::<_, [u8; TFT_FRAGMENT_BUCKET_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_schema", error))?;
+            for index in 0..TFT_FRAGMENT_BUCKETS {
+                let bytes = array
+                    .get(&index, 4) // BPF_F_LOCK
+                    .map_err(|error| map_error("ebpf_tft_schema", error))?;
+                let empty = match now_ns {
+                    Some(now_ns) => {
+                        opc_gtpu_ebpf_common::tft_fragment_bucket_is_empty_at(&bytes, now_ns)
+                    }
+                    None => bytes[4..].iter().all(|byte| *byte == 0),
+                };
+                if !empty {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+
+        fn require_empty_tft_fragment_map(map: &Map) -> Result<(), GtpuError> {
+            Self::tft_fragment_map_is_empty(map, None)?
+                .then_some(())
+                .ok_or_else(|| state_indeterminate("ebpf_tft_schema"))
+        }
+
         fn require_loaded_tft_initialization_empty(ebpf: &Ebpf) -> Result<(), GtpuError> {
             macro_rules! require_empty {
                 ($name:expr, $key:ty, $value:ty) => {{
@@ -37387,6 +37503,10 @@ mod aya_runtime {
                 [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
                 [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN]
             );
+            let fragments = ebpf
+                .map(MAP_TFT_FRAGMENT_AFFINITY)
+                .ok_or_else(|| state_indeterminate("ebpf_tft_schema"))?;
+            Self::require_empty_tft_fragment_map(fragments)?;
             Ok(())
         }
 
@@ -48572,6 +48692,34 @@ mod aya_runtime {
         }
 
         #[test]
+        fn historical_25_tft_schema_is_frozen_at_v4() {
+            let v4 = *b"OPC-TFT-IPv4-v4\0";
+            assert!(AyaGtpuRuntime::historical_25_tft_schema_is_canonical(&v4));
+            assert!(!AyaGtpuRuntime::historical_25_tft_schema_is_canonical(
+                &TFT_CLASSIFIER_SCHEMA_MARKER_VALUE
+            ));
+            assert!(!tft_classifier_schema_is_current(&v4));
+            for (schema, expected) in [
+                (v4, Ok(())),
+                (
+                    TFT_CLASSIFIER_SCHEMA_MARKER_VALUE,
+                    Err(LegacyV2IdentityError::Mismatch),
+                ),
+            ] {
+                assert_eq!(
+                    AyaGtpuRuntime::historical_25_fixed_array_values_are_canonical(
+                        [0; UPLINK_PMTU_VALUE_LEN],
+                        [192, 0, 2, 1],
+                        [0; GTPU_SESSION_CONFIG_VALUE_LEN],
+                        [0; GTPU_SESSION_SCHEMA_MARKER_LEN],
+                        schema,
+                    ),
+                    expected
+                );
+            }
+        }
+
+        #[test]
         fn observation_gate_changes_identity_across_every_reset_and_fails_on_exhaustion() {
             assert_eq!(next_traffic_observation_gate(0), Some((2, 3)));
             assert_eq!(next_traffic_observation_gate(3), Some((4, 5)));
@@ -50384,7 +50532,10 @@ mod aya_runtime {
             assert_eq!(object.maps.len(), CURRENT_MAP_NAMES.len());
             for name in CURRENT_MAP_NAMES {
                 let map = object.maps.get(name).expect("current named map");
-                let expected = if name == GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME {
+                let expected = if matches!(
+                    name,
+                    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME | MAP_TFT_FRAGMENT_AFFINITY
+                ) {
                     // BTF maps cannot carry legacy map-def pinning metadata.
                     // The loader supplies this one exact pin path explicitly.
                     PinningType::None
@@ -50431,10 +50582,15 @@ mod aya_runtime {
                     .try_into()
                     .expect("current program is a tc classifier");
                 program.load().expect("load current tc program");
-                let live_tag = program.info().expect("read live program info").tag();
+                let info = program.info().expect("read live program info");
+                let live_tag = info.tag();
                 assert!(
                     expected.contains(live_tag),
                     "running-kernel tag must be one exact normalized candidate"
+                );
+                println!(
+                    "OPC_GTPU_PROGRAM_VERIFIER_INFO program={name} verified_insns={:?}",
+                    info.verified_instruction_count()
                 );
             }
             drop(ebpf);
@@ -53841,6 +53997,7 @@ mod aya_runtime {
                 tft_meta: 23,
                 tft_filters: 24,
                 tft_counters: 25,
+                tft_fragments: 35,
                 traffic_observation_registration: 26,
                 traffic_observation_redirect: 33,
                 traffic_observation_events: 27,
@@ -54869,6 +55026,7 @@ mod tests {
     use opc_gtpu_ebpf_common::{
         default_bearer_graph_is_valid, GTPU_TRAFFIC_OBSERVATION_PUBLICATION_ID_MAX,
         TFT_CLASSIFIER_SCHEMA_MARKER_VALUE, TFT_CLASSIFIER_SCHEMA_VALUE_LEN,
+        TFT_FRAGMENT_BUCKET_VALUE_LEN,
     };
 
     use crate::model::{GtpBearerMark, Teid};
@@ -55456,7 +55614,8 @@ mod tests {
             (u32, [u8; TFT_CLASSIFIER_FILTER_KEY_LEN]),
             [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
         >,
-        tft_map_identity: HashMap<u32, [u32; 4]>,
+        tft_fragments: HashMap<(u32, u32), [u8; TFT_FRAGMENT_BUCKET_VALUE_LEN]>,
+        tft_map_identity: HashMap<u32, [u32; 5]>,
         tft_next_map_identity: u32,
         pdr: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_PDR_VALUE_LEN]>,
         marked_pdr: HashMap<(u32, [u8; 4]), [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>,
@@ -55477,6 +55636,7 @@ mod tests {
         tft_meta_map_ready: HashSet<u32>,
         tft_filters_map_ready: HashSet<u32>,
         tft_counters_map_ready: HashSet<u32>,
+        tft_fragments_map_ready: HashSet<u32>,
         marked_pdr_map_ready: HashSet<u32>,
         marked_owner_map_ready: HashSet<u32>,
         downlink_binding_map_ready: HashSet<u32>,
@@ -55856,7 +56016,8 @@ mod tests {
             (u32, [u8; TFT_CLASSIFIER_FILTER_KEY_LEN]),
             [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
         >,
-        tft_map_identity: HashMap<u32, [u32; 4]>,
+        tft_fragments: HashMap<(u32, u32), [u8; TFT_FRAGMENT_BUCKET_VALUE_LEN]>,
+        tft_map_identity: HashMap<u32, [u32; 5]>,
         tft_next_map_identity: u32,
         schema: HashMap<PathBuf, FakeSchema>,
     }
@@ -55901,6 +56062,7 @@ mod tests {
                 tft_schema: state.tft_schema.clone(),
                 tft_meta: state.tft_meta.clone(),
                 tft_filters: state.tft_filters.clone(),
+                tft_fragments: state.tft_fragments.clone(),
                 tft_map_identity: state.tft_map_identity.clone(),
                 tft_next_map_identity: state.tft_next_map_identity,
                 schema: state.schema.clone(),
@@ -55948,7 +56110,7 @@ mod tests {
         pmtu_ready: bool,
         pmtu_counters_ready: bool,
         pmtu_policy: [u8; UPLINK_PMTU_VALUE_LEN],
-        tft_map_identity: Option<[u32; 4]>,
+        tft_map_identity: Option<[u32; 5]>,
     }
 
     impl FakeSelectorNamespaceGraphIdentity {
@@ -56629,6 +56791,7 @@ mod tests {
         }
 
         fn selector_namespace_maps_are_empty(state: &FakeState, ifindex: u32) -> bool {
+            let now_ns = u64::try_from(traffic_boottime_duration().unwrap().as_nanos()).unwrap();
             let contains = |index: u32| {
                 state
                     .session_groups
@@ -56683,6 +56846,10 @@ mod tests {
                         .tft_filters
                         .keys()
                         .any(|(current, _)| *current == index)
+                    || state.tft_fragments.iter().any(|((current, _), value)| {
+                        *current == index
+                            && !opc_gtpu_ebpf_common::tft_fragment_bucket_is_empty_at(value, now_ns)
+                    })
                     || state
                         .traffic_observation_registrations
                         .keys()
@@ -57010,14 +57177,19 @@ mod tests {
                 state.tft_meta_map_ready.contains(&ifindex),
                 state.tft_filters_map_ready.contains(&ifindex),
                 state.tft_counters_map_ready.contains(&ifindex),
+                state.tft_fragments_map_ready.contains(&ifindex),
             ];
             let meta_present = state.tft_meta.keys().any(|(index, _)| *index == ifindex);
             let filters_present = state.tft_filters.keys().any(|(index, _)| *index == ifindex);
+            let fragments_present = state.tft_fragments.iter().any(|((index, _), value)| {
+                *index == ifindex && value[4..].iter().any(|byte| *byte != 0)
+            });
             let any_state = map_presence.iter().any(|present| *present)
                 || state.tft_schema.contains_key(&ifindex)
                 || state.tft_map_identity.contains_key(&ifindex)
                 || meta_present
-                || filters_present;
+                || filters_present
+                || fragments_present;
             if !any_state {
                 return Ok(());
             }
@@ -57036,7 +57208,11 @@ mod tests {
             if tft_classifier_schema_is_current(&marker) {
                 return Ok(());
             }
-            if marker != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] || meta_present || filters_present {
+            if marker != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]
+                || meta_present
+                || filters_present
+                || fragments_present
+            {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_tft_schema",
                 });
@@ -57070,12 +57246,12 @@ mod tests {
             }
             if !state.tft_map_identity.contains_key(&ifindex) {
                 let first = state.tft_next_map_identity.max(1);
-                let last = first.checked_add(3).ok_or(GtpuError::StateIndeterminate {
+                let last = first.checked_add(4).ok_or(GtpuError::StateIndeterminate {
                     operation: "ebpf_tft_map_identity",
                 })?;
                 state
                     .tft_map_identity
-                    .insert(ifindex, [first, first + 1, first + 2, last]);
+                    .insert(ifindex, [first, first + 1, first + 2, first + 3, last]);
                 state.tft_next_map_identity =
                     last.checked_add(1).ok_or(GtpuError::StateIndeterminate {
                         operation: "ebpf_tft_map_identity",
@@ -57085,6 +57261,7 @@ mod tests {
             state.tft_meta_map_ready.insert(ifindex);
             state.tft_filters_map_ready.insert(ifindex);
             state.tft_counters_map_ready.insert(ifindex);
+            state.tft_fragments_map_ready.insert(ifindex);
             Ok(())
         }
 
@@ -57104,6 +57281,7 @@ mod tests {
                 && state.tft_meta_map_ready.contains(&ifindex)
                 && state.tft_filters_map_ready.contains(&ifindex)
                 && state.tft_counters_map_ready.contains(&ifindex)
+                && state.tft_fragments_map_ready.contains(&ifindex)
                 && state
                     .tft_schema
                     .get(&ifindex)
@@ -57139,22 +57317,21 @@ mod tests {
                     .ok_or(GtpuError::StateIndeterminate {
                         operation: "ebpf_tft_authority",
                     })?;
+            let mut digest = Sha256::new();
+            digest.update(b"opc-gtpu/fake-tft-owner/v1");
+            digest.update(ifindex.to_be_bytes());
+            for id in identity {
+                digest.update(id.to_be_bytes());
+            }
+            let digest: [u8; 32] = digest.finalize().into();
             let mut owner = [0_u8; 16];
-            for (position, id) in identity.iter().enumerate() {
-                owner[position * 4..position * 4 + 4].copy_from_slice(&id.to_be_bytes());
-            }
-            let attachment = ifindex.to_be_bytes();
-            for (position, byte) in attachment.iter().enumerate() {
-                owner[position] ^= *byte;
-            }
+            owner.copy_from_slice(&digest[..16]);
             if owner == [0; 16] {
                 owner[15] = 1;
             }
             let mut generation_bytes = [0_u8; 8];
-            generation_bytes[..4].copy_from_slice(&identity[0].to_be_bytes());
-            generation_bytes[4..].copy_from_slice(&identity[3].to_be_bytes());
-            let mut owner_generation =
-                u64::from_be_bytes(generation_bytes) ^ u64::from(ifindex).rotate_left(17);
+            generation_bytes.copy_from_slice(&digest[16..24]);
+            let mut owner_generation = u64::from_be_bytes(generation_bytes);
             if owner_generation == 0 {
                 owner_generation = 1;
             }
@@ -58339,6 +58516,10 @@ mod tests {
                     state.tft_meta_map_ready.remove(&old_ifindex);
                     state.tft_filters_map_ready.remove(&old_ifindex);
                     state.tft_counters_map_ready.remove(&old_ifindex);
+                    state.tft_fragments_map_ready.remove(&old_ifindex);
+                    state
+                        .tft_fragments
+                        .retain(|(index, _), _| *index != old_ifindex);
                     state.uplink_filter_pin_dir.remove(&old_ifindex);
                     state.downlink_filter_pin_dir.remove(&old_ifindex);
                 }
@@ -58615,6 +58796,7 @@ mod tests {
             state.tft_meta_map_ready.insert(ifindex);
             state.tft_filters_map_ready.insert(ifindex);
             state.tft_counters_map_ready.insert(ifindex);
+            state.tft_fragments_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
@@ -61018,6 +61200,7 @@ mod tests {
             state.tft_meta_map_ready.remove(&ifindex);
             state.tft_filters_map_ready.remove(&ifindex);
             state.tft_counters_map_ready.remove(&ifindex);
+            state.tft_fragments_map_ready.remove(&ifindex);
             state.uplink_filter_ready.remove(&ifindex);
             state.downlink_filter_ready.remove(&ifindex);
             state.uplink_filter_pin_dir.remove(&ifindex);
@@ -61046,6 +61229,9 @@ mod tests {
             state.tft_map_identity.remove(&ifindex);
             state.tft_meta.retain(|(index, _), _| *index != ifindex);
             state.tft_filters.retain(|(index, _), _| *index != ifindex);
+            state
+                .tft_fragments
+                .retain(|(index, _), _| *index != ifindex);
             state.pdr.retain(|(index, _), _| *index != ifindex);
             state.marked_pdr.retain(|(index, _), _| *index != ifindex);
             state
@@ -64281,6 +64467,234 @@ mod tests {
         assert!(state.downlink_filter_ready.contains(&S2BU_IFINDEX));
     }
 
+    #[tokio::test]
+    async fn retained_four_map_tft_graph_refuses_adoption_before_mutation() {
+        for marker in [TFT_CLASSIFIER_SCHEMA_MARKER_VALUE, *b"OPC-TFT-IPv4-v4\0"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+            let before = {
+                let mut state = runtime.state();
+                suspend_fake_attachment(&mut state, S2BU_IFINDEX);
+                state.tft_fragments_map_ready.remove(&S2BU_IFINDEX);
+                state.tft_map_identity.get_mut(&S2BU_IFINDEX).unwrap()[4] = 0;
+                state.tft_schema.insert(S2BU_IFINDEX, marker);
+                FakeGroupedPublicationSnapshot::capture(&state)
+            };
+            assert!(matches!(
+                runtime.adopt("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY),
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_schema"
+                })
+            ));
+            let state = runtime.state();
+            assert!(before == FakeGroupedPublicationSnapshot::capture(&state));
+            assert!(!state.tft_fragments_map_ready.contains(&S2BU_IFINDEX));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_fragment_entries_allow_all_three_selector_namespace_empty_proofs() {
+        let (backend, runtime) = backend_with_fake();
+        let device_id = grouped_device_id(0x73);
+        let endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap();
+        backend
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints))
+            .await
+            .unwrap();
+        let group = grouped_group(
+            0x73,
+            device_id,
+            vec![grouped_v6_entry(0x1000_0073, 0x2000_0073, ipv6_peer())],
+        );
+        let binding = fresh_group_admission(&group).binding();
+        let mut bytes = [0; TFT_FRAGMENT_BUCKET_VALUE_LEN];
+        bytes[4] = 1; // Retained nonzero key after all forwarding rows are removed.
+                      // Four-byte spin lock, then the fixed 116-byte key/metadata/packet prefix.
+        bytes[120..128].copy_from_slice(&u64::MAX.to_be_bytes());
+        runtime
+            .state()
+            .tft_fragments
+            .insert((S2BU_IFINDEX, 0), bytes);
+        assert!(!FakeRuntime::selector_namespace_maps_are_empty(
+            &runtime.state(),
+            S2BU_IFINDEX
+        ));
+
+        // One nanosecond after boot has elapsed on both real and fake clocks.
+        bytes[120..128].copy_from_slice(&1_u64.to_be_bytes());
+        runtime
+            .state()
+            .tft_fragments
+            .insert((S2BU_IFINDEX, 0), bytes);
+        let mut currentness = selector_namespace_current();
+        backend
+            .provision_selector_namespace_sync(binding, &mut currentness)
+            .expect("expired state permits the one-shot fresh provisioning proof");
+        runtime
+            .read_pristine_selector_namespace_effect(S2BU_IFINDEX, binding, &mut currentness)
+            .expect("expired state permits pristine readback");
+        {
+            let mut state = runtime.state();
+            state.cleanup_only.insert(S2BU_IFINDEX);
+            state.uplink_filter_ready.remove(&S2BU_IFINDEX);
+            state.downlink_filter_ready.remove(&S2BU_IFINDEX);
+        }
+        runtime
+            .provision_selector_namespace_effect(S2BU_IFINDEX, binding, &mut currentness)
+            .expect("expired state permits stopped initializing recovery");
+        assert_eq!(
+            runtime.state().tft_fragments[&(S2BU_IFINDEX, 0)],
+            bytes,
+            "emptiness proofs never erase retained fragment bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_fragment_bytes_block_zero_schema_and_fresh_namespace_proofs() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        let before = {
+            let mut state = runtime.state();
+            let mut bytes = [0; TFT_FRAGMENT_BUCKET_VALUE_LEN];
+            bytes[4] = 1;
+            state.tft_fragments.insert((S2BU_IFINDEX, 0), bytes);
+            assert!(!FakeRuntime::selector_namespace_maps_are_empty(
+                &state,
+                S2BU_IFINDEX
+            ));
+            suspend_fake_attachment(&mut state, S2BU_IFINDEX);
+            state
+                .tft_schema
+                .insert(S2BU_IFINDEX, [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+            FakeGroupedPublicationSnapshot::capture(&state)
+        };
+        assert!(matches!(
+            runtime.adopt("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY),
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_schema"
+            })
+        ));
+        assert!(before == FakeGroupedPublicationSnapshot::capture(&runtime.state()));
+    }
+
+    #[tokio::test]
+    async fn fragment_map_is_retained_on_adopt_and_recreated_only_after_exact_detach() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        let mut bytes = [0; TFT_FRAGMENT_BUCKET_VALUE_LEN];
+        bytes[4] = 0x41;
+        let original_identity = {
+            let mut state = runtime.state();
+            assert!(state.tft_fragments_map_ready.contains(&S2BU_IFINDEX));
+            assert!(state.tft_fragments.is_empty());
+            state.tft_fragments.insert((S2BU_IFINDEX, 0), bytes);
+            suspend_fake_attachment(&mut state, S2BU_IFINDEX);
+            state.tft_map_identity[&S2BU_IFINDEX]
+        };
+        runtime
+            .adopt("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY)
+            .unwrap();
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_map_identity[&S2BU_IFINDEX], original_identity);
+            assert_eq!(state.tft_fragments[&(S2BU_IFINDEX, 0)], bytes);
+        }
+        runtime
+            .detach("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY)
+            .unwrap();
+        {
+            let state = runtime.state();
+            assert!(state.tft_fragments.is_empty());
+            assert!(!state.tft_fragments_map_ready.contains(&S2BU_IFINDEX));
+            assert!(!state.tft_map_identity.contains_key(&S2BU_IFINDEX));
+        }
+        runtime
+            .attach(
+                "s2bu",
+                S2BU_IFINDEX,
+                &pin_dir,
+                DEFAULT_TC_PRIORITY,
+                [192, 0, 2, 1],
+                None,
+                None,
+            )
+            .unwrap();
+        let state = runtime.state();
+        assert_ne!(state.tft_map_identity[&S2BU_IFINDEX], original_identity);
+        assert!(state.tft_fragments_map_ready.contains(&S2BU_IFINDEX));
+        assert!(state.tft_fragments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn classifier_replacement_and_failed_removal_preserve_fragment_tombstones() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let initial = tft_classifier(0x41, 7, 6);
+        let replacement = tft_classifier(0x42, 8, 17);
+        backend
+            .reconcile_tft_uplink_classifier(initial.clone())
+            .await
+            .unwrap();
+        let mut bytes = [0; TFT_FRAGMENT_BUCKET_VALUE_LEN];
+        bytes[4] = 0x41;
+        runtime
+            .state()
+            .tft_fragments
+            .insert((S2BU_IFINDEX, 0), bytes);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        assert_eq!(runtime.state().tft_fragments[&(S2BU_IFINDEX, 0)], bytes);
+        runtime.fail_in_order(["tft_filter_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_fragments[&(S2BU_IFINDEX, 0)], bytes);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(runtime.state().tft_fragments[&(S2BU_IFINDEX, 0)], bytes);
+        // The same desired classifier gets a fresh publication identity after
+        // removal, so a retained datagram cannot acquire the new authority.
+        backend
+            .reconcile_tft_uplink_classifier(initial.clone())
+            .await
+            .unwrap();
+        let key = (S2BU_IFINDEX, tft_classifier_key_bytes(&initial));
+        let first = TftClassifierMeta::decode(runtime.state().tft_meta[&key]).unwrap();
+        backend
+            .remove_tft_uplink_classifier_exact(initial.clone())
+            .await
+            .unwrap();
+        backend
+            .reconcile_tft_uplink_classifier(initial)
+            .await
+            .unwrap();
+        let second = TftClassifierMeta::decode(runtime.state().tft_meta[&key]).unwrap();
+        assert_ne!(first.snapshot_generation(), second.snapshot_generation());
+        assert_ne!(
+            first.classifier_fingerprint(),
+            second.classifier_fingerprint()
+        );
+        assert_eq!(runtime.state().tft_fragments[&(S2BU_IFINDEX, 0)], bytes);
+    }
+
     #[test]
     fn partial_tft_pin_graph_is_refused_without_materialization() {
         let runtime = FakeRuntime::new();
@@ -64314,6 +64728,7 @@ mod tests {
         assert!(!state.tft_meta_map_ready.contains(&S2BU_IFINDEX));
         assert!(!state.tft_filters_map_ready.contains(&S2BU_IFINDEX));
         assert!(!state.tft_counters_map_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.tft_fragments_map_ready.contains(&S2BU_IFINDEX));
         assert_eq!(
             state.tft_schema.get(&S2BU_IFINDEX),
             Some(&[0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN])
@@ -68074,7 +68489,7 @@ mod tests {
                     }
                     // A named managed pin now resolves to a different map ID.
                     "pin" => {
-                        state.tft_map_identity.insert(S2BU_IFINDEX, [9, 9, 9, 9]);
+                        state.tft_map_identity.insert(S2BU_IFINDEX, [9, 9, 9, 9, 9]);
                     }
                     // An SDK occupant appeared after the complete tc dump.
                     "tc-add" => {
@@ -74384,7 +74799,7 @@ mod tests {
             (
                 "pub fn opc_gtpu_uplink(mut ctx: TcContext)",
                 "#[classifier]\npub fn opc_gtpu_downlink",
-                "let mark = packet_mark(&ctx);",
+                "let mut mark = packet_mark(&ctx);",
             ),
             (
                 "pub fn opc_gtpu_downlink(mut ctx: TcContext)",

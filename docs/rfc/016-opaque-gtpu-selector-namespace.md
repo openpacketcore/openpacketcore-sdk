@@ -684,12 +684,13 @@ The separate `TFT nohz_full` workflow matrix boots the pinned Linux 6.8 and
 enterprise 5.14 guests with `nohz_full=1`. Each requires a changed guest boot
 ID, `CONFIG_NO_HZ_FULL=y`, an effective CPU mask, and GLOBAL absent from the
 actual membarrier query. With that profile required before any test skip path,
-the three existing TFT packet proofs must report production Aya capability,
-exact install/replacement and retained inactive-bank reuse, and removal with
-default-bearer forwarding. The kernel reader/control proof also remains
-mandatory. Binaries, source revision, offline package versions and checksums,
-kernel identity, and proof logs are retained. These guest gates do not qualify
-PREEMPT_RT, bare-metal scheduling, or production latency.
+the fifteen TFT packet proofs must report production Aya capability. They cover
+exact install/replacement and retained inactive-bank reuse, removal with
+default-bearer forwarding, and twelve IPv4 fragment-affinity proofs. The kernel
+reader/control proof also remains mandatory. Binaries, source revision, offline
+package versions and checksums, kernel identity, and proof logs are retained.
+These guest gates do not qualify PREEMPT_RT, bare-metal scheduling, or production
+latency.
 
 ### 5.5 Marked Child Under a Resident Default
 

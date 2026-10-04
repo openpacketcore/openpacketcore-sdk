@@ -26,7 +26,7 @@
 use core::fmt;
 
 /// Current shared-SA TFT map ABI version.
-pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 4;
+pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 5;
 /// The only inner family executable by the current GTP-U tc forwarding path.
 pub const TFT_CLASSIFIER_FAMILY_IPV4: u8 = 4;
 /// Number of immutable filter banks per classifier.
@@ -72,7 +72,7 @@ pub const MAP_TFT_CLASSIFIER_COUNTERS: &str = "GTPU_TFT_DROP";
 pub const TFT_CLASSIFIER_SCHEMA_VALUE_LEN: usize = 16;
 /// Current schema marker for the additive IPv4-only classifier map graph.
 pub const TFT_CLASSIFIER_SCHEMA_MARKER_VALUE: [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] =
-    *b"OPC-TFT-IPv4-v4\0";
+    *b"OPC-TFT-IPv4-v5\0";
 /// Classifier metadata-map key width.
 pub const TFT_CLASSIFIER_KEY_LEN: usize = 8;
 /// Exact classifier fingerprint width.
@@ -85,12 +85,13 @@ pub const TFT_CLASSIFIER_FILTER_KEY_LEN: usize = 44;
 pub const TFT_CLASSIFIER_FILTER_VALUE_LEN: usize = 72;
 
 /// Counter index: an owned classifier received a malformed, truncated, or
-/// fragmented IPv4 packet. Such packets never use the default bearer.
+/// invalid fragment envelope. Such packets never use the default bearer.
 pub const COUNTER_TFT_CLASSIFIER_MALFORMED: u32 = 0;
 /// Counter index: no filter matched and the exact snapshot has no default.
 pub const COUNTER_TFT_CLASSIFIER_NO_MATCH: u32 = 1;
 /// Counter index: a retained classifier map graph was stale, partial, or
-/// internally inconsistent. The packet was dropped fail closed.
+/// internally inconsistent, or fragment affinity was absent, stale, full, or
+/// ambiguous. The packet was dropped fail closed.
 pub const COUNTER_TFT_CLASSIFIER_INVALID_STATE: u32 = 2;
 
 const META_FLAG_HAS_DEFAULT: u8 = 1;
@@ -299,6 +300,62 @@ pub struct TftClassifierMeta {
 }
 
 impl TftClassifierMeta {
+    /// Scalar identity words for helper-free fragment state transfers.
+    /// The fragment map stores these words in little-endian byte arrays;
+    /// converting the network-order fields prevents LLVM from lowering a
+    /// whole-record copy or comparison to forbidden calls under a BPF lock.
+    #[inline(always)]
+    pub(crate) fn fragment_identity_word(&self, index: usize) -> u64 {
+        match index {
+            0 => u64::from_be_bytes([
+                self.abi_version,
+                self.family,
+                self.active_bank,
+                self.flags,
+                self.filter_count[0],
+                self.filter_count[1],
+                self.removal_progress[0],
+                self.removal_progress[1],
+            ]),
+            1 => u64::from_be_bytes([
+                self.owner[0],
+                self.owner[1],
+                self.owner[2],
+                self.owner[3],
+                self.owner[4],
+                self.owner[5],
+                self.owner[6],
+                self.owner[7],
+            ]),
+            2 => u64::from_be_bytes([
+                self.owner[8],
+                self.owner[9],
+                self.owner[10],
+                self.owner[11],
+                self.owner[12],
+                self.owner[13],
+                self.owner[14],
+                self.owner[15],
+            ]),
+            3 => u64::from_be_bytes(self.owner_generation),
+            4 => u64::from_be_bytes(self.snapshot_generation),
+            5..=8 => {
+                let start = (index - 5) * 8;
+                u64::from_be_bytes([
+                    self.classifier_fingerprint[start],
+                    self.classifier_fingerprint[start + 1],
+                    self.classifier_fingerprint[start + 2],
+                    self.classifier_fingerprint[start + 3],
+                    self.classifier_fingerprint[start + 4],
+                    self.classifier_fingerprint[start + 5],
+                    self.classifier_fingerprint[start + 6],
+                    self.classifier_fingerprint[start + 7],
+                ])
+            }
+            _ => 0,
+        }
+    }
+
     /// Construct one complete active-bank selector.
     #[must_use]
     pub const fn new(
@@ -455,6 +512,7 @@ impl TftClassifierMeta {
 
     /// Encode this canonical metadata record for byte-array BPF map I/O.
     #[must_use]
+    #[inline(always)]
     pub const fn encode(self) -> [u8; TFT_CLASSIFIER_META_VALUE_LEN] {
         [
             self.abi_version,
@@ -1586,6 +1644,7 @@ pub struct TftClassifierIpv4Packet {
     local_port: [u8; 2],
     remote_port: [u8; 2],
     esp_spi: [u8; 4],
+    udp_length: [u8; 2],
     protocol: u8,
     tos: u8,
     present: u8,
@@ -1597,6 +1656,31 @@ const PACKET_HAS_REMOTE_PORT: u8 = 1 << 1;
 const PACKET_HAS_ESP_SPI: u8 = 1 << 2;
 
 impl TftClassifierIpv4Packet {
+    /// Scalar parsed fields, including UDP length, for the helper-free lock
+    /// region. The final word's zero tail replaces no packet identity bits.
+    #[inline(always)]
+    pub(crate) fn fragment_packet_word(&self, index: usize) -> u32 {
+        match index {
+            0 => u32::from_be_bytes(self.local_address),
+            1 => u32::from_be_bytes(self.remote_address),
+            2 => u32::from_be_bytes([
+                self.local_port[0],
+                self.local_port[1],
+                self.remote_port[0],
+                self.remote_port[1],
+            ]),
+            3 => u32::from_be_bytes(self.esp_spi),
+            4 => u32::from_be_bytes([
+                self.udp_length[0],
+                self.udp_length[1],
+                self.protocol,
+                self.tos,
+            ]),
+            5 => u32::from_be_bytes([self.present, self.reserved, 0, 0]),
+            _ => 0,
+        }
+    }
+
     /// Construct a packet view after a boundary has completed strict parsing.
     #[must_use]
     pub const fn new(
@@ -1636,10 +1720,34 @@ impl TftClassifierIpv4Packet {
             local_port,
             remote_port,
             esp_spi,
+            udp_length: [0; 2],
             protocol,
             tos,
             present,
             reserved: 0,
+        }
+    }
+
+    /// Retain the validated UDP datagram length for fragment interval checks.
+    /// Callers constructing a UDP view must supply its declared length after
+    /// validating the complete transport header. Other protocols ignore it.
+    #[must_use]
+    #[inline(always)]
+    pub const fn with_udp_length(mut self, length: u16) -> Self {
+        if self.protocol == 17 {
+            self.udp_length = length.to_be_bytes();
+        }
+        self
+    }
+
+    /// Declared UDP payload end, or no transport length for another protocol.
+    #[must_use]
+    #[inline(always)]
+    pub const fn udp_length(&self) -> Option<u16> {
+        if self.protocol == 17 {
+            Some(u16::from_be_bytes(self.udp_length))
+        } else {
+            None
         }
     }
 
@@ -1662,6 +1770,23 @@ impl TftClassifierIpv4Packet {
     /// to define the same fail-closed boundary used by tc.
     #[must_use]
     pub fn parse(packet: &[u8]) -> Option<Self> {
+        Self::parse_transport(packet, false)
+    }
+
+    /// Parse a fully visible fragment-zero header for bounded affinity only.
+    ///
+    /// This view must never authorize a fragment without an affinity entry.
+    /// TCP needs its complete declared header, UDP its complete header and a
+    /// larger declared datagram length, and ESP its complete eight-byte header.
+    #[must_use]
+    pub fn parse_first_fragment(packet: &[u8]) -> Option<Self> {
+        if !crate::TftIpv4Fragment::parse(packet)?.is_first() {
+            return None;
+        }
+        Self::parse_transport(packet, true)
+    }
+
+    fn parse_transport(packet: &[u8], first_fragment: bool) -> Option<Self> {
         if packet.len() < 20 || packet[0] >> 4 != 4 {
             return None;
         }
@@ -1672,7 +1797,7 @@ impl TftClassifierIpv4Packet {
             || header_len > packet.len()
             || total_len != packet.len()
             || total_len < header_len
-            || fragment & 0xbfff != 0
+            || (!first_fragment && fragment & 0xbfff != 0)
         {
             return None;
         }
@@ -1680,6 +1805,7 @@ impl TftClassifierIpv4Packet {
         let local_address = [packet[12], packet[13], packet[14], packet[15]];
         let remote_address = [packet[16], packet[17], packet[18], packet[19]];
         let payload = &packet[header_len..];
+        let mut udp_length = 0;
         let (local_port, remote_port) = match protocol {
             6 => {
                 if payload.len() < 20 {
@@ -1695,9 +1821,16 @@ impl TftClassifierIpv4Packet {
                 )
             }
             17 => {
-                if payload.len() < 8
-                    || usize::from(u16::from_be_bytes([payload[4], payload[5]])) != payload.len()
-                {
+                if payload.len() < 8 {
+                    return None;
+                }
+                let udp_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
+                udp_length = udp_len as u16;
+                if if first_fragment {
+                    udp_len <= payload.len() || udp_len > usize::from(u16::MAX) - header_len
+                } else {
+                    udp_len != payload.len()
+                } {
                     return None;
                 }
                 (
@@ -1717,15 +1850,18 @@ impl TftClassifierIpv4Packet {
         } else {
             None
         };
-        Some(Self::new(
-            local_address,
-            remote_address,
-            protocol,
-            packet[1],
-            local_port,
-            remote_port,
-            esp_spi,
-        ))
+        Some(
+            Self::new(
+                local_address,
+                remote_address,
+                protocol,
+                packet[1],
+                local_port,
+                remote_port,
+                esp_spi,
+            )
+            .with_udp_length(udp_length),
+        )
     }
 }
 
@@ -1875,7 +2011,7 @@ pub const fn tft_classifier_schema_is_current(
         && value[11] == 0x34
         && value[12] == 0x2d
         && value[13] == 0x76
-        && value[14] == 0x34
+        && value[14] == 0x35
         && value[15] == 0
 }
 
@@ -1921,7 +2057,7 @@ const _: [(); TFT_CLASSIFIER_FILTER_KEY_LEN] = [(); core::mem::size_of::<TftClas
 const _: [(); 1] = [(); core::mem::align_of::<TftClassifierFilterKey>()];
 const _: [(); TFT_CLASSIFIER_FILTER_VALUE_LEN] = [(); core::mem::size_of::<TftClassifierFilter>()];
 const _: [(); 1] = [(); core::mem::align_of::<TftClassifierFilter>()];
-const _: [(); 20] = [(); core::mem::size_of::<TftClassifierIpv4Packet>()];
+const _: [(); 22] = [(); core::mem::size_of::<TftClassifierIpv4Packet>()];
 const _: [(); 1] = [(); core::mem::align_of::<TftClassifierIpv4Packet>()];
 
 #[cfg(test)]
@@ -1944,7 +2080,7 @@ mod tests {
     fn callback_packet_has_no_padding_and_zeroes_absent_payloads() {
         let packet =
             TftClassifierIpv4Packet::new([10, 45, 0, 2], [192, 0, 2, 1], 1, 0, None, None, None);
-        assert_eq!(core::mem::size_of::<TftClassifierIpv4Packet>(), 20);
+        assert_eq!(core::mem::size_of::<TftClassifierIpv4Packet>(), 22);
         assert_eq!(core::mem::align_of::<TftClassifierIpv4Packet>(), 1);
         assert_eq!(packet.local_port, [0; 2]);
         assert_eq!(packet.remote_port, [0; 2]);
@@ -2593,6 +2729,7 @@ mod tests {
         assert!(tft_classifier_schema_is_current(
             &TFT_CLASSIFIER_SCHEMA_MARKER_VALUE
         ));
+        assert!(!tft_classifier_schema_is_current(b"OPC-TFT-IPv4-v4\0"));
         for index in 0..TFT_CLASSIFIER_SCHEMA_VALUE_LEN {
             let mut wrong = TFT_CLASSIFIER_SCHEMA_MARKER_VALUE;
             wrong[index] ^= 1;

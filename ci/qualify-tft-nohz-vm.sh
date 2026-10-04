@@ -210,25 +210,37 @@ grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' "${logs}/grace.log"
 grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' "${logs}/grace.log"
 grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' "${logs}/grace.log"
 
-# These exact existing packet proofs validate the opt-in profile before any
+# These exact packet proofs validate the opt-in profile before any
 # setup/skip path. They require effective nohz CPUs, GLOBAL absent, and actual
 # Aya availability; the shared-PAA test also proves retained bank reuse.
 ssh "${ssh_options[@]}" opc@127.0.0.1 \
-  'sudo env OPC_GTPU_RUN_PRIVILEGED=1 OPC_GTPU_REQUIRE_NOHZ_FULL=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && exec /tmp/opc-tft-nohz/datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous"' \
+  'sudo env OPC_GTPU_RUN_PRIVILEGED=1 OPC_GTPU_REQUIRE_NOHZ_FULL=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && exec /tmp/opc-tft-nohz/datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous ebpf_gtpu_tft_fragmented_esp_pair ebpf_gtpu_tft_fragment_affinity_exact_key ebpf_gtpu_tft_fragment_affinity_conflicting_first ebpf_gtpu_tft_fragment_affinity_overlap_and_range_bound ebpf_gtpu_tft_fragment_affinity_classifier_identity ebpf_gtpu_tft_fragment_affinity_lifecycle ebpf_gtpu_tft_fragment_affinity_malformed_retained ebpf_gtpu_tft_fragment_affinity_expiry ebpf_gtpu_tft_fragment_affinity_authority_revocation ebpf_gtpu_tft_fragment_affinity_capacity ebpf_gtpu_tft_fragment_affinity_cross_attachment ebpf_gtpu_tft_fragment_affinity_port_only_control"' \
   2>&1 | tee "${logs}/datapath.log"
 if grep -q 'skipping:' "${logs}/datapath.log"; then
   echo 'nohz_full packet proofs skipped instead of running' >&2
   exit 1
 fi
-grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored;' "${logs}/datapath.log"
+grep -Eq '^test result: ok\. 15 passed; 0 failed; 0 ignored;' "${logs}/datapath.log"
 for marker in OPC_GTPU_TFT_NOHZ_PROFILE_PROVEN OPC_GTPU_TFT_NOHZ_CAPABILITY_PROVEN; do
-  test "$(grep -Fxc "$marker" "${logs}/datapath.log")" = 3
+  test "$(grep -Fxc "$marker" "${logs}/datapath.log")" = 15
 done
 for marker in OPC_GTPU_TFT_NOHZ_BANK_REUSE_PROVEN OPC_GTPU_TFT_NOHZ_LIFECYCLE_PROVEN OPC_GTPU_TFT_IPV4_LIVE_PROVEN; do
   test "$(grep -Fxc "$marker" "${logs}/datapath.log")" = 1
 done
 grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${logs}/datapath.log"
 grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_ESP_PAIR_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_EXACT_KEY_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_CONFLICTING_FIRST_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_OVERLAP_AND_RANGE_BOUND_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_CLASSIFIER_IDENTITY_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_LIFECYCLE_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_MALFORMED_RETAINED_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_EXPIRY_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_AUTHORITY_REVOCATION_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_CAPACITY_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN' "${logs}/datapath.log"
+grep -Fxq 'OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN' "${logs}/datapath.log"
 ssh "${ssh_options[@]}" opc@127.0.0.1 \
   'cd /tmp/opc-tft-nohz && sha256sum -c SHA256SUMS' | tee "${logs}/binary-after.txt"
 echo 'OPC_GTPU_TFT_NOHZ_VM_QUALIFIED'

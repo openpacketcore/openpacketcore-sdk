@@ -19,6 +19,7 @@ mod n3;
 mod pmtu;
 mod session;
 mod tft_classifier;
+mod tft_fragment;
 /// Privileged traffic-observation map ABI shared only by the trusted loader
 /// and tc program.
 ///
@@ -75,6 +76,7 @@ pub use session::{
     GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
 };
 pub use tft_classifier::*;
+pub use tft_fragment::*;
 pub use trusted_traffic_observation_abi::{
     GtpuTrafficObservationBinding, GtpuTrafficObservationDirection, GtpuTrafficObservationEvent,
     GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
