@@ -51,7 +51,7 @@ use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
 };
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
-    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_exceeds_inner_mtu,
+    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
     downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
@@ -77,12 +77,12 @@ use opc_gtpu_ebpf_common::{
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
-    GTPU_PACKET_TOO_BIG_QUEUE_PORT, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
-    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
-    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
-    GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
-    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
-    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
+    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
+    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
@@ -4204,42 +4204,50 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
     pack_downlink_parse_result(u16::from_be(total_length), payload_offset, teid)
 }
 
-/// Return whether an authorized inner IPv4 packet exceeds its Active commit's
-/// optional downlink inner MTU with Don't Fragment set.
+/// Return the backend-owned queue port that an authorized inner IPv4 packet
+/// is handed to, or zero when tc decapsulates it.
+///
+/// A session whose Active commit carries a downlink inner MTU hands off a
+/// packet that exceeds it with Don't Fragment set, and every inner fragment
+/// (More Fragments set, or a non-zero fragment offset). A session without one
+/// hands nothing off.
 #[inline(never)]
-fn downlink_inner_exceeds_session_mtu(
+fn downlink_inner_hand_off_port(
     ctx: &TcContext,
     commit: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
     payload_offset: usize,
-) -> bool {
+) -> u16 {
     let mtu = pdp_commit_wire_downlink_inner_mtu(commit);
     if mtu == 0 {
-        return false;
+        return 0;
     }
     let Ok(total_length) = ctx.load::<u16>(payload_offset + 2) else {
-        return false;
+        return 0;
     };
     let Ok(flags_fragment) = ctx.load::<u16>(payload_offset + 6) else {
-        return false;
+        return 0;
     };
-    downlink_ipv4_exceeds_inner_mtu(
+    match downlink_ipv4_hand_off_port(
         mtu,
         u16::from_be(total_length),
         u16::from_be(flags_fragment),
-    )
+    ) {
+        Some(port) => port,
+        None => 0,
+    }
 }
 
-/// Steer one authorized over-MTU G-PDU, undecapsulated, to the backend-owned
-/// packet-too-big queue by rewriting only its UDP destination port.
+/// Steer one authorized G-PDU, undecapsulated, to the backend-owned queue on
+/// `port` by rewriting only its UDP destination port.
 ///
 /// The UDP checksum is updated incrementally (a zero checksum stays zero), so
 /// the port change and its compensation cancel in any complete-checksum
-/// state. A flood of such packets can then fill only the dedicated queue,
+/// state. A flood of such packets can then fill only that hand-off queue,
 /// never the shared UDP/2152 queue carrying Echo and reassembled G-PDUs.
 #[inline(never)]
-fn hand_off_packet_too_big(ctx: &mut TcContext, l4_offset: usize) -> i32 {
+fn hand_off_to_backend_queue(ctx: &mut TcContext, l4_offset: usize, port: u16) -> i32 {
     let from = u16::from_ne_bytes(GTPU_UDP_PORT.to_be_bytes());
-    let to = u16::from_ne_bytes(GTPU_PACKET_TOO_BIG_QUEUE_PORT.to_be_bytes());
+    let to = u16::from_ne_bytes(port.to_be_bytes());
     if ctx
         .l4_csum_replace(
             l4_offset + 6,
@@ -4413,16 +4421,26 @@ fn authorize_and_decap_legacy_downlink(
         count(COUNTER_DL_DST_MISMATCH);
         return TC_ACT_SHOT as i32;
     }
-    if downlink_inner_exceeds_session_mtu(ctx, commit, payload_offset) {
-        // The session's optional downlink inner MTU cannot carry this DF
-        // packet after access-side encapsulation. Hand the exact authorized
-        // G-PDU, undecapsulated, to the backend-owned packet-too-big queue.
-        // Its consumer fragments the inner packet by default (RFC 4459
-        // section 3.4), or signals the originator inside the UE's
-        // default-bearer uplink tunnel when the session opted in (RFC 1191).
-        // Decapsulating here would let the host emit an unroutable,
-        // plaintext-quoting ICMP error instead.
-        return hand_off_packet_too_big(ctx, l4_offset);
+    let hand_off_port = downlink_inner_hand_off_port(ctx, commit, payload_offset);
+    if hand_off_port != 0 {
+        // Hand the exact authorized G-PDU, undecapsulated, to a
+        // backend-owned queue of a session with a downlink inner MTU.
+        //
+        // A DF packet that the MTU cannot carry after access-side
+        // encapsulation goes to the packet-too-big queue. Its consumer
+        // fragments the inner packet by default (RFC 4459 section 3.4), or
+        // signals the originator inside the UE's default-bearer uplink
+        // tunnel when the session opted in (RFC 1191). Decapsulating here
+        // would let the host emit an unroutable, plaintext-quoting ICMP
+        // error instead.
+        //
+        // Every other inner fragment goes to the inner-fragment queue. A
+        // sibling fragment whose G-PDU was fragmented on the outer path
+        // reaches the consumer through kernel reassembly, so decapsulating
+        // this one would split the datagram between the consumer and the
+        // host's forwarding path, where netfilter defragmentation can hold
+        // both halves until they expire.
+        return hand_off_to_backend_queue(ctx, l4_offset, hand_off_port);
     }
 
     // Strip outer IPv4 + UDP + GTP-U (+ optional block and extension
@@ -5903,6 +5921,68 @@ mod tests {
         let authority_decoded = false;
         assert!(!authority_decoded);
         assert!(!grouped_index_permits_v5_fallback(index_was_retained));
+    }
+
+    #[test]
+    fn legacy_downlink_hands_inner_fragments_to_the_backend_before_decapsulation() {
+        // A host unit test cannot execute a loaded tc classifier, so prove
+        // the legacy downlink subprogram's order directly. An authorized
+        // inner IPv4 packet reaches the hand-off decision only after the
+        // complete Active graph and the inner destination are proven, and
+        // before the outer envelope is stripped. A fragment of a session
+        // with a downlink inner MTU therefore leaves for the backend-owned
+        // queue undecapsulated, and an unauthorized one is never handed off.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, legacy) = source
+            .split_once("\nfn authorize_and_decap_legacy_downlink(")
+            .expect("legacy downlink subprogram is present");
+        let (legacy, _) = legacy
+            .split_once("\n#[cfg(test)]")
+            .expect("legacy downlink subprogram has a bounded body");
+        let position = |needle: &str| {
+            legacy
+                .find(needle)
+                .unwrap_or_else(|| panic!("legacy downlink subprogram contains `{needle}`"))
+        };
+        let authorized = position("!pdp_commit_wire_authorizes_downlink(commit, teid, binding)");
+        let destination = position("if inner_dst != pdr.ue_ip {");
+        let decision = position("downlink_inner_hand_off_port(ctx, commit, payload_offset)");
+        let hand_off = position("return hand_off_to_backend_queue(ctx, l4_offset, hand_off_port);");
+        let decapsulation = position(".adjust_room(-(strip as i32), BPF_ADJ_ROOM_MAC, 0)");
+        assert!(authorized < destination, "the graph is proven first");
+        assert!(
+            destination < decision,
+            "only a packet for the session's own address is handed off"
+        );
+        assert!(decision < hand_off && hand_off < decapsulation);
+
+        // tc decides with the shared predicate the consumer's tests pin, and
+        // reads the same two inner header fields: Total Length and the
+        // flags/fragment offset word.
+        let (_, decision) = source
+            .split_once("\nfn downlink_inner_hand_off_port(")
+            .expect("hand-off decision subprogram is present");
+        let (decision, _) = decision
+            .split_once("\n}\n")
+            .expect("hand-off decision subprogram has a bounded body");
+        assert!(decision.contains("pdp_commit_wire_downlink_inner_mtu(commit)"));
+        assert!(decision.contains("ctx.load::<u16>(payload_offset + 2)"));
+        assert!(decision.contains("ctx.load::<u16>(payload_offset + 6)"));
+        assert!(decision.contains("downlink_ipv4_hand_off_port("));
+
+        // The hand-off rewrites nothing but the UDP destination port and
+        // its checksum compensation.
+        let (_, steer) = source
+            .split_once("\nfn hand_off_to_backend_queue(")
+            .expect("hand-off subprogram is present");
+        let (steer, _) = steer
+            .split_once("\n}\n")
+            .expect("hand-off subprogram has a bounded body");
+        assert!(steer.contains(".l4_csum_replace("));
+        assert!(steer.contains("BPF_F_MARK_MANGLED_0"));
+        assert!(steer.contains("ctx.store(l4_offset + 2, &to, 0)"));
+        assert_eq!(steer.matches(".store(").count(), 1);
+        assert!(!steer.contains("adjust_room") && !steer.contains("set_mark"));
     }
 
     #[test]

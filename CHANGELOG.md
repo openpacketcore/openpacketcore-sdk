@@ -110,6 +110,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf` / `opc-gtpu-ebpf-common`:
+  every downlink inner IPv4 fragment of a context with a downlink inner MTU
+  goes through the backend-owned consumer. Refs #1023 (part (i); part (ii),
+  fragmenting a packet without Don't Fragment to the MTU, remains open).
+  - **Why.** The fragments of one datagram arrive in separate G-PDUs. One
+    whose G-PDU is fragmented on the outer path reaches the consumer through
+    kernel reassembly, while tc decapsulated the ones that fit. Where
+    connection tracking is active, netfilter then held the two halves in
+    separate reassembly queues (PRE_ROUTING and LOCAL_OUT) until both
+    expired, and the datagram was lost without any error.
+  - **tc steering.** For a context with `downlink_inner_mtu`, tc no longer
+    decapsulates an authorized inner fragment (More Fragments set, or a
+    non-zero fragment offset), whatever its size. It rewrites the UDP
+    destination port to a second backend-owned queue
+    (`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154), the hand-off already used for an
+    over-MTU Don't Fragment packet, which keeps its own queue (2153) even
+    when it is a fragment. Contexts without a downlink inner MTU, grouped
+    entries and inner-IPv6 contexts are unchanged. The datapath object is
+    rebuilt; the map ABI is unchanged.
+  - **Consumer.** `try_receive_downlink` returns the fragment as
+    `GtpuDownlinkEvent::Decapsulated`, exactly as it arrived, with its
+    tunnel's bearer mark. It does not reassemble and keeps no state per
+    datagram.
+  - **Rate limits.** A returned fragment takes no token from
+    `GtpuInnerFragmentRateLimit` or `GtpuPacketTooBigRateLimit`: nothing is
+    fragmented, no Identification is assigned and no error is sent. A
+    fragment over the MTU with Don't Fragment set is handled by the
+    oversize policy and its limits as before.
+  - **Queue budget.** Each hand-off queue is bounded by its own socket
+    receive buffer (`net.core.rmem_default`), so a flood of inner fragments
+    overflows only the inner-fragment queue. The kernel counts the drops
+    (`GtpuDownlinkCounters::inner_fragment_queue_drops`), and
+    `decapsulated_inner_fragments` counts the returned fragments. The shared
+    queue is still served first; the two hand-off queues are then served in
+    turn, so neither backlog can starve the other.
+  - **Authorization.** A non-first fragment needs no transport header: like
+    any G-PDU it is authorized by its tunnel, outer endpoints, complete
+    Active graph and inner destination, on its own.
+  - **Integration.** A consumer that already injects `Decapsulated` packets
+    needs no new code path, and should set `IP_NODEFRAG` on its injection
+    socket so that netfilter does not reassemble the fragments at LOCAL_OUT.
+    The backend binds UDP/2154 next to UDP/2152 and UDP/2153 when the control
+    port is first opened; a host filter on INPUT must admit it, and should
+    admit all three only from the GTP-U peers.
+  - **Limits.** These inner fragments now depend on the consumer, where tc
+    forwarded them on its own:
+    - while nothing drains the queues (before the first open, while the
+      process is down, after a retirement) they are not forwarded (#1019);
+    - a sender that reaches UDP/2154 directly, or keeps the shared UDP/2152
+      queue busy, can crowd them out before the consumer refuses its
+      datagrams;
+    - a fragment above the MTU without Don't Fragment is returned
+      unfragmented. An `IP_HDRINCL` injection then fragments the ESP packet
+      on the outer header, or fails with `EMSGSIZE` above the egress device
+      MTU (part (ii) of #1023);
+    - on an `IP_HDRINCL` send Linux replaces a zero Identification per
+      fragment, so a fragmented datagram whose sender chose Identification
+      zero cannot be reassembled (#1022).
+  - **Evidence.** On a real kernel with one connection-tracking rule, a
+    2,600-octet datagram whose first G-PDU is outer-fragmented reaches the UE,
+    each inner fragment leaving as its own packet (on a dedicated bearer, as
+    its own ESP packet), and no fragment enters a host reassembly queue. A
+    fragment flood larger than the queue's receive buffer is dropped and
+    counted by the kernel while Echo and over-MTU packets are still served.
+
 - `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
   reads to local encryption and remote sealing wrappers. Every returned
   physical record requires a canonical envelope and the existing authenticated

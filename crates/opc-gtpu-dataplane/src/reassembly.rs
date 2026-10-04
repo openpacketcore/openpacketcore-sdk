@@ -490,6 +490,22 @@ impl GtpuReassemblySocket {
         )
     }
 
+    /// Bind the backend-owned queue that receives authorized G-PDUs whose
+    /// inner IPv4 packet is a fragment, steered away from UDP/2152 by tc
+    /// ([`opc_gtpu_ebpf_common::GTPU_INNER_FRAGMENT_QUEUE_PORT`]). Its
+    /// receive buffer is this queue's own budget: a flood of inner fragments
+    /// fills only it, never the packet-too-big queue or the shared queue.
+    pub(crate) fn bind_inner_fragment_queue(
+        local_address: Ipv4Addr,
+        interface_name: &str,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_port(
+            local_address,
+            interface_name,
+            opc_gtpu_ebpf_common::GTPU_INNER_FRAGMENT_QUEUE_PORT,
+        )
+    }
+
     fn bind_on_port(
         local_address: Ipv4Addr,
         interface_name: &str,
@@ -1188,6 +1204,12 @@ pub enum GtpuDownlinkDrop {
 pub struct GtpuDownlinkCounters {
     /// G-PDUs authorized and decapsulated exactly once.
     pub decapsulated: u64,
+    /// Of [`Self::decapsulated`], the G-PDUs whose inner IPv4 packet was a
+    /// fragment (More Fragments set, or a non-zero fragment offset), returned
+    /// as it arrived. It is counted by content, whatever queue delivered the
+    /// G-PDU. tc hands every such fragment of a context with a downlink inner
+    /// MTU to the consumer and keeps no hand-off counter of its own.
+    pub decapsulated_inner_fragments: u64,
     /// Non-G-PDU messages handed back for control processing.
     pub control_plane: u64,
     /// G-PDUs whose TEID selects no installed tunnel (no inner forwarding).
@@ -1219,6 +1241,16 @@ pub struct GtpuDownlinkCounters {
     /// dedicated packet-too-big queue (`SO_RXQ_OVFL`). This is the hand-off
     /// overload signal; tc itself keeps no hand-off counter.
     pub packet_too_big_queue_drops: u64,
+    /// Cumulative tc-steered inner-fragment G-PDUs the kernel dropped from
+    /// the dedicated inner-fragment queue (`SO_RXQ_OVFL`): that queue's
+    /// overload signal. Its receive buffer is the whole budget of the
+    /// inner-fragment hand-off, so these drops never come at the expense of
+    /// the packet-too-big queue or the shared queue.
+    ///
+    /// Like the other two queue-drop counters, this is the count the kernel
+    /// reported with the last datagram received from that queue. Drops since
+    /// then, or from a queue that is not being served, are not included yet.
+    pub inner_fragment_queue_drops: u64,
     /// Authorized over-MTU packets fragmented under the default policy and
     /// returned as [`GtpuDownlinkEvent::Fragmented`].
     pub inner_fragmented: u64,
@@ -1801,6 +1833,12 @@ pub enum GtpuDownlinkEvent {
     /// The G-PDU was authorized by the backend's own commit-last map reads
     /// and decapsulated exactly once. The caller delivers the inner packet
     /// (route/XFRM injection with the returned mark).
+    ///
+    /// The inner packet is returned exactly as the T-PDU carried it. It can
+    /// be an IPv4 fragment: tc hands every inner fragment of a context with a
+    /// downlink inner MTU to this consumer, so that all fragments of one
+    /// datagram leave through the caller. A packet without Don't Fragment is
+    /// not fragmented here and can exceed that MTU.
     Decapsulated(GtpuDecapsulatedDownlink),
     /// A non-G-PDU message (typed control, unmodelled message or unsupported
     /// required extension). Use the existing response planners.

@@ -16,17 +16,23 @@
 //!
 //! The shared wire validators in `opc-gtpu-ebpf-common` are the same code the
 //! tc object runs. Any read failure is `StateUnavailable`, never a fallback.
+//!
+//! The same authorization serves the G-PDUs that tc steers to the two
+//! backend-owned hand-off queues for a session with a downlink inner MTU:
+//! over-MTU Don't Fragment packets, which leave as a fragmentation or Packet
+//! Too Big plan, and every other inner IPv4 fragment, which is decapsulated
+//! like any authorized G-PDU and returned exactly as it arrived.
 
 use bytes::Bytes;
 use opc_gtpu_ebpf_common::{
-    downlink_ipv4_exceeds_inner_mtu, gtpu_endpoint_requires_extension_control,
-    marked_owner_wire_authorizes_downlink, n3_downlink_psc_matches, parse_gtpu_tpdu,
-    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
-    pdp_commit_wire_authorizes_graph, pdp_commit_wire_downlink_inner_mtu,
-    pdp_commit_wire_downlink_packet_too_big, select_gtpu_session_entry_wire,
-    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr,
-    GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
-    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    downlink_ipv4_exceeds_inner_mtu, downlink_ipv4_is_fragment,
+    gtpu_endpoint_requires_extension_control, marked_owner_wire_authorizes_downlink,
+    n3_downlink_psc_matches, parse_gtpu_tpdu, pdp_commit_wire_authorized_source_port,
+    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
+    pdp_commit_wire_downlink_inner_mtu, pdp_commit_wire_downlink_packet_too_big,
+    select_gtpu_session_entry_wire, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
+    DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar,
+    UplinkFarKey, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
 };
 
 use super::EbpfGtpuRuntime;
@@ -275,7 +281,8 @@ pub(super) enum ProcessedDownlink {
 }
 
 /// Authorize and decapsulate one received datagram, recording exactly one
-/// counter.
+/// outcome counter. A decapsulated inner IPv4 fragment is also counted in
+/// `decapsulated_inner_fragments`, a subset of `decapsulated`.
 pub(super) fn process_downlink_datagram(
     runtime: &dyn EbpfGtpuRuntime,
     scope: DownlinkAuthorityScope,
@@ -297,6 +304,17 @@ pub(super) fn process_downlink_datagram(
         } => {
             counters.decapsulated = counters.decapsulated.saturating_add(1);
             let inner: Bytes = datagram.bytes_handle().slice(payload_offset..);
+            if family == GtpAddressFamily::Ipv4
+                && inner.get(6..8).is_some_and(|flags_fragment| {
+                    downlink_ipv4_is_fragment(u16::from_be_bytes([
+                        flags_fragment[0],
+                        flags_fragment[1],
+                    ]))
+                })
+            {
+                counters.decapsulated_inner_fragments =
+                    counters.decapsulated_inner_fragments.saturating_add(1);
+            }
             GtpuDownlinkEvent::Decapsulated(GtpuDecapsulatedDownlink::new(
                 inner,
                 GtpBearerMark::new(u32::from_be_bytes(bearer_mark)),
@@ -632,10 +650,18 @@ fn authorize_legacy(
     if payload[16..20] != pdr.ue_ip {
         return Verdict::Drop(GtpuDownlinkDrop::DestinationMismatch);
     }
-    // tc hands an over-MTU DF packet to this queue undecapsulated; the same
-    // Active commit carries the session's optional downlink inner MTU and
-    // its policy: inner fragmentation by default, or the explicit in-tunnel
-    // Packet Too Big opt-in.
+    // tc hands an over-MTU DF packet to this consumer undecapsulated; the
+    // same Active commit carries the session's optional downlink inner MTU
+    // and its policy: inner fragmentation by default, or the explicit
+    // in-tunnel Packet Too Big opt-in.
+    //
+    // tc also hands over every other inner fragment of such a session. It
+    // needs no decision here: a fragment carries the same authorization data
+    // as any G-PDU (its tunnel, outer endpoints and inner destination, none
+    // of which is in a transport header), so it was authorized above on its
+    // own and is decapsulated below exactly as it arrived, with its tunnel's
+    // bearer mark. It takes no token from either rate limit: nothing is
+    // fragmented and no error is sent for it.
     let total_length = u16::from_be_bytes([payload[2], payload[3]]);
     let flags_fragment = u16::from_be_bytes([payload[6], payload[7]]);
     let mtu = pdp_commit_wire_downlink_inner_mtu(&commit);
