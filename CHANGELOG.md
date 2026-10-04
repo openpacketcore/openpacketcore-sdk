@@ -218,6 +218,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: `GtpuDownlinkInjector::raw_ipv4` injects control-port
+  `Decapsulated` and `Fragmented` outcomes with `IP_HDRINCL`, `IP_NODEFRAG`,
+  exact bearer marks, inner-source `IP_PKTINFO` and ordered fragment sends.
+  Containment remains the consumer's obligation: continuously retain a
+  lower-priority pool-wide outbound block policy with `disable_xfrm=0` on
+  both `all` and the egress device, and no intersecting higher-priority
+  bypass. A namespace default outbound block is another containment option
+  for non-loopback output. No read-only query is an atomic receipt.
+  Zero-ID non-DF fragments and batches are refused before sending: an
+  origin-fragmented datagram cannot be repaired by rewriting only one piece.
+  The interface-bound contract in #1085 avoids that raw-path limit.
+  Access-denied errors (including prohibit routes and disallowed broadcasts)
+  are distinct from policy/filter refusals. Outcome types also admit testkit
+  fixtures and do not themselves establish authorization or validation.
+  Native all-device traces verify no ICMP for raw block and MTU refusals with
+  a usable return route toward the inner source.
+  Constructors probe mark privileges; value-free send classes distinguish
+  MTU, buffer and policy/filter failures. `testkit` supplies structural
+  outcomes for consumer fakes. Native proofs cover real receive outcomes,
+  both bearers, source selectors, ordering, zero-ID refusal, `disable_xfrm`
+  bypass, namespace default block and conntrack-invalid filter refusal.
+  Refs #1022.
+
 - `opc-ipsec-xfrm` / `opc-linux-xfrm-sys`: key-scoped SA snapshots and an
   optional exact SA removal request, implemented only by the locked mock.
   Refs #1050.

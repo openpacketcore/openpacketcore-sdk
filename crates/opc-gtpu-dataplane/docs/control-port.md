@@ -511,32 +511,13 @@ The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
 count and MTU.
 
-**Injection.** The caller injects every fragment, in order, toward XFRM
-with the returned mark, exactly as for a `Decapsulated` packet. On Linux an
-`IPPROTO_RAW` socket (`IP_HDRINCL`) does this with `SO_MARK` set to the
-bearer mark (zero for the default bearer). Linux builds the XFRM flow for
-such a socket from the socket, not the packet: pass the inner source as the
-`IP_PKTINFO` source so a source-specific OUT selector matches, and do not
-rely on port or protocol selectors. Set `IP_NODEFRAG` on that socket too.
-Where connection tracking is active, netfilter otherwise reassembles the
-injected fragments at LOCAL_OUT: it holds them until the datagram is
-complete, and the reassembled packet leaves as one ESP packet, which is
-fragmented on the outer header when it exceeds the link MTU. This applies
-equally to `Fragmented` fragments and to `Decapsulated` inner fragments.
-Linux also replaces an Identification
-of zero on an `IP_HDRINCL` send, which would break reassembly; fragments of
-an atomic datagram never carry zero, but a received DF fragment's own
-Identification is preserved as it is. So is that of a `Decapsulated` inner
-fragment. If it is zero and the fragment has no Don't Fragment, Linux gives
-each fragment a different Identification on such a send, and the datagram
-cannot be reassembled, where tc forwarded the fragments unchanged. That
-affects a datagram whose sender chose Identification zero (#1022). Unlike a
-forwarding router (RFC 1812
-section 5.3.1), the consumer does not decrement TTL, for fragments or for
-`Decapsulated` packets. Nor does it process IPv4 options (source routing,
-Record Route, Timestamp): a `Decapsulated` packet with options is returned
-with a validated header and unprocessed options. These are documented
-limitations of this path.
+**Injection.** `GtpuDownlinkInjector::raw_ipv4()` injects either a
+`Decapsulated` packet or every packet of a `Fragmented` outcome, in order,
+with the returned bearer mark. The consumer must continuously retain a
+pool-wide outbound block policy below the bearer policies. The injector
+installs no containment configuration and a policy query cannot provide an
+atomic receipt. See [Raw IPv4 injection](#raw-ipv4-injection) for the exact
+obligation, zero-Identification handling and limits.
 
 **Owner-approved policy.** Fragmenting a datagram with Don't Fragment set is
 not standard router behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3
@@ -707,3 +688,220 @@ Both privileged lanes require `OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN`,
 `OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN`,
 `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN` and
 `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_BASELINE_PROVEN`.
+
+
+### Raw IPv4 injection
+
+**Containment is the consumer's obligation.** Before opening
+`GtpuDownlinkInjector::raw_ipv4()`, install a lower-priority OUT block policy
+over the complete subscriber address pool, matching every source, mark and
+protocol. Keep it for the **whole lifetime of the plaintext source**, not
+just while a bearer policy is present. A lower priority has a larger numeric
+priority value than each intended bearer protection policy. Keep both
+`net.ipv4.conf.all.disable_xfrm=0` and
+`net.ipv4.conf.<egress>.disable_xfrm=0`, and admit no higher-priority
+intersecting bypass policy that could pass the packet without a required
+transform. `disable_policy` relaxes inbound checks; auditing it cannot prevent
+this outbound bypass. The native negative control shows plaintext despite a
+retained pool block and `disable_policy=0` when either effective `disable_xfrm`
+setting is enabled.
+
+For example, for a synthetic subscriber pool whose bearer policies have
+priorities below 10,000:
+
+```sh
+ip xfrm policy add dir out dst 203.0.113.0/24 priority 10000 action block
+```
+
+The block has no source, protocol or mark constraint. All outbound bearer
+policies, including the default bearer, must match the actual inner source
+and destination and require their intended SA. Route rules, addresses and
+policy ownership remain application configuration. The injector installs,
+removes and queries none of them. Establish these obligations before enabling
+any plaintext source and retain them across process restarts, policy
+replacements and bearer teardown.
+
+**A diagnostic is not a guard.** A read such as `ip xfrm policy get dir out
+dst 203.0.113.0/24` is a snapshot, not a lease or atomic containment receipt.
+Neither checking twice nor watching asynchronous netlink notifications can
+recall a packet already sent. If the consumer violates its lifetime
+obligation, the block can disappear after the last successful read and before
+any fragment's kernel policy lookup. This interval has no fixed upper bound;
+plaintext may continue until protection is restored or sending stops. No
+read-only diagnostic is included because it cannot turn that observation into
+send authority.
+
+The kernel does the FIB lookup before XFRM. An ordinary route must therefore
+exist even when a bearer policy protects traffic. A blackhole, unreachable
+or prohibit FIB route can reject the lookup before a valid SA is selected.
+Without a matching policy, the default ACCEPT behavior uses the ordinary
+route and can emit plaintext. The retained pool block makes a missing bearer
+policy refuse at the XFRM lookup instead. Construction and send success never
+prove containment or peer receipt.
+
+**Namespace default block.** On kernels and iproute2 versions providing the
+namespace default-policy API, another option is:
+
+```sh
+ip xfrm policy setdefault out block
+ip xfrm policy getdefault
+```
+
+The default is separate from ordinary SPD entries: deleting the pool block,
+or even flushing all ordinary policies, does not remove it. An unmatched
+non-loopback output flow then fails instead of taking the plain route, so
+this option removes the deleted-pool-block window while the namespace
+default remains block. Its cost is namespace-wide: every other permitted
+non-loopback output flow needs an explicit policy too. The kernel exempts
+loopback routes from this default; this is not a loopback containment guard.
+A higher-priority explicit plaintext allow can still bypass the intended
+protection and must not intersect the subscriber flow. The consumer owns
+these settings continuously; a readback is still only a snapshot.
+
+The native test deletes the ordinary block, proves refusal under the namespace
+default, demonstrates that a deliberate explicit allow emits plaintext, and
+restores encryption under the same default block. Upstream Linux 5.14 lacks
+this API; the pinned enterprise 5.14.0-427 line carries its backport.
+Consumers on kernels without it must retain the pool block or select another
+supported send contract.
+
+**API and send behavior.** The constructor opens one nonblocking,
+close-on-exec raw IPv4 socket in the current network namespace. The socket
+stays there. It requires `CAP_NET_RAW`, and `SO_MARK` also requires
+`CAP_NET_ADMIN` on kernels before Linux 5.17. The constructor probes `SO_MARK`
+and reads back `IP_HDRINCL` and `IP_NODEFRAG`: an initial mark-privilege gap is
+reported as a socket construction/configuration error. Required privileges
+must remain available for later per-packet mark changes.
+
+```rust
+use opc_gtpu_dataplane::{GtpuDownlinkEvent, GtpuDownlinkInjector};
+
+// First establish the containment obligation above in this namespace.
+let mut injector = GtpuDownlinkInjector::raw_ipv4()?;
+match event {
+    GtpuDownlinkEvent::Decapsulated(packet) => {
+        injector.inject((&packet).into())?;
+    }
+    GtpuDownlinkEvent::Fragmented(batch) => {
+        injector.inject((&batch).into())?;
+    }
+    _ => { /* Process the other control-port outcomes normally. */ }
+}
+```
+
+`GtpuDownlinkInjectionPort` is an object-safe seam that a consumer can fake
+without a socket. `testkit::decapsulated_downlink` and
+`testkit::fragmented_downlink` build structural inputs from synthetic bytes
+for those tests, including deliberately malformed fixtures. They grant no
+receive or forwarding authority; production outcomes come from the control
+port. An external-crate test exercises both factories with a consumer fake.
+
+The real injector takes exclusive mutable access so a bearer mark cannot
+change partway through a batch. Each send uses:
+
+- `IP_HDRINCL`, retaining the validated caller header; Linux recalculates
+  its total length and checksum;
+- `SO_MARK` equal to the outcome's bearer mark, explicitly zero for the
+  default bearer even after a marked send;
+- `IP_PKTINFO` with `ipi_spec_dst` equal to the inner source. Linux builds
+  this flow from the socket and ancillary data, not the supplied IP header.
+  HDRINCL implies `FLOWI_FLAG_ANYSRC`, allowing a nonlocal source. Selectors
+  must not rely on inner protocol or ports: this raw flow has protocol
+  `IPPROTO_RAW` and zero ports;
+- `IP_NODEFRAG`, so connection tracking does not gather the inner fragments
+  at LOCAL_OUT and recombine them into an oversized packet before ESP.
+
+`IP_NODEFRAG` does not make every fragment a tracked flow. A non-initial
+fragment has no usable transport header for conntrack, remains without a
+connection entry and matches `ct state invalid` (not the explicit nftables
+`untracked` state). A common output-chain `ct state invalid drop` rule refuses
+it even while its matching XFRM policy and SA remain installed. The native
+proof checks the independent invalid-fragment counter, the refusal class and
+zero wire output. Consumers must account for this when defining output rules.
+
+The whole batch is validated before its first send, then sent in offset order.
+Successful calls count local kernel acceptance. A failure stops at the first
+failed packet and reports earlier acceptance in `Send { class, packets_sent }`.
+The value-free `GtpuDownlinkSendFailure` classes distinguish `WouldBlock`,
+`MessageTooLarge`, `NoBufferSpace`, `PolicyOrFilterRefused`, `AccessDenied`,
+`ShortWrite` and `Other`. Pool/default-block and netfilter refusals normally use
+`PolicyOrFilterRefused`; the errno cannot identify which policy or filter
+refused the packet. Revoking mark privileges after construction can also
+produce this class. Linux `EACCES` is separately `AccessDenied`, including
+prohibit-route and disallowed-broadcast failures; it is not an XFRM diagnosis.
+
+Raw-mode pool/default-block refusals return a local error before packet output.
+Device-MTU and DF tunnel path-MTU refusals likewise return `MessageTooLarge`:
+`raw_send_hdrinc` uses `ip_local_error`, and `xfrm4_tunnel_check_size` uses
+`xfrm_local_error` for the attached full raw socket rather than sending ICMP.
+The native proof supplies a route and an explicit output allow toward the
+inner source, including under default block, and observes no ICMP on any
+namespace device for these cases. This observation does not cover arbitrary
+consumer routes, redirects or firewall rules that generate their own errors.
+
+After partial acceptance the datagram is lost: accepted pieces cannot be
+recalled and this API cannot resume or resend the remainder. Do not resend the
+whole outcome. There is no automatic retry or packet queue. Errors, `Debug`
+and counters contain only static classes and counts, never addresses, marks,
+SPIs or bytes. IPv6 is unsupported. An unspecified source is refused because
+Linux would replace it. TTL is not decremented and IPv4 options are preserved
+without router processing.
+
+**Identification zero.** Zero is legal under RFC 6864, but Linux
+`raw_send_hdrinc()` calls `ip_select_ident()` when it sees zero with DF clear.
+Sibling fragments can therefore receive different IDs and never reassemble.
+Both a `Fragmented` batch with zero ID and DF clear and an independent
+`Decapsulated` fragment (MF or nonzero offset) with zero ID and DF clear are
+refused with `GtpuDownlinkInjectionError::ZeroIdentificationFragment` before
+anything is sent. `zero_identification_refusals` counts refused outcomes,
+one per independent fragment or batch, not inferred datagrams.
+
+The crate emits `Fragmented` only for DF sources. An atomic source already
+receives a fresh nonzero ID from the fragmenter. A zero-ID batch is therefore
+one re-fragmented piece of an origin-fragmented datagram, whose siblings arrive
+as separate outcomes. Inventing an ID for that piece cannot agree with those
+siblings. The injector allocates no IDs and keeps no correlation cache.
+
+The lost traffic is an origin-fragmented zero-ID datagram that requires any
+non-DF raw send, either as received or after the fragmenter clears DF. For
+uniformly numbered sources this is about one affected datagram in 65,536;
+sources repeatedly using zero can lose every affected datagram. Fitting DF
+fragments keep zero, and an unfragmented zero-ID packet may be numbered by
+Linux. Nonzero IDs are preserved. Keeping DF on pieces made from a DF-fragment
+source would let zero survive raw output. Choosing those flags changes the
+fragmenter's MTU/fragmentation policy and belongs there, not in this injector.
+The interface-bound sender in [#1085](https://github.com/openpacketcore/openpacketcore-sdk/issues/1085)
+preserves zero and does not have this raw-path limit.
+
+**Evidence.** The independent Python peer in
+`tests/fixtures/downlink_injection.py` configures synthetic private namespaces,
+observes encrypted egress and decrypted fragments, and receives exact
+reassembled UDP payloads. The native Rust test exercises both marks, nonlocal
+source selectors, ordered fragments with conntrack active, zero-ID refusals,
+pool/default-block containment, `disable_xfrm` bypass, query/delete/send and
+invalid-filter controls, and no ICMP for block and MTU refusals with a usable
+return route. Its sender trace records every device without an address filter.
+The shared runner requires each native case exactly
+once, zero ignored executions and `OPC_GTPU_RAW_INJECTION_PROVEN`.
+
+The privileged backend fragmentation and hand-off suites feed actual
+`try_receive_downlink` outcomes to the production injector. They prove normal
+fragment delivery and the zero-ID origin-fragment case: the re-fragmented
+batch is refused before sending; its fitting DF sibling keeps zero, and the
+datagram is lost. Native, pinned Linux 6.8 and enterprise lanes register the
+raw proof; their kernels provide the namespace default-policy facility.
+
+Source checks cover Linux v7.1.8:
+[`raw_sendmsg`/`raw_send_hdrinc`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/raw.c),
+[`ip_cmsg_send`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/ip_sockglue.c),
+[`inet_sk_flowi_flags`](https://github.com/gregkh/linux/blob/v7.1.8/include/net/inet_sock.h),
+[`ip_select_ident`](https://github.com/gregkh/linux/blob/v7.1.8/include/net/ip.h),
+[`__mkroute_output` and `ip_route_output_flow`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/route.c),
+[`xfrm_lookup_with_ifid`, including `nopol`](https://github.com/gregkh/linux/blob/v7.1.8/net/xfrm/xfrm_policy.c),
+[`xfrm4_tunnel_check_size`](https://github.com/gregkh/linux/blob/v7.1.8/net/xfrm/xfrm_output.c),
+[`xfrm4_local_error`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/xfrm4_output.c),
+[conntrack defrag](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/netfilter/nf_defrag_ipv4.c),
+and [`ipv4_get_l4proto`/`nf_conntrack_in`](https://github.com/gregkh/linux/blob/v7.1.8/net/netfilter/nf_conntrack_core.c).
+The [enterprise default-policy backport](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/net/xfrm/xfrm_user.c)
+provides SETDEFAULT/GETDEFAULT. Identification semantics follow
+[RFC 6864](https://www.rfc-editor.org/rfc/rfc6864.html).

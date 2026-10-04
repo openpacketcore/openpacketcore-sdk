@@ -1282,7 +1282,12 @@ impl GtpuDownlinkCounters {
     }
 }
 
-/// One authorized inner packet produced from a received G-PDU.
+/// One inner packet and its output bearer metadata.
+///
+/// The control port produces this after receive authorization and validation.
+/// The public [`crate::testkit`] can also construct unvalidated fixtures: the
+/// type alone is neither validation evidence nor forwarding authority. The
+/// injector validates packet structure again before sending.
 ///
 /// The inner bytes are subscriber traffic. `Debug` exposes only the family
 /// and length; the bearer mark is redacted.
@@ -1320,10 +1325,10 @@ impl GtpuDecapsulatedDownlink {
         }
     }
 
-    /// Complete inner IP packet, unmodified. An IPv4 packet has a header
-    /// that passed validation and ends at its total length: octets that the
-    /// T-PDU carried after it are not part of the datagram and are not
-    /// returned.
+    /// Inner packet bytes, unmodified. For control-port outcomes, an IPv4
+    /// header has passed validation and the bytes end at its total length;
+    /// trailing T-PDU octets are excluded. Testkit fixtures need not satisfy
+    /// these conditions.
     #[must_use]
     pub fn inner_packet(&self) -> &[u8] {
         &self.inner_packet
@@ -1589,12 +1594,18 @@ impl PacketTooBigLimiter {
     }
 }
 
-/// An authorized over-MTU downlink IPv4 packet fragmented before
+/// An over-MTU downlink IPv4 packet fragmented before
 /// encapsulation under the default
 /// [`GtpuDownlinkOversizePolicy::FragmentInner`](crate::GtpuDownlinkOversizePolicy::FragmentInner).
 ///
-/// Every fragment is one complete IPv4 datagram of at most [`Self::mtu`]
-/// octets, in offset order, built by the RFC 791 section 3.2 procedure: the
+/// Control-port outcomes follow receive authorization and the procedure below.
+/// Public [`crate::testkit`] fixtures need not satisfy it; this type alone is
+/// neither validation evidence nor forwarding authority. The injector validates
+/// packet structure and ordering again before sending.
+///
+/// For control-port outcomes, every fragment is one complete IPv4 datagram of
+/// at most [`Self::mtu`] octets, in offset order, built by the RFC 791 section
+/// 3.2 procedure: the
 /// original 20-octet header is copied, and the total length, More Fragments
 /// flag, fragment offset and header checksum are set per fragment. Don't
 /// Fragment is cleared, the owner-approved RFC 4459 section 3.4 policy. All
@@ -1643,13 +1654,14 @@ impl GtpuFragmentedDownlink {
         }
     }
 
-    /// The complete IPv4 fragments, in offset order.
+    /// The fragment bytes. Control-port outcomes contain complete IPv4
+    /// fragments in offset order; testkit fixtures may be malformed.
     #[must_use]
     pub fn fragments(&self) -> &[bytes::Bytes] {
         &self.fragments
     }
 
-    /// Consume the event and return the fragments, in offset order.
+    /// Consume the event and return its fragment bytes in their stored order.
     #[must_use]
     pub fn into_fragments(self) -> Vec<bytes::Bytes> {
         self.fragments

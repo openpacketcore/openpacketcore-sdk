@@ -246,6 +246,40 @@ pub fn socket_kernel_identity(socket: BorrowedFd<'_>) -> io::Result<u64> {
     socket_u64_option(socket, libc::SO_COOKIE)
 }
 
+pub fn configure_raw_ipv4_injection_socket(socket: BorrowedFd<'_>) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    for option in [libc::IP_HDRINCL, libc::IP_NODEFRAG] {
+        // SAFETY: the descriptor is borrowed for this call; `enabled` points
+        // to an initialized integer whose size matches both Linux options.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                option,
+                (&enabled as *const libc::c_int).cast(),
+                mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    validate_raw_ipv4_injection_option_values(
+        socket_i32_option(socket, libc::IPPROTO_IP, libc::IP_HDRINCL)?,
+        socket_i32_option(socket, libc::IPPROTO_IP, libc::IP_NODEFRAG)?,
+    )
+}
+
+fn validate_raw_ipv4_injection_option_values(hdrincl: i32, nodefrag: i32) -> io::Result<()> {
+    if hdrincl != 1 || nodefrag != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw_ipv4_injection_options",
+        ));
+    }
+    Ok(())
+}
+
 pub fn verify_udp_fence_socket_options(socket: BorrowedFd<'_>, ipv6: bool) -> io::Result<()> {
     let (level, freebind, transparent) = if ipv6 {
         (
@@ -1451,6 +1485,16 @@ mod tests {
                 .expect_err("unsafe socket option");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert_eq!(error.to_string(), "udp_fence_socket_options");
+        }
+    }
+
+    #[test]
+    fn raw_ipv4_injection_options_require_header_inclusion_and_no_defrag() {
+        assert!(validate_raw_ipv4_injection_option_values(1, 1).is_ok());
+        for (hdrincl, nodefrag) in [(0, 1), (1, 0), (0, 0), (2, 1), (1, -1)] {
+            let error = validate_raw_ipv4_injection_option_values(hdrincl, nodefrag).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "raw_ipv4_injection_options");
         }
     }
 

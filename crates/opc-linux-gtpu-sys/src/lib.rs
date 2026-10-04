@@ -408,6 +408,22 @@ pub fn verify_udp_fence_socket_options(
         .map_err(|error| io::Error::new(error.kind(), "udp_fence_socket_options"))
 }
 
+/// Enable `IP_HDRINCL` and `IP_NODEFRAG` on a caller-owned raw IPv4 socket.
+///
+/// The caller retains the descriptor and owns all packet validation, mark,
+/// source selection and XFRM containment policy. `IP_NODEFRAG` keeps locally
+/// injected fragments out of connection tracking's reassembly queue.
+///
+/// # Errors
+/// Returns a value-free error if either option cannot be set or this platform
+/// does not support these Linux socket options. A failure may have set the
+/// first option; callers must discard the socket instead of sending through it.
+#[cfg(target_os = "linux")]
+pub fn configure_raw_ipv4_injection_socket(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    platform::configure_raw_ipv4_injection_socket(socket)
+        .map_err(|error| io::Error::new(error.kind(), "raw_ipv4_injection_options"))
+}
+
 /// Query the locally attached cgroup-v2 INET-egress programs.
 ///
 /// The inventory is hard-bounded to the kernel cgroup-BPF limit of 64
