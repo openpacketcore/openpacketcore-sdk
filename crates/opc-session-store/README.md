@@ -1146,18 +1146,39 @@ replenished or permanently retires that permit. This prevents a write-held
 SQLite connection from globally serializing unrelated acceptance reads without
 creating a connection, task, or pool entry per caller or subscriber.
 
-After Openraft startup recovery finishes, log and state-machine writes may mark
+After Openraft startup recovery finishes, ordinary SQLite committed-frontier
+writes on a current-thread Tokio runtime use owned blocking jobs. One
+process-wide semaphore admits at most 64 queued and running jobs across all
+stores and runtimes. Saturated callers wait asynchronously before acquiring
+prune preemption or the primary connection. Each submitted job retains that
+original connection guard, prune preemption, snapshot-directory lease and a
+tracked shutdown owner through its transaction. Caller cancellation cannot
+release those resources early or replay the write. A successful commit signals
+the checkpoint lane even when its caller has stopped waiting; a rejected commit
+rolls back without signaling. Failures emit a diagnostic containing only the
+error kind, even if the caller has stopped waiting. The pinned Tokio 1.53.1 pool
+drains jobs already queued behind a busy blocking worker even after
+`shutdown_timeout` returns; those jobs retain their resources and admission until
+completion. A closed runtime rejects new dispatch without executing SQL and
+releases the rejected job's resources. Blocking threads belong to the caller's
+runtime and follow its idle retirement policy, so a write after pool inactivity
+may need a new thread. This scheduling behavior does not qualify a latency
+target. Native WAL routing and acknowledgements are unchanged.
+
+Other SQLite log and state-machine writes may mark
 their synchronous SQLite turn as blocking after acquiring the existing writer
-and connection guards. On a multi-thread Tokio runtime, an admitted handoff can
+and connection guards once startup recovery finishes. On a multi-thread Tokio
+runtime, including for committed-frontier writes, an admitted handoff can
 let other runnable tasks progress while the calling thread completes the
-transaction and its full row checks. The write is never detached from its
+transaction and its full row checks. This synchronous helper never detaches its
 caller, and ordinary one-row frontier decoding stays inline. Cancellation
 cannot release an admitted transaction's guards early or replay its work.
-Startup recovery, including on a caller's LocalSet, and current-thread runtimes
-retain inline execution.
+Startup recovery, including on a caller's LocalSet, retains inline execution.
+The borrowed helper also retains inline execution on current-thread runtimes
+and continues to accept borrowed, non-Send operations.
 
-Each store admits one runtime handoff until a completion marker runs in the
-same blocking pool. Pending scheduler work is bounded to one replacement-worker
+Each store admits one synchronous runtime handoff until a completion marker runs
+in the same blocking pool. Pending scheduler work is bounded to one replacement-worker
 job and one marker; other writes execute inline while admission is occupied.
 The marker holds only bookkeeping, with no SQLite connection, transaction or
 storage owner guard. One static counter shared by all stores and runtimes in

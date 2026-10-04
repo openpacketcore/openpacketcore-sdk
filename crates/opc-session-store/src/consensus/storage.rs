@@ -3,6 +3,18 @@
 //! Openraft exclusively owns election, commit, and membership decisions. This
 //! adapter only provides serialized durable I/O and deterministic application
 //! of entries Openraft has already committed.
+//!
+//! After startup, ordinary SQLite committed-frontier writes on current-thread
+//! Tokio runtimes use blocking jobs with process-wide admission for at most 64
+//! queued or active writes. The job retains its original connection, prune
+//! preemption, namespace lease and shutdown owner through completion, including
+//! after caller cancellation, and signals checkpoints only after success. No
+//! write is replayed. The pinned Tokio pool drains jobs queued behind a busy
+//! blocking worker even after `shutdown_timeout` returns; they retain ownership
+//! until completion. A closed runtime rejects new dispatch without executing
+//! SQL and releases the job's resources. Startup and borrowed synchronous
+//! helpers remain inline on current-thread runtimes; native WAL routing is
+//! unchanged.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -2953,6 +2965,15 @@ struct ConsensusStorageShutdownCompletion {
 const MAX_RUNTIME_WRITE_HANDOFFS: usize = 64;
 static RUNTIME_WRITE_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
 
+// Unlike borrowed multi-thread handoffs, current-thread committed writes own
+// their blocking job. Reserve before acquiring storage guards and submitting
+// it, and retain the permit through completion. Waiting callers yield rather
+// than fall back to blocking the runtime. The static bound survives churn of
+// stores and runtimes and includes both queued and running jobs.
+const MAX_OWNED_COMMITTED_WRITES: usize = 64;
+static OWNED_COMMITTED_WRITES: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_OWNED_COMMITTED_WRITES);
+
 // This unique admission deliberately has no Drop refund. A lost or cancelled
 // marker cannot prove that its replacement worker left the runtime queue.
 struct RuntimeWriteHandoff {
@@ -3061,6 +3082,12 @@ impl ConsensusStorageShutdownGuard {
         Some(RuntimeWriteHandoff {
             completion: Arc::clone(completion),
         })
+    }
+
+    fn runtime_write_handoff_enabled(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|completion| completion.runtime_write_handoff.load(Ordering::Acquire))
     }
 
     fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
@@ -4734,6 +4761,43 @@ fn enqueue_runtime_write_handoff_completion(
     })
 }
 
+/// One admitted committed-frontier write on the original SQLite connection.
+///
+/// The blocking closure owns this entire value, including the directory lease
+/// and shutdown child in `store`, so cancelling its async caller cannot release
+/// any write resource or suppress successful checkpoint accounting. Field order
+/// releases the connection and prune preemption before the tracked store, then
+/// returns process-wide admission last. No failed or cancelled job is replayed.
+struct OwnedCommittedSqliteWrite {
+    conn: tokio::sync::OwnedMutexGuard<rusqlite::Connection>,
+    _prune_preemption: consensus::ConsensusLogPrunePrimaryPreemption,
+    store: SqliteConsensusLogStore,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl OwnedCommittedSqliteWrite {
+    fn commit(self, committed: Option<LogId<SessionConsensusNodeId>>) -> io::Result<()> {
+        let result = consensus::save_committed_with_authority_sync(
+            &self.conn,
+            self.store.core.storage_identity,
+            self.store.core.authority_profile,
+            &self.store.core.expected_members,
+            &self.store.core.expected_bindings,
+            self.store.core.fixed_placement_policy,
+            committed,
+        );
+        drop(self.conn);
+        if result.is_ok() {
+            self.store.core.signal_proactive_checkpoint();
+        } else if let Err(error) = &result {
+            // The caller may have stopped awaiting this owned job. Record only
+            // the fixed error category, never SQL text, paths or session values.
+            tracing::error!(kind = ?error.kind(), "session committed-frontier write failed");
+        }
+        result
+    }
+}
+
 impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     type LogReader = Self;
 
@@ -4847,6 +4911,37 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?
         {
             return wal.save_committed(committed).await;
+        }
+        if self.shutdown_guard.runtime_write_handoff_enabled()
+            && tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+            })
+        {
+            let permit = OWNED_COMMITTED_WRITES.acquire().await.map_err(|error| {
+                storage_error(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Write,
+                    io::Error::other(error),
+                )
+            })?;
+            let prune_preemption = self.core.request_consensus_log_prune_preemption().await;
+            let conn = Arc::clone(&self.core.conn).lock_owned().await;
+            let write = OwnedCommittedSqliteWrite {
+                conn,
+                _prune_preemption: prune_preemption,
+                store: self.tracked_reader(),
+                _permit: permit,
+            };
+            return tokio::task::spawn_blocking(move || write.commit(committed))
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Logs,
+                        ErrorVerb::Write,
+                        io::Error::other(error),
+                    )
+                })?
+                .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
         }
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
@@ -13265,6 +13360,30 @@ mod tests {
         exercise_admitted_sqlite_commit(false, true).await;
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_commit_allows_independent_runtime_progress() {
+        exercise_admitted_sqlite_commit(false, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_commit_retains_ownership_after_cancellation() {
+        exercise_admitted_sqlite_commit(true, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_commit_error_rolls_back_before_releasing_ownership() {
+        exercise_admitted_sqlite_commit(false, true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_commit_error_after_cancellation_rolls_back() {
+        exercise_admitted_sqlite_commit(true, true).await;
+    }
+
     #[tokio::test]
     async fn admitted_sqlite_write_supports_current_thread_borrowed_scope() {
         assert_admitted_sqlite_write_borrowed_scope();
@@ -13683,6 +13802,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn admitted_sqlite_write_cancelled_before_connection_never_commits() {
+        exercise_admitted_sqlite_cancelled_before_connection().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_cancelled_before_connection_never_commits() {
+        exercise_admitted_sqlite_cancelled_before_connection().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_admitted_sqlite_cancelled_before_connection() {
         let directory = FixedRawReadStoreFixture::new();
         let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
         let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
@@ -13697,6 +13827,12 @@ mod tests {
             .blocking_append([blank_entry(1)])
             .await
             .expect("append the uncommitted next row");
+        let prune = state_machine.core.consensus_log_prune_lane();
+        if let Some(lane) = &prune {
+            // Isolate connection admission from the fixture's initial prune
+            // turn so the pending future below actually reaches its lock wait.
+            lane.shutdown().await;
+        }
         shutdown.enable_runtime_write_handoff();
         let conn = state_machine.core.conn.lock().await;
         let mut pending = Box::pin(log_store.save_committed(Some(log_id(1))));
@@ -13709,9 +13845,31 @@ mod tests {
             Some(log_id(0))
         );
         drop(conn);
-        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+        let connection = Arc::clone(&state_machine.core.conn);
+        let storage_identity = state_machine.core.storage_identity;
+        let checkpoint = state_machine.core.proactive_checkpoint_lane();
+        drop(log_store);
+        drop(state_machine);
+        tokio::time::timeout(Duration::from_secs(2), shutdown.wait())
+            .await
+            .expect("cancelled admission leaves no detached storage owner");
+        if let Some(lane) = prune {
             lane.shutdown().await;
         }
+        if let Some(lane) = checkpoint {
+            lane.shutdown().await;
+        }
+        let conn = connection.lock().await;
+        assert!(
+            conn.is_autocommit(),
+            "no late transaction after lock release"
+        );
+        assert_eq!(
+            consensus::read_committed_sync(&conn, storage_identity)
+                .expect("read frontier after releasing admission and joining owners"),
+            Some(log_id(0)),
+            "cancellation before connection ownership cannot submit a late write"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -13772,6 +13930,12 @@ mod tests {
             .blocking_append([blank_entry(1)])
             .await
             .expect("append one exact frontier advance");
+        let checkpoint = state_machine
+            .core
+            .proactive_checkpoint_lane()
+            .expect("file-backed fixture checkpoint lane");
+        #[cfg(feature = "test-vfs")]
+        let checkpoint_budget = checkpoint.durable_write_budget_for_test();
         shutdown.enable_runtime_write_handoff();
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -13833,9 +13997,18 @@ mod tests {
                 conn.is_autocommit(),
             )
         };
-        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+        let prune = state_machine.core.consensus_log_prune_lane();
+        drop(state_machine);
+        // Connection release precedes successful checkpoint accounting. Join
+        // the admitted owner before stopping either lane, even if its caller
+        // was cancelled and no longer awaits the blocking job's result.
+        tokio::time::timeout(Duration::from_secs(2), shutdown.wait())
+            .await
+            .expect("the original transaction retires its final storage owner");
+        if let Some(lane) = prune {
             lane.shutdown().await;
         }
+        checkpoint.shutdown().await;
         match commit_result {
             Ok(result) if reject_commit => assert!(result.is_err()),
             Ok(result) => result.expect("the original commit succeeds"),
@@ -13848,9 +14021,564 @@ mod tests {
         );
         assert!(autocommit, "the transaction has completed before returning");
         assert_eq!(commits.load(Ordering::Relaxed), 1, "no replayed commit");
+        #[cfg(feature = "test-vfs")]
+        assert_eq!(
+            checkpoint.durable_write_budget_for_test(),
+            checkpoint_budget - u64::from(!reject_commit),
+            "only a successful commit signals the checkpoint lane"
+        );
         assert!(
             made_progress.load(Ordering::Relaxed),
             "an admitted synchronous SQLite commit must not strand unrelated runtime work"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_cancelled_commit_precedes_next_write() {
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "ordered cancelled writer initial membership",
+        )
+        .await;
+        log_store
+            .blocking_append([blank_entry(1), blank_entry(2)])
+            .await
+            .expect("append two exact frontier advances");
+        let mut next_log = log_store.tracked_reader();
+        let connection = Arc::clone(&log_store.core.conn);
+        let prune = log_store.core.consensus_log_prune_lane().unwrap();
+        let checkpoint = log_store.core.proactive_checkpoint_lane().unwrap();
+        shutdown.enable_runtime_write_handoff();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let hook_released = Arc::clone(&released);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let hook_commits = Arc::clone(&commits);
+        let mut entered_tx = Some(entered_tx);
+        connection
+            .lock()
+            .await
+            .commit_hook(Some(move || {
+                hook_commits.fetch_add(1, Ordering::Relaxed);
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    hook_released.store(
+                        release_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                        Ordering::Release,
+                    );
+                }
+                false
+            }))
+            .unwrap();
+
+        let first = tokio::spawn(async move { log_store.save_committed(Some(log_id(1))).await });
+        entered_rx.await.expect("first commit owns the connection");
+        first.abort();
+        assert!(
+            first.await.is_err_and(|error| error.is_cancelled()),
+            "caller cancellation completes while its original commit is held"
+        );
+        let mut second = Box::pin(next_log.save_committed(Some(log_id(2))));
+        assert!(
+            futures_util::poll!(second.as_mut()).is_pending(),
+            "the second write waits behind the cancelled caller's transaction"
+        );
+        assert!(connection.try_lock().is_err());
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
+        release_tx
+            .send(())
+            .expect("explicitly release the first commit");
+        second
+            .await
+            .expect("the next exact frontier commits in order");
+        drop(next_log);
+        drop(state_machine);
+        tokio::time::timeout(Duration::from_secs(2), shutdown.wait())
+            .await
+            .expect("both original writes retire their owners");
+        prune.shutdown().await;
+        checkpoint.shutdown().await;
+        let conn = connection.lock().await;
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            consensus::read_committed_sync(&conn, identity(1)).unwrap(),
+            Some(log_id(2)),
+            "the cancelled first write cannot overwrite the later frontier"
+        );
+        assert_eq!(
+            commits.load(Ordering::Relaxed),
+            2,
+            "each write commits once"
+        );
+        assert!(
+            released.load(Ordering::Acquire),
+            "no cleanup fallback release"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sqlite_current_thread_cancelled_commit_blocks_shutdown() {
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, database) =
+            open_fixed_raw_read_store(&directory).await;
+        let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "cancelled shutdown initial membership",
+        )
+        .await;
+        log_store.blocking_append([blank_entry(1)]).await.unwrap();
+        shutdown.enable_runtime_write_handoff();
+        let original_connection = Arc::downgrade(&log_store.core.conn);
+        let original_lease = Arc::downgrade(&log_store._snapshot_directory_lease);
+        let prune = log_store.core.consensus_log_prune_lane().unwrap();
+        let checkpoint = log_store.core.proactive_checkpoint_lane().unwrap();
+        #[cfg(feature = "test-vfs")]
+        let checkpoint_budget = checkpoint.durable_write_budget_for_test();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let hook_released = Arc::clone(&released);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let hook_commits = Arc::clone(&commits);
+        let mut entered_tx = Some(entered_tx);
+        log_store
+            .core
+            .conn
+            .lock()
+            .await
+            .commit_hook(Some(move || {
+                hook_commits.fetch_add(1, Ordering::Relaxed);
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    hook_released.store(
+                        release_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                        Ordering::Release,
+                    );
+                }
+                false
+            }))
+            .unwrap();
+        let commit = tokio::spawn(async move { log_store.save_committed(Some(log_id(1))).await });
+        entered_rx
+            .await
+            .expect("original transaction reaches commit");
+        commit.abort();
+        let cancelled = commit.await.is_err_and(|error| error.is_cancelled());
+        drop(state_machine);
+
+        // No storage wrapper remains. Weak observations must not supply the
+        // connection, namespace lease or shutdown owner that the job needs.
+        let connection_held = original_connection
+            .upgrade()
+            .is_some_and(|connection| connection.try_lock().is_err());
+        let lease_held = original_lease.strong_count() != 0;
+        let shutdown_pending = futures_util::poll!(Box::pin(shutdown.wait())).is_pending();
+        let primary_writers = prune.primary_writers_for_test();
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), shutdown.wait())
+            .await
+            .expect("shutdown joins the admitted write after explicit release");
+        prune.shutdown().await;
+        checkpoint.shutdown().await;
+
+        assert!(cancelled, "caller cancellation completes while SQL is held");
+        assert!(
+            connection_held,
+            "the job retains the original connection guard"
+        );
+        assert!(lease_held, "the job retains the original directory lease");
+        assert!(
+            shutdown_pending,
+            "the admitted job remains a shutdown owner"
+        );
+        assert_eq!(primary_writers, 1, "prune preemption survives cancellation");
+        assert_eq!(prune.primary_writers_for_test(), 0);
+        assert!(original_connection.upgrade().is_none());
+        assert!(original_lease.upgrade().is_none());
+        assert!(
+            released.load(Ordering::Acquire),
+            "no cleanup fallback release"
+        );
+        assert_eq!(
+            commits.load(Ordering::Relaxed),
+            1,
+            "no replay after cancellation"
+        );
+        #[cfg(feature = "test-vfs")]
+        assert_eq!(
+            checkpoint.durable_write_budget_for_test(),
+            checkpoint_budget - 1
+        );
+        let conn = rusqlite::Connection::open(database).unwrap();
+        assert_eq!(
+            consensus::read_committed_sync(&conn, identity(1)).unwrap(),
+            Some(log_id(1))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    struct OwnedCommittedSqliteFixture {
+        _directory: FixedRawReadStoreFixture,
+        database: PathBuf,
+        connection: std::sync::Weak<tokio::sync::Mutex<rusqlite::Connection>>,
+        lease: std::sync::Weak<SnapshotDirectoryLease>,
+        shutdown: ConsensusStorageShutdownObserver,
+        prune: Arc<consensus::ConsensusLogPruneLane>,
+        checkpoint: Arc<consensus::ProactiveCheckpointLane>,
+        commits: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OwnedCommittedSqliteFixture {
+        async fn new() -> (Self, SqliteConsensusLogStore) {
+            let directory = FixedRawReadStoreFixture::new();
+            let (mut log, mut machine, database) = open_fixed_raw_read_store(&directory).await;
+            let shutdown = track_admitted_sqlite_fixture(&mut log, &mut machine);
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry()],
+                "bounded committed write initial membership",
+            )
+            .await;
+            log.blocking_append([blank_entry(1)]).await.unwrap();
+            let commits = Arc::new(AtomicUsize::new(0));
+            let hook_commits = Arc::clone(&commits);
+            log.core
+                .conn
+                .lock()
+                .await
+                .commit_hook(Some(move || {
+                    hook_commits.fetch_add(1, Ordering::Relaxed);
+                    false
+                }))
+                .unwrap();
+            shutdown.enable_runtime_write_handoff();
+            let fixture = Self {
+                _directory: directory,
+                database,
+                connection: Arc::downgrade(&log.core.conn),
+                lease: Arc::downgrade(&log._snapshot_directory_lease),
+                shutdown,
+                prune: log.core.consensus_log_prune_lane().unwrap(),
+                checkpoint: log.core.proactive_checkpoint_lane().unwrap(),
+                commits,
+            };
+            drop(machine);
+            // Finish the initial prune turn before deliberately saturating
+            // the only blocking thread. Otherwise the write can wait behind
+            // that queued turn until the pool blocker's cleanup fallback.
+            // The retained lane still supplies real primary-write preemption.
+            fixture.prune.shutdown().await;
+            (fixture, log)
+        }
+
+        async fn queue_and_cancel(&self, mut log: SqliteConsensusLogStore) {
+            let write = tokio::spawn(async move { log.save_committed(Some(log_id(1))).await });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.shutdown.0.active_owners.load(Ordering::Acquire) != 2 {
+                    assert!(
+                        !write.is_finished(),
+                        "the held pool cannot finish this write"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the job owns admission and all storage guards before cancellation");
+            write.abort();
+            assert!(write.await.unwrap_err().is_cancelled());
+            self.assert_owned();
+        }
+
+        fn assert_owned(&self) {
+            assert_eq!(self.shutdown.0.active_owners.load(Ordering::Acquire), 1);
+            assert!(self.connection.upgrade().unwrap().try_lock().is_err());
+            assert_ne!(self.lease.strong_count(), 0);
+            assert_eq!(self.prune.primary_writers_for_test(), 1);
+        }
+
+        fn assert_retired(&self, committed: bool) {
+            assert_eq!(self.shutdown.0.active_owners.load(Ordering::Acquire), 0);
+            assert!(self.connection.upgrade().is_none());
+            assert!(self.lease.upgrade().is_none());
+            assert_eq!(self.prune.primary_writers_for_test(), 0);
+            assert_eq!(self.commits.load(Ordering::Relaxed), usize::from(committed));
+            let conn = rusqlite::Connection::open(&self.database).unwrap();
+            assert_eq!(
+                consensus::read_committed_sync(&conn, identity(1)).unwrap(),
+                Some(log_id(u64::from(committed)))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn block_owned_sqlite_runtime(
+        runtime: &tokio::runtime::Runtime,
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<bool>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        (release_tx, blocker)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_sqlite_owned_commits_bound_queued_work_across_stores_and_runtimes() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_owned_commits_bound_queued_work_across_stores_and_runtimes",
+        ) {
+            return;
+        }
+        let runtimes: Vec<_> = (0..2)
+            .map(|_| {
+                tokio::runtime::Builder::new_current_thread()
+                    .max_blocking_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let mut stores: Vec<_> = (0..MAX_OWNED_COMMITTED_WRITES + 2)
+            .map(|index| {
+                let (fixture, log) =
+                    runtimes[index % 2].block_on(OwnedCommittedSqliteFixture::new());
+                (fixture, Some(log))
+            })
+            .collect();
+        let blockers: Vec<_> = runtimes.iter().map(block_owned_sqlite_runtime).collect();
+        for (index, (fixture, log)) in stores
+            .iter_mut()
+            .take(MAX_OWNED_COMMITTED_WRITES)
+            .enumerate()
+        {
+            runtimes[index % 2].block_on(fixture.queue_and_cancel(log.take().unwrap()));
+            assert_eq!(
+                OWNED_COMMITTED_WRITES.available_permits(),
+                MAX_OWNED_COMMITTED_WRITES - index - 1
+            );
+        }
+
+        // A fresh runtime cannot evade reservations retained by closed store
+        // callers on either saturated pool. Waiting owns no SQLite resources
+        // and cancellation submits no work and refunds no existing admission.
+        let replacement = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (fixture, log) in stores.iter_mut().skip(MAX_OWNED_COMMITTED_WRITES) {
+            let mut log = log.take().unwrap();
+            replacement.block_on(async {
+                let mut pending = Box::pin(log.save_committed(Some(log_id(1))));
+                assert!(futures_util::poll!(pending.as_mut()).is_pending());
+                assert!(fixture.connection.upgrade().unwrap().try_lock().is_ok());
+                assert_eq!(fixture.prune.primary_writers_for_test(), 0);
+                assert_eq!(OWNED_COMMITTED_WRITES.available_permits(), 0);
+                drop(pending);
+            });
+            drop(log);
+            fixture.assert_retired(false);
+        }
+        drop(replacement);
+
+        // Release both pools before draining either one's disk commits and
+        // lane shutdowns, so that work cannot consume the other fallback.
+        let mut released_blockers = Vec::with_capacity(blockers.len());
+        for (release, blocker) in blockers {
+            release.send(()).unwrap();
+            released_blockers.push(blocker);
+        }
+        for (runtime_index, blocker) in released_blockers.into_iter().enumerate() {
+            runtimes[runtime_index].block_on(async {
+                assert!(
+                    blocker.await.unwrap(),
+                    "explicit pool release precedes fallback"
+                );
+                for (fixture, _) in stores
+                    .iter()
+                    .take(MAX_OWNED_COMMITTED_WRITES)
+                    .skip(runtime_index)
+                    .step_by(2)
+                {
+                    tokio::time::timeout(Duration::from_secs(2), fixture.shutdown.wait())
+                        .await
+                        .expect("drain each original admitted write");
+                    fixture.prune.shutdown().await;
+                    fixture.checkpoint.shutdown().await;
+                    fixture.assert_retired(true);
+                }
+            });
+        }
+        // Both pools can now finish concurrently. The job drops its shutdown
+        // owner before returning the last admission field, so join that final
+        // release after draining every owner instead of counting per pool.
+        runtimes[0].block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while OWNED_COMMITTED_WRITES.available_permits() != MAX_OWNED_COMMITTED_WRITES {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed jobs return process-wide admission");
+        });
+        drop(runtimes);
+        let replacement = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        replacement.block_on(async {
+            let (fixture, mut log) = OwnedCommittedSqliteFixture::new().await;
+            log.save_committed(Some(log_id(1))).await.unwrap();
+            drop(log);
+            fixture.shutdown.wait().await;
+            fixture.prune.shutdown().await;
+            fixture.checkpoint.shutdown().await;
+            fixture.assert_retired(true);
+        });
+        assert_eq!(
+            OWNED_COMMITTED_WRITES.available_permits(),
+            MAX_OWNED_COMMITTED_WRITES
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_sqlite_owned_commit_runtime_shutdown_drains_queued_job() {
+        exercise_owned_committed_runtime_shutdown(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_sqlite_owned_commit_runtime_shutdown_retains_started_job() {
+        exercise_owned_committed_runtime_shutdown(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_sqlite_owned_commit_closed_runtime_rejects_unstarted_job() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_owned_commit_closed_runtime_rejects_unstarted_job",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fixture, mut log) = runtime.block_on(OwnedCommittedSqliteFixture::new());
+        let handle = runtime.handle().clone();
+        runtime.shutdown_timeout(Duration::ZERO);
+        // A retained handle can still poll this storage future, but its closed
+        // blocking pool rejects the owned job without running the transaction.
+        assert!(handle
+            .block_on(log.save_committed(Some(log_id(1))))
+            .is_err());
+        drop(log);
+        fixture.assert_retired(false);
+        assert_eq!(
+            OWNED_COMMITTED_WRITES.available_permits(),
+            MAX_OWNED_COMMITTED_WRITES
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_owned_committed_runtime_shutdown(started: bool) {
+        let name = if started {
+            "admitted_sqlite_owned_commit_runtime_shutdown_retains_started_job"
+        } else {
+            "admitted_sqlite_owned_commit_runtime_shutdown_drains_queued_job"
+        };
+        if run_admitted_sqlite_resource_case_in_child(name) {
+            return;
+        }
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .on_thread_stop(move || {
+                let _ = stopped_tx.send(());
+            })
+            .build()
+            .unwrap();
+        let (fixture, mut log) = runtime.block_on(OwnedCommittedSqliteFixture::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let (release, blocker) = if started {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let hook_released = Arc::clone(&released);
+            let commits = Arc::clone(&fixture.commits);
+            let mut entered_tx = Some(entered_tx);
+            runtime.block_on(async {
+                log.core
+                    .conn
+                    .lock()
+                    .await
+                    .commit_hook(Some(move || {
+                        commits.fetch_add(1, Ordering::Relaxed);
+                        if let Some(entered_tx) = entered_tx.take() {
+                            let _ = entered_tx.send(());
+                            hook_released.store(
+                                release_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                                Ordering::Release,
+                            );
+                        }
+                        false
+                    }))
+                    .unwrap();
+                let write = tokio::spawn(async move { log.save_committed(Some(log_id(1))).await });
+                entered_rx.await.unwrap();
+                write.abort();
+                assert!(write.await.unwrap_err().is_cancelled());
+            });
+            (release_tx, None)
+        } else {
+            let (release, blocker) = block_owned_sqlite_runtime(&runtime);
+            runtime.block_on(fixture.queue_and_cancel(log));
+            (release, Some(blocker))
+        };
+        assert_eq!(
+            OWNED_COMMITTED_WRITES.available_permits(),
+            MAX_OWNED_COMMITTED_WRITES - 1
+        );
+        runtime.shutdown_timeout(Duration::ZERO);
+        fixture.assert_owned();
+        release.send(()).unwrap();
+        stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking thread drains its queue after shutdown");
+        if let Some(blocker) = blocker {
+            assert!(futures_util::FutureExt::now_or_never(blocker)
+                .unwrap()
+                .unwrap());
+        } else {
+            assert!(
+                released.load(Ordering::Acquire),
+                "explicit commit release precedes fallback"
+            );
+        }
+        // This pinned Tokio pool drains jobs queued behind an already busy
+        // worker. Both paths must retain ownership until that original write
+        // finishes, despite runtime shutdown and caller cancellation.
+        fixture.assert_retired(true);
+        assert_eq!(
+            OWNED_COMMITTED_WRITES.available_permits(),
+            MAX_OWNED_COMMITTED_WRITES
         );
     }
 

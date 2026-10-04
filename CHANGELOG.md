@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: ordinary SQLite committed-frontier writes no longer
+  strand unrelated tasks on current-thread Tokio runtimes after startup.
+  Process-wide admission bounds queued and active owned writes; jobs retain
+  the original transaction resources and shutdown ownership through completion
+  after caller cancellation. Successful commits still signal checkpoints;
+  rejected commits roll back, and writes are never replayed. Native WAL routing and
+  startup/LocalSet behavior are unchanged. Fixes #829.
+
 - `opc-session-testkit`: require direct protected V2 facade successes in a
   non-ignored authenticated three-voter test. Six nominal transitions permit
   at most one receipt resolution, with exact outcomes, readback and mutation
