@@ -8,9 +8,9 @@
 //! they never become the unsupported-procedure fallback. Local triggers for
 //! those messages remain disabled in this SDK boundary.
 //!
-//! [`UnsupportedProcedure`] exposes the envelope's procedure code, triggering
+//! [`UnsupportedProcedure`](crate::n3iwf::applicability::UnsupportedProcedure) exposes the envelope's procedure code, triggering
 //! message and criticality as value-free metadata, including for silently
-//! ignored procedures whose [`diagnostics`](UnsupportedProcedure::diagnostics)
+//! ignored procedures whose [`diagnostics`](crate::n3iwf::applicability::UnsupportedProcedure::diagnostics)
 //! are absent.
 //!
 //! Direction and signalling describe the protocol, not association ownership.
