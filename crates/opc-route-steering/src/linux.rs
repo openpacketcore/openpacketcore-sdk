@@ -5262,8 +5262,9 @@ mod tests {
             );
             // Exactly the lock mask and the MTU: two u32 attributes.
             assert_eq!(nested.len(), 2 * (ROUTE_ATTRIBUTE_HEADER_LEN + 4));
-            // The legacy encoder and the removal request carry the same
-            // metric, so kernel deletion matches only the locked MTU route.
+            // The legacy encoder and deletion request carry the same metrics
+            // for both families. IPv4 compares them during deletion; IPv6
+            // does not, so exact owned removal requires readback.
             let legacy = encode_legacy_route_request(&request).unwrap();
             assert_eq!(
                 attr_payload(&legacy, ROUTE_MESSAGE_LEN, RTA_METRICS),
