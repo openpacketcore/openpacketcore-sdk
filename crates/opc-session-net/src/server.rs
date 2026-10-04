@@ -249,6 +249,8 @@ fn connection_failure_reason(error: &ProtocolError) -> &'static str {
 fn record_server_connection_failure(error: &ProtocolError) {
     match error {
         ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            #[cfg(test)]
+            crate::test_support::record_connection_timeout_failure();
             &METRICS.session_net_connection_failure_timeout
         }
         ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
@@ -265,6 +267,8 @@ fn record_server_connection_outcome(result: &Result<(), ProtocolError>) {
             METRICS
                 .session_net_connection_successes
                 .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            crate::test_support::record_connection_success();
         }
         Err(error) => record_server_connection_failure(error),
     }
@@ -3945,42 +3949,18 @@ mod tests {
         bytes
     }
 
-    #[derive(Clone, Copy)]
-    struct ConnectionOutcomeMetricSnapshot {
-        idle_retirements: u64,
-        timeout_failures: u64,
-        successes: u64,
-        drain_started: u64,
-        drain_completed: u64,
+    fn connection_outcome_metrics() -> crate::test_support::ConnectionOutcomeMetricSnapshot {
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .try_with(|accounting| accounting.snapshot())
+            .expect("connection outcome accounting scope")
     }
 
-    fn connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
-        ConnectionOutcomeMetricSnapshot {
-            idle_retirements: METRICS
-                .session_net_lifecycle_retirement_idle_timeout
-                .load(Ordering::Relaxed),
-            timeout_failures: METRICS
-                .session_net_connection_failure_timeout
-                .load(Ordering::Relaxed),
-            successes: METRICS
-                .session_net_connection_successes
-                .load(Ordering::Relaxed),
-            drain_started: METRICS
-                .session_net_lifecycle_drain_started
-                .load(Ordering::Relaxed),
-            drain_completed: METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed),
-        }
-    }
-
-    async fn wait_for_drain_completion(minimum: u64) {
+    async fn wait_for_drain_completion(
+        minimum: u64,
+        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
+    ) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed)
-                < minimum
-            {
+            while snapshot_metrics().drain_completed < minimum {
                 tokio::task::yield_now().await;
             }
         })
@@ -4016,26 +3996,36 @@ mod tests {
         (result, writer)
     }
 
-    #[tokio::test]
-    async fn generic_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
-
-        let before_idle = connection_outcome_metrics();
+    async fn assert_generic_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
+    ) {
+        let before_idle = snapshot_metrics();
         let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
         record_server_connection_outcome(&idle_result);
         idle_result.expect("byte-idle authenticated connection is a policy retirement");
-        wait_for_drain_completion(before_idle.drain_completed + 1).await;
-        let after_idle = connection_outcome_metrics();
+        wait_for_drain_completion(before_idle.drain_completed + 1, snapshot_metrics).await;
+        let after_idle = snapshot_metrics();
         assert_eq!(
             after_idle.idle_retirements,
-            before_idle.idle_retirements + 1
+            before_idle.idle_retirements + 1,
+            "authenticated idle retirement increments the idle counter exactly once"
         );
         assert_eq!(after_idle.timeout_failures, before_idle.timeout_failures);
-        assert!(after_idle.successes > before_idle.successes);
-        assert!(after_idle.drain_started > before_idle.drain_started);
-        assert!(after_idle.drain_completed > before_idle.drain_completed);
+        assert_eq!(
+            after_idle.successes,
+            before_idle.successes + 1,
+            "authenticated idle retirement records one successful connection"
+        );
+        assert_eq!(
+            after_idle.drain_started,
+            before_idle.drain_started + 1,
+            "authenticated idle retirement starts one drain"
+        );
+        assert_eq!(
+            after_idle.drain_completed,
+            before_idle.drain_completed + 1,
+            "dropping the retired connection completes one drain"
+        );
         let mut acknowledgement = std::io::Cursor::new(acknowledgement);
         assert!(matches!(
             read_frame::<_, BootstrapResponse>(&mut acknowledgement, MAX_HANDSHAKE_FRAME_SIZE)
@@ -4044,7 +4034,7 @@ mod tests {
             BootstrapResponse::HelloAck(_)
         ));
 
-        let before_partial = connection_outcome_metrics();
+        let before_partial = snapshot_metrics();
         let (partial_result, _acknowledgement) = dispatch_after_authentication(&[0]).await;
         assert!(matches!(
             partial_result,
@@ -4052,14 +4042,19 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
         record_server_connection_outcome(&partial_result);
-        let after_partial = connection_outcome_metrics();
+        let after_partial = snapshot_metrics();
         assert_eq!(
             after_partial.idle_retirements, before_partial.idle_retirements,
             "one active frame byte must preserve the slowloris timeout failure"
         );
-        assert!(after_partial.timeout_failures > before_partial.timeout_failures);
+        assert_eq!(
+            after_partial.timeout_failures,
+            before_partial.timeout_failures + 1,
+            "a partial active frame records one timeout failure"
+        );
+        assert_eq!(after_partial.successes, before_partial.successes);
 
-        let before_handshake = connection_outcome_metrics();
+        let before_handshake = snapshot_metrics();
         let reauthentication = SessionReauthenticationControl::new();
         let pending = PendingServerLifecycle::insecure(reauthentication.generation());
         let mut config = test_dispatch_config(reauthentication);
@@ -4082,12 +4077,69 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
         record_server_connection_outcome(&handshake_result);
-        let after_handshake = connection_outcome_metrics();
+        let after_handshake = snapshot_metrics();
         assert_eq!(
             after_handshake.idle_retirements,
             before_handshake.idle_retirements
         );
-        assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
+        assert_eq!(
+            after_handshake.timeout_failures,
+            before_handshake.timeout_failures + 1,
+            "bootstrap silence records one timeout failure"
+        );
+        assert_eq!(after_handshake.successes, before_handshake.successes);
+    }
+
+    #[tokio::test]
+    async fn generic_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
+        let accounting = Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(
+                accounting,
+                assert_generic_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+                    connection_outcome_metrics,
+                ),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn generic_server_records_production_connection_outcome_metrics() {
+        const CHILD_MARKER: &str = "OPC_SESSION_NET_SERVER_OUTCOME_METRICS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current session-net test executable"),
+            )
+            .args([
+                "--exact",
+                "server::tests::generic_server_records_production_connection_outcome_metrics",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated generic server outcome metrics child");
+            assert!(
+                status.success(),
+                "isolated generic server outcome metrics child passes"
+            );
+            return;
+        }
+
+        let transport_before = METRICS
+            .session_net_connection_failure_transport
+            .load(Ordering::Relaxed);
+        assert_generic_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+            crate::test_support::production_connection_outcome_metrics,
+        )
+        .await;
+        assert_eq!(
+            METRICS
+                .session_net_connection_failure_transport
+                .load(Ordering::Relaxed),
+            transport_before,
+            "idle retirement and timeouts are not transport failures"
+        );
     }
 
     #[tokio::test]
