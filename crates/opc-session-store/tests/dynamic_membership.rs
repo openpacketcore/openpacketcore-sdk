@@ -3684,6 +3684,13 @@ async fn stale_reconciliation_cannot_reopen_admission_while_successor_is_in_flig
         after.staged && !after.admitted_latch,
         "a stale reconciliation of the completed request reopened admission while its successor was in flight: {after:?}"
     );
+    // The successor was staged before the stale pass checked, so that pass
+    // ended at its staging check: it never contended for the admission gate
+    // that the successor's barriers need.
+    assert!(
+        stale.first_poll.await.is_err(),
+        "a pass for a superseded request contended for the admission gate"
+    );
 
     next.release
         .send(())
