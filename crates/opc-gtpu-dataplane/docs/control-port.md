@@ -181,12 +181,34 @@ validators and the backend's own map reads:
    DSCP are read and the Active `PdpContextCommit` is read last as the
    publication fence. Pending, Removing, absent or mixed graphs fail closed.
 
+**Inner IPv4 header.** The consumer stands in for tc and also for the
+kernel's IPv4 input, which validated every inner packet that tc decapsulated.
+Before an authorized inner IPv4 packet is returned as `Decapsulated`, its
+header must pass the same checks (`ip_rcv_core`; RFC 1122 section 3.2.1.2,
+RFC 1812 section 5.2.2):
+
+- version 4, and a header length of at least five words that lies within the
+  packet;
+- a correct header checksum, over the options too;
+- a total length that covers the header and does not exceed the received
+  length.
+
+A failure is a `Malformed` drop. Octets after the total length are not part
+of the datagram and are trimmed, as the kernel trims them. The check applies
+to every route into the consumer: a reassembled G-PDU, a hand-off from tc,
+and grouped as well as ordinary attachments.
+
+It matters because of the injection. An `IP_HDRINCL` send rewrites the header
+checksum and the total length. A header that the kernel discarded would
+otherwise be repaired and sent on, and trailing octets would become part of
+the datagram.
+
 | Event | Meaning |
 | --- | --- |
-| `Decapsulated` | Exact inner packet, inner family and bearer mark (default bearer is `None`). The caller injects it toward XFRM with that mark. |
+| `Decapsulated` | The inner packet, its family and bearer mark (default bearer is `None`). An IPv4 packet has a validated header and ends at its total length. The caller injects it toward XFRM with that mark. The packet can be an inner IPv4 fragment; see [Inner fragments](#inner-fragments). |
 | `Control` | Non-G-PDU message; use the response planners above. |
 | `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
-| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
+| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed (including an inner IPv4 header that fails the checks above), binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
 | `Fragmented` | An over-MTU DF IPv4 packet split into RFC 791 inner fragments under the default policy below, with the bearer mark. The caller injects every fragment, in order, toward XFRM with that mark. |
 | `PacketTooBig` | An over-MTU DF IPv4 packet under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
 
@@ -224,8 +246,12 @@ set that exceeds the MTU:
 - `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` is the **explicit
   opt-in** alternative, one in-tunnel RFC 1191 error.
 
-`None` keeps today's behaviour: tc decapsulates the packet and the host
-drops it with its own Fragmentation Needed toward the core.
+Under either policy, tc also hands every inner IPv4 fragment of the context
+to this consumer; see [Inner fragments](#inner-fragments).
+
+`None` keeps today's behaviour: tc decapsulates every packet, fragment or
+not, and the host drops an over-MTU Don't Fragment packet with its own
+Fragmentation Needed toward the core.
 
 **Storage.** The field lives in the previously reserved bytes 66..68 of the
 Active `PdpContextCommit`, so it is published, replaced and read back
@@ -245,9 +271,10 @@ contexts refuse both policies. The eBPF probe reports
 fragments are produced, and errors sent, only while the application drains
 this port.
 
-**Binding and integration order.** The backend binds UDP/2152 and UDP/2153
-when the control port is first opened for the attachment. It keeps them until
-the attachment is removed or its queue is retired. Nothing is bound:
+**Binding and integration order.** The backend binds UDP/2152, UDP/2153 and
+UDP/2154 when the control port is first opened for the attachment. It keeps
+them until the attachment is removed or its queue is retired. If any of the
+three cannot be bound, no port is published. Nothing is bound:
 - before that first open;
 - while the process is down across a restart, because tc keeps steering from
   the pinned graph;
@@ -261,13 +288,19 @@ per peer, and `icmp_msgs_per_sec` is global. Each error holds at most 576
 octets (RFC 1812 section 4.3.2.3), so its quote holds at most 548. That quote
 includes up to about 512 octets of the inner packet, in plaintext, toward
 the core. The UDP/2152 hand-offs of #1003 have always behaved the same way.
+In those windows the host forwards neither an over-MTU Don't Fragment packet
+nor an inner fragment of a context with a downlink inner MTU.
 
 Open the control port right after creating or adopting the attachment, before
 installing any context with a downlink inner MTU. Keep draining it for the
 attachment's lifetime. That order cannot close one window. Adopting a retained
 graph after a restart reopens tc's traffic gate before the port can be opened,
-so its MTU contexts steer to an unbound UDP/2153 until the port is open.
-Enforcement is tracked in #1019.
+so its MTU contexts steer to an unbound UDP/2153 and UDP/2154 until the port
+is open. Enforcement is tracked in #1019.
+
+tc rewrites the destination port before netfilter sees the packet. A host
+filter on the INPUT path that selects GTP-U by UDP destination port must
+therefore also admit UDP/2153 and UDP/2154 from the GTP-U peers.
 
 **tc.** When an authorized inner IPv4 packet with Don't Fragment set exceeds
 the MTU, tc does not decapsulate it, so the host never forwards it. The host
@@ -278,9 +311,152 @@ same local address (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). tc reads only
 the MTU bits, so it steers identically under both policies. Outer fragments
 are reassembled first and arrive on the shared queue.
 
-**Queue priority.** `try_receive_downlink` always serves the shared UDP/2152
-queue first. A backlog of hand-offs therefore cannot delay or crowd out Echo
-or reassembled G-PDUs.
+Every other authorized inner IPv4 fragment of such a context is steered the
+same way to the backend-owned inner-fragment queue
+(`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154); see
+[Inner fragments](#inner-fragments).
+
+**Queue priority.** `try_receive_downlink` serves the shared UDP/2152 queue
+first, so a backlog of hand-offs cannot crowd out Echo or reassembled G-PDUs.
+That priority holds for a run of at most eight datagrams. After a full run,
+the hand-off queues get one turn, and they also get a turn whenever the
+shared queue is empty:
+
+- Echo and unknown-TEID G-PDUs reach the shared queue from any source. With
+  absolute priority, sustained input there would keep the consumer from both
+  hand-off queues, and the packets waiting in them would overflow. With the
+  bounded run, the hand-off queues together receive at least one of every
+  nine datagrams served.
+- A hand-off backlog delays the shared queue by at most one hand-off
+  datagram per run of eight. A hand-off turn that finds both queues empty
+  costs the shared queue nothing.
+- The two hand-off queues take their turns alternately: a hand-off queue
+  that holds a datagram is served at least every second hand-off turn,
+  however long the other queue's backlog is.
+
+**No authority in the port.** A datagram is authorized in full whatever queue
+delivered it. A queue's port neither grants nor replaces any check.
+
+#### Inner fragments
+
+A context with a downlink inner MTU has tc hand over every authorized inner
+IPv4 fragment: a packet with More Fragments set or a non-zero fragment offset
+(RFC 791 section 3.1), whatever its size. The hand-off is the one used for an
+over-MTU packet: tc does not decapsulate, and rewrites only the UDP
+destination port, to the inner-fragment queue (UDP/2154). A fragment that
+also exceeds the MTU with Don't Fragment set is an over-MTU packet first and
+goes to the packet-too-big queue, as before. A context without a downlink
+inner MTU is unchanged: tc decapsulates its fragments.
+
+**Why.** The fragments of one datagram arrive in separate G-PDUs. A G-PDU
+that outgrows the S2b-U link is fragmented on the outer path, so its inner
+fragment reaches this consumer through kernel reassembly. A sibling whose
+G-PDU fits would be decapsulated by tc and forwarded by the host. Where
+connection tracking is active in the namespace, netfilter then reassembles
+the two halves in different queues: the forwarded half at PRE_ROUTING, the
+injected half at LOCAL_OUT. Neither queue completes, and both halves expire
+after `ipfrag_time` without any error. With every fragment handed over, the
+whole datagram takes one path, which the application controls.
+
+**Consumer.** The G-PDU is re-authorized like any other, and its inner header
+is validated as above. A fragment that is not an over-MTU Don't Fragment
+packet is then returned as `Decapsulated`, unmodified, with its tunnel's
+bearer mark. The consumer does not reassemble, and keeps no state per
+datagram.
+
+The three decisions that this hand-off needed:
+
+1. **Rate limits: a returned fragment takes no token.**
+   - The inner fragmentation budget bounds fragmentation work and the use of
+     fresh Identifications per destination. A returned fragment is not
+     fragmented and keeps its own Identification.
+   - The Packet Too Big limit bounds in-tunnel errors. None is sent for a
+     returned fragment.
+   - Charging either budget would drop legitimate datagrams: one 64 KiB
+     datagram arrives as 45 back-to-back fragments.
+   - A fragment that exceeds the MTU with Don't Fragment set is still an
+     over-MTU packet. It is fragmented under its destination's budget, within
+     its own offset range and with its own Identification, or signalled
+     under its session's limit. Only a first fragment is ever answered.
+   - The load of returned fragments is bounded by the queue budget instead.
+2. **Queue budget: inner fragments have their own queue.**
+   - Each hand-off queue is one UDP socket with the receive buffer the kernel
+     gives a new socket (`net.core.rmem_default`, 212,992 octets by default).
+     That buffer is the queue's whole budget and its memory bound. Linux
+     charges a datagram the size of its buffer, not of its payload: on
+     Linux 7.1, a default buffer held 92 G-PDUs of 1,404 octets.
+   - Beyond the budget the kernel drops silently, and `SO_RXQ_OVFL` counts
+     the drops per queue (`inner_fragment_queue_drops`). An overflow never
+     produces an ICMP error.
+   - A flood of inner fragments fills only the inner-fragment queue. It
+     cannot take room from over-MTU packets, Echo or reassembled G-PDUs, and
+     the turn-taking above keeps it from delaying over-MTU packets by more
+     than one datagram each. An over-MTU flood cannot starve fragments
+     either.
+   - The consumer holds one datagram at a time, so it adds no queue of its
+     own.
+3. **Authorization: every fragment carries its own, first or not.**
+   - A non-first fragment has no transport header, and downlink authorization
+     needs none. A G-PDU is authorized by its tunnel (TEID), its outer peer,
+     local endpoint and source port, the complete Active graph, and its inner
+     destination, the session PAA. Each fragment carries all of that in its
+     own G-PDU.
+   - Each fragment is therefore authorized on its own, and an unauthorized
+     one is dropped for the same reasons as any G-PDU. Nothing is inferred
+     from a first fragment, so fragments that never had one fill no table.
+   - The bearer mark is that of the tunnel the fragment arrived in. The core
+     gateway chose that bearer when it encapsulated the fragment (TS 23.401
+     downlink bearer binding). Fragments of one datagram that the core sent
+     on different bearers are returned with different marks.
+   - Injection needs nothing more either. The returned mark selects the
+     Child SA; a port or protocol selector, which a non-first fragment could
+     not match, is not involved (see Injection below).
+
+**Costs.**
+
+- **Slow path.** Every inner fragment of such a context costs a receive, a
+  re-authorization and the caller's injection, where tc forwarded it in the
+  kernel. Fragmented traffic is expected to be rare; its rate is capped by
+  how fast the application drains the queue.
+- **Reordering.** A fragment can arrive after later packets of the same
+  flow that took the tc fast path.
+- **No queue sizing.** The queue budget is the kernel's default receive
+  buffer. This port offers no call to change it.
+
+**Limits.**
+
+- **A fragment above the MTU without Don't Fragment** is returned as it
+  arrived, like any such packet after outer reassembly. The caller's
+  injection may then fragment the ESP packet on the outer header, or refuse
+  a packet above the egress device MTU (an `IP_HDRINCL` send fails with
+  `EMSGSIZE`). Before this hand-off, the host forwarded such a fragment when
+  its G-PDU fit the S2b-U link. Fragmenting these packets to the MTU is part
+  (ii) of #1023.
+- **While nothing drains the queues** (see the binding windows above), tc
+  still steers. The inner fragments of contexts with a downlink inner MTU are
+  then not forwarded; without this hand-off the host would forward them.
+- **Other senders can crowd fragments out.** The queue budget separates the
+  two hand-off classes from each other. It does not protect a class from
+  datagrams that tc did not steer:
+  - the hand-off queues are unconnected UDP sockets on the S2b-U address. A
+    sender that reaches UDP/2154 directly uses the queue's buffer, and one of
+    the consumer's turns per datagram, before the consumer can refuse it;
+  - the shared queue is served first for runs of eight, and tc passes Echo
+    and unknown-TEID G-PDUs to it from any source. A sender that keeps
+    UDP/2152 busy takes eight of every nine of the consumer's turns. The
+    hand-off queues keep the ninth, so they are slowed but not starved.
+
+  Inner fragments that arrive faster than the remaining share overflow their
+  queue, where tc used to forward them whatever the consumer was doing.
+  UDP/2153 has always been exposed in the same way. Admit UDP/2152 to
+  UDP/2154 on the S2b-U address only from the GTP-U peers.
+- **Contexts without a downlink inner MTU** are unchanged: tc decapsulates
+  their fragments. One of their datagrams can still be split when a G-PDU is
+  fragmented on the outer path and the application drains this port. Give
+  the context a downlink inner MTU to send every fragment through the
+  consumer, and give it to every bearer of the session: a core gateway may
+  send the fragments of one datagram on different bearers. Grouped entries
+  and ordinary inner-IPv6 contexts cannot carry one.
 
 #### Default: inner fragmentation
 
@@ -341,12 +517,26 @@ with the returned mark, exactly as for a `Decapsulated` packet. On Linux an
 bearer mark (zero for the default bearer). Linux builds the XFRM flow for
 such a socket from the socket, not the packet: pass the inner source as the
 `IP_PKTINFO` source so a source-specific OUT selector matches, and do not
-rely on port or protocol selectors. Linux also replaces an Identification
+rely on port or protocol selectors. Set `IP_NODEFRAG` on that socket too.
+Where connection tracking is active, netfilter otherwise reassembles the
+injected fragments at LOCAL_OUT: it holds them until the datagram is
+complete, and the reassembled packet leaves as one ESP packet, which is
+fragmented on the outer header when it exceeds the link MTU. This applies
+equally to `Fragmented` fragments and to `Decapsulated` inner fragments.
+Linux also replaces an Identification
 of zero on an `IP_HDRINCL` send, which would break reassembly; fragments of
 an atomic datagram never carry zero, but a received DF fragment's own
-Identification is preserved as it is. Unlike a forwarding router (RFC 1812
+Identification is preserved as it is. So is that of a `Decapsulated` inner
+fragment. If it is zero and the fragment has no Don't Fragment, Linux gives
+each fragment a different Identification on such a send, and the datagram
+cannot be reassembled, where tc forwarded the fragments unchanged. That
+affects a datagram whose sender chose Identification zero (#1022). Unlike a
+forwarding router (RFC 1812
 section 5.3.1), the consumer does not decrement TTL, for fragments or for
-`Decapsulated` packets. This is a documented limitation of this path.
+`Decapsulated` packets. Nor does it process IPv4 options (source routing,
+Record Route, Timestamp): a `Decapsulated` packet with options is returned
+with a validated header and unprocessed options. These are documented
+limitations of this path.
 
 **Owner-approved policy.** Fragmenting a datagram with Don't Fragment set is
 not standard router behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3
@@ -423,16 +613,22 @@ Destination Unreachable (Fragmentation Needed) error is sent:
 **Counters.** Value-free counters report fragmented packets and fragments,
 rate-limited and unfragmentable packets under the default policy, and
 too-big, signalled, rate-limited and unsendable packets under the opt-in.
-`SO_RXQ_OVFL` reports kernel drops from the shared queue and from the
-packet-too-big queue.
+`decapsulated_inner_fragments` reports the decapsulated packets that were
+inner fragments. `SO_RXQ_OVFL` reports kernel drops from the shared queue,
+from the packet-too-big queue and from the inner-fragment queue. The kernel
+reports a queue's drop count with each datagram received from it, so each of
+these three counters shows the drops up to the last datagram read from its
+queue. Drops since then, or from a queue that is not being served, are not
+visible yet.
 
 **Limits.**
 
 - tc has no hand-off counter and no in-kernel policer. Either would add a map
   and change the retained pin inventory and the durable recovery records.
-- A flood toward one PAA can still fill the packet-too-big queue. When it
-  does, the kernel drops further hand-offs from any session, and those drops
-  are counted. It can never affect the shared queue.
+- A flood toward one PAA can still fill a hand-off queue. When it does, the
+  kernel drops further hand-offs of that class from any session, and those
+  drops are counted. It can never affect the other hand-off queue or the
+  shared queue.
 
 **IPv6.** IPv6 has no in-network fragmentation: only the source fragments
 (RFC 8200 sections 4.5 and 5), and a router answers an oversized packet with
@@ -474,6 +670,40 @@ without enforcement. Inner IPv6 Packet Too Big (#1007) needs three pieces:
 A baseline test pins the unchanged default without an MTU: the host emits
 its own error, quoting 548 octets toward the core.
 
+A further native test covers inner fragments, with one connection-tracking
+rule active in the gateway namespace:
+
+- a 2,600-octet datagram that the core fragments at 1,500. The first
+  fragment's G-PDU arrives as two outer fragments and the last one's fits.
+  Both come back as `Decapsulated`, the UE receives the exact payload, and
+  each fragment leaves as its own packet. The host reassembles the two outer
+  fragments and nothing else, and no reassembly fails;
+- three fragments in reverse order, none of which enters a host reassembly
+  queue;
+- a 28-octet first fragment with one flipped header checksum octet. Without
+  a downlink inner MTU, tc decapsulates it and the kernel's IPv4 input
+  discards it (`InHdrErrors`). With one, the consumer drops it as
+  `Malformed`, and nothing is sent toward the UE. The same holds for a
+  fragment whose total length claims one octet more than arrived;
+- two fragments followed by six octets beyond their total length. They come
+  back trimmed, and the UE reassembles the exact datagram;
+- a dedicated bearer through its real ESP Child SA: one dedicated-SPI ESP
+  packet per inner fragment, none fragmented on the outer header;
+- a context without a downlink inner MTU, and a packet that is not a
+  fragment, which tc still decapsulates;
+- the queue budget: with nobody draining, a flood larger than the receive
+  buffer leaves at most one buffer of fragments queued, and every other one
+  dropped and counted (on Linux 7.1 with a 212,992-octet buffer, 92 of 272
+  queued and 180 dropped). Twenty Echo Requests are served in runs of eight
+  with one hand-off turn after each run, and three over-MTU packets
+  alternate with the fragment backlog. No Echo and no over-MTU packet is
+  lost;
+- an Echo Request and a G-PDU for no tunnel sent straight to UDP/2154, which
+  are dropped;
+- zero plaintext ICMP toward the core, and an unchanged host
+  `OutDestUnreachs`.
+
 Both privileged lanes require `OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN`,
+`OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN`,
 `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN` and
 `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_BASELINE_PROVEN`.

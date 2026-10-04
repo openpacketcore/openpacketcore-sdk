@@ -64,26 +64,44 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// This is the production consumer for G-PDUs that the kernel delivers to
     /// the backend-owned queues. The shared UDP/2152 queue carries
     /// outer-fragmented downlink G-PDUs after kernel reassembly (TS 29.281
-    /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is always
-    /// served first. The UDP/2153 queue carries G-PDUs that tc steered because
-    /// their inner IPv4 packet has Don't Fragment set and exceeds the
-    /// session's downlink inner MTU. An authorized G-PDU is decapsulated
-    /// exactly once with the same selector, endpoint-binding, owner,
-    /// generation and commit-last checks as the tc fast path. An over-MTU one
-    /// becomes `Fragmented` under the default policy (the caller injects the
+    /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is served
+    /// first, for at most eight datagrams in a row. Two more queues carry
+    /// G-PDUs that tc steered for a session with a downlink inner MTU. They
+    /// get one turn after every full run of the shared queue and whenever it
+    /// is empty, and take those turns alternately, so that sustained input
+    /// on the shared queue cannot starve them:
+    /// UDP/2153 when the inner IPv4 packet has Don't Fragment set and exceeds
+    /// that MTU, and UDP/2154 when it is any other inner fragment (More
+    /// Fragments set, or a non-zero fragment offset). An authorized G-PDU is
+    /// decapsulated exactly once with the same selector, endpoint-binding,
+    /// owner, generation and commit-last checks as the tc fast path, whatever
+    /// queue delivered it. An over-MTU Don't Fragment one becomes
+    /// `Fragmented` under the default policy (the caller injects the
     /// fragments) or `PacketTooBig` under the explicit opt-in. Under the
     /// opt-in this call itself may send one in-tunnel error G-PDU toward the
-    /// peer through the backend-owned UDP/2152 socket. Non-G-PDU messages are
-    /// returned for the existing control planners. Receive and processing are
-    /// serialized per attachment and never wait behind PDP mutation; a `Busy`
-    /// result from an implementation consumes nothing from the queue.
+    /// peer through the backend-owned UDP/2152 socket. Every other inner
+    /// fragment is returned as `Decapsulated`, unmodified, so all fragments
+    /// of one datagram leave through the caller; it takes no token from
+    /// either rate limit. Before any inner IPv4 packet is returned as
+    /// `Decapsulated`, its header is validated as the kernel's IPv4 input
+    /// validates a packet that tc decapsulated, and octets after its total
+    /// length are trimmed; a packet that fails is a `Malformed` drop.
+    /// Non-G-PDU messages are returned for the
+    /// existing control planners. Receive and processing are serialized per
+    /// attachment and never wait behind PDP mutation; a `Busy` result from an
+    /// implementation consumes nothing from the queue.
     ///
-    /// The backend binds both queues when a port is first opened for the
-    /// attachment and keeps them until the attachment is removed or its queue
-    /// is retired. Open the port before installing any context with a
-    /// downlink inner MTU, and keep draining it for the attachment's lifetime:
-    /// while nothing is bound, the kernel may answer handed-off datagrams
-    /// with rate-limited ICMP Port Unreachable toward the peer (#1019).
+    /// The backend binds the three queues when a port is first opened for
+    /// the attachment and keeps them until the attachment is removed or its
+    /// queue is retired. Each hand-off queue is bounded by its own socket
+    /// receive buffer, so a flood of one class overflows only its own queue;
+    /// the kernel counts those drops (see
+    /// [`crate::GtpuDownlinkCounters`]). Open the port before installing any
+    /// context with a downlink inner MTU, and keep draining it for the
+    /// attachment's lifetime: while nothing is bound, the kernel may answer
+    /// handed-off datagrams with rate-limited ICMP Port Unreachable toward
+    /// the peer (#1019), and neither over-MTU Don't Fragment packets nor
+    /// inner fragments of those contexts are forwarded.
     ///
     /// The default implementation belongs to ports without backend state and
     /// returns [`GtpuControlPortError::Unsupported`] without receiving.

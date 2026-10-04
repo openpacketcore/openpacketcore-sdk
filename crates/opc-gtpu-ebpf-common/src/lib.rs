@@ -103,6 +103,16 @@ pub const GTPU_UDP_PORT: u16 = 2152;
 /// packets fills this dedicated socket queue and never the shared UDP/2152
 /// queue that carries Echo and reassembled G-PDUs.
 pub const GTPU_PACKET_TOO_BIG_QUEUE_PORT: u16 = 2153;
+/// Local UDP port of the backend-owned queue that receives authorized
+/// downlink G-PDUs whose inner IPv4 packet is a fragment.
+///
+/// tc hands such a G-PDU off exactly as it hands off an over-MTU one: it
+/// rewrites only the destination port, and the packet stays addressed to the
+/// concrete local S2b-U endpoint. The queue is separate from
+/// [`GTPU_PACKET_TOO_BIG_QUEUE_PORT`], so each hand-off class is bounded by
+/// its own socket receive buffer: a flood of inner fragments fills this queue
+/// and never the over-MTU queue or the shared UDP/2152 queue.
+pub const GTPU_INNER_FRAGMENT_QUEUE_PORT: u16 = 2154;
 
 /// Ethernet header length on the attach interface.
 pub const ETH_HDR_LEN: usize = 14;
@@ -1959,6 +1969,48 @@ pub const fn downlink_ipv4_exceeds_inner_mtu(
     mtu != 0 && total_length > mtu && flags_fragment & 0x4000 != 0
 }
 
+/// Return whether a downlink inner IPv4 packet is a fragment: More Fragments
+/// set, or a non-zero fragment offset (RFC 791 section 3.1).
+///
+/// Don't Fragment and the reserved flag do not make a packet a fragment.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_ipv4_is_fragment(flags_fragment: u16) -> bool {
+    flags_fragment & 0x3fff != 0
+}
+
+/// Return the backend-owned queue that tc hands an authorized downlink inner
+/// IPv4 packet to instead of decapsulating it, or `None` to decapsulate.
+///
+/// Only a session with a downlink inner MTU hands anything off (`mtu == 0`,
+/// unset, never does): that MTU is the session's statement that the
+/// application drains the backend-owned queues. For such a session:
+///
+/// - a packet that exceeds the MTU with Don't Fragment set goes to
+///   [`GTPU_PACKET_TOO_BIG_QUEUE_PORT`], fragment or not, exactly as
+///   [`downlink_ipv4_exceeds_inner_mtu`] decides;
+/// - every other fragment ([`downlink_ipv4_is_fragment`]) goes to
+///   [`GTPU_INNER_FRAGMENT_QUEUE_PORT`], whatever its size, so all fragments
+///   of one datagram leave through the consumer and none is left to the
+///   host's forwarding path;
+/// - an unfragmented packet that fits the MTU, or lacks Don't Fragment, is
+///   decapsulated by tc.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_ipv4_hand_off_port(
+    mtu: u16,
+    total_length: u16,
+    flags_fragment: u16,
+) -> Option<u16> {
+    if downlink_ipv4_exceeds_inner_mtu(mtu, total_length, flags_fragment) {
+        return Some(GTPU_PACKET_TOO_BIG_QUEUE_PORT);
+    }
+    if mtu != 0 && downlink_ipv4_is_fragment(flags_fragment) {
+        return Some(GTPU_INNER_FRAGMENT_QUEUE_PORT);
+    }
+    None
+}
+
 /// Return the committed UDP source port when an encoded Active record
 /// authorizes the exact live uplink FAR and DSCP state.
 ///
@@ -2957,6 +3009,99 @@ mod tests {
                 expected,
                 "mtu {mtu} total {total} flags {flags:#06x}"
             );
+        }
+    }
+
+    #[test]
+    fn downlink_inner_fragment_is_more_fragments_or_a_non_zero_offset() {
+        // RFC 791 section 3.1: bit 0 reserved, bit 1 DF, bit 2 MF, then the
+        // 13-bit fragment offset.
+        for (flags, expected) in [
+            (0x0000, false),
+            (0x4000, false),
+            (0x8000, false),
+            (0xc000, false),
+            (0x2000, true),
+            (0x6000, true),
+            (0x0001, true),
+            (0x00b9, true),
+            (0x1fff, true),
+            (0x3fff, true),
+            (0x4001, true),
+            (0xffff, true),
+        ] {
+            assert_eq!(
+                downlink_ipv4_is_fragment(flags),
+                expected,
+                "flags {flags:#06x}"
+            );
+        }
+        // Every one of the 2^14 - 1 non-zero MF/offset combinations is a
+        // fragment under either value of DF and the reserved flag.
+        for fragment in 1..=0x3fff_u16 {
+            for high in [0x0000, 0x4000, 0x8000, 0xc000] {
+                assert!(downlink_ipv4_is_fragment(high | fragment));
+            }
+        }
+    }
+
+    #[test]
+    fn downlink_hand_off_steers_every_fragment_of_a_session_with_an_inner_mtu() {
+        const TOO_BIG: Option<u16> = Some(GTPU_PACKET_TOO_BIG_QUEUE_PORT);
+        const FRAGMENT: Option<u16> = Some(GTPU_INNER_FRAGMENT_QUEUE_PORT);
+        assert_eq!(GTPU_PACKET_TOO_BIG_QUEUE_PORT, 2153);
+        assert_eq!(GTPU_INNER_FRAGMENT_QUEUE_PORT, 2154);
+        // (mtu, total length, flags/fragment offset, hand-off queue)
+        for (mtu, total, flags, expected) in [
+            // Not a fragment: only an over-MTU Don't Fragment packet leaves.
+            (1_300, 1_300, 0x0000, None),
+            (1_300, 1_300, 0x4000, None),
+            (1_300, 1_400, 0x0000, None),
+            (1_300, 1_400, 0x8000, None),
+            (1_300, 1_301, 0x4000, TOO_BIG),
+            (1_300, u16::MAX, 0x4000, TOO_BIG),
+            // A first fragment (More Fragments, offset zero).
+            (1_300, 576, 0x2000, FRAGMENT),
+            (1_300, 1_300, 0x2000, FRAGMENT),
+            // A middle and a last fragment.
+            (1_300, 1_300, 0x20b9, FRAGMENT),
+            (1_300, 28, 0x00b9, FRAGMENT),
+            (1_300, 1_300, 0x1fff, FRAGMENT),
+            // A fragment larger than the MTU without Don't Fragment is still
+            // handed off: it must not take a different path from its siblings.
+            (1_300, 1_500, 0x2000, FRAGMENT),
+            (1_300, 1_500, 0x00b9, FRAGMENT),
+            // A fragment with Don't Fragment: within the MTU it is a
+            // fragment like any other; over the MTU it stays an over-MTU
+            // Don't Fragment packet for the oversize policy.
+            (1_300, 1_300, 0x6000, FRAGMENT),
+            (1_300, 1_300, 0x40b9, FRAGMENT),
+            (1_300, 1_301, 0x6000, TOO_BIG),
+            (1_300, 1_400, 0x40b9, TOO_BIG),
+            // Without a downlink inner MTU nothing is ever handed off.
+            (0, 1_500, 0x2000, None),
+            (0, 1_500, 0x00b9, None),
+            (0, 1_500, 0x6000, None),
+            (0, u16::MAX, 0x4000, None),
+        ] {
+            assert_eq!(
+                downlink_ipv4_hand_off_port(mtu, total, flags),
+                expected,
+                "mtu {mtu} total {total} flags {flags:#06x}"
+            );
+        }
+        // The over-MTU decision is exactly the existing predicate, for every
+        // flag combination at both sides of the MTU boundary.
+        for flags in [
+            0x0000, 0x2000, 0x4000, 0x6000, 0x8000, 0x00b9, 0x40b9, 0x60b9,
+        ] {
+            for total in [1_299, 1_300, 1_301] {
+                assert_eq!(
+                    downlink_ipv4_hand_off_port(1_300, total, flags) == TOO_BIG,
+                    downlink_ipv4_exceeds_inner_mtu(1_300, total, flags),
+                    "total {total} flags {flags:#06x}"
+                );
+            }
         }
     }
 
