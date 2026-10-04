@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::consensus::recovery_types::{Action, Prepared, Ready, Reply, Request, Round, Selection};
+use crate::consensus::store::initialization_evidence::{observe, DeadlineStage, ProbeControl};
 
 fn coordinator(fleet: &Fleet) -> SessionConsensusNodeId {
     fleet.peers.iter().map(|peer| peer.node).min().unwrap()
@@ -159,6 +160,30 @@ async fn committed(fleet: &Fleet, selection: &Selection) -> LogId<SessionConsens
 }
 
 pub(super) async fn recover(fleet: &Fleet) {
+    recover_with_control(fleet, &RecoveryInitializationControl::default()).await;
+}
+
+#[derive(Default)]
+struct RecoveryInitializationControl {
+    admitted_survivors: BTreeSet<SessionConsensusNodeId>,
+    survivor_initializations: AtomicU64,
+}
+
+impl RecoveryInitializationControl {
+    async fn initialize(
+        &self,
+        store: &ConsensusSessionStore,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
+        if self.admitted_survivors.contains(&store.inner.local_node_id) {
+            self.survivor_initializations.fetch_add(1, Ordering::AcqRel);
+            observe(store, ProbeControl::UntilDeadline).await.result
+        } else {
+            store.initialize_cluster().await
+        }
+    }
+}
+
+async fn recover_with_control(fleet: &Fleet, control: &RecoveryInitializationControl) {
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let _ = join_all(
@@ -166,7 +191,11 @@ pub(super) async fn recover(fleet: &Fleet) {
                     .stores
                     .iter()
                     .flatten()
-                    .map(ConsensusSessionStore::initialize_cluster),
+                    // Reinitializing a healthy survivor revokes its application
+                    // admission, including its authority to certify a cold peer.
+                    // Activated but not yet admitted members still need retries.
+                    .filter(|store| !store.exact_membership_is_admitted())
+                    .map(|store| control.initialize(store)),
             )
             .await;
             let reports = join_all(
@@ -187,6 +216,10 @@ pub(super) async fn recover(fleet: &Fleet) {
     })
     .await;
     if result.is_err() {
+        eprintln!(
+            "recovery_fixture_survivor_initializations={}",
+            control.survivor_initializations.load(Ordering::Acquire)
+        );
         for store in fleet.stores.iter().flatten() {
             eprintln!(
                 "recovery_fixture_progress stage={:?} active={}",
@@ -196,6 +229,189 @@ pub(super) async fn recover(fleet: &Fleet) {
         }
     }
     result.expect("complete recovery and usable application authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_rejoin_preserves_admitted_survivor_authority() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::with_protected_recovery(5);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        cold(&mut fleet).await;
+        recover(&fleet).await;
+        let leader = fleet.leader();
+        // The first V2 transition and the independent V1 observation marker
+        // require unanimous capability negotiation. Establish both through
+        // public calls before testing ordinary traffic with a voter offline.
+        let first = create_request(fleet.store(leader), 156, &provider()).await;
+        // Full cold recovery retires the prior history epoch. Read the public
+        // successor epoch before submitting a new transition into that history.
+        let epoch = fleet
+            .store(leader)
+            .fenced_transition_v2_history_state()
+            .await
+            .unwrap()
+            .active_epoch()
+            .unwrap();
+        let first = FencedTransitionV2Request::new(
+            epoch,
+            FencedTransitionV2CallerNonce::from_bytes(156u128.to_be_bytes()),
+            first.lease().clone(),
+            first.mutation().clone(),
+        )
+        .unwrap();
+        let first_outcome = create(fleet.store(leader), &first).await;
+        fleet
+            .store(leader)
+            .activate_fenced_transition_capability()
+            .await
+            .unwrap();
+        for store in fleet.stores.iter().flatten() {
+            assert_recorded(store, &first, &first_outcome).await;
+            assert!(store
+                .activated_fenced_transition_scope_is_current()
+                .await
+                .unwrap());
+            store.drain_async_persistence().await.unwrap();
+        }
+        let unavailable = (leader + 1) % 5;
+        let returning = (leader + 2) % 5;
+        fleet.close(unavailable).await;
+        fleet.close(returning).await;
+        let survivors: Vec<_> = (0..5)
+            .filter(|index| *index != unavailable && *index != returning)
+            .collect();
+        let control = RecoveryInitializationControl {
+            admitted_survivors: survivors
+                .iter()
+                .map(|index| {
+                    let store = fleet.store(*index);
+                    assert!(store.exact_membership_is_admitted());
+                    store.inner.local_node_id
+                })
+                .collect(),
+            ..RecoveryInitializationControl::default()
+        };
+        fleet
+            .open(returning, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        // Clear only transport observations, before any attempt by this cold
+        // incarnation. An earlier rejoin's certificate cannot satisfy this test.
+        for peer in &fleet.peers {
+            *peer.last_cut.lock().unwrap() = None;
+        }
+        let cold_store = fleet.store(returning);
+        assert!(!cold_store.inner.persistence_protocol.is_active());
+
+        // Reproduce one original unfiltered batch. Poll the active survivors
+        // first so their real initializers revoke admission and enter the hold.
+        // Each hold expires at the original public 800-ms operation deadline.
+        let (warm_attempts, cold_attempt) = tokio::join!(
+            biased;
+            join_all(survivors.iter().map(|index| {
+                observe(fleet.store(*index), ProbeControl::UntilDeadline)
+            })),
+            async {
+                assert_eq!(fleet.leader(), leader);
+                assert!(survivors.iter().all(|index| {
+                    let store = fleet.store(*index);
+                    store.inner.persistence_protocol.is_active()
+                        && !store.inner.admitted.load(Ordering::Acquire)
+                }));
+                observe(cold_store, ProbeControl::Run).await
+            }
+        );
+        for attempt in warm_attempts {
+            assert!(!attempt.cold_on_entry);
+            assert_eq!(
+                attempt.expired_stage(),
+                Some(DeadlineStage::InitializedProbe)
+            );
+            assert!(attempt.probe_was_active_and_unadmitted());
+            assert!(matches!(
+                attempt.result,
+                Err(ConsensusSessionStoreOpenError::ClusterFormationRejected)
+            ));
+        }
+        assert_eq!(fleet.leader(), leader);
+        assert!(cold_attempt.cold_on_entry);
+        assert!(matches!(
+            cold_attempt.result,
+            Err(ConsensusSessionStoreOpenError::RecoveryRequired)
+        ));
+        assert!(!cold_store.inner.persistence_protocol.is_active());
+        assert!(cold_store
+            .inner
+            .persistence_protocol
+            .resume_cut_before(tokio::time::Instant::now() + OPERATION_BOUND)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fleet
+            .peers
+            .iter()
+            .all(|peer| peer.last_cut.lock().unwrap().is_none()));
+
+        // Restore survivors through real initialization. Keep the same frozen
+        // control set: any unnecessary reinitialization will revoke them again.
+        for result in join_all(
+            survivors
+                .iter()
+                .map(|index| fleet.store(*index).initialize_cluster()),
+        )
+        .await
+        {
+            result.unwrap();
+        }
+        recover_with_control(&fleet, &control).await;
+        assert_eq!(control.survivor_initializations.load(Ordering::Acquire), 0);
+        let applied = cold_store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .unwrap();
+        // The certifying leader may have changed. Require a fresh certificate
+        // for this incarnation whose boundary the returning member applied.
+        assert!(fleet.peers.iter().any(|peer| {
+            let cut = *peer.last_cut.lock().unwrap();
+            cut.is_some_and(|cut| {
+                cut.requester == cold_store.inner.local_node_id
+                    && cut.request.incarnation == cold_store.inner.persistence_protocol.boot()
+                    && cut.request.is_valid()
+                    && applied.index >= cut.barrier.index
+                    && applied.leader_id >= cut.barrier.leader_id
+                    && (applied.index != cut.barrier.index || applied == cut.barrier)
+            })
+        }));
+        assert!(cold_store.exact_membership_is_admitted());
+        assert_eq!(
+            cold_store
+                .fenced_transition_v2_history_state()
+                .await
+                .unwrap()
+                .active_epoch(),
+            Some(epoch)
+        );
+        let request = create_request(cold_store, 157, &provider()).await;
+        let request = FencedTransitionV2Request::new(
+            epoch,
+            FencedTransitionV2CallerNonce::from_bytes(157u128.to_be_bytes()),
+            request.lease().clone(),
+            request.mutation().clone(),
+        )
+        .unwrap();
+        let outcome = create(cold_store, &request).await;
+        for store in fleet.stores.iter().flatten() {
+            assert_recorded(store, &request, &outcome).await;
+        }
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 struct DiskHold {

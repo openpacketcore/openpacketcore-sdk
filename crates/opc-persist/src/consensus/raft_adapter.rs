@@ -1,5 +1,6 @@
 //! Private Openraft adapter over the shared authenticated consensus transport.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -164,14 +165,16 @@ impl ConfigRaftNetwork {
     }
 
     // OpenRaft's append RPC must retain its prescribed transport error type.
+    // Production passes the DTO by value; 'static rejects borrowing that local
+    // DTO. Borrow also permits an Arc of the real DTO for the ownership test.
     #[allow(clippy::result_large_err)]
     async fn append(
         &self,
-        request: &AppendEntriesRequest<ConfigRaftTypeConfig>,
+        request: impl Borrow<AppendEntriesRequest<ConfigRaftTypeConfig>> + 'static,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
-        let entry_count = request.entries.len();
-        let payload = match encode_config_wire(request) {
+        let entry_count = request.borrow().entries.len();
+        let payload = match encode_config_wire(request.borrow()) {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
                 if let Some(entries_hint) = append_entries_split_hint(entry_count) {
@@ -189,6 +192,9 @@ impl ConfigRaftNetwork {
                 )))
             }
         };
+        // The wire bytes now own everything needed by the peer. Retire the
+        // typed entries and their nested payloads before waiting for peer IO.
+        drop(request);
         self.call(
             ConsensusRpcFamily::AppendEntries,
             opc_consensus::engine::RPCTypes::AppendEntries,
@@ -209,7 +215,7 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         request: AppendEntriesRequest<ConfigRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
-        self.append(&request, option).await
+        self.append(request, option).await
     }
 
     async fn install_snapshot(
@@ -434,14 +440,4 @@ struct PeerIdentityChanged;
 struct CodecTransportError(#[source] ConsensusCodecError);
 
 #[cfg(test)]
-mod tests {
-    use super::append_entries_split_hint;
-
-    #[test]
-    fn append_entries_split_hint_never_retries_a_singleton_as_payload_too_large() {
-        assert_eq!(append_entries_split_hint(0), None);
-        assert_eq!(append_entries_split_hint(1), None);
-        assert_eq!(append_entries_split_hint(2), Some(1));
-        assert_eq!(append_entries_split_hint(64), Some(32));
-    }
-}
+mod tests;

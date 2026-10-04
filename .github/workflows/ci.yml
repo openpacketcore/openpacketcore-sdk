@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -130,6 +130,11 @@ jobs:
           python3 ci/test-sdk702-release-attest.py
           bash -n ci/setup-fsverity-tmp.sh
 
+      - name: Test nohz guest reboot handoff
+        run: |
+          python3 ci/test-qualify-tft-nohz-vm.py
+          bash -n ci/qualify-tft-nohz-vm.sh
+
       - name: Test live voter memory evidence validators
         run: python3 scripts/test-observe-session-store-live-memory.py
 
@@ -188,7 +193,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -220,7 +225,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -290,7 +295,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -332,7 +337,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -404,7 +409,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy
 
@@ -436,7 +441,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy
 
@@ -481,7 +486,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
@@ -659,7 +664,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -760,7 +765,7 @@ jobs:
           sudo apt-get install --yes --no-install-recommends gcc-multilib
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           targets: i686-unknown-linux-gnu
 
@@ -883,7 +888,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
@@ -907,7 +912,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: rustfmt
 
@@ -935,7 +940,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 
@@ -981,7 +986,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
 

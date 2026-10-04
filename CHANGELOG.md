@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: TFT classification can use a qualified private
+  map-in-map RCU grace when GLOBAL membarrier is unavailable, including
+  `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
+  remain refused. Exact removal still waits after publishing its tombstone;
+  inactive-bank reuse now waits before any retained row is mutated. Failed
+  waits preserve rows for retry. An additive value-free unavailable-reason
+  API explains the capability gate. `opc-linux-gtpu-sys` owns the private
+  maps; no datapath map ABI or program changes are required. Fixes #1057.
+
+- `opc-session-net`: a prepared compare-and-set or lease acquire whose
+  current voter answers with a complete `Rejected(Unavailable)` now moves the
+  identical request to the next voter, as after a pre-write failure, and ends
+  `NotTransmitted` when every voter rejects or is unreachable. That rejection
+  is closed and precedes the consensus state machine; before, the request
+  failed although the rest of the quorum could serve it. Completed-operation
+  accounting now records the reply as not transmitted instead of as an other
+  failure, so it no longer raises `completed_operation_unsafe_failures`. A V1
+  fenced transition reports it as `NotTransmitted` instead of a rejected
+  `BackendUnavailable`; the activated affine handle still never sends a
+  written mutation to a second voter. Scope, topology, authorization and
+  validation rejections are unchanged. Fixes #1036.
+
+- `opc-gtpu-dataplane`: exact TFT classifier removal no longer drops
+  default-bearer uplink. Removal first converts the classifier into its
+  durable removal fence, and the tc program used to drop every unmarked IPv4
+  packet from the PAA while that fence existed, default-bearer traffic
+  included (TS 24.302 section 7.4.6.4.3). A fence whose classifier has a
+  default bearer now classifies as absent, the state removal publishes last:
+  unmarked packets take mark zero without any filter row being read. A fence
+  without a default bearer still drops. Before deleting any row, each removal
+  attempt also waits for tc invocations that copied the active selector before
+  the fence, using a qualified kernel reader grace. Where no such grace is
+  available, TFT classification reports Missing, and install, replacement
+  and removal refuse before any mutation. The datapath object is
+  rebuilt; the map ABI is unchanged. Fixes #1030.
+
+- Shared Openraft dependency: consume the exact 0.9.25 fork revision
+  `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,
+  joined replication retirement, stale-campaign cleanup and cancellable
+  no-progress retry pacing. Preserve native WAL and Durable/Async semantics.
+  Refs #957.
+
+- `opc-gtpu-dataplane`: cleanup-only activation is now all or nothing. It
+  re-proves the attached graph (interface, tc placement, exact identity,
+  executable PMTU policy) and the quiescent traffic source while the gate is
+  still even, and enabling the gate is the commit. Before, it enabled the gate
+  and committed the device as active before that re-proof, so a failed
+  re-proof left a forwarding datapath that the backend still recorded as
+  cleanup-only: every retry was refused as already active and the device could
+  not be removed. Any failure now leaves the runtime and the backend agreeing
+  that the device is cleanup-only, with its hooks detached and the gate even,
+  so a retry can activate it. The host traffic sequence window is dropped only
+  after the runtime reports success. Fixes #1010.
+- `opc-gtpu-dataplane`: `activate_cleanup_recovery` now re-enables the
+  retained traffic gate that cleanup-only acquisition leaves packet-inert. It
+  starts a fresh source incarnation while the hooks are fenced, attaches them,
+  proves quiescence and enables the gate as ordinary adoption does, and on
+  failure restores the even gate and detaches, leaving the device cleanup-only
+  and retryable. Before this, the reattached programs passed every packet
+  unchanged until a later adoption. Refs #997.
+- `opc-gtpu-dataplane`: an IPv6 `remove_pdp_context` on an ordinary eBPF
+  attachment no longer falls through to the IPv4 removal by local TEID, which
+  removed the IPv4 context sharing that TEID. Removal is now family-scoped.
 - `opc-route-steering`: `RuleRequest` gains an explicit `family` so mark-only
   policy rules can be created, read back, converged and removed as `AF_INET6`
   rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
@@ -59,6 +122,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested route or scope. IPv6 routes require 1280 bytes. Breaking:
   struct-literal constructors must add
   `locked_mtu: None`, and `RouteMismatch` literals `mtu`. Refs #991.
+
+- `opc-persist`: add an online audit recipient client and authority-owned
+  verification session without exporting signing keys. Verify actual received
+  pages, frozen-range completeness and fresh independent checkpoints; bind
+  results to the original caller, authority, request and expiry. Verification
+  retains no acknowledgement authority at the recipient. The application owns
+  authenticated transport and authorization. Refs #959.
+
+- `opc-gtpu-dataplane` / `opc-gtpu-ebpf-common`: inner fragmentation is the
+  default policy for an over-MTU downlink IPv4 packet with Don't Fragment set.
+  Refs #1002.
+  - **Policy.** `GtpuDownlinkInnerMtu::new(mtu)` selects the default: the
+    backend-owned consumer clears DF and fragments the inner packet before
+    encapsulation (RFC 4459 section 3.4), an owner-approved deviation from the
+    DF rules of RFC 791, RFC 1191 and RFC 6864.
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` stays the explicit
+    opt-in; `GtpuDownlinkOversizePolicy` names both.
+  - **Wire.** The commit record's MTU field keeps the MTU in its low 15 bits
+    (576 to 32,767); bit 15 marks the in-tunnel Packet Too Big opt-in. tc reads
+    only the MTU and steers identically. Records without an MTU are unchanged.
+  - **Consumer.** `GtpuDownlinkEvent::Fragmented` returns RFC 791 fragments
+    of at most the MTU with the bearer mark, for the caller to inject toward
+    XFRM. The header is validated first (RFC 1812 section 5.2.2); IPv4
+    options are refused (`InnerUnfragmentable`). A fragment keeps its own
+    Identification; an atomic datagram gets a fresh non-zero value from a
+    per-destination sequence (RFC 6864 sections 4.1 and 4.3).
+  - **Budget.** Per-destination token buckets (`GtpuInnerFragmentRateLimit`,
+    burst 64, one token per 4 ms, set by `set_inner_fragment_rate_limit`)
+    admit at most burst + ⌈255 s / interval⌉ packets in 255 seconds (63,814
+    by default); `new` refuses any limit above 65,535. While a destination
+    stays tracked under one limit, this bounds its work and keeps its
+    sequence from repeating within 255 seconds. Past 4,096 concurrently
+    tracked destinations, LRU eviction makes uniqueness probabilistic and
+    removes the per-destination bound. A new attachment registration
+    (restart, re-adoption, re-created attachment) restarts every sequence
+    from a new random value (#1018). Excess packets are
+    `InnerFragmentRateLimited` drops. Value-free counters record fragmented
+    packets, fragments and refusals.
+  - **Costs.** Over-MTU DF traffic is capped at 250 packets per second per
+    destination by default, beyond which it is dropped silently with no
+    Packet Too Big. Slow-path packets can be reordered behind later
+    fast-path packets. Fresh Identifications share the (source,
+    destination, protocol) space with the originator's own non-atomic
+    datagrams. They therefore cannot comply "as if the datagram were
+    sourced by that device" as RFC 6864 section 5.3.1 requires. That
+    deviation is inherent to clearing DF and fragmenting, and is part of the
+    owner-approved default policy decided on #1002. The consumer does not
+    decrement TTL (RFC 1812 section 5.3.1).
+  - **Integration.** Open the control port before installing any
+    MTU-bearing context and keep draining it. Until it is first opened,
+    while the process is down, and after a retirement, nothing is bound.
+    Adopting a retained graph reopens tc's gate before the port can be
+    opened, so this window cannot be avoided after a restart. The kernel
+    may then answer steered packets with rate-limited ICMP Port Unreachable
+    toward the peer, quoting up to about 512 octets of the inner packet
+    (#1019).
+  - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
+    1,400-octet access link reaches the UE as two exact fragments, on the
+    default bearer, after outer reassembly and on a dedicated bearer through
+    its ESP Child SA, with no host ICMP.
+
+- `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf`: opt-in downlink tunnel-MTU
+  enforcement with an in-tunnel RFC 1191 error. Refs #1002.
+  - **Opt-in.** `GtpPdpContext::downlink_inner_mtu` is a new field and is
+    source-breaking; `None` keeps today's behaviour. It is set with
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)`, where the MTU is
+    at least 576. `GtpuProbe::downlink_inner_mtu_enforcement` is a new public
+    field of `GtpuProbe`, which is not `#[non_exhaustive]`, so struct
+    literals of `GtpuProbe` are source-breaking too.
+  - **Storage and downgrade.** The MTU is stored in the formerly reserved
+    bytes of the Active commit record; records without it are byte-identical.
+    An older SDK's recovery refuses an attachment holding any MTU record, so
+    drain those contexts before downgrading.
+  - **tc steering.** tc does not decapsulate an authorized over-MTU DF IPv4
+    packet. It rewrites the packet's UDP destination port to a dedicated
+    backend-owned queue (2153), so hand-offs never fill the UDP/2152 queue
+    used by Echo.
+  - **Consumer.** `try_receive_downlink` serves UDP/2152 first. It returns
+    `GtpuDownlinkEvent::PacketTooBig` and sends at most one Fragmentation
+    Needed on the UE's default-bearer uplink, from the PAA to the originator,
+    quoting the header plus 64 bits.
+  - **Never answered** (RFC 1122 3.2.2), checked before any rate-limit
+    token: 0/8, 127/8, 224/4 and 240/4 originators, non-initial fragments
+    and ICMP errors. An invoking packet with a bad header checksum, or one
+    shorter than its total length, is silently discarded (RFC 1812 section
+    5.2.2).
+  - **Rate limit and counters.** Per-session token buckets (RFC 1812 section
+    4.3.2.8; `set_packet_too_big_rate_limit`), per session while it stays
+    tracked (#1018), with value-free counters, including `SO_RXQ_OVFL`
+    queue-drop counts.
+  - **Not provided.** tc has no hand-off counter or policer, because either
+    would change the map ABI.
+  - **Evidence.** The baseline test (the RED on `main`) shows the host
+    emitting a plaintext Fragmentation Needed toward the core, quoting 548
+    octets. The opt-in test shows exactly one well-formed in-tunnel error
+    and no host ICMP. It also covers per-session limiting and Echo served
+    ahead of a hand-off backlog.
+  - **IPv6.** An opted-in ordinary inner-IPv6 context is refused
+    (`downlink_inner_mtu_inner_ipv6`). Inner IPv6 Packet Too Big is a
+    follow-up, because it needs an MTU in the family-tagged entry wire.
+
+- `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
+  consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
+  the eBPF attachment's backend-owned UDP/2152 queue and, under the same
+  serialization as attachment mutation, authorizes a reassembled or handed-off
+  G-PDU with the tc fast path's own decisions: grouped index first (Active
+  generation, device, slot, endpoints, source-port policy, inner PAA, N3 PSC),
+  otherwise the v5 PDR, endpoint binding, owner journal, FAR and DSCP with the
+  Active commit read last. It returns `GtpuDownlinkEvent::Decapsulated` with
+  the exact inner packet and bearer mark, the untouched datagram for controls
+  or unknown tunnels, or a value-free `GtpuDownlinkDrop`; a closed traffic
+  gate, cleanup-only, successor-pending or unreadable state fails closed.
+  `downlink_counters` exposes bounded per-registration counters. Grouped
+  attachments with an IPv4 outer endpoint now report
+  `KernelReassemblyHandoff` for outer IPv4 fragments. Native tests cover
+  in-order, reordered, duplicated, missing, foreign-TEID, stale-generation,
+  owner-only, mixed-binding and gate-closed fragment sets. On an ordinary
+  attachment, inner-IPv6 contexts (#998) decapsulate through the attachment's
+  published family authority. Refs #1001.
+
+- `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
+  IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
+  requires the destination inside the `/64`, and transport stays IPv4. An
+  IPv4v6 PDN is two family-scoped contexts sharing one bearer TEID. Readback,
+  exact removal, restart adoption and cleanup-only recovery are family-aware;
+  `pdp_inner_ipv6_capability()` reports support. The family-tagged authority
+  is retired with the last inner-IPv6 context, so drained attachments stay
+  eligible for legacy terminal-successor recovery. An IPv6 context on a grouped
+  attachment reports `ordinary_inner_ipv6_pdp_on_grouped_attachment`. Refs
+  #986.
+
 - `opc-gtpu-dataplane`: `TftUplinkClassifier` owns a typed `TftUplinkPaaSet`
   holding at most one IPv4 `/32` and one canonical IPv6 `/64` (TS 23.401
   5.3.1.2.2, TS 23.402 4.7). IPv6 uplink from any address in the prefix,

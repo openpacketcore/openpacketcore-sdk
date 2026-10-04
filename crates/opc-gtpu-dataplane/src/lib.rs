@@ -60,6 +60,7 @@ pub mod control_port;
 pub mod ebpf;
 pub mod error;
 pub mod icmp;
+mod inner_fragment;
 pub mod linux;
 pub mod mock;
 pub mod model;
@@ -113,11 +114,12 @@ pub use model::{
     DrainedV2TeardownProgress, DrainedV2TeardownRefusal, DrainedV2TeardownRequest,
     EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration, GtpAddressFamily, GtpBearerMark,
     GtpDevice, GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuIpFamilyCapabilities,
-    GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
-    GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup,
-    GtpuSessionGroupConflict, GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason,
-    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuDownlinkInnerMtu,
+    GtpuDownlinkOversizePolicy, GtpuIpFamilyCapabilities, GtpuLocalEndpointSet,
+    GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds, GtpuSessionAttachmentSelector,
+    GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup, GtpuSessionGroupConflict,
+    GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionModelError,
     GtpuSessionPaa, GtpuSessionSelectorProvenance, GtpuSessionSelectorReuseEvidence,
     GtpuSessionSelectorReuseProof, GtpuSourcePortPolicy, GtpuSourcePortRange,
@@ -174,9 +176,11 @@ pub use reassembly::{
     GtpuKernelReassemblyStatsError, GtpuReassemblySocket,
 };
 pub use reassembly::{
-    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
-    GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
-    GtpuReassemblyPdr, GtpuReassemblySelector,
+    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuDecapsulatedDownlink,
+    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkPacketTooBig,
+    GtpuFragmentedDownlink, GtpuInnerFragmentRateLimit, GtpuPacketTooBigRateLimit,
+    GtpuPacketTooBigSignal, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
+    GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
 };
 pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
 pub use selector_namespace::{
@@ -208,9 +212,10 @@ pub use selector_namespace_v2::{
     GtpuSessionSelectorRetiredDrainRequest,
 };
 pub use tft_classifier::{
-    TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
-    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,
-    TftUplinkPaaSet, TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
+    TftUplinkBearer, TftUplinkClassification, TftUplinkClassificationUnavailableReason,
+    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome, TftUplinkDropReason, TftUplinkPaaSet,
+    TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
 };
 pub use traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
@@ -245,6 +250,7 @@ mod integration_tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 

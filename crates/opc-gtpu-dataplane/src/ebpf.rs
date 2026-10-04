@@ -22,11 +22,14 @@
 //! PDP-context installs/removals are pure BPF map upserts/deletes and are
 //! idempotent.
 //!
-//! The legacy single-context API remains IPv4-only. The additive grouped API
-//! supports independent inner and outer IPv4/IPv6 families, including both
-//! inner families active in one logical group. Callers must inspect the exact
-//! attachment's typed family capabilities; outer-IPv6 uplink encapsulation is
-//! deliberately advertised only for fully materialized, non-GSO packets.
+//! The single-context API keeps IPv4 contexts in the frozen v5 maps. An inner
+//! IPv6 context on an ordinary attachment is carried by the family-tagged
+//! authority over the attachment's IPv4 transport (see `ordinary_ipv6`). The
+//! additive grouped API supports independent inner and outer IPv4/IPv6
+//! families, including both inner families active in one logical group.
+//! Callers must inspect the exact attachment's typed family capabilities;
+//! outer-IPv6 uplink encapsulation is deliberately advertised only for fully
+//! materialized, non-GSO packets.
 
 use std::cell::RefCell;
 
@@ -35,6 +38,9 @@ mod control_port;
 pub(crate) mod grouped_simulation;
 #[cfg(target_os = "linux")]
 mod n3_end_marker;
+mod ordinary_ipv6;
+#[cfg(target_os = "linux")]
+mod reassembled_downlink;
 mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -1335,6 +1341,55 @@ impl fmt::Debug for EbpfSessionIndexInventory {
     }
 }
 
+/// Family-tagged device authority owned by an ordinary attachment.
+///
+/// An ordinary attachment keeps its IPv4 S2b-U endpoint in `GTPU_CONFIG`.
+/// Inner-IPv6 PDP contexts are carried by the family-tagged tc authority,
+/// which additionally requires `GTPU_CONFIG6` and the `GTPU_SCHEMA6` marker.
+/// The configuration is written before the marker, so `ConfigOnly` is the one
+/// legal interrupted initialization; every other shape is indeterminate.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrdinaryFamilyAuthority {
+    Uninitialized,
+    ConfigOnly([u8; GTPU_SESSION_CONFIG_VALUE_LEN]),
+    Initialized([u8; GTPU_SESSION_CONFIG_VALUE_LEN]),
+}
+
+impl fmt::Debug for OrdinaryFamilyAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Uninitialized => "OrdinaryFamilyAuthority::Uninitialized",
+            Self::ConfigOnly(_) => "OrdinaryFamilyAuthority::ConfigOnly(<redacted>)",
+            Self::Initialized(_) => "OrdinaryFamilyAuthority::Initialized(<redacted>)",
+        })
+    }
+}
+
+/// Classify the raw `GTPU_CONFIG6`/`GTPU_SCHEMA6` values of one attachment.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn classify_ordinary_family_authority(
+    config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    schema: [u8; opc_gtpu_ebpf_common::GTPU_SESSION_SCHEMA_MARKER_LEN],
+) -> Result<OrdinaryFamilyAuthority, GtpuError> {
+    let canonical =
+        GtpuSessionDeviceConfig::decode(&config).is_some_and(|decoded| decoded.encode() == config);
+    let config_zero = config == [0; GTPU_SESSION_CONFIG_VALUE_LEN];
+    let schema_zero = schema == [0; opc_gtpu_ebpf_common::GTPU_SESSION_SCHEMA_MARKER_LEN];
+    match (config_zero, schema_zero) {
+        (true, true) => Ok(OrdinaryFamilyAuthority::Uninitialized),
+        (false, true) if canonical => Ok(OrdinaryFamilyAuthority::ConfigOnly(config)),
+        (false, false)
+            if canonical && schema == opc_gtpu_ebpf_common::GTPU_SESSION_SCHEMA_MARKER_VALUE =>
+        {
+            Ok(OrdinaryFamilyAuthority::Initialized(config))
+        }
+        _ => Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_ordinary_family_authority",
+        }),
+    }
+}
+
 /// Narrow synchronous port to the kernel eBPF machinery.
 ///
 /// The production implementation loads the committed CO-RE object with `aya`,
@@ -1372,6 +1427,25 @@ fn state_indeterminate(operation: &'static str) -> GtpuError {
     GtpuError::StateIndeterminate { operation }
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TftReaderGraceMethod {
+    Global,
+    MapInMap,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn select_tft_reader_grace(
+    global_available: bool,
+    map_available: impl FnOnce() -> bool,
+) -> Option<TftReaderGraceMethod> {
+    if global_available {
+        Some(TftReaderGraceMethod::Global)
+    } else {
+        map_available().then_some(TftReaderGraceMethod::MapInMap)
+    }
+}
+
 pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Complete the qualified kernel grace boundary for the non-sleepable
     /// grouped XDP/TC readers. No map, hook or packet-source mutation is allowed.
@@ -1379,6 +1453,19 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         Err(GtpuError::UnsupportedFeature {
             feature: "grouped_selector_quiescence",
         })
+    }
+    /// Complete the qualified kernel grace boundary for the non-sleepable TC
+    /// readers of the TFT classifier. No datapath map, hook or packet-source
+    /// mutation is allowed; an implementation may update private grace maps.
+    fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_classifier_reader_grace",
+        })
+    }
+    /// Return whether [`Self::synchronize_tft_readers`] is available on this
+    /// kernel. Exact TFT classifier removal requires it.
+    fn tft_reader_grace_available(&self) -> bool {
+        false
     }
     /// Reconcile one exclusively owned workload graph to absence.
     fn reset_workload_graph(
@@ -1467,6 +1554,19 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Activate a cleanup-only managed device: attach the forwarding programs
     /// and links, transitioning it to a normal active attachment.
+    ///
+    /// Activation is all or nothing. Every fallible proof of the attached
+    /// graph and of the fresh traffic source runs while the traffic gate is
+    /// still even (packet-inert), and enabling the gate is the commit.
+    ///
+    /// An error never changes whether the device is cleanup-only.
+    /// [`GtpuError::NotFound`] and [`GtpuError::AlreadyExists`] are returned
+    /// before any effect, the latter when the device is already active or
+    /// another operation holds its graph's operation lock. Once activation of
+    /// a cleanup-only device has begun, any error leaves the gate even and no
+    /// hook attached by this call, or is [`GtpuError::StateIndeterminate`]
+    /// when that rollback cannot be proven. The device is still cleanup-only
+    /// either way, so a retry fences the gate again before it reattaches.
     #[cfg(any(target_os = "linux", test))]
     fn activate_cleanup_only(
         &self,
@@ -2228,6 +2328,51 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         key: [u8; GTPU_SESSION_GROUP_ID_LEN],
     ) -> Result<EbpfSessionIndexInventory, GtpuError>;
 
+    /// Read the family-tagged device authority of an ordinary attachment.
+    fn ordinary_family_authority(
+        &self,
+        _ifindex: u32,
+    ) -> Result<OrdinaryFamilyAuthority, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "ebpf_ordinary_inner_ipv6",
+        })
+    }
+
+    /// Initialize an ordinary attachment's family-tagged device authority, or
+    /// complete an interrupted initialization of exactly `config`.
+    ///
+    /// The configuration is written and read back before the schema marker.
+    /// Any other retained configuration is indeterminate and is never
+    /// replaced.
+    fn initialize_ordinary_family_authority(
+        &self,
+        _ifindex: u32,
+        _config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "ebpf_ordinary_inner_ipv6",
+        })
+    }
+
+    /// Retire an ordinary attachment's family-tagged device authority once no
+    /// inner-IPv6 state remains, so the drained graph is identical to one
+    /// that never carried inner IPv6.
+    ///
+    /// Only exactly `config` (complete or config-only) is retired. It returns
+    /// `false`, changing nothing, while any record, selector, or transaction
+    /// journal remains. The schema marker is cleared and read back before the
+    /// configuration, so an interrupted retirement leaves a config-only
+    /// authority that a later retirement or install completes.
+    fn retire_ordinary_family_authority(
+        &self,
+        _ifindex: u32,
+        _config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    ) -> Result<bool, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "ebpf_ordinary_inner_ipv6",
+        })
+    }
+
     /// Prove the exact grouped schema, config, held pins, live hooks, program
     /// references, and namespace lease for this attachment. Implementations
     /// repeat exact named-map identity around schema/config/live-hook
@@ -2392,6 +2537,15 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// managed attachment identity are all simultaneously authoritative.
     fn tft_datapath_usable(&self, ifindex: u32) -> bool;
 
+    /// Explain a failed per-device TFT authority check without exposing values.
+    fn tft_datapath_unavailable_reason(
+        &self,
+        ifindex: u32,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        (!self.tft_datapath_usable(ifindex))
+            .then_some(crate::TftUplinkClassificationUnavailableReason::DatapathNotCurrent)
+    }
+
     /// Probe the environment for eBPF datapath readiness.
     fn probe_environment(&self) -> EbpfEnvironment;
 
@@ -2418,6 +2572,17 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Return whether readback can trust the exact programs, every named map,
     /// and the held reconciler lease for this managed device.
     fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool;
+
+    /// Read the exact loader traffic gate the tc programs consult before any
+    /// packet effect. `Ok(false)` means tc passes packets unprocessed, so a
+    /// userspace consumer must not decapsulate on the attachment's behalf.
+    // Only the Linux-only post-reassembly consumer reads the gate.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn traffic_gate_allows_packet_effects(&self, _ifindex: u32) -> Result<bool, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_gate_readback",
+        })
+    }
 
     /// Return whether PDP cleanup can safely mutate the held maps.
     ///
@@ -2533,6 +2698,18 @@ fn grouped_device_config(
     )
 }
 
+/// Project a validated commit's optional downlink inner MTU and policy into
+/// the model. `None` means a valid record carried a value the model cannot
+/// represent.
+fn commit_downlink_inner_mtu(
+    commit: PdpContextCommit,
+) -> Option<Option<crate::GtpuDownlinkInnerMtu>> {
+    match commit.downlink_inner_mtu() {
+        None => Some(None),
+        Some(wire) => crate::GtpuDownlinkInnerMtu::from_wire(wire).map(Some),
+    }
+}
+
 fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
     let context = entry.context();
     validate_gtp_version(context.gtp_version).ok()?;
@@ -2604,6 +2781,7 @@ fn grouped_model_from_record(
                 .map(crate::DscpCodepoint::new)
                 .transpose()
                 .ok()?,
+            downlink_inner_mtu: None,
         };
         let model = GtpuSessionEntry::new(context, ip_address(entry.local_outer_address())).ok()?;
         entries.push(match entry.n3_qfi() {
@@ -3932,18 +4110,34 @@ impl EbpfGtpuDataplaneBackend {
     /// consumer has reconciled durable GTP-U state. It is refused unless the
     /// device is currently held cleanup-only by this backend.
     ///
+    /// Activation is all or nothing. The attached hooks and the fresh traffic
+    /// source are re-proven while forwarding is still fenced, and forwarding
+    /// is enabled only as the final step. If activation fails, the device is
+    /// still held cleanup-only, by this backend and its runtime alike: no hook
+    /// it attached remains and forwarding stays fenced, or the error is
+    /// [`GtpuError::StateIndeterminate`] when that rollback cannot be proven.
+    /// Either way a retry attempts the whole activation again, fencing
+    /// forwarding before it reattaches.
+    ///
     /// Unlike the acquisition handle, this is a plain blocking operation.
     /// Cancellation before worker admission is no-effect; once the worker
     /// claims execution, dropping the returned future does not stop it. The
-    /// worker completes reattachment under the operation lock, and a retry
-    /// observes the converged state (the device is active, so it is refused
-    /// with [`GtpuError::AlreadyExists`]) rather than overlapping a second
-    /// attach.
+    /// worker completes or rolls back the activation under the operation
+    /// lock, and a retry observes the converged state rather than overlapping
+    /// a second attach: a completed activation left the device active, so the
+    /// retry is refused with [`GtpuError::AlreadyExists`]; a failed one left
+    /// it cleanup-only, so the retry activates it again.
     ///
     /// # Errors
     ///
     /// Returns [`GtpuError::NotFound`] when `device` is not managed by this
-    /// backend and [`GtpuError::AlreadyExists`] when it is already active.
+    /// backend or its interface no longer resolves to the managed index.
+    /// Returns [`GtpuError::AlreadyExists`] when the device is already active,
+    /// or when another operation holds its graph's operation lock; the device
+    /// is then unchanged, and in the second case a later retry can succeed.
+    /// Returns [`GtpuError::StateIndeterminate`] when the attached graph or
+    /// the rollback cannot be proven. After any error the device is still
+    /// cleanup-only unless it was already active.
     #[cfg(any(target_os = "linux", test))]
     pub async fn activate_cleanup_recovery(
         &self,
@@ -5032,6 +5226,11 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_tft_stage",
             });
         }
+        if !old_inactive.is_empty() {
+            // A reader may still hold this bank's selector from before the
+            // previous publication. Keep both banks intact until it exits.
+            self.inner.runtime.synchronize_tft_readers()?;
+        }
         for (key, _) in &old_inactive {
             self.inner.runtime.tft_filter_remove(ifindex, *key)?;
         }
@@ -5250,6 +5449,19 @@ impl EbpfGtpuDataplaneBackend {
                 Ok(observed) => observed,
                 Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
             };
+            // A classifier published without the reader grace could never be
+            // removed exactly, so no mutation is admitted without it.
+            let mutates = match &observed {
+                TftClassifierObservation::Present(value) => {
+                    Self::tft_observation_owned_by(value, authority) && value.classifier != desired
+                }
+                TftClassifierObservation::Absent | TftClassifierObservation::Indeterminate => true,
+            };
+            if mutates && !self.inner.runtime.tft_reader_grace_available() {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                });
+            }
             let (previous, replacement) = match &observed {
                 TftClassifierObservation::Absent => (None, false),
                 TftClassifierObservation::Present(value) => {
@@ -5497,6 +5709,18 @@ impl EbpfGtpuDataplaneBackend {
         authority: EbpfTftAuthority,
         key: TftClassifierKey,
     ) -> TftUplinkClassifierRemovalOutcome {
+        // A TC invocation that copied the active selector before the fence
+        // may still read its rows; one that copies the fence reads none. Wait
+        // out the former once, before this attempt deletes any row, even when
+        // an earlier attempt published the fence. Without a completed wait no
+        // row is deleted: the fence and every row stay for a retry.
+        let mut reader_grace_done = false;
+        let mut await_reader_grace = || {
+            reader_grace_done || {
+                reader_grace_done = self.inner.runtime.synchronize_tft_readers().is_ok();
+                reader_grace_done
+            }
+        };
         loop {
             let Some((raw_fence, records)) =
                 self.stable_tft_removal_fence_locked(expected, authority, key)
@@ -5519,6 +5743,9 @@ impl EbpfGtpuDataplaneBackend {
                 .collect::<Vec<_>>();
 
             if !authorized_active_keys.is_empty() {
+                if !await_reader_grace() {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                }
                 for record_key in authorized_active_keys {
                     if !matches!(
                         self.inner
@@ -5569,6 +5796,9 @@ impl EbpfGtpuDataplaneBackend {
             // Every active rank has been durably authorized and proved absent.
             // Any remaining records belong to the inactive bank and may be
             // cleaned idempotently under the same exact owner authority.
+            if !records.is_empty() && !await_reader_grace() {
+                return TftUplinkClassifierRemovalOutcome::Indeterminate;
+            }
             for (record_key, _) in records {
                 if !matches!(
                     self.inner
@@ -5637,6 +5867,15 @@ impl EbpfGtpuDataplaneBackend {
                 }
                 TftClassifierObservation::Indeterminate => {
                     return Ok(self.finish_tft_removal_fence_locked(&expected, authority, key));
+                }
+                // Without the reader grace a fence could never be finished, so
+                // the complete classifier stays published and forwarding.
+                TftClassifierObservation::Present(_)
+                    if !self.inner.runtime.tft_reader_grace_available() =>
+                {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "tft_classifier_reader_grace",
+                    });
                 }
                 TftClassifierObservation::Present(value) => value,
             };
@@ -8071,11 +8310,13 @@ impl EbpfGtpuDataplaneBackend {
             } else {
                 GtpuUplinkChecksumOffloadContract::Unsupported
             },
-            // The existing userspace reassembly consumer authorizes only the
-            // frozen single-context IPv4 graph. Grouped maps deliberately
-            // contain no legacy PDR/commit authority, so a reassembled
-            // grouped TEID cannot safely re-enter that consumer.
-            downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            // The backend-owned IPv4 queue authorizes a reassembled grouped
+            // G-PDU against the exact grouped index, Active generation and
+            // endpoint authority (`GtpuControlPort::try_receive_downlink`).
+            // The caller-closure consumer remains single-context only.
+            downlink_outer_ipv4_fragment_handling: downlink_outer_fragment_contract(
+                outer_ipv4 == GtpuCapability::Available,
+            ),
             downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
         })
     }
@@ -9007,6 +9248,10 @@ impl EbpfGtpuDataplaneBackend {
                 || self.pin_dir(&device.name),
                 |grouped| self.grouped_pin_dir(grouped.device_id),
             );
+        #[cfg(target_os = "linux")]
+        let control_slot = devices
+            .get(&device.ifindex)
+            .map(|managed| Arc::clone(&managed.control_socket));
         drop(devices);
         let related_attempts = self
             .traffic_attempts()?
@@ -9031,6 +9276,18 @@ impl EbpfGtpuDataplaneBackend {
                 stores.remove(&group_key);
             }
         }
+        // Control-port operations are excluded per attachment by this slot, not
+        // by the backend-wide operation lock. Hold it across the hook change so
+        // an in-flight receive, authorization or send linearizes entirely
+        // before the attachment changes; retire it only once removal commits.
+        #[cfg(target_os = "linux")]
+        let mut control_guard = match control_slot.as_ref() {
+            Some(slot) => Some(
+                slot.lock()
+                    .map_err(|_| GtpuError::io("ebpf_control_port_state", poisoned_lock()))?,
+            ),
+            None => None,
+        };
         if retain_grouped {
             self.inner.runtime.suspend_grouped(
                 &device.name,
@@ -9047,6 +9304,10 @@ impl EbpfGtpuDataplaneBackend {
             )?;
         }
         self.devices()?.remove(&device.ifindex);
+        #[cfg(target_os = "linux")]
+        if let Some(guard) = control_guard.as_mut() {
+            guard.retire();
+        }
         self.traffic_sequence_sources()?.remove(&device.ifindex);
         Ok(())
     }
@@ -10336,24 +10597,30 @@ impl EbpfGtpuDataplaneBackend {
             Err(error) => return Err(error),
         }
         let mut devices = self.devices()?;
-        {
-            let managed = devices.get(&device.ifindex).ok_or(GtpuError::NotFound)?;
-            if managed.name != device.name {
-                return Err(GtpuError::NotFound);
-            }
-            if !managed.cleanup_only {
-                return Err(GtpuError::AlreadyExists);
-            }
+        let managed = devices
+            .get_mut(&device.ifindex)
+            .ok_or(GtpuError::NotFound)?;
+        if managed.name != device.name {
+            return Err(GtpuError::NotFound);
         }
+        if !managed.cleanup_only {
+            return Err(GtpuError::AlreadyExists);
+        }
+        // The runtime either commits the whole activation or leaves the
+        // device cleanup-only and fenced, and every fallible host step runs
+        // before it, so this flag and the runtime change together or not at
+        // all. The host sequence window is held across the call and dropped
+        // only once the runtime reports that its fresh traffic source is
+        // reset and enabled, as `reset_traffic_sequence_source` requires.
+        let mut sequence_sources = self.traffic_sequence_sources()?;
         self.inner.runtime.activate_cleanup_only(
             &device.name,
             device.ifindex,
             &self.pin_dir(&device.name),
             self.inner.config.tc_priority,
         )?;
-        if let Some(managed) = devices.get_mut(&device.ifindex) {
-            managed.cleanup_only = false;
-        }
+        sequence_sources.remove(&device.ifindex);
+        managed.cleanup_only = false;
         Ok(device)
     }
 
@@ -10504,6 +10771,11 @@ impl EbpfGtpuDataplaneBackend {
         context: &GtpPdpContext,
     ) -> Result<Ipv4Addr, GtpuError> {
         validate_gtp_version(context.gtp_version)?;
+        if context.ms_address.is_ipv6() {
+            let local_ip = self.managed_local_ip_locked(context.link_ifindex)?;
+            ordinary_ipv6::ordinary_ipv6_plan(context, local_ip)?;
+            return Ok(local_ip);
+        }
         let ms_address = require_ipv4(context.ms_address, "pdp.ms_address")?;
         let peer_address = require_ipv4(context.peer_address, "pdp.peer_address")?;
         if ms_address.is_unspecified() {
@@ -10645,6 +10917,7 @@ impl EbpfGtpuDataplaneBackend {
             return Err(indeterminate());
         }
         let uplink_source_port_policy = commit.uplink_source_port_policy();
+        let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
         let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
         Ok(GtpPdpContext {
@@ -10658,6 +10931,7 @@ impl EbpfGtpuDataplaneBackend {
             bearer_mark: None,
             egress_dscp,
             uplink_source_port_policy,
+            downlink_inner_mtu,
         })
     }
 
@@ -10745,6 +11019,7 @@ impl EbpfGtpuDataplaneBackend {
             return Err(indeterminate());
         }
         let uplink_source_port_policy = commit.uplink_source_port_policy();
+        let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
@@ -10756,6 +11031,7 @@ impl EbpfGtpuDataplaneBackend {
             bearer_mark: Some(bearer_mark),
             egress_dscp,
             uplink_source_port_policy,
+            downlink_inner_mtu,
         })
     }
 
@@ -10770,10 +11046,11 @@ impl EbpfGtpuDataplaneBackend {
                 "ifindex must be nonzero",
             ));
         }
-        if selector.address_family() != GtpAddressFamily::Ipv4 {
-            return Err(GtpuError::UnsupportedFeature {
-                feature: "ebpf_ipv6_pdp_readback",
-            });
+        if selector.address_family() == GtpAddressFamily::Ipv6 {
+            return self.inspect_ordinary_ipv6_local_locked(
+                selector.link_ifindex(),
+                selector.local_teid(),
+            );
         }
         self.managed_local_ip_locked(selector.link_ifindex())?;
         let local_teid = selector.local_teid().get().to_be_bytes();
@@ -10821,6 +11098,13 @@ impl EbpfGtpuDataplaneBackend {
                 "pdp.selector.link_ifindex",
                 "ifindex must be nonzero",
             ));
+        }
+        if let IpAddr::V6(ms_address) = selector.identity().ms_address() {
+            return self.inspect_ordinary_ipv6_uplink_locked(
+                selector.link_ifindex(),
+                ms_address,
+                selector.identity().bearer_mark(),
+            );
         }
         self.managed_local_ip_locked(selector.link_ifindex())?;
         let ms_address = require_ipv4(selector.identity().ms_address(), "pdp.selector.ms_address")?;
@@ -11176,6 +11460,23 @@ impl EbpfGtpuDataplaneBackend {
 
     fn install_pdp_context_locked(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         validate_gtp_version(request.gtp_version)?;
+        if request.ms_address.is_ipv6() {
+            let local_ip = {
+                let devices = self.devices()?;
+                let device = devices
+                    .get(&request.link_ifindex)
+                    .ok_or(GtpuError::NotFound)?;
+                if device.cleanup_only {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "cleanup_only_pdp_install",
+                    });
+                }
+                device.local_ip.ok_or(GtpuError::UnsupportedFeature {
+                    feature: ordinary_ipv6::ORDINARY_INNER_IPV6_ON_GROUPED_ATTACHMENT,
+                })?
+            };
+            return self.install_ordinary_ipv6_locked(&request, local_ip);
+        }
         let ms_address = require_ipv4(request.ms_address, "pdp.ms_address")?;
         let peer_address = require_ipv4(request.peer_address, "pdp.peer_address")?;
         if ms_address.is_unspecified() {
@@ -11260,6 +11561,31 @@ impl EbpfGtpuDataplaneBackend {
                 "uplink source-port policy and PDP graph must be canonical",
             )
         })?;
+        if request.downlink_inner_mtu.is_some_and(|mtu| {
+            mtu.policy() == crate::GtpuDownlinkOversizePolicy::InTunnelPacketTooBig
+        }) && request.uplink_source_port_policy
+            != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
+        {
+            // The in-tunnel error leaves through the backend-owned UDP/2152
+            // socket, which cannot honor a selected uplink source port. The
+            // default inner fragmentation sends nothing uplink.
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu_with_selected_uplink_source_port",
+            });
+        }
+        let invalid_mtu = || {
+            GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "downlink inner MTU must be from the IPv4 minimum to the 15-bit maximum",
+            )
+        };
+        let downlink_inner_mtu = request
+            .downlink_inner_mtu
+            .map(|mtu| mtu.to_wire().ok_or_else(invalid_mtu))
+            .transpose()?;
+        let commit = commit
+            .with_downlink_inner_mtu(downlink_inner_mtu)
+            .ok_or_else(invalid_mtu)?;
         if request.bearer_mark.is_some()
             && !self
                 .inner
@@ -11655,7 +11981,11 @@ impl EbpfGtpuDataplaneBackend {
                 .ok_or(GtpuError::NotFound)?;
             if device.local_ip.is_none() {
                 return Err(GtpuError::UnsupportedFeature {
-                    feature: "legacy_ipv4_pdp_on_grouped_attachment",
+                    feature: if request.address_family == GtpAddressFamily::Ipv6 {
+                        ordinary_ipv6::ORDINARY_INNER_IPV6_ON_GROUPED_ATTACHMENT
+                    } else {
+                        "legacy_ipv4_pdp_on_grouped_attachment"
+                    },
                 });
             }
         }
@@ -11667,6 +11997,9 @@ impl EbpfGtpuDataplaneBackend {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_remove_pdp_context",
             });
+        }
+        if request.address_family == GtpAddressFamily::Ipv6 {
+            return self.remove_ordinary_ipv6_locked(request.link_ifindex, request.local_teid);
         }
         let pdr_key = request.local_teid.get().to_be_bytes();
         let owner_selector = self
@@ -11805,7 +12138,7 @@ impl EbpfGtpuDataplaneBackend {
         } else {
             Some("eBPF GTP-U datapath mutation ready")
         };
-        GtpuProbe {
+        let mut probe = GtpuProbe {
             kind: GtpuBackendKind::LinuxEbpf,
             platform_supported: env.platform_supported,
             kernel_reachable: env.bpffs_present,
@@ -11902,8 +12235,18 @@ impl EbpfGtpuDataplaneBackend {
             downlink_outer_fragment_handling: downlink_outer_fragment_contract(
                 has_legacy_ipv4_downlink_attachment && endpoint_binding_datapath_usable,
             ),
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details,
-        }
+        };
+        // The MTU rides in the complete commit record; steered packets land
+        // in the Linux backend-owned packet-too-big queue and the error leaves
+        // through the UDP/2152 socket.
+        probe.downlink_inner_mtu_enforcement = if cfg!(target_os = "linux") {
+            probe.uplink_source_port_selection
+        } else {
+            GtpuCapability::Missing
+        };
+        probe
     }
 }
 
@@ -12136,7 +12479,9 @@ impl EbpfGtpuDataplaneBackend {
     /// The kernel source reset starts its producer sequence from zero. Drop
     /// only the matching host high-water after the runtime reports that reset
     /// fully succeeded; retaining it would reject every new-source event as a
-    /// replay.
+    /// replay. A caller that must not fail once the runtime has committed
+    /// (cleanup-only activation) instead holds [`Self::traffic_sequence_sources`]
+    /// across the runtime call and removes the entry after it succeeds.
     fn reset_traffic_sequence_source(&self, ifindex: u32) -> Result<(), GtpuError> {
         self.traffic_sequence_sources()?.remove(&ifindex);
         Ok(())
@@ -14574,33 +14919,48 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
     }
 
     fn tft_uplink_classification_capability(&self) -> GtpuCapability {
+        self.tft_uplink_classification_unavailable_reason()
+            .map_or(GtpuCapability::Available, |reason| reason.capability())
+    }
+
+    fn tft_uplink_classification_unavailable_reason(
+        &self,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
         let environment = self.inner.runtime.probe_environment();
         if !environment.platform_supported || !environment.bpffs_present || !environment.btf_present
         {
-            return GtpuCapability::Missing;
+            return Some(Reason::EnvironmentUnavailable);
         }
         if !environment.net_admin_capable || !environment.bpf_capable {
-            return GtpuCapability::PermissionDenied;
+            return Some(Reason::PermissionDenied);
+        }
+        // Exact removal waits for in-flight TC readers before deleting any
+        // row; without that grace an installed classifier could not be
+        // removed, so classification is not offered.
+        if !self.inner.runtime.tft_reader_grace_available() {
+            return Some(Reason::ReaderGraceUnavailable);
         }
         let devices = match self.devices() {
             Ok(devices) if !devices.is_empty() => devices
                 .iter()
                 .map(|(ifindex, device)| (*ifindex, device.cleanup_only, device.successor_pending))
                 .collect::<Vec<_>>(),
-            Ok(_) | Err(_) => return GtpuCapability::Unknown,
+            Ok(_) => return Some(Reason::NoManagedDevice),
+            Err(_) => return Some(Reason::DeviceInventoryUnavailable),
         };
-        if devices
-            .iter()
-            .all(|(ifindex, cleanup_only, successor_pending)| {
-                !cleanup_only
-                    && !successor_pending
-                    && self.inner.runtime.tft_datapath_usable(*ifindex)
-            })
-        {
-            GtpuCapability::Available
-        } else {
-            GtpuCapability::Missing
+        for (ifindex, cleanup_only, successor_pending) in devices {
+            if cleanup_only {
+                return Some(Reason::CleanupOnly);
+            }
+            if successor_pending {
+                return Some(Reason::SuccessorPending);
+            }
+            if let Some(reason) = self.inner.runtime.tft_datapath_unavailable_reason(ifindex) {
+                return Some(reason);
+            }
         }
+        None
     }
 
     fn validate_tft_uplink_classifier(
@@ -15023,6 +15383,22 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
             Ok(outcome)
         })
         .await
+    }
+
+    fn pdp_inner_ipv6_capability(&self) -> GtpuCapability {
+        // Ordinary inner-IPv6 contexts use the family-tagged tc authority that
+        // every current program executes, keyed by the IPv6 /64 and carried
+        // over the attachment's IPv4 S2b-U endpoint. Each mutation still
+        // proves the exact live hooks, maps, and attachment configuration.
+        let environment = self.inner.runtime.probe_environment();
+        if !environment.platform_supported || !environment.bpffs_present || !environment.btf_present
+        {
+            GtpuCapability::Missing
+        } else if !environment.net_admin_capable || !environment.bpf_capable {
+            GtpuCapability::PermissionDenied
+        } else {
+            GtpuCapability::Available
+        }
     }
 
     fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
@@ -15610,15 +15986,15 @@ mod aya_runtime {
     };
 
     use super::{
-        ebpf_pmtu_map_state_is_executable, historical_25_replacement_name_commitment,
-        CurrentRecoveryManagedState, CurrentRecoveryPristineObservation,
-        CurrentRecoverySuccessorActivation, CurrentRecoverySuccessorRegistration,
-        CurrentTerminalAdmissionExecution, CurrentTerminalSuccessorConfiguration,
-        EbpfAttachmentDisposition, EbpfCleanupOnlyAdoption, EbpfEnvironment,
-        EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime, EbpfMapUpdateMode,
-        EbpfSessionIndexInventory, EbpfTftAuthority, EbpfTftFilterMapCapacity,
+        classify_ordinary_family_authority, ebpf_pmtu_map_state_is_executable,
+        historical_25_replacement_name_commitment, CurrentRecoveryManagedState,
+        CurrentRecoveryPristineObservation, CurrentRecoverySuccessorActivation,
+        CurrentRecoverySuccessorRegistration, CurrentTerminalAdmissionExecution,
+        CurrentTerminalSuccessorConfiguration, EbpfAttachmentDisposition, EbpfCleanupOnlyAdoption,
+        EbpfEnvironment, EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
+        EbpfMapUpdateMode, EbpfSessionIndexInventory, EbpfTftAuthority, EbpfTftFilterMapCapacity,
         EbpfTrafficObservationDrain, HistoricalEbpfGraphRecoveryCurrentnessProbe,
-        SelectorNamespaceCurrentnessGate, SelectorNamespaceEffectGuard,
+        OrdinaryFamilyAuthority, SelectorNamespaceCurrentnessGate, SelectorNamespaceEffectGuard,
         SelectorOperationStampRecord, TftClassifierFilter, TftClassifierFilterKey,
         TftClassifierKey, TftClassifierMeta,
     };
@@ -17304,6 +17680,9 @@ mod aya_runtime {
         // final readback compare the exact loaded graph, rather than only its
         // selector marker path.
         devices: Arc<Mutex<HashMap<u32, LoadedDevice>>>,
+        // Private, unpinned maps; never part of a packet program's map graph.
+        // Failed initialization is not cached, so a later probe can recover.
+        tft_map_reader_grace: Mutex<Option<sys::BpfMapReaderGrace>>,
     }
 
     struct ReconcilerOwnership {
@@ -17975,7 +18354,16 @@ mod aya_runtime {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum CurrentGroupedAuthority {
         Uninitialized,
-        Initialized { populated: bool },
+        Initialized {
+            populated: bool,
+        },
+        /// Family-tagged authority owned by an ordinary attachment: it names
+        /// exactly the retained IPv4 S2b-U endpoint of `GTPU_CONFIG`, no IPv6
+        /// endpoint, and no grouped transaction journal exists. It carries only
+        /// ordinary inner-IPv6 PDP contexts.
+        Ordinary {
+            populated: bool,
+        },
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17990,11 +18378,15 @@ mod aya_runtime {
                 || matches!(
                     self.grouped,
                     CurrentGroupedAuthority::Initialized { populated: true }
+                        | CurrentGroupedAuthority::Ordinary { populated: true }
                 )
         }
 
         fn cleanup_only_compatible(self) -> bool {
-            self.grouped == CurrentGroupedAuthority::Uninitialized
+            matches!(
+                self.grouped,
+                CurrentGroupedAuthority::Uninitialized | CurrentGroupedAuthority::Ordinary { .. }
+            )
         }
     }
 
@@ -30089,11 +30481,15 @@ mod aya_runtime {
                 [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
                 [u8; GTPU_SESSION_GROUP_REF_LEN]
             );
+            let journal_populated_before = grouped_populated;
+            grouped_populated = false;
             observe_grouped_hash!(
                 MAP_SESSION_TRANSACTIONS,
                 [u8; GTPU_SESSION_GROUP_ID_LEN],
                 [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
             );
+            let transactions_populated = grouped_populated;
+            grouped_populated = journal_populated_before || transactions_populated;
 
             let config_ipv6 = Array::<MapData, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(
                 Self::current_map(pin_dir, MAP_CONFIG_IPV6)?,
@@ -30107,6 +30503,22 @@ mod aya_runtime {
             .map_err(|_| CurrentIdentityError::Mismatch)?
             .get(&GTPU_SESSION_CONFIG_KEY, 0)
             .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            let canonical_config = GtpuSessionDeviceConfig::decode(&config_ipv6)
+                .is_some_and(|decoded| decoded.encode() == config_ipv6);
+            let local_ip = config
+                .get(&0, 0)
+                .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            // The ordinary attachment's own authority names exactly the
+            // retained IPv4 S2b-U endpoint, no IPv6 endpoint, and has no
+            // grouped transaction journal.
+            let ordinary = canonical_config
+                && local_ip != [0; 4]
+                && !transactions_populated
+                && GtpuSessionDeviceConfig::decode(&config_ipv6).is_some_and(|decoded| {
+                    decoded.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                        == Some(opc_gtpu_ebpf_common::GtpuEndpointAddress::Ipv4(local_ip))
+                        && decoded.local_endpoint(GtpuSessionIpFamily::Ipv6).is_none()
+                });
             let grouped = if config_ipv6 == [0; GTPU_SESSION_CONFIG_VALUE_LEN]
                 && schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN]
             {
@@ -30114,12 +30526,24 @@ mod aya_runtime {
                     return Err(CurrentIdentityError::Mismatch);
                 }
                 CurrentGroupedAuthority::Uninitialized
-            } else if schema == GTPU_SESSION_SCHEMA_MARKER_VALUE
-                && GtpuSessionDeviceConfig::decode(&config_ipv6)
-                    .is_some_and(|decoded| decoded.encode() == config_ipv6)
-            {
-                CurrentGroupedAuthority::Initialized {
-                    populated: grouped_populated,
+            } else if schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN] && ordinary {
+                // An ordinary authority interrupted between its config and
+                // schema writes (or during retirement). Nothing can have been
+                // published under it; the install path resumes it and the
+                // next removal retires it.
+                if grouped_populated {
+                    return Err(CurrentIdentityError::Mismatch);
+                }
+                CurrentGroupedAuthority::Ordinary { populated: false }
+            } else if schema == GTPU_SESSION_SCHEMA_MARKER_VALUE && canonical_config {
+                if ordinary {
+                    CurrentGroupedAuthority::Ordinary {
+                        populated: grouped_populated,
+                    }
+                } else {
+                    CurrentGroupedAuthority::Initialized {
+                        populated: grouped_populated,
+                    }
                 }
             } else {
                 return Err(CurrentIdentityError::Mismatch);
@@ -31049,11 +31473,13 @@ mod aya_runtime {
 
             // The current-graph observer requires the exact PMTU-v5 marker,
             // executable PMTU state, and structurally readable current maps.
-            // This IPv4 cleanup authority additionally requires the
-            // independent grouped CONFIG6/SCHEMA6 authority to remain
-            // uninitialized and all four grouped hashes to be empty. A valid
-            // grouped attachment is still a different writer domain, not
-            // cleanup authority this legacy request may silently discard.
+            // This ordinary cleanup authority additionally requires the
+            // family-tagged CONFIG6/SCHEMA6 authority to remain uninitialized,
+            // or to be the ordinary attachment's own inner-IPv6 authority:
+            // exactly this graph's IPv4 endpoint, no IPv6 endpoint, and no
+            // grouped transaction journal. A grouped attachment is still a
+            // different writer domain, not cleanup authority this ordinary
+            // request may silently discard.
             match Self::current_graph_population(pin_dir) {
                 Ok(population) if population.cleanup_only_compatible() => {}
                 Ok(_) => {
@@ -31556,6 +31982,68 @@ mod aya_runtime {
             }
             let _ = write;
             Err(state_indeterminate("ebpf_grouped_schema_write"))
+        }
+
+        fn grouped_schema_clear_verified(ebpf: &mut Ebpf) -> Result<(), GtpuError> {
+            let write = {
+                let map = ebpf.map_mut(MAP_SESSION_SCHEMA).ok_or_else(|| {
+                    GtpuError::io("ebpf_grouped_schema", invalid_data("map missing"))
+                })?;
+                let mut array = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+                array.set(
+                    GTPU_SESSION_CONFIG_KEY,
+                    [0; GTPU_SESSION_SCHEMA_MARKER_LEN],
+                    0,
+                )
+            };
+            if matches!(
+                Self::grouped_schema_read(ebpf),
+                Ok(observed) if observed == [0; GTPU_SESSION_SCHEMA_MARKER_LEN]
+            ) {
+                return Ok(());
+            }
+            let _ = write;
+            Err(state_indeterminate("ebpf_grouped_schema_clear"))
+        }
+
+        /// Whether any family-tagged record, selector, or transaction journal
+        /// exists in this graph.
+        fn family_tagged_state_populated(
+            ebpf: &Ebpf,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            macro_rules! populated {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = ebpf
+                        .map($name)
+                        .ok_or_else(|| state_indeterminate(operation))?;
+                    BpfHashMap::<_, $key, $value>::try_from(map)
+                        .map_err(|_| state_indeterminate(operation))?
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|_| state_indeterminate(operation))?
+                        .is_some()
+                }};
+            }
+            Ok(populated!(
+                MAP_SESSION_GROUPS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN]
+            ) || populated!(
+                MAP_SESSION_UPLINK_INDEX,
+                [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            ) || populated!(
+                MAP_SESSION_DOWNLINK_INDEX,
+                [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            ) || populated!(
+                MAP_SESSION_TRANSACTIONS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
+            ))
         }
 
         /// Grouped attachment never adopts legacy IPv4 authority. Every
@@ -38891,6 +39379,97 @@ mod aya_runtime {
             })
     }
 
+    fn tft_map_reader_grace_kernel_profile(release: &[u8], version: &[u8]) -> bool {
+        if !grouped_reader_grace_kernel_profile(version) {
+            return false;
+        }
+        let Ok(release) = std::str::from_utf8(release) else {
+            return false;
+        };
+        if release.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return false;
+        }
+        let (numbers, suffix) = release.split_once('-').unwrap_or((release, ""));
+        let mut fields = numbers.split('.');
+        let (Some(major), Some(minor), Some(patch)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let decimal =
+            |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+        if fields.next().is_some() || ![major, minor, patch].into_iter().all(decimal) {
+            return false;
+        }
+        let (Ok(major), Ok(minor), Ok(_patch)) = (
+            major.parse::<u32>(),
+            minor.parse::<u32>(),
+            patch.parse::<u32>(),
+        ) else {
+            return false;
+        };
+        // Bound this fallback to reviewed release families. A successful map
+        // syscall alone cannot attest an unknown kernel's RCU implementation.
+        // Object loadability remains an independent per-device prerequisite.
+        match (major, minor) {
+            (6, 8..=19) | (7, 0..=2) => !suffix.starts_with("rc"),
+            (5, 14) if patch == "0" => suffix
+                .strip_prefix("427.")
+                .and_then(|suffix| suffix.split_once(".el9_4"))
+                .is_some_and(|(build, architecture)| {
+                    build.split('.').all(decimal)
+                        && architecture.starts_with('.')
+                        && architecture.len() > 1
+                }),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn tft_map_reader_grace_accepts_only_reviewed_non_realtime_profiles() {
+        let version = b"#1 SMP PREEMPT_DYNAMIC Wed Sep 9 00:00:00 UTC 2026";
+        for release in [
+            "5.14.0-427.13.1.el9_4.x86_64",
+            "6.8.0-134-generic",
+            "6.12.0",
+            "6.18.1",
+            "6.19.0",
+            "7.1.8-200.fc44.x86_64",
+            "7.2.0",
+        ] {
+            assert!(
+                tft_map_reader_grace_kernel_profile(release.as_bytes(), version),
+                "{release}"
+            );
+        }
+        for release in [
+            "5.14.0",
+            "5.14.0-427.el9.x86_64",
+            "5.14.0-570.1.el9_6.x86_64",
+            "6.7.12",
+            "6.8.0-rc1",
+            "7.3.0",
+            "8.0.0",
+            "6.8",
+            "unknown",
+            "",
+        ] {
+            assert!(
+                !tft_map_reader_grace_kernel_profile(release.as_bytes(), version),
+                "{release}"
+            );
+        }
+        for version in [
+            "#1 SMP PREEMPT_RT Wed Sep 9 00:00:00 UTC 2026",
+            "#1 SMP PREEMPT_UNKNOWN Wed Sep 9 00:00:00 UTC 2026",
+            "unknown",
+        ] {
+            assert!(!tft_map_reader_grace_kernel_profile(
+                b"7.2.0",
+                version.as_bytes()
+            ));
+        }
+    }
+
     #[test]
     fn grouped_reader_grace_refuses_realtime_and_unknown_kernel_profiles() {
         for version in [
@@ -38929,6 +39508,41 @@ mod aya_runtime {
     }
 
     impl AyaGtpuRuntime {
+        fn tft_reader_grace_method(&self) -> Option<super::TftReaderGraceMethod> {
+            use rustix::thread::{membarrier_query, MembarrierQuery};
+            let kernel = rustix::system::uname();
+            if !grouped_reader_grace_kernel_profile(kernel.version().to_bytes()) {
+                return None;
+            }
+            super::select_tft_reader_grace(
+                membarrier_query().contains(MembarrierQuery::GLOBAL),
+                || {
+                    tft_map_reader_grace_kernel_profile(
+                        kernel.release().to_bytes(),
+                        kernel.version().to_bytes(),
+                    ) && self.prepare_tft_map_reader_grace().is_ok()
+                },
+            )
+        }
+
+        fn prepare_tft_map_reader_grace(&self) -> Result<(), GtpuError> {
+            let mut grace = self
+                .tft_map_reader_grace
+                .lock()
+                .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?;
+            if grace.is_none() {
+                let candidate = sys::BpfMapReaderGrace::new()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?;
+                // Creation is not capability evidence. Require a successful
+                // userspace UPDATE before admitting the first TFT mutation.
+                candidate
+                    .synchronize()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?;
+                *grace = Some(candidate);
+            }
+            Ok(())
+        }
+
         fn detach_managed_device(
             &self,
             interface: &str,
@@ -39077,6 +39691,27 @@ mod aya_runtime {
             }
             membarrier(MembarrierCommand::Global)
                 .map_err(|_| state_indeterminate("ebpf_selector_global_grace"))
+        }
+
+        fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+            match self.tft_reader_grace_method() {
+                Some(super::TftReaderGraceMethod::Global) => self.synchronize_grouped_readers(),
+                Some(super::TftReaderGraceMethod::MapInMap) => self
+                    .tft_map_reader_grace
+                    .lock()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?
+                    .as_ref()
+                    .ok_or_else(|| state_indeterminate("ebpf_tft_map_grace"))?
+                    .synchronize()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace")),
+                None => Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                }),
+            }
+        }
+
+        fn tft_reader_grace_available(&self) -> bool {
+            self.tft_reader_grace_method().is_some()
         }
 
         fn reset_workload_graph(
@@ -40522,17 +41157,16 @@ mod aya_runtime {
             _pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<EbpfAttachmentDisposition, GtpuError> {
-            let ownership =
-                self.selector_namespace_ownership(ifindex, "ebpf_activate_cleanup_only")?;
-            let _graph_lock =
-                Self::acquire_operation_control_lock(&ownership, "ebpf_activate_cleanup_only")?;
+            const OPERATION: &str = "ebpf_activate_cleanup_only";
+            let ownership = self.selector_namespace_ownership(ifindex, OPERATION)?;
+            let _graph_lock = Self::acquire_operation_control_lock(&ownership, OPERATION)?;
             let mut devices = self
                 .devices
                 .lock()
-                .map_err(|_| GtpuError::io("ebpf_activate_cleanup_only", super::poisoned_lock()))?;
+                .map_err(|_| GtpuError::io(OPERATION, super::poisoned_lock()))?;
             let device = devices.get_mut(&ifindex).ok_or(GtpuError::NotFound)?;
             if !Arc::ptr_eq(&device._reconciler_ownership, &ownership) {
-                return Err(state_indeterminate("ebpf_activate_cleanup_only"));
+                return Err(state_indeterminate(OPERATION));
             }
             if !device.cleanup_only {
                 return Err(GtpuError::AlreadyExists);
@@ -40544,22 +41178,72 @@ mod aya_runtime {
             if !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?) {
                 return Err(state_indeterminate("ebpf_cleanup_schema"));
             }
+            // Cleanup-only acquisition left the retained traffic gate at an
+            // even, packet-inert incarnation. Start a fresh source incarnation
+            // while the hooks are still fenced and attach them. The gate stays
+            // even, so the attached programs pass every packet unchanged
+            // until the commit below.
+            let traffic_observation_gate =
+                Self::reset_traffic_observation_source(&mut device.ebpf)?;
             let attached = self.attach_programs_by_ifindex(
                 &mut device.ebpf,
                 ifindex,
                 &device.pin_dir,
                 tc_priority,
             )?;
-            device.datapath_identity = attached.identity;
-            device.links = Some(attached.links);
+            // Every fallible proof precedes the commit. Present the attached
+            // graph as active in memory only, re-prove the complete live graph
+            // (interface, control directory, exact identity, tc placement,
+            // executable PMTU policy) and the quiescent fresh source while the
+            // gate is still even, then enable the gate as ordinary adoption
+            // does. The enable is the commit and the last fallible step.
+            let fenced_identity =
+                std::mem::replace(&mut device.datapath_identity, attached.identity.clone());
             device.cleanup_only = false;
-            Self::selector_namespace_graph_identity(
+            let committed = Self::selector_namespace_graph_identity(
                 ifindex,
                 device,
                 &ownership,
                 &_graph_lock,
-                "ebpf_activate_cleanup_only",
-            )?;
+                OPERATION,
+            )
+            .and_then(|_| {
+                Self::verify_traffic_observation_source_quiescent(
+                    &mut device.ebpf,
+                    traffic_observation_gate,
+                )
+            })
+            .and_then(|()| {
+                Self::enable_traffic_observation_source(&mut device.ebpf, traffic_observation_gate)
+            });
+            if let Err(error) = committed {
+                // Keep the device cleanup-only and fenced: restore its fenced
+                // identity and the even gate, and always detach the hooks this
+                // call attached, even when they replaced an exact predecessor,
+                // so no attachment survives behind a gate that may still be
+                // odd. Any failed step, or a replaced predecessor, is
+                // indeterminate; the device stays cleanup-only either way, so
+                // a retry fences the gate again before it reattaches.
+                device.cleanup_only = true;
+                device.datapath_identity = fenced_identity;
+                let gate_restored = Self::disable_traffic_observation_source_exact(
+                    &mut device.ebpf,
+                    traffic_observation_gate,
+                );
+                let detached = detach_datapath_if_current(
+                    attached.links,
+                    &attached.identity,
+                    ifindex,
+                    tc_priority,
+                );
+                return Err(error_after_rollback(
+                    error,
+                    detached.and(gate_restored),
+                    attached.replaced_existing,
+                    OPERATION,
+                ));
+            }
+            device.links = Some(attached.links);
             Ok(EbpfAttachmentDisposition::Retained)
         }
 
@@ -46163,16 +46847,35 @@ mod aya_runtime {
         }
 
         fn tft_datapath_usable(&self, ifindex: u32) -> bool {
-            let devices = self
-                .devices
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            devices.get(&ifindex).is_some_and(|device| {
-                !device.successor_pending
-                    && Self::loaded_datapath_is_current(ifindex, device)
-                    && Self::tft_schema_slot(&device.ebpf)
-                        .is_ok_and(|marker| tft_classifier_schema_is_current(&marker))
-            })
+            self.tft_datapath_unavailable_reason(ifindex).is_none()
+        }
+
+        fn tft_datapath_unavailable_reason(
+            &self,
+            ifindex: u32,
+        ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+            use crate::TftUplinkClassificationUnavailableReason as Reason;
+            let Ok(devices) = self.devices.lock() else {
+                return Some(Reason::DatapathNotCurrent);
+            };
+            let Some(device) = devices.get(&ifindex) else {
+                return Some(Reason::DatapathNotCurrent);
+            };
+            if device.cleanup_only {
+                return Some(Reason::CleanupOnly);
+            }
+            if device.successor_pending {
+                return Some(Reason::SuccessorPending);
+            }
+            if !Self::loaded_datapath_is_current(ifindex, device) {
+                return Some(Reason::DatapathNotCurrent);
+            }
+            if !Self::tft_schema_slot(&device.ebpf)
+                .is_ok_and(|marker| tft_classifier_schema_is_current(&marker))
+            {
+                return Some(Reason::SchemaNotCurrent);
+            }
+            None
         }
 
         fn pdr_get(
@@ -47120,6 +47823,83 @@ mod aya_runtime {
             })
         }
 
+        fn ordinary_family_authority(
+            &self,
+            ifindex: u32,
+        ) -> Result<OrdinaryFamilyAuthority, GtpuError> {
+            self.with_device(ifindex, "ebpf_ordinary_family_authority", |device| {
+                classify_ordinary_family_authority(
+                    Self::grouped_config_read(&device.ebpf)?,
+                    Self::grouped_schema_read(&device.ebpf)?,
+                )
+            })
+        }
+
+        fn initialize_ordinary_family_authority(
+            &self,
+            ifindex: u32,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "ebpf_ordinary_family_authority_initialize";
+            self.with_device(ifindex, OPERATION, |device| {
+                if device.cleanup_only {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "cleanup_only_pdp_install",
+                    });
+                }
+                let current = classify_ordinary_family_authority(
+                    Self::grouped_config_read(&device.ebpf)?,
+                    Self::grouped_schema_read(&device.ebpf)?,
+                )?;
+                match current {
+                    OrdinaryFamilyAuthority::Uninitialized => {
+                        Self::grouped_config_write_verified(&mut device.ebpf, config)?;
+                        Self::grouped_schema_write_verified(&mut device.ebpf)
+                    }
+                    OrdinaryFamilyAuthority::ConfigOnly(existing) if existing == config => {
+                        Self::grouped_schema_write_verified(&mut device.ebpf)
+                    }
+                    OrdinaryFamilyAuthority::Initialized(existing) if existing == config => Ok(()),
+                    OrdinaryFamilyAuthority::ConfigOnly(_)
+                    | OrdinaryFamilyAuthority::Initialized(_) => {
+                        Err(state_indeterminate(OPERATION))
+                    }
+                }
+            })
+        }
+
+        fn retire_ordinary_family_authority(
+            &self,
+            ifindex: u32,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<bool, GtpuError> {
+            const OPERATION: &str = "ebpf_ordinary_family_authority_retire";
+            self.with_device(ifindex, OPERATION, |device| {
+                match classify_ordinary_family_authority(
+                    Self::grouped_config_read(&device.ebpf)?,
+                    Self::grouped_schema_read(&device.ebpf)?,
+                )? {
+                    OrdinaryFamilyAuthority::Uninitialized => return Ok(true),
+                    OrdinaryFamilyAuthority::ConfigOnly(existing)
+                    | OrdinaryFamilyAuthority::Initialized(existing)
+                        if existing == config => {}
+                    OrdinaryFamilyAuthority::ConfigOnly(_)
+                    | OrdinaryFamilyAuthority::Initialized(_) => {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                }
+                if Self::family_tagged_state_populated(&device.ebpf, OPERATION)? {
+                    return Ok(false);
+                }
+                Self::grouped_schema_clear_verified(&mut device.ebpf)?;
+                Self::grouped_config_write_verified(
+                    &mut device.ebpf,
+                    [0; GTPU_SESSION_CONFIG_VALUE_LEN],
+                )?;
+                Ok(true)
+            })
+        }
+
         fn grouped_datapath_usable(
             &self,
             ifindex: u32,
@@ -47593,6 +48373,22 @@ mod aya_runtime {
             };
             devices.get(&ifindex).is_some_and(|device| {
                 !device.successor_pending && Self::loaded_datapath_is_current(ifindex, device)
+            })
+        }
+
+        fn traffic_gate_allows_packet_effects(&self, ifindex: u32) -> Result<bool, GtpuError> {
+            const OPERATION: &str = "ebpf_traffic_gate_readback";
+            self.with_device(ifindex, OPERATION, |device| {
+                let map = device
+                    .ebpf
+                    .map(GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME)
+                    .ok_or_else(|| state_indeterminate(OPERATION))?;
+                let gate =
+                    Array::<_, u64>::try_from(map).map_err(|_| state_indeterminate(OPERATION))?;
+                let value = gate
+                    .get(&GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, 0)
+                    .map_err(|_| state_indeterminate(OPERATION))?;
+                Ok(value != 0 && value & 1 == 1)
             })
         }
 
@@ -54054,6 +54850,9 @@ mod tests {
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
+    mod ordinary_ipv6;
+    #[cfg(target_os = "linux")]
+    mod reassembled_downlink;
     mod retained_namespace_boundary;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
@@ -54583,6 +55382,8 @@ mod tests {
         grouped_reader_grace_enabled: bool,
         grouped_reader_grace_calls: usize,
         grouped_reader_grace_fault: bool,
+        tft_reader_grace_unavailable: bool,
+        tft_map_reader_grace_available: bool,
         grouped_reader_grace_corrupt_group: Option<[u8; 16]>,
         grouped_reader_grace_replace_path: bool,
         attached: HashMap<u32, FakeAttachment>,
@@ -55988,6 +56789,22 @@ mod tests {
             self.state().failures_after.extend(operations);
         }
 
+        /// Every current pin graph carries the family-tagged maps. The fake
+        /// exposes them to a grouped attachment, and to an ordinary
+        /// attachment once its family-tagged authority has been written.
+        fn family_maps_ready(state: &FakeState, ifindex: u32) -> bool {
+            state.grouped_map_ready.contains(&ifindex)
+                || state.attached.get(&ifindex).is_some_and(|attachment| {
+                    state
+                        .pinned_config
+                        .get(&attachment.pin_dir)
+                        .is_some_and(|local_ip| *local_ip != [0; 4])
+                        && state
+                            .pinned_grouped_config
+                            .contains_key(&attachment.pin_dir)
+                })
+        }
+
         fn fail_if_requested(
             state: &mut FakeState,
             operation: &'static str,
@@ -56108,6 +56925,79 @@ mod tests {
             (state.traffic_observation_gate.get(&ifindex).copied() == Some(disabled))
                 .then_some(())
                 .ok_or_else(|| state_indeterminate("traffic_observation_disable"))
+        }
+
+        /// Mirror the production quiescence proof that precedes a gate
+        /// enable: the source is still at a nonzero even incarnation and holds
+        /// no registration, redirect, retained record, loss, or sequence.
+        fn verify_traffic_observation_source_quiescent(
+            state: &mut FakeState,
+            ifindex: u32,
+        ) -> Result<(), GtpuError> {
+            state.operations.push("traffic_observation_quiescence");
+            Self::fail_if_requested(state, "traffic_observation_quiescence")?;
+            let quiescent = state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .is_some_and(|gate| *gate != 0 && *gate & 1 == 0)
+                && !state
+                    .traffic_observation_registrations
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                && !state
+                    .traffic_observation_redirects
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                && state
+                    .traffic_observation_events
+                    .get(&ifindex)
+                    .is_none_or(VecDeque::is_empty)
+                && state
+                    .traffic_observation_loss
+                    .get(&ifindex)
+                    .is_none_or(|loss| *loss == 0)
+                && state
+                    .traffic_observation_next_sequence
+                    .get(&ifindex)
+                    .is_none_or(|sequence| *sequence == 0);
+            quiescent
+                .then_some(())
+                .ok_or_else(|| state_indeterminate("ebpf_traffic_source_reset"))
+        }
+
+        /// Mirror the production re-proof of an activated cleanup-only graph
+        /// (`selector_namespace_graph_identity` on the attached device): the
+        /// exact attachment, both hooks on this pin graph, and an executable
+        /// PMTU policy slot.
+        fn cleanup_activation_graph_is_exact(
+            state: &mut FakeState,
+            ifindex: u32,
+            pin_dir: &Path,
+        ) -> Result<(), GtpuError> {
+            state
+                .operations
+                .push("activate_cleanup_only_graph_identity");
+            Self::fail_if_requested(state, "activate_cleanup_only_graph_identity")?;
+            let exact = state
+                .attached
+                .get(&ifindex)
+                .is_some_and(|attachment| attachment.pin_dir == pin_dir)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && state
+                    .uplink_filter_pin_dir
+                    .get(&ifindex)
+                    .is_some_and(|attached| attached == pin_dir)
+                && state
+                    .downlink_filter_pin_dir
+                    .get(&ifindex)
+                    .is_some_and(|attached| attached == pin_dir)
+                && state.pmtu_policy.get(&ifindex).is_some_and(|value| {
+                    ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+                });
+            exact
+                .then_some(())
+                .ok_or_else(|| state_indeterminate("ebpf_activate_cleanup_only"))
         }
 
         /// Mirror the production pre-load TFT schema guard. The fake stores
@@ -57109,6 +57999,33 @@ mod tests {
             Ok(())
         }
 
+        fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_reader_grace");
+            match select_tft_reader_grace(!state.tft_reader_grace_unavailable, || {
+                state.tft_map_reader_grace_available
+            }) {
+                Some(TftReaderGraceMethod::Global) => {}
+                Some(TftReaderGraceMethod::MapInMap) => {
+                    state.operations.push("tft_map_reader_grace");
+                }
+                None => {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "tft_classifier_reader_grace",
+                    });
+                }
+            }
+            Self::fail_if_requested(&mut state, "tft_reader_grace")
+        }
+
+        fn tft_reader_grace_available(&self) -> bool {
+            let state = self.state();
+            select_tft_reader_grace(!state.tft_reader_grace_unavailable, || {
+                state.tft_map_reader_grace_available
+            })
+            .is_some()
+        }
+
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
             self.ifindexes.get(name).copied().ok_or(GtpuError::NotFound)
         }
@@ -57813,6 +58730,10 @@ mod tests {
                     RetainedGraphCleanupRefusal::NotCurrentSchema,
                 ));
             }
+            let transactions_populated = state
+                .session_transactions
+                .keys()
+                .any(|(index, _)| *index == ifindex);
             let grouped_populated = state
                 .session_groups
                 .keys()
@@ -57825,16 +58746,31 @@ mod tests {
                     .session_downlink_index
                     .keys()
                     .any(|(index, _)| *index == ifindex)
-                || state
-                    .session_transactions
-                    .keys()
-                    .any(|(index, _)| *index == ifindex);
+                || transactions_populated;
             let grouped_config_zero = state
                 .pinned_grouped_config
                 .get(pin_dir)
                 .is_none_or(|config| *config == [0; GTPU_SESSION_CONFIG_VALUE_LEN]);
             let grouped_schema_zero = !state.grouped_schema_ready.contains(pin_dir);
-            if !grouped_config_zero || !grouped_schema_zero || grouped_populated {
+            // The ordinary attachment's own inner-IPv6 authority names exactly
+            // its retained IPv4 endpoint and has no grouped journal.
+            let ordinary_family = (!grouped_schema_zero || !grouped_populated)
+                && !transactions_populated
+                && state.pinned_config.get(pin_dir).is_some_and(|local_ip| {
+                    *local_ip != [0; 4]
+                        && state
+                            .pinned_grouped_config
+                            .get(pin_dir)
+                            .and_then(GtpuSessionDeviceConfig::decode)
+                            .is_some_and(|config| {
+                                config.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                                    == Some(GtpuEndpointAddress::Ipv4(*local_ip))
+                                    && config.local_endpoint(GtpuSessionIpFamily::Ipv6).is_none()
+                            })
+                });
+            if !ordinary_family
+                && (!grouped_config_zero || !grouped_schema_zero || grouped_populated)
+            {
                 return Ok(EbpfCleanupOnlyAdoption::Refused(
                     RetainedGraphCleanupRefusal::NotCurrentSchema,
                 ));
@@ -57926,11 +58862,13 @@ mod tests {
                     operation: "ebpf_cleanup_schema",
                 });
             }
-            // Model the attach failure before clearing cleanup-only so a
-            // failed activation leaves the device fenced and retryable,
-            // matching the real runtime's error semantics.
+            // Mirror the production order: a fresh even source incarnation
+            // while fenced, attach, re-prove the attached graph and the
+            // quiescent source while the gate is still even, then enable the
+            // gate as the commit. A failure at any step leaves the device
+            // fenced, cleanup-only and retryable.
+            Self::reset_traffic_observation_source(&mut state, [ifindex])?;
             Self::fail_if_requested(&mut state, "activate_cleanup_only_attach")?;
-            state.cleanup_only.remove(&ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
@@ -57939,6 +58877,37 @@ mod tests {
             state
                 .downlink_filter_pin_dir
                 .insert(ifindex, pin_dir.to_path_buf());
+            let enabled = state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .copied()
+                .and_then(|disabled| disabled.checked_add(1));
+            let committed = Self::cleanup_activation_graph_is_exact(&mut state, ifindex, pin_dir)
+                .and_then(|()| {
+                    Self::verify_traffic_observation_source_quiescent(&mut state, ifindex)
+                })
+                .and_then(|()| {
+                    Self::enable_traffic_observation_source(&mut state, ifindex).map(|_| ())
+                });
+            if let Err(error) = committed {
+                // Restore through the exact disable path, then detach
+                // regardless; a failed restore is indeterminate.
+                let gate_restored = enabled.map_or_else(
+                    || Err(state_indeterminate("traffic_observation_disable")),
+                    |enabled| {
+                        Self::disable_traffic_observation_source_exact(&mut state, ifindex, enabled)
+                    },
+                );
+                state.uplink_filter_ready.remove(&ifindex);
+                state.downlink_filter_ready.remove(&ifindex);
+                state.uplink_filter_pin_dir.remove(&ifindex);
+                state.downlink_filter_pin_dir.remove(&ifindex);
+                return Err(match gate_restored {
+                    Ok(()) => error,
+                    Err(_) => state_indeterminate("ebpf_activate_cleanup_only"),
+                });
+            }
+            state.cleanup_only.remove(&ifindex);
             Ok(EbpfAttachmentDisposition::Retained)
         }
 
@@ -61465,7 +62434,7 @@ mod tests {
             }
             let mut state = self.state();
             Self::fail_if_requested(&mut state, "session_group_get")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             if let Some(value) = state.session_group_get_overrides.pop_front() {
@@ -61496,7 +62465,7 @@ mod tests {
             state.operations.push("session_group_put");
             Self::fail_if_requested(&mut state, phase_operation)?;
             Self::fail_if_requested(&mut state, "session_group_put")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             fake_grouped_put(&mut state.session_groups, ifindex, key, value, mode)?;
@@ -61517,7 +62486,7 @@ mod tests {
             let mut state = self.state();
             state.operations.push("session_group_remove");
             Self::fail_if_requested(&mut state, "session_group_remove")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             let removed = state.session_groups.remove(&(ifindex, key)).is_some();
@@ -61535,7 +62504,7 @@ mod tests {
         ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
             let mut state = self.state();
             Self::fail_if_requested(&mut state, "session_uplink_get")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             Ok(state.session_uplink_index.get(&(ifindex, key)).copied())
@@ -61562,7 +62531,7 @@ mod tests {
             state.operations.push("session_uplink_put");
             Self::fail_if_requested(&mut state, phase_operation)?;
             Self::fail_if_requested(&mut state, "session_uplink_put")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             fake_grouped_put(&mut state.session_uplink_index, ifindex, key, value, mode)?;
@@ -61581,7 +62550,7 @@ mod tests {
             let mut state = self.state();
             state.operations.push("session_uplink_remove");
             Self::fail_if_requested(&mut state, "session_uplink_remove")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             let removed = state.session_uplink_index.remove(&(ifindex, key)).is_some();
@@ -61597,7 +62566,7 @@ mod tests {
         ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
             let mut state = self.state();
             Self::fail_if_requested(&mut state, "session_downlink_get")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             Ok(state.session_downlink_index.get(&(ifindex, key)).copied())
@@ -61624,7 +62593,7 @@ mod tests {
             state.operations.push("session_downlink_put");
             Self::fail_if_requested(&mut state, phase_operation)?;
             Self::fail_if_requested(&mut state, "session_downlink_put")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             fake_grouped_put(&mut state.session_downlink_index, ifindex, key, value, mode)?;
@@ -61643,7 +62612,7 @@ mod tests {
             let mut state = self.state();
             state.operations.push("session_downlink_remove");
             Self::fail_if_requested(&mut state, "session_downlink_remove")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             let removed = state
@@ -61820,7 +62789,7 @@ mod tests {
         ) -> Result<EbpfSessionIndexInventory, GtpuError> {
             let mut state = self.state();
             Self::fail_if_requested(&mut state, "session_index_inventory")?;
-            if !state.grouped_map_ready.contains(&ifindex) {
+            if !Self::family_maps_ready(&state, ifindex) {
                 return Err(GtpuError::NotFound);
             }
             let mut inventory = EbpfSessionIndexInventory {
@@ -61846,6 +62815,121 @@ mod tests {
             Ok(inventory)
         }
 
+        fn ordinary_family_authority(
+            &self,
+            ifindex: u32,
+        ) -> Result<OrdinaryFamilyAuthority, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "ordinary_family_authority")?;
+            let pin_dir = state
+                .attached
+                .get(&ifindex)
+                .map(|attachment| attachment.pin_dir.clone())
+                .ok_or(GtpuError::NotFound)?;
+            let config = state
+                .pinned_grouped_config
+                .get(&pin_dir)
+                .copied()
+                .unwrap_or([0; GTPU_SESSION_CONFIG_VALUE_LEN]);
+            let schema = if state.grouped_schema_ready.contains(&pin_dir) {
+                opc_gtpu_ebpf_common::GTPU_SESSION_SCHEMA_MARKER_VALUE
+            } else {
+                [0; opc_gtpu_ebpf_common::GTPU_SESSION_SCHEMA_MARKER_LEN]
+            };
+            classify_ordinary_family_authority(config, schema)
+        }
+
+        fn initialize_ordinary_family_authority(
+            &self,
+            ifindex: u32,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let current = self.ordinary_family_authority(ifindex)?;
+            let mut state = self.state();
+            state
+                .operations
+                .push("initialize_ordinary_family_authority");
+            Self::fail_if_requested(&mut state, "initialize_ordinary_family_authority")?;
+            if state.cleanup_only.contains(&ifindex) {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "cleanup_only_pdp_install",
+                });
+            }
+            let pin_dir = state
+                .attached
+                .get(&ifindex)
+                .map(|attachment| attachment.pin_dir.clone())
+                .ok_or(GtpuError::NotFound)?;
+            match current {
+                OrdinaryFamilyAuthority::Uninitialized => {
+                    state.pinned_grouped_config.insert(pin_dir.clone(), config);
+                    state.grouped_schema_ready.insert(pin_dir);
+                }
+                OrdinaryFamilyAuthority::ConfigOnly(existing) if existing == config => {
+                    state.grouped_schema_ready.insert(pin_dir);
+                }
+                OrdinaryFamilyAuthority::Initialized(existing) if existing == config => {}
+                OrdinaryFamilyAuthority::ConfigOnly(_)
+                | OrdinaryFamilyAuthority::Initialized(_) => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_ordinary_family_authority_initialize",
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        fn retire_ordinary_family_authority(
+            &self,
+            ifindex: u32,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<bool, GtpuError> {
+            let current = self.ordinary_family_authority(ifindex)?;
+            let mut state = self.state();
+            state.operations.push("retire_ordinary_family_authority");
+            Self::fail_if_requested(&mut state, "retire_ordinary_family_authority")?;
+            match current {
+                OrdinaryFamilyAuthority::Uninitialized => return Ok(true),
+                OrdinaryFamilyAuthority::ConfigOnly(existing)
+                | OrdinaryFamilyAuthority::Initialized(existing)
+                    if existing == config => {}
+                OrdinaryFamilyAuthority::ConfigOnly(_)
+                | OrdinaryFamilyAuthority::Initialized(_) => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_ordinary_family_authority_retire",
+                    });
+                }
+            }
+            let populated = state
+                .session_groups
+                .keys()
+                .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_uplink_index
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_downlink_index
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_transactions
+                    .keys()
+                    .any(|(index, _)| *index == ifindex);
+            if populated {
+                return Ok(false);
+            }
+            let pin_dir = state
+                .attached
+                .get(&ifindex)
+                .map(|attachment| attachment.pin_dir.clone())
+                .ok_or(GtpuError::NotFound)?;
+            state.grouped_schema_ready.remove(&pin_dir);
+            Self::crash_if_requested(&mut state, "retire_ordinary_family_schema");
+            state.pinned_grouped_config.remove(&pin_dir);
+            Ok(true)
+        }
+
         fn grouped_datapath_usable(
             &self,
             ifindex: u32,
@@ -61863,7 +62947,7 @@ mod tests {
             };
             state.pinned_grouped_config.get(&attachment.pin_dir) == Some(&expected.encode())
                 && state.grouped_schema_ready.contains(&attachment.pin_dir)
-                && state.grouped_map_ready.contains(&ifindex)
+                && Self::family_maps_ready(&state, ifindex)
                 && !state.successor_pending.contains(&ifindex)
                 && state.uplink_filter_ready.contains(&ifindex)
                 && state.downlink_filter_ready.contains(&ifindex)
@@ -62438,6 +63522,33 @@ mod tests {
             Self::tft_datapath_is_exact(&self.state(), ifindex)
         }
 
+        fn tft_datapath_unavailable_reason(
+            &self,
+            ifindex: u32,
+        ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+            use crate::TftUplinkClassificationUnavailableReason as Reason;
+            let state = self.state();
+            if state.cleanup_only.contains(&ifindex) {
+                Some(Reason::CleanupOnly)
+            } else if state.successor_pending.contains(&ifindex) {
+                Some(Reason::SuccessorPending)
+            } else if state.attached.contains_key(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && Self::tft_identity_is_exact(&state, ifindex)
+                && !state
+                    .tft_schema
+                    .get(&ifindex)
+                    .is_some_and(tft_classifier_schema_is_current)
+            {
+                Some(Reason::SchemaNotCurrent)
+            } else if !Self::tft_datapath_is_exact(&state, ifindex) {
+                Some(Reason::DatapathNotCurrent)
+            } else {
+                None
+            }
+        }
+
         fn probe_environment(&self) -> EbpfEnvironment {
             self.environment
         }
@@ -62495,6 +63606,18 @@ mod tests {
                 && state.downlink_filter_ready.contains(&ifindex)
                 && !state.pin_identity_invalid.contains(&ifindex)
                 && !state.downlink_filter_foreign.contains(&ifindex)
+        }
+
+        fn traffic_gate_allows_packet_effects(&self, ifindex: u32) -> Result<bool, GtpuError> {
+            let state = self.state();
+            if !state.attached.contains_key(&ifindex) || state.successor_pending.contains(&ifindex)
+            {
+                return Err(state_indeterminate("fake_traffic_gate_readback"));
+            }
+            Ok(state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .is_some_and(|gate| *gate != 0 && *gate & 1 == 1))
         }
 
         fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool {
@@ -62561,6 +63684,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 
@@ -64692,6 +65816,544 @@ mod tests {
         );
     }
 
+    /// A TC invocation that copied the active selector before the fence may
+    /// still read its rows, so every attempt waits out such readers after the
+    /// fence is published and before it deletes a row.
+    #[tokio::test]
+    async fn tft_classifier_removal_waits_for_pre_fence_readers_before_deleting_rows() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let position = |operation| {
+            operations
+                .iter()
+                .position(|recorded| *recorded == operation)
+                .unwrap_or_else(|| panic!("{operation} is recorded"))
+        };
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|recorded| **recorded == "tft_reader_grace")
+                .count(),
+            1,
+            "one wait per attempt"
+        );
+        assert!(position("tft_meta_put") < position("tft_reader_grace"));
+        assert!(position("tft_reader_grace") < position("tft_filter_remove"));
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[test]
+    fn tft_classification_reasons_distinguish_environment_and_permissions() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        for (fault, expected) in [
+            ("platform", Reason::EnvironmentUnavailable),
+            ("bpffs", Reason::EnvironmentUnavailable),
+            ("btf", Reason::EnvironmentUnavailable),
+            ("net_admin", Reason::PermissionDenied),
+            ("bpf", Reason::PermissionDenied),
+        ] {
+            let mut runtime = FakeRuntime::new();
+            match fault {
+                "platform" => runtime.environment.platform_supported = false,
+                "bpffs" => runtime.environment.bpffs_present = false,
+                "btf" => runtime.environment.btf_present = false,
+                "net_admin" => runtime.environment.net_admin_capable = false,
+                "bpf" => runtime.environment.bpf_capable = false,
+                _ => unreachable!(),
+            }
+            let backend = EbpfGtpuDataplaneBackend::with_runtime(Arc::new(runtime));
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                Some(expected),
+                "{fault}"
+            );
+            assert_eq!(
+                backend.tft_uplink_classification_capability(),
+                expected.capability(),
+                "{fault}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classification_reasons_distinguish_managed_device_state() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        for (fault, expected) in [
+            ("no_device", Reason::NoManagedDevice),
+            ("grace", Reason::ReaderGraceUnavailable),
+            ("cleanup", Reason::CleanupOnly),
+            ("successor", Reason::SuccessorPending),
+            ("hook", Reason::DatapathNotCurrent),
+            ("schema", Reason::SchemaNotCurrent),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            if fault != "no_device" {
+                backend.create_device(create_request()).await.unwrap();
+                assert_eq!(backend.tft_uplink_classification_unavailable_reason(), None);
+            }
+            match fault {
+                "grace" => runtime.state().tft_reader_grace_unavailable = true,
+                "cleanup" => {
+                    backend
+                        .devices()
+                        .unwrap()
+                        .get_mut(&S2BU_IFINDEX)
+                        .unwrap()
+                        .cleanup_only = true
+                }
+                "successor" => {
+                    backend
+                        .devices()
+                        .unwrap()
+                        .get_mut(&S2BU_IFINDEX)
+                        .unwrap()
+                        .successor_pending = true
+                }
+                "hook" => {
+                    runtime.state().uplink_filter_ready.remove(&S2BU_IFINDEX);
+                }
+                "schema" => {
+                    runtime
+                        .state()
+                        .tft_schema
+                        .insert(S2BU_IFINDEX, [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+                }
+                "no_device" => {}
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                Some(expected),
+                "{fault}"
+            );
+            assert_eq!(
+                backend.tft_uplink_classification_capability(),
+                expected.capability(),
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn tft_reader_grace_prefers_global_without_probing_map() {
+        assert_eq!(
+            select_tft_reader_grace(true, || panic!("GLOBAL does not require a BPF map")),
+            Some(TftReaderGraceMethod::Global)
+        );
+        assert_eq!(select_tft_reader_grace(false, || false), None);
+    }
+
+    #[test]
+    fn tft_reader_grace_selects_map_when_global_is_unavailable() {
+        assert_eq!(
+            select_tft_reader_grace(false, || true),
+            Some(TftReaderGraceMethod::MapInMap)
+        );
+    }
+
+    /// nohz_full removes GLOBAL from QUERY. An available independent map
+    /// grace must still permit exact install and removal, with the actual
+    /// selected grace completed between the tombstone and row deletion.
+    #[tokio::test]
+    async fn tft_classifier_nohz_uses_map_grace_before_removal() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        {
+            let mut state = runtime.state();
+            state.tft_reader_grace_unavailable = true;
+            state.tft_map_reader_grace_available = true;
+        }
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Available
+        );
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let position = |operation| {
+            operations
+                .iter()
+                .position(|recorded| *recorded == operation)
+                .expect("removal must exercise this operation")
+        };
+        assert!(position("tft_meta_put") < position("tft_map_reader_grace"));
+        assert!(position("tft_map_reader_grace") < position("tft_filter_remove"));
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_map_grace_failure_preserves_fence_and_rows_for_retry() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        {
+            let mut state = runtime.state();
+            state.tft_reader_grace_unavailable = true;
+            state.tft_map_reader_grace_available = true;
+        }
+        let classifier = tft_classifier_with_two_filters();
+        backend
+            .reconcile_tft_uplink_classifier(classifier.clone())
+            .await
+            .unwrap();
+        let rows = runtime.state().tft_filters.clone();
+        runtime.state().operations.clear();
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_filters, rows);
+            assert!(state.operations.contains(&"tft_meta_put"));
+            assert!(!state.operations.contains(&"tft_filter_remove"));
+            assert!(!state.operations.contains(&"tft_meta_remove"));
+        }
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|op| *op == "tft_map_reader_grace")
+            .unwrap();
+        let delete = operations
+            .iter()
+            .position(|op| *op == "tft_filter_remove")
+            .unwrap();
+        assert!(grace < delete);
+    }
+
+    /// A reader can retain bank zero across the first replacement. Before
+    /// reusing that bank, the next replacement must wait before deleting or
+    /// overwriting any of its rows.
+    #[tokio::test]
+    async fn tft_classifier_bank_reuse_waits_before_any_row_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x42, 8, 17))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        runtime.state().operations.clear();
+        let replacement = tft_classifier(0x43, 9, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|operation| *operation == "tft_reader_grace")
+            .expect("bank reuse must complete a reader grace");
+        for mutation in ["tft_filter_remove", "tft_filter_put", "tft_meta_put"] {
+            let position = operations
+                .iter()
+                .position(|operation| *operation == mutation)
+                .expect("replacement must exercise this mutation");
+            assert!(grace < position, "reader grace must precede {mutation}");
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(replacement.link_ifindex(), replacement.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(replacement)
+        );
+    }
+
+    /// A failed bank-reuse grace must preserve both banks and the active
+    /// selector, allowing an exact retry without a partial replacement.
+    #[tokio::test]
+    async fn tft_classifier_bank_reuse_grace_failure_preserves_both_banks() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        for classifier in [tft_classifier(0x41, 7, 6), tft_classifier(0x42, 8, 17)] {
+            backend
+                .reconcile_tft_uplink_classifier(classifier)
+                .await
+                .unwrap();
+        }
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x43, 9, 6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        let state = runtime.state();
+        assert_eq!(state.tft_meta, meta);
+        assert_eq!(state.tft_filters, rows);
+        for mutation in ["tft_filter_remove", "tft_filter_put", "tft_meta_put"] {
+            assert!(!state.operations.contains(&mutation));
+        }
+    }
+
+    /// Without the reader grace a removal fence could never be finished, so
+    /// classification is not offered, and removal leaves the complete
+    /// classifier published without any mutation.
+    #[tokio::test]
+    async fn tft_classifier_removal_without_reader_grace_is_refused_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().tft_reader_grace_unavailable = true;
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Missing
+        );
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert!(matches!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_meta, meta);
+            assert_eq!(state.tft_filters, rows);
+            assert!(!state.operations.contains(&"tft_meta_put"));
+            assert!(!state.operations.contains(&"tft_filter_remove"));
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier.clone())
+        );
+
+        runtime.state().tft_reader_grace_unavailable = false;
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+    }
+
+    /// Without the reader grace a classifier could never be removed exactly,
+    /// so reconciliation admits no install or replacement and changes no map,
+    /// while an exact present classifier still reports `AlreadyPresent`.
+    #[tokio::test]
+    async fn tft_classifier_reconcile_without_reader_grace_is_refused_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        runtime.state().tft_reader_grace_unavailable = true;
+        runtime.state().operations.clear();
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        {
+            let state = runtime.state();
+            assert!(state.tft_meta.is_empty());
+            assert!(state.tft_filters.is_empty());
+            assert!(!state.operations.contains(&"tft_filter_put"));
+            assert!(!state.operations.contains(&"tft_meta_put"));
+        }
+
+        runtime.state().tft_reader_grace_unavailable = false;
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().tft_reader_grace_unavailable = true;
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_meta, meta);
+            assert_eq!(state.tft_filters, rows);
+            assert!(!state.operations.contains(&"tft_filter_put"));
+            assert!(!state.operations.contains(&"tft_meta_put"));
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
+        );
+    }
+
+    /// A failed reader wait leaves the published fence and every row. A
+    /// fence retried without the grace still deletes nothing, and a retry
+    /// with it waits again before its first deletion.
+    #[tokio::test]
+    async fn tft_classifier_removal_retries_a_failed_reader_wait_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let rows = runtime.state().tft_filters.clone();
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, rows);
+        assert!(!runtime.state().operations.contains(&"tft_filter_remove"));
+
+        runtime.state().tft_reader_grace_unavailable = true;
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, rows);
+        assert!(!runtime.state().operations.contains(&"tft_filter_remove"));
+
+        {
+            let mut state = runtime.state();
+            state.tft_reader_grace_unavailable = false;
+            state.operations.clear();
+        }
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|recorded| *recorded == "tft_reader_grace")
+            .expect("the retry waits for readers");
+        let first_delete = operations
+            .iter()
+            .position(|recorded| *recorded == "tft_filter_remove")
+            .expect("the retry deletes rows");
+        assert!(grace < first_delete);
+    }
+
     #[tokio::test]
     async fn tft_classifier_retries_after_filter_remove_ack_loss() {
         let (backend, runtime) = backend_with_fake();
@@ -65215,6 +66877,7 @@ mod tests {
                 bearer_mark: None,
                 egress_dscp: Some(crate::DscpCodepoint::new(18).unwrap()),
                 uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                downlink_inner_mtu: None,
             },
             IpAddr::V6(ipv6_local()),
         )
@@ -65234,6 +66897,7 @@ mod tests {
                 bearer_mark: None,
                 egress_dscp: None,
                 uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                downlink_inner_mtu: None,
             },
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
         )
@@ -65260,6 +66924,7 @@ mod tests {
                 bearer_mark: bearer_mark.and_then(GtpBearerMark::new),
                 egress_dscp: None,
                 uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                downlink_inner_mtu: None,
             },
             local_outer,
         )
@@ -67486,6 +69151,25 @@ mod tests {
                 feature: "legacy_ipv4_pdp_on_grouped_attachment"
             }
         ));
+        // An ordinary inner-IPv6 context names its own family.
+        let ordinary_ipv6 = GtpPdpContext {
+            ms_address: IpAddr::V6("2001:db8:45:1::".parse().unwrap()),
+            ..context()
+        };
+        assert!(matches!(
+            backend.install_pdp_context(ordinary_ipv6.clone()).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "ordinary_inner_ipv6_pdp_on_grouped_attachment"
+            })
+        ));
+        assert!(matches!(
+            backend
+                .remove_pdp_context(RemovePdpContextRequest::from_context(&ordinary_ipv6))
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "ordinary_inner_ipv6_pdp_on_grouped_attachment"
+            })
+        ));
 
         let group = grouped_group(
             11,
@@ -67528,10 +69212,12 @@ mod tests {
             ))
             .await
             .unwrap_err();
+        // The grouped entry is inner IPv6, so the ordinary removal names that
+        // family rather than the legacy IPv4 path.
         assert!(matches!(
             legacy_remove_error,
             GtpuError::UnsupportedFeature {
-                feature: "legacy_ipv4_pdp_on_grouped_attachment"
+                feature: "ordinary_inner_ipv6_pdp_on_grouped_attachment"
             }
         ));
         let grouped_after_legacy_remove = {
@@ -67675,6 +69361,13 @@ mod tests {
             .unwrap();
         assert_eq!(capabilities.outer_ipv4, GtpuCapability::Available);
         assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+        ));
+        // The kernel stack the handoff hands off to exists only on Linux.
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
             capabilities.downlink_outer_ipv4_fragment_handling,
             GtpuDownlinkFragmentContract::Unsupported
@@ -78763,6 +80456,473 @@ mod tests {
                 .await
                 .unwrap(),
             PdpContextInstallOutcome::Installed
+        );
+    }
+
+    /// Cleanup-only acquisition leaves the retained traffic gate at an even
+    /// (packet-inert) incarnation. Activation must re-enable it after the
+    /// hooks are attached, or the reattached programs pass every packet.
+    #[tokio::test]
+    async fn cleanup_only_activation_reenables_the_retained_traffic_gate() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        let fenced_gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(fenced_gate != 0 && fenced_gate & 1 == 0);
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        let active_gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(
+            active_gate & 1 == 1 && active_gate > fenced_gate,
+            "activation must enable a fresh traffic gate: {fenced_gate} -> {active_gate}"
+        );
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+
+    /// A failed gate enable rolls activation back: the hooks are detached
+    /// again, the gate is even, the device stays cleanup-only and fenced, and
+    /// a retry activates it.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_when_the_traffic_gate_cannot_be_enabled() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        {
+            let state = runtime.state();
+            assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+            let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+            assert!(
+                gate != 0 && gate & 1 == 0,
+                "rollback must leave the gate even: {gate}"
+            );
+        }
+        assert!(matches!(
+            recovered
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        ));
+
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        let gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert_eq!(gate & 1, 1);
+        assert!(runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+
+    /// If the gate cannot be restored to even after a failed enable, the
+    /// hooks are still detached and the outcome is indeterminate: the device
+    /// never keeps attached hooks behind a possibly odd gate.
+    #[tokio::test]
+    async fn cleanup_only_activation_detaches_when_the_gate_cannot_be_restored() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        runtime.fail_in_order(["traffic_observation_disable"]);
+        assert!(matches!(
+            recovered.activate_cleanup_recovery(&device).await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
+        let state = runtime.state();
+        assert!(
+            state.failures.is_empty(),
+            "the gate restore must be attempted"
+        );
+        assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
+    /// Acquire a retained graph cleanup-only and remove its stale context,
+    /// leaving it ready for activation.
+    async fn acquired_cleanup_only_device(
+        runtime: &Arc<FakeRuntime>,
+    ) -> (EbpfGtpuDataplaneBackend, GtpPdpContext, GtpDevice) {
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let installed = create_device_with_context(&backend).await;
+        drop(backend);
+        simulate_process_loss(runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        assert_eq!(
+            recovered
+                .remove_pdp_context_exact(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+        (recovered, installed, device)
+    }
+
+    /// A failed activation leaves the runtime and the backend agreeing that
+    /// the device is cleanup-only: both hooks detached, the traffic gate even,
+    /// installation fenced, and a retry able to activate it.
+    async fn assert_failed_activation_is_fenced_and_retryable(
+        runtime: &Arc<FakeRuntime>,
+        recovered: &EbpfGtpuDataplaneBackend,
+        installed: &GtpPdpContext,
+        failure: &str,
+    ) {
+        {
+            let state = runtime.state();
+            assert!(
+                state.cleanup_only.contains(&S2BU_IFINDEX),
+                "{failure}: the runtime must still hold the device cleanup-only"
+            );
+            assert!(
+                !state.uplink_filter_ready.contains(&S2BU_IFINDEX)
+                    && !state.downlink_filter_ready.contains(&S2BU_IFINDEX),
+                "{failure}: a failed activation must detach both hooks"
+            );
+            let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+            assert!(
+                gate != 0 && gate & 1 == 0,
+                "{failure}: a failed activation must leave the gate packet-inert: {gate}"
+            );
+        }
+        assert!(
+            matches!(
+                recovered
+                    .install_pdp_context_classified(installed.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable
+                )
+            ),
+            "{failure}: the backend must still hold the device cleanup-only"
+        );
+    }
+
+    async fn assert_activation_retry_forwards(
+        runtime: &Arc<FakeRuntime>,
+        recovered: &EbpfGtpuDataplaneBackend,
+        installed: GtpPdpContext,
+        device: &GtpDevice,
+        failure: &str,
+    ) {
+        recovered
+            .activate_cleanup_recovery(device)
+            .await
+            .unwrap_or_else(|error| panic!("{failure}: retry must activate: {error:?}"));
+        {
+            let state = runtime.state();
+            assert!(!state.cleanup_only.contains(&S2BU_IFINDEX), "{failure}");
+            assert!(
+                state.uplink_filter_ready.contains(&S2BU_IFINDEX),
+                "{failure}"
+            );
+            assert!(
+                state.downlink_filter_ready.contains(&S2BU_IFINDEX),
+                "{failure}"
+            );
+            assert_eq!(
+                state.traffic_observation_gate[&S2BU_IFINDEX] & 1,
+                1,
+                "{failure}"
+            );
+        }
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed,
+            "{failure}"
+        );
+    }
+
+    /// The activated graph is re-proven (interface, tc placement, exact
+    /// identity, executable PMTU policy) before the gate is enabled and the
+    /// activation committed. A failed re-proof, whether from a PMTU slot that
+    /// is no longer executable or any other re-proof failure, is rolled back
+    /// completely: never a forwarding datapath the backend still records as
+    /// cleanup-only, and never a device a retry reports as already active.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_a_failed_graph_reproof() {
+        for failure in ["non_executable_pmtu_slot", "injected_reproof_failure"] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let (recovered, installed, device) = acquired_cleanup_only_device(&runtime).await;
+            let executable = runtime.state().pmtu_policy[&S2BU_IFINDEX];
+            if failure == "non_executable_pmtu_slot" {
+                runtime
+                    .state()
+                    .pmtu_policy
+                    .insert(S2BU_IFINDEX, [0, 0, 0, 1]);
+            } else {
+                runtime.fail_in_order(["activate_cleanup_only_graph_identity"]);
+            }
+            let activation = recovered.activate_cleanup_recovery(&device).await;
+            // The re-proof reports a non-executable slot as indeterminate. An
+            // injected re-proof failure is returned unchanged, because the
+            // rollback is proven and no predecessor hook was replaced.
+            assert!(
+                if failure == "non_executable_pmtu_slot" {
+                    matches!(
+                        activation,
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_activate_cleanup_only"
+                        })
+                    )
+                } else {
+                    matches!(
+                        activation,
+                        Err(GtpuError::Io {
+                            operation: "activate_cleanup_only_graph_identity",
+                            kind: io::ErrorKind::Other,
+                            raw_os_error: None,
+                        })
+                    )
+                },
+                "{failure}: {activation:?}"
+            );
+            assert!(runtime.state().failures.is_empty(), "{failure}");
+            runtime.state().pmtu_policy.insert(S2BU_IFINDEX, executable);
+            assert_failed_activation_is_fenced_and_retryable(
+                &runtime, &recovered, &installed, failure,
+            )
+            .await;
+            assert_activation_retry_forwards(&runtime, &recovered, installed, &device, failure)
+                .await;
+        }
+    }
+
+    /// A failed quiescence proof is rolled back like a failed gate enable.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_a_failed_quiescence_proof() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let (recovered, installed, device) = acquired_cleanup_only_device(&runtime).await;
+        runtime.fail_in_order(["traffic_observation_quiescence"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        assert!(runtime.state().failures.is_empty());
+        assert_failed_activation_is_fenced_and_retryable(
+            &runtime,
+            &recovered,
+            &installed,
+            "quiescence",
+        )
+        .await;
+        assert_activation_retry_forwards(&runtime, &recovered, installed, &device, "quiescence")
+            .await;
+    }
+
+    /// The host sequence window follows the helper contract: it is dropped
+    /// only after the runtime reports that activation reset and enabled a
+    /// fresh kernel source. A failed activation keeps it.
+    #[tokio::test]
+    async fn cleanup_only_activation_drops_the_host_sequence_window_only_after_success() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let (recovered, _installed, device) = acquired_cleanup_only_device(&runtime).await;
+        let retained = |backend: &EbpfGtpuDataplaneBackend| {
+            backend
+                .inner
+                .traffic_observation_sequences
+                .lock()
+                .unwrap()
+                .get(&S2BU_IFINDEX)
+                .map(|window| window.high_water)
+        };
+        recovered
+            .inner
+            .traffic_observation_sequences
+            .lock()
+            .unwrap()
+            .insert(
+                S2BU_IFINDEX,
+                TrafficObservationSequenceWindow {
+                    high_water: 7,
+                    ..TrafficObservationSequenceWindow::default()
+                },
+            );
+        runtime.fail_in_order(["activate_cleanup_only_graph_identity"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        assert_eq!(
+            retained(&recovered),
+            Some(7),
+            "a failed activation must not drop the host high-water"
+        );
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        assert_eq!(
+            retained(&recovered),
+            None,
+            "a successful activation drops the host high-water"
+        );
+    }
+
+    /// Every fallible host step precedes the runtime commit. With the host
+    /// sequence window unavailable (its lock poisoned), activation fails
+    /// before the runtime is asked to activate, so the runtime never commits
+    /// a device that the backend still records as cleanup-only.
+    #[tokio::test]
+    async fn cleanup_only_activation_takes_the_host_sequence_window_before_the_runtime_commit() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let (recovered, _installed, device) = acquired_cleanup_only_device(&runtime).await;
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _window = recovered
+                    .inner
+                    .traffic_observation_sequences
+                    .lock()
+                    .unwrap();
+                panic!("poison the host traffic sequence window");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(recovered.inner.traffic_observation_sequences.is_poisoned());
+        let operations_before = runtime.state().operations.len();
+        let activation = recovered.activate_cleanup_recovery(&device).await;
+        assert!(
+            matches!(
+                activation,
+                Err(GtpuError::Io {
+                    operation: "ebpf_traffic_sequence",
+                    ..
+                })
+            ),
+            "{activation:?}"
+        );
+        let state = runtime.state();
+        assert!(
+            !state.operations[operations_before..].contains(&"activate_cleanup_only"),
+            "the runtime must not be asked to activate after a host step failed"
+        );
+        assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+        assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+        let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(gate != 0 && gate & 1 == 0, "{gate}");
+    }
+
+    /// Aya tc hooks and maps cannot be exercised in this unit-test target,
+    /// and no deterministic kernel fault exists that only the attach itself
+    /// creates. Pin the production commit order at the source level instead:
+    /// the attached graph (its tc placement included) is re-proven after the
+    /// hooks are attached and before the gate is enabled, and the activation
+    /// is committed only after the enable. A re-proof moved before the attach
+    /// would pass a corrupt PMTU slot test yet miss an inexact placement.
+    #[test]
+    fn cleanup_only_activation_reproves_the_attached_graph_before_the_commit() {
+        let source = include_str!("ebpf.rs");
+        let (_, aya_runtime) = source
+            .split_once("impl EbpfGtpuRuntime for AyaGtpuRuntime {")
+            .expect("Aya runtime implementation is present");
+        let (_, activation) = aya_runtime
+            .split_once("        fn activate_cleanup_only(")
+            .expect("Aya cleanup-only activation is present");
+        let (activation, _) = activation
+            .split_once("        fn teardown_drained_v2(")
+            .expect("Aya cleanup-only activation has a bounded body");
+        let steps = [
+            "Self::reset_traffic_observation_source(&mut device.ebpf)?",
+            "self.attach_programs_by_ifindex(",
+            "device.cleanup_only = false;",
+            "Self::selector_namespace_graph_identity(",
+            "Self::verify_traffic_observation_source_quiescent(",
+            "Self::enable_traffic_observation_source(",
+            "device.links = Some(attached.links);",
+        ];
+        let positions = steps
+            .iter()
+            .map(|step| {
+                assert_eq!(activation.matches(step).count(), 1, "{step}");
+                activation.find(step).expect("step is present")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "activation steps must run in this order: {steps:?}"
         );
     }
 

@@ -822,6 +822,8 @@ struct RemoteRotationPeer {
     target: SessionConsensusNodeId,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
+    lose_next_forward_reply: Arc<AtomicBool>,
+    lost_forward_replies: Arc<AtomicUsize>,
 }
 
 impl RemoteRotationPeer {
@@ -830,6 +832,8 @@ impl RemoteRotationPeer {
             target,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
+            lose_next_forward_reply: Arc::new(AtomicBool::new(false)),
+            lost_forward_replies: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -875,7 +879,15 @@ impl SessionConsensusPeer for RemoteRotationPeer {
             .await
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
-        Ok(handler.handle(request.sender, request).await)
+        let lose_reply = request.family
+            == crate::consensus::SessionConsensusRpcFamily::ForwardMutation
+            && self.lose_next_forward_reply.swap(false, Ordering::SeqCst);
+        let reply = handler.handle(request.sender, request).await;
+        if lose_reply {
+            self.lost_forward_replies.fetch_add(1, Ordering::SeqCst);
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        Ok(reply)
     }
 }
 
@@ -1315,6 +1327,81 @@ fn finite_remote_forward_preflight() -> RecordExpiryPreflight {
 }
 
 #[tokio::test]
+async fn activation_evidence_records_lost_remote_reply_without_replay() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let leader = cluster.current_leader();
+    let follower = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != leader)
+        .expect("three-member cluster has a follower");
+    let follower_store = &cluster.stores[follower];
+    let leader_store = &cluster.stores[leader];
+    let before = leader_store
+        .inner
+        .raft
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap();
+    let path = cluster
+        .paths
+        .get(&(follower, leader))
+        .expect("forward path");
+    path.lose_next_forward_reply.store(true, Ordering::SeqCst);
+    follower_store
+        .inner
+        .remote_forward_attempts
+        .store(0, Ordering::SeqCst);
+
+    let (result, failure) = super::activation_evidence::observe_capability_activation_for_test(
+        follower_store.activate_fenced_transition_capability(),
+    )
+    .await;
+    assert_eq!(result, Err(super::consensus_unavailable()));
+    assert_eq!(
+        failure.expect("actual remote response-loss branch").stage,
+        super::activation_evidence::CapabilityActivationFailureStageForTest::AfterTransmission
+    );
+    assert_eq!(path.lost_forward_replies.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        follower_store
+            .inner
+            .remote_forward_attempts
+            .load(Ordering::SeqCst),
+        1,
+        "the observed invocation must not replay after response loss"
+    );
+    assert_eq!(
+        leader_store.inner.raft.metrics().borrow().last_log_index,
+        Some(before + 1)
+    );
+    let (scope, voters) = leader_store.current_scope().expect("leader exact scope");
+    assert!(leader_store
+        .inner
+        .backend
+        .consensus_fenced_transition_activation_matches_scope(
+            leader_store.inner.storage_identity,
+            scope,
+            voters,
+        )
+        .await
+        .expect("read committed activation"));
+
+    // A separate invocation may resolve the exact durable certificate. It
+    // must not inherit the rejected invocation's diagnostic or append again.
+    let resolved = super::activation_evidence::observe_capability_activation_for_test(
+        follower_store.activate_fenced_transition_capability(),
+    )
+    .await;
+    assert_eq!(resolved, (Ok(()), None));
+    assert_eq!(
+        leader_store.inner.raft.metrics().borrow().last_log_index,
+        Some(before + 1)
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn capability_activation_follower_recovery_after_route_discovery_is_not_transmitted() {
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
     let cluster = RemoteRotationCluster::start().await;
@@ -1338,9 +1425,10 @@ async fn capability_activation_follower_recovery_after_route_discovery_is_not_tr
     let submission = tokio::spawn({
         let follower_store = follower_store.clone();
         async move {
-            follower_store
-                .activate_fenced_transition_capability_before(deadline)
-                .await
+            super::activation_evidence::observe_capability_activation_for_test(
+                follower_store.activate_fenced_transition_capability_before(deadline),
+            )
+            .await
         }
     });
 
@@ -1368,10 +1456,15 @@ async fn capability_activation_follower_recovery_after_route_discovery_is_not_tr
     .expect("assert follower recovery latch after route discovery");
     drop(hold);
 
+    let (result, failure) = submission.await.expect("activation task");
     assert!(matches!(
-        submission.await.expect("activation task"),
+        result,
         Err(crate::StoreError::BackendUnavailable(_))
     ));
+    assert_eq!(
+        failure.expect("actual pre-transmission rejection").stage,
+        super::activation_evidence::CapabilityActivationFailureStageForTest::PreTransmitAuthority
+    );
     assert_eq!(
         follower_store
             .inner

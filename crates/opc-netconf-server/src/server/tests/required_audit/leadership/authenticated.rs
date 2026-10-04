@@ -320,8 +320,15 @@ impl NetworkQuorum {
     }
 
     async fn leader_except(&self, excluded: Option<usize>) -> usize {
-        tokio::time::timeout(TRANSITION_TIMEOUT, async {
+        let mut scans = 0_u64;
+        let mut probes = 0_u64;
+        let mut activity_waits = 0_u64;
+        let mut proving = None;
+        let mut observations = [None; 3];
+        let mut outcomes = [None; 3];
+        let result = tokio::time::timeout(TRANSITION_TIMEOUT, async {
             loop {
+                scans = scans.saturating_add(1);
                 let activity = self.activity.notified();
                 tokio::pin!(activity);
                 activity.as_mut().enable();
@@ -330,20 +337,40 @@ impl NetworkQuorum {
                         continue;
                     }
                     let status = store.status();
-                    if status.leader_id == Some(status.node_id)
-                        && matches!(
-                            store.ensure_local_authority().await,
-                            ConfigLocalAuthorityOutcome::LocalAuthority
-                        )
-                    {
-                        return index;
+                    // Cache only existing observations: no additional status
+                    // read, authority probe, wakeup, or payload in diagnostics.
+                    observations[index] = Some((
+                        status.node_id,
+                        status.term,
+                        status.leader_id,
+                        status.applied_index,
+                        status.committed_index,
+                        status.admitted,
+                    ));
+                    if status.leader_id == Some(status.node_id) {
+                        proving = Some(index);
+                        probes = probes.saturating_add(1);
+                        let outcome = store.ensure_local_authority().await;
+                        outcomes[index] = Some(outcome);
+                        proving = None;
+                        if matches!(outcome, ConfigLocalAuthorityOutcome::LocalAuthority) {
+                            return index;
+                        }
                     }
                 }
+                activity_waits = activity_waits.saturating_add(1);
                 activity.await;
             }
         })
-        .await
-        .expect("authenticated quorum did not establish fresh local authority")
+        .await;
+        result.unwrap_or_else(|error| {
+            panic!(
+                "authenticated quorum did not establish fresh local authority: {error:?}; \
+                 excluded={excluded:?} scans={scans} probes={probes} \
+                 activity_waits={activity_waits} proving={proving:?} \
+                 observations={observations:?} outcomes={outcomes:?}"
+            )
+        })
     }
 
     fn isolate(&self, node: usize) {
@@ -464,6 +491,34 @@ async fn assert_authentication_controls(
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partitioned_authority_timeout_reports_observed_voter_state() {
+    let quorum = NetworkQuorum::open().await;
+    let first_node = quorum.stores[0].status().node_id;
+    let result = AssertUnwindSafe(async {
+        let (one, two, three) = tokio::join!(
+            quorum.stores[0].initialize_cluster(),
+            quorum.stores[1].initialize_cluster(),
+            quorum.stores[2].initialize_cluster(),
+        );
+        one.unwrap();
+        two.unwrap();
+        three.unwrap();
+        for node in 0..3 {
+            quorum.isolate(node);
+        }
+        quorum.leader_except(None).await
+    })
+    .catch_unwind()
+    .await;
+    quorum.shutdown().await;
+    assert_authority_timeout_observed(
+        result,
+        "authenticated quorum did not establish fresh local authority",
+        first_node,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

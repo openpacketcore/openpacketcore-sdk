@@ -377,6 +377,20 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         GtpuCapability::Missing
     }
 
+    /// Explain a current non-Available TFT capability without exposing values.
+    ///
+    /// Existing implementations inherit a coarse reason from their capability
+    /// method. Native adapters may provide a more specific prerequisite or
+    /// state reason. `None` means Available at the time of this observation;
+    /// neither this method nor the older capability method authorizes a write.
+    fn tft_uplink_classification_unavailable_reason(
+        &self,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        crate::TftUplinkClassificationUnavailableReason::for_capability(
+            self.tft_uplink_classification_capability(),
+        )
+    }
+
     /// Validate whether one complete TFT classifier can be represented by this
     /// backend without changing runtime state.
     ///
@@ -433,6 +447,12 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Absence is idempotent, foreign complete ownership is `Conflict`, and
     /// partial, mixed, stale, or otherwise unprovable state is `Indeterminate`.
+    ///
+    /// Removal never interrupts default-bearer uplink: while a classifier
+    /// with a default bearer is being removed, including after an
+    /// interrupted removal, every unmarked packet it owns is forwarded as
+    /// either the complete classifier or its absent successor forwards it. A
+    /// classifier without a default bearer keeps dropping until it is absent.
     async fn remove_tft_uplink_classifier_exact(
         &self,
         _expected: TftUplinkClassifier,
@@ -1267,6 +1287,21 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         Ok(GtpuCapability::Missing)
     }
 
+    /// Report support for PDP contexts whose inner UE address is IPv6.
+    ///
+    /// `Available` means [`Self::install_pdp_context`],
+    /// [`Self::install_pdp_context_classified`], [`Self::read_pdp_context`],
+    /// [`Self::remove_pdp_context`] and [`Self::remove_pdp_context_exact`]
+    /// accept an IPv6 `ms_address` naming the PDN connection's /64 prefix
+    /// (TS 23.401 clause 5.3.1.2.2, TS 29.274 clause 8.14) and match every
+    /// packet address inside that prefix. An IPv4v6 PDN connection is two
+    /// family-scoped contexts, one per inner family, which may share the
+    /// bearer's TEIDs, peer and mark. This coarse report grants no attachment
+    /// or mutation authority; every mutation still revalidates it.
+    fn pdp_inner_ipv6_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
     /// Report support for the authority-bearing durable restart-recovery
     /// request independently of generationless exact removal.
     fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
@@ -1331,6 +1366,27 @@ mod tests {
     #[derive(Debug)]
     struct LegacyExternalBackend;
 
+    #[test]
+    fn tft_unavailable_reason_default_tracks_existing_capability() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        let backend = crate::MockGtpuDataplaneBackend::new();
+        for (capability, reason) in [
+            (GtpuCapability::Available, None),
+            (GtpuCapability::Missing, Some(Reason::BackendUnavailable)),
+            (GtpuCapability::Unknown, Some(Reason::BackendUnknown)),
+            (
+                GtpuCapability::PermissionDenied,
+                Some(Reason::PermissionDenied),
+            ),
+        ] {
+            backend.set_tft_uplink_classification_capability(capability);
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                reason
+            );
+        }
+    }
+
     #[async_trait]
     impl GtpuDataplaneBackend for LegacyExternalBackend {
         async fn create_device(
@@ -1367,6 +1423,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_external_implementer_gets_fail_closed_defaults() {
         let backend: Box<dyn GtpuDataplaneBackend> = Box::new(LegacyExternalBackend);
+        assert_eq!(
+            backend.tft_uplink_classification_unavailable_reason(),
+            Some(crate::TftUplinkClassificationUnavailableReason::BackendUnavailable)
+        );
         assert_eq!(
             backend.pdp_context_reconciliation_capabilities(),
             PdpContextReconciliationCapabilities::unsupported()
@@ -1429,6 +1489,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         assert!(matches!(
             backend.acquire_pdp_live_writer_proof().await,

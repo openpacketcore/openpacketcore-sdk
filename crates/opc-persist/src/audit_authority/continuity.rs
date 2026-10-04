@@ -15,6 +15,13 @@ pub use export::{
     AuditExportVerifier, VerifiedAuditExport,
 };
 
+mod recipient;
+pub use recipient::{
+    AuditRecipientClient, AuditRecipientExportSession, AuditRecipientSessionBinding,
+    AuditRecipientVerificationReport, AuditRecipientVerificationRequest,
+    CompletedAuditRecipientVerification,
+};
+
 #[cfg(test)]
 mod tests;
 

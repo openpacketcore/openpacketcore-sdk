@@ -1851,8 +1851,12 @@ impl PinnedSqliteFile {
         let _child_launch = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
             .read()
             .expect("test snapshot-seal gate remains available");
-        let digest = opc_fs_verity_sys::enable_fixed_profile(self.file.as_fd())
-            .map_err(fs_verity_enable_error)?;
+        let enabled = opc_fs_verity_sys::enable_fixed_profile(self.file.as_fd());
+        #[cfg(test)]
+        if let Err(error) = &enabled {
+            crate::test_process::record_snapshot_seal_failure(&self.file, error);
+        }
+        let digest = enabled.map_err(fs_verity_enable_error)?;
         let metadata = self.file.metadata()?;
         self.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
