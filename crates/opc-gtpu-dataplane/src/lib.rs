@@ -8,6 +8,9 @@
 //! GTP-C/PFCP control plane, route steering, XFRM policy, namespace
 //! management, or deployment policy; GTP-U packet handling itself lives in
 //! the committed eBPF datapath object and `opc-gtpu-ebpf-common`.
+//! The experimental [`n3`] module adds software G-PDU/PSC packet helpers and
+//! directional intent types; all shipped backends report N3 forwarding as
+//! unavailable, independently of those packet helpers.
 //!
 //! The additive reconciliation contract provides typed lookup by local TEID or
 //! uplink identity, dual-selector classified install, and capability-gated
@@ -53,15 +56,19 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod control_port;
 pub mod ebpf;
 pub mod error;
 pub mod icmp;
+mod inner_fragment;
 pub mod linux;
 pub mod mock;
 pub mod model;
+pub mod n3;
 pub mod reassembly;
 pub mod selector_namespace;
 mod selector_namespace_v2;
+pub mod testkit;
 pub mod tft_classifier;
 pub mod traffic_observation;
 pub mod unsupported;
@@ -107,11 +114,12 @@ pub use model::{
     DrainedV2TeardownProgress, DrainedV2TeardownRefusal, DrainedV2TeardownRequest,
     EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration, GtpAddressFamily, GtpBearerMark,
     GtpDevice, GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuIpFamilyCapabilities,
-    GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
-    GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup,
-    GtpuSessionGroupConflict, GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason,
-    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuDownlinkInnerMtu,
+    GtpuDownlinkOversizePolicy, GtpuIpFamilyCapabilities, GtpuLocalEndpointSet,
+    GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds, GtpuSessionAttachmentSelector,
+    GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup, GtpuSessionGroupConflict,
+    GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionModelError,
     GtpuSessionPaa, GtpuSessionSelectorProvenance, GtpuSessionSelectorReuseEvidence,
     GtpuSessionSelectorReuseProof, GtpuSourcePortPolicy, GtpuSourcePortRange,
@@ -168,24 +176,29 @@ pub use reassembly::{
     GtpuKernelReassemblyStatsError, GtpuReassemblySocket,
 };
 pub use reassembly::{
-    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
-    GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
-    GtpuReassemblyPdr, GtpuReassemblySelector,
+    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuDecapsulatedDownlink,
+    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkPacketTooBig,
+    GtpuFragmentedDownlink, GtpuInnerFragmentRateLimit, GtpuPacketTooBigRateLimit,
+    GtpuPacketTooBigSignal, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
+    GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
 };
 pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
 pub use selector_namespace::{
-    GtpuSessionSelectorActiveClaim, GtpuSessionSelectorAdmission,
+    GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt,
+    GtpuN3EndMarkerRequest, GtpuSessionSelectorActiveClaim, GtpuSessionSelectorAdmission,
     GtpuSessionSelectorAuthorityGeneration, GtpuSessionSelectorBackendBinding,
     GtpuSessionSelectorBackendReceipt, GtpuSessionSelectorBindingLease,
-    GtpuSessionSelectorCoordinatorError, GtpuSessionSelectorDecommissionInspectRequest,
-    GtpuSessionSelectorDecommissionReadbackRequest, GtpuSessionSelectorDecommissionRequest,
-    GtpuSessionSelectorEffectRequest, GtpuSessionSelectorInstallingNoEffectRequest,
-    GtpuSessionSelectorNamespaceAuthority, GtpuSessionSelectorNamespaceError,
-    GtpuSessionSelectorOperation, GtpuSessionSelectorProvisionRequest,
+    GtpuSessionSelectorConcurrentNamespace, GtpuSessionSelectorCoordinatorError,
+    GtpuSessionSelectorDecommissionInspectRequest, GtpuSessionSelectorDecommissionReadbackRequest,
+    GtpuSessionSelectorDecommissionRequest, GtpuSessionSelectorEffectRequest,
+    GtpuSessionSelectorInstallingNoEffectRequest, GtpuSessionSelectorNamespaceAuthority,
+    GtpuSessionSelectorNamespaceError, GtpuSessionSelectorOperation,
+    GtpuSessionSelectorPristineReadbackRequest, GtpuSessionSelectorProvisionRequest,
     GtpuSessionSelectorReadbackRequest, GtpuSessionSelectorRemovalRequest,
     GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorRetiringNoEffectRequest,
     GtpuSessionSelectorReuseAuthorization, GtpuSessionSelectorReuseReceipt,
-    GtpuSessionSelectorReuseRequest,
+    GtpuSessionSelectorReuseRequest, GtpuSessionSelectorUnadmittedClaim,
+    GTPU_SHARED_PAA_MAX_LIVE_BEARERS,
 };
 #[cfg(test)]
 pub(crate) use selector_namespace::{
@@ -199,8 +212,10 @@ pub use selector_namespace_v2::{
     GtpuSessionSelectorRetiredDrainRequest,
 };
 pub use tft_classifier::{
-    TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
-    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,
+    TftUplinkBearer, TftUplinkClassification, TftUplinkClassificationUnavailableReason,
+    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome, TftUplinkDropReason, TftUplinkPaaSet,
+    TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
 };
 pub use traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
@@ -235,6 +250,7 @@ mod integration_tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 

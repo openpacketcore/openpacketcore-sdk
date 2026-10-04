@@ -962,7 +962,7 @@ impl LocalAuthorityRegistry {
     pub(crate) fn permit_for_publication(
         &self,
         call: &EstablishedPublicationCall<'_>,
-    ) -> Result<LocalAuthorityPermit, ()> {
+    ) -> Result<LocalAuthorityPermit, PublicationAuthorityCheckError> {
         let publication = call.authority();
         let current = publication.current_authority();
         let key = LocalAuthorityKey {
@@ -971,9 +971,16 @@ impl LocalAuthorityRegistry {
             roster_id: publication.roster_id(),
             admission_commitment: publication.admission_commitment(),
         };
-        let mut entries = self.lock_entries(&key).map_err(|_| ())?;
+        let mut entries = self.inner.entries[self.shard_index(&key)]
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => PublicationAuthorityCheckError::Unavailable,
+                std::sync::TryLockError::Poisoned(_) => PublicationAuthorityCheckError::Rejected,
+            })?;
         self.prune_expired_locked(&mut entries);
-        let entry = entries.get(&key).ok_or(())?;
+        let entry = entries
+            .get(&key)
+            .ok_or(PublicationAuthorityCheckError::Rejected)?;
         if entry.registration != Some(publication.current_registration())
             || entry.authority != *current
             || call.roster_id() != publication.roster_id()
@@ -983,7 +990,7 @@ impl LocalAuthorityRegistry {
             || call.current_fence() != current.fence()
             || !self.current_at(&entry.authority)
         {
-            return Err(());
+            return Err(PublicationAuthorityCheckError::Rejected);
         }
         Ok(LocalAuthorityPermit {
             key,
@@ -991,6 +998,18 @@ impl LocalAuthorityRegistry {
             authority: entry.authority.clone(),
             generation: entry.generation,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn lock_publication_shard_for_test<'a>(
+        &'a self,
+        call: &EstablishedPublicationCall<'_>,
+    ) -> impl Sized + 'a {
+        let permit = self
+            .permit_for_publication(call)
+            .expect("test publication authority is current before contention");
+        self.lock_entries(&permit.key)
+            .expect("test publication shard is initially free")
     }
 
     /// Hold the exact publication authority shard while accepting provider
@@ -3223,14 +3242,22 @@ impl fmt::Debug for CurrentPublicationAuthorityRead<'_> {
 /// command or otherwise mutate consensus state.
 #[async_trait]
 pub(crate) trait PublicationAuthorityReader: Send + Sync {
-    /// Backend-local error whose details never cross the publication adapter.
-    type Error: Send + Sync + 'static;
-
     /// Read and authenticate one exact current publication authority.
     async fn read_current_publication_authority(
         &self,
         request: CurrentPublicationAuthorityRead<'_>,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), PublicationAuthorityCheckError>;
+}
+
+/// Fixed classification of a local or backend publication precheck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationAuthorityCheckError {
+    /// The check rejected the exact capability; it must not be retried as a
+    /// temporary availability failure.
+    Rejected,
+    /// The check could not currently establish authority. No authority or
+    /// provider non-transmission evidence is granted by this result.
+    Unavailable,
 }
 
 fn validate_terminal_request_shape(
@@ -4913,6 +4940,17 @@ where
                 .get(index)
                 .cloned()
                 .ok_or(ExecutorError::InvalidMember)?;
+            // Only a previously retained Applied proof can identify an
+            // ambiguous compensation. The first authenticated Applied result
+            // after admission/effect recovery has not dispatched an inverse.
+            let recovering_compensation = prior_attempt == LocalAttempt::OutcomeUnknown
+                && matches!(
+                    first_conclusive.as_ref(),
+                    Some(ConclusiveObservation {
+                        outcome: ProviderOutcome::AppliedExecuted | ProviderOutcome::AppliedAdopted,
+                        ..
+                    })
+                );
             let compensation = local
                 .compensations
                 .get(index)
@@ -5096,8 +5134,7 @@ where
                     ..
                 })
             ) && compensation.is_none()
-                && (prior_attempt == LocalAttempt::OutcomeUnknown
-                    || task.operation == ProviderOperation::Compensate);
+                && (recovering_compensation || task.operation == ProviderOperation::Compensate);
             let has_conclusive = first_conclusive.is_some();
             let attempt = local
                 .attempts
@@ -6078,6 +6115,8 @@ mod local_authority_registry_tests {
 
 #[cfg(test)]
 mod production_runtime_cut_matrix_tests {
+    mod async_provider_authority_tests;
+
     use super::*;
     use crate::fenced_mutation_roster::canonical::{
         AdmissionProposal, EstablishedMutation, MemberCall, MemberOperationId, Profile,
@@ -8882,6 +8921,103 @@ mod production_runtime_cut_matrix_tests {
                 .phase(),
             Phase::Aborted
         );
+    }
+
+    async fn first_recovered_applied_observation_can_compensate(adopt: bool) {
+        let request = request_with_members(2);
+        let provider = Arc::new(CompensationProvider::new(
+            CompensationMode::ConclusiveThenStaleAppliedStatus,
+        ));
+        let backend = Arc::new(CutBackend::default());
+        let first = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let registration = first.register(request.clone()).await.expect("admitted");
+        drop(registration);
+        drop(first);
+
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let recovered = recovered(second.recover(recovery).await.expect("current recovery"));
+        let applied = if adopt {
+            second.adopt(&recovered, 0).await
+        } else {
+            second.status(&recovered, 0).await
+        };
+        let _applied = conclusive(applied.expect("first authenticated applied observation"));
+        assert!(matches!(
+            second.prepare(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            second.execute(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            second.compensate_member(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 0);
+
+        let not_applied = conclusive(
+            second
+                .reconcile_member(&recovered, 1)
+                .await
+                .expect("complete aborting roster"),
+        );
+        assert!(matches!(
+            second.compensate_member(&recovered, 0).await,
+            Ok(CallResult::OutcomeUnknown)
+        ));
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+
+        // Once an inverse was actually dispatched, re-observing Applied must
+        // not reauthorize it. Only exact compensation recovery can settle it.
+        let still_applied = if adopt {
+            second.adopt(&recovered, 0).await
+        } else {
+            second.status(&recovered, 0).await
+        };
+        let _still_applied = conclusive(still_applied.expect("retained applied observation"));
+        assert!(matches!(
+            second.compensate_member(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+
+        let compensated = conclusive(
+            second
+                .reconcile_member(&recovered, 0)
+                .await
+                .expect("exact final compensation"),
+        );
+        assert_eq!(
+            second
+                .prepare_terminal(&recovered, vec![compensated, not_applied])
+                .await
+                .expect("complete aborted terminal")
+                .body
+                .phase(),
+            Phase::Aborted
+        );
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_first_applied_adoption_can_compensate_an_aborting_roster() {
+        first_recovered_applied_observation_can_compensate(true).await;
+    }
+
+    #[tokio::test]
+    async fn recovered_first_applied_status_can_compensate_an_aborting_roster() {
+        first_recovered_applied_observation_can_compensate(false).await;
     }
 
     #[tokio::test]

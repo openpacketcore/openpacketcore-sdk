@@ -652,11 +652,9 @@ fn select_module(capability: CryptoCapability) -> Result<ModuleSelection, Ikev2C
     Ok(ModuleSelection(installed))
 }
 
-pub(crate) fn execute_prf(
+fn select_prf_module(
     algorithm: Ikev2PrfAlgorithm,
-    key: &[u8],
-    data: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
+) -> Result<ModuleSelection, Ikev2CryptoModuleError> {
     let selected = select_module(CryptoCapability::IkePrf)?;
     if !selected.prf_admitted(algorithm) {
         return Err(algorithm_not_admitted());
@@ -665,6 +663,22 @@ pub(crate) fn execute_prf(
     if !selected.module().supports_prf(mapped) {
         return Err(algorithm_unsupported());
     }
+    Ok(selected)
+}
+
+pub(crate) fn check_prf_admission(
+    algorithm: Ikev2PrfAlgorithm,
+) -> Result<(), Ikev2CryptoModuleError> {
+    select_prf_module(algorithm).map(|_| ())
+}
+
+pub(crate) fn execute_prf(
+    algorithm: Ikev2PrfAlgorithm,
+    key: &[u8],
+    data: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
+    let selected = select_prf_module(algorithm)?;
+    let mapped = map_prf(algorithm);
     let output = selected
         .module()
         .prf(mapped, key, data)
@@ -679,14 +693,8 @@ pub(crate) fn execute_prf_plus(
     seed: &[u8],
     output_len: usize,
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
-    let selected = select_module(CryptoCapability::IkePrf)?;
-    if !selected.prf_admitted(algorithm) {
-        return Err(algorithm_not_admitted());
-    }
+    let selected = select_prf_module(algorithm)?;
     let mapped = map_prf(algorithm);
-    if !selected.module().supports_prf(mapped) {
-        return Err(algorithm_unsupported());
-    }
     let output = selected
         .module()
         .prf_plus(mapped, key, seed, output_len)

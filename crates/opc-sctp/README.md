@@ -27,6 +27,9 @@ Diameter transports are outside the current crate boundary.
 - Messaging: `OutboundMessage`, `InboundMessage`, `SctpEvent`,
   `SctpPeerAddrState`, `SctpAuthenticationIndication`, `SctpEndpoint`,
   `SctpAssociation`, and its exclusive send/receive halves.
+- N2 framing: `n2::UnprotectedN2Profile`, `n2::UnprotectedN2Association`,
+  `n2::N2Inbound`, `n2::N2Error`, and `n2::NGAP_DEFAULT_PORT` provide strict
+  PPID-60 framing with bounded, redacted diagnostics.
 - SCTP-AUTH lifecycle: `SctpAuthKeyId`, zeroizing `SctpAuthKey`, typed AUTH
   events, active-key selection, confirmed old-key retirement, and bounded
   `SctpSenderDrainOutcome` waits.
@@ -48,18 +51,68 @@ Diameter transports are outside the current crate boundary.
 
 ```rust,no_run
 use bytes::Bytes;
-use opc_sctp::{
-    OutboundMessage, SctpAssociation, SctpConnectConfig, SctpError, NGAP_PPID,
-};
+use opc_sctp::n2::{N2Error, UnprotectedN2Association};
 
-async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), SctpError> {
-    let assoc = SctpAssociation::connect(SctpConnectConfig::new(remote)).await?;
-    assoc
-        .send(OutboundMessage::ordered(payload, 0, NGAP_PPID))
-        .await?;
+async fn send_ngap(
+    association: &UnprotectedN2Association,
+    stream_id: u16,
+    payload: Bytes,
+) -> Result<(), N2Error> {
+    association.send(payload, stream_id).await?;
     Ok(())
 }
 ```
+
+### Strict unprotected N2 framing
+
+Connect with `UnprotectedN2Association::connect(SctpConnectConfig)` or consume
+an accepted association with `from_association`. The adapter preserves the
+existing SCTP receive bound, ordered address configuration, cancellation
+ownership and exact address readback. `n2::default_destination(ip)` selects
+service port 38412; an explicit configured port is retained for additional
+TNL associations. Retain the association for the caller's transport lifetime.
+
+The adapter emits ordered PPID 60 DATA on the selected stream. Receive admits
+only complete ordered PPID 60 records, rejects truncated ancillary metadata,
+and returns transport notifications separately as `N2Inbound::Notification`.
+PPID 66 DATA is rejected without a compatibility mode. Payload bounds apply
+to DATA, not the independent notification envelope. Any inbound framing or
+transport error aborts the association. Drop also closes it when an abort
+handle survives. Invalid local send payloads fail before transmission.
+
+`UnprotectedN2Profile` exposes the same record checks for other backends, which
+remain responsible for faithful metadata and record boundaries. Its outbound
+wrapper has redacted diagnostics; explicitly converting it to the generic
+SCTP message transfers payload-handling responsibility to the backend caller.
+None of these types decodes NGAP, proves protection, selects AMFs or assigns
+UE/non-UE streams. Use `N2AssociationOwner` when association generations and
+bounded reconnect are required.
+See [CONFORMANCE.md](CONFORMANCE.md) for the exact scope and evidence.
+
+### N2 association generations
+
+`N2AssociationOwner::connect_candidate(config, bounds)` connects within an
+explicit `N2ReconnectPolicy`. `candidate(association)` consumes an already
+connected/accepted adapter. Neither candidate can send or receive. Explicit
+`promote(candidate)` grants an affine `N2Generation`; competing candidates
+based on the same owner state have exactly one winner. Losing candidates close.
+Retain the returned generation for its transport lifetime: dropping a current
+token retires it, while dropping a stale token cannot close its successor.
+
+Pass that exact token to `send`, `recv`, `readback`, `set_primary_peer_path` or
+`retire`. Replacement cancels pending I/O and stale tokens fail before transport
+admission. Bytes submitted before replacement may already have reached the
+peer. Terminal notifications retire the generation before returning a tagged
+`N2Received`; they never authorize a new generation. Reconnection and promotion
+remain explicit caller decisions. `close` permanently closes this owner.
+
+The owner requires Linux lifecycle event subscriptions. Stream resets retain
+exact direction, outcome and up to 64 explicit IDs; oversized or malformed
+notifications fail closed. The owner observes reconfiguration but does not
+enable or originate RFC 6525 requests. It does not infer NGAP stream bindings,
+AMF preference or peer authentication. Address lists and path snapshots are
+exact readback metadata; Debug and errors remain redacted. See
+[N2-LIFECYCLE.md](N2-LIFECYCLE.md) for support limits and evidence.
 
 ### Diameter connect progress across an application timeout
 
@@ -123,15 +176,34 @@ the socket scratch. After a successful receive, the SDK zeroizes exactly the
 kernel-reported scratch prefix before the next chunk or return, so small
 successful messages do not incur a full 64 KiB clear. If the receive syscall
 fails, there is no reliable byte count; the SDK conservatively zeroizes the
-entire offered scratch slice (up to 64 KiB) before returning the error. Partial
-accumulated records are also cleared if an error or cancellation drops them.
-The scratch allocation is released and fully cleared when the socket is
-dropped.
+entire offered scratch slice (up to 64 KiB) before returning the error. The
+scratch allocation is released and fully cleared when the socket is dropped.
 
-Receive futures remain non-cancellation-safe after consuming the first chunk of
-a multi-chunk SCTP record: canceling at that point can leave the kernel's
-remaining partial delivery for the next caller. This ordering contract is
-unchanged by scratch reuse.
+Partial DATA belongs to the socket. Cancelling a receive, including while
+another receiver is queued, preserves every consumed prefix and the original
+cumulative byte bound for the next caller. The socket receive owner also
+preserves the prefix on recoverable readiness errors, as exposed by one-to-many
+endpoint receive. The one-to-one association API retains its existing policy
+of closing on any returned receive error, which clears that prefix. Terminal
+receive errors, explicit close, and socket drop
+clear partial data; close can clear it while receive I/O is pending. There is no
+background reader or automatic timeout: an idle partial record remains bounded
+and owned until receive resumes, the socket closes, or the socket is dropped.
+
+Complete path, sender-dry, and authentication notifications remain visible
+without consuming the DATA byte budget or discarding its prefix. Association
+change and shutdown notifications invalidate a partial record for the affected
+association. Unknown, malformed, or truncated notifications during partial
+DATA fail closed because their effect on the record boundary is ambiguous.
+Fully present ancillary metadata must agree on association, stream, PPID,
+ordering and (for ordered DATA) SSN across chunks. TSN progress and unordered
+SSN differences remain valid. Existing DATA truncation flags still propagate;
+a caller must reject them before treating metadata as authoritative.
+
+These receive guarantees are composed by the typed N2 owner in
+[#788](https://github.com/openpacketcore/openpacketcore-sdk/issues/788).
+The [receive conformance scope](CONFORMANCE.md) records the standards baseline,
+synthetic schedules, native checks and N2 support limits.
 
 ### Multihoming path events and health
 
@@ -159,9 +231,9 @@ and preserves the last known designation rather than applying a possibly stale
 address.
 Health therefore reflects notifications consumed by the application; it is not
 a separate background socket reader. Concurrent active association receives
-are serialized so path events are applied in kernel receive order. Receive
-futures remain non-cancellation-safe after they begin consuming a multi-chunk
-record. IPv6 flow information is ignored for path identity because
+are serialized so path events are applied in kernel receive order. Cancelled
+receives retain partial DATA as described above. IPv6 flow information is
+ignored for path identity because
 system-produced socket addresses may represent it in raw host form; IP address,
 port, and scope ID identify the path.
 
@@ -461,6 +533,7 @@ this crate.
 
 ```sh
 cargo test -p opc-sctp
+cargo test --locked -p opc-sctp --lib -- --ignored --exact n2::tests::native::unprotected_n2_profile --nocapture --test-threads=1
 cargo test -p opc-libsctp-sys linux::tests::loopback_path_tuning_and_primary_selection -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_static_multihoming_binds_and_connects_full_sets -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_diameter_recv_surfaces_transport_notification -- --ignored --exact

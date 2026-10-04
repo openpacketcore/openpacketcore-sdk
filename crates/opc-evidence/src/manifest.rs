@@ -9,7 +9,7 @@ use crate::EvidenceError;
 pub fn compute_digest(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Manifest entry for a single file or artifact inside an evidence bundle.

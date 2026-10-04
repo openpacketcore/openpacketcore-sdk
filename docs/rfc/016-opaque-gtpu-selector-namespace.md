@@ -83,8 +83,9 @@ after a complete durable namespace transaction.
   traffic admission, readiness, drain, retry, and deployment policy.
 - A product's persistence provider, retention tier, key-custody choice, or
   operator workflow, subject to this RFC's durability and conformance rules.
-- Per-selector mixed provenance and same-group republish. They require a
-  distinct proposal tracked by issue #663.
+- General per-selector mixed provenance and same-group republish. They require
+  RFC 017, tracked by issue #663. Section 5.4 defines a bounded single-bearer
+  reattach profile inside the existing one-successor lifecycle.
 - Rebinding traffic-proof authority after a selector authority change. That is
   distinct work tracked by issue #664.
 - A claim that reconcile/readback proves forwarding traffic, a carrier
@@ -403,6 +404,15 @@ entries in IPv4-then-IPv6 order; for each entry:
   egress DSCP tag (0=none, 1=present + u8)
 ```
 
+An N3 fixed-flow group uses desired-codec version `2`, with the same fields
+above followed by one byte per entry: QFI `0..63` for N3, or `0xff` for an
+ordinary entry. That byte follows the entry's egress DSCP. Version `2` requires
+at least one N3 entry; an entirely ordinary group retains the exact version `1`
+encoding. Decoding both versions requires exact canonical re-encoding. The QFI
+is forwarding semantics bound by the desired fingerprint, not a new selector
+atom. An unchanged-selector recovery or single-bearer reattach cannot change
+the N3 profile or QFI. See [the fixed-flow profile](../n3-fixed-flow-forwarding.md).
+
 No padding is present. The complete-set codec is version `1`, then a u16 big-
 endian atom count, then sorted unique atoms. Each atom is `tag || u16 length ||
 bytes`: tag `T` contains the existing 8-byte
@@ -539,7 +549,7 @@ new group or newly shaped complete set that contains any previously published
 TEID, PAA, or mark atom; checking only the candidate group or complete-set
 commitment is forbidden.
 
-This RFC permits exactly one other admission form: SDK-mediated transfer of the
+The whole-set reissue admission form permits SDK-mediated transfer of the
 *identical complete atom set* from one exact, permanently retired predecessor
 to one distinct successor group. Reissue MUST require the SDK's exact retired
 capability and an opaque SDK/backend quiescence authorization, validate the
@@ -547,8 +557,9 @@ retained source tombstone, terminal-retired stamp, authoritative absence, and
 all namespace bindings, and create a higher generation and new nonce while
 preserving the permanent predecessor tombstone/lineage. It MUST NOT admit a
 subset, superset, mixed provenance set, multiple predecessors, the same group
-identity, or a changed selector set. Mixed transfers and exact same-group
-republish are #663 work. Thus no caller can cause accidental reuse merely by
+identity, or a changed selector set. The separately named §5.4 profile is the
+only bounded exception to this unchanged API. General mixed transfers and
+exact same-group republish are #663 work. Thus no caller can cause accidental reuse merely by
 reasserting `Fresh`, retaining old values, or constructing a drain enum.
 
 Exact removal returns an opaque retired capability. A separately named,
@@ -557,9 +568,9 @@ and returns the opaque quiescence authorization only after it revalidates the
 terminal-retired stamp and absence and performs its trusted drain/RCU barrier.
 The backend-neutral port permits a backend with a separately reviewed concrete
 quiescence boundary to implement this operation. The built-in eBPF backend
-leaves it `Unsupported` until it has a real kernel/network quiescence mechanism;
-ordinary map deletion, userspace sleep, or an in-process RCU assumption is not
-such a mechanism. A conformance fake can exercise protocol state transitions
+uses the restricted Linux mechanism in §5.4 and refuses unsupported kernel
+profiles. Ordinary map deletion, userspace sleep, or an in-process RCU
+assumption is not such a mechanism. A conformance fake can exercise protocol state transitions
 with test-only authority, but a product MUST NOT pass that fake to a production
 lifecycle. Doing so would select it into the TCB and let it assert a production
 receipt. Any other backend must be deliberately selected into the TCB and
@@ -572,6 +583,182 @@ detect a malicious selected adapter that lies about its own barrier.
 authorization, and distinct successor group in one ledger transition; neither
 input is cloneable or reusable. This RFC does not treat traffic-proof authority
 as drain evidence and does not implement #664.
+
+### 5.4 Single-Bearer Reattach
+
+`reconcile_reattached` admits one distinct single-entry successor using exactly
+the predecessor's PAA and optional mark atoms plus one never-published local
+TEID atom. The protected ledger, not a caller-supplied source or assertion,
+selects the unique completely `Retired` predecessor with no successor. Both
+complete graphs must retain the stable device, inner address, local outer
+address/family, and mark. Active, incomplete, ambiguous, consumed, same-group,
+cross-device, changed-PAA/mark, or previously published new-TEID candidates are
+rejected before any claim or effect. Multi-entry groups, multiple predecessors,
+partial drain, arbitrary subset transfers, and same-group republish remain
+unsupported here. `Fresh` and whole-set reuse keep their existing validation.
+
+One supervised operation holds the durable worker lease across source
+discovery, backend quiescence qualification, claim, handoff, and terminal
+acknowledgement. The backend holds the namespace host effect lock while it
+checks the exact terminal-retired operation stamp and full source graph/index
+absence, performs the real reader barrier, and checks those facts again. The
+lease window and filesystem authority must remain current through receipt
+completion. The claim revalidates the protected predecessor and atom history,
+then atomically writes its sole successor edge, the fresh TEID reservation,
+a higher generation/new nonce, and the full `Installing` intent. All earlier
+group/atom/tombstone history, including the old TEID, remains permanent. No
+product can construct the private reattach proof or grouped request.
+
+The first such claim atomically upgrades `OPCSN15` or `OPCSN16` to `OPCSN17`.
+The latter retains the former fields, always includes the bounded unadmitted
+index (which may be empty), and appends a nonempty u32 big-endian count followed
+by strictly sorted 32-byte predecessor group commitments. These entries mark
+reattach successor edges; they are not a second authority store. The existing
+Installing reuse-descriptor tag is `1` for whole-set reuse and `2` for this
+profile, with the same exact predecessor descriptor. Tag `2` is valid only in
+`OPCSN17`. Decode validates each edge's complete shape, generation, one incoming
+predecessor, and fresh-TEID lineage; missing, forged, duplicated, truncated,
+downgraded, or inconsistent provenance closes the record. Existing canonical
+15/16 records keep their encoding until this transition; old readers refuse
+17. Existing record, atom, and permanent-group ceilings stay unchanged.
+Recovery reconstructs a pending request from that protected intent and uses
+the existing supervised exact install recovery. Lost responses or dropped
+observers never authorize a second effect.
+
+The Linux eBPF profile uses non-expedited `MEMBARRIER_CMD_GLOBAL` after exact
+source removal. The reviewed Linux implementation calls `synchronize_rcu()`
+when multiple CPUs are online. Its single-online-CPU shortcut is usable only
+for qualified non-realtime XDP/TC bottom-half readers, which a userspace caller
+cannot overtake. The adapter requires a recognized kernel-reported SMP
+build/preemption profile and rejects realtime/unknown profiles. Unsupported or
+blocked membarrier and `nohz_full` return failure; expedited/private commands,
+time delays, and empty map readback are never substitutes. This mechanism
+depends on the selected kernel implementation and attached program profile,
+not just the syscall's userspace memory-ordering API. Deployment qualification
+must verify that boundary; simulated runtime tests do not prove kernel RCU,
+packet drain, forwarding, or performance. Primary implementation references:
+Linux [membarrier.c](https://github.com/torvalds/linux/blob/v6.12/kernel/sched/membarrier.c),
+[network reader context](https://github.com/torvalds/linux/blob/v6.12/net/core/dev.c),
+and [kernel build profile](https://github.com/torvalds/linux/blob/v6.12/init/Makefile).
+
+#### TFT reader grace
+
+TFT row reclamation is separate from grouped-selector retirement above. It
+prefers the existing GLOBAL boundary, but when GLOBAL is unavailable it may
+use a successful userspace ARRAY_OF_MAPS update on SDK-owned private maps.
+The maps are unpinned, unattached, and absent from the datapath graph. The
+kernel's `maybe_wait_bpf_programs` completes `synchronize_rcu` before returning
+success on [Linux 6.8](https://github.com/torvalds/linux/blob/v6.8/kernel/bpf/syscall.c)
+and the [5.14.0-427 enterprise source](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/kernel/bpf/syscall.c).
+[Linux 6.19](https://github.com/torvalds/linux/blob/v6.19/kernel/bpf/syscall.c)
+and [7.2](https://github.com/torvalds/linux/blob/v7.2/kernel/bpf/syscall.c)
+use `synchronize_rcu_expedited`, which still waits for full kernel RCU grace
+and is distinct from expedited membarrier. Failed updates and sleepable BPF
+readers are excluded. TC egress executes within `rcu_read_lock_bh`; Linux 5.0
+and later include BH readers in ordinary RCU grace, as documented in
+[rcupdate.h](https://github.com/torvalds/linux/blob/v5.14/include/linux/rcupdate.h).
+
+The fallback retains the recognized non-realtime SMP build-profile check and
+admits only reviewed release families 6.8–6.19, 7.0–7.2, and
+`5.14.0-427.*el9_4*`. Unknown/future releases and PREEMPT_RT remain refused.
+Private-map creation and an initial update must succeed before capability is
+offered. Every removal attempt publishes its exact tombstone, completes a
+fresh grace, then deletes canonical rows. Reusing an old inactive bank also
+waits before the first row mutation. A failed wait retains the rows and
+returns indeterminate; initial unavailability refuses before mutation. This
+does not alter grouped-selector retirement or imply packet/NIC drain.
+
+Privileged qualification instruments actual RCU entry/return, filtering the
+updater's exact process/thread identity inside BPF before map access, and
+requires the interval to contain the end of an already-running,
+non-sleepable TC test reader on another CPU. The reader must retain both old
+row samples before post-grace replacement. Exact event pairs, overlap, and an
+ordinary ARRAY negative control are mandatory. A grace in a separate thread
+must leave both trace records untouched. Perf task binding alone is not a BPF
+filter: the [enterprise kprobe path](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/kernel/trace/trace_kprobe.c)
+invokes attached BPF before perf event filtering. Simulated selection and this
+primitive proof alone do not establish native nohz_full execution, RT support,
+forwarding, or latency.
+
+The separate `TFT nohz_full` workflow matrix boots the pinned Linux 6.8 and
+enterprise 5.14 guests with `nohz_full=1`. Each requires a changed guest boot
+ID, `CONFIG_NO_HZ_FULL=y`, an effective CPU mask, and GLOBAL absent from the
+actual membarrier query. With that profile required before any test skip path,
+the three existing TFT packet proofs must report production Aya capability,
+exact install/replacement and retained inactive-bank reuse, and removal with
+default-bearer forwarding. The kernel reader/control proof also remains
+mandatory. Binaries, source revision, offline package versions and checksums,
+kernel identity, and proof logs are retained. These guest gates do not qualify
+PREEMPT_RT, bare-metal scheduling, or production latency.
+
+### 5.5 Marked Child Under a Resident Default
+
+`reconcile_bearer` consumes a current exact default claim and admits one marked
+IPv4 child in the same protected namespace. Both groups have one entry and
+share the exact PAA, local and peer endpoints, link and protocol version; the
+child has a full-mask mark and a distinct local TEID. The unmarked default keeps
+its group identity, generation, selectors and installed context. At most one
+child may be live or unresolved for that default. This is a separate bounded
+profile, not general mixed-selector or arbitrary subset admission. Legacy
+`Fresh`, whole-set reuse and single-bearer reattach checks remain unchanged.
+
+`reconcile_bearer_under_active_parent` is an alternative when a consumer has
+the complete parent descriptor but needs no separately returned parent claim.
+Under the same fenced operation lease, the coordinator reads the protected
+ledger, resolves the exact authenticated Active issuance descriptor, and
+performs the existing parent backend qualification before child admission.
+It MUST NOT install, repair or reattach a parent, accept a marked parent, or
+reuse a cached admission across operations. The concurrent entry point reserves
+the parent, child and overlapping selectors before resolution. All original
+child transitions, fresh durable readbacks, supervised cancellation semantics
+and failure recovery remain mandatory. A failed final readback or lease release
+MUST NOT publish a successful child claim, even if its effect is recoverable.
+
+The complete canonical P/M/T atoms and group fingerprints remain unchanged.
+For this profile only, the child reserves its T atom and a B atom whose payload
+is the concatenation of the framed canonical P and full-mask M atoms. This
+makes the actual `(PAA, mark)` selector exclusive while allowing independent
+default PAAs to use the same numeric bearer mark. Only the exact recorded
+default owns the shared P atom. Legacy groups retain their global M reservation
+semantics; this profile cannot reinterpret or appropriate those reservations.
+Any legacy global M history and a child B(P,M) with that M are mutually
+exclusive, regardless of PAA or lifecycle phase.
+Complete canonical atom counts still obey the configured operation capacity.
+
+The first child claim upgrades the ledger to `OPCSN18`. After the preceding
+fields it always carries the bounded unadmitted and reattach indexes, either
+of which may be empty, then a nonempty u32 big-endian child-parent count. Each
+entry contains a 32-byte child group commitment and a 32-byte parent group
+commitment, strictly sorted by child. Decode requires the complete descriptors,
+exact relationship, reservation profile, capacity and valid lifecycle states;
+missing, duplicate, foreign, inconsistent or truncated edges fail closed.
+Older readers refuse this format. Existing records retain their format until
+the corresponding transition; permanent history and record ceilings remain.
+
+Child install, recovery and retirement use the existing supervised lifecycle.
+Caller cancellation stops observation rather than dropping an admitted effect.
+Indeterminate writes retain permanent debt; incomplete stamp publication may
+make the namespace unavailable. Recovery does not guarantee cleanup and cannot
+replay an effect whose exact outcome remains unknown.
+The default cannot retire while a child is live or unresolved. A new child
+group may reuse an exactly retired child's mark only after the backend proves
+the source group's quiescence and the new local TEID is fresh. It may cross to a
+new default only through that default's recorded, bounded retired-to-reattached
+successor chain, with all predecessor children retired. Neither a shared PAA
+nor a reused mark alone authorizes this transfer. Old group IDs, TEIDs, parent
+edges and tombstones remain permanent; stale parent claims fail.
+
+Before a possible child map mutation, the eBPF adapter invalidates issued and
+pending traffic proof for the exact parent. Unrelated groups retain their
+authority. An application must separately complete its classifier and product
+owner transition and obtain fresh proof before reporting traffic readiness.
+The structural grouped simulation uses the protected coordinator, adapter
+codecs, index construction and stamp inventory validator. Its effects are
+atomic in memory, and its TFT replacement uses the SDK mock's transaction
+model after native representation validation. It cannot issue live traffic
+proof and does not exercise staged kernel IO faults or proof revocation; those
+require the separate adapter regressions. Simulation tests do not qualify
+kernel quiescence, packet forwarding or an application lifecycle.
 
 ## 6. Public Capability Surface
 
@@ -914,6 +1101,41 @@ same rule recovers the retired capability needed for exact reissue.
 An in-process retry joins the existing supervised operation instead of
 re-minting while its delivery owner remains live.
 
+#### 7.4.1 Terminal No-Admission Completion
+
+An attempted group can be rejected before its Installing CAS, for example
+because a different retired or active group already owns one of its selectors.
+That rejection is not an Active or Retired state, and a generic coordinator
+error is not proof of no mutation. Cleanup MUST NOT remove overlapping
+selectors or claim another group's terminal stamp to settle the attempt.
+
+The experimental `seal_unadmitted` operation serializes with every admission
+through the existing namespace supervisor and durable worker lease. After
+validating the exact backend namespace, it requires the complete group identity
+to be absent from every admitted phase, then commits a permanent no-admission
+record in the same protected ledger. Even an unstarted Installing reservation
+is refused. The record retains the canonical desired graph and a nonzero
+monotonic generation; it owns no selector atom and creates no backend stamp.
+Fresh and reused admission both reject the sealed group identity permanently.
+
+Only the acknowledged, fenced record or its exact later recovery can issue
+`GtpuSessionSelectorUnadmittedClaim`. The affine claim matches the complete
+desired graph and the opened authority instance, including its clones. A new
+opener must recover a new claim from the durable record. The claim grants
+no removal or reuse permission and says nothing about other groups that
+previously forwarded through the same selectors. Caller cancellation does not
+cancel the supervised seal, and a lost acknowledgement is recovered by reading
+the same decision rather than guessing that the operation failed.
+
+The no-admission index shares the 1,024 permanent-group and 512 KiB encoded
+record limits; repeated exact cleanup reads add no new record or generation.
+Its first insertion atomically upgrades the ledger encoding from `OPCSN15` to
+`OPCSN16`. New readers accept existing canonical `OPCSN15` records without
+rewriting them. Older readers reject `OPCSN16` before issuing authority; they
+cannot silently discard its admission barriers. The backend epoch, existing
+group lineage, selector reservations, and tombstones do not change. This is
+terminal completion for an unadmitted group, not RFC 017 mixed-selector reuse.
+
 ### 7.5 Process and Cancellation Ownership
 
 One namespace operation owns a bounded SDK coordinator task and its capability
@@ -926,8 +1148,9 @@ awaits a separate non-aborting result receiver; dropping or cancelling it MUST
 NOT release ownership or cancel blocking kernel work while a durable effect is
 pending.
 
-One process polls exactly one such worker for a protected storage-scope
-commitment from durable lease acquisition through release. Other admitted
+The default API polls exactly one such worker per process for a protected
+storage-scope commitment from durable lease acquisition through release.
+Section 7.6 specifies the separately selected concurrent composition. Other admitted
 same-scope supervisors remain bounded and unpolled. This is required because a
 same-`OwnerId` store acquire denotes recovery by that replica and replaces its
 prior credential; overlapping local acquisitions would invalidate a live guard
@@ -954,11 +1177,95 @@ per-process number of supervisors and report only a closed cancellation
 classification. If the SDK runtime cannot provide this worker ownership, the
 capability is unsupported.
 
+Short steps within that one owned operation may share a confirmed durable
+lease. Its conservative monotonic and wall-clock budgets start **before** the
+acquire or renewal request, including acknowledgement latency. Each backend
+step still receives a fresh affine authorization, capped by the original
+renewal deadline and the five-second effect bound. Renew early when a full
+backend step would cross the ten-second cadence; minting another authorization
+never restarts that cadence. Clear the worker's timing before awaiting renewal,
+so cancellation, failure, or a late reply cannot revive it. Every ledger CAS
+still submits the exact guard for the store's expiry, credential, fence, and
+generation checks. In the default API this timing belongs only to the
+non-cloneable worker lease; it is never cached on an authority or shared between
+operations. Section 7.6 permits sharing one owned lease only within its bounded
+cohort, with the additional credential and settlement ordering specified there.
+
 The durable lock/CAS authority, not a process mutex, decides cross-process
 ownership. The process-local worker gate prevents only reentrant acquisition by
 one replica identity; it is not a distributed fence. Concurrent replicas with
 distinct owner identities still serialize through the durable generation/CAS
 and the host-global control-marker lock.
+
+### 7.6 Explicit Concurrent Operation Composition
+
+The default API retains §7.5's one-operation worker. An experimental
+`GtpuSessionSelectorConcurrentNamespace` selects a separate, explicit
+composition over an already opened authority. Clones of that handle share one
+SDK-owned cohort. Independently selected handles, open/provision/rebind,
+terminal namespace lifecycle operations, and default API workers still exclude
+that cohort through the same process-local storage-scope gate. No concurrent
+same-owner lease acquisition is permitted.
+
+The cohort exists only while admitted operations overlap. It owns one durable
+worker credential and the complete acquire-to-release scope gate. Each member
+first reserves the existing bounded process and namespace supervisor slots and
+its complete group/PAA/TEID conflict guards. Parent and child operations share
+the same PAA guard. The protected record's complete ownership validation,
+including legacy global marks, remains mandatory. Local guards are scheduling
+exclusions and never authority.
+
+The handle includes fresh and marked-child reconciliation, their existing
+recovery/retirement operations, exact never-admitted sealing, and the bounded
+single-bearer reattachment profile. Sealing reserves the complete desired graph
+and serializes its protected no-admission transition. Reattachment's exact PAA
+guard also excludes every eligible retired predecessor: the existing predicate
+requires an identical PAA, mark, endpoint and transport family, with only one
+fresh TEID selector. Source discovery, backend quiescence qualification and the
+atomic one-successor reservation are unchanged. This does not expose concurrent
+general mixed-selector transfer or accept a cached reuse authorization.
+
+Authenticated root read/transition/CAS/exact-readback sections serialize under
+one cohort transition mutex. The full inventory observation also holds that
+mutex. Independent backend installation/removal sections may overlap; the
+backend retains its existing bounded host-lock sections and exact receipts.
+The cohort lease mutex serializes renewal, window minting, and every durable
+mutation through its exact readback. A renew changes the exact guard expiry,
+so it cannot overtake a CAS using the previous guard. Each member receives a
+fresh affine backend window with the original conservative deadlines. Timing
+is never copied into a member or cached after cohort settlement. A failed,
+late, cancelled, expired, or clock-ambiguous renewal permanently clears the
+cohort's timing. Every member then fails closed before another effect.
+
+A successful nonfinal member may return after its own complete terminal durable
+readback and current-lease check. Its unrelated peers need not finish first.
+The last member awaits exact durable lease release before returning success.
+A failed release changes that member's successful result to indeterminate;
+a primary lifecycle failure is retained. This changes only the explicit
+composition's lease ownership lifetime, never mandatory lifecycle durability.
+
+The complete backend inventory may explain an absent Installing stamp only
+with an SDK-private live in-flight proof. The owner registers that proof after
+the exact protected reservation CAS/readback, while holding the transition
+mutex. It binds device, group, complete selector set, desired graph, pending
+and terminal generations/nonces. The complete legacy predicate still checks
+every present stamp and every settled group. A proof cannot explain a wrong
+present stamp, missing Active/Retired stamp, foreign key, wrong epoch,
+changed generation/nonce, or expired owner. Proof currentness is checked again
+before accepting inventory. It grants no new selector or traffic authority.
+
+The proof is invalidated when the owned operation settles and is never durable
+or available to a public caller. After process loss, retained Installing state
+has no such proof and must follow the exact existing recovery rules. Dropping
+an observer never cancels the detached worker, releases conflict guards,
+releases cohort membership, or removes its proof. Unexpected destruction of a
+concurrent worker invalidates its proofs and quarantines the cohort; bounded
+supervisor slots and the scope gate remain retained until process recovery.
+This cannot convert uncertain host work into permission for a new owner.
+
+This explicit composition does not change the single-record permanent-history
+capacity profile. It provides no sharding, compaction, publication-identity
+reuse, product lifecycle policy, capacity claim, or traffic proof.
 
 ## 8. Persistent eBPF Control Marker
 
@@ -1132,7 +1439,10 @@ protected ledger. An extra stamp proves a rolled-back or foreign ledger; a
 missing stamp for a terminal operation proves map loss or rollback. A pending
 operation with no current-operation stamp is admissible only when §7.4's exact
 pre-effect inventory also holds; it must enter recovery before the namespace
-can serve. An `Installing` operation durably recorded as not backend-started
+can serve. The explicit live concurrent composition in §7.6 additionally
+allows the exact SDK-owned in-flight Installing proof; it never survives
+process loss or substitutes for recovery evidence. An `Installing` operation
+durably recorded as not backend-started
 may have no stamp and can only start its same precommitted coordinate under the
 exact recovery rule in §7.4. A missing, malformed, stale, wrong-generation,
 wrong-nonce, wrong-epoch, wrong-commitment, or journal-mismatched stamp is

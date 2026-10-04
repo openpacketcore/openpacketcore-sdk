@@ -1,0 +1,75 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-auth-known-answer",
+  "context": {
+    "inputs": {
+      "initiator_spi": "0102030405060708",
+      "responder_spi": "1112131415161718",
+      "initiator_nonce": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "responder_nonce": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+      "dh_shared": "7df27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978",
+      "signing_peer": "responder",
+      "ike_sa_init_message": "010203040506070811121314151617182120222000000000000000b02200002800000024010100030300000c01000014800e01000300000802000005000000080400001328000048001300007cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1000000242122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+      "peer_nonce": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "identity_payload_body": "020000006e336977662e6578616d706c65",
+      "auth_keying_material": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "auth_peer": "responder",
+    "reference_error": "authentication-failed",
+    "crypto_profile": "prf-hmac-sha256-aes-gcm16-256-ecp256",
+    "sdk_custody_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.auth-responder-changed-dh-input",
+  "subset": "protocol-key",
+  "case_class": "malformed",
+  "source": {
+    "document": "RFC 7296",
+    "release": "Published RFC (2014)",
+    "clauses": [
+      "2.13",
+      "2.14",
+      "2.15",
+      "2.16",
+      "3.9",
+      "TS 33.501 V18.12.0 7.2.1"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "Synthetic SA_INIT transcript and externally supplied test K_N3IWF; EAP success and peer certificate verification remain caller preconditions.",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/ike-auth-sha256.json",
+    "notes": "Independent standard-library HMAC-SHA256/PRF+ answers and OpenSSL public test scalar agreement. No SDK encoder, real peer, key custody or memory-erasure claim."
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-inputs",
+      "treatment": "public-test-scalars-1-and-2-and-zero-NGAP-placeholder",
+      "value_class": "synthetic-not-peer-key"
+    },
+    {
+      "name": "nonces-and-SPIs",
+      "treatment": "fixed-incrementing-test-octets",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "identities",
+      "treatment": "fixed-test-ID-KEY-ID-and-reserved-example-domain",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/auth-responder-changed-dh-input.hex",
+    "digest_sha256": "94933be0fc5b0b717c1669c40fa5a038cecc54632a3bee940641ba790a0d87b5"
+  },
+  "semantic_assertions": [
+    "AUTH_method=2",
+    "PRF=HMAC-SHA256",
+    "custody_validation=false"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

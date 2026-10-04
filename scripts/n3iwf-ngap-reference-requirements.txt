@@ -1,0 +1,4 @@
+# External reference tools only; neither is linked into or shipped with the SDK.
+# Pycrate: LGPL-2.1-or-later; pypdf: BSD-3-Clause. No transitive dependencies.
+pycrate==0.8.1 --hash=sha256:65c4dd48d93248a0a4aa2fc78bab10ea64087c6382827035fae9f8bba343db53
+pypdf==6.1.0 --hash=sha256:6b34e4147df20978bf270af19826692e0485431a9d3944617b9533bc77efb695

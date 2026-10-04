@@ -62,6 +62,19 @@ delayed task scheduling cannot extend it. The default is `Disabled`, which
 retains a fresh coalesced quorum round for every barrier cohort; consumers
 cannot supply a lease duration.
 
+Before releasing an engine vote lease for planned retirement, call
+`disable_lease_reuse()` on every applicable barrier. The veto is permanent for
+that barrier and all its clones: an in-flight proof cannot repopulate the cache
+or return a cached admission after the veto. Fresh engine checks retain their
+normal authority and deadline requirements. Clearing a cache once is not an
+equivalent retirement fence.
+
+The appended `LeadershipTransfer` RPC family carries only an engine-issued
+handoff request. Its payload limit is 1,024 bytes and its deadline uses the
+existing five-second Vote budget. Consumers must authenticate the exact sender,
+vote issuer and membership scope before passing the request to the engine.
+This family does not replace ordinary election, quorum or applied-prefix checks.
+
 New leaders can use `open_leader(projection, deadline)` with a
 `LeaderReadProjection` implementation. The helper executes the barrier,
 drives the consumer-owned projection to Openraft's applied log ID, independently
@@ -75,10 +88,18 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`f607e636406b16bd0ad7925dbb631da1b7a4cd96` (signed tag
-`opc-v0.9.24-election-resampling-1`) because registry Openraft 0.9.24 does not
-resample an election timeout for each campaign. The pin is by `rev`, never a
-branch or tag.
+`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5` (0.9.25 plus fork fixes). It retains the
+per-campaign election-timeout fix and preserves a recovering snapshot target's
+required log suffix through successful handoff, while failed targets release
+their ownership before retrying. When a higher vote ends leadership, the core
+joins the former leader's replication readers before a conflicting suffix can
+be truncated. Strict storage errors and operation deadlines stay unchanged.
+The candidate also includes bounded apply dispatch, joined replication task
+retirement, obsolete campaign cleanup and cancellable pacing of append retries
+that acknowledge no progress. Bounded apply is opt-in; this dependency update
+does not select a new SDK runtime limit. The pin is by `rev`, never a branch or tag.
+The frozen HA profiles retain their original revision and evidence; they do
+not qualify this later source-build candidate.
 
 Crates that contain this engine or have a transitive normal dependency path to
 it are source-build only: `opc-alarm`, `opc-alarm-k8s`, `opc-alarm-testkit`,

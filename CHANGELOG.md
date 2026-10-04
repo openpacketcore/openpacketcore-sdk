@@ -8,6 +8,623 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
+- `opc-gtpu-dataplane`: TFT classification can use a qualified private
+  map-in-map RCU grace when GLOBAL membarrier is unavailable, including
+  `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
+  remain refused. Exact removal still waits after publishing its tombstone;
+  inactive-bank reuse now waits before any retained row is mutated. Failed
+  waits preserve rows for retry. An additive value-free unavailable-reason
+  API explains the capability gate. `opc-linux-gtpu-sys` owns the private
+  maps; no datapath map ABI or program changes are required. Fixes #1057.
+
+- `opc-session-net`: a prepared compare-and-set or lease acquire whose
+  current voter answers with a complete `Rejected(Unavailable)` now moves the
+  identical request to the next voter, as after a pre-write failure, and ends
+  `NotTransmitted` when every voter rejects or is unreachable. That rejection
+  is closed and precedes the consensus state machine; before, the request
+  failed although the rest of the quorum could serve it. Completed-operation
+  accounting now records the reply as not transmitted instead of as an other
+  failure, so it no longer raises `completed_operation_unsafe_failures`. A V1
+  fenced transition reports it as `NotTransmitted` instead of a rejected
+  `BackendUnavailable`; the activated affine handle still never sends a
+  written mutation to a second voter. Scope, topology, authorization and
+  validation rejections are unchanged. Fixes #1036.
+
+- `opc-gtpu-dataplane`: exact TFT classifier removal no longer drops
+  default-bearer uplink. Removal first converts the classifier into its
+  durable removal fence, and the tc program used to drop every unmarked IPv4
+  packet from the PAA while that fence existed, default-bearer traffic
+  included (TS 24.302 section 7.4.6.4.3). A fence whose classifier has a
+  default bearer now classifies as absent, the state removal publishes last:
+  unmarked packets take mark zero without any filter row being read. A fence
+  without a default bearer still drops. Before deleting any row, each removal
+  attempt also waits for tc invocations that copied the active selector before
+  the fence, using a qualified kernel reader grace. Where no such grace is
+  available, TFT classification reports Missing, and install, replacement
+  and removal refuse before any mutation. The datapath object is
+  rebuilt; the map ABI is unchanged. Fixes #1030.
+
+- Shared Openraft dependency: consume the exact 0.9.25 fork revision
+  `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,
+  joined replication retirement, stale-campaign cleanup and cancellable
+  no-progress retry pacing. Preserve native WAL and Durable/Async semantics.
+  Refs #957.
+
+- `opc-gtpu-dataplane`: cleanup-only activation is now all or nothing. It
+  re-proves the attached graph (interface, tc placement, exact identity,
+  executable PMTU policy) and the quiescent traffic source while the gate is
+  still even, and enabling the gate is the commit. Before, it enabled the gate
+  and committed the device as active before that re-proof, so a failed
+  re-proof left a forwarding datapath that the backend still recorded as
+  cleanup-only: every retry was refused as already active and the device could
+  not be removed. Any failure now leaves the runtime and the backend agreeing
+  that the device is cleanup-only, with its hooks detached and the gate even,
+  so a retry can activate it. The host traffic sequence window is dropped only
+  after the runtime reports success. Fixes #1010.
+- `opc-gtpu-dataplane`: `activate_cleanup_recovery` now re-enables the
+  retained traffic gate that cleanup-only acquisition leaves packet-inert. It
+  starts a fresh source incarnation while the hooks are fenced, attaches them,
+  proves quiescence and enables the gate as ordinary adoption does, and on
+  failure restores the even gate and detaches, leaving the device cleanup-only
+  and retryable. Before this, the reattached programs passed every packet
+  unchanged until a later adoption. Refs #997.
+- `opc-gtpu-dataplane`: an IPv6 `remove_pdp_context` on an ordinary eBPF
+  attachment no longer falls through to the IPv4 removal by local TEID, which
+  removed the IPv4 context sharing that TEID. Removal is now family-scoped.
+- `opc-route-steering`: `RuleRequest` gains an explicit `family` so mark-only
+  policy rules can be created, read back, converged and removed as `AF_INET6`
+  rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
+  determines the family, and a conflicting explicit family is rejected. IPv4
+  and IPv6 rules with the same mark, table and priority are distinct objects.
+  Breaking: struct-literal constructors must add `family: None`. Refs #989.
+- `opc-proto-gtpv2c`: model TS 29.274 Causes 18 (new PDN type due to network
+  preference) and 19 (new PDN type due to single address bearer only). A
+  Create Session Response carrying either now projects as accepted with its
+  bearer, PGW F-TEIDs and narrowed PAA instead of as a rejection. The
+  procedure-generic `CauseValue::is_accepted` keeps its 16/17 scope; the new
+  `is_create_session_accepted` and `is_new_pdn_type` predicates expose the
+  wider set. `CauseValue` gains two variants. Refs #990.
+
+- `opc-session-net`: remove the duplicate control probe before the first
+  bounded frame chunk copy. Preserve cancellation, absolute deadlines, exact
+  byte bounds and all pre-publication checks. Refs #972.
+
+- GTP-U eBPF sends validated nonzero unknown-TEID G-PDUs to the configured
+  local control endpoint without decapsulation. Retained inconsistent
+  ownership, foreign local endpoints, zero TEID and malformed envelopes
+  remain drops. Native legacy/grouped tests check exact IPv4 Error Indication
+  bytes and ports, plus raw grouped IPv6 handoff. Refs #341, #790, #795.
+
+- GTP-U tc and host reassembly parsers now hand unknown required extension
+  headers to the shared control queue after full chain validation, before
+  tunnel lookup or decapsulation. Live IPv4/IPv6 packet evidence covers every
+  required identifier, optional skip behavior and malformed suffix rejection.
+  N3 forwarding capabilities remain unchanged. Refs #341, #790, #795.
+
+
+- `opc-sctp`: add an affine N2 association owner with explicit candidate
+  promotion, generation-fenced I/O and path readback, bounded reconnect,
+  typed reset/stream-count/partial-abort notifications, and mandatory native
+  replacement, shutdown and multihoming failover qualification (Refs #788).
+
+### Added
+
+- `opc-persist`: add an online audit recipient client and authority-owned
+  verification session without exporting signing keys. Verify actual received
+  pages, frozen-range completeness and fresh independent checkpoints; bind
+  results to the original caller, authority, request and expiry. Verification
+  retains no acknowledgement authority at the recipient. The application owns
+  authenticated transport and authorization. Refs #959.
+
+- `opc-gtpu-dataplane` / `opc-gtpu-ebpf-common`: inner fragmentation is the
+  default policy for an over-MTU downlink IPv4 packet with Don't Fragment set.
+  Refs #1002.
+  - **Policy.** `GtpuDownlinkInnerMtu::new(mtu)` selects the default: the
+    backend-owned consumer clears DF and fragments the inner packet before
+    encapsulation (RFC 4459 section 3.4), an owner-approved deviation from the
+    DF rules of RFC 791, RFC 1191 and RFC 6864.
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` stays the explicit
+    opt-in; `GtpuDownlinkOversizePolicy` names both.
+  - **Wire.** The commit record's MTU field keeps the MTU in its low 15 bits
+    (576 to 32,767); bit 15 marks the in-tunnel Packet Too Big opt-in. tc reads
+    only the MTU and steers identically. Records without an MTU are unchanged.
+  - **Consumer.** `GtpuDownlinkEvent::Fragmented` returns RFC 791 fragments
+    of at most the MTU with the bearer mark, for the caller to inject toward
+    XFRM. The header is validated first (RFC 1812 section 5.2.2); IPv4
+    options are refused (`InnerUnfragmentable`). A fragment keeps its own
+    Identification; an atomic datagram gets a fresh non-zero value from a
+    per-destination sequence (RFC 6864 sections 4.1 and 4.3).
+  - **Budget.** Per-destination token buckets (`GtpuInnerFragmentRateLimit`,
+    burst 64, one token per 4 ms, set by `set_inner_fragment_rate_limit`)
+    admit at most burst + ⌈255 s / interval⌉ packets in 255 seconds (63,814
+    by default); `new` refuses any limit above 65,535. While a destination
+    stays tracked under one limit, this bounds its work and keeps its
+    sequence from repeating within 255 seconds. Past 4,096 concurrently
+    tracked destinations, LRU eviction makes uniqueness probabilistic and
+    removes the per-destination bound. A new attachment registration
+    (restart, re-adoption, re-created attachment) restarts every sequence
+    from a new random value (#1018). Excess packets are
+    `InnerFragmentRateLimited` drops. Value-free counters record fragmented
+    packets, fragments and refusals.
+  - **Costs.** Over-MTU DF traffic is capped at 250 packets per second per
+    destination by default, beyond which it is dropped silently with no
+    Packet Too Big. Slow-path packets can be reordered behind later
+    fast-path packets. Fresh Identifications share the (source,
+    destination, protocol) space with the originator's own non-atomic
+    datagrams. They therefore cannot comply "as if the datagram were
+    sourced by that device" as RFC 6864 section 5.3.1 requires. That
+    deviation is inherent to clearing DF and fragmenting, and is part of the
+    owner-approved default policy decided on #1002. The consumer does not
+    decrement TTL (RFC 1812 section 5.3.1).
+  - **Integration.** Open the control port before installing any
+    MTU-bearing context and keep draining it. Until it is first opened,
+    while the process is down, and after a retirement, nothing is bound.
+    Adopting a retained graph reopens tc's gate before the port can be
+    opened, so this window cannot be avoided after a restart. The kernel
+    may then answer steered packets with rate-limited ICMP Port Unreachable
+    toward the peer, quoting up to about 512 octets of the inner packet
+    (#1019).
+  - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
+    1,400-octet access link reaches the UE as two exact fragments, on the
+    default bearer, after outer reassembly and on a dedicated bearer through
+    its ESP Child SA, with no host ICMP.
+
+- `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf`: opt-in downlink tunnel-MTU
+  enforcement with an in-tunnel RFC 1191 error. Refs #1002.
+  - **Opt-in.** `GtpPdpContext::downlink_inner_mtu` is a new field and is
+    source-breaking; `None` keeps today's behaviour. It is set with
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)`, where the MTU is
+    at least 576. `GtpuProbe::downlink_inner_mtu_enforcement` is a new public
+    field of `GtpuProbe`, which is not `#[non_exhaustive]`, so struct
+    literals of `GtpuProbe` are source-breaking too.
+  - **Storage and downgrade.** The MTU is stored in the formerly reserved
+    bytes of the Active commit record; records without it are byte-identical.
+    An older SDK's recovery refuses an attachment holding any MTU record, so
+    drain those contexts before downgrading.
+  - **tc steering.** tc does not decapsulate an authorized over-MTU DF IPv4
+    packet. It rewrites the packet's UDP destination port to a dedicated
+    backend-owned queue (2153), so hand-offs never fill the UDP/2152 queue
+    used by Echo.
+  - **Consumer.** `try_receive_downlink` serves UDP/2152 first. It returns
+    `GtpuDownlinkEvent::PacketTooBig` and sends at most one Fragmentation
+    Needed on the UE's default-bearer uplink, from the PAA to the originator,
+    quoting the header plus 64 bits.
+  - **Never answered** (RFC 1122 3.2.2), checked before any rate-limit
+    token: 0/8, 127/8, 224/4 and 240/4 originators, non-initial fragments
+    and ICMP errors. An invoking packet with a bad header checksum, or one
+    shorter than its total length, is silently discarded (RFC 1812 section
+    5.2.2).
+  - **Rate limit and counters.** Per-session token buckets (RFC 1812 section
+    4.3.2.8; `set_packet_too_big_rate_limit`), per session while it stays
+    tracked (#1018), with value-free counters, including `SO_RXQ_OVFL`
+    queue-drop counts.
+  - **Not provided.** tc has no hand-off counter or policer, because either
+    would change the map ABI.
+  - **Evidence.** The baseline test (the RED on `main`) shows the host
+    emitting a plaintext Fragmentation Needed toward the core, quoting 548
+    octets. The opt-in test shows exactly one well-formed in-tunnel error
+    and no host ICMP. It also covers per-session limiting and Echo served
+    ahead of a hand-off backlog.
+  - **IPv6.** An opted-in ordinary inner-IPv6 context is refused
+    (`downlink_inner_mtu_inner_ipv6`). Inner IPv6 Packet Too Big is a
+    follow-up, because it needs an MTU in the family-tagged entry wire.
+
+- `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
+  consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
+  the eBPF attachment's backend-owned UDP/2152 queue and, under the same
+  serialization as attachment mutation, authorizes a reassembled or handed-off
+  G-PDU with the tc fast path's own decisions: grouped index first (Active
+  generation, device, slot, endpoints, source-port policy, inner PAA, N3 PSC),
+  otherwise the v5 PDR, endpoint binding, owner journal, FAR and DSCP with the
+  Active commit read last. It returns `GtpuDownlinkEvent::Decapsulated` with
+  the exact inner packet and bearer mark, the untouched datagram for controls
+  or unknown tunnels, or a value-free `GtpuDownlinkDrop`; a closed traffic
+  gate, cleanup-only, successor-pending or unreadable state fails closed.
+  `downlink_counters` exposes bounded per-registration counters. Grouped
+  attachments with an IPv4 outer endpoint now report
+  `KernelReassemblyHandoff` for outer IPv4 fragments. Native tests cover
+  in-order, reordered, duplicated, missing, foreign-TEID, stale-generation,
+  owner-only, mixed-binding and gate-closed fragment sets. On an ordinary
+  attachment, inner-IPv6 contexts (#998) decapsulate through the attachment's
+  published family authority. Refs #1001.
+
+- `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
+  IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
+  requires the destination inside the `/64`, and transport stays IPv4. An
+  IPv4v6 PDN is two family-scoped contexts sharing one bearer TEID. Readback,
+  exact removal, restart adoption and cleanup-only recovery are family-aware;
+  `pdp_inner_ipv6_capability()` reports support. The family-tagged authority
+  is retired with the last inner-IPv6 context, so drained attachments stay
+  eligible for legacy terminal-successor recovery. An IPv6 context on a grouped
+  attachment reports `ordinary_inner_ipv6_pdp_on_grouped_attachment`. Refs
+  #986.
+
+- `opc-gtpu-dataplane`: `TftUplinkClassifier` owns a typed `TftUplinkPaaSet`
+  holding at most one IPv4 `/32` and one canonical IPv6 `/64` (TS 23.401
+  5.3.1.2.2, TS 23.402 4.7). IPv6 uplink from any address in the prefix,
+  including RFC 8981 temporary addresses, is classified; an IPv4v6 PDN uses
+  one classifier for both families. `new` stays source-compatible and
+  canonicalizes an IPv6 PAA; `with_paa_set` and `paa_set` are added.
+  Unspecified, loopback, multicast and broadcast PAAs are rejected. The native
+  eBPF backend still rejects any IPv6 family, including a dual set, without
+  truncating it (#988). Closes #987.
+
+  Behaviour changes: `TftUplinkClassifier::paa` now returns the set's primary
+  PAA, which is the IPv4 PAA when present and otherwise the canonical `/64`
+  prefix address with a zero interface identifier, so an IPv6 PAA given to
+  `new` no longer reads back unchanged. `paa` is no longer a `const fn`
+  (breaking for const callers). The mock identifies a PDN's classifier by
+  overlapping PAA set on the attachment: widening or narrowing its families
+  is `Replaced` for either family, exact removal by a set that only overlaps
+  the resident is `Conflict`, and a set spanning two residents is `Conflict`.
+
+- `opc-session-store`: add `FencedTransitionV2RecoveryJournal`, an SDK-owned
+  journal that binds a caller-stable `FencedTransitionRequestId` to its
+  complete sealed V2 request before dispatch, with #701-equivalent path,
+  SQLite, and per-row plus full-set authentication rules. Its authenticated
+  4,096-row count is an admission fence, not an absorbing lifetime: rows are
+  removed only by exact compare-and-delete once the transition is resolved or
+  provably unbound. The protection wrappers gain
+  `with_fenced_transition_v2_recovery_journal`. V1, the #701 journal, the raw
+  V2 wrapper path, and the `/2` wire are unchanged. A wrapper holding both
+  journals excludes concurrent V1 and V2 preparations of one caller ID, and
+  retired-floor reclamation reads the floor itself. Refs #982.
+
+- `opc-session-net`: add `SessionConsumerPreparedFencedTransitionV2Backend`,
+  the protected V2 prepared consumer facade for local-AEAD and remote-sealing
+  protection. It keeps the V1 facade's exact-voter activation, canonical
+  routing, and affine execute handle, selects the active epoch internally from
+  a cached linearized history state, and recovers status by caller-stable ID.
+  It adds `release_resolved`, a bounded `reclaim_resolved_fenced_transitions`
+  sweep, and `with_legacy_v1_recovery` so retained V1 transitions stay
+  status-recoverable after an upgrade. It adds no wire operation. The sweep
+  reads each row's status past an unavailable voter, a proven-unsent row whose
+  self-removal failed stays releasable, and a cached local row failure ends
+  `status_until_terminal` at once. Refs #982.
+
+- `opc-session-testkit`: forward `/2` requests through
+  `AuthenticatedPreparedFencedTransitionFixture`, open the protected V2 facade
+  over its real voters (optionally composed with V1 recovery), withhold one
+  committed V2 response, and count V2 transition, status, and history-state
+  requests. Refs #982.
+
+- `opc-gtpu-dataplane`: resolve an exact existing Active parent inside fenced
+  child admission with `reconcile_bearer_under_active_parent`. Avoid a separate
+  parent recovery lease while retaining selector reservations, fresh backend
+  qualification, all child writes/readbacks and supervised recovery. Refs #975.
+
+- `opc-session-testkit`: compose independent authenticated consumers over the
+  same three voters with separate retained journals, and clone paired protected
+  backends without a second journal open. Add fixed numeric consensus peer-call
+  observations under `test-control`; authority and journal limits are unchanged.
+
+- `opc-gtpu-dataplane`: add explicit grouped restart detachment that removes
+  exact owned tc hooks while retaining all map objects and selector history.
+  Revoke the old managed attachment, refuse conflicting identities, and keep
+  ordinary device removal and missing-map recovery boundaries unchanged.
+  Refs #964.
+
+- `opc-gtpu-dataplane`: add experimental explicit relocation for a protected
+  selector namespace with permanent proof of no prior group admission. Retain
+  its ledger and secret, fence stale writers, and resume only the exact
+  precommitted replacement after interruption. All prior session history is
+  refused; ordinary open/provision and general restart support are unchanged.
+  See RFC 018.
+
+- `opc-n3iwf-fixtures`: complete the Child-SA evidence inventory with fifteen
+  digest-bound records covering 3,364 model cases and 89 runtime-test
+  obligations. Preserve historical vectors and publish an aggregate SDK
+  completion map without promoting catalog records to runtime authority.
+  Refs #784, #793, #795.
+
+- `opc-ipsec-xfrm` and `opc-proto-ikev2`: bind authenticated MOBIKE permits
+  to installed Child-SA rosters and relocate every directional/rekey member
+  under one durable writer gate. Exact policy blocks, complete readback and
+  process-loss recovery preserve selector and counter continuity; unsupported
+  kernels retain precise refusal. Pinned migration-enabled VM qualification
+  covers native ESP, NAT-T, authority and caller cancellation. Refs #793, #795.
+
+- `opc-ipsec-xfrm`: seal authenticated ESP-in-UDP source observations to the
+  exact installed Child-SA pair, publication and monitor registration. Fresh
+  whole-roster checks reject stale publications and queued-event relabelling;
+  native packet tests cover three overlapping children, replay rejection and
+  rekey overlap. Observations preserve the existing source and loss limits
+  without granting relocation authority. Refs #793, #795.
+
+- `opc-ipsec-xfrm`: add optional actor-fenced installed Child-SA roster
+  publication and exact marked outbound selection. Whole-roster key/readback
+  proof, stale-writer invalidation, bounded generation and native rekey packet
+  checks preserve the existing migration and custody boundaries. Raw Linux,
+  mock and unsupported adapters report the precise missing profile. Refs #793,
+  #795.
+
+- N3IWF DTLS fixture profiles bind 634 independent vector projections and
+  authored rekey, retirement, path-loss and process-restart obligations to
+  exact public source digests. Historical wires and their narrower scopes
+  remain intact; catalog loading makes no transport-execution claim. Refs #784, #795.
+
+- `opc-gtpu-dataplane`: submit N3 End Markers from exact protected retired
+  claims after classifier quiescence, using the existing IPv4 UDP/2152
+  control socket and original tunnel tuples. Refuse shared peer tunnels,
+  stale maps and unsupported profiles; preserve owned workers through caller
+  cancellation. Completion reports local submission only. Refs #790, #795.
+
+- `opc-gtpu-dataplane`: add an eBPF N3 fixed-flow profile through the protected
+  grouped selector namespace. Bind one QFI per inner-family entry to atomic
+  authority, insert uplink PSC, enforce downlink QFI/direction, and account
+  for PSC bytes in IPv4/IPv6 checksums, PMTU and observation bounds. The broader N3 capability
+  remains missing pending multi-QFI and End Marker lifecycle work. Refs #790,
+  #795.
+
+- `opc-diameter-transport`: add opt-in NDS/AF ECDSA certificate constraints
+  for generic RFC 6083 endpoints with required CRLs. Validate local and
+  selected peer paths, TLS CA constraints, key strength, names, criticality
+  and anchor expiry; retain the profile through rekey. Independent signed
+  fixtures and native SCTP tests qualify this bounded subset. Refs #794,
+  #784, #795.
+
+- `opc-diameter-transport`: add bounded RFC 6066 SNI for generic DTLS/SCTP
+  endpoints, with exact server DNS SAN checks in addition to mutual SPIFFE
+  authentication and the same name retained across coordinated rekey.
+  Independent protected-Hello fixtures and native wire capture qualify the
+  named profile. Refs #794, #784, #795.
+
+- `opc-diameter-transport`: add opt-in coordinated RFC 5746/RFC 6083 rekey
+  within the original credential, peer, cipher and lifetime bounds. Preserve
+  queued streams across fresh record/exporter keys, drain real SCTP receive
+  buffers at cipher/close boundaries, and qualify native key transitions with
+  independent packet capture. Refs #794, #784, #795.
+
+- `opc-gtpu-dataplane`: expose the eBPF attachment's shared IPv4 control
+  socket through the backend trait, with exact hook checks, weak lifetime
+  ownership and removal/reinstall fencing. Linux kernel/mock backends return
+  explicit unsupported results; live tc tests cover Echo and required
+  extensions through this public port. Refs #341, #790, #795.
+
+- `opc-gtpu-dataplane` exposes a bounded control-datagram/response port on the
+  existing Linux IPv4 reassembly socket. Echo, Error Indication and extension
+  notifications preserve their transport rules, with explicit byte/ratio
+  budgets, exact socket identity and live binding checks. The shared receive
+  queue avoids a second UDP/2152 listener. Refs #341, #790; backend exposure
+  and installed forwarding remain separate work.
+- `opc-proto-gtpu`: correct the Supported Extension Headers Notification
+  list count to the single-octet wire layout in TS 29.281 figure 8.5-1;
+  reject the former two-octet encoding and retain bounded IE parsing,
+  independent full-count-domain fixtures and corrected fuzz seeds (Refs #341,
+  #790).
+- `opc-proto-ngap`: consolidate N3IWF subset acceptance evidence, public
+  revisions and bounded fuzz qualification; reconcile stale procedure-status
+  text while preserving all unsupported fields and disabled triggers (Refs #787).
+- `opc-diameter-transport`: require native peer-process crash/restart
+  qualification in both DTLS roles, with queued-delivery retirement, wrong
+  replacement identity rejection and fresh mutual authentication (Refs #794,
+  #784).
+- `opc-diameter-transport`: require seven native RFC 6083 cases in Linux SCTP
+  CI, including authenticated multistream delivery through actual active
+  destination loss, exact retained protection, bounded all-path retirement,
+  and fresh association replacement in both DTLS roles (Refs #794, #784).
+- `opc-diameter-transport`: add opt-in reliable ordered application streams to
+  generic RFC 6083 transport. Preserve stream metadata through exact decrypted
+  record identities, bound pending correlations and plaintext queues, retain
+  control stream zero, and enforce DTLS 1.2 protected-record wire versions.
+  Qualify both endpoint roles on the real Linux SCTP-AUTH carrier (Refs #794,
+  #784).
+- `opc-diameter-transport`: add optional required direct-CRL constructors for
+  generic RFC 6083 endpoints. Bind full-path revocation verification and
+  retained connection evidence to the exact credential/trust epoch and CRL
+  publication; retire on replacement, withdrawal, publisher loss or expiry.
+  Bound inputs and issuer rollback floors; preserve the original generic and
+  Diameter profiles (Refs #794, #784).
+- `opc-proto-ngap`: construct and admit up to three additional uplink
+  endpoints in Setup/Modify requests and additional downlink flow associations
+  in Modify responses. Share bounded tunnel codecs with independent Release
+  18 transfer and complete-message evidence. Request literals gain optional
+  `additional_uplink`; Modify response literals gain `additional` (Refs #787).
+- `opc-proto-ngap`: preserve and construct Setup response flow mappings and
+  up to three additional downlink tunnels, including complete context/session
+  responses. Validate each tunnel's flow list and the accepted/failed union
+  before allocation, with independent Release 18 wire evidence. Existing
+  single-tunnel accessors retain their primary-tunnel meaning (Refs #787).
+- `opc-proto-ngap`: admit and construct optional Criticality Diagnostics in
+  Setup unsuccessful transfers and all three enclosing response/failure
+  outcomes. Reuse the qualified Modify root layout with independent Setup
+  bytes, bounded diagnostic lists and response-specific header restrictions.
+  `SetupFailureTransfer` gains `diagnostics`; it and `FailedSession` are now
+  `Clone` rather than `Copy` (Refs #787).
+- `opc-proto-ngap`: construct and admit root non-dynamic/dynamic QoS profiles,
+  GBR parameters and optional E-RAB identifiers. Add exact caller-supplied
+  session/QFI classification for conditional Session AMBR and per-flow failure
+  reporting, with independent Release 18 bytes and bounded replay. Session
+  AMBR literals now use `Option`, setup-list values expose `QosFlow`, and Modify
+  matches gain two variants; the crate conformance record documents migration
+  and the remaining unsupported extensions (Refs #787).
+- `opc-proto-ngap`: construct and admit Common Network Instance in Setup/Modify
+  transfers and numeric Network Instance in Modify. Preserve opaque identifiers,
+  expose the specified Common-first request preference, and preflight fragmented
+  values with independent leaf, transfer and complete-message evidence (Refs #787).
+- `opc-n3iwf-fixtures`: bind ten DTLS lifecycle families to eight independent
+  certificate cases and 78 SDK stream-zero schedules. Replay them against the
+  existing generic protected PPID 66 transport; also qualify the certificate
+  corpus at protected PPID 47. Keep kernel, multistream, rekey and revocation
+  evidence boundaries explicit (Refs #784, #794).
+- `opc-n3iwf-fixtures`: bind nine durable XFRM roster lifecycle families to
+  636 independent schedules over all supported member counts and SA/policy
+  shapes. Replay ordered acquisition, compensation, recovery and authenticated
+  inspection against the existing store and scripted backend (Refs #784, #793).
+- `opc-proto-ngap`: admit session-setup Security Indication and Network Instance,
+  preserve response Security Result at unaligned bit offsets, and enforce the
+  conditional UL integrity rate. Apply the specified receiver-ignore rule for
+  Data Forwarding Not Possible outside handover; qualify independent leaf,
+  transfer and complete-message construction without security side effects
+  (Refs #787).
+- `opc-proto-ngap`: admit and construct Initial Context Setup optional old/extended
+  AMF names, masked identity, partial slices and bounded root trace parameters.
+  Preserve message-specific criticality and combined slice constraints with
+  independent complete-message and semantic reconstruction evidence (Refs #787).
+- `opc-proto-ngap`: admit and construct NG Setup root node/extended names,
+  UE-retention reports and served-GUAMI backup AMF names. Preserve optional
+  name components and existing duplicate policy with bounded, redacted types
+  and independent complete-message construction evidence (Refs #787).
+- `opc-proto-ngap`: construct and admit Error Indication's optional 5G-S-TMSI
+  with its distinct ignore criticality. Preserve explicit signalling context,
+  required UE IDs and error basis; qualify the binding with independent Release
+  18 messages, bounded mutations and redacted field reconstruction (Refs #787).
+- `opc-n3iwf-fixtures`: execute 25 independently authored protocol-key custody
+  schedules through the existing SDK API, including generation/reuse/drop and
+  cancellation boundaries. Bind successful use to both synthetic AUTH answers
+  and distinguish private pre-release zeroization evidence (Refs #784).
+- `opc-proto-ngap`: construct and admit optional Allowed NSSAI in Initial UE
+  and Downlink NAS messages and optional Old AMF in Downlink NAS. Both messages
+  also admit Partially Allowed NSSAI with combined count/disjointness checks;
+  Initial UE admits the fixed 44-bit Selected NID with strict padding, AMF Set
+  ID, 5G-S-TMSI and opaque AMF reroute containers. Downlink admits Masked IMEISV
+  and Extended Old AMF with independent optional VisibleString/UTF8String names.
+  Reuse bounded, redacted field types and qualify complete messages with independent
+  Release 18 reference bytes, duplicate policies and adverse field/boundary tests
+  (Refs #787).
+- `opc-n3iwf-fixtures`: bind 22 unchanged independent N3 packet vectors into
+  the catalog, covering both downlink RQI values, all absent/present PPI values
+  and QFI boundaries in both directions. Check source provenance separately
+  from regeneration and execute the shared PSC codec (Refs #784).
+- `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
+  strict PPID 60, the default NGAP service port, bounded ordered records,
+  separate notification delivery and redacted diagnostics. Reuse existing
+  partial-receive ownership; reject PPID 66 and incomplete metadata before
+  exposing payloads. Generation fencing and restart remain separate work
+  (Refs #788).
+- `opc-proto-eap`: add bounded EAP-5G bootstrap envelopes with typed AN
+  parameters, opaque NAS forwarding, explicit duplicate and presence policy,
+  canonical construction and redacted diagnostics (Refs #785).
+- `opc-session-store`: add `ProtectedAsyncRecovery` for retained-root majority
+  and all-cold recovery with a complete, root-signed inventory of external
+  effect owners. Every owner durably retires the old authority range before
+  real quorum commitment and completed generations admit a successor. Normal
+  Async acknowledgements remain independent of disk; acknowledged state can
+  still be lost. This recovery path requires all original retained voters and
+  inventoried owners, plus downstream provider composition (Refs #908, #929).
+
+
+### Changed
+- `opc-diameter-transport`: expose an opaque generic RFC 6083 connector,
+  acceptor and protected connection using the existing mutual DTLS/SCTP
+  machinery without Diameter procedure state. Admit protected PPIDs 47 and 66
+  on ordered stream zero, bound opaque application records, and reconcile
+  credential and observed carrier retirement before readback or delivery.
+  Complete NGAP stream and 3GPP PKI profiles remain unsupported (Refs #794).
+- Raise the minimum supported Rust version to **1.89** for `russh` 0.63.3,
+  and keep the workspace, standalone SMF consumer, and CI compiler gate aligned.
+- Upgrade `quick-xml` to 0.42, `base64` to 0.23, and the gNMI Prost/Tonic stack
+  to 0.14. Adapt the UTF-8 XML API and the separate Tonic Prost codec/generator;
+  retain raw SSH host-key pinning and fail closed on host certificates.
+- Migrate workspace HMAC/HKDF/SHA-2 together to the digest 0.11 generation,
+  including both Cargo lockfiles and zeroization of key-derived hash state.
+  Keep RSA's digest adapter on its supported trait generation, and preserve
+  persisted envelopes, privacy digests, and protobuf wire bytes.
+
+### Fixed
+- Publish XFRM recovery-test readiness only after the complete record is
+  written and synced. Preserve exclusive publication and strict malformed
+  record refusal across the single-object, roster and SA relocation harnesses
+  (Refs #793).
+- `opc-n3iwf-fixtures`: correct N2 metadata port octets from `96 1c` (38428)
+  to the declared IANA NGAP service port `96 0c` (38412), refreshing four wire
+  digests. Independently verify numeric PPID/port claims in both metadata
+  orders and repeated tuples, plus DATA user length, so valid framing and
+  a refreshed digest cannot conceal a contradictory claim. Clarify the DATA
+  and caller-port-bound provenance without changing runtime scope (Refs #784, #788).
+- `opc-sctp`: preserve socket-owned partial DATA and its cumulative byte bound
+  across cancelled receives and interleaved non-lifecycle notifications. Clear
+  partial state on terminal errors and close, invalidate it on matching
+  association lifecycle events, and reject conflicting complete metadata or
+  ambiguous notifications. This receive reliability slice precedes the typed
+  N2 profile and does not establish protected transport (Refs #788).
+- `opc-route-steering`: schedule independent exact route/rule operations and
+  non-overlapping owned collections concurrently with bounded workers. Retain
+  conflicting-key exclusion through dispatched verification and rollback after
+  cancellation, and align mock exact source-sibling readback with Linux (#894).
+- Make the persistent-file identity qualification recognize actual reuse of
+  any inode it previously deleted, retaining the 4,096-attempt bound and the
+  generation-change assertion when another filesystem user takes the first inode.
+- Wait for Raft's metrics publication before asserting the held vote in the
+  five-voter async-persistence regression test. The real response remains held,
+  and the existing operation and election bounds still apply.
+- `opc-gtpu-dataplane`: admit one exact marked IPv4 child under a current
+  unmarked default group without retiring that default. Preserve independent
+  subscribers using the same bearer mark, require exact quiescence before
+  retired child reuse, and retain immutable parent lineage across bounded
+  default reattach. Child changes invalidate the parent's traffic proof while
+  leaving unrelated groups' authority intact. The consumer simulation refuses
+  live traffic-proof issuance; kernel and product qualification remain separate
+  (Refs #845).
+- `opc-gtpu-dataplane`: renew the owned selector worker lease at the bounded
+  cadence instead of before every backend step and fenced write. Retain
+  conservative call-start timing, fresh backend authorizations, exact store
+  credential checks, and the original request deadlines. Ambiguous or late
+  renewals fence the worker (Refs #821).
+- `opc-session-testkit`: reconcile an exact ambiguous paired-fixture transition
+  through its authoritative receipt before shared readback and facade reopening.
+  Real response-loss and no-replay controls retain the original request deadlines
+  and general-backend capability boundary (Refs #824).
+- `opc-session-testkit`: retain each synthetic traffic acquisition's exact
+  consumer request and fixed deadline before polling. Reconcile uncertain
+  outcomes before admitting a successor, preserve custody across restart, and
+  retire recorded old acquisitions before fresh restart authority. The v10
+  qualification schedule combines this recovery profile with readiness and scan
+  reproof from v9; ordinary lease APIs, stale-fence checks and existing recovery
+  bounds are unchanged (Refs #819).
+- `opc-session-store`: separate a pinned snapshot directory's original configured
+  namespace name from its owned I/O capability. Independent processes no longer
+  share a lease key merely because their inherited descriptor numbers match.
+  The explicit fixed-quorum handoff and qualification consumer retain directory
+  and database exclusion, replacement/cleanup custody, independent flock
+  ownership, and existing persistence and integrity policies (Refs #808).
+- **TLS dependency security:** require Rustls 0.23.45 for
+  RUSTSEC-2026-0285, preserving the existing provider and TLS feature policy.
+  Refresh the workspace and standalone reference lockfiles, including the
+  required WebPKI patch and the reference's previously yanked ChaCha20 patch
+  (Refs #817).
+- `opc-session-net`: join three-voter fixture engines on normal test exits and
+  retain isolation until later service/transport owners retire. Restart keeps
+  the original fixture binding and transfers its guards without reacquiring;
+  production verifier limits and operation deadlines are unchanged (Refs #815).
+- **Cancelled legacy cache verification — `opc-session-store`:** the explicit
+  Linux `PrivateWalTest` route retains an already-started read's connection,
+  permit and WAL guard through cache validation after caller cancellation.
+  The original deadline and foreign-write fence remain enforced; queued
+  cancellation releases unused admission. Late result delivery fails without
+  fencing an owner validated on time. Ordinary SQL cancellation and native
+  persistence are unchanged.
+- `opc-session-store`: distinguish a proven post-activation initialization-probe
+  timeout from genuine admission rejection in the bounded Async recovery test.
+  Per-call test evidence, deterministic deadline and native-scope controls, and
+  clarified recovery documentation preserve production errors and deadlines
+  (Refs #814).
+- **Native journal read admission — `opc-session-store`:** preflight complete
+  journal output before copying and bound concurrent construction to 32 MiB
+  within the existing 128 MiB verifier budget. Oversized requests return
+  `BackendUnavailable` and permit a smaller complete retry without changing
+  cursor, integrity, ownership, persistence, or deadline rules.
+- **SWm STA application extension — `opc-proto-diameter`:** ordinary Session-
+  Termination answers may carry the known `Auth-Application-Id` extension
+  alongside `User-Name`. Decode and encode require the application value to
+  match the SWm header, retain singleton and dictionary validation, and keep
+  exact session, transaction and authenticated-peer correlation. Independent
+  six-AVP fixtures cover strict framing and malformed or foreign answers.
+- **First Applied recovery and compensation — `opc-session-net`:** a first
+  authenticated Applied status/adoption result no longer looks like an inverse
+  that was already dispatched. A complete conclusive aborting roster can
+  compensate that member once. Actual compensation ambiguity still prevents
+  another inverse, and incomplete or all-Applied rosters remain excluded.
+- **Nested NETCONF leaf-list recovery edits — `opc-yanggen`,
+  `opc-netconf-server`:** generated numeric leafref leaf-lists now compile,
+  and repeated typed list keys or singleton parents cannot bypass duplicate
+  leaf-list edit rejection. Leaf-list `create`/`delete` existence failures
+  preserve RFC `data-exists`/`data-missing` replies for running, candidate,
+  and startup. Full-root replacements with multiple values under keyed APNs
+  have generated service/commit-path regression coverage. Compatibility note:
+  exhaustive `EditConfigError` matches must handle `DataExists` and
+  `DataMissing`; ambiguous repeated-parent edits now fail with `invalid-value`.
 - **Redaction-safe Child-SA KEYMAT nonce diagnostics — `opc-ipsec-xfrm`:**
   `Ikev2ChildSaKeyMaterialError::KeyDerivation` now retains an
   `Ikev2ChildSaKeyMaterialDiagnostic`: a closed snapshot containing the stable
@@ -17,8 +634,217 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded `Display` output are unchanged. Compatibility note: downstream
   matches must change the `KeyDerivation` payload from
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
+- `opc-session-store`: preserve a cold voter's certified catch-up progress
+  across caller deadlines and recertify a newer committed leader. Reuse exact
+  in-memory signature calculations during protected recovery validation while
+  independently verifying every cold or wire decode. Preserve operation
+  deadlines, full authority checks and Durable/Ephemeral behavior (Refs #908).
+
 
 ### Added
+- Vendored DTLS: pair RFC 6083 application plaintext with its exact decrypted
+  record number for later SCTP stream correlation, preserving the existing
+  Diameter polling API. Complete NGAP stream support remains pending (Refs #794).
+- `opc-ipsec-xfrm::child_sa`: bounded, immutable caller-selected class/default
+  intentions with exact directional ESP identities and explicit rekey overlap.
+  Refuse ambiguous Linux SA lookup domains and stale incarnation metadata;
+  keep live publication, authentication and relocation authority separate
+  (Refs #793).
+- `opc-proto-nas`: bounded, opaque NAS-over-TCP envelopes with exact
+  caller-storage encoding, borrowed first-frame receive, incremental framing
+  across arbitrary reads, caller-owned coalesced tails and explicit terminal
+  truncation. Validate length before allocation and preserve protected NAS
+  without content decoding (Refs #792).
+- **Consume-once N3IWF protocol-key custody — `opc-proto-ikev2`:** zeroizing
+  K_N3IWF import binds an opaque association, generation, pending operation
+  and negotiated profile. One attempt computes both directional AUTH MICs
+  through the admitted IKE module; cancellation, release, replacement and
+  drop revoke custody. The handle has no key-byte export or envelope-handle
+  conversion. Independent synthetic AUTH vectors and lifecycle/provider tests
+  cover this volatile software contract; sealing, restore and live peer
+  interoperability remain unsupported (Refs #791).
+- `opc-gtpu-dataplane`: add experimental directional N3 tunnel/marking intent,
+  bounded complete G-PDU/PSC reception and constructed uplink PSC insertion
+  through the existing GTP-U codecs. All shipped adapters explicitly report
+  N3 forwarding as missing pending control/selector-authority integration
+  (Refs #790, #795).
+- `opc-proto-gre`: experimental bounded NWu keyed GRE with explicit packet
+  direction, checked QFI and downlink RQI, canonical transmission, and a
+  backend-neutral association model that exposes all exact or default fallback
+  candidates. Includes independent synthetic wire vectors and bounded fuzzing;
+  SA selection, QoS policy, XFRM installation, and live interoperability remain
+  outside this crate. Cargo publication is held (Refs #789, #795).
+- `opc-proto-ngap`: optional UE Context Release Complete session reports with
+  unique IDs and optional empty release-response transfers, backed by 1,287
+  independent fields and 1,308 complete messages. Preflight nested framing,
+  count and depth before allocation. Complete variant literals and exhaustive
+  patterns must include or allow the new `sessions` field.
+- `opc-proto-ngap`: optional Criticality Diagnostics in seven existing response
+  types, backed by 4,349 independent complete-message vectors. Preserve absent
+  versus empty diagnostics, enforce response header applicability and bound
+  diagnostic lists before allocation. Affected struct literals and Release
+  Complete patterns must include or allow the new `diagnostics` field.
+- Add explicit N3IWF receive routing for all 40 applicable NGAP outcomes,
+  assigned metadata checks for all Release 18 procedures, disabled trigger gates
+  for pending codecs and value-free unsupported-procedure diagnostic headers.
+  Document each pending procedure's receive/error behavior and caller effects.
+  Envelope classification remains separate from typed field admission.
+- `opc-proto-ngap`: qualify complete PDU Session Resource Modify Request/Response
+  with bounded session lists, optional NAS/S-NSSAI and partial failure diagnostics.
+  Add two public message variants (exhaustive matches require updates), independent
+  Release 18 byte evidence and shared adversarial replay; caller-owned effects
+  and the remaining #787 procedure matrix stay explicit.
+
+- `opc-proto-ngap`: bounded Modify response and unsuccessful transfers with
+  optional directional endpoints, unique/disjoint QFI results and qualified
+  response diagnostics. Preserve empty roots and absent/empty diagnostics;
+  1,436 independent vectors qualify parent-offset framing. Request correlation,
+  conditional NAS forwarding and resource effects remain caller-owned (Refs #787).
+- `opc-proto-ngap`: bounded Modify Request Transfer with optional AMBR, tunnel
+  modifications, add/modify QFIs and release causes, backed by 380 independent
+  complete transfers. Preserve empty roots and absent parameters, apply shared
+  IE policies and reject cross-list QFI conflicts; enclosing Modify messages
+  and resource effects remain separate (Refs #787).
+- `opc-proto-ngap`: standalone PDU Resource Modify flow and tunnel-pair fields,
+  backed by 687 independent Release 18 cases. Preserve absent QoS parameters,
+  typed endpoint directions and ordered tunnel pairs; validate root counts,
+  identifiers and exact framing before allocation. Further Modify transfers
+  and complete procedure admission remain pending (Refs #787).
+- `opc-proto-ngap`: canonical PDU Session Resource Notify with typed root
+  flow notifications, released QFIs and whole-session release reports, backed
+  by 1,014 independent cases. Enforces nonempty reports and disjoint identifiers;
+  GBR classification, correlation and cleanup remain caller-owned. Shared
+  contained-field preflight rejects nonminimal short-value lengths. Adds a
+  public message variant; downstream exhaustive matches need updating (Refs #787).
+- `opc-proto-ngap`: canonical NG Reset, Reset Acknowledge and Error Indication
+  with explicit signalling context, bounded fragmented connection lists and
+  root Criticality Diagnostics. Preserve legal empty/repeated connection items
+  and enforce conditional Error fields and diagnostic applicability, backed by
+  1,282 independent cases. Adds three public message variants; downstream
+  exhaustive matches need updating. Correlation and resource effects remain
+  caller-owned (Refs #787).
+- `opc-proto-ngap`: canonical NAS Non-Delivery Indication and UE Context
+  Release Request with required root Cause and optional unique session IDs,
+  backed by 548 independent field/message cases. Root Cause now rejects
+  nonzero final padding across all admitted procedures. Adds public message
+  variants; downstream exhaustive matches need updating (Refs #787).
+- `opc-proto-ngap`: canonical PDU Session Resource Release Command/Response
+  construction and admission, with unique session lists, per-session root
+  Causes and bounded generated transfer codecs. Independent Release 18 evidence
+  covers every list length, optional NAS/location and receiver-ignore behavior;
+  correlation and resource cleanup remain caller-owned (Refs #787).
+- `opc-proto-ngap`: canonical construction and typed admission for all five
+  Initial Context/PDU Session Resource Setup outcomes, with required and
+  conditional presence, nested caller policies and disjoint partial results.
+  Independent Release 18 messages cover receiver-ignored capabilities, borrowed
+  keys and fragmented NAS; resource effects remain caller-owned (Refs #787).
+- `opc-proto-ngap`: bounded context/PDU Setup session request/result lists
+  with optional borrowed NAS, S-NSSAI, unique session IDs and disjoint partial
+  results. Independent Release 18 vectors cover seven root layouts and nested
+  fragmentation; nested admission preserves caller IE policies (Refs #787).
+- `opc-proto-ngap`: construct/admit bounded setup response and unsuccessful
+  transfers, with distinct downlink endpoints and unique, disjoint accepted/
+  failed QFI results. Independent Release 18 vectors qualify the response
+  layout and all root Causes; malformed final padding is rejected before
+  generated unsuccessful-transfer decoding (Refs #787).
+- `opc-proto-ngap`: admit and construct a bounded PDU-session setup-request
+  transfer with distinct UL/DL tunnel fields, session AMBR, root session types
+  and unique non-GBR 5QI 9 flows. Preserve nested unknown/duplicate IE policies;
+  require conditional AMBR and reject unimplemented known fields. Independent
+  Release 18 vectors qualify the nested QoS framing fix (Refs #787).
+- `opc-proto-ngap`: bounded standalone GUAMI and Allowed NSSAI field codecs,
+  plus construction-only UE security algorithm masks. Independent Release 18
+  vectors cover every root list length, optional slice differentiators and
+  every mask bit. Context-message composition is qualified separately above.
+- `opc-proto-ngap`: construct and admit all three NG Setup outcomes with bounded
+  N3IWF identity, TA/PLMN/slice/GUAMI lists, AMF name/capacity and root retry
+  delay. Preserve mandatory presence plus receiver-ignore behavior for DRX.
+  Independent Release 18 vectors qualify fixes for nested APER alignment;
+  association activation and selection remain caller-owned (Refs #787).
+- Experimental NGAP N3IWF UE release field admission and construction, including
+  AMF/RAN and AMF-only identifier choices, all root Cause values and optional
+  location. Independent Release 18 messages qualify this bounded subset; resource
+  cleanup, association authorization and remaining procedure fields stay outside.
+- `opc-proto-ngap`: construct and admit bounded Initial UE and uplink/downlink
+  NAS messages, enforce every required field, validate N3IWF-applicable UE
+  AMBR, and report unknown-notify diagnostic IDs. Explicitly gate unsupported
+  known fields and retain generic decode selection/raw preservation. Compare
+  with 44 independent complete-message cases (Refs #787).
+- `opc-proto-ngap`: typed, redacted N3IWF UE IDs, opaque NAS, borrowed Security
+  Key, TAI and IPv4/IPv6 location values with canonical field encoding and
+  bounded decoding. Correct TAI receive and without-port CHOICE alignment
+  against 51 independent Release 18 field vectors and two complete UL NAS
+  messages. Encoded buffers clear on drop; procedure presence, additional
+  nested extensions and key-provider admission remain separate (Refs #787).
+- `opc-proto-ngap`: construct and canonically encode the supported root PDU/IE
+  containers from opaque encoded IE values; preserve existing receive policies
+  and raw replay. Correct open-type fragmentation boundaries, check complete
+  output bounds before writing, and compare all 15 admitted outcomes with the
+  independent Release 18 corpus. Typed N3IWF semantic IE admission and further
+  applicable procedures remain pending (Refs #787).
+- `opc-proto-ikev2::nwu::mobike`: authenticated network-side mobility updates,
+  source/replay checks, typed NAT/address notifications and COOKIE2 proof before
+  Child-SA migration intent. Crypto and entropy use the admitted IKE module;
+  XFRM application remains separate (Refs #786).
+- `opc-proto-ikev2::nwu`: bounded TS 24.502 configuration and QoS payloads,
+  opened Child-SA creation/modification, explicit NWu Child/IKE deletion and
+  caller-ordered AEAD selection and conditional MOBIKE capability advertisement
+  (Refs #786).
+- **Bounded acknowledged configuration history — `opc-persist`:** the existing
+  consensus authority commits exact-head retention decisions with record and
+  encoded-byte limits, authenticated cursor boundaries, and protected rollback
+  references. Capacity rejection rolls back the entire mutation; retained
+  outcomes and original encrypted lineage survive pruning, reopen, natural
+  election and member snapshot repair. Real encrypted ConfigWatch recovery
+  resumes from a complete snapshot and its ordered tail. Configuration wire and
+  command revision 4 and storage/snapshot representation 2 require a coordinated
+  cutover; no representation-1 authority conversion is provided. Legacy command
+  semantics remain preserved. See ADR 0023 (Refs #802).
+- **Synthetic N3IWF fixture contracts — `opc-n3iwf-fixtures`:** ten independently
+  consumable inventories with explicit encoding, validation scope, caller
+  context, provenance, and byte digests. Catalog loading validates bounded
+  regular files, redacted diagnostics, unique JSON fields, and pinned
+  TS 38.413 V18.10.0 IE presence/criticality/cardinality matrices. Read-only
+  generation, independent envelope/scenario oracles, existing NGAP/GTP-U codec
+  tests, and Git content stamps guard the inventory. The reused legacy NGAP
+  vector is sanitized structural evidence; complete Release-18 N3IWF messages,
+  typed encoding, cryptography, transports, and kernel state remain unproven.
+  All records keep `runtime_claim=false`. This establishes the documented
+  fixture boundaries and leaves broader evidence tracked in #784; issue 795
+  remains outside this change.
+- **Selectable fixed-quorum persistence — `opc-session-store`:** supported
+  `SessionPersistenceMode::Async` acknowledges validated resident storage,
+  real quorum replication, and committed application while one coalescing
+  writer persists local generations. Existing constructors retain `Durable`.
+  Additive openers accept persistence independently of snapshot integrity,
+  including the existing explicit clock and complete-operation deadline shape.
+  Mode-aware readiness, typed passive health, and an explicit local drain
+  report the selected contract. Every existing Async root rejoins through a
+  fresh surviving-quorum commit and exact local catch-up; an all-cold set stays
+  `RecoveryRequired`. Mode mismatches fail closed on disk and consensus/control
+  traffic. Losing the volatile quorum can lose acknowledged results; local
+  persistence does not authorize recovery. No automatic mode migration is
+  provided. See ADR 0022 for semantics and qualification boundaries.
+- **Durable non-voting configuration consumers:** `DurableConfigConsumer` composes
+  authenticated snapshot/tail recovery with a sealed SDK checkpoint and a
+  product-owned apply/readback port. It persists original committed revisions
+  and complete apply intent, rejects rollback/conflict/gaps, and reconciles
+  interrupted application without replay. `ConsumerCheckpointStore` adds
+  bounded explicit provision/reopen and atomic CAS, using purpose-separated
+  `ConfigConsumerCheckpoint` custody. Accepted storage bounds account for SQLite
+  overflow pages at the maximum payload, and canonical checkpoints preserve
+  typed JSON integer precision without changing shared Serde JSON features.
+  This adds no voter or authoring authority
+  and no independent global-freshness claim; see SDK #799's consumer contract.
+- **Retained configuration-authority lifecycle — `opc-persist`:** explicit
+  provisioning, ordinary reopen, and member-repair APIs bind local storage to
+  exact consensus, backing and key scope. Reopen rejects missing or incomplete
+  authority without creating it; repaired voters cannot bootstrap a new
+  cluster. Base-schema admission uses the SDK catalog, including the unique
+  replay index, rather than trusting a stored compatibility digest. Local
+  bindings stay out of replicated snapshots. Ephemeral storage remains an
+  explicit choice. Whole-store rollback freshness still requires external
+  authority; see the retained lifecycle contract and issue #800.
 - **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
   workload scopes select separate bpffs roots and local writer locks. An
   explicit stopped-generation reset reclaims only the unbound current IPv4
@@ -688,6 +1514,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
+- **Dependency compatibility:** update AES-GCM-SIV to 0.12.1 and tower-http to
+  0.7.1 across the workspace and standalone SMF consumer. Preserve persisted
+  ciphertext compatibility and Rust 1.88 support, retaining AES 0.9.2. Update
+  both Go operator modules to Kubernetes 0.37.0 / controller-runtime 0.25.0
+  together (Refs #836).
 - **Strict-default IKEv2 nonce validation with initial-exchange compatibility — `opc-proto-ikev2`, `opc-ipsec-xfrm` (breaking):**
   parent IKE-SA and IKE-SA-rekey KDFs now reject nonce inputs below the selected
   PRF half-key floor by default. The explicit `Ikev2InitialExchangeNoncePolicy`

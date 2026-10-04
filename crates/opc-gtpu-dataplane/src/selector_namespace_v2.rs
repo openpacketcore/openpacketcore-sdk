@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_gtpu_ebpf_common::GtpuSessionDownlinkKey;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -176,7 +176,7 @@ impl SelectorNamespaceCommitmentKeyV2 {
         domain: &[u8],
         encoded: &[u8],
     ) -> Result<SelectorNamespaceCommitmentV2, SelectorNamespaceCodecError> {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.0.as_ref())
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.0.as_ref())
             .map_err(|_| SelectorNamespaceCodecError::invalid())?;
         mac.update(domain);
         mac.update(encoded);

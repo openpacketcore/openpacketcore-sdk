@@ -1,30 +1,34 @@
 # opc-proto-ngap conformance — v1 subset
 
-3GPP release: TS 38.413 R18. ASN.1 types generated offline from the 3GPP
+Fixture profile: TS 38.413 V18.10.0. ASN.1 types generated offline from the V19.2.0
 modules mirrored by Wireshark at pinned commit
 `d296f939b42891994714939384adc3deaef3f180` (see
-`scripts/generate-ngap.py`); APER via `rasn`.
+`scripts/generate-ngap.py`); APER via `rasn`. The generated object set includes
+later extensions. It is not the source of the independent Release 18 corpus.
 
 ## Coverage
 
-✅ = proven by a conformance fixture per ADR 0015 (externally sourced or
-hand-authored from the specification with octet comments). 🧪 = structural
-typed dispatch is tested with explicit APER wrapper/body fixtures and fuzzed,
-but no external field-level fixture proves the IE mapping yet.
+✅ = proven at the stated boundary by a conformance fixture per ADR 0015.
+🧪 = structural dispatch only. An IE mapping check proves its identifier,
+criticality and opaque open-type bytes; it does not validate the field's
+internal semantics in the SDK.
 
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
-| NGAP-PDU framing | InitiatingMessage | ✅ | External NGSetupRequest fixture round-trip |
-| NGAP-PDU framing | SuccessfulOutcome | ✅ | Hand-authored wrapper fixture (octet comments, X.691 CHOICE index 1); body kept raw |
-| NGAP-PDU framing | UnsuccessfulOutcome | ✅ | Hand-authored wrapper fixture (CHOICE index 2); body kept raw |
-| Typed decode | NGSetupRequest | ✅ | 78-byte external fixture; IE ids, RANNodeName content, and DefaultPagingDRX value asserted |
-| Typed decode | NGSetupResponse / NGSetupFailure | 🧪 | Successful/unsuccessful outcome dispatch with hand-authored empty-IE APER fixtures; malformed recognized bodies fail closed |
-| Typed decode | InitialUEMessage | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture; external field fixture pending |
-| Typed decode | DownlinkNASTransport / UplinkNASTransport | 🧪 | First-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | InitialContextSetup Request/Response/Failure | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | PDUSessionResourceSetup Request/Response | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | PDUSessionResourceRelease Command/Response | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | UEContextRelease Command/Complete | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
+| NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
+| Constructed root containers | 23 admitted outcomes | ✅ | 21 published-corpus construction cases, 291 UE request cases, 189 Reset/Error cases, 43 Notify cases and 63 Modify cases below |
+| Constructed length determinants | All three outcomes; short, two-octet and fragmented open types | ✅ | 54 independent Pycrate cases, including inner/outer 128, 16384 and 65536 boundaries |
+| Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
+| Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
+| Typed IE mapping | InitialContextSetup Request/Response/Failure | ✅ | Complete context and nested resource fields |
+| Typed IE mapping | PDUSessionResourceSetup Request/Response | ✅ | Nested setup transfers and partial resource results |
+| Typed IE mapping | PDUSessionResourceRelease Command/Response | ✅ | Nested release transfers |
+| Typed IE mapping | UEContextRelease Command/Complete | ✅ | UE identifier pair and N3IWF location |
+| Typed IE mapping | NASNonDeliveryIndication; UEContextReleaseRequest | ✅ | Independent complete requests, root Causes and session IDs |
+| Typed IE mapping | NGReset; NGResetAcknowledge; ErrorIndication | ✅ | Independent complete messages, fragmented connection lists and root diagnostics |
+| Typed IE mapping | PDUSessionResourceNotify | ✅ | Independent flow/session reports, root Causes and optional N3IWF location |
+| Typed IE mapping | PDUSessionResourceModify Request/Response | ✅ | Three independent session lists and complete procedure messages, including partial results |
+| N3IWF envelope routing | 40 applicable outcomes; metadata for 81 Release 18 procedures | ✅ | [Explicit receive/error/trigger matrix](N3IWF-PROCEDURES.md), 2,321 independent routing envelopes; no field admission inferred |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
@@ -32,14 +36,25 @@ on an initiating message, NGSetupResponse on a successful outcome, and
 NGSetupFailure on an unsuccessful outcome. The same outcome-aware rule is
 applied to the first-CNF N2 subset above.
 
+The [N3IWF procedure contract](N3IWF-PROCEDURES.md) classifies all applicable
+outcomes before generic decoding and keeps 17 pending codec triggers disabled.
+Its independent envelope/diagnostic evidence does not expand the 23 qualified
+message subsets or the published fixture corpus.
+
+The [subset acceptance record](N3IWF-ACCEPTANCE.md) maps the original #787
+criteria to these implemented boundaries, independent sources, runtime tests
+and qualification records. It preserves the explicit unsupported ranges and
+disabled procedure triggers below.
+
 ## Protocol-IE policy and cardinality
 
 The wrapper carries procedure/outcome-specific metadata transcribed from the
-pinned TS 38.413 Release-18 ASN.1 object sets for every typed row above:
+pinned generated ASN.1 object sets for every typed row above:
 recognized top-level IE identifiers, expected criticality, and
 singleton/repeatable cardinality.
 
-- Known identifiers are accepted only with their specified criticality.
+- Known procedures and IE identifiers are accepted only with their specified
+  criticality. The procedure check runs before typed-body materialization.
 - `UnknownIePolicy::Preserve` retains the generated entry and opaque open-type
   value; `Drop` removes it from the typed container; and `Reject` returns a
   stable value-free decode error.
@@ -58,7 +73,8 @@ singleton/repeatable cardinality.
 These policies filter the typed generated container, not the preserved wire
 image. `Pdu::raw` remains the immutable received bytes. Raw-preserving encode
 therefore reproduces unknown or duplicate entries removed by `Drop`, `First`,
-or `Last`; it is not a sanitized typed-view encoder.
+or `Last`. Canonical encoding serializes the resulting typed container. Neither
+mode performs nested semantic admission.
 
 Public `Debug` output for the wrapper and message enums is redacted to
 procedure/outcome metadata, lengths, variant names, and IE counts. It does not
@@ -68,20 +84,1540 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
 
 - **Raw-preserving**: byte-exact `decode → encode` is proven for every
   fixture above; the original PDU bytes are preserved and re-emitted.
-- **Canonical typed encode**: unsupported in the v1 subset and rejected with an
-  error.
-  `rasn` 0.28's APER encoder does not reproduce the octet alignment of the
-  external fixtures for the inner message types (and its output for those
-  types does not survive its own decoder), so this codec profile preserves raw
-  bytes instead of constructing new NGAP messages from typed values.
-  Raw-preserving encode also rejects PDUs without decoded raw bytes.
+- **Canonical container encode**: explicitly writes the supported typed root
+  PDU/IE containers using TS 38.413 9.4 and X.691 aligned BASIC-PER. This avoids
+  the generated `rasn` 0.28 inner-container encoder alignment defect. The
+  mode name describes SDK reconstruction, not ASN.1 CANONICAL-PER. IE order
+  and opaque IE value bytes are preserved; alignment bits are zero, length
+  determinants are minimal, large open types use the largest permitted 16K
+  multiple up to 64K followed by a terminating determinant (including zero),
+  and no message SEQUENCE extension additions are written. Use raw mode when
+  received extensions or ignored bytes must survive exactly.
+- Construction accepts `MessageType` plus borrowed `ProtocolIe` values and
+  applies the existing receive policies, including caller-selected unknown
+  and duplicate handling. It bounds count/depth/complete wire size before
+  payload allocation. Returned `raw` is empty. Canonical send revalidates the
+  mutable wrapper/message tuple, known criticality and singleton uniqueness;
+  unknown reject-criticality IEs and unknown message bodies fail. Capacity
+  errors leave the destination unchanged; `wire_len` allocates no heap memory.
+- General typed IE construction, required/conditional presence, and nested
+  resource validation remain outside container construction. The optional
+  individual-field subset below validates its own values. A malformed
+  opaque leaf can be structurally constructed; the API does not claim semantic
+  send admission. Raw-preserving encode rejects PDUs without received bytes.
+
+## Typed N3IWF field subset
+
+TS 29.413 V18.5.0 5.3 and TS 38.413 V18.10.0 9.3 govern these field values.
+The individual ASN.1 constraints are independently compiled from the pinned
+Release 18 publication; field limits and the closed extension subset are SDK
+admission choices, not additional standards requirements.
+
+| Field | Construct / receive | Boundary |
+|---|---|---|
+| RAN UE NGAP ID / AMF UE NGAP ID | Both | Distinct local/peer types; 32/40 bits |
+| NAS-PDU | Both | Opaque OCTET STRING, including empty and fragmented values |
+| Security Key | Both | Borrowed exactly 256 bits; K_N3IWF meaning, no key-provider effects |
+| TAI | Both | Shared validated PLMN plus three-octet TAC; no extensions |
+| N3IWF ULI with port | Both | IPv4/IPv6, optional TAI extension 213 |
+| N3IWF ULI without port | Both | Choice extension 439, IPv4/IPv6, optional TAI |
+
+The [field oracle](tests/fixtures/n3iwf-fields.json) has 51 independently
+encoded cases: integer boundaries, NAS lengths through 131072, a nonzero key,
+two-/three-digit MNCs, and all 16 address/port/TAI/PLMN combinations. Reproduce
+with `scripts/generate-ngap-n3iwf-field-fixtures.py --spec PATH --output PATH`
+in the pinned reference environment. Published corpus bytes are unchanged.
+Two complete UL NAS messages also construct entirely from typed field values
+and match the published IPv4/IPv6 oracle. Additional tests cover byte mutations,
+truncation, trailing data, forged extension counts, capacity and redaction.
+
+The generated TAI decoder mishandles alignment of its three-octet PLMN after
+SEQUENCE flags. Its without-port location CHOICE encoder also misaligns the
+extension container ID. Bounded explicit receive layout and a fixed aligned
+CHOICE wrapper avoid those defects; qualified generated encoders handle the
+inner structures. NAS shares the independently tested open-type length codec.
+
+All wrappers redact identity, NAS, key and peer values. Security Key decoding
+borrows the input without copying; encoded buffers use `zeroize::Zeroizing`.
+Caller-owned input, generic PDU and final wire copies remain caller custody.
+No association authorization, derivation, import, cryptographic decision or
+backend effect occurs. Location addressing/port assignment, required TAI and
+message-level presence remain caller responsibilities. Nested extensions other
+than the enumerated TAI fail explicitly regardless of context policy; the
+existing outer decoder's unknown/duplicate behavior is unchanged.
+
+## N3IWF NAS message admission
+
+`n3iwf::nas::NasMessage` adds complete field construction and required-field
+admission for Initial UE Message, Downlink NAS Transport and Uplink NAS
+Transport. It consumes the generic decoder's policy-filtered view, revalidates
+mutable wrapper/IE metadata, and retains the original PDU unchanged. It has no
+AMF-selection, identifier-binding, NAS-delivery, key or backend effects.
+
+| Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
+|---|---|---|---|
+| Initial UE (initiating 15) | RAN UE ID 85, NAS 38, ULI 121, establishment cause 90 | Selected PLMN 174; UE context request 112; Allowed NSSAI 0; Partially Allowed NSSAI 414; Selected NID 371; AMF Set ID 3; 5G-S-TMSI 26; source-to-target AMF reroute information 171 | Ignore 201/224/225/227/259/333/402/427 as required by TS 29.413 5.2 |
+| Downlink NAS (initiating 4) | AMF UE ID 10, RAN UE ID 85, NAS 38 | UE aggregate bit rate 110; Allowed NSSAI 0; Old AMF 48; Partially Allowed NSSAI 414; Masked IMEISV 34; Extended Old AMF 443 | Ignore 83/36/31/177/205/206/209/222/117/228/226/264/334/400; **110 is applicable** for N3IWF |
+| Uplink NAS (initiating 46) | AMF UE ID 10, RAN UE ID 85, NAS 38, ULI 121 | None in this admitted subset | W-AGF/TNGF/TWIF identity IEs 239/246/247 fail this N3IWF boundary |
+
+Other recognized IEs belonging to other access profiles fail admission
+explicitly, including Initial UE Authenticated Indication 245 and AUN3 Device
+Access Information 440. Those fields are not relabeled as unknown procedures
+and cannot silently disappear into an admitted NAS message. SNPN selection
+and other access conditions outside this subset must be handled by the caller
+before constructing these messages. The codec does not authorize a local
+procedure trigger or make an association/application decision.
+
+Unknown reject-criticality IEs fail. Preserved unknown-ignore IEs contribute
+to an ignored count; preserved unknown-notify IEs return identifier-only
+criticality-diagnostics obligations. The caller owns Error Indication and
+procedure processing. Generic Drop/First/Last selection still affects only the
+typed view; the raw PDU retains discarded entries. Known receiver-ignored
+values are not decoded. Downlink AMBR is decoded, with separate UL/DL values
+in bits/s and the ASN.1 root maximum of 4,000,000,000,000. Extended bitrate
+ranges and nested AMBR extensions are outside the admitted subset.
+
+Field depth starts after the four enclosing layers: simple messages need
+five, AMBR and Extended Old AMF six, and location eight. Message byte/count
+bounds are also checked.
+The allocation budget remains advisory. Debug and errors expose no NAS, peer
+or identifier values. Application/subscriber authorization is separate.
+
+Allowed NSSAI reuses `context_fields::AllowedNssai`: one through eight S-NSSAIs,
+with optional SD, preserved list order and explicit rejection of nested
+extensions. Old AMF reuses `setup_fields::AmfName`: the root PrintableString
+alphabet and 1–150 characters. Both are optional reject-criticality singletons;
+their type bindings are checked against the pinned Release 18 object sets.
+Neither field grants slice or AMF-selection authority. Their depths are eight
+and five respectively, including the four enclosing message layers. The list
+count also obeys `max_ies`; name extension lengths remain unsupported.
+
+`PartiallyAllowedNssai` is a distinct type with the independently qualified
+same root item layout and bounds as Allowed NSSAI. NAS construction and
+admission enforce TS 38.413 8.6.1.3/8.6.2.3: when present, the two lists have
+at most eight entries combined and no S-NSSAI appears in both. Equality
+includes optional SD; an absent SD differs from a present one. Checks run
+after generic duplicate selection, without sorting or deduplicating values.
+These NAS entry points do not enable IE 414 in other procedures.
+
+`SelectedNid` preserves the fixed 44-bit value in six octets, rejects nonzero
+padding and out-of-range construction, and requires field depth one (five
+with the message envelope). Its value and Selected PLMN together identify an
+SNPN under TS 29.413 5.2. Both fields are optional in the pinned object set;
+the codec preserves a standalone NID without inventing a PLMN, selecting a
+network or granting access. Partially Allowed NSSAI and Selected NID are
+optional ignore-criticality singletons; malformed supported values fail.
+
+`nas_fields` preserves AMF Set ID (ten bits), 5G-S-TMSI (its own ten-bit
+AMF Set ID, six-bit pointer and four TMSI octets), Masked IMEISV (64 bits) and
+source-to-target AMF reroute information (independent optional opaque 128/32/32
+octet containers). The outer AMF Set ID is not conflated with the identity's
+AMF Set ID. Empty reroute information differs from an absent IE. Encoders
+preflight exact sizes; decoders reject nonzero padding, extensions, truncation
+and trailing bytes. Leaf depths are one for AMF Set ID/Masked IMEISV and two
+for 5G-S-TMSI/reroute information. These fields do not grant subscriber identity,
+AMF-selection, routing or slice authorization. 5G-S-TMSI is reject-criticality
+in Initial UE and ignore-criticality in the separately qualified Error Indication
+binding below.
+
+Extended Old AMF uses `ExtendedAmfName`, the TS 38.413 9.3.3.51 SEQUENCE with
+independent optional VisibleString and UTF8String names, each 1–150 characters.
+Both present and both absent are preserved; Old AMF remains a separate optional
+IE. VisibleString admits ASCII 32–126. UTF8String length determinants count
+bytes while the character bound counts Unicode scalar values (at most 600
+bytes); invalid UTF-8, noncanonical lengths, fragments and extension encodings
+fail explicitly. Its maximum root encoding is 754 bytes and leaf depth two.
+The other four new NAS field bindings have ignore criticality. All leaf types,
+message diagnostics and errors redact values. ASN.1 extension values and
+applicability to other procedures remain outside these NAS entry points.
+
+The [NAS oracle](tests/fixtures/n3iwf-nas.json) supplies 599 independently
+encoded complete messages and independent mandatory/duplicate validation.
+The original 44 cases are unchanged. The 65 added optional-field cases cover
+every root slice count with absent/mixed/present SD, name lengths 1/2/127/128/149/150,
+combined fields, reversed IE order, different duplicate values and both wrong
+criticalities. They include 56 valid reference messages and nine independently
+rejected messages. A further 256 slice/NID cases cover every root partial-list
+count, all 64 pairs of list lengths in both messages, overlapping and distinct
+SDs, combined fields and reverse order, all 44 single NID bits, zero/max,
+standalone NID, criticality and duplicate selection. Of these, 167 are valid,
+76 fail the separately recorded message-level slice semantics, and 13 fail
+independent singleton/criticality checks. Another 234 identity/reroute cases
+cover every identifier bit, component boundaries, all eight reroute presence
+combinations with distinct opaque patterns, empty/visible/UTF-8/both name
+forms, 1/2/127/128/149/150 character lengths and four UTF-8 widths, combined
+fields, reordered IEs and different duplicate values. These include 219 valid
+and 15 independently rejected messages. Overall, 452 cases compare complete
+constructor bytes. Tests replay 152,304 complete-wire mutations under two
+bounded decoding contexts and reconstruct every admitted field.
+Tests verify received typed values, constructor bytes, generic duplicate/unknown
+policies,
+receiver-ignored malformed fields, unsupported known fields and mutable
+wrapper rejection. Every added valid field is checked for truncated prefixes,
+trailing bytes, unsupported extensions and exact/one-short byte/count/depth
+bounds. Independent messages also seed the shared semantic fuzz/replay
+checks, which preserve all admitted fields through reconstruction. These
+synthetic checks do not establish peer interoperability. Reproduce using
+`scripts/generate-ngap-nas-fixtures.py` with the pinned reference tools and PDF.
+
+## N3IWF UE release field admission
+
+`n3iwf::release` implements the root Cause field, UE identifier choice and
+the following optional typed boundary. Sources: TS 38.413 V18.10.0 8.3.3,
+9.2.2.5–9.2.2.6 and 9.3.1.2; TS 29.413 V18.5.0 5.2–5.3. The existing release corpus
+metadata is corrected to those message clauses; its wire bytes are unchanged.
+
+| Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
+|---|---|---|---|
+| UE Context Release Command (initiating 41) | UE NGAP IDs 114, Cause 15 | None | AMF/RAN pair or AMF-only when RAN ID is unavailable |
+| UE Context Release Complete (successful 41) | AMF UE ID 10, RAN UE ID 85 | N3IWF ULI 121, session reports 60, response diagnostics 19 | Ignore paging IEs 32/207; session transfer usage extensions remain unsupported |
+
+Both outcomes support canonical construction and receive admission. The generic
+decoder applies unknown/duplicate policies first; typed admission revalidates
+the mutable wrapper and mandatory fields without changing the original PDU.
+Unknown-ignore entries are counted and unknown-notify identifiers are returned
+for caller-owned diagnostics. Unknown reject-criticality and unimplemented
+recognized fields fail explicitly.
+
+`UeIdentifiers` separates local and peer IDs in a pair and retains the valid
+AMF-only choice. Fixed choice/SEQUENCE flags reject extensions before generated
+collection decoding. `Cause` admits all 64 standard root values in five classes;
+extension values and the choice-extension branch are outside this subset.
+Both fields use qualified generated encoders/decoders. Numeric cause getters
+and UE identifier fields are explicit access; Debug and errors redact values.
+
+The [release oracle](tests/fixtures/n3iwf-release.json) independently compiles
+94 field cases and 109 complete messages, including 97 constructions, all four
+missing-mandatory cases, duplicates and each unknown criticality. It covers
+every root Cause and AMF/RAN variable-length integer boundary. Tests compare
+decoded values and complete constructor bytes, then mutate/truncate every
+independent input. Reproduce with `scripts/generate-ngap-release-fixtures.py`
+and the pinned reference environment/PDF. Published wire inventory is unchanged.
+
+Message byte/count limits are checked; fields start after four enclosing
+layers. Identifier choices need depth three, causes two and location four.
+The allocation budget is advisory. The caller resolves association/UE ownership,
+releases signaling and user-plane resources, orders completion, and handles
+applicable optional fields before selecting this subset. No resource effect or
+acknowledgement is performed here. UE Release Request has its separate admitted
+boundary below. The other 17 applicable outcomes retain the disabled-handler
+boundary in [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md).
+
+### UE Release Complete session reports
+
+`release_sessions::ContextReleasedSessions` qualifies optional message IE 60
+with reject criticality. The list contains 1–256 unique session IDs in wire
+order. Each item admits either no extensions or exactly one extension 145 with
+ignore criticality, containing the qualified empty Release Response Transfer.
+Absent transfers and present empty roots remain distinct. Other item extensions,
+duplicate extension entries, usage-report transfer extensions and wrong
+criticalities reject explicitly. This is a closed field subset; generic unknown
+IE policy does not expand it.
+
+The receive scan checks physical length, count, unique IDs, sequence flags,
+padding and both open-type/OCTET STRING framing layers before generated list
+allocation. The existing generated encoder and decoder both match all 1,280
+admitted independent field values. Encoding preflights the exact size
+`1 + 2 * items + 8 * transfers` before constructing generated values. Field depth
+is 3 without transfers and 6 with them; total message depth is at least 7 or 10,
+alongside existing location and diagnostic limits. `max_ies` bounds the session
+list as well as the outer message. Construction preflights count and depth
+before encoding the list.
+
+The [independent oracle](tests/fixtures/n3iwf-release-sessions.json) contains
+1,287 fields (1,280 admitted, 7 negative) and 1,308 complete messages (1,298
+admitted, 10 negative). It covers every list count 1–256 with absent, present and
+mixed transfers, every identifier with either transfer presence, and optional
+location/diagnostic combinations. Both unmodified reference encoders agree;
+structured decoding verifies their values. Existing release corpus bytes and
+the published fixture revision remain unchanged. Reproduce with
+`scripts/generate-ngap-release-session-fixtures.py --sdk-root DIR --spec PATH --output PATH`.
+Tests check exact construction/admission limits, singleton duplicate policies,
+malformed nested framing, wrapper mutation and shared bounded fuzz replay.
+
+`ReleaseMessage::Complete` gains an explicit optional `sessions` field; update
+struct literals and exhaustive destructuring. These are peer reports under
+38.413 8.3.3.2 and 9.2.2.6. Correlation, resource ownership and actual cleanup
+remain caller-owned. This field expansion adds no qualified outcome; the
+aggregate subset evidence is recorded in [N3IWF-ACCEPTANCE.md](N3IWF-ACCEPTANCE.md).
+
+## N3IWF NG Setup admission
+
+`n3iwf::setup` admits the Request, Response and Failure root subsets below
+(TS 38.413 V18.10.0 9.2.6.1–3; TS 29.413 V18.5.0 5.3). It validates the
+filtered generic PDU without changing its raw image or activating an association.
+
+| Outcome | Required fields | Optional fields admitted | Receiver-ignored IEs |
+|---|---|---|---|
+| Request | Global RAN Node ID 27 restricted to N3IWF; Supported TA List 102; presence of Default Paging DRX 21 | RAN Node Name 82, UE Retention Information 147, Extended RAN Node Name 273 (all ignore) | 21, 204 |
+| Response | AMF Name 1; Served GUAMI List 96; Relative AMF Capacity 86; PLMN Support List 80 | Response diagnostics 19, UE Retention Information 147, Extended AMF Name 274 (all ignore) | 200, 404 |
+| Failure | Cause 15 | Root Time To Wait 107, response diagnostics 19 | None |
+
+Default Paging DRX remains mandatory on the wire, but its received contents
+are ignored. `NgSetupRequest::construct` takes an explicit `PagingDrx`;
+`SetupMessage::from_pdu` returns only the interpreted request fields and the
+ignored count. Unknown-notify IDs are caller-owned diagnostics. Other
+recognized optional IEs outside the table fail explicitly. Served GUAMI entries
+preserve optional root backup AMF names. All nested extensions, including GUAMI
+Type and Extended Backup AMF Name, remain unsupported; their values are never
+silently discarded into a successful view.
+
+RAN node names and backup AMF names use the root PrintableString alphabet and
+1..=150-character bound. Extended RAN and AMF names preserve independent optional
+VisibleString and UTF8String components, including both absent or both present.
+The qualified AMF layout supplies shared validation: depth two, at most 754
+octets, 1..=150 characters per present component, and at most 600 UTF-8 octets.
+The separate RAN wrapper is compared with its independently compiled schema.
+UE Retention Information preserves absence versus the root `UesRetained` report;
+its one-octet encoding requires zero padding and rejects extension enum values.
+Retention and names do not restore a context, select an AMF or authorize an
+association. Generic duplicate selection precedes typed admission, and mutable
+containers are revalidated before their selected fields are interpreted.
+
+`ServedGuamiList::new` and `values` keep their identity-only API.
+`with_backups` and `entries` preserve the name associated with every identity;
+all constructors enforce 1..=256 identities. This adds no list depth. Each name
+is bounded before copying and contributes its exact encoded size to preflight.
+`NgSetupRequest` struct literals gain optional `node_name`, `retention` and
+`extended_node_name` fields. Response literals gain `retention` and
+`extended_name`; absence remains `None`.
+
+`setup_fields` uses shared `PlmnId` and `Snssai` values. Root counts are
+TA/GUAMI 1..=256, PLMN 1..=12 and slices 1..=1024. Before each receive list
+allocation, its count must fit the remaining physical bits and the cumulative
+field-local `max_ies` item budget. Every TA, GUAMI, PLMN and slice consumes an
+item; this extra bound is an SDK admission choice, separate from the outer IE
+count. `allocation_budget` remains advisory. Field depth is four for global
+N3IWF ID/served GUAMIs, six for PLMN support, eight for supported TAs and one
+for AMF name. Message admission adds four enclosing layers: Request twelve,
+Response ten and Failure six. The conservative depth-eight context thus needs
+an explicit increase for Request/Response. Field bytes and complete-message
+bytes are bounded separately. Encode preflights exact sizes before allocating
+wire buffers or generated collections. Diagnostics expose no field values.
+
+Independent bytes expose the runtime's fixed-octet receive alignment defect
+in all four nested identity/list fields. The generated encoder also loses
+parent bit offsets in PLMN/slice lists (the single-PLMN vector is already
+wrong). Explicit root readers and the two list writers are qualified against
+the independent oracle; zero padding is required on this receive boundary.
+Generated encoders remain qualified for global N3IWF ID, served GUAMIs, AMF
+name, capacity and timers. General ASN.1 extensions remain outside this narrow
+exception, documented in ADR 0013.
+
+The [setup oracle](tests/fixtures/n3iwf-setup.json) contains 63 independent
+fields and 87 complete messages: 67 constructive cases, every missing
+mandatory field, duplicates and all unknown criticalities. It includes both
+MNC widths, integer limits, optional slice differentiators, maximum list
+counts and root name/timer values. Reproduce using
+`scripts/generate-ngap-setup-fixtures.py --spec PATH --output PATH` and the
+pinned Pycrate/pypdf reference environment. All 150 vectors seed fuzz/replay;
+ordinary tests exercise every truncation and sampled byte mutations across
+large list vectors. No AMF selection, slice authorization, timer/retry,
+configuration application or live peer interoperability is established.
+
+The additional [optional-field oracle](tests/fixtures/n3iwf-setup-optionals.json)
+contains 162 complete messages: 118 admitted cases, including 112 independent
+construction comparisons, and 44 explicit policy/malformed/unsupported cases.
+It covers every name presence combination, UTF-8 byte and character boundaries,
+all root backup-list count/name limits including the fragmented maximum,
+duplicate First/Last/Reject policies, unknown criticalities, reordered IEs and
+malformed name/retention/list framing. The original 150 setup vectors remain
+unchanged. Reproduce with `scripts/generate-ngap-setup-optionals.py --spec PATH
+--output PATH`; the generator uses the same pinned specification and Python
+environment. The structured Pycrate APER path handles complete-message
+fragmentation; its ordinary path also agrees for messages below 16 KiB.
+Twelve additional fuzz seeds use shared bounded semantic reconstruction.
+Ordinary tests replay sampled truncations and byte mutations under two resource
+contexts; no new libFuzzer campaign or external interoperability is claimed.
+
+## Initial context individual fields
+
+`n3iwf::context_fields` adds three individual fields needed by Initial Context
+Setup. Whole-message presence, conditional AMBR, key custody and nested resource
+rules are composed separately by `resource_setup`, documented below.
+
+| Field | Construction | Receive | Bounds |
+| --- | --- | --- | --- |
+| GUAMI | Qualified generated encoder | Bounded root reader | PLMN, 8-bit region, 10-bit set, 6-bit pointer; depth 2 |
+| Allowed NSSAI | Bounded root writer | Bounded root reader | 1–8 shared S-NSSAI values; depth 4; count charged to `max_ies` before allocation |
+| UE Security Capabilities | Qualified generated encoder | Contents receiver-ignored under TS 29.413 5.3 | Four explicit 16-bit masks; no algorithm selection |
+
+All field encoders preflight the exact size against `max_message_len` before
+allocating encoded buffers. Receivers bound bytes/depth, require zero padding
+and reject SEQUENCE and IE extensions. Debug is redacted; value getters are
+explicit. Slice authorization and cryptographic policy remain caller-owned.
+
+The [context-field oracle](tests/fixtures/n3iwf-context-fields.json) contains
+98 independent Release 18 values: eight GUAMIs, 24 Allowed NSSAI combinations
+covering every root list length with absent/mixed/present SD, and 66 security
+mask cases including all 64 individual bits. Reproduce using
+`scripts/generate-ngap-context-field-fixtures.py --spec PATH --output PATH`
+with the same pinned PDF and Python reference environment as NG Setup.
+Generated GUAMI receive misaligns fixed PLMN octets; generated Allowed NSSAI
+receive and optional-SD construction differ from these independent bytes.
+The existing bounded root reader/writer is reused for those qualified shapes.
+The generated security-mask encoder is retained. All 98 vectors seed fuzz
+and replay; tests also cover every truncation and byte mutation.
+
+## N3IWF resource setup-request transfer
+
+TS 38.413 V18.10.0 9.3.4.1 defines this nested transfer. The opt-in
+`n3iwf::resource_request` boundary admits the independently qualified root QoS
+profiles described below. Enclosing Initial Context Setup and PDU Session
+Resource Setup admission is a separate `resource_setup` boundary below.
+
+| Field | IE | Criticality | Construction / receive |
+| --- | --- | --- | --- |
+| Session aggregate maximum bit rate | 130 | reject | Distinct UL/DL root rates; required by the default API, or when any flow is caller-classified non-GBR (8.2.1.4) |
+| UL NG-U UP transport information | 139 | reject | Mandatory single IPv4/IPv6 GTP tunnel |
+| PDU session type | 134 | reject | Mandatory; all five root payload kinds |
+| Security Indication | 138 | reject | Optional three-root integrity/confidentiality requirements; conditional UL rate |
+| Network Instance | 129 | reject | Optional root 1–256; Common takes precedence when supplied |
+| Common Network Instance | 166 | ignore | Optional opaque network identifier, with bounded fragmented OCTET STRING framing |
+| Data Forwarding Not Possible | 127 | reject | Receiver-ignored outside Handover Request (9.3.4.1); never emitted by this setup constructor |
+| QoS flow setup request list | 136 | reject | Mandatory 1–64 unique root QFIs; root dynamic/non-dynamic descriptors, ARP, GBR information, attributes and optional E-RAB |
+
+Recognized optional transfer IEs outside this table fail explicitly,
+including extra/redundant tunnels and Redundant Common Network Instance.
+The shared IE policy implementation handles unknown criticality and
+Drop/Preserve/Reject and duplicate First/Last/Reject before field admission.
+Retained unknown-ignore entries are counted; notify IDs are returned without
+values; retained unknown-reject entries prevent semantic admission. Structural
+Drop keeps its existing generic behavior, including discarding unknown-reject
+entries. Strict/ProcedureAware contexts reject them before dropping.
+Typed construction emits required and supplied admitted fields; callers retaining original
+transfer bytes retain custody of that separate input.
+Data Forwarding Not Possible contributes to `ignored_ie_count` after shared
+criticality and duplicate selection. Its value is never decoded, including
+malformed/extended payloads, because this boundary does not handle handover.
+
+`resource_fields` exposes distinct UplinkTransport and DownlinkTransport types
+with explicit address and 32-bit TEID getters. IPv4/IPv6 roots are qualified;
+dual-address bit strings and extensions are unsupported. The codec permits
+all wire address/TEID values; endpoint validation and installation are external.
+Session AMBR reuses the byte-identical two-BitRate root layout with a distinct
+public type, qualified by independent session vectors. Root QFI values are
+0–63; allocation policy is external. Root QoS fields and E-RAB identifiers are
+qualified below; nested extensions remain explicitly unsupported.
+
+Transfer receive requires depth ten, or eleven with dynamic QoS, with four
+levels subtracted before leaf decoding. Flow lists require depth six, or seven
+with dynamic QoS, and enforce `max_ies` and physical
+count feasibility before allocation. Byte limits apply to the entire input
+and each leaf. Container/list counts use separate field-local limits;
+`allocation_budget` remains advisory. All fields are bounded and exact
+constructed framing is measured before the
+final allocation. Fragmented unknown values use the existing physical-length
+preflight before coalescing. Debug/errors redact values; encoded buffers clear
+on drop. No NAS/key processing, resource allocation, endpoint assignment,
+pre-emption action, backend effect or live interoperability is established.
+
+The [request oracle](tests/fixtures/n3iwf-resource-request.json) contains 225
+fields and 49 transfers, including 30 complete constructions, every missing
+required/conditional field, duplicates, wrong criticalities, duplicate QFIs,
+unknown policies and independent 16K/64K fragments. It covers both address
+families, TEID/rate boundaries, every QFI, all ARP values/flag combinations and
+every flow-list length. Regenerate with
+`scripts/generate-ngap-resource-request-fixtures.py --spec PATH --output PATH`
+in the pinned Release 18 reference environment. Generated tunnel codecs match
+the independent values and bytes. Generated QoS list codecs differ; a bounded
+root reader/writer covers the qualified root profiles. The transfer reuses
+the existing canonical container framing. All 274 vectors seed fuzz/replay;
+ordinary tests exercise every truncation and bounded byte mutations.
+
+Remaining work includes additional applicable transfer and extension fields.
+The qualified resource-result transfers and
+outer session lists are described below. No local procedure trigger is enabled here.
+
+## Root QoS profiles and conditional Session AMBR
+
+`n3iwf::qos_fields` constructs and decodes the two root QoS characteristic
+choices from TS 38.413 V18.10.0 9.3.1.18–19. Non-dynamic descriptors preserve
+the root 5QI (0–255), optional priority (1–127), averaging window and maximum
+data burst (0–4095). Dynamic descriptors also preserve delay (0–1023), packet
+error scalar/exponent (0–9), optional 5QI and the distinct absent/false/true
+Delay Critical values. Root ARP retains priority 1–15 and both pre-emption flags.
+GBR information retains four rates (0–4,000,000,000,000), Notification Control
+presence and optional UL/DL loss rates (0–1000). Reflective and Additional QoS
+attributes and optional E-RAB identifiers (0–15) retain their presence.
+Extension integers, choice extensions, SEQUENCE/IE extensions, nonzero padding,
+nonminimal rates, trailing data and duplicate QFIs fail explicitly.
+
+`QosParameters::applicable` checks per-flow conditions using a caller-established
+`QosResourceType`; GBR-information presence alone never establishes that type.
+Missing GBR information for a GBR flow, missing conditional dynamic fields,
+and missing burst volume for a delay-critical flow produce value-free failures.
+The caller can report each failed flow while processing the other flows. The
+applicable view hides GBR information for non-GBR flows, hides Reflective and
+Additional QoS attributes for GBR flows, and clears Notification Control's
+requested effect for N3IWF (TS 29.413 5.3). `requested()` retains the original
+fields for explicit access and canonical construction. Classification, rate
+consistency, request correlation, Cause selection and resource effects remain
+caller responsibilities.
+
+`SetupRequestTransfer::aggregate_bit_rate` is now optional. The existing
+`decode`/`encode` APIs still require AMBR. The explicit `decode_classified` and
+`encode_classified` APIs accept its absence only for an all-GBR flow set.
+`QosResourceTypes` requires exact QFI coverage and `SessionResourceTypes` exact
+session/QFI coverage; missing, duplicate or unrelated entries fail. These are
+caller-supplied inputs, not peer assertions or authorization capabilities.
+Classification is never guessed from the presence of GBR information.
+`SessionSetupRequests` and both complete Setup request constructors/admission
+paths expose corresponding classified APIs. Enclosing Initial Context UE-AMBR
+and security/key requirements remain unchanged. Shared DecodeContext selection,
+unknown-critical handling, mutable-container validation and NAS custody still
+apply before classified admission.
+
+API migration: wrap supplied Session AMBR literals in `Some(...)`.
+`QosFlowSetupList::new(Vec<NonGbrFlow>)` remains available;
+`with_profiles(Vec<QosFlow>)` accepts the broader roots, and `values()` now
+returns `&[QosFlow]`. Existing QFI/ARP getters remain. Exhaustive matches on
+`QosFlowModification` must handle `Profile` and `IdentifierWithErab` in addition
+to the original variants. Exact original 5QI 9 values normalize to `NonGbr`.
+
+The [profile corpus](tests/fixtures/n3iwf-qos-profiles.json) contains 5,060 cases
+(5,058 admitted and two duplicate-QFI negatives). Both unmodified Pycrate
+encoders agree, structural reference decoding checks exact values, and SDK
+constructors compare to those independent bytes. It covers all 256 root 5QIs,
+optional combinations, rate-width boundaries, all 100 packet-error pairs,
+conditional failures, list lengths 1–64 and differing parent bit offsets.
+The [conditional corpus](tests/fixtures/n3iwf-qos-admission.json) adds 224
+transfers and 224 complete requests: each set has 160 classified admissions
+and 64 missing-AMBR failures. Two-session messages preserve classification
+separation and both Initial Context and PDU Session outcomes. The independently
+authored classification rules are separate from the ASN.1 wire oracle.
+
+Regenerate with `scripts/generate-ngap-qos-profiles.py` followed by
+`scripts/generate-ngap-qos-admission.py`, each with `--spec PATH --output PATH`
+in the pinned Release 18 reference environment. Profile SHA-256:
+`581c9b2a814a24334183f2b2d307eae0a59489829a70bc0f81eafdaa2120000a`;
+conditional SHA-256:
+`8fc7d4ad79bf15b677266fd9da4d85c7e94921f3092484b6d23cdc36d90874cc`.
+Fifty-nine representative new corpus seeds exercise shared semantic replay.
+Independent value/byte checks, exact/one-short limits, constructor bounds,
+redaction, truncations and deterministic mutations supplement round trips.
+The old request/Modify fixture bytes are unchanged; their newly supported
+5QI 8/E-RAB cases now have explicit constructor expectations.
+
+Standalone parameters need depth four (non-dynamic) or five (dynamic); flow
+lists need six/seven, Setup transfers ten/eleven, session lists thirteen/fourteen,
+and complete Setup requests seventeen/eighteen. Preflight checks complete list
+framing, physical count feasibility, uniqueness and depth before vector
+allocation. Exact output size is checked before allocation. The classified
+inputs use fixed QFI masks and at most 256 session entries. No new dependencies,
+schema changes, procedure triggers, resource effects or live-peer
+interoperability claims are introduced.
+
+## N3IWF resource setup-result transfers
+
+`n3iwf::resource_results` admits and constructs the following Release 18 roots
+(TS 38.413 9.3.4.2 and 9.3.4.16):
+
+| Transfer | Admitted contents | Explicitly unsupported |
+| --- | --- | --- |
+| Setup response | One mandatory and up to three additional downlink IPv4/IPv6 GTP tunnels; 1–64 associated QFIs per tunnel with optional root mapping indications; optional failed QFIs with root Cause; optional root Security Result | Extensions |
+| Setup unsuccessful | Root Cause in any of the five classes; optional root response diagnostics | Extensions |
+
+QFIs must be unique within each tunnel and the failed list; failures must not
+overlap any accepted association. A QFI may occur on several tunnels. The entirely failed case
+uses the unsuccessful transfer; the response always has at least one accepted
+flow. These are reports only. Request correlation, cause selection, supported
+security policy, endpoint ownership and resource changes remain caller-owned.
+An absent result/security field does not establish a successful security or
+QoS operation. No enclosing context/session procedure is admitted here.
+
+Response receive requires depth six, or eight with additional tunnels. `max_ies`
+limits flow occurrences, failures and additional tunnel items cumulatively;
+the entire physical layout is checked before list allocation. Fixed
+IPv4/IPv6 buffers avoid address allocation. Unsupported extension flags,
+nonzero padding and trailing bytes fail explicitly. Response construction
+checks its exact bounded length before allocating. Cause-only unsuccessful
+roots remain at most two bytes; optional diagnostics extend the maximum to
+773 bytes with shared exact size/framing preflight. Errors and Debug redact
+values; encoded buffers clear on drop.
+
+The [result oracle](tests/fixtures/n3iwf-resource-results.json) contains 547
+independent vectors, originally labeled 539 admitted and eight negative/unsupported cases. It
+covers all 64 root Causes, all QFIs and accepted-list sizes, each partial-result
+split, Cause fields at every offset produced by the accepted list, IP/TEID
+boundaries, duplicate/conflicting results and recognized unsupported fields.
+Regenerate using `scripts/generate-ngap-resource-result-fixtures.py` with the
+same `--spec`/`--output` arguments and pinned Release 18 environment.
+Its original bytes and labels are preserved. The historical
+`unsupported-security-result`, `unsupported-diagnostics`, both mapping vectors
+and `unsupported-additional-tunnel` now admit and are compared with explicit
+constructors in the harness, giving 544 admitted and three rejected
+vectors under the expanded boundary.
+
+Generated failure-transfer encode/decode matches all 128 positive probes;
+explicit final-padding validation closes its permissive padding behavior.
+Generated response transfer construction/receive fails 196 of 198 independent
+probes. The bounded qualified root writer/reader covers that response layout,
+including unaligned root Cause fields. All vectors seed fuzz/replay; ordinary
+tests exercise every truncation and three mutations of every reference byte,
+plus size/count/depth, extension, padding and redaction checks. This establishes
+neither additional profile coverage nor live peer interoperability.
+
+### Session security and network-instance roots
+
+`security_fields` qualifies Security Indication (9.3.1.27), Security Result
+(9.3.1.59) and Network Instance (9.3.1.113). Integrity and confidentiality each
+retain Required/Preferred/NotNeeded independently. Required or Preferred
+integrity requires the UL rate; NotNeeded preserves an optional supplied rate.
+The two UL roots are 64 kbit/s and maximum UE rate. The separate DL-rate
+extension remains unsupported. Root security values require depth two,
+Network Instance depth one; all reject extensions, nonzero padding and trailing
+bytes. Encoders preflight their exact one- or two-octet extent and then use the
+independently qualified generated leaf encoders.
+
+`SetupRequestTransfer` literals gain `security` and `network_instance` options.
+`SetupResponseTransfer::new` retains its existing arguments; use
+`with_security_result` to supply or clear the optional peer report. The embedded
+result occupies six bits at the parent's current offset, before the failed-flow
+list, with no standalone leaf padding. Existing request/response depth and
+combined flow-count bounds remain unchanged. A reported result does not prove
+installed integrity or confidentiality protection, and this boundary performs
+no cryptographic operation or network selection.
+
+The separate [resource-security corpus](tests/fixtures/n3iwf-resource-security.json)
+has SHA-256 `ab44434d9744a119496647471367b5fcc04fd312f54bf63ea708b05cf78fe3fd`.
+It contains 287 leaf cases (281 admitted, six conditional failures), 375 request
+transfers (348 admitted), 1,536 response transfers and 108 complete Initial
+Context/PDU Session Setup messages (96 admitted). Both Pycrate 0.8.1 APER
+encoders agree using the same pinned ETSI Release 18.10.0 publication. The
+independent generator applies 9.3.4.1 receiver-ignore before interpreting Data
+Forwarding Not Possible; its canonical oracle omits that field. Regenerate
+with `scripts/generate-ngap-resource-security.py --spec PATH --output PATH`.
+The original 274 request, 547 result and 122 outer resource-message vectors
+remain byte-identical.
+
+Qualification covers all security requirement/rate combinations, all 256
+network-instance values, four security results, every accepted/failed flow
+count, every root Cause at all four result bit offsets, IPv4/IPv6, criticality,
+duplicate selection including invalid Last, receiver-ignore, exact limits,
+constructor bytes and redacted semantic reconstruction. Exhaustive comparison
+checks all 131,328 fixed-width leaf patterns against independently admitted
+sets. Shared fuzz/replay logic checks all new cases and 244,616 deterministic
+mutations across two bounded contexts; 21 representative seeds are committed.
+These deterministic checks are separate from hosted PR fuzz smoke and do not
+claim a new local libFuzzer campaign. Subsequent root QoS qualification is
+recorded above. Unsupported extensions retain the explicit restrictions in
+each field section; see [subset acceptance](N3IWF-ACCEPTANCE.md).
+
+## Setup failure diagnostics
+
+`SetupFailureTransfer` now carries optional `CriticalityDiagnostics` under
+TS 38.413 9.3.4.16 and 9.3.1.3. Absent and present-empty diagnostics remain
+distinct. Root procedure criticality and 1–256 ordered diagnostic IE reports
+are preserved; repeated IE identifiers are allowed. Same-procedure responses
+refuse Procedure Code and Triggering Message. Diagnostic item criticality is
+reject or notify; ignore, extension values, nonzero padding and trailing data
+remain refused. No offending IE value is stored, and diagnostics do not select
+a response, retry or resource operation.
+
+The Setup and Modify unsuccessful-transfer roots have independently identical
+layouts. They share the existing qualified failure scanner and exact-size
+writer, including parent bit offsets after all five Cause classes. Receive
+preflights the complete root before allocating the diagnostic list. Depth is
+three without items and five with them; `max_ies` bounds the item count and
+`max_message_len` bounds the whole transfer. The maximum root is 773 bytes.
+Failed session lists retain three enclosing levels, and complete messages
+retain four more. Constructors preflight the added diagnostic depth and keep
+the existing shared DecodeContext and mutable-container policies.
+
+The [independent corpus](tests/fixtures/n3iwf-setup-failure-diagnostics.json)
+has 584 transfers (576 admitted, eight refused) and 102 complete messages
+(78 admitted, 24 refused), covering Initial Context Response/Failure and PDU
+Session Resource Setup Response. `scripts/generate-ngap-setup-failure-diagnostics.py`
+loads the independently authored Modify diagnostic models, verifies them with
+the pinned Release 18 reference, encodes the separate Setup ASN.1 type with
+both unmodified Pycrate encoders, and checks exact decoded values. Its own
+semantic classifier rechecks response restrictions. It also encodes all three
+outer message bindings independently, including their assigned IE criticalities.
+It does not consume SDK-generated output.
+
+Transfer coverage includes every root Cause, all diagnostic list lengths,
+optional criticality, repeated/boundary identifiers and response-inapplicable
+headers. Complete-message cases cover each Cause width, absent/empty/full
+diagnostics, count boundaries and adverse headers/extensions. Corpus SHA-256:
+`6c27bb547ede9a08f41e6c5dddb82744d6d5ca1c75f164d603bdd9ca1ab2ed3c`.
+Regenerate with `--spec PATH --output PATH` in the same pinned reference
+environment. Existing transfer/list/message fixtures remain byte-identical;
+the former `unsupported-diagnostics` empty root now has an explicit admitted
+constructor expectation. Tests compare values and canonical bytes, exact and
+one-short limits at both boundaries, redaction, truncations and bounded adverse
+mutations. 120 new representative seeds exercise shared public reconstruction
+in replay and fuzzing.
+
+API migration: add `diagnostics: None` to prior `SetupFailureTransfer` literals.
+`SetupFailureTransfer` and `FailedSession` retain `Clone` and equality but no
+longer implement `Copy`; callers copying from borrowed lists must clone
+explicitly. All transfer extensions remain outside this increment. Setup
+response root tunnels/mappings are qualified separately below. The aggregate
+codec record is [N3IWF-ACCEPTANCE.md](N3IWF-ACCEPTANCE.md); broader fixture
+acceptance remains in #784.
+
+## Setup response tunnels and flow mappings
+
+`SetupResponseTransfer::with_tunnels` admits the mandatory
+`DLQosFlowPerTNLInformation` and the optional list of one to three additional
+downlink reports in TS 38.413 9.3.4.2. Each `DownlinkQosTunnel` preserves its
+IPv4/IPv6 address, TEID, ordered 1–64 flow associations and each optional root
+`ul`/`dl` mapping indication. Absence is preserved. Per TS 38.413 8.2.1,
+additional transport bearers may serve some or all of the same flows: QFIs are
+unique within each report, while repeated associations across reports are
+retained. Failed QFIs are unique and disjoint from the accepted union. Endpoint
+uniqueness, preferred bearer, request correspondence and installed resources
+are not inferred. These value types describe peer reports only.
+
+The legacy constructor has no additional tunnels or mappings. `downlink()` and
+`accepted()` still describe the primary report only; new consumers inspect
+`primary().flows()` and `additional()`. Construction measures the complete
+root encoding before allocating. Receive preflights the entire message before
+allocating lists, including every count, extension flag, flow conflict, padding
+bit and trailing byte. Its cumulative `max_ies` includes all associated flow
+occurrences, additional list items and failures. Required depth is six, or
+eight with additional tunnels; successful session lists require nine/eleven
+and complete context/session responses thirteen/fifteen. A conservative
+512-byte contained-transfer bound covers the admitted root; the maximum
+independent vector is 478 bytes with four IPv6 tunnels, all 64 mapped QFIs per
+tunnel and a security report (259 counted items).
+
+The [independent corpus](tests/fixtures/n3iwf-setup-tunnels.json) contains 925
+transfers (916 admitted, nine duplicate/conflict refusals) and 32 complete
+context/session responses (14 admitted, 18 refusals). Both Pycrate 0.8.1 APER
+encoders and decoders agree using the pinned TS 38.413 V18.10.0 source. The
+expected admission classifier uses independently authored semantic models;
+complete-message criticality, presence and field order come from the reference
+schema. SHA-256:
+`46c640c5f2043f9a19518d1be0de9ae18649b77f81c3addad47567b54356fc36`.
+Regenerate with `scripts/generate-ngap-setup-tunnels.py --spec PATH --output PATH`
+in the pinned reference environment. Existing fixtures remain unchanged and
+their three previously unsupported tunnel/mapping examples are explicitly
+requalified. Coverage includes every QFI, list count, root Cause, both address
+families, mixed/absent mappings, repeated cross-tunnel associations, partial
+failure/security combinations and maximum-size roots. Public construction and
+semantic reconstruction must reproduce reference bytes; exact and one-short
+resource limits, redaction, truncation and adverse byte mutations are checked.
+Seventy new seeds exercise the same reconstruction in replay and fuzzing.
+Extensions and 160-bit combined addresses remain explicitly unsupported;
+this does not qualify Modify response tunnels, forwarding or live peers.
+
+## N3IWF session setup lists
+
+`n3iwf::session_lists` admits seven independently qualified Release 18 list
+roots. The public types group only layouts proven to have identical bytes:
+
+| Type | Qualified ASN.1 roots | Receive depth |
+| --- | --- | --- |
+| `SessionSetupRequests` | `PDUSessionResourceSetupListCxtReq`, `PDUSessionResourceSetupListSUReq` | 13; 14 with dynamic QoS |
+| `SuccessfulSessions` | `PDUSessionResourceSetupListCxtRes`, `PDUSessionResourceSetupListSURes` | 9; 11 with additional tunnels |
+| `FailedSessions` | `PDUSessionResourceFailedToSetupListCxtFail`, `PDUSessionResourceFailedToSetupListCxtRes`, `PDUSessionResourceFailedToSetupListSURes` | 6; 8 with diagnostic items |
+
+Each list requires 1–256 distinct root session IDs (0–255), preserving input
+order. Request items include S-NSSAI, optional NAS (absent and present-empty
+remain distinct), and an admitted root request transfer. Results use the
+qualified response/unsuccessful transfers. `SessionResults` rejects a session
+appearing in both result lists. Empty paired results are representable because
+context setup may request no resources; enclosing PDU Setup admission must
+require a nonempty result. Request/result correlation remains caller-owned.
+
+Counts must fit physical input and `max_ies` before list allocation. The outer
+count and each contained transfer have field-local count limits; the enclosing
+byte bound applies to their combined wire input. Nested decoders retain caller
+unknown/duplicate policies and the remaining depth. Strict unknown-critical
+rejection still precedes Drop; per-session ignored counts and unknown-notify
+identifiers are returned without their values. Malformed later entries reject
+the entire list. Optional extensions, nonzero padding and trailing bytes fail.
+Ordinary NAS borrows input; fragmented NAS is coalesced only after physical
+framing checks. Encoders preflight total size before writing NAS; encoded output
+clears on drop, and Debug/errors redact session values.
+
+Generated construction/receive is retained for the five result-list roots,
+with bounded receive preflight. The request reader reuses qualified root and
+open-type helpers because generated receive misreads aligned SD and fragmented
+fields. Fuzzing also exposed generated NAS construction repeating the wrong
+prefix in a fragmented remainder. Nonrepeating independent NAS vectors confirm
+that fault at each 16K fragment boundary; the request writer composes the existing
+S-NSSAI and open-type helpers after exact size preflight. Across 93 positive
+cases, generated construction fails 16 probes and receive fails 36, all in
+request lists. This exception adds no general ASN.1 codec.
+
+The [list oracle](tests/fixtures/n3iwf-session-lists.json) has 102 cases (93
+admitted, nine negative), including all seven roots, counts 1/2/15/16/255/256,
+session-ID boundaries, SD values, absent/empty/fragmented NAS through 65,537
+bytes, nested policy cases, partial IPv6 flow results and duplicate sessions.
+NAS bytes use distinct SHA-256-derived synthetic blocks so fragment substitution
+cannot be masked by a repeating byte ramp.
+Regenerate with `scripts/generate-ngap-session-list-fixtures.py --spec PATH
+--output PATH` in the pinned reference environment. The unmodified Pycrate
+0.8.1 plain decoder mishandles alignment after a nonempty fragmented remainder;
+the generator uses `from_aper_ws`, requires both reference encoders to agree,
+and verifies exact values and reencoding. Both modes use the independently
+compiled Release 18 schema, never the SDK codec.
+
+All cases and the original fuzz reproducer seed fuzz/replay. Tests check independent semantic values and bytes,
+size/count/depth limits, borrowing, redaction, policy propagation, disjoint
+partial results, truncations and bounded byte mutations. Enclosing context/PDU
+Setup admission is documented below; no resource effects are enabled.
+
+## Initial Context and PDU Session Resource Setup messages
+
+`n3iwf::resource_setup` composes the qualified fields, lists and transfers.
+It admits five outcomes from a decoded `Pdu` and constructs canonical messages
+from typed fields. The matrix covers TS 38.413 V18.10.0 9.2.2.1–9.2.2.3 and
+9.2.1.1–9.2.1.2, with N3IWF receiver exceptions from TS 29.413 V18.5.0 5.3.
+
+| Outcome | Required fields | Admitted optional/conditional fields | Encode / receive |
+| --- | --- | --- | --- |
+| Initial Context Setup Request | AMF/RAN UE IDs, GUAMI, Allowed NSSAI, UE Security Capabilities presence, Security Key | Session setup requests, opaque NAS, Old AMF, Trace Activation, Masked IMEISV, Partially Allowed NSSAI, Extended Old AMF; UE AMBR required when session requests exist | Canonical / typed |
+| Initial Context Setup Response | AMF/RAN UE IDs | Disjoint successful and failed session lists; both may be absent; response diagnostics | Canonical / typed |
+| Initial Context Setup Failure | AMF/RAN UE IDs, root Cause | Failed session list, response diagnostics | Canonical / typed |
+| PDU Session Resource Setup Request | AMF/RAN UE IDs, session setup request list | Opaque NAS, UE AMBR | Canonical / typed |
+| PDU Session Resource Setup Response | AMF/RAN UE IDs, at least one result list | Successful/failed lists, N3IWF location, response diagnostics | Canonical / typed |
+
+Every top-level IE is singleton with the existing procedure-specific criticality.
+Admission consumes the generic decoder's selected unknown/duplicate policy view
+and rechecks mutable wrapper metadata, criticality, bytes and counts. Use the
+same context for decoding and admission; filtering already performed by the
+generic decoder cannot be undone. Contained request transfers receive the
+same validation/unknown/duplicate policy and remaining depth. Unknown-ignore
+counts and unknown-notify identifiers are returned without opaque values.
+Strict unknown-critical rejection precedes Drop at both nesting levels.
+
+Context capability contents and the 39 other context IEs in the explicit
+TS 29.413 receiver-ignore list are skipped even if their opaque values are
+malformed. The capability IE must still exist; construction requires four
+caller-provided masks. RAN Paging Priority and UE Slice Maximum Bit Rate List
+are receiver-ignored on PDU setup requests. Trace Activation and UE AMBR are
+applicable to N3IWF under the non-trusted-access exceptions: both are decoded
+as bounded values; neither creates resources nor starts tracing.
+Other recognized applicable fields outside this subset fail explicitly. Ignored fields are omitted by construction,
+apart from mandatory capabilities. No ignored bytes are exposed as semantic data.
+
+Requests with a resource list need total depth 17; a context-only request needs
+8. Responses need 13 with successful results, 10 with only cause/empty-diagnostic
+failures, 12 with diagnostic-item failures, or 5 for an empty context response.
+Context failure needs 10/12 with the corresponding failed sessions and 6
+without them. These explicit limits exceed the default depth for resource
+requests. Each list and contained transfer uses the caller's field-local
+`max_ies`; complete input/output is bounded by `max_message_len`. Physical
+preflight, unique session IDs, disjoint partial results and fragment handling
+come from the qualified nested codecs. A failed-only PDU setup result still
+uses the successful outcome wrapper; there is no separate unsuccessful outcome.
+
+The [message oracle](tests/fixtures/n3iwf-resource-setup.json) has 122 independently
+encoded Release 18 cases: 83 admitted and 39 negative. It covers all required
+fields, conditional AMBR, empty/partial results, 256 sessions, 64 flows, absent/
+empty/fragmented NAS with distinct synthetic blocks, nested unknown policies,
+malformed receiver-ignored values, duplicate singleton/session IDs and result
+overlap. Canonical transfer IE ordering is derived from the independent schema.
+Regenerate with `scripts/generate-ngap-resource-setup-fixtures.py --spec PATH
+--output PATH` using the pinned PDF and reference environment. Both reference
+encoders must agree; structured decode validates the independently admitted
+values. Receiver-ignored malformed values intentionally need not decode as
+their ASN.1 leaf type. All cases seed fuzz/replay; tests add truncated/mutated
+nested framing, key lengths, metadata, bounds and policy changes.
+
+Security Key borrows exactly 32 bytes without installation or cryptographic
+use. NAS remains opaque; Debug and failures redact values. UE ownership,
+request/result correlation, slice authorization, tunnel/resource changes and
+local procedure triggers remain caller-owned. Optional/extension fields outside
+these documented subsets remain unsupported. The other applicable procedures
+retain explicit handler dispositions; no live interoperability is established.
+
+
+Initial Context Request also admits and constructs Old AMF (48/reject), Trace
+Activation (108/ignore), Masked IMEISV (34/ignore), Partially Allowed NSSAI
+(414/ignore), and Extended Old AMF (443/ignore). Old AMF has different criticality
+here than in Downlink NAS. These fields reuse the qualified name, identity and
+slice roots. Allowed NSSAI remains mandatory; partial slices must be disjoint,
+including optional SD, and the combined count must not exceed eight under
+TS 38.413 8.3.1.4. Validation follows duplicate selection, including a selected
+last duplicate that creates overlap or overflow. Mandatory capability presence
+and conditional AMBR remain unchanged. Public InitialContextRequest struct
+literals gain five optional fields.
+
+`trace_fields::TraceActivation` preserves the eight opaque trace-ID octets,
+all eight interface bits, one of six root depth values and a 1..=160-bit
+Transport Layer Address. Per 9.3.2.4, transport-layer interpretation belongs to
+the caller; the codec preserves the complete root bit string with zero unused
+low bits. Reserved interface bits are retained without selecting an interface.
+The decoder uses fixed storage, requires depth two and rejects sequence, IE,
+address-length and enumeration extensions, invalid root indices, nonzero
+padding and trailing data. Generated root construction agrees with independent
+bytes for all 160 address lengths after exact 13..=32-octet size preflight.
+Optional MDT Configuration and Trace Collection Entity URI remain unsupported;
+no trace activation, collector connection or reporting authority is granted.
+
+The separate [context optional-field corpus](tests/fixtures/n3iwf-context-optionals.json)
+contains 453 independent complete messages: 378 admitted cases, 375 canonical
+constructor comparisons and 75 negative cases. It covers every trace address
+root length and depth, interface-bit boundaries, names, masked identity bits,
+all allowed/partial count pairs, overlap, SD distinctions, duplicate
+First/Last/Reject, mutable criticality, unknown policy and malformed trace
+framing. The existing 122 resource-setup vectors are unchanged; their legacy
+`unsupported` labels for empty Old AMF/Trace values remain negative malformed
+leaf cases. Reproduce using `scripts/generate-ngap-context-optionals.py --spec
+PATH --output PATH` with the same pinned PDF/Pycrate environment. Five new
+ordinary tests exercise independent values, exact constructor bytes, limits,
+redaction and complete-message/leaf mutations under two bounded contexts.
+Eighteen added seeds share semantic reconstruction in fuzz/replay. No new local
+fuzz campaign or external interoperability is claimed.
+
+## PDU Session Resource Release
+
+`n3iwf::resource_release` admits and constructs the two release outcomes from
+TS 38.413 V18.10.0 9.2.1.3–9.2.1.4 and the contained transfers from
+9.3.4.12 and 9.3.4.21. TS 29.413 V18.5.0 5.3 makes RAN Paging Priority
+receiver-ignored. The complete wire and typed leaf values are independently
+qualified for this root-only subset.
+
+| Boundary | Required fields / limits | Optional fields | Construction / receive |
+| --- | --- | --- | --- |
+| Release Command Transfer | One root Cause; depth 3; 1–2 bytes | None admitted | Qualified generated codec with exact framing/padding preflight |
+| Release Response Transfer | Empty root; depth 1; exactly one zero octet | None admitted | Qualified generated codec with exact framing/padding preflight |
+| Requested-session list | 1–256 unique session IDs and command transfers; depth 6 | None admitted | Qualified generated codec with physical count, duplicate, flag and length preflight |
+| Released-session list | 1–256 unique session IDs and empty response transfers; depth 4 | None admitted | Qualified generated codec with the same bounded preflight |
+| Release Command | AMF/RAN UE IDs and requested-session list; depth 10 | Opaque NAS; RAN Paging Priority contents ignored | Canonical / typed |
+| Release Response | AMF/RAN UE IDs and released-session list; depth 8 | N3IWF location, response diagnostics | Canonical / typed |
+
+All top-level fields are singleton with existing procedure-specific criticality.
+There is no unsuccessful outcome. Required lists cannot be empty, and each
+contained transfer must be admitted before the complete list is returned.
+Known applicable unimplemented fields, including transfer extensions, fail explicitly. Ordinary NAS borrows input; fragments
+are physically preflighted before coalescing. Unknown/duplicate policies are
+selected by generic decoding and remain authoritative; use the same context
+for typed admission. Mutable metadata, bytes, counts and remaining depth are
+rechecked. Diagnostics expose only ignored counts and unknown-notify IE IDs.
+
+The [independent oracle](tests/fixtures/n3iwf-resource-release.json) contains
+579 fields (577 admitted and two duplicate-ID negatives) and 28 complete
+messages (15 admitted and 13 negatives). Fields cover all 64 root Causes and
+every list length from 1 through 256; 1,154 independent generated encode/decode
+comparisons pass. Messages cover mandatory presence, duplicate selection,
+unknown criticality, ignored malformed priority, fragmented synthetic NAS and
+IPv4/IPv6 location. Regenerate with
+`scripts/generate-ngap-resource-release-fixtures.py --spec PATH --output PATH`
+using the pinned PDF and reference environment. Both reference encoders agree;
+structured decoding verifies reference values and wire bytes. All 607 cases
+seed fuzz/replay. Tests also corrupt every unused transfer padding bit, nested
+extensions, lengths, count/size/depth limits, metadata and sampled input bytes.
+
+Generated codecs are retained after independent qualification; this adds no
+new handwritten ASN.1 layout. Shared result-list and root-Cause helpers perform
+preflight. Exact output size is checked before allocating list encodings. Debug
+and errors redact values. Session ownership, request/response correlation,
+resource teardown, response triggering and live interoperability remain outside
+this codec boundary.
+
+## UE reports and context release requests
+
+`n3iwf::ue_requests` admits and constructs the two initiating messages in
+TS 38.413 V18.10.0 9.2.5.4 and 9.2.2.4. Their outer criticality is ignore;
+TS 29.413's N3IWF profile retains their listed fields.
+
+| Boundary | Mandatory fields | Optional fields | Required depth |
+| --- | --- | --- | --- |
+| NAS Non-Delivery Indication (19) | AMF/RAN UE IDs, opaque NAS, root Cause | None | 6 |
+| UE Context Release Request (42) | AMF/RAN UE IDs, root Cause | Session ID list | 6 without list; 7 with list |
+| Context release session list | 1–256 unique session IDs | None; root only | 3 |
+
+AMF/RAN IDs and the session list have reject criticality; NAS and Cause have
+ignore criticality. All fields are singleton. Optional list absence is valid;
+an empty list is invalid. NAS may be empty, borrows contiguous input, and
+physically preflights fragments before coalescing. The list uses independently
+qualified generated codecs with bounded physical counts, unique IDs, exact
+framing, zero padding and trailing-byte checks before generated allocation.
+Exact output capacity is checked before list encoding allocation. Unsupported
+extensions fail. Generic IE policies remain authoritative; use the same
+context for generic and semantic admission. Metadata, count, byte and remaining
+depth limits are rechecked. Unknown-ignore counts and unknown-notify identifiers
+are reported without exposing values.
+
+The [independent oracle](tests/fixtures/n3iwf-ue-requests.json) contains 257
+session lists (256 admitted, one duplicate negative) and 291 complete messages
+(144 admitted, 147 negative). It covers every list length, all 64 root Causes,
+nonzero Cause padding, missing fields, wrong criticality, duplicate policies,
+unknown policies, optional lists and distinct synthetic NAS at fragment
+boundaries. Both reference encoders agree; the structured reference decoder
+verifies values and framing. All 512 generated list constructor/typed-decoder
+comparisons pass. Regenerate with
+`scripts/generate-ngap-ue-request-fixtures.py --spec PATH --output PATH` using
+the pinned Release 18 PDF and reference environment. All 548 cases seed
+fuzz/replay, whose successful semantic round trips compare all admitted values.
+
+The shared `release::Cause` decoder previously accepted nonzero final padding.
+An explicit root framing check now rejects it before generated decoding.
+All 64 valid root Causes remain admitted, and all 297 independent single-bit
+padding mutations reject. This tightens malformed-input acceptance for every
+procedure using Cause. New `Message` and `MessageType` variants require updates
+to downstream exhaustive matches. No schema regeneration or dependency change
+is involved. Tests also cover every session-item flag/padding bit, capacity,
+depth, counts, metadata mutation, truncation and bounded hostile mutations.
+
+These APIs do not establish UE ownership, prove delivery status, choose local
+procedure triggers, or perform resource release. Other applicable procedures
+retain the disabled-handler boundary in [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md).
+Live interoperability is not established.
+
+## Reset and Error Indication
+
+`n3iwf::reset` constructs and admits the three outcomes in TS 38.413 V18.10.0
+8.7.4–8.7.5 and 9.2.6.11–9.2.6.13. Signalling context is an explicit caller
+argument; peer identifier presence does not establish an association.
+
+| Boundary | Required fields and conditions | Optional fields | Required depth |
+| --- | --- | --- | --- |
+| NG Reset (initiating 20/reject) | Cause, Reset Type; non-UE signalling | None | 6 for All; 8 for Part |
+| Reset Acknowledge (successful 20/reject) | Non-UE signalling | Connection list, diagnostics | 5 empty; 7 with connections; up to 8 with diagnostics |
+| Error Indication (initiating 9/ignore) | Cause or diagnostics; both AMF/RAN IDs for UE-associated signalling | AMF/RAN IDs, Cause, diagnostics subject to those rules; 5G-S-TMSI 26/ignore | 6 without diagnostic items; 8 with items |
+| Connection list | 1–65536 ordered items; either, both or neither ID may be present | AMF/RAN IDs per item | 3 |
+| Reset Type | Explicit All or Part choice | None | 2 for All; 4 for Part |
+| Criticality Diagnostics | Root fields all optional; IE list has 1–256 items when present | Procedure code/outcome/criticality, IE list | 2 without items; 4 with items |
+
+TS 38.413 8.7.4.4 requires receivers to ignore connection items with neither
+identifier and permits acknowledging or omitting them. Admission preserves
+these items, repeated IDs and received order, reports their count, and exposes
+a `nonempty()` receiver view. An all-empty partial list remains Part; it never
+becomes All. Correlating IDs, preserving requested acknowledgement order,
+waiting for release completion and executing resource effects are caller duties.
+There is no Reset unsuccessful outcome.
+
+Diagnostic IE criticality is reject or notify: ignore is explicitly inapplicable
+under 9.3.1.3 even though ASN.1 can encode it. Procedure code and triggering
+outcome belong only in Error Indication diagnostics and reject in Reset
+Acknowledge. Empty root diagnostics are legal; repeated diagnostic IDs retain
+order. Error Indication's optional 5G-S-TMSI reuses the bounded seven-octet root
+identity codec with its own ignore criticality. It grants no identity authority
+and does not replace an error basis or either UE identifier. All message fields
+are singleton. Generic unknown/duplicate and
+criticality policies remain authoritative; use the same context for generic
+and semantic admission. Unknown-ignore counts and unknown-notify IDs disclose
+no opaque values. Public field and message Debug output is redacted.
+
+The [independent field corpus](tests/fixtures/n3iwf-reset-fields.json) has 1,093
+cases (1,079 admitted, 14 semantic negatives). It covers ID width boundaries,
+every list count through 256, larger counts and all element-fragment boundaries
+through 65,536, empty/repeated items, diagnostic presence combinations and enum
+roots. The [complete-message corpus](tests/fixtures/n3iwf-reset.json) has 393
+cases (333 admitted, 60 negative), including all root Causes, required and
+conditional fields, signalling context, metadata, policies and canonical output.
+The identity increment preserves 188 original cases exactly, admits the original
+previously unsupported identity wire, and adds 204 independently generated
+message cases. These cover identity component boundaries, every combination of
+error basis/UE IDs under both signalling contexts, criticalities, duplicate
+selection, unknown IEs and malformed flags/padding/lengths. Complete constructors
+use the reference's semantic identity components, not SDK-decoded leaf bytes.
+Regenerate with `scripts/generate-ngap-reset-field-fixtures.py` and
+`scripts/generate-ngap-reset-fixtures.py`, each taking `--spec PATH --output PATH`,
+using the pinned Release 18 PDF and reference environment.
+
+Generated probes fail all 366 connection-list encode/decode cases and all 366
+partial Reset cases; generated All encoding/decoding passes. Diagnostics has
+304/360 encode failures and 256/360 decode failures. These fields therefore use
+bounded explicit root layouts that preserve parent bit offsets, with generated
+All retained. Complete physical preflight checks flags, count fragments,
+cumulative `max_ies`, minimal integer widths, zero padding, exact framing and
+remaining depth before vector allocation. Encoding measures exact capacity
+before allocating a zeroized output buffer. The connection-list upper bound
+65,536 requires unconstrained element-count determinants and fragmentation,
+rather than a fixed-width constrained count. Schema and dependencies are unchanged.
+
+Pycrate 0.8.1's plain fragmented SEQUENCE OF encoder calls the missing
+`ASN1CodecPER.encode_pas`. The generators use its unmodified structured
+`to_aper_ws`/`from_aper_ws` path and compare the plain encoder wherever it works;
+`plain_encoder` records those cases. No reference-package patch is used.
+Tests cover all complete maximum-size vectors, malformed/truncated framing,
+nonzero padding and exact/one-short depth, count and byte limits. Fuzz/replay
+compares all successfully admitted values. The 1,282 new seeds comprise 1,274
+complete vectors and eight bounded prefixes for vectors above the fuzz target's
+131,072-byte input limit; the complete large vectors remain ordinary tests.
+Nine additional identity seeds replay semantic reconstruction, and 26,060 adverse
+byte mutations run under two bounded DecodeContexts. The standalone fuzz harness
+is compile-checked; these checks are not a new libFuzzer campaign. Six catalog
+references update only the source corpus digest; their packet bytes are unchanged.
+
+The new public message variants require downstream exhaustive-match updates.
+Error Indication struct literals must supply `fiveg_s_tmsi` (`None` when absent).
+Admission does not choose Error Indication triggers, prove transport/UE
+ownership, correlate requests or perform reset actions. Other procedures and
+unsupported optional fields retain their documented restrictions. Live
+interoperability is not established.
+
+## PDU Session Resource Notify
+
+`n3iwf::notify::ResourceNotify` constructs and admits initiating procedure
+30/ignore under TS 38.413 V18.10.0 8.2.4 and 9.2.1.7. TS 29.413 5.1–5.2
+lists the procedure as applicable to N3IWF; 5.3 supplies no Notify-specific
+receiver-ignore exception. The admitted root transfers follow 9.3.4.5 and
+9.3.4.13.
+
+| Boundary | Required fields and conditions | Optional fields | Required depth |
+| --- | --- | --- | --- |
+| Complete Notify | AMF/RAN IDs; at least one session-report list | Notified list 66/reject, released list 67/ignore, N3IWF location 121/ignore | 10 for released sessions; 11 for notifications; 12 with released flows |
+| Notify transfer | At least one flow-report list; each present list has 1–64 entries | Root fulfilled/not-fulfilled notifications, released QFI/Cause reports | 4 for notifications; 5 with released flows |
+| Notify released transfer | Root Cause | None | 3 |
+| Notified session list | 1–256 unique session IDs and typed Notify transfers | None | 7 for notifications; 8 with released flows |
+| Released session list | 1–256 unique session IDs and typed released transfers | None | 6 |
+
+Session IDs are unique and disjoint across the two complete-message lists.
+QFIs are unique and disjoint across both lists within each Notify transfer.
+All top-level IEs are singleton; both required IDs use reject criticality.
+Generic duplicate selection, unknown-IE and criticality policies remain
+authoritative; use the same context for generic and semantic admission.
+Unknown-ignore counts and unknown-notify identifiers expose no opaque values.
+Debug output for typed fields and messages is redacted.
+
+The [field corpus](tests/fixtures/n3iwf-notify-fields.json) has 971 independent
+cases (964 admitted, seven negative), including every flow/session list count,
+both root notification states for every QFI, all 64 root Causes, mixed flow
+reports and maximum-width contained transfers. The
+[message corpus](tests/fixtures/n3iwf-notify.json) has 43 cases (27 admitted,
+16 negative), including fragmented complete PDUs, ID widths, IPv4/IPv6 location,
+missing/conflicting reports, distinct duplicate values and unknown criticalities.
+Regenerate with `scripts/generate-ngap-notify-field-fixtures.py` and
+`scripts/generate-ngap-notify-fixtures.py`, each taking `--spec PATH --output PATH`,
+using the pinned Release 18 PDF and reference environment. Both unmodified
+reference encoders agree; its structured decoder verifies the input values.
+
+Generated probes match all 388 Notify-transfer encodings, but decode only the
+empty ASN.1 root: 387 nonempty decodes fail. Only that nested receiver uses an
+explicit root layout. Generated released-transfer encoding/decoding passes all
+64 cases; generated notified/released session lists pass all 262/257 cases in
+both directions. Preserve those qualified generated paths. Physical preflight
+checks flags, exact framing, padding, cumulative counts and remaining depth
+before vector allocation; encoders check exact capacity before constructing
+generated values. `max_ies` bounds the total flow count within a transfer and
+each outer list. Schema and dependencies are unchanged.
+
+The shared contained-field reader now rejects a two-octet length determinant
+for a value below 128 bytes. The initial regression accepted that malformed
+form; this tightens contained-field framing for existing callers as well.
+Tests cover exact and one-short byte/count/depth limits, malformed flags and
+padding, truncation and trailing bytes. Fuzz/replay compares admitted fields
+and canonical messages using all 1,014 complete independent seeds.
+
+The new public message variant requires downstream exhaustive-match updates.
+The caller checks session/QFI ownership and the established GBR classification
+of notification reports, selects triggers and performs resource effects.
+Construction does not override TS 29.413's receiver-ignore rules for Notification
+Control in Setup/Modify or establish eligibility to generate a notification.
+Alternative QoS, feedback, RAT usage and other extensions remain explicitly
+unsupported. Modify qualification follows below; the applicability, receive/error
+and trigger matrix is in [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md). Applicable
+optional field gaps and live interoperability evidence remain explicitly open.
+
+## PDU Session Resource Modify root fields
+
+`n3iwf::modify_fields` adds four standalone root lists from TS 38.413 V18.10.0
+9.3.4.3–4, using the QFI, QoS and Cause definitions in 9.3.1.12–13 and 9.3.1.51.
+These are field codecs; the request-transfer composition is qualified below.
+Complete Modify messages and request/response conditions are qualified below.
+The standalone field boundary adds no PDU outcome.
+
+| Field | Qualified root | Required depth |
+| --- | --- | --- |
+| `QosFlowModifications` | 1–64 unique QFIs; absent parameters or explicit root QoS profiles; optional E-RAB | 3 for identifiers only; 6 non-dynamic / 7 dynamic |
+| `ModifiedQosFlows` | 1–64 unique reported QFIs | 3 |
+| `QosFlowCauses` | 1–64 unique QFI/root-Cause pairs | 4 |
+| `UplinkModifications` | 1–4 ordered UL/DL GTP-tunnel pairs; IPv4 or IPv6 per endpoint | 5 |
+
+Request parameter absence is represented separately from supplied parameters;
+it does not establish that a flow exists or provide default QoS. Root ARP has
+priority 1–15 and explicit pre-emption flags. Root QoS profiles and E-RAB
+identifiers are qualified above; extension additions remain unsupported.
+QFI values 0–63 and all wire endpoint/TEID values are representable; reservation,
+ownership and endpoint policy are caller duties. Directional endpoint types stay
+distinct. Tunnel pairs preserve repetition and order without inventing a
+uniqueness requirement. Each list uses `max_ies` and exact byte/depth limits.
+Public formatting is redacted.
+
+The [independent oracle](tests/fixtures/n3iwf-modify-fields.json) contains 687
+cases (originally 682 admitted, three duplicate negatives and two unsupported
+profiles; both profile cases are now independently qualified and admitted).
+It covers every list count, every QFI with and without parameters, all root
+Causes, all ARP priorities/pre-emption combinations, mixed parameter presence,
+both IP families, endpoint/TEID boundaries and repeated tunnel pairs. Both
+unmodified reference encoders agree and structured reference decoding verifies
+values. Regenerate with `scripts/generate-ngap-modify-field-fixtures.py
+--spec PATH --output PATH` and the pinned Release 18 PDF/reference environment.
+
+Generated probes across all 687 cases find 253/383 request-list encode failures
+and 380/383 decode failures, 0/129 response-list encode and 129/129 decode
+failures, 0/130 Cause-list encode and 129/130 decode failures, and 45/45 tunnel
+list failures in both directions. Retain the generated response/Cause encoders
+and all 129 admitted identifier-only request encodings. Only request lists
+containing parameters, tunnel encoding and the failed receivers use explicit
+bounded layouts. Two-pass decoding checks all physical framing, root flags,
+zero padding, counts and uniqueness before allocating vectors. Exact sizing
+precedes output allocation; schema and dependencies are unchanged.
+
+Tests compare all admitted values and exact independent bytes, exact/one-short
+limits, unsupported fields, truncations, trailing bytes and flag/padding
+mutations. Shared fuzz/replay assertions include all 687 complete independent
+seeds. Complete Modify request/response support, documented below, enforces
+TS 29.413's receiver-ignore rules. Request correlation, conditional NAS
+forwarding, abnormal-condition responses and resource effects remain caller-owned.
+
+## PDU Session Resource Modify Request Transfer
+
+`n3iwf::modify_request::ModifyRequestTransfer` admits the bounded root subset
+of TS 38.413 V18.10.0 8.2.3 / 9.3.4.3. Session AMBR (130), uplink tunnel
+modifications (140), flow additions/modifications (135) and flow releases (137)
+are independently optional and reject-criticality. An empty root is preserved.
+Numeric Network Instance (129/reject) and Common Network Instance (166/ignore)
+are also optional; their separate qualification is recorded below.
+Modify does not require a new AMBR: an existing
+session can retain its prior limits. Absent QoS parameters remain absent.
+The type neither asserts an existing session nor applies previous values.
+
+| Present root field | Required depth | Nested count bound |
+| --- | --- | --- |
+| None | 4 | Zero IEs is valid |
+| Numeric or Common Network Instance | 5 | No list |
+| Session AMBR | 6 | No list |
+| Identifier-only add/modify requests | 7 | 1–64 |
+| Release QFI/Cause pairs | 8 | 1–64 |
+| UL/DL tunnel modification pairs | 9 | 1–4 |
+| Add/modify requests with parameters | 10 non-dynamic / 11 dynamic | 1–64 |
+
+All QFIs are unique and disjoint across add/modify and release lists. The
+container and each nested list separately use `max_ies`; byte/depth limits
+are explicit SDK caller limits and `allocation_budget` stays advisory.
+Complete container framing, flags, minimal determinants and zero padding are
+checked before allocating entries. Entries borrow original IE frames; discarded
+or unknown values are not coalesced. Shared duplicate/unknown/validation policies
+select fields before semantic admission. Retained unknown reject IEs fail;
+ignore IEs produce only a count and notify IEs only identifiers. Known optional
+fields outside the subset are recognized and fail explicitly even under Drop.
+SecurityIndication is ignore-criticality here, unlike Setup. Formatting is redacted.
+
+The [independent oracle](tests/fixtures/n3iwf-modify-request.json) supplies 380
+complete transfers: 363 admitted and 17 negative. Both unmodified reference
+encoders agree, and structured decoding verifies the container, nested values
+and classification. It covers all 16 presence combinations, every flow count,
+63 disjoint QFI splits, AMBR bounds, tunnel forms, distinct duplicate values,
+known unsupported fields, unknown criticalities and 16K/64K fragmentation.
+Regenerate with `scripts/generate-ngap-modify-request-fixtures.py --spec PATH
+--output PATH`; the separately qualified field corpus is hash-recorded as input.
+
+Generated enclosing encoding matches only the empty transfer (1/380), while
+receiving fails the two fragmented cases (378/380 pass). Reuse qualified bounded
+container framing and nested field codecs, without changing the schema or
+runtime. Exact field and complete-container sizing precede output allocation.
+Tests compare independent field values and canonical bytes, first/last selection,
+metadata, empty/absent values, exact/one-short limits, overlap, malformed framing,
+all truncations and bounded mutations. All 380 full vectors seed shared replay
+and fuzz assertions.
+
+### Network-instance fields in Setup and Modify
+
+`network_fields::CommonNetworkInstance` owns opaque octets with value-free
+formatting. TS 38.413 9.3.1.120 references TS 29.244 8.2.4: identifiers may use
+domain/APN encoding but are not universally restricted to it. The codec preserves
+the unconstrained OCTET STRING, including empty and fragmented values, without
+resolving an identifier or enforcing deployment-specific naming. It needs depth
+one and checks caller byte bounds, complete minimal length determinants and
+trailing data before allocating. Construction takes a caller-owned vector and
+checks the full fragmented wire length before allocating output.
+
+Setup and Modify expose `network_instance` and `common_network_instance` plus
+`transport_network_instance()`. The accessor returns Common first, as required
+by TS 38.413 8.2.1.2/8.2.3.2. Both supplied values are preserved and validated
+after shared duplicate selection; Common presence does not make a malformed
+numeric value admissible. Numeric extension integers remain unsupported. The
+accessor describes the request and provides no local routing authority. New
+optional fields require updates to existing public struct literals.
+
+Both transfer constructors emit schema order and field-specific criticality;
+receivers preflight all physical IE framing before allocating entries or
+coalescing selected values. The Common field is ignore-criticality, but a known
+malformed selected Common value is rejected by this typed admission boundary.
+Unknown Drop and First/Last/Reject retain the existing shared policy semantics.
+No QoS profile, extra/redundant tunnel or unqualified extension is added.
+
+The [independent network-instance corpus](tests/fixtures/n3iwf-network-instance.json)
+contains 271 Common leaf vectors, 365 transfer cases and 15 complete Initial
+Context Setup, Session Setup and Session Modify requests. Pycrate 0.8.1 is
+compiled from the unchanged hash-pinned TS 38.413 V18.10.0 ASN.1; both encoder
+paths and structured decoding agree. It covers all one-octet identifier values,
+empty/127/128/16K/32K/48K/64K fragmentation boundaries, every numeric root in
+Modify, Common precedence, malformed numeric values even when Common is present,
+criticality, distinct and invalid selected duplicates, unknown IEs and ordering.
+Regenerate with `scripts/generate-ngap-network-instance.py --spec PATH --output
+PATH`. Numeric-value semantics remain TS 38.413 9.3.1.113.
+
+The original Modify corpus is byte-identical. Its two `unsupported-known-129`
+vectors and one `unsupported-known-166` vector now pass explicit construction
+and admission assertions; their old scope labels remain visible. Tests compare
+fresh typed construction with independent bytes, exact and one-short limits,
+complete-message encoding and redacted formatting. Shared fuzz/replay assertions
+reconstruct selected values and test canonical re-admission under bounded inputs.
+
+This is a transfer boundary, not an additional admitted NGAP PDU. The caller
+checks session/bearer ownership and conditional presence, correlates requests,
+constructs the abnormal-condition response required by 8.2.3.4, forwards NAS
+only after qualifying success and performs resource effects. A decode error
+alone is not that response. Response/failure roots and enclosing Modify messages
+follow below; [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md) defines routing, receive/error
+obligations and trigger gates for other applicable procedures.
+
+## PDU Session Resource Modify result transfers
+
+`n3iwf::modify_results` qualifies the roots of TS 38.413 V18.10.0 8.2.3,
+9.3.4.4 and 9.3.4.17. `ModifyResponseTransfer` has independently optional
+N3IWF downlink and core uplink endpoints, accepted QFIs and failed QFI/Cause
+reports. QFIs are unique and disjoint; present lists contain 1–64 entries.
+An empty or failed-flow-only root can accompany a successful AMBR, tunnel or
+release change. The codec therefore preserves these shapes without asserting
+request correspondence or that an operation succeeded. Additional per-tunnel
+associations are qualified below. Non-root address choices and extensions
+remain unsupported.
+
+`ModifyFailureTransfer` carries a mandatory root Cause and optional root
+Criticality Diagnostics. Absent and empty diagnostics remain distinct. Diagnostic
+lists contain 1–256 items and preserve repeated identifiers. TS 38.413 9.3.1.3
+makes procedure code and triggering outcome inapplicable in same-procedure
+responses, so construction and admission reject them. The qualified diagnostic
+item type excludes ignore criticality; reported procedure criticality may still
+be ignore. A failed session belongs in a Modify Response session list, not an
+unsuccessful procedure-26 PDU.
+
+| Transfer shape | Required depth | Count bound |
+| --- | --- | --- |
+| Empty response | 1 | No list |
+| Response with tunnels and/or accepted QFIs | 4 | Accepted list 1–64 |
+| Response with failed QFIs | 5 | Each list 1–64; combined count uses caller budget |
+| Response with additional downlink associations | 8 | 1–3 bearers, each with 1–64 flows; all occurrences and result lists share the caller budget |
+| Failure Cause and optional diagnostics without items | 3 | No list |
+| Failure with diagnostic items | 5 | 1–256, repeats retained |
+
+Complete flags, counts, enums, unique QFIs, padding and exact framing preflight
+precedes vector allocation. Exact output sizing precedes generated materialization
+or bounded output allocation. Nested layouts retain their actual parent bit
+offsets. Accepted/failed QFIs, additional bearer items and their flow occurrences
+cumulatively use `max_ies`; allocation-budget targets remain
+advisory. Public formatting is redacted. Internal transport, Cause and diagnostic
+helpers are reused without changing their public field contracts.
+
+The [independent oracle](tests/fixtures/n3iwf-modify-results.json) supplies 1,436
+complete transfers: 852 responses and 584 unsuccessful transfers, originally
+with 1,423 admissions and 13 negative cases. The historical additional-tunnel
+vector is now explicitly requalified at depth eight: 1,424 admit and 12 refuse,
+with no fixture byte or label changes. Both unmodified reference encoders agree;
+structured decoding verifies explicit models and admission classifications.
+Coverage includes all 16 response presence combinations, directional IPv4/IPv6
+endpoint bounds, all QFI counts and disjoint splits, every root Cause at eight
+list offsets, all diagnostic counts, repeated identifiers, absence, empty roots,
+inapplicable diagnostics and unsupported extensions/additional tunnels.
+Regenerate with `scripts/generate-ngap-modify-result-fixtures.py --spec PATH
+--output PATH` in the pinned Release 18 reference environment.
+
+Generated probes cover 1,433 modeled root cases, excluding the three explicit
+unsupported extension/additional-tunnel examples. The empty response passes
+both directions. All 773 QFI-only response encodings pass while all their
+decodings fail. Tunnel responses encode 4/76 and decode 55/76 correctly.
+Cause-only unsuccessful transfers pass all 64 in both directions; diagnostics
+encode 149/519 and decode 284/519 correctly. Keep generated encoding for
+responses without tunnels, empty-response decoding, and Cause-only failure
+encoding/decoding. Explicit bounded layouts handle the failed shapes. Schema,
+runtime and reference packages are unchanged.
+
+Tests compare independent values and exact output, constructor negatives,
+exact/one-short byte/depth/count bounds, unsupported flags, parent-offset padding,
+all truncations and bounded mutations. All 1,436 complete vectors seed shared
+replay and fuzz assertions. Enclosing session lists/messages, request correlation,
+conditional NAS forwarding, response selection, rollback and resource effects
+remain separate and are described in the enclosing-message section below.
+This field increment adds no admitted PDU outcome.
+
+### Additional request tunnels and Modify associations
+
+`resource_fields::UplinkTransportList` preserves one to three additional
+IPv4/IPv6 core endpoints in peer order, including repeated endpoints and every
+root TEID value. Setup and Modify transfers expose `additional_uplink` and emit
+IE 126 with reject criticality in schema order. Shared duplicate/unknown IE
+selection still precedes semantic admission. Existing public request literals
+need `additional_uplink: None`; Modify's default remains empty.
+
+`ModifyResponseTransfer::additional` preserves zero to three additional
+`DownlinkQosTunnel` values, including each associated QFI and optional UL/DL
+mapping. Existing literals need `additional: Vec::new()`. Associated QFIs are
+unique within a bearer and may repeat across bearers. Successful and failed
+modification lists remain unique and disjoint. Associations are separate from
+those result lists: this codec does not infer successful modification from an
+association, request correspondence, endpoint availability or resource effects.
+The caller applies TS 38.413 8.2.3, including fallback to the prior configuration
+for failed modifications and the conditions on additional transport bearers.
+
+The additional UL leaf requires depth five; enclosing Setup transfers retain
+their ten/eleven-level QoS requirement, and Modify requests require at least
+nine with this field. Additional DL associations require depth eight, eleven
+in the Modify session list and fifteen in the complete response. A single
+reader cumulatively charges every response list entry and flow occurrence
+against `max_ies`. Request containers and each nested list retain their separate
+caller count bounds. Two-pass scanners check complete physical framing before
+vector allocation. Exact output measurement precedes buffer allocation.
+Extensions, unsupported address lengths, nonzero padding and trailing bytes
+refuse explicitly. Root admission never installs a bearer or selects a peer.
+
+The [independent corpus](tests/fixtures/n3iwf-remaining-tunnels.json) contains
+631 transfers (625 admitted, six duplicate/conflict negatives) and 35 complete
+Setup/Modify messages (29 admitted, six negatives). Both unmodified Pycrate
+encoders and decoders agree on the pinned TS 38.413 V18.10.0 schema. Cases cover
+all 64 QFIs and mapping alternatives, every association-list size, tunnel-list
+arity, mixed IPv4/IPv6 and TEID boundaries, optional fields at differing parent
+offsets, every root Cause, and the 516-byte maximum tested response. Reference
+outer metadata and mandatory fields come from the schema. No SDK codec supplies
+oracle bytes. Regenerate with `scripts/generate-ngap-remaining-tunnels.py --spec
+PATH --output PATH` in the pinned reference environment. Corpus SHA-256:
+`f9254fdf6c66365b88fcc4d8c3ec9ced2c5f9289591a1251679a2f300ef2d055`.
+
+Three positive reference cases failed against the previous implementation before
+adding support. Tests compare explicit typed values and exact reference bytes,
+complete-message construction/admission, exact and one-short limits, constructor
+bounds, truncations and mutations. Shared fuzz/replay code rebuilds additional
+endpoints and mappings through public constructors; 79 new corpus seeds exercise
+those boundaries. Root item extensions,
+redundant/forwarding extension fields and combined IPv4-plus-IPv6 addresses
+remain explicit gaps; this evidence is not live-peer interoperability.
+
+## Complete PDU Session Resource Modify
+
+`n3iwf::modify_lists` and `n3iwf::modify` compose the transfer roots above into
+TS 38.413 V18.10.0 8.2.3 / 9.2.1.5–6 messages. Procedure 26 has reject
+criticality, an initiating Request and a successful Response. Session failures
+are entries in Response; no unsuccessful procedure outcome is defined.
+
+| Outcome | Mandatory singleton IEs | Optional singleton IEs | Receive behavior |
+| --- | --- | --- | --- |
+| Request | AMF UE ID 10, RAN UE ID 85, nonempty Modify List 64 (all reject) | RAN Paging Priority 83 (ignore) | Ignore 83 contents as required by TS 29.413 5.3; omit it from typed construction |
+| Response | AMF UE ID 10, RAN UE ID 85 (both ignore) | Modified List 65, Failed List 54, N3IWF location 121, Criticality Diagnostics 19 (all ignore) | At least one result list; disjoint session IDs; diagnostics omit procedure code/triggering outcome under 9.3.1.3 |
+
+All three lists contain 1–256 unique session IDs. Request items preserve optional
+opaque NAS (absent and empty are distinct) and optional S-NSSAI extension 148
+with reject criticality. Exactly one such extension is supported; duplicate
+S-NSSAI, Expected UE Activity Behaviour 281 and other item extensions explicitly
+reject in this initial subset, including under unknown-IE Drop. No slice default
+or authorization is inferred. Failed results retain their qualified response
+diagnostics; repeated diagnostic IE identifiers remain representable.
+
+Request lists require depth 7–13 (three layers plus the contained transfer).
+Successful lists require depth 4 for empty transfers, 7 with tunnels/accepted
+QFIs, 8 with failed QFIs and 11 with additional tunnel associations. Failed lists require depth 6, or 8 with diagnostic
+items. Complete messages add four enclosing layers; optional top-level fields
+retain their own qualified depth requirements. Outer lists, the top container,
+and each contained transfer independently use `max_ies`. Counts are caller
+limits, not extra standards cardinality. Complete physical framing of every
+list item and fragment is checked before list materialization or NAS/transfer
+coalescing. Ordinary NAS borrows the input; fragmented NAS is bounded by actual
+physical bytes. Exact output size precedes list allocation; allocation-budget
+targets remain advisory.
+
+Both boundaries use the same `DecodeContext`. Duplicate First/Last/Reject and
+unknown Preserve/Drop/Reject policies remain authoritative at the outer and
+contained request levels; previously dropped fields cannot be recovered.
+Retained unknown reject IEs fail typed admission. Unknown-ignore counts and
+notify IDs propagate as value-free diagnostics, including per-session evidence.
+Construction emits canonical known fields in schema order. All formatting
+remains redacted. Exhaustive users of public `Message`/`MessageType` must handle
+the two new Modify variants; previously unknown procedure-26 Request/Response
+bodies now receive typed structural dispatch and its IE policy checks.
+
+The independent [list oracle](tests/fixtures/n3iwf-modify-lists.json) has 1,062
+cases (1,051 admitted, 11 negative), including every list count and SST, NAS
+fragment boundaries through 65,537 bytes, optional slices, nested unknown IEs,
+duplicates and unsupported extensions. Its inputs name and hash the qualified
+transfer corpora. The [message oracle](tests/fixtures/n3iwf-modify.json) has 63
+complete messages (35 admitted, 28 negative), with partial/all-failed results,
+location, diagnostics, receiver-ignore, missing fields and criticality policies.
+Both unmodified reference encoders agree and structured decoding verifies values
+and admission classifications. Regenerate with
+`scripts/generate-ngap-modify-list-fixtures.py --spec PATH --fixtures DIR --output PATH`
+and `scripts/generate-ngap-modify-fixtures.py --spec PATH --output PATH`.
+
+Generated probes cover all 1,051 admitted list cases. Request encoders pass
+525/533 and decoders 521/533; failures involve fragmented NAS or contained
+transfers. Both directions pass all 260 response and 258 failure lists. Retain
+those generated result paths after physical preflight; use the already qualified
+fragment writer and borrowed reader for requests. The pinned generated schema
+and dependencies remain unchanged. All complete vectors seed bounded shared
+replay/fuzz checks, with exact limits and malformed flags, padding and lengths.
+
+The caller checks exact request/result coverage, established session and QFI
+ownership, conditional NAS forwarding and optional-field applicability to its
+session state; it selects and constructs the abnormal-condition responses of
+8.2.3.4. Returning a typed decode error does not send those responses. Actual
+resource modifications, rollback and procedure triggers remain outside the codec.
+Other optional fields remain outside the enumerated subset. The complete
+applicability/receive/error/trigger matrix is in
+[N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md). This evidence does not claim live
+interoperability.
+
+## Optional diagnostics in existing responses
+
+The seven existing NG Setup Response/Failure, Initial Context Setup
+Response/Failure, PDU Session Resource Setup/Release Response and UE Context
+Release Complete boundaries admit and construct optional IE 19 with ignore
+criticality. This extends their field subsets without adding outcomes to the
+23 locally qualified messages or changing the published 15-outcome corpus.
+Sources: TS 38.413 V18.10.0 message tables and 9.3.1.3; TS 29.413 V18.5.0 5.3.
+
+Absent diagnostics and a present empty root remain distinct. Procedure code
+and triggering outcome belong to Error Indication and fail both response
+admission and construction. Procedure criticality remains optional, including
+ignore. An optional IE list has 1–256 entries with reject/notify criticality;
+repeated identifiers retain order. Diagnostic values remain redacted. A caller
+selects the response and correlates these reports with its triggering procedure.
+
+Each constructor checks diagnostic count and remaining depth before encoding.
+The enclosing message needs at least depth 6 for diagnostics without items, or
+8 with items, in addition to any deeper existing fields. Byte, count and depth
+limits use the same context for generic decoding, admission and construction.
+Generic duplicate First/Last/Reject and unknown Preserve/Drop/Reject policies
+remain authoritative; the new supported IE is never counted as receiver-ignored.
+Unimplemented extensions and malformed flags, lengths or padding still fail.
+
+The [independent response oracle](tests/fixtures/n3iwf-response-diagnostics.json)
+contains 4,349 complete messages: 2,046 admitted and 2,303 negative. Every outcome
+covers all 1–256 valid diagnostic list counts; minimal message forms separately
+expose exact depth 6/8 boundaries, absent/empty roots and maximum item counts.
+Header applicability, invalid item criticality, duplicate selection and outer
+criticality negatives accompany model-to-byte construction and receive checks.
+Historical zero-octet diagnostics negatives remain malformed; the prior hashed
+corpora are unchanged. Both unmodified reference encoders agree and structured
+reference decoding verifies values. Regenerate using
+`scripts/generate-ngap-response-diagnostics-fixtures.py --sdk-root DIR --spec PATH --output PATH`.
+All complete vectors seed shared bounded replay/fuzz assertions. These additions
+require `diagnostics: None` (or an explicit value) in affected public struct
+literals and the Release Complete variant; exhaustive destructuring must allow
+the new field. Remaining applicable fields and procedure codecs stay open in
+#787; these tests do not establish live peer interoperability.
 
 ## Fixtures
 
-- `NGSetupRequest`: 78-byte APER PDU captured from an independent
-  `asn1c`-based implementation (libngap): GlobalRANNodeID, RANNodeName
-  ("My little gNB"), SupportedTAList, DefaultPagingDRX(v64). Field-level
-  content is asserted, not just the decoded type.
+- [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
+  complete messages for its 15 published outcomes, encoded by Pycrate 0.8.1
+  compiled directly from the exact ETSI Release 18.10 publication. The
+  [SDK field comparison](../opc-n3iwf-fixtures/tests/ngap_messages.rs) verifies
+  every decoded IE and raw-preserving output. The separate reference gate
+  validates mandatory fields and nested ASN.1 values. Construction tests use
+  independently encoded leaf bytes as inputs and compare complete output
+  with the published PDU. This proves container construction, not SDK semantic
+  admission of those leaf values.
+- [Constructed framing oracle](tests/fixtures/constructed-framing.json):
+  SHA-256 and length of 54 independently encoded root containers with a
+  deterministic synthetic unknown ignore-criticality IE. These are structural
+  containers, not complete procedures. Reproduce with the pinned reference
+  Python environment and local hash-checked ETSI V18.10.0 PDF:
+  `python scripts/generate-ngap-constructed-fixtures.py --spec PATH --output PATH`.
+  Tests cover exact/one-short bounds, fragmented inner and outer open types,
+  all outcomes, zero-length values and terminating zero determinants.
+- Legacy `NGSetupRequest`: 78-byte structural derivative of the libngap
+  literal. Its erroneous outer criticality is corrected from ignore to reject;
+  the original literal remains as provenance. It is not a complete N3IWF peer
+  exchange. Existing field-level assertions are retained.
 - Successful/unsuccessful outcome wrappers and empty-IE message bodies:
   hand-authored from TS 38.413 §9.2 and X.691 aligned-PER rules with
   octet-level comments. These prove routing and raw-preserving behavior, not
@@ -89,27 +1625,36 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
 
 ## Robustness & Fuzzing
 
-The decode path carries no `unsafe` and uses checked length arithmetic. For
-typed procedures it parses the exact aligned-PER container prefix before
-`rasn`: the fixed-width 16-bit `ProtocolIE-Container` count must satisfy
+The decode path carries no `unsafe` and uses checked length arithmetic. Root
+PDU/IE open types are preflighted through their final length determinant before
+fragment coalescing; the claimed fragment must physically fit. For typed
+procedures the fixed-width 16-bit `ProtocolIE-Container` count must satisfy
 `DecodeContext::max_ies` and the minimum physical bytes required by that many
-entries before `SequenceOf` materialization. Three additional layers guard it:
+entries before materialization. Generated types decode fixed IE headers;
+fragments cannot consume a following IE or PDU. Trailing bytes inside a root
+container are rejected. SEQUENCE extension additions retain the earlier
+generated decoder path; fragmented additions are not qualified. Three
+additional layers guard it:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   corpus entry, byte-truncations of each, and hostile constant inputs through
   `Pdu::decode_owned` under `catch_unwind`. Runs in ordinary `cargo test`; no
   nightly toolchain or libFuzzer required.
 - **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_ngap.rs` with a seeded
-  corpus, registered in `.github/workflows/fuzz.yml` and run weekly.
+  corpus, registered in `.github/workflows/fuzz.yml` and run weekly. The target
+  also constructs bounded borrowed IE lists, exercises duplicate policies,
+  and checks canonical lengths and structural replay.
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~26M
   executions with no crash, leak, or OOM.
 
 ## Codec Boundary (v1 subset)
 
-- Canonical (typed) encoding of any message.
-- External field-level fixtures for the structural typed-dispatch subset above.
+- Typed semantic encoding of IE values beyond the explicitly admitted
+  N3IWF field subset, including resource transfers.
+- External field-level fixtures for Paging and procedures outside the admitted
+  N3IWF corpus.
 - Typed decode of procedures outside the first-CNF N2 subset above; preserved
   raw as `Message::Unknown`.
 - UPER encoding.
 - Semantic validation of IE contents or mandatory/conditional presence beyond
-  the top-level identifier, criticality, and cardinality contract above.
+  the explicitly documented field/message admission subsets above.

@@ -25,8 +25,8 @@ use crate::model::{
     RuleConflict, RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
 };
 use crate::validation::{
-    canonical_route_request, validate_owned_rule_request, validate_route_request,
-    validate_rule_request,
+    canonical_route_request, source_only_rules_are_provably_disjoint, validate_owned_rule_request,
+    validate_route_request, validate_rule_request,
 };
 
 /// One recorded call against the mock backend.
@@ -143,11 +143,7 @@ impl RouteKernelKey {
 
 impl RuleKernelKey {
     fn from_request(request: &RuleRequest) -> Self {
-        let ipv4 = request
-            .source
-            .or(request.destination)
-            .map(crate::model::IpPrefix::is_ipv4)
-            .unwrap_or(true);
+        let ipv4 = rule_is_ipv4(request);
         Self {
             ipv4,
             priority: request.priority,
@@ -608,11 +604,21 @@ impl MockRouteSteeringBackend {
         let Some(candidates) = state.rules.get(&RuleKernelKey::from_request(request)) else {
             return Ok(RuleReadback::Absent);
         };
+        let candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                !(candidate.owned
+                    && source_only_rules_are_provably_disjoint(request, &candidate.request))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(RuleReadback::Absent);
+        }
         let candidate_count = candidate_count(candidates.len())?;
         let mut aggregate = RuleMismatch::default();
         let mut resident = None;
         let mut exact_count = 0_u16;
-        for candidate in candidates {
+        for candidate in &candidates {
             let mismatch = RuleMismatch {
                 source: candidate.request.source != request.source,
                 destination: candidate.request.destination != request.destination,
@@ -1596,6 +1602,7 @@ mod tests {
             }),
             table: 100,
             priority: 1000,
+            family: None,
         }
     }
 
@@ -1626,6 +1633,7 @@ mod tests {
             fwmark: None,
             table: 100,
             priority: 100,
+            family: None,
         }
     }
 
@@ -1796,6 +1804,7 @@ mod tests {
             fwmark: None,
             table: 100,
             priority: 1000,
+            family: None,
         };
         assert!(matches!(
             backend.read_rule(&invalid_rule).await,
@@ -1836,6 +1845,7 @@ mod tests {
             }),
             table: 100,
             priority: 1000,
+            family: None,
         };
         backend.install_rule(legacy.clone()).await.unwrap();
         assert!(matches!(
@@ -2059,11 +2069,78 @@ mod tests {
             fwmark: rule().fwmark,
             table: rule().table,
             priority: rule().priority,
+            family: None,
         };
         backend.seed_rule(mark_only).unwrap();
         assert!(matches!(
             backend.read_rule(&rule()).await.unwrap(),
             RuleReadback::Conflict(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ipv4_and_ipv6_mark_only_rules_are_distinct_objects() {
+        let backend = MockRouteSteeringBackend::new();
+        let mark_only = |family| RuleRequest {
+            source: None,
+            destination: None,
+            fwmark: rule().fwmark,
+            table: rule().table,
+            priority: rule().priority,
+            family,
+        };
+        let ipv4 = mark_only(None);
+        let ipv6 = mark_only(Some(crate::collection::RouteSteeringIpFamily::Ipv6));
+
+        assert_eq!(
+            backend.converge_rule(ipv6.clone()).await.unwrap(),
+            RuleConvergenceOutcome::Installed
+        );
+        assert_eq!(
+            backend.read_rule(&ipv4).await.unwrap(),
+            RuleReadback::Absent
+        );
+        assert_eq!(
+            backend.read_rule(&ipv6).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        // The IPv4 rule with the same mark, table, and priority lives in the
+        // separate IPv4 rule list and neither conflicts with nor replaces it.
+        assert_eq!(
+            backend.converge_rule(ipv4.clone()).await.unwrap(),
+            RuleConvergenceOutcome::Installed
+        );
+        assert_eq!(
+            backend.read_rule(&ipv4).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        assert_eq!(
+            backend.converge_rule(ipv6.clone()).await.unwrap(),
+            RuleConvergenceOutcome::ExactAlreadyPresent
+        );
+        backend.remove_rule(ipv4.clone()).await.unwrap();
+        assert_eq!(
+            backend.read_rule(&ipv4).await.unwrap(),
+            RuleReadback::Absent
+        );
+        assert_eq!(
+            backend.read_rule(&ipv6).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        backend.remove_rule(ipv6.clone()).await.unwrap();
+        assert_eq!(
+            backend.read_rule(&ipv6).await.unwrap(),
+            RuleReadback::Absent
+        );
+
+        let mut conflicting = rule();
+        conflicting.family = Some(crate::collection::RouteSteeringIpFamily::Ipv6);
+        assert!(matches!(
+            backend.install_rule(conflicting).await,
+            Err(RouteSteeringError::InvalidConfig {
+                field: "rule.family",
+                ..
+            })
         ));
     }
 
@@ -2191,6 +2268,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_owned_source_siblings_match_linux_readback_and_cleanup() {
+        let backend = MockRouteSteeringBackend::new();
+        let first = sibling_rule(10);
+        let second = sibling_rule(11);
+        backend.seed_rule(first.clone()).unwrap();
+        backend.seed_rule(second.clone()).unwrap();
+        assert_eq!(
+            backend.read_rule(&first).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        backend.remove_converged_rule(first.clone()).await.unwrap();
+        assert_eq!(
+            backend.read_rule(&first).await.unwrap(),
+            RuleReadback::Absent
+        );
+        assert_eq!(
+            backend.read_rule(&second).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        assert_eq!(backend.operations(), vec![MockOperation::RemoveRule(first)]);
+    }
+
+    #[tokio::test]
+    async fn exact_source_sibling_readback_keeps_foreign_and_overlapping_candidates() {
+        for variant in 0..4 {
+            let backend = MockRouteSteeringBackend::new();
+            let target = sibling_rule(10);
+            let mut sibling = sibling_rule(11);
+            backend.seed_rule(target.clone()).unwrap();
+            match variant {
+                0 => backend.seed_foreign_rule(sibling).unwrap(),
+                1 => {
+                    sibling.source.as_mut().unwrap().prefix_len = 24;
+                    backend.seed_rule(sibling).unwrap();
+                }
+                2 => {
+                    sibling.table += 1;
+                    backend.seed_rule(sibling).unwrap();
+                }
+                _ => {
+                    sibling.destination = sibling.source;
+                    backend.seed_rule(sibling).unwrap();
+                }
+            }
+            assert!(matches!(
+                backend.read_rule(&target).await.unwrap(),
+                RuleReadback::Conflict(_)
+            ));
+            assert!(backend.remove_converged_rule(target).await.is_err());
+            assert!(backend.operations().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn owned_collection_converges_retries_and_removes_same_priority_siblings_exactly() {
         let backend = MockRouteSteeringBackend::new();
         let desired = OwnedRouteRuleSet::new(
@@ -2264,6 +2395,7 @@ mod tests {
             fwmark: None,
             table: 100,
             priority: 100,
+            family: None,
         };
         let desired =
             OwnedRouteRuleSet::new(owned_scope(), Vec::new(), vec![desired_rule]).unwrap();
@@ -2411,6 +2543,7 @@ mod tests {
             fwmark: None,
             table: 2000,
             priority: 900,
+            family: None,
         };
         let backend = MockRouteSteeringBackend::new();
         for offset in 0..SET_SIZE {
@@ -2448,6 +2581,7 @@ mod tests {
             fwmark: None,
             table: 2000,
             priority: 900,
+            family: None,
         };
         let backend = MockRouteSteeringBackend::new();
         for offset in 0..(SET_SIZE * 2) {
@@ -2491,6 +2625,7 @@ mod tests {
                 fwmark: None,
                 table: 2000,
                 priority: 900,
+                family: None,
             });
         }
         let desired = OwnedRouteRuleSet::new(scope, routes, rules).unwrap();

@@ -1,5 +1,5 @@
 use aes_gcm_siv::{
-    aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
+    aead::{AeadInOut, KeyInit},
     Aes256GcmSiv,
 };
 use async_trait::async_trait;
@@ -140,13 +140,13 @@ impl KeyHandle {
             .map_err(|_| CryptoOperationError::EncryptionFailed)?;
         let derived_key = self.derive_aead_key(aad, CryptoOperationError::EncryptionFailed)?;
 
-        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(&derived_key[..]));
+        let cipher = Aes256GcmSiv::new((&*derived_key).into());
         let mut ciphertext = plaintext.to_vec();
         let tag = cipher
-            .encrypt_in_place_detached(
-                GenericArray::from_slice(&nonce),
+            .encrypt_inout_detached(
+                (&nonce).into(),
                 serialized_aad.as_slice(),
-                &mut ciphertext,
+                ciphertext.as_mut_slice().into(),
             )
             .map_err(|_| CryptoOperationError::EncryptionFailed)?;
         ciphertext.extend_from_slice(tag.as_slice());
@@ -182,17 +182,19 @@ impl KeyHandle {
 
         let derived_key =
             self.derive_aead_key(expected_aad, CryptoOperationError::DecryptionFailed)?;
-        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(&derived_key[..]));
+        let cipher = Aes256GcmSiv::new((&*derived_key).into());
         let split = ciphertext_and_tag.len() - AEAD_TAG_LEN;
         let mut plaintext = ciphertext_and_tag[..split].to_vec();
-        let tag = GenericArray::clone_from_slice(&ciphertext_and_tag[split..]);
+        let tag = ciphertext_and_tag[split..]
+            .try_into()
+            .map_err(|_| CryptoOperationError::DecryptionFailed)?;
 
         cipher
-            .decrypt_in_place_detached(
-                GenericArray::from_slice(&nonce),
+            .decrypt_inout_detached(
+                (&nonce).into(),
                 expected_serialized.as_slice(),
-                &mut plaintext,
-                &tag,
+                plaintext.as_mut_slice().into(),
+                tag,
             )
             .map_err(|_| CryptoOperationError::DecryptionFailed)?;
 

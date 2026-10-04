@@ -369,7 +369,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             } else {
                                 quote! { &mut self.#field_ident }
                             };
-                            let parse_elem = match &child.type_ref {
+                            // Match the element type emitted by `types`: a
+                            // leafref carries its target's scalar type, not
+                            // necessarily a string.
+                            let mut element_type = child.type_ref.as_ref();
+                            if let Some(TypeRef::LeafRef { target_path }) = element_type {
+                                if let Some(target) = nodes_by_path.get(target_path) {
+                                    element_type = target.type_ref.as_ref();
+                                }
+                            }
+                            let parse_elem = match element_type {
                                 Some(TypeRef::Boolean) => quote! {
                                     let parsed_elem = match v {
                                         "true" => true,

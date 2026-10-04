@@ -91,6 +91,7 @@ impl DurableConsensusTimingProfile {
     pub const fn rpc_timeout(self, family: ConsensusRpcFamily) -> Duration {
         Duration::from_millis(match family {
             ConsensusRpcFamily::Vote => self.vote_timeout_millis,
+            ConsensusRpcFamily::LeadershipTransfer => self.vote_timeout_millis,
             ConsensusRpcFamily::AppendEntries => self.append_entries_timeout_millis,
             ConsensusRpcFamily::AppendEntriesRoster => self.append_entries_timeout_millis,
             ConsensusRpcFamily::InstallSnapshot => self.install_snapshot_timeout_millis,
@@ -340,6 +341,10 @@ mod tests {
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::Vote),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            profile.rpc_timeout(ConsensusRpcFamily::LeadershipTransfer),
             Duration::from_millis(5_000)
         );
         for family in [

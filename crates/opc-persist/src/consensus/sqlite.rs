@@ -63,6 +63,16 @@ CREATE TABLE config_raft_identity (
     audit_key_fingerprint BLOB NOT NULL CHECK (length(audit_key_fingerprint) = 32),
     schema_manifest_digest BLOB NOT NULL CHECK (length(schema_manifest_digest) = 32)
 );
+CREATE TABLE config_raft_management_audit (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state_json BLOB NOT NULL CHECK (length(state_json) BETWEEN 1 AND 16777216),
+    state_hmac BLOB NOT NULL CHECK (length(state_hmac) = 32)
+);
+CREATE TABLE config_raft_history_retention (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state_json BLOB NOT NULL CHECK (length(state_json) BETWEEN 1 AND 4096),
+    state_hmac BLOB NOT NULL CHECK (length(state_hmac) = 32)
+);
 CREATE TABLE config_raft_vote (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
@@ -257,6 +267,8 @@ const AUTHORITY_TABLES: &[&str] = &[
 
 const RAFT_TABLES: &[&str] = &[
     "config_raft_identity",
+    "config_raft_management_audit",
+    "config_raft_history_retention",
     "config_raft_vote",
     "config_raft_committed",
     "config_raft_purged",
@@ -279,12 +291,13 @@ const LEGACY_RAFT_TABLES: &[&str] = &[
 
 #[derive(Clone)]
 pub(crate) struct ConfigConsensusCore {
-    pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    pub(crate) conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     pub(crate) identity: ConsensusIdentity,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) audit_key: Arc<AuditKey>,
+    pub(crate) management_audit_keys: Option<Arc<crate::audit_authority::continuity::AuditKeyRing>>,
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
     pub(crate) snapshot_binding_path: Arc<PathBuf>,
     pub(crate) durable_progress: Arc<super::storage::ConfigDurableProgress>,
@@ -376,23 +389,49 @@ impl ConfigConsensusCore {
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
+        let worker_backend = backend.clone();
+        let retained = backend.retained_binding.is_some();
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let progress_cancellation = worker_cancellation.clone();
-            worker_conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
-            let result = initialize_schema(
-                &worker_conn,
-                identity,
-                &worker_members,
-                &worker_audit_key,
-                recovery.as_ref(),
-                &worker_cancellation,
-                before_commit,
-            );
-            worker_conn.progress_handler(0, None::<fn() -> bool>);
+            worker_conn
+                .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+                .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+            let result = if retained {
+                if recovery.is_some() {
+                    Err(ConfigConsensusStorageError::RecoveryRequired)
+                } else {
+                    validate_existing_schema(
+                        &worker_conn,
+                        identity,
+                        &worker_members,
+                        &worker_audit_key,
+                        false,
+                        &worker_cancellation,
+                    )
+                }
+            } else {
+                initialize_schema(
+                    &worker_conn,
+                    identity,
+                    &worker_members,
+                    &worker_audit_key,
+                    recovery.as_ref(),
+                    &worker_cancellation,
+                    before_commit,
+                )
+            };
+            if result.is_ok() {
+                // Latch before releasing the shared connection, including when
+                // the awaiting future is cancelled after the durable claim.
+                worker_backend.require_config_consensus_history();
+            }
+            worker_conn
+                .progress_handler(0, None::<fn() -> bool>)
+                .expect("installed SQLite hook belongs to an owned connection");
             result
         });
         let initialization = match tokio::time::timeout_at(deadline, &mut worker).await {
@@ -425,6 +464,7 @@ impl ConfigConsensusCore {
             snapshot_dir: Arc::new(snapshot_dir),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             audit_key: Arc::new(backend.audit_key().clone()),
+            management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,
             snapshot_binding_path: Arc::new(snapshot_binding_path),
             durable_progress,
@@ -536,7 +576,7 @@ where
 
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
-    conn: Arc<tokio::sync::Mutex<Connection>>,
+    conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>
@@ -563,17 +603,21 @@ where
         let commit_cancellation = worker_cancellation.clone();
         conn.commit_hook(Some(move || {
             commit_cancellation.authorize_commit().is_err()
-        }));
+        }))
+        .map_err(db_error)?;
         let progress_cancellation = worker_cancellation.clone();
         conn.progress_handler(
             1_000,
             Some(move || {
                 progress_cancellation.is_cancelled() || std::time::Instant::now() >= std_deadline
             }),
-        );
+        )
+        .map_err(db_error)?;
         let result = operation(&conn, &worker_cancellation);
-        conn.commit_hook(None::<fn() -> bool>);
-        conn.progress_handler(0, None::<fn() -> bool>);
+        conn.commit_hook(None::<fn() -> bool>)
+            .expect("installed SQLite hook belongs to an owned connection");
+        conn.progress_handler(0, None::<fn() -> bool>)
+            .expect("installed SQLite hook belongs to an owned connection");
         result
     });
     let result = match tokio::time::timeout_at(deadline, &mut worker).await {
@@ -605,6 +649,41 @@ where
     };
     cancel_on_drop.disarm();
     result
+}
+
+/// Provision consensus schema without starting an engine, listener or voter.
+pub(crate) fn provision_retained_schema(
+    conn: &Connection,
+    topology: &super::ConfigConsensusTopology,
+    audit_key: &AuditKey,
+    deadline: std::time::Instant,
+) -> Result<(), ConfigConsensusStorageError> {
+    initialize_schema(
+        conn,
+        topology.identity(),
+        topology.members(),
+        audit_key,
+        None,
+        &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
+        None,
+    )
+}
+
+/// Read existing schema and authenticated history without any initialization.
+pub(crate) fn validate_retained_schema(
+    conn: &Connection,
+    topology: &super::ConfigConsensusTopology,
+    audit_key: &AuditKey,
+    deadline: std::time::Instant,
+) -> Result<(), ConfigConsensusStorageError> {
+    validate_existing_schema(
+        conn,
+        topology.identity(),
+        topology.members(),
+        audit_key,
+        false,
+        &SqliteWorkCancellation::with_deadline(deadline),
+    )
 }
 
 fn initialize_schema(
@@ -687,6 +766,10 @@ fn initialize_schema_transaction(
             ],
         )
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        super::audit::initialize_sync(&tx, audit_key, identity)
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        super::history::initialize_sync(&tx, identity, audit_key, cancellation)
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if let Some(recovery) = recovery {
             tx.execute(
                 "INSERT INTO config_raft_legacy_recovery (singleton, approved_sha256, authoritative_tx_id, authoritative_version, disposition, completed) VALUES (1, ?1, ?2, ?3, 1, 1)",
@@ -794,7 +877,8 @@ fn validate_legacy_recovery_snapshot(
     )
     .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let progress_cancellation = cancellation.clone();
-    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
@@ -1091,18 +1175,17 @@ fn validate_existing_schema(
         .map_err(|_| ConfigConsensusStorageError::CorruptState)
 }
 
+const CONFIG_SCHEMA_OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
+    WHERE type IN ('table', 'index', 'trigger', 'view') \
+    AND (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
+    AND name NOT GLOB 'sqlite_autoindex_*'";
+
 fn config_schema_manifest(
     conn: &Connection,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Vec<(String, String, String, String)>> {
     let mut statement = conn
-        .prepare(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master \
-             WHERE type IN ('table', 'index', 'trigger', 'view') \
-               AND (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
-               AND name NOT GLOB 'sqlite_autoindex_*' \
-             ORDER BY type, name",
-        )
+        .prepare(&format!("{CONFIG_SCHEMA_OBJECTS} ORDER BY type, name"))
         .map_err(db_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -1132,22 +1215,64 @@ fn config_schema_manifest_digest(
         .execute_batch(CONFIG_RAFT_SCHEMA)
         .map_err(db_error)?;
     let expected_manifest = config_schema_manifest(&expected, cancellation)?;
-    let live_manifest = config_schema_manifest(conn, cancellation)?;
-    if live_manifest != expected_manifest {
+    let live_count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM ({CONFIG_SCHEMA_OBJECTS})"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if usize::try_from(live_count).ok() != Some(expected_manifest.len()) {
         return Err(invalid_data(
             "config consensus owned schema manifest does not match",
         ));
     }
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"openpacketcore/config-consensus/storage-manifest/v1\0");
-    for (kind, name, table, sql) in live_manifest {
+    for (kind, name, table, sql) in expected_manifest {
         cancellation.check_io()?;
+        // Compare supplied DDL inside SQLite; only bounded SDK-authored DDL
+        // enters Rust memory. Equal manifests retain the original digest.
+        let matches: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = ?1 AND name = ?2 AND tbl_name = ?3 AND sql = ?4)",
+            params![kind, name, table, sql],
+            |row| row.get(0),
+        ).map_err(db_error)?;
+        if !matches {
+            return Err(invalid_data(
+                "config consensus owned schema manifest does not match",
+            ));
+        }
         for value in [kind, name, table, sql] {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value.as_bytes());
         }
     }
     Ok(hasher.finalize().into())
+}
+
+/// Validate the executable schema in the same transaction as history use.
+/// Authenticating rows alone cannot authorize a changed trigger or constraint
+/// to alter unrelated records during an otherwise legitimate lifecycle update.
+pub(super) fn validate_live_history_schema_sync(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    cancellation.check_io()?;
+    // No SDK operation needs a trigger or a temporary object. Check all main
+    // triggers, including objects on the separately owned admission table;
+    // temporary objects could otherwise shadow an authenticated main table.
+    let unexpected: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger') OR EXISTS(SELECT 1 FROM sqlite_temp_schema)",
+        [], |row| row.get(0),
+    ).map_err(db_error)?;
+    if unexpected {
+        return Err(invalid_data("config history schema is not admitted"));
+    }
+    crate::schema::validate_retained_base_schema(conn)
+        .map_err(|_| invalid_data("config history base schema does not match"))?;
+    config_schema_manifest_digest(conn, cancellation)?;
+    cancellation.check_io()
 }
 
 pub(crate) fn checked_i64(value: u64) -> io::Result<i64> {
@@ -2073,7 +2198,16 @@ pub(crate) fn purge_logs_sync(
             return Err(invalid_data("config consensus purged pointer regressed"));
         }
     }
-    validate_pointer_against_log_sync(&tx, identity, log_id)?;
+    match read_log_id_at_sync(&tx, identity, log_id.index)? {
+        Some(stored) if stored == *log_id => {}
+        None if read_snapshot_log_id_unchecked_sync(&tx, identity)? == Some(*log_id)
+            || read_purged_sync(&tx, identity)? == Some(*log_id) => {}
+        _ => {
+            return Err(invalid_data(
+                "config consensus purge lacks exact durable lineage",
+            ))
+        }
+    }
     tx.execute(
         "DELETE FROM config_raft_log WHERE log_index <= ?1",
         [checked_i64(log_id.index)?],
@@ -2549,6 +2683,12 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
+        ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
+            invalid_data("audit command requires its authority dispatcher"),
+        ),
+        ConfigMutationIntent::RetainHistory(_) => {
+            Err(invalid_data("retention requires authenticated writer"))
+        }
         ConfigMutationIntent::AppendCommit(commit) => append_prepared_commit_sync(
             conn,
             commit,
@@ -2585,9 +2725,121 @@ fn execute_intent_sync(
     }
 }
 
+/// The effect savepoint rolls back configuration failure only. Its audited
+/// rejection survives in the enclosing Raft transaction. An I/O failure still
+/// rolls back everything and never creates a caller-asserted commit receipt.
+#[allow(clippy::too_many_arguments)]
+fn apply_audited_mutation_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConsensusIdentity,
+    prepared: &super::PreparedAuditedMutation,
+    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    use crate::audit_authority::AuditOperationState;
+    let invalid = || invalid_data("invalid audited configuration mutation");
+    if prepared.verify_effect(key).is_err() {
+        return Ok(Err(ConfigMutationFailure::InvalidInput));
+    }
+    let Some(mut ledger) = super::audit::read_with_keys_sync(conn, key, audit_keys, identity)?
+    else {
+        return Ok(Err(ConfigMutationFailure::InvalidInput));
+    };
+    let receipt = match ledger.lookup(key, &prepared.handle, prepared.handle.body.binding.caller) {
+        Ok(Some(receipt)) => receipt,
+        _ => return Ok(Err(ConfigMutationFailure::InvalidInput)),
+    };
+    match receipt.state() {
+        AuditOperationState::Committed { .. } => return Ok(Ok(())),
+        AuditOperationState::Rejected | AuditOperationState::Observed { .. } => {
+            return Ok(Err(ConfigMutationFailure::Conflict))
+        }
+        AuditOperationState::Intent => {}
+    }
+    if let Some(chain) = &ledger.continuity {
+        let checkpointed = ledger.operations.iter().any(|operation| {
+            operation.handle == prepared.handle
+                && chain
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.sequence() >= operation.first_sequence)
+        });
+        if !checkpointed
+            || ledger
+                .operations
+                .iter()
+                .any(|op| ledger.mutation_outcome_needs_checkpoint(op))
+        {
+            // No configuration effect and no invented rejection: the exact
+            // admitted intent remains recoverable under its original owner.
+            return Ok(Err(ConfigMutationFailure::InvalidInput));
+        }
+    }
+    validate_sealed_state_sync(conn, key, cancellation)?;
+    let current_version: u64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version),0) FROM config_history",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    let now = logical_time.as_offset_datetime().unix_timestamp();
+    let live = prepared.handle.require_live(now).is_ok()
+        && current_version == prepared.handle.body.binding.base_version;
+    conn.execute_batch("SAVEPOINT audited_config_effect")
+        .map_err(db_error)?;
+    let updates = prepared.effect.updates_existing_records();
+    let mut result = if live {
+        execute_intent_sync(
+            conn,
+            &prepared.effect.intent(),
+            super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
+            logical_time,
+            request_id,
+            cancellation,
+        )?
+    } else {
+        Err(ConfigMutationFailure::Conflict)
+    };
+    if result.is_ok() {
+        result = super::history::refresh_sync(conn, key, updates, cancellation)?;
+    }
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK TO audited_config_effect")
+            .map_err(db_error)?;
+    }
+    conn.execute_batch("RELEASE audited_config_effect")
+        .map_err(db_error)?;
+    let state = if result.is_ok() {
+        let version: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM config_history",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        AuditOperationState::Committed { version }
+    } else {
+        AuditOperationState::Rejected
+    };
+    ledger
+        .resolve(key, &prepared.handle, state)
+        .map_err(|_| invalid())?;
+    ledger.seal_continuity(audit_keys).map_err(|_| invalid())?;
+    ledger
+        .validate_continuity(audit_keys)
+        .map_err(|_| invalid())?;
+    super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 pub(crate) fn apply_entries_sync(
     conn: &Connection,
+    audit_key: &AuditKey,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: Vec<Entry<ConfigRaftTypeConfig>>,
@@ -2598,15 +2850,20 @@ pub(crate) fn apply_entries_sync(
         expected_members,
         entries,
         &SqliteWorkCancellation::new(),
+        audit_key,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_entries_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: Vec<Entry<ConfigRaftTypeConfig>>,
     cancellation: &SqliteWorkCancellation,
+    audit_key: &AuditKey,
+    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
@@ -2633,6 +2890,7 @@ pub(crate) fn apply_entries_cancellable_sync(
             .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
     let tx = conn.unchecked_transaction().map_err(db_error)?;
+    super::history::validate_access_sync(&tx, audit_key, true, cancellation)?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
@@ -2657,6 +2915,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                 digest: None,
                 logical_time: None,
                 raft_log_index: entry.log_id.index,
+                audit_receipt: None,
             },
             EntryPayload::Membership(membership) => {
                 let stored = StoredMembership::new(Some(entry.log_id), membership);
@@ -2667,6 +2926,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                     digest: None,
                     logical_time: None,
                     raft_log_index: entry.log_id.index,
+                    audit_receipt: None,
                 }
             }
             EntryPayload::Normal(command) => {
@@ -2686,6 +2946,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                             digest: (machine.0 != 0).then_some(machine.1),
                             logical_time: machine.2,
                             raft_log_index: entry.log_id.index,
+                            audit_receipt: None,
                         }
                     } else {
                         stored_response
@@ -2701,13 +2962,98 @@ pub(crate) fn apply_entries_cancellable_sync(
                     let digest = command
                         .calculate_applied_digest(sequence, machine.1, logical_time)
                         .map_err(|_| invalid_data("config consensus applied digest failed"))?;
-                    let result = execute_intent_sync(
+                    tx.execute_batch("SAVEPOINT config_history_command")
+                        .map_err(db_error)?;
+                    let updates_existing_records = match &command.intent {
+                        ConfigMutationIntent::AppendCommit(_)
+                        | ConfigMutationIntent::RetainHistory(_)
+                        | ConfigMutationIntent::ManagementAudit(_)
+                        | ConfigMutationIntent::AuditedMutation(_) => false,
+                        ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
+                        | ConfigMutationIntent::ClearRecoveryRequired { .. }
+                        | ConfigMutationIntent::MarkConfirmed { .. }
+                        | ConfigMutationIntent::CreateRollbackPoint { .. } => true,
+                    };
+                    if updates_existing_records {
+                        super::history::validate_record_chain_sync(&tx, audit_key, cancellation)?;
+                    }
+                    let mut result = match &command.intent {
+                        ConfigMutationIntent::AuditedMutation(prepared) => {
+                            apply_audited_mutation_sync(
+                                &tx,
+                                audit_key,
+                                identity,
+                                prepared,
+                                audit_keys,
+                                logical_time,
+                                command.request_id,
+                                cancellation,
+                            )?
+                        }
+                        ConfigMutationIntent::ManagementAudit(audit) => super::audit::apply_sync(
+                            &tx,
+                            audit_key,
+                            identity,
+                            audit,
+                            logical_time.as_offset_datetime().unix_timestamp(),
+                            audit_keys,
+                        )?,
+                        ConfigMutationIntent::RetainHistory(retention) => {
+                            validate_sealed_state_sync(&tx, audit_key, cancellation)?;
+                            super::history::retain_sync(&tx, audit_key, retention, cancellation)?
+                        }
+                        _ => {
+                            let requires_audit = matches!(
+                                command.intent,
+                                ConfigMutationIntent::AppendCommit(_)
+                                    | ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
+                                    | ConfigMutationIntent::MarkConfirmed { .. }
+                                    | ConfigMutationIntent::CreateRollbackPoint { .. }
+                            );
+                            if requires_audit
+                                && (audit_keys.is_some()
+                                    || super::audit::read_sync(&tx, audit_key, identity)?.is_some())
+                            {
+                                Err(ConfigMutationFailure::InvalidInput)
+                            } else {
+                                execute_intent_sync(
+                                    &tx,
+                                    &command.intent,
+                                    command.schema_version,
+                                    logical_time,
+                                    command.request_id,
+                                    cancellation,
+                                )?
+                            }
+                        }
+                    };
+                    if result.is_ok()
+                        && !matches!(
+                            command.intent,
+                            ConfigMutationIntent::ManagementAudit(_)
+                                | ConfigMutationIntent::AuditedMutation(_)
+                        )
+                    {
+                        result = super::history::refresh_sync(
+                            &tx,
+                            audit_key,
+                            updates_existing_records,
+                            cancellation,
+                        )?;
+                    }
+                    if result.is_err()
+                        && !matches!(command.intent, ConfigMutationIntent::AuditedMutation(_))
+                    {
+                        tx.execute_batch("ROLLBACK TO config_history_command")
+                            .map_err(db_error)?;
+                    }
+                    tx.execute_batch("RELEASE config_history_command")
+                        .map_err(db_error)?;
+                    let audit_receipt = super::audit::applied_receipt_sync(
                         &tx,
+                        audit_key,
+                        identity,
                         &command.intent,
-                        command.schema_version,
-                        logical_time,
-                        command.request_id,
-                        cancellation,
                     )?;
                     let response = ConfigConsensusResponse {
                         result,
@@ -2715,6 +3061,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                         digest: Some(digest),
                         logical_time: Some(logical_time),
                         raft_log_index: entry.log_id.index,
+                        audit_receipt,
                     };
                     tx.execute(
                         "INSERT INTO config_raft_request_outcomes (request_id, configuration_epoch, applied_sequence, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2773,6 +3120,12 @@ fn validate_sealed_state_sync(
     audit_key: &AuditKey,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    if super::history::has_consensus_metadata_sync(conn)? {
+        validate_live_history_schema_sync(conn, cancellation)?;
+    }
+    super::audit::validate_sync(conn, audit_key)?;
+    super::history::validate_sync(conn, audit_key)?;
+    super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
     let mut statement = conn
         .prepare(
@@ -2809,6 +3162,8 @@ fn validate_sealed_state_sync(
             audit_count,
             terminal_hash,
         ) = row.map_err(db_error)?;
+        let parent_tx_id =
+            super::history::original_parent_sync(conn, audit_key, &tx_id, version, parent_tx_id)?;
         if tx_id.len() != 16
             || parent_tx_id
                 .as_ref()
@@ -3079,7 +3434,9 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     validate_fixed_membership(&membership, expected_members)?;
     let mut destination = Connection::open(path).map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
-    destination.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+    destination
+        .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(db_error)?;
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
         loop {
@@ -3103,6 +3460,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
             DELETE FROM config_raft_purged;
             DELETE FROM config_raft_log;
             DELETE FROM config_raft_snapshot;
+            DROP TABLE IF EXISTS consensus_retained_binding;
             PRAGMA journal_mode = DELETE;
             VACUUM;
             "#,
@@ -3126,6 +3484,18 @@ fn validate_snapshot_has_no_log_authority(
     conn: &Connection,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    let local_binding: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'consensus_retained_binding')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if local_binding {
+        return Err(invalid_data(
+            "config snapshot contains local storage authority",
+        ));
+    }
     for table in [
         "config_raft_vote",
         "config_raft_committed",
@@ -3153,7 +3523,7 @@ fn validate_snapshot_database_sync(
     audit_key: &AuditKey,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
     cancellation: &Arc<SqliteWorkCancellation>,
-) -> io::Result<()> {
+) -> io::Result<Connection> {
     cancellation.check_io()?;
     validate_fixed_membership(&meta.last_membership, expected_members)?;
     let conn = Connection::open_with_flags(
@@ -3162,7 +3532,12 @@ fn validate_snapshot_database_sync(
     )
     .map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
-    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(db_error)?;
+    // Keep the same read transaction from validation through copying. The
+    // retained destination's pinned VFS intentionally rejects ATTACH paths
+    // outside its own namespace; it must not be widened for snapshot import.
+    conn.execute_batch("BEGIN").map_err(db_error)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(db_error)?;
@@ -3188,7 +3563,7 @@ fn validate_snapshot_database_sync(
     {
         return Err(invalid_data("config consensus snapshot metadata mismatch"));
     }
-    Ok(())
+    Ok(conn)
 }
 
 fn valid_snapshot_file_name(file_name: &str) -> bool {
@@ -3240,7 +3615,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     byte_length: u64,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<()> {
-    validate_snapshot_database_sync(
+    let source = validate_snapshot_database_sync(
         snapshot_db_path,
         identity,
         expected_members,
@@ -3251,9 +3626,6 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     if !valid_snapshot_file_name(final_file_name) {
         return Err(invalid_data("invalid config consensus snapshot file name"));
     }
-    let snapshot_path = snapshot_db_path
-        .to_str()
-        .ok_or_else(|| invalid_data("config consensus snapshot path is not UTF-8"))?;
     cancellation.check_io()?;
     let stale_incoming: bool = conn
         .query_row(
@@ -3270,96 +3642,123 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         conn.execute("DETACH DATABASE config_raft_incoming", [])
             .map_err(db_error)?;
     }
-    conn.execute(
-        "ATTACH DATABASE ?1 AS config_raft_incoming",
-        [snapshot_path],
+    cancellation.check_io()?;
+    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    // Validate the destination before replacing authority. Source authentication
+    // cannot prevent a destination trigger or temporary table from changing the
+    // imported state. Repair may replace damaged rows, so check only schema here.
+    validate_live_history_schema_sync(&tx, cancellation)?;
+    for table in [
+        "config_lifecycle_audit",
+        "rollback_labels",
+        "audit_trail",
+        "config_history",
+        "config_raft_request_outcomes",
+        "config_raft_management_audit",
+        "config_raft_history_retention",
+        "config_raft_machine",
+        "config_raft_membership",
+        "config_raft_applied",
+    ] {
+        cancellation.check_io()?;
+        tx.execute(&format!("DELETE FROM {table}"), [])
+            .map_err(db_error)?;
+    }
+    for (table, columns) in [
+        (
+            "config_history",
+            "tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at, audit_count, audit_terminal_hash",
+        ),
+        (
+            "audit_trail",
+            "id, tx_id, sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac",
+        ),
+        ("rollback_labels", "label, tx_id, created_at"),
+        (
+            "config_lifecycle_audit",
+            "id, tx_id, action, principal, occurred_at, details",
+        ),
+        (
+            "config_raft_management_audit",
+            "singleton, state_json, state_hmac",
+        ),
+        (
+            "config_raft_history_retention",
+            "singleton, state_json, state_hmac",
+        ),
+        (
+            "config_raft_request_outcomes",
+            "request_id, configuration_epoch, applied_sequence, payload_digest, response_json",
+        ),
+        (
+            "config_raft_machine",
+            "singleton, configuration_epoch, application_sequence, last_digest, logical_time",
+        ),
+        (
+            "config_raft_membership",
+            "singleton, configuration_epoch, membership_json",
+        ),
+        (
+            "config_raft_applied",
+            "singleton, configuration_epoch, term, log_index, log_id_json",
+        ),
+    ] {
+        cancellation.check_io()?;
+        copy_snapshot_table(&source, &tx, table, columns, cancellation)?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO config_raft_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            epoch_i64(identity)?,
+            encode_json(meta)?,
+            final_file_name,
+            checksum.as_slice(),
+            checked_positive_i64(byte_length)?,
+        ],
     )
     .map_err(db_error)?;
-    let result = (|| {
-        cancellation.check_io()?;
-        let tx = conn.unchecked_transaction().map_err(db_error)?;
-        for table in [
-            "config_lifecycle_audit",
-            "rollback_labels",
-            "audit_trail",
-            "config_history",
-            "config_raft_request_outcomes",
-            "config_raft_machine",
-            "config_raft_membership",
-            "config_raft_applied",
-        ] {
-            cancellation.check_io()?;
-            tx.execute(&format!("DELETE FROM {table}"), [])
-                .map_err(db_error)?;
-        }
-        for (table, columns) in [
-            (
-                "config_history",
-                "tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at, audit_count, audit_terminal_hash",
-            ),
-            (
-                "audit_trail",
-                "id, tx_id, sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac",
-            ),
-            ("rollback_labels", "label, tx_id, created_at"),
-            (
-                "config_lifecycle_audit",
-                "id, tx_id, action, principal, occurred_at, details",
-            ),
-            (
-                "config_raft_request_outcomes",
-                "request_id, configuration_epoch, applied_sequence, payload_digest, response_json",
-            ),
-            (
-                "config_raft_machine",
-                "singleton, configuration_epoch, application_sequence, last_digest, logical_time",
-            ),
-            (
-                "config_raft_membership",
-                "singleton, configuration_epoch, membership_json",
-            ),
-            (
-                "config_raft_applied",
-                "singleton, configuration_epoch, term, log_index, log_id_json",
-            ),
-        ] {
-            cancellation.check_io()?;
-            tx.execute(
-                &format!("INSERT INTO {table} ({columns}) SELECT {columns} FROM config_raft_incoming.{table}"),
-                [],
-            )
-            .map_err(db_error)?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO config_raft_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
-            params![
-                epoch_i64(identity)?,
-                encode_json(meta)?,
-                final_file_name,
-                checksum.as_slice(),
-                checked_positive_i64(byte_length)?,
-            ],
-        )
+    cancellation.check_io()?;
+    tx.commit().map_err(db_error)
+}
+
+fn copy_snapshot_table(
+    source: &Connection,
+    destination: &Connection,
+    table: &str,
+    columns: &str,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    // Only the closed table/column list above reaches this helper. Copy one
+    // bounded row at a time; no complete snapshot is buffered in memory.
+    let order = if table == "config_history" {
+        " ORDER BY version ASC"
+    } else {
+        ""
+    };
+    let mut select = source
+        .prepare(&format!("SELECT {columns} FROM {table}{order}"))
         .map_err(db_error)?;
+    let width = select.column_count();
+    let parameters = std::iter::repeat_n("?", width)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut insert = destination
+        .prepare(&format!(
+            "INSERT INTO {table} ({columns}) VALUES ({parameters})"
+        ))
+        .map_err(db_error)?;
+    let mut rows = select.query([]).map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
         cancellation.check_io()?;
-        tx.commit().map_err(db_error)
-    })();
-    let detach = conn
-        .execute("DETACH DATABASE config_raft_incoming", [])
-        .map_err(db_error);
-    match result {
-        Ok(()) => {
-            // The state-machine transaction is authority. A post-commit
-            // DETACH failure must not turn that durable success into an error
-            // that makes the caller delete the now-referenced envelope.
-            let _ = detach;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = detach;
-            Err(error)
-        }
+        let values = (0..width)
+            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        insert
+            .execute(rusqlite::params_from_iter(values.iter()))
+            .map_err(db_error)?;
     }
+    Ok(())
 }
 
 pub(crate) fn save_current_snapshot_sync(
@@ -3793,8 +4192,14 @@ mod tests {
         let persisted = read_log_range_sync(&conn, identity(), &expected_members(), 0, None, None)
             .expect("read persisted legacy log");
         assert_eq!(persisted, entries);
-        let responses = apply_entries_sync(&conn, identity(), &expected_members(), persisted)
-            .expect("replay legacy log");
+        let responses = apply_entries_sync(
+            &conn,
+            reopened.audit_key(),
+            identity(),
+            &expected_members(),
+            persisted,
+        )
+        .expect("replay legacy log");
         assert!(responses.iter().all(|response| response.result.is_ok()));
 
         let latest: (Vec<u8>, i64) = conn
@@ -3842,8 +4247,14 @@ mod tests {
             ),
         ];
 
-        let responses = apply_entries_sync(&conn, identity(), &expected_members(), entries)
-            .expect("apply revision-one confirmation history");
+        let responses = apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            entries,
+        )
+        .expect("apply revision-one confirmation history");
         assert!(responses.iter().all(|response| response.result.is_ok()));
         let confirmed_at: Option<String> = conn
             .query_row(
@@ -3910,8 +4321,14 @@ mod tests {
             ),
         ];
 
-        let responses = apply_entries_sync(&conn, identity(), &expected_members(), entries)
-            .expect("apply digest collision and successor");
+        let responses = apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            entries,
+        )
+        .expect("apply digest collision and successor");
         assert_eq!(Ok(()), responses[1].result);
         assert_eq!(Err(ConfigMutationFailure::Conflict), responses[2].result);
         assert_eq!(Ok(()), responses[3].result);
@@ -3947,8 +4364,14 @@ mod tests {
             ),
         ];
 
-        let responses = apply_entries_sync(&conn, identity(), &expected_members(), entries)
-            .expect("apply named rollback point");
+        let responses = apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            entries,
+        )
+        .expect("apply named rollback point");
         assert_eq!(Ok(()), responses[1].result);
         let stored: (i64, Option<String>) = conn
             .query_row(
@@ -4143,6 +4566,7 @@ mod tests {
 
         let responses = apply_entries_sync(
             &conn,
+            backend.audit_key(),
             identity(),
             &expected_members(),
             vec![membership, legacy, replay],
@@ -4302,6 +4726,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_snapshot_excludes_sender_binding_and_preserves_receiver_binding() {
+        use crate::{RetainedConfigBinding, RetainedConfigDurability, RetainedConfigOptions};
+
+        let directory = tempfile::tempdir().expect("storage");
+        let topology = super::super::ConfigConsensusTopology::try_new(
+            identity(),
+            node_id(),
+            expected_members(),
+        )
+        .expect("topology");
+        let options = |name: &str, backing| {
+            RetainedConfigOptions::new(
+                directory.path().join(name),
+                RetainedConfigBinding::new(topology.clone(), [backing; 32], [0x42; 32])
+                    .expect("binding"),
+                RetainedConfigDurability::Ephemeral,
+                16 * 1024 * 1024,
+                Duration::from_secs(30),
+            )
+            .expect("options")
+        };
+        let key = || AuditKey::new([0x71; 32]).expect("key");
+        let source = SqliteBackend::provision_config_authority(options("source.sqlite", 1), key())
+            .await
+            .expect("source provision");
+        let target =
+            SqliteBackend::provision_config_member_repair(options("target.sqlite", 2), key())
+                .await
+                .expect("receiver repair provision");
+        let source_conn = source.conn();
+        let source_conn = source_conn.lock().await;
+        let target_conn = target.conn();
+        let target_conn = target_conn.lock().await;
+        let binding = |conn: &Connection| -> Vec<u8> {
+            conn.query_row(
+                "SELECT record FROM consensus_retained_binding WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("local admission binding")
+        };
+        let sender_binding = binding(&source_conn);
+        let receiver_binding = binding(&target_conn);
+        assert_ne!(sender_binding, receiver_binding);
+        apply_entries_sync(
+            &source_conn,
+            source.audit_key(),
+            identity(),
+            &expected_members(),
+            vec![membership_entry()],
+        )
+        .expect("source membership");
+        let snapshot_path = directory.path().join("snapshot.sqlite");
+        let (last_log_id, last_membership) = build_snapshot_database_sync(
+            &source_conn,
+            identity(),
+            &expected_members(),
+            source.audit_key(),
+            &snapshot_path,
+        )
+        .expect("snapshot database before envelope sealing");
+        let incoming = Connection::open(&snapshot_path).expect("inspect snapshot");
+        let contains_binding: bool = incoming.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'consensus_retained_binding')",
+            [], |row| row.get(0),
+        ).expect("snapshot schema");
+        assert!(
+            !contains_binding,
+            "a snapshot must not carry sender-local admission authority"
+        );
+        drop(incoming);
+        let meta = SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "retained-binding".to_owned(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &expected_members(),
+            target.audit_key(),
+            &snapshot_path,
+            &meta,
+            "snapshot-retained.opc",
+            [0x81; 32],
+            1,
+        )
+        .expect("install replicated state into admitted receiver");
+        assert_eq!(
+            Some(log_id(0)),
+            read_applied_sync(&target_conn, identity()).expect("applied membership")
+        );
+        assert_eq!(
+            receiver_binding,
+            binding(&target_conn),
+            "install must preserve receiver-local authority"
+        );
+
+        // A peer-controlled snapshot containing even a syntactically valid
+        // local binding is rejected before changing the receiver's state.
+        let incoming = Connection::open(&snapshot_path).expect("tamper snapshot fixture");
+        incoming.execute_batch("CREATE TABLE consensus_retained_binding (singleton INTEGER PRIMARY KEY, record BLOB NOT NULL)")
+            .expect("inject sender binding table");
+        incoming
+            .execute(
+                "INSERT INTO consensus_retained_binding VALUES (1, ?1)",
+                [sender_binding],
+            )
+            .expect("inject sender binding");
+        drop(incoming);
+        target_conn
+            .execute(
+                "UPDATE config_raft_machine SET application_sequence = 73 WHERE singleton = 1",
+                [],
+            )
+            .expect("target rejection sentinel");
+        assert!(install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &expected_members(),
+            target.audit_key(),
+            &snapshot_path,
+            &meta,
+            "snapshot-rejected.opc",
+            [0x82; 32],
+            1,
+        )
+        .is_err());
+        let sequence: i64 = target_conn
+            .query_row(
+                "SELECT application_sequence FROM config_raft_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sentinel after rejection");
+        assert_eq!(73, sequence);
+        assert_eq!(receiver_binding, binding(&target_conn));
+    }
+
+    #[tokio::test]
     async fn invalid_snapshot_history_is_rejected_before_target_mutation() {
         let temp = tempfile::tempdir().expect("snapshot directory");
         let source = initialized_backend().await;
@@ -4310,6 +4874,7 @@ mod tests {
         let membership = membership_entry();
         apply_entries_sync(
             &source_conn,
+            source.audit_key(),
             identity(),
             &expected_members(),
             vec![membership.clone()],
@@ -4391,6 +4956,7 @@ mod tests {
         save_committed_sync(&conn, identity(), Some(applied.log_id)).expect("committed floor");
         apply_entries_sync(
             &conn,
+            backend.audit_key(),
             identity(),
             &expected_members(),
             vec![membership, applied.clone()],
@@ -4454,6 +5020,7 @@ mod tests {
         save_committed_sync(&conn, identity(), Some(committed.log_id)).expect("committed floor");
         apply_entries_sync(
             &conn,
+            backend.audit_key(),
             identity(),
             &expected_members(),
             vec![membership, committed.clone()],
@@ -4596,6 +5163,21 @@ mod tests {
 
     #[tokio::test]
     async fn committed_but_unapplied_entry_replays_after_atomic_apply_faults() {
+        use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+        fn deny_insert(conn: &Connection, table: &'static str, reached: Arc<AtomicBool>) {
+            conn.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Insert { table_name } if table_name == table)
+                {
+                    reached.store(true, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            })).expect("SQLite test hook registration");
+        }
+
         let backend = initialized_backend().await;
         let shared_conn = backend.conn();
         let conn = shared_conn.lock().await;
@@ -4609,8 +5191,14 @@ mod tests {
         .expect("membership log");
         save_committed_sync(&conn, identity(), Some(membership.log_id))
             .expect("membership committed");
-        apply_entries_sync(&conn, identity(), &expected_members(), vec![membership])
-            .expect("membership applied");
+        apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            vec![membership],
+        )
+        .expect("membership applied");
 
         let tx_id = TxId::new();
         conn.execute(
@@ -4633,6 +5221,17 @@ mod tests {
             ],
         )
         .expect("seed target record");
+        // This existing raw lifecycle-fault fixture owns its synthetic seed.
+        // Admit that seed into the authenticated head before injecting the
+        // mid-command fault, so the detector still reaches the intended effect.
+        super::super::history::refresh_sync(
+            &conn,
+            backend.audit_key(),
+            false,
+            &SqliteWorkCancellation::new(),
+        )
+        .expect("authenticate lifecycle fixture")
+        .expect("unbounded fixture history");
         let entry = mark_confirmed_entry(1, [0xA1; 16], tx_id);
         append_logs_sync(
             &conn,
@@ -4644,22 +5243,45 @@ mod tests {
         save_committed_sync(&conn, identity(), Some(entry.log_id)).expect("normal committed");
         let baseline_machine = read_machine_sync(&conn, identity()).expect("baseline machine");
 
-        conn.execute_batch(
-            r#"
-            CREATE TRIGGER fail_config_lifecycle_apply
-            BEFORE INSERT ON config_lifecycle_audit
-            BEGIN
-                SELECT RAISE(ABORT, 'node-local-secret-canary');
-            END;
-            "#,
+        // Schema faults are now refused before apply. Inject the two intended
+        // I/O faults with the connection's test-only authorizer instead, and
+        // observe actual writes to prove both faults still occur mid-operation.
+        let writes = Arc::new(AtomicU8::new(0));
+        let observed_writes = Arc::clone(&writes);
+        conn.update_hook(Some(
+            move |_: Action, database: &str, table: &str, _: i64| {
+                if database == "main" {
+                    let bit = match table {
+                        "config_history" => 1,
+                        "config_raft_request_outcomes" => 2,
+                        "config_raft_machine" => 4,
+                        _ => 0,
+                    };
+                    observed_writes.fetch_or(bit, Ordering::SeqCst);
+                }
+            },
+        ))
+        .expect("SQLite test hook registration");
+        let fault_reached = Arc::new(AtomicBool::new(false));
+        deny_insert(&conn, "config_lifecycle_audit", Arc::clone(&fault_reached));
+        let error = apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            vec![entry.clone()],
         )
-        .expect("install mid-intent fault");
-        let error = apply_entries_sync(&conn, identity(), &expected_members(), vec![entry.clone()])
-            .expect_err("mid-intent SQLite fault must abort apply");
+        .expect_err("mid-intent SQLite fault must abort apply");
         assert_eq!(io::ErrorKind::Other, error.kind());
-        assert!(!error.to_string().contains("node-local-secret-canary"));
-        conn.execute("DROP TRIGGER fail_config_lifecycle_apply", [])
-            .expect("remove mid-intent fault");
+        assert!(!error.to_string().contains("config_lifecycle_audit"));
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("SQLite test hook registration");
+        assert!(fault_reached.load(Ordering::SeqCst));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "domain write preceded fault"
+        );
 
         for stage in ["mid-intent", "before-commit"] {
             assert_eq!(
@@ -4700,21 +5322,27 @@ mod tests {
             );
         }
 
-        conn.execute_batch(
-            r#"
-            CREATE TRIGGER fail_config_applied_pointer
-            BEFORE INSERT ON config_raft_applied
-            WHEN NEW.log_index = 1
-            BEGIN
-                SELECT RAISE(ABORT, 'after-outcome-before-commit');
-            END;
-            "#,
+        writes.store(0, Ordering::SeqCst);
+        fault_reached.store(false, Ordering::SeqCst);
+        deny_insert(&conn, "config_raft_applied", Arc::clone(&fault_reached));
+        apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            vec![entry.clone()],
         )
-        .expect("install pre-commit fault");
-        apply_entries_sync(&conn, identity(), &expected_members(), vec![entry.clone()])
-            .expect_err("fault after domain, outcome, and machine writes must abort apply");
-        conn.execute("DROP TRIGGER fail_config_applied_pointer", [])
-            .expect("remove pre-commit fault");
+        .expect_err("fault after domain, outcome, and machine writes must abort apply");
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("SQLite test hook registration");
+        conn.update_hook(None::<fn(Action, &str, &str, i64)>)
+            .expect("SQLite test hook registration");
+        assert!(fault_reached.load(Ordering::SeqCst));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            7,
+            "domain, outcome and machine writes preceded the pre-commit fault"
+        );
         assert_eq!(
             Some(log_id(0)),
             read_applied_sync(&conn, identity()).expect("applied after pre-commit fault")
@@ -4731,8 +5359,14 @@ mod tests {
         .expect("outcome after pre-commit fault")
         .is_none());
 
-        apply_entries_sync(&conn, identity(), &expected_members(), vec![entry.clone()])
-            .expect("committed entry replay");
+        apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            vec![entry.clone()],
+        )
+        .expect("committed entry replay");
         assert_eq!(
             Some(entry.log_id),
             read_applied_sync(&conn, identity()).expect("replayed applied pointer")
@@ -4764,8 +5398,14 @@ mod tests {
         .expect("membership log");
         save_committed_sync(&conn, identity(), Some(membership.log_id))
             .expect("membership committed");
-        apply_entries_sync(&conn, identity(), &expected_members(), vec![membership])
-            .expect("membership applied");
+        apply_entries_sync(
+            &conn,
+            backend.audit_key(),
+            identity(),
+            &expected_members(),
+            vec![membership],
+        )
+        .expect("membership applied");
 
         let missing_tx = TxId::new();
         let mut start = 1_u64;
@@ -4782,8 +5422,14 @@ mod tests {
                 .expect("bounded log append");
             save_committed_sync(&conn, identity(), entries.last().map(|entry| entry.log_id))
                 .expect("advance committed pointer");
-            apply_entries_sync(&conn, identity(), &expected_members(), entries)
-                .expect("bounded state-machine apply");
+            apply_entries_sync(
+                &conn,
+                backend.audit_key(),
+                identity(),
+                &expected_members(),
+                entries,
+            )
+            .expect("bounded state-machine apply");
             start = end;
         }
 

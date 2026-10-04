@@ -1,0 +1,44 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject"
+  },
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.truncated-header",
+  "subset": "n3-gtpu",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 29.281",
+    "release": "V18.4.0",
+    "clauses": [
+      "5.1"
+    ]
+  },
+  "direction": "either",
+  "role": "gtpu-endpoint",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Four-octet header only"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/truncated-header.hex",
+    "digest_sha256": "4d59f88920242e74f0488678811030c89a17e547e4a4304c5c0977fc4fdfc046"
+  },
+  "semantic_assertions": [
+    "truncated=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

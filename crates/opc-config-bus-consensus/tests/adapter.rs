@@ -196,6 +196,12 @@ struct ProjectionCluster {
 
 impl ProjectionCluster {
     async fn start() -> Self {
+        Self::start_with_continuity(None).await
+    }
+
+    async fn start_with_continuity(
+        checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("projection cluster directory");
         let nodes = [1_u64, 2, 3]
             .map(|value| ConfigConsensusNodeId::new(value).expect("projection cluster node ID"));
@@ -234,18 +240,37 @@ impl ProjectionCluster {
             )
             .await
             .expect("projection cluster backend");
-            stores.push(Arc::new(
-                ConsensusConfigStore::open_with_operation_timeout(
-                    ConfigConsensusTopology::try_new(identity, node, members.clone())
-                        .expect("projection cluster topology"),
+            let topology = ConfigConsensusTopology::try_new(identity, node, members.clone())
+                .expect("projection cluster topology");
+            let snapshots = directory.path().join(format!("snapshots-{index}"));
+            let store = if let Some(checkpoints) = &checkpoints {
+                use opc_persist::audit_authority::continuity::{
+                    AuditContinuityPolicy, AuditKeyRing, AuditSigningKey,
+                };
+                let keys = AuditKeyRing::new(vec![
+                    AuditSigningKey::new(1, [0x91; 32]).expect("separate signing key")
+                ])
+                .expect("key ring");
+                ConsensusConfigStore::open_with_audit_continuity(
+                    topology,
                     backend,
-                    directory.path().join(format!("snapshots-{index}")),
+                    snapshots,
+                    peers,
+                    AuditContinuityPolicy::new(keys, Arc::clone(checkpoints), 1, 1)
+                        .expect("continuity policy"),
+                )
+                .await
+            } else {
+                ConsensusConfigStore::open_with_operation_timeout(
+                    topology,
+                    backend,
+                    snapshots,
                     peers,
                     DURABLE_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("projection cluster store"),
-            ));
+            };
+            stores.push(Arc::new(store.expect("projection cluster store")));
         }
         for ((_, target), path) in &paths {
             path.install(stores[*target].rpc_handler()).await;
@@ -264,7 +289,23 @@ impl ProjectionCluster {
         one.expect("initialize projection node one");
         two.expect("initialize projection node two");
         three.expect("initialize projection node three");
-        cluster.wait_ready().await;
+        if checkpoints.is_some() {
+            // Required audit readiness deliberately stays closed until the
+            // separate ledger/checkpoint provisioning below the fixture.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !cluster
+                    .stores
+                    .iter()
+                    .any(|store| store.status().leader_id.is_some())
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("projection cluster leader before audit provisioning");
+        } else {
+            cluster.wait_ready().await;
+        }
         cluster
     }
 
@@ -441,6 +482,141 @@ async fn unavailable_persistence_maps_to_retryable_store_error() {
         Err(error) => error,
     };
     assert_eq!(StoreErrorCode::Unavailable, error.code);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_config_bus_replay_precedes_new_operation_base_guard() {
+    let cluster = ProjectionCluster::start().await;
+    let authority = Arc::clone(&cluster.stores[cluster.leader()]);
+    let source = Arc::new(EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<TestConfig>::new_local_authority(
+            Arc::clone(&authority),
+        )),
+        provider(),
+    ));
+    source
+        .append_commit(projection_record(TxId::new(), None, 1, "revision-1"))
+        .await
+        .expect("encrypted initial configuration");
+    let bus = ConfigBus::restore_or_new_dev_only(
+        TestConfig {
+            name: "initial".to_owned(),
+        },
+        Arc::clone(&source),
+    )
+    .await
+    .expect("real encrypted bus");
+    let replacement = |version: u64| {
+        CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Internal,
+            ConfigOperation::Replace,
+            TestConfig {
+                name: format!("revision-{version}"),
+            },
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .with_base_version(ConfigVersion::new(version - 1))
+        .with_idempotency_key(
+            opc_config_model::IdempotencyKey::new(format!("revision-{version}")).expect("key"),
+        )
+    };
+    bus.submit(replacement(2))
+        .await
+        .expect("second configuration");
+    let mut rollback = CommitRequest::rollback(
+        RequestId::new(),
+        principal(),
+        TransportType::Internal,
+        RequestSource::Internal,
+        RollbackTarget::Previous,
+        Vec::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .with_base_version(ConfigVersion::new(2))
+    .with_idempotency_key(
+        opc_config_model::IdempotencyKey::new("acknowledged-rollback").expect("key"),
+    );
+    bus.submit(rollback.clone())
+        .await
+        .expect("original rollback");
+    bus.submit(replacement(4))
+        .await
+        .expect("fourth configuration");
+    let mut current_request = replacement(5);
+    let current = bus
+        .submit(current_request.clone())
+        .await
+        .expect("fifth configuration");
+    authority
+        .retain_history_idempotent(
+            opc_persist::ConfigConsensusRequestId::from_bytes([0xEC; 16]),
+            opc_persist::ConfigHistoryRetention::new(
+                current.tx_id,
+                ConfigVersion::new(5),
+                ConfigVersion::new(3),
+                ConfigVersion::new(4),
+                opc_persist::ConfigHistoryLimits::new(3, 1_048_576).expect("limits"),
+            )
+            .expect("acknowledged prefix"),
+        )
+        .await
+        .expect("real consensus pruning");
+    assert_eq!(
+        source
+            .retained_history_floor()
+            .await
+            .expect("authenticated floor"),
+        Some(ConfigVersion::new(3))
+    );
+    // Only the call deadline is refreshed; request identity, payload and base
+    // remain the original request. The retained result wins before admission.
+    current_request.deadline = Instant::now() + Duration::from_secs(5);
+    let replay = bus
+        .submit(current_request)
+        .await
+        .expect("retained exact replay");
+    assert_eq!(replay, current);
+    rollback.deadline = Instant::now() + Duration::from_secs(5);
+    let error = bus
+        .submit(rollback)
+        .await
+        .expect_err("retired rollback cannot become a fresh write");
+    assert_eq!(
+        error.code,
+        opc_config_model::CommitErrorCode::AdmissionRejected
+    );
+    assert_eq!(bus.version(), ConfigVersion::new(5));
+    assert_eq!(
+        source
+            .load_committed_latest()
+            .await
+            .expect("unchanged head")
+            .expect("head")
+            .tx_id,
+        current.tx_id
+    );
+    // A new request at the current base can still use the retained Previous
+    // target. Refusing the stale request did not fence a healthy bus.
+    bus.submit(
+        CommitRequest::rollback(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Internal,
+            RollbackTarget::Previous,
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .with_base_version(ConfigVersion::new(5)),
+    )
+    .await
+    .expect("fresh rollback");
+    assert_eq!(bus.version(), ConfigVersion::new(6));
+    cluster.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -653,3 +829,5 @@ async fn promoted_follower_reconciles_the_live_bus_before_writing() {
 
     cluster.shutdown().await;
 }
+
+mod management_audit;

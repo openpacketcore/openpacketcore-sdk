@@ -38,9 +38,41 @@ recovery. Mutation or lease outcomes that can make authority ambiguous discard
 the prior guard, reacquire same-owner authority at a strictly higher fence, and
 validate the exact scheduled record. Read-only get, restore-scan, and readiness
 outcomes retain the already-proven guard and validate that same exact record
-without minting unnecessary fencing authority. Evidence binds this routing as
-`stage-aware-known-authority/v1`. The fixed
-schedule drops one successful release response per mutator, allows eight
+without minting unnecessary fencing authority. The current schedule binds
+`stage-aware-known-authority-readiness-and-scan-reproof/v2`.
+After a readiness failure, the retained-authority checkpoint also requires a
+fresh durable-readiness proof. An exact get uses a logical-time proposal and
+cannot certify the separate read-index path. Every completed not-ready proof
+and proof timeout consumes the existing interruption budget, bounded by the
+remaining original episode deadline. Recovery closes only after both the
+exact record and readiness are proven. After a restore-scan failure, recovery
+repeats the complete scan and requires the same exact record, durable cursor
+profile, count and page bounds. An exact get cannot certify scan availability.
+The scan uses that same original deadline and interruption allowance;
+malformed pages and terminal scan errors remain terminal.
+
+Before every acquisition, the synthetic caller syncs its exact consumer request
+ID, body, scope, identity and original absolute deadline into a private,
+single-writer journal beside its database. The complete image is bounded to
+4096 bytes. Uncertainty is reconciled through the existing consumer receipt
+API; `NotFound` permits only an explicit retry of that identical live request,
+never a distinct successor. At restart, a recorded terminal acquisition is
+retired before fresh authority. Expired unknown requests stay fenced, and
+retries never extend their deadlines. Missing or mismatched journal custody
+beside an existing database fails closed. This trusted local qualification
+caller adds no consumer-mTLS or production persistence claim and changes no
+ordinary lease API. Its acquisition profile is
+`retained-consumer-id-receipt-before-successor/v1`.
+
+The current `opc-session-ha/traffic-resource/v10` schedule binds both behaviors.
+Historical v6, v7, v8 and v9 retain their original meanings: v7 added retained
+acquisitions, v8 added readiness reproof, and v9 added complete scan reproof.
+The combined schedule changes no numeric workload, timeout, interruption or
+resource bound. Current 3/5-voter traffic and mTLS candidate digests bind the
+combined algorithm.
+
+See the [qualification contract](../../crates/opc-session-testkit/README.md).
+The fixed schedule drops one successful release response per mutator, allows eight
 outcomes per node, uses the fixed 26-second two-election-plus-operation
 transition envelope per recovery episode, and applies a 50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,
@@ -816,6 +848,18 @@ missing namespace MUST be created `0700`; SDK snapshot files MUST be created
 parent-path replacement cannot redirect accepted work. Durable snapshot rows
 name logical basenames, not a mutable parent path.
 
+A pinned-directory handoff MUST distinguish the original configured absolute
+namespace name from the owned directory capability. Construction MUST verify
+name/capability correspondence and obtain an independent open-file description;
+duplicating an existing description is insufficient for independent flock
+ownership. The configured name MUST remain the socket and pending-cleanup key,
+including across a parent-symlink retarget. A process-relative descriptor locator
+MUST NOT replace that key. After construction, store admission MUST use the
+retained capability and recheck its permission policy without redirecting I/O
+through a replacement pathname. Directory and database exclusion, atomic database
+admission, and cleanup-owned lease retirement MUST remain unchanged. This handoff
+does not alter Durable/Async acknowledgement, snapshot integrity or deadlines.
+
 Supported writers are cooperative SDK processes under one dedicated service
 UID, serialized by the snapshot/database leases. Operators MUST use a private
 parent directory, must not share that UID with untrusted workloads, and MUST
@@ -1059,6 +1103,26 @@ Every deployment profile MUST publish:
 - Maximum tolerated replication lag.
 - Which state classes are replicated.
 - Which state classes are rebuildable.
+
+Snapshot installation and covered-log purge run on separate Openraft workers.
+Purge MUST retain unapplied history until the exact process-owned install has
+published durable applied coverage. The install's completion dependency is
+not a fixed deployment recovery-time limit: a larger authenticated snapshot
+may take longer while the surviving quorum remains available. Failure or
+cancellation MUST wake the purge with an error, and completion without durable
+coverage MUST fail closed. A missing, unrelated, or late-starting install does
+not extend the existing absolute apply guard. Install ownership MUST remain
+process-local and MUST NOT be inferred from persisted staging artifacts.
+
+A donor MUST retain the log suffix needed by an active snapshot receiver and
+hand successful snapshot progress directly to retained log replication before
+executing a pending purge. This successful handoff uses the issued purge
+frontier to select the retained suffix. New and failed attempts MUST respect
+the scheduled purge frontier so unreachable targets cannot repeatedly reclaim
+each other's pending ranges. Failed data transfers release their retention
+before retry; heartbeat outcomes do not release an active data transfer's
+ownership. Existing capacity limits, quorum
+authority, committed/applied floors and operation deadlines remain unchanged.
 
 ## 12. Serialization
 
@@ -1737,6 +1801,14 @@ creates nor substitutes for this durable recovery boundary, and MUST NOT fall
 back to V1. A legacy protection wrapper without that journal, an older binary,
 and raw V1 transport MUST fail closed for the V2 history path.
 
+The #982 `SessionConsumerPreparedFencedTransitionV2Backend` composes only the
+existing `/2` capability, history-state, singleton-transition, and status
+operations over an opaque exact roster whose every voter proved
+`FencedTransitionV2Capability::V2`. It adds no wire operation, and its
+caller-stable `FencedTransitionRequestId` never crosses the wire. Its
+durable recovery boundary is the separate caller-keyed
+`FencedTransitionV2RecoveryJournal` described in §14.1.
+
 The first authorized transition after that unanimous proof carries the scope
 identity and canonical voter-set commitment inside its same single user command
 and application position. Apply atomically installs its receipt/effects, the
@@ -1885,6 +1957,18 @@ request body under the retained ID through the durable request binding; reuse
 of that ID for a different request is a closed conflict. Applications otherwise
 must perform authoritative readback and apply the existing fencing/idempotency
 contract.
+
+A complete V1 `Rejected(Unavailable)` reply is a closed rejection. For a
+mutation, a server MUST return it only before it submits the operation's own
+consensus intent. It MAY follow the effect-free durable request binding, which
+the identical request rebinds idempotently. A read MAY receive it after read
+work. The reply therefore proves that the request had no application effect
+on the answering voter. The persistent client MUST count it as a
+not-transmitted completion, never as an unsafe failure. A prepared
+compare-and-set or lease acquire MUST move the identical request to its next
+voter, exactly as after a proven pre-write failure, and MUST end
+`NotTransmitted` when every voter rejects or is unreachable. Scope, topology,
+authorization and validation rejections remain terminal.
 
 For persistent V2 calls, `NotTransmitted` is a pre-write result. A
 `ReadUnavailable` result is a post-write read loss for a non-effectful V2
@@ -2102,6 +2186,11 @@ setup is safe and retryable because no application bytes can cross the
 transport boundary. After dispatch begins, a possible send, including
 `OutcomeUnknown`, or cancellation is ambiguous and MUST permanently make the
 handle receipt-only; it MUST NOT regain mutation authority.
+A complete closed `Rejected(Unavailable)` reply proves that the selected voter
+did not dispatch the transition, but the handle has already written its call:
+it MUST return a terminal `NotTransmitted` result and MUST NOT advance to
+another voter. A single-voter consumer fenced-transition backend also reports
+that reply as `NotTransmitted`, not as a rejected store error.
 `BeforeCallWrite(SessionConsumerClientError::Scope)` is a terminal topology
 authority revocation and MUST be returned as rejected
 `StoreError::TopologyAuthorityRevoked`; it MUST NOT be downgraded to a generic
@@ -2117,6 +2206,39 @@ is proof that a delayed mutation cannot commit. A terminal receipt is cached
 locally. Restart recovery returns only the status-only
 `SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
 no execute authority, even if the recovered token is otherwise valid.
+
+`SessionConsumerPreparedFencedTransitionV2Backend` (#982) is the protected
+consumer facade for #702's epoch-fenced V2 protocol. It has the V1 facade's
+exact-roster activation, canonical routing, affine execute handle,
+receipt-only restart recovery, and single-seal journal discipline, with these
+differences. The caller supplies the same `FencedTransitionRequest`, whose
+16-byte ID is the caller-stable recovery identity. The facade MUST name an
+active epoch from a linearized V2 history state it observed; callers never
+choose an epoch or a nonce. It MAY reuse that observation across preparations
+because epochs only advance: a request whose epoch has since closed is
+rejected without binding, and that rejection MUST invalidate the reused
+state. A reused state that records no active epoch or a full one MUST NOT be
+used. It seals once, builds the sealed V2 request, and
+MUST durably bind caller ID to that complete request in the SDK-owned
+`FencedTransitionV2RecoveryJournal` before returning a dispatchable handle.
+Execution and status MUST dispatch only that authenticated journaled request.
+`recover_fenced_transition_status` MUST NOT require the plaintext body.
+
+The recovery journal holds at most 4,096 live rows. That count is an
+authenticated admission fence, not an absorbing lifetime: a row is removed by
+exact compare-and-delete only after a proven all-voter pre-dispatch failure, a
+definitive unbound rejection, a caller `release_resolved` on a handle that
+observed a resolution, or a bounded `reclaim_resolved_fenced_transitions`
+sweep. The sweep removes rows at or below the retired floor, or whose fresh
+exact status is `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`,
+or `EpochNotActive` below the active epoch. It MUST retain `Recorded`,
+`NotFound`, and `RequestConflict` rows. `NotFound` stays non-exclusionary.
+Epoch rotation and retired-floor advancement remain the state process's
+local-leader `ConsensusSessionStore::maintain_fenced_transition_v2_history`
+authority; the facade observes it and adds no maintenance authority.
+`with_legacy_v1_recovery` composes a consumed V1 facade so retained V1 rows
+stay status-recoverable and V2 preparation rejects their IDs. The
+session-store atomic-transition document defines the complete contract.
 
 Journal provisioning and reopening are distinct. A deployment MUST call
 `PreparedFencedTransitionJournal::create_new` exactly once for a missing path
@@ -2493,11 +2615,17 @@ fencing.
   fresh bidirectional mTLS/bootstrap paths on every incident edge, leaves
   unrelated survivor explicit/material-epoch retirement counters unchanged,
   and settles all lifecycle drains plus survivor availability episodes before
-  the next traffic baseline. The schedule-bound
-  `member-scoped-reauth-settled-baseline/v4` checkpoint starts its 86-second
-  absolute bound and 60-second two-stage server tail at the atomic
-  projected-data rename, then requires a final 2.5-second outbound-ledger quiet
-  tail. A prepublication common-key pulse and conservative 13-second
+  the next traffic baseline. Functional snapshot catch-up records elapsed time
+  and monotonic applied frontiers without inheriting a fixed connection-cleanup
+  deadline. Every voter must become ready with the exact quorum witnesses and
+  cover the first observed committed frontier; majority progress alone never
+  completes recovery. After readiness and canary verification, connection
+  settlement retains its own 86-second bound, full 60-second two-stage server
+  tail and final 2.5-second outbound-ledger quiet tail. The frozen schedule-bound
+  `member-scoped-reauth-settled-baseline/v4` descriptor and historical results
+  retain their publication-based clock; these corrected functional checks do
+  not qualify that historical timing profile or a deployment recovery SLO on
+  shared storage. A prepublication common-key pulse and conservative 13-second
   observations require one active key to advance on every survivor observer
   and bound that pulse's worst-case actual event gap to 26 seconds. An
   independent 26-second checkpoint requires every active key on every observer

@@ -130,6 +130,10 @@ pub enum ConsensusRpcFamily {
     /// Prove that a staged membership candidate applied a durable transition
     /// marker before successor Vote traffic is admitted.
     TopologyAdmissionBarrier,
+    /// Release one exact retiring leader vote and let its selected, caught-up
+    /// voter use the engine's ordinary election. This does not carry commands
+    /// or change membership.
+    LeadershipTransfer,
 }
 
 impl ConsensusRpcFamily {
@@ -144,6 +148,7 @@ impl ConsensusRpcFamily {
             Self::ForwardRosterMutation => "forward_roster_mutation",
             Self::ReadBarrier => "read_barrier",
             Self::TopologyAdmissionBarrier => "topology_admission_barrier",
+            Self::LeadershipTransfer => "leadership_transfer",
         }
     }
 
@@ -155,6 +160,9 @@ impl ConsensusRpcFamily {
     /// that family, and receivers must prove it again after decoding.
     pub const fn max_request_payload_bytes(self) -> usize {
         match self {
+            // Exact vote, membership log ID and accepted log prefix, including
+            // the persistence envelope, are fixed-size control metadata.
+            Self::LeadershipTransfer => 1_024,
             Self::ForwardRosterMutation | Self::AppendEntriesRoster => {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
             }
@@ -375,7 +383,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::{ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId};
+    use crate::{
+        encode_bounded, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId,
+    };
 
     #[derive(Debug)]
     struct CompatibilityPeer {
@@ -450,6 +460,37 @@ mod tests {
             result: Ok(vec![0; CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1]),
         };
         assert_eq!(over_response.validate(), Err(ConsensusPeerError::Protocol));
+    }
+
+    #[test]
+    fn leadership_transfer_control_payload_has_its_own_small_bound() {
+        let template = request();
+        let family = ConsensusRpcFamily::LeadershipTransfer;
+        assert_eq!(family.max_request_payload_bytes(), 1_024);
+        let exact = ConsensusWireRequest::try_new(
+            template.identity,
+            template.sender,
+            family,
+            vec![0; 1_024],
+        )
+        .expect("inclusive control envelope bound");
+        assert_eq!(exact.validate(), Ok(()));
+        let over = ConsensusWireRequest {
+            payload: vec![0; 1_025],
+            ..exact
+        };
+        assert_eq!(over.validate(), Err(ConsensusPeerError::Protocol));
+        assert_eq!(
+            ConsensusWireRequest::try_new(over.identity, over.sender, family, over.payload),
+            Err(ConsensusPeerError::Protocol)
+        );
+        // Adding the family must preserve existing encoded discriminants.
+        assert_eq!(encode_bounded(&ConsensusRpcFamily::Vote).unwrap(), vec![0]);
+        assert_eq!(
+            encode_bounded(&ConsensusRpcFamily::TopologyAdmissionBarrier).unwrap(),
+            vec![7]
+        );
+        assert_eq!(encode_bounded(&family).unwrap(), vec![8]);
     }
 
     #[test]

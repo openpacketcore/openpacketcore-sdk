@@ -48,6 +48,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   RUST_BACKTRACE: "1"
 
@@ -55,13 +56,15 @@ jobs:
   root-cgroup-egress:
     name: Root-cgroup egress fence
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Cold host builds and the full kernel proof suite can exceed one hour.
+    # This job budget leaves every test and product latency bound unchanged.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
           components: clippy,rustfmt
           targets: aarch64-apple-darwin
@@ -147,6 +150,7 @@ jobs:
             "${optimized_sqlite_contracts[@]}"
             lagging_replica_installs_compacted_snapshot_without_losing_committed_state
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+            compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart
           )
           broad_skip_arguments=()
           for contract in "${broad_test_skips[@]}"; do
@@ -186,6 +190,19 @@ jobs:
             --test-threads=1 \
             --exact \
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+          # Predecessor compaction commits the production snapshot threshold
+          # before catch-up. Keep that 5-minute command batch off the shared
+          # four-thread binary so host scheduling cannot turn an existing
+          # bound into a teardown-queue timeout.
+          cargo test --locked \
+            -p opc-session-store \
+            --all-features \
+            --quiet \
+            --test consensus_openraft \
+            -- \
+            --test-threads=1 \
+            --exact \
+            compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart
           # This proof owns a scoped snapshot-promotion gate while it verifies
           # an unrelated concurrent install. Give that process-global test
           # control a fresh process without changing its one-second bound.

@@ -94,6 +94,7 @@ spec:
               host: ""
               scheme: ""
               httpheaders: []
+              protocol: null
             tcpsocket: null
             grpc: null
           initialdelayseconds: 10
@@ -114,6 +115,7 @@ spec:
               host: ""
               scheme: ""
               httpheaders: []
+              protocol: null
             tcpsocket: null
             grpc: null
           initialdelayseconds: 5
@@ -134,6 +136,7 @@ spec:
               host: ""
               scheme: ""
               httpheaders: []
+              protocol: null
             tcpsocket: null
             grpc: null
           initialdelayseconds: 5
@@ -230,6 +233,7 @@ spec:
       resources: null
       hostnameoverride: null
       schedulinggroup: null
+      evictionresponders: []
   strategy:
     type: ""
     rollingupdate: null

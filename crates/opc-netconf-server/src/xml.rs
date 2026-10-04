@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use opc_mgmt_errors::{NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::{LimitsError, MgmtLimits};
-use quick_xml::encoding::Decoder;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::reader::Reader;
@@ -945,17 +944,12 @@ impl ParserState {
         }
     }
 
-    fn push_start(
-        &mut self,
-        start: &BytesStart<'_>,
-        decoder: Decoder,
-        limits: &MgmtLimits,
-    ) -> Result<(), XmlError> {
+    fn push_start(&mut self, start: &BytesStart<'_>, limits: &MgmtLimits) -> Result<(), XmlError> {
         if self.root_closed && self.stack.is_empty() {
             return Err(XmlError::MultipleRoots);
         }
 
-        let scoped = scoped_attributes(start, decoder, limits, self.scopes.last())?;
+        let scoped = scoped_attributes(start, limits, self.scopes.last())?;
         let raw_name = start.name();
         let (prefix, local) = split_qname(raw_name.as_ref())?;
         self.note_rpc_operation_hint(local);
@@ -987,17 +981,12 @@ impl ParserState {
         Ok(())
     }
 
-    fn push_empty(
-        &mut self,
-        start: &BytesStart<'_>,
-        decoder: Decoder,
-        limits: &MgmtLimits,
-    ) -> Result<(), XmlError> {
-        self.push_start(start, decoder, limits)?;
+    fn push_empty(&mut self, start: &BytesStart<'_>, limits: &MgmtLimits) -> Result<(), XmlError> {
+        self.push_start(start, limits)?;
         self.pop_end(start.name().as_ref())
     }
 
-    fn pop_end(&mut self, raw_name: &[u8]) -> Result<(), XmlError> {
+    fn pop_end(&mut self, raw_name: &str) -> Result<(), XmlError> {
         let scope = self.scopes.last().ok_or(XmlError::Malformed)?;
         let (prefix, local) = split_qname(raw_name)?;
         let namespace = resolve_namespace(prefix, scope)?;
@@ -2472,7 +2461,7 @@ impl ParserState {
         scope: &NamespaceScope,
     ) -> Result<(), XmlError> {
         let raw_name = start.name();
-        let name = qname_bytes_to_str(raw_name.as_ref())?;
+        let name = raw_name.as_ref();
         let mut rewritten = BytesStart::new(name);
         if let Some(default) = scope.default.as_deref() {
             rewritten.push_attribute(("xmlns", default));
@@ -2959,12 +2948,12 @@ fn parse_message_with_context(
         {
             Event::Start(start) => {
                 state
-                    .push_start(&start, reader.decoder(), limits)
+                    .push_start(&start, limits)
                     .map_err(|err| parse_error(&state, err))?;
             }
             Event::Empty(start) => {
                 state
-                    .push_empty(&start, reader.decoder(), limits)
+                    .push_empty(&start, limits)
                     .map_err(|err| parse_error(&state, err))?;
             }
             Event::End(end) => {
@@ -2982,11 +2971,8 @@ fn parse_message_with_context(
                         .map_err(|err| parse_error(&state, err))?;
                     continue;
                 }
-                let decoded = text
-                    .decode()
-                    .map_err(|_| parse_error(&state, XmlError::Malformed))?;
                 state
-                    .text(decoded.as_ref())
+                    .text(text.as_ref())
                     .map_err(|err| parse_error(&state, err))?;
             }
             Event::CData(cdata) => {
@@ -3092,7 +3078,6 @@ fn validate_xml_decl_start(xml: &str) -> Result<(), XmlError> {
 
 fn scoped_attributes(
     start: &BytesStart<'_>,
-    decoder: Decoder,
     limits: &MgmtLimits,
     parent: Option<&NamespaceScope>,
 ) -> Result<ScopedAttributes, XmlError> {
@@ -3107,9 +3092,9 @@ fn scoped_attributes(
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| XmlError::Malformed)?;
         attr_count += 1;
-        let key = qname_bytes_to_str(attr.key.as_ref())?;
+        let key = attr.key.as_ref();
         let value = attr
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|_| XmlError::Malformed)?
             .into_owned();
         limits.check_value_bytes(value.len())?;
@@ -3181,7 +3166,7 @@ fn validate_attribute_names(
     scope: &NamespaceScope,
 ) -> Result<(), XmlError> {
     for (name, _) in attrs {
-        let (prefix, _) = split_qname(name.as_bytes())?;
+        let (prefix, _) = split_qname(name)?;
         if let Some(prefix) = prefix {
             if prefix != "xml" && !scope.bindings.contains_key(prefix) {
                 return Err(XmlError::UnknownNamespace);
@@ -3288,8 +3273,7 @@ fn filter_kind(attrs: &[(String, String)]) -> Result<FilterKind, XmlError> {
     }
 }
 
-fn split_qname(raw: &[u8]) -> Result<(Option<&str>, &str), XmlError> {
-    let name = qname_bytes_to_str(raw)?;
+fn split_qname(name: &str) -> Result<(Option<&str>, &str), XmlError> {
     if name.is_empty() {
         return Err(XmlError::Malformed);
     }
@@ -3301,10 +3285,6 @@ fn split_qname(raw: &[u8]) -> Result<(Option<&str>, &str), XmlError> {
     } else {
         Ok((None, name))
     }
-}
-
-fn qname_bytes_to_str(raw: &[u8]) -> Result<&str, XmlError> {
-    std::str::from_utf8(raw).map_err(|_| XmlError::Malformed)
 }
 
 fn resolve_namespace(prefix: Option<&str>, scope: &NamespaceScope) -> Result<String, XmlError> {

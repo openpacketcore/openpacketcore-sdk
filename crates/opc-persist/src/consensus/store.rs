@@ -1,5 +1,8 @@
 //! ConfigStore implementation coordinated exclusively by Openraft.
 
+mod audit;
+mod audit_continuity;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -70,6 +73,9 @@ pub enum ConfigConsensusOpenError {
     /// Durable SQLite or snapshot storage could not be opened.
     #[error("config consensus durable storage is unavailable")]
     StorageUnavailable,
+    /// Required audit keys or external rollback protection could not be proven.
+    #[error("config consensus audit continuity is unavailable")]
+    AuditContinuityUnavailable,
     /// Fixed Openraft runtime profile or deadline was invalid.
     #[error("config consensus runtime configuration is invalid")]
     InvalidRuntimeConfiguration,
@@ -288,6 +294,7 @@ struct ConsensusConfigStoreInner {
     clock: Arc<dyn ConfigConsensusClock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
+    audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
@@ -382,6 +389,7 @@ impl ConsensusConfigStore {
             clock,
             operation_timeout,
             None,
+            None,
         )
         .await
     }
@@ -403,6 +411,7 @@ impl ConsensusConfigStore {
             Arc::new(SystemConfigConsensusClock),
             DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
             Some(approval),
+            None,
         )
         .await
     }
@@ -416,8 +425,16 @@ impl ConsensusConfigStore {
         clock: Arc<dyn ConfigConsensusClock>,
         operation_timeout: Duration,
         recovery: Option<ApprovedLegacyConfigRecovery>,
+        audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     ) -> Result<Self, ConfigConsensusOpenError> {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
+            return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
+        }
+        if backend
+            .retained_binding
+            .as_ref()
+            .is_some_and(|binding| binding.topology() != &topology)
+        {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
         let identity = topology.identity();
@@ -430,6 +447,11 @@ impl ConsensusConfigStore {
             .collect::<BTreeSet<_>>();
         if peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers {
             return Err(ConfigConsensusOpenError::PeerSetMismatch);
+        }
+        if let Some(policy) = &audit_continuity {
+            backend
+                .attach_management_audit_keys(policy.keys.clone())
+                .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         }
         let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
         let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
@@ -444,6 +466,14 @@ impl ConsensusConfigStore {
         } else {
             storage::open(&backend, snapshot_dir, identity, members.clone()).await?
         };
+        audit_continuity::verify_startup(
+            &backend,
+            audit_continuity.as_deref(),
+            identity,
+            operation_timeout,
+        )
+        .await
+        .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let raft = ConfigRaft::new(
             local_node_id,
             Arc::new(config_raft_config()?),
@@ -467,6 +497,7 @@ impl ConsensusConfigStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
+                audit_continuity,
                 linearizability,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
@@ -491,6 +522,8 @@ impl ConsensusConfigStore {
     /// members wait for that exact membership to replicate. Restarted members
     /// with durable Openraft state skip bootstrap and re-admit normally. Clean
     /// first formation fails closed if the canonical member is absent.
+    /// A retained member provisioned for repair never invokes bootstrap; it
+    /// must recover the existing membership through its authenticated peers.
     pub async fn initialize_cluster(&self) -> Result<(), ConfigConsensusOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
@@ -501,7 +534,10 @@ impl ConsensusConfigStore {
             .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
             .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
         let canonical_bootstrap = self.inner.members.first().copied();
-        if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
+        if !initialized
+            && canonical_bootstrap == Some(self.inner.local_node_id)
+            && !self.inner.backend.retained_repair_only
+        {
             let initialize = tokio::time::timeout_at(
                 deadline,
                 self.inner.raft.initialize(self.inner.members.clone()),
@@ -739,7 +775,13 @@ impl ConsensusConfigStore {
 
     /// Prove quorum through the same read-index path used by authoritative reads.
     pub async fn probe_durable_readiness(&self) -> Result<(), PersistError> {
-        self.linearizable_barrier().await.map(|_| ())
+        self.linearizable_barrier().await?;
+        if self.inner.audit_continuity.is_some() {
+            self.read_audit_ledger()
+                .await
+                .map_err(|_| PersistError::unavailable())?;
+        }
+        Ok(())
     }
 
     /// Ask Openraft to build and compact a state-machine snapshot.
@@ -757,6 +799,19 @@ impl ConsensusConfigStore {
         .map_err(|_| consensus_unavailable());
         self.publish_global_metrics();
         result
+    }
+
+    /// Apply an explicit acknowledged history-retention decision through the
+    /// existing consensus authority, retaining the same request ID for retries.
+    pub async fn retain_history_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        retention: super::ConfigHistoryRetention,
+    ) -> Result<(), PersistError> {
+        retention.validate()?;
+        self.submit_request(request_id, ConfigMutationIntent::RetainHistory(retention))
+            .await?
+            .into_result()
     }
 
     /// Stop this Openraft node and all of its engine tasks.
@@ -1783,6 +1838,12 @@ impl ConfigStore for ConsensusConfigStore {
 
     async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
         self.inner.backend.load_committed_latest().await
+    }
+
+    async fn retained_history_floor(
+        &self,
+    ) -> Result<Option<opc_types::ConfigVersion>, PersistError> {
+        self.inner.backend.retained_history_floor().await
     }
 
     async fn load_since(

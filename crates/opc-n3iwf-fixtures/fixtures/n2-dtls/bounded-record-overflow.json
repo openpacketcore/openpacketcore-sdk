@@ -1,0 +1,53 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "dtls-record",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.bounded-record-overflow",
+  "subset": "n2-dtls",
+  "case_class": "bounded-overflow",
+  "source": {
+    "document": "IETF RFC 6347",
+    "release": "RFC 6347",
+    "clauses": [
+      "4.1"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "n3iwf",
+  "prerequisite": "Caller record-size bound",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "DTLS length 0xffff over a five-octet header"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/bounded-record-overflow.hex",
+    "digest_sha256": "3e4b345950ea59c41370d8ec24c23a58d1af148a7e67002bbf7b42037785ea38"
+  },
+  "semantic_assertions": [
+    "declared_length=65535",
+    "caller_max_record=16384"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

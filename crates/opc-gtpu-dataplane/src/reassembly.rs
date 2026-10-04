@@ -259,6 +259,7 @@ fn authoritative_ingress_ifindex(
 fn validate_reassembly_socket_address(
     local: std::net::SocketAddr,
     expected_address: Ipv4Addr,
+    expected_port: u16,
 ) -> std::io::Result<()> {
     if expected_address.is_unspecified() {
         return Err(std::io::Error::new(
@@ -268,7 +269,7 @@ fn validate_reassembly_socket_address(
     }
     match local {
         std::net::SocketAddr::V4(local)
-            if *local.ip() == expected_address && local.port() == GTPU_PORT =>
+            if *local.ip() == expected_address && local.port() == expected_port =>
         {
             Ok(())
         }
@@ -414,9 +415,13 @@ impl fmt::Debug for DownlinkOuterProvenance {
 #[cfg(target_os = "linux")]
 pub struct GtpuReassemblySocket {
     socket: std::net::UdpSocket,
+    control_identity: std::sync::Arc<()>,
     interface_name: std::ffi::OsString,
     ingress_ifindex: u32,
     local_address: Ipv4Addr,
+    port: u16,
+    /// Cumulative kernel receive-queue drops reported by `SO_RXQ_OVFL`.
+    queue_drops: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(target_os = "linux")]
@@ -466,6 +471,30 @@ impl GtpuReassemblySocket {
     /// binding, packet-info setup, or mismatched kernel readback return stable
     /// operation labels without the interface name or address.
     pub fn bind(local_address: Ipv4Addr, interface_name: &str) -> std::io::Result<Self> {
+        Self::bind_on_port(local_address, interface_name, GTPU_PORT)
+    }
+
+    /// Bind the backend-owned queue that receives authorized over-MTU G-PDUs
+    /// steered away from UDP/2152 by tc
+    /// ([`opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT`]). A flood of
+    /// such packets therefore fills only this queue, never the shared queue
+    /// that carries Echo and reassembled G-PDUs.
+    pub(crate) fn bind_packet_too_big_queue(
+        local_address: Ipv4Addr,
+        interface_name: &str,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_port(
+            local_address,
+            interface_name,
+            opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT,
+        )
+    }
+
+    fn bind_on_port(
+        local_address: Ipv4Addr,
+        interface_name: &str,
+        port: u16,
+    ) -> std::io::Result<Self> {
         use nix::sys::socket::{
             bind, getsockopt, setsockopt, socket, sockopt, AddressFamily, SockFlag, SockType,
             SockaddrIn,
@@ -510,7 +539,7 @@ impl GtpuReassemblySocket {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device binding failed")
         })?;
-        let address = SocketAddrV4::new(local_address, GTPU_PORT);
+        let address = SocketAddrV4::new(local_address, port);
         bind(fd.as_raw_fd(), &SockaddrIn::from(address)).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly address binding failed")
@@ -519,12 +548,17 @@ impl GtpuReassemblySocket {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly packet-info setup failed")
         })?;
+        setsockopt(&fd, sockopt::RxqOvfl, &1).map_err(|error| {
+            let error = std::io::Error::from(error);
+            std::io::Error::new(error.kind(), "reassembly queue-drop reporting setup failed")
+        })?;
         let socket = std::net::UdpSocket::from(fd);
         validate_reassembly_socket_address(
             socket.local_addr().map_err(|error| {
                 std::io::Error::new(error.kind(), "reassembly local binding readback failed")
             })?,
             local_address,
+            port,
         )?;
         let observed_name = getsockopt(&socket, sockopt::BindToDevice).map_err(|error| {
             let error = std::io::Error::from(error);
@@ -546,9 +580,12 @@ impl GtpuReassemblySocket {
         )?;
         Ok(Self {
             socket,
+            control_identity: std::sync::Arc::new(()),
             interface_name,
             ingress_ifindex,
             local_address,
+            port,
+            queue_drops: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -604,7 +641,7 @@ impl GtpuReassemblySocket {
         let local = self.socket.local_addr().map_err(|error| {
             std::io::Error::new(error.kind(), "reassembly local binding readback failed")
         })?;
-        validate_reassembly_socket_address(local, self.local_address)?;
+        validate_reassembly_socket_address(local, self.local_address, self.port)?;
         let observed_name = getsockopt(&self.socket, sockopt::BindToDevice).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device readback failed")
@@ -641,17 +678,169 @@ impl GtpuReassemblySocket {
     /// truncated envelopes, absent packet info, conflicting provenance, or
     /// the underlying receive operation.
     pub fn receive(&self, buffer: &mut [u8]) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
-        use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn};
+        self.receive_with_flags(buffer, nix::sys::socket::MsgFlags::empty())
+    }
+
+    /// Nonblocking receive from the same queue used for reassembled G-PDUs.
+    ///
+    /// A single caller must demultiplex this queue: do not concurrently call
+    /// `receive` and this method, or bind a competing reuse-port socket. The
+    /// returned G-PDU bytes/provenance can be passed to the existing reassembly
+    /// consumer. Malformed and unsupported-required-extension events must not
+    /// be decapsulated. This socket observation does not prove tc attachment,
+    /// an installed tunnel or peer admission.
+    ///
+    /// # Errors
+    /// Refuses a cap outside 8..=65,507 bytes, truncated payload/control data,
+    /// or lost exact binding. `Ok(None)` means the queue was empty.
+    pub fn try_receive_datagram(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<
+        Option<crate::control_port::GtpuControlDatagram>,
+        crate::control_port::GtpuControlPortError,
+    > {
+        use crate::control_port::{
+            GtpuControlDatagram, GtpuControlPortError, GTPU_CONTROL_MAX_DATAGRAM,
+        };
+        if !(8..=GTPU_CONTROL_MAX_DATAGRAM).contains(&maximum_bytes) {
+            return Err(GtpuControlPortError::InvalidLimits);
+        }
+        let mut bytes = vec![0; maximum_bytes];
+        match self.receive_with_flags(&mut bytes, nix::sys::socket::MsgFlags::MSG_DONTWAIT) {
+            Ok((length, provenance)) => {
+                bytes.truncate(length);
+                Ok(Some(GtpuControlDatagram::received(
+                    bytes.into(),
+                    provenance,
+                    std::sync::Arc::clone(&self.control_identity),
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Send one budgeted response through its exact receiving socket.
+    ///
+    /// The local IP/port and device binding are rechecked, and the response
+    /// keeps the message-specific destination chosen by its receive event.
+    /// Consumes the plan on every outcome. A success reports UDP payload bytes
+    /// accepted by the local kernel, not peer delivery or session authority.
+    ///
+    /// # Errors
+    /// Refuses another socket's plan, lost binding, a nonblocking send failure
+    /// or an unexpected partial write. No automatic retry or queue is created.
+    pub fn send_control_response(
+        &self,
+        plan: crate::control_port::GtpuControlSendPlan,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+
+        if !std::sync::Arc::ptr_eq(&plan.socket_identity, &self.control_identity) {
+            return Err(GtpuControlPortError::SocketMismatch);
+        }
+        if plan.source != std::net::SocketAddrV4::new(self.local_address, GTPU_PORT) {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        self.send_control_bytes(plan.peer, &plan.bytes)
+    }
+
+    /// Cumulative datagrams the kernel dropped from this socket's receive
+    /// queue before they could be read, as last reported by `SO_RXQ_OVFL`.
+    pub(crate) fn queue_drops(&self) -> u32 {
+        self.queue_drops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Internal send path for one in-tunnel error G-PDU, used only by the
+    /// backend-owned downlink consumer under the attachment mutation guard.
+    /// The G-PDU is sent from this socket's exact local UDP/2152 tuple to the
+    /// committed peer's UDP/2152; its payload is already encapsulated.
+    pub(crate) fn send_in_tunnel_error(
+        &self,
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+        gpdu: &[u8],
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        if local != self.local_address
+            || self.port != GTPU_PORT
+            || peer.is_unspecified()
+            || peer.is_multicast()
+            || peer.is_broadcast()
+        {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        self.send_control_bytes(std::net::SocketAddrV4::new(peer, GTPU_PORT), gpdu)
+    }
+
+    /// Internal send path used only under the backend's retired-source request,
+    /// attachment mutation lock and protected namespace effect lease. Public
+    /// control responses continue to require their receive-bound affine plan.
+    pub(crate) fn send_retired_n3_end_marker(
+        &self,
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+        teid: crate::Teid,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        use opc_proto_gtpu::{GtpuControlMessage, GtpuEndMarker, GtpuTunnelEndpointId};
+        if local != self.local_address
+            || peer.is_unspecified()
+            || peer.is_multicast()
+            || peer.is_broadcast()
+        {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        let bytes = GtpuControlMessage::EndMarker(GtpuEndMarker::new(GtpuTunnelEndpointId::new(
+            teid.get(),
+        )))
+        .to_bytes(opc_protocol::EncodeContext::default())
+        .map_err(|_| GtpuControlPortError::Encoding)?;
+        self.send_control_bytes(std::net::SocketAddrV4::new(peer, GTPU_PORT), &bytes)
+    }
+
+    fn send_control_bytes(
+        &self,
+        peer: std::net::SocketAddrV4,
+        bytes: &[u8],
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        use nix::sys::socket::{sendto, MsgFlags, SockaddrIn};
+        use std::os::fd::AsRawFd;
+        self.verify_live_binding()?;
+        let written = sendto(
+            self.socket.as_raw_fd(),
+            bytes,
+            &SockaddrIn::from(peer),
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+        )
+        .map_err(std::io::Error::from)?;
+        if written != bytes.len() {
+            return Err(GtpuControlPortError::Io {
+                kind: std::io::ErrorKind::WriteZero,
+            });
+        }
+        self.verify_live_binding()?;
+        Ok(written)
+    }
+
+    fn receive_with_flags(
+        &self,
+        buffer: &mut [u8],
+        flags: nix::sys::socket::MsgFlags,
+    ) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
+        use nix::sys::socket::{recvmsg, ControlMessageOwned, SockaddrIn};
         use std::os::fd::AsRawFd;
 
         self.verify_live_binding()?;
-        let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo);
+        let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo, u32);
         let mut iov = [std::io::IoSliceMut::new(buffer)];
         let message = recvmsg::<SockaddrIn>(
             self.socket.as_raw_fd(),
             &mut iov,
             Some(&mut cmsg_space),
-            MsgFlags::empty(),
+            flags,
         )?;
         validate_reassembly_envelope_flags(message.flags)?;
         // Close the blocking-receive race: an interface rename, deletion, or
@@ -667,24 +856,27 @@ impl GtpuReassemblySocket {
                 "non-IPv4 datagram source",
             ));
         };
-        let packet_info = message
-            .cmsgs()
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid reassembly control-message envelope",
-                )
-            })?
-            .find_map(|control| match control {
-                ControlMessageOwned::Ipv4PacketInfo(info) => Some(info),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "missing IP_PKTINFO control message",
-                )
-            })?;
+        let mut packet_info = None;
+        for control in message.cmsgs().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid reassembly control-message envelope",
+            )
+        })? {
+            match control {
+                ControlMessageOwned::Ipv4PacketInfo(info) => packet_info = Some(info),
+                ControlMessageOwned::RxqOvfl(drops) => self
+                    .queue_drops
+                    .store(drops, std::sync::atomic::Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        let packet_info = packet_info.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing IP_PKTINFO control message",
+            )
+        })?;
         let ingress_ifindex =
             authoritative_ingress_ifindex(packet_info.ipi_ifindex, self.ingress_ifindex)?;
         let local = Ipv4Addr::from(u32::from_be(packet_info.ipi_addr.s_addr));
@@ -699,6 +891,26 @@ impl GtpuReassemblySocket {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical provenance")
             })?;
         Ok((message.bytes, provenance))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::control_port::GtpuControlPort for GtpuReassemblySocket {
+    fn try_receive_datagram(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<
+        Option<crate::control_port::GtpuControlDatagram>,
+        crate::control_port::GtpuControlPortError,
+    > {
+        Self::try_receive_datagram(self, maximum_bytes)
+    }
+
+    fn send_control_response(
+        &self,
+        plan: crate::control_port::GtpuControlSendPlan,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        Self::send_control_response(self, plan)
     }
 }
 
@@ -879,12 +1091,12 @@ pub enum GtpuReassemblyDrop {
 pub struct GtpuReassemblyCounters {
     /// Reassembled G-PDUs decapsulated and handed to the embedding ePDG.
     pub decapsulated: u64,
-    /// Messages passed through for the control plane (non-G-PDU GTP-U).
+    /// Messages passed through for controls or unknown required extensions.
     pub control_plane: u64,
     /// Reassembled messages dropped as malformed, including corrupt PDR
     /// state (dual-map TEID, reserved zero mark).
     pub malformed: u64,
-    /// G-PDUs dropped for an unknown TEID.
+    /// Unknown-TEID G-PDUs; no inner forwarding, with possible eBPF control handoff.
     pub unknown_teid: u64,
     /// G-PDUs dropped by the outer-endpoint binding or the marked-bearer
     /// owner journal.
@@ -907,7 +1119,8 @@ pub enum GtpuReassemblyOutcome {
         /// default bearer (mark zero), matching the fast path.
         bearer_mark: Option<GtpBearerMark>,
     },
-    /// Not a G-PDU: hand the message to the GTP-U control plane.
+    /// Control message or unknown required extension: hand the complete
+    /// datagram to the shared GTP-U control consumer, without decapsulation.
     ControlPlane,
     /// Fail-closed drop with a bounded typed reason.
     Dropped(GtpuReassemblyDrop),
@@ -932,6 +1145,682 @@ impl fmt::Debug for GtpuReassemblyOutcome {
             Self::Dropped(reason) => f.debug_tuple("Dropped").field(reason).finish(),
         }
     }
+}
+
+/// Stable, redaction-safe reason a backend-authoritative downlink consumer
+/// dropped one received G-PDU.
+///
+/// Every variant is value-free. It is returned by
+/// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)
+/// and never carries addresses, TEIDs, marks or packet bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GtpuDownlinkDrop {
+    /// GTP-U framing or the inner packet violates the fast-path invariants,
+    /// or the persisted PDR state is corrupt (dual-map TEID, reserved mark).
+    Malformed,
+    /// The outer endpoint binding, owner journal, grouped generation, or
+    /// complete Active commit graph did not authorize the packet.
+    BindingMismatch(DownlinkBindingMismatch),
+    /// The inner destination is not the session's UE PAA.
+    DestinationMismatch,
+    /// The attachment is not currently authoritative: cleanup-only,
+    /// successor-pending, traffic gate closed, hooks replaced, or a map read
+    /// failed. Nothing is decapsulated while authority is unknown.
+    StateUnavailable,
+    /// An authorized over-MTU packet exceeded its destination's inner
+    /// fragmentation budget ([`GtpuInnerFragmentRateLimit`]). It was neither
+    /// fragmented nor signalled.
+    InnerFragmentRateLimited,
+    /// An authorized over-MTU packet carries IPv4 options. The inner
+    /// fragmenter implements neither the RFC 791 option copy rules nor a
+    /// router's option processing, so the packet is not fragmented.
+    InnerUnfragmentable,
+}
+
+/// Bounded, value-free counters of one backend-owned downlink consumer.
+///
+/// These count the userspace post-reassembly path of one managed attachment
+/// registration. They are separate from the tc datapath's per-CPU counters
+/// and from the kernel's `/proc/net/snmp` reassembly counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GtpuDownlinkCounters {
+    /// G-PDUs authorized and decapsulated exactly once.
+    pub decapsulated: u64,
+    /// Non-G-PDU messages handed back for control processing.
+    pub control_plane: u64,
+    /// G-PDUs whose TEID selects no installed tunnel (no inner forwarding).
+    pub unknown_tunnel: u64,
+    /// Malformed framing, malformed inner packets and corrupt PDR state.
+    pub malformed: u64,
+    /// Endpoint, owner, generation or commit-graph authorization failures.
+    pub binding_drops: u64,
+    /// Inner destination was not the session PAA.
+    pub destination_mismatches: u64,
+    /// Attachment authority was unavailable when the datagram was processed.
+    pub state_unavailable: u64,
+    /// Authorized G-PDUs whose inner packet exceeded the session's downlink
+    /// inner MTU under the in-tunnel Packet Too Big opt-in and was not
+    /// forwarded.
+    pub packet_too_big: u64,
+    /// In-tunnel ICMP errors accepted by the local kernel for the peer.
+    pub packet_too_big_signalled: u64,
+    /// Over-MTU packets dropped without an error by the rate limit.
+    pub packet_too_big_rate_limited: u64,
+    /// Over-MTU packets for which no error may or could be sent: an invalid
+    /// invoking header (RFC 1812 5.2.2), a never-answer rule (RFC 1122
+    /// 3.2.2), no authorized default-bearer uplink, or a failed submission.
+    pub packet_too_big_unsendable: u64,
+    /// Cumulative datagrams the kernel dropped from the shared UDP/2152 queue
+    /// before the consumer read them (`SO_RXQ_OVFL`).
+    pub shared_queue_drops: u64,
+    /// Cumulative tc-steered over-MTU G-PDUs the kernel dropped from the
+    /// dedicated packet-too-big queue (`SO_RXQ_OVFL`). This is the hand-off
+    /// overload signal; tc itself keeps no hand-off counter.
+    pub packet_too_big_queue_drops: u64,
+    /// Authorized over-MTU packets fragmented under the default policy and
+    /// returned as [`GtpuDownlinkEvent::Fragmented`].
+    pub inner_fragmented: u64,
+    /// Fragments returned in those events.
+    pub inner_fragments: u64,
+    /// Over-MTU packets dropped by the per-destination fragmentation budget.
+    pub inner_fragment_rate_limited: u64,
+    /// Over-MTU packets not fragmented because they carry IPv4 options.
+    pub inner_unfragmentable: u64,
+}
+
+impl GtpuDownlinkCounters {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_drop(&mut self, reason: GtpuDownlinkDrop) {
+        let slot = match reason {
+            GtpuDownlinkDrop::Malformed => &mut self.malformed,
+            GtpuDownlinkDrop::BindingMismatch(_) => &mut self.binding_drops,
+            GtpuDownlinkDrop::DestinationMismatch => &mut self.destination_mismatches,
+            GtpuDownlinkDrop::StateUnavailable => &mut self.state_unavailable,
+            GtpuDownlinkDrop::InnerFragmentRateLimited => &mut self.inner_fragment_rate_limited,
+            GtpuDownlinkDrop::InnerUnfragmentable => &mut self.inner_unfragmentable,
+        };
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// One authorized inner packet produced from a received G-PDU.
+///
+/// The inner bytes are subscriber traffic. `Debug` exposes only the family
+/// and length; the bearer mark is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuDecapsulatedDownlink {
+    inner_packet: bytes::Bytes,
+    bearer_mark: Option<GtpBearerMark>,
+    family: crate::model::GtpAddressFamily,
+}
+
+impl fmt::Debug for GtpuDecapsulatedDownlink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuDecapsulatedDownlink")
+            .field("family", &self.family)
+            .field("inner_packet_len", &self.inner_packet.len())
+            .field(
+                "bearer_mark",
+                &self.bearer_mark.map(|_| "<redacted>").unwrap_or("default"),
+            )
+            .finish()
+    }
+}
+
+impl GtpuDecapsulatedDownlink {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(
+        inner_packet: bytes::Bytes,
+        bearer_mark: Option<GtpBearerMark>,
+        family: crate::model::GtpAddressFamily,
+    ) -> Self {
+        Self {
+            inner_packet,
+            bearer_mark,
+            family,
+        }
+    }
+
+    /// Complete inner IP packet, exactly as carried by the T-PDU.
+    #[must_use]
+    pub fn inner_packet(&self) -> &[u8] {
+        &self.inner_packet
+    }
+
+    /// Consume the event and return the inner packet bytes.
+    #[must_use]
+    pub fn into_inner_packet(self) -> bytes::Bytes {
+        self.inner_packet
+    }
+
+    /// Output bearer mark for XFRM policy selection. `None` is the default
+    /// bearer (mark zero), exactly as the tc fast path stamps it.
+    #[must_use]
+    pub const fn bearer_mark(&self) -> Option<GtpBearerMark> {
+        self.bearer_mark
+    }
+
+    /// Inner packet family.
+    #[must_use]
+    pub const fn family(&self) -> crate::model::GtpAddressFamily {
+        self.family
+    }
+}
+
+/// What happened to the single in-tunnel error for one over-MTU packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GtpuPacketTooBigSignal {
+    /// One RFC 1191 error was encapsulated in the default-bearer uplink G-PDU and
+    /// accepted by the local kernel toward the peer (not a delivery receipt).
+    Sent,
+    /// The attachment's error rate limit suppressed the error.
+    RateLimited,
+    /// The error could not be built or submitted; nothing was sent.
+    Unsendable,
+}
+
+/// A downlink inner packet that exceeded its session's inner MTU.
+///
+/// The packet itself is never forwarded or returned. `Debug` exposes only
+/// the family, the MTU (a path property) and the signal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuDownlinkPacketTooBig {
+    family: crate::model::GtpAddressFamily,
+    mtu: u16,
+    signal: GtpuPacketTooBigSignal,
+}
+
+impl GtpuDownlinkPacketTooBig {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn new(
+        family: crate::model::GtpAddressFamily,
+        mtu: u16,
+        signal: GtpuPacketTooBigSignal,
+    ) -> Self {
+        Self {
+            family,
+            mtu,
+            signal,
+        }
+    }
+
+    /// Inner packet family.
+    #[must_use]
+    pub const fn family(&self) -> crate::model::GtpAddressFamily {
+        self.family
+    }
+
+    /// The session's downlink inner MTU that the packet exceeded.
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Outcome of the in-tunnel error for this packet.
+    #[must_use]
+    pub const fn signal(&self) -> GtpuPacketTooBigSignal {
+        self.signal
+    }
+}
+
+/// Explicit per-session rate limit for in-tunnel Packet Too Big errors.
+///
+/// Each offending session (its local TEID) has its own token bucket
+/// (RFC 1812 section 4.3.2.8): up to `burst` errors may be sent back to back,
+/// and one token is restored every `refill_interval`. While the session
+/// stays tracked, a flood toward one PAA therefore exhausts only that
+/// session's budget, never another subscriber's. The default is a burst of
+/// 16 with one token per 10 ms (100 errors per second per session). At most
+/// 4,096 sessions are tracked per attachment; the least recently used bucket
+/// is evicted first, and a re-tracked session restarts with a full bucket.
+/// Past 4,096 concurrently tracked sessions, the per-session bound therefore
+/// does not hold (#1018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuPacketTooBigRateLimit {
+    burst: u32,
+    refill_interval: std::time::Duration,
+}
+
+impl Default for GtpuPacketTooBigRateLimit {
+    fn default() -> Self {
+        Self {
+            burst: 16,
+            refill_interval: std::time::Duration::from_millis(10),
+        }
+    }
+}
+
+impl GtpuPacketTooBigRateLimit {
+    /// Create a limit. A zero burst or zero interval returns `None`.
+    #[must_use]
+    pub fn new(burst: u32, refill_interval: std::time::Duration) -> Option<Self> {
+        (burst != 0 && !refill_interval.is_zero()).then_some(Self {
+            burst,
+            refill_interval,
+        })
+    }
+
+    /// Maximum back-to-back errors.
+    #[must_use]
+    pub const fn burst(&self) -> u32 {
+        self.burst
+    }
+
+    /// Interval restoring one token.
+    #[must_use]
+    pub const fn refill_interval(&self) -> std::time::Duration {
+        self.refill_interval
+    }
+}
+
+/// One token bucket for [`GtpuPacketTooBigRateLimit`] and
+/// [`GtpuInnerFragmentRateLimit`].
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct TokenBucket {
+    tokens: u32,
+    last_refill: std::time::Instant,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl TokenBucket {
+    /// Take one token at `now`, refilling whole intervals since the last
+    /// refill. Returns `false` when the bucket is empty.
+    fn admit(
+        &mut self,
+        burst: u32,
+        refill_interval: std::time::Duration,
+        now: std::time::Instant,
+    ) -> bool {
+        let last = self.last_refill;
+        let elapsed = now.saturating_duration_since(last);
+        let intervals = elapsed.as_nanos() / refill_interval.as_nanos().max(1);
+        if intervals > 0 {
+            let restored = u32::try_from(intervals).unwrap_or(u32::MAX);
+            self.tokens = self.tokens.saturating_add(restored).min(burst);
+            let advanced = refill_interval
+                .checked_mul(restored)
+                .and_then(|advance| last.checked_add(advance));
+            self.last_refill = advanced.unwrap_or(now).min(now);
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// Maximum sessions whose Packet Too Big budget, or destinations whose inner
+/// fragmentation budget, one attachment tracks.
+const PACKET_TOO_BIG_TRACKED_SESSIONS: usize = 4_096;
+
+/// Bounded per-key token buckets, least recently used first out, each with
+/// a small piece of per-key state.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct SessionBuckets<T> {
+    burst: u32,
+    refill_interval: std::time::Duration,
+    sessions: std::collections::HashMap<[u8; 4], (TokenBucket, std::time::Instant, T)>,
+}
+
+// Keys are TEIDs or UE addresses: never render them.
+impl<T> fmt::Debug for SessionBuckets<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionBuckets")
+            .field("burst", &self.burst)
+            .field("refill_interval", &self.refill_interval)
+            .field("tracked", &self.sessions.len())
+            .finish()
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl<T> SessionBuckets<T> {
+    fn new(burst: u32, refill_interval: std::time::Duration) -> Self {
+        Self {
+            burst,
+            refill_interval,
+            sessions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Take one token from `key`'s bucket at `now`, creating it full with
+    /// `init` state when untracked. Returns that key's state, or `None` when
+    /// its bucket is empty; other keys are unaffected.
+    fn admit(
+        &mut self,
+        key: [u8; 4],
+        now: std::time::Instant,
+        init: impl FnOnce() -> T,
+    ) -> Option<&mut T> {
+        if !self.sessions.contains_key(&key)
+            && self.sessions.len() >= PACKET_TOO_BIG_TRACKED_SESSIONS
+        {
+            if let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, (_, last_use, _))| *last_use)
+                .map(|(key, _)| *key)
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+        let (burst, refill_interval) = (self.burst, self.refill_interval);
+        let (bucket, last_use, state) = self.sessions.entry(key).or_insert_with(|| {
+            (
+                TokenBucket {
+                    tokens: burst,
+                    last_refill: now,
+                },
+                now,
+                init(),
+            )
+        });
+        *last_use = now;
+        bucket.admit(burst, refill_interval, now).then_some(state)
+    }
+}
+
+/// Per-session token buckets for [`GtpuPacketTooBigRateLimit`].
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct PacketTooBigLimiter(SessionBuckets<()>);
+
+impl Default for PacketTooBigLimiter {
+    fn default() -> Self {
+        Self::new(GtpuPacketTooBigRateLimit::default())
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl PacketTooBigLimiter {
+    pub(crate) fn new(limit: GtpuPacketTooBigRateLimit) -> Self {
+        Self(SessionBuckets::new(limit.burst, limit.refill_interval))
+    }
+
+    /// Take one token from `session`'s bucket at `now`. Returns `false` when
+    /// that session's bucket is empty; other sessions are unaffected.
+    pub(crate) fn admit(&mut self, session: [u8; 4], now: std::time::Instant) -> bool {
+        self.0.admit(session, now, || ()).is_some()
+    }
+}
+
+/// An authorized over-MTU downlink IPv4 packet fragmented before
+/// encapsulation under the default
+/// [`GtpuDownlinkOversizePolicy::FragmentInner`](crate::GtpuDownlinkOversizePolicy::FragmentInner).
+///
+/// Every fragment is one complete IPv4 datagram of at most [`Self::mtu`]
+/// octets, in offset order, built by the RFC 791 section 3.2 procedure: the
+/// original 20-octet header is copied, and the total length, More Fragments
+/// flag, fragment offset and header checksum are set per fragment. Don't
+/// Fragment is cleared, the owner-approved RFC 4459 section 3.4 policy. All
+/// fragments carry one Identification: the original's when the packet was
+/// itself a fragment, otherwise a fresh non-zero value from the destination's
+/// own sequence (RFC 6864 sections 4.1 and 4.3). TTL and every other field
+/// are unchanged: unlike a forwarding router (RFC 1812 section 5.3.1), this
+/// path does not decrement TTL.
+///
+/// The caller injects every fragment, in order, toward XFRM with
+/// [`Self::bearer_mark`], exactly as it injects a
+/// [`GtpuDecapsulatedDownlink`]. The fragments are subscriber traffic:
+/// `Debug` exposes only their count and the MTU; the bearer mark is
+/// redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuFragmentedDownlink {
+    fragments: Vec<bytes::Bytes>,
+    bearer_mark: Option<GtpBearerMark>,
+    mtu: u16,
+}
+
+impl fmt::Debug for GtpuFragmentedDownlink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuFragmentedDownlink")
+            .field("fragments", &self.fragments.len())
+            .field("mtu", &self.mtu)
+            .field(
+                "bearer_mark",
+                &self.bearer_mark.map(|_| "<redacted>").unwrap_or("default"),
+            )
+            .finish()
+    }
+}
+
+impl GtpuFragmentedDownlink {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(
+        fragments: Vec<bytes::Bytes>,
+        bearer_mark: Option<GtpBearerMark>,
+        mtu: u16,
+    ) -> Self {
+        Self {
+            fragments,
+            bearer_mark,
+            mtu,
+        }
+    }
+
+    /// The complete IPv4 fragments, in offset order.
+    #[must_use]
+    pub fn fragments(&self) -> &[bytes::Bytes] {
+        &self.fragments
+    }
+
+    /// Consume the event and return the fragments, in offset order.
+    #[must_use]
+    pub fn into_fragments(self) -> Vec<bytes::Bytes> {
+        self.fragments
+    }
+
+    /// Output bearer mark for XFRM policy selection. `None` is the default
+    /// bearer (mark zero), exactly as the tc fast path stamps it.
+    #[must_use]
+    pub const fn bearer_mark(&self) -> Option<GtpBearerMark> {
+        self.bearer_mark
+    }
+
+    /// The session's downlink inner MTU that the packet exceeded; no
+    /// fragment is longer.
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Inner packet family: always IPv4. IPv6 has no in-network
+    /// fragmentation (RFC 8200 section 4.5).
+    #[must_use]
+    pub const fn family(&self) -> crate::model::GtpAddressFamily {
+        crate::model::GtpAddressFamily::Ipv4
+    }
+}
+
+/// Longest time an IPv4 datagram can remain in the internet system: the
+/// 255-second Time to Live ceiling of RFC 791 section 3.1. It bounds the
+/// maximum datagram lifetime within which RFC 6864 section 4.3 forbids a
+/// source of non-atomic datagrams to repeat an Identification.
+const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(255);
+
+/// Explicit per-destination rate limit for inner fragmentation under the
+/// default [`GtpuDownlinkOversizePolicy::FragmentInner`](crate::GtpuDownlinkOversizePolicy::FragmentInner).
+///
+/// Each destination (the session's UE address) has its own token bucket:
+/// up to `burst` over-MTU packets may be fragmented back to back, and one
+/// token is restored every `refill_interval`. While the destination stays
+/// tracked under one unchanged limit, this bounds the consumer's
+/// fragmentation work per destination, so a flood toward one PAA exhausts
+/// only its own budget. It also keeps the destination's 16-bit
+/// Identification sequence from repeating within the maximum datagram
+/// lifetime, as RFC 6864 sections 4.3 and 5.2 require of a source of
+/// non-atomic datagrams: a limit that could admit more than 65,535 packets
+/// in 255 seconds (`burst` + ⌈255 s / `refill_interval`⌉) is refused. The
+/// default is a burst of 64 with one token per 4 ms (250 packets per second
+/// per destination), at most 64 + 63,750 packets in any 255 seconds.
+///
+/// At most 4,096 destinations are tracked per attachment. The least recently
+/// used is evicted first, and restarts with a full bucket and a fresh
+/// keyed-random Identification sequence. Past 4,096 concurrently tracked
+/// destinations, Identification uniqueness is therefore probabilistic and
+/// the per-destination bound does not hold. A new attachment registration
+/// (a process restart, a re-adoption or a re-created attachment) likewise
+/// restarts every destination with a full bucket and a new random sequence,
+/// possibly within 255 seconds of the previous registration's
+/// Identifications. Admissions before and after a limit replacement are not
+/// counted together (#1018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuInnerFragmentRateLimit {
+    burst: u32,
+    refill_interval: std::time::Duration,
+}
+
+impl Default for GtpuInnerFragmentRateLimit {
+    fn default() -> Self {
+        Self {
+            burst: 64,
+            refill_interval: std::time::Duration::from_millis(4),
+        }
+    }
+}
+
+impl GtpuInnerFragmentRateLimit {
+    /// Create a limit. A zero burst, a zero interval, or a limit that could
+    /// admit more than 65,535 packets within 255 seconds returns `None`.
+    ///
+    /// A bucket can admit `burst` + ⌈255 s / `refill_interval`⌉ packets in a
+    /// half-open 255-second window: it opens with a full bucket just before
+    /// a refill instant and takes every refill as it arrives.
+    #[must_use]
+    pub fn new(burst: u32, refill_interval: std::time::Duration) -> Option<Self> {
+        if burst == 0 || refill_interval.is_zero() {
+            return None;
+        }
+        let refills = MAXIMUM_DATAGRAM_LIFETIME
+            .as_nanos()
+            .div_ceil(refill_interval.as_nanos());
+        (u128::from(burst) + refills <= u128::from(u16::MAX)).then_some(Self {
+            burst,
+            refill_interval,
+        })
+    }
+
+    /// Maximum back-to-back fragmented packets per destination.
+    #[must_use]
+    pub const fn burst(&self) -> u32 {
+        self.burst
+    }
+
+    /// Interval restoring one token.
+    #[must_use]
+    pub const fn refill_interval(&self) -> std::time::Duration {
+        self.refill_interval
+    }
+}
+
+/// Per-destination budgets and Identification sequences for
+/// [`GtpuInnerFragmentRateLimit`].
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct InnerFragmentBudget {
+    buckets: SessionBuckets<u16>,
+    /// Per-registration random SipHash keys seeding each destination's
+    /// first Identification, so a re-tracked destination restarts from an
+    /// unpredictable value rather than a fixed one. It can still overlap
+    /// recently used values (#1018).
+    seed_keys: std::collections::hash_map::RandomState,
+    seeded: u64,
+}
+
+impl Default for InnerFragmentBudget {
+    fn default() -> Self {
+        Self::new(GtpuInnerFragmentRateLimit::default())
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl InnerFragmentBudget {
+    pub(crate) fn new(limit: GtpuInnerFragmentRateLimit) -> Self {
+        Self {
+            buckets: SessionBuckets::new(limit.burst, limit.refill_interval),
+            seed_keys: std::collections::hash_map::RandomState::new(),
+            seeded: 0,
+        }
+    }
+
+    /// Replace the limit. Tracked destinations keep their Identification
+    /// sequences and at most their current tokens, so a replacement never
+    /// grants an extra burst.
+    pub(crate) fn set_limit(&mut self, limit: GtpuInnerFragmentRateLimit) {
+        self.buckets.burst = limit.burst;
+        self.buckets.refill_interval = limit.refill_interval;
+        for (bucket, _, _) in self.buckets.sessions.values_mut() {
+            bucket.tokens = bucket.tokens.min(limit.burst);
+        }
+    }
+
+    /// Take one token from `destination`'s budget at `now` and, for an
+    /// atomic datagram (RFC 6864 section 4), assign the next non-zero
+    /// Identification of its sequence. Returns `None` when the budget is
+    /// empty; `Some(None)` admits a datagram that keeps its own
+    /// Identification.
+    pub(crate) fn admit(
+        &mut self,
+        destination: [u8; 4],
+        now: std::time::Instant,
+        atomic: bool,
+    ) -> Option<Option<u16>> {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        self.seeded = self.seeded.wrapping_add(1);
+        let (keys, seeded) = (&self.seed_keys, self.seeded);
+        let next = self.buckets.admit(destination, now, || {
+            let mut hasher = keys.build_hasher();
+            destination.hash(&mut hasher);
+            seeded.hash(&mut hasher);
+            // 1..=65,535: zero is never assigned.
+            u16::try_from(hasher.finish() % u64::from(u16::MAX)).map_or(1, |value| value + 1)
+        })?;
+        if !atomic {
+            return Some(None);
+        }
+        let identification = *next;
+        *next = match next.wrapping_add(1) {
+            0 => 1,
+            following => following,
+        };
+        Some(Some(identification))
+    }
+}
+
+/// One event from a backend-authoritative shared GTP-U receive queue.
+///
+/// See [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GtpuDownlinkEvent {
+    /// The G-PDU was authorized by the backend's own commit-last map reads
+    /// and decapsulated exactly once. The caller delivers the inner packet
+    /// (route/XFRM injection with the returned mark).
+    Decapsulated(GtpuDecapsulatedDownlink),
+    /// A non-G-PDU message (typed control, unmodelled message or unsupported
+    /// required extension). Use the existing response planners.
+    Control(crate::control_port::GtpuControlDatagram),
+    /// A G-PDU whose TEID currently selects no installed tunnel. It was not
+    /// decapsulated. This is an observation, not an absence receipt: the
+    /// caller must establish tunnel absence before planning an Error
+    /// Indication.
+    UnknownTunnel(crate::control_port::GtpuControlDatagram),
+    /// Fail-closed drop with a bounded typed reason.
+    Dropped(GtpuDownlinkDrop),
+    /// An authorized packet exceeded the session's downlink inner MTU under
+    /// the in-tunnel Packet Too Big opt-in. It was not forwarded; at most one
+    /// in-tunnel error was sent for it.
+    PacketTooBig(GtpuDownlinkPacketTooBig),
+    /// An authorized inner IPv4 packet with Don't Fragment set exceeded the
+    /// session's downlink inner MTU and was fragmented (the default policy).
+    /// The caller injects every fragment, in order, toward XFRM with the
+    /// returned mark, exactly like a `Decapsulated` packet.
+    Fragmented(GtpuFragmentedDownlink),
 }
 
 /// Post-reassembly downlink consumer: the SDK GTP-U consumer that kernel
@@ -1517,9 +2406,9 @@ mod tests {
         }
 
         let valid = SocketAddr::V4(SocketAddrV4::new(LOCAL, GTPU_PORT));
-        assert!(validate_reassembly_socket_address(valid, LOCAL).is_ok());
+        assert!(validate_reassembly_socket_address(valid, LOCAL, GTPU_PORT).is_ok());
         assert_eq!(
-            validate_reassembly_socket_address(valid, Ipv4Addr::UNSPECIFIED)
+            validate_reassembly_socket_address(valid, Ipv4Addr::UNSPECIFIED, GTPU_PORT)
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::InvalidInput
@@ -1530,7 +2419,7 @@ mod tests {
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, GTPU_PORT, 0, 0)),
         ] {
             assert_eq!(
-                validate_reassembly_socket_address(invalid, LOCAL)
+                validate_reassembly_socket_address(invalid, LOCAL, GTPU_PORT)
                     .unwrap_err()
                     .kind(),
                 std::io::ErrorKind::InvalidData
@@ -1585,5 +2474,124 @@ mod tests {
             authoritative_ingress_ifindex(8, 7).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    /// The most packets `limit` lets one destination fragment in any
+    /// half-open 255-second window: open the window with a full bucket just
+    /// before a refill instant, drain it, then take every refill as it comes.
+    fn worst_case_lifetime_admissions(limit: GtpuInnerFragmentRateLimit) -> u32 {
+        use std::time::{Duration, Instant};
+        let mut budget = InnerFragmentBudget::new(limit);
+        let destination = UE.octets();
+        let start = Instant::now();
+        // Refill instants are start + k * interval; idle until full again.
+        assert!(budget.admit(destination, start, true).is_some());
+        let interval = limit.refill_interval();
+        let full_refill = start + interval * (limit.burst() + 2);
+        let window_start = full_refill - Duration::from_nanos(1);
+        let window_end = window_start + Duration::from_secs(255);
+        let mut admitted = 0;
+        while budget.admit(destination, window_start, true).is_some() {
+            admitted += 1;
+        }
+        let mut now = full_refill;
+        while now < window_end {
+            assert!(budget.admit(destination, now, true).is_some());
+            admitted += 1;
+            now += interval;
+        }
+        admitted
+    }
+
+    /// RFC 6864 section 4.3: a destination's 65,535 non-zero Identifications
+    /// must not wrap within the 255-second maximum datagram lifetime, so an
+    /// accepted limit may admit at most 65,535 packets in any such window.
+    #[test]
+    fn inner_fragment_rate_limit_never_admits_65_536_in_one_lifetime() {
+        use std::time::Duration;
+        for (burst, nanos) in [
+            (1, 3_891_000),
+            (1, 3_892_000),
+            (16, 3_892_000),
+            (1_785, 4_000_000),
+            (1_786, 4_000_000),
+        ] {
+            let Some(limit) = GtpuInnerFragmentRateLimit::new(burst, Duration::from_nanos(nanos))
+            else {
+                continue;
+            };
+            let admitted = worst_case_lifetime_admissions(limit);
+            assert!(
+                admitted <= u32::from(u16::MAX),
+                "burst {burst}, interval {nanos} ns admits {admitted} in 255 s"
+            );
+        }
+        // burst + ceil(255 s / interval): 16 + 65,520 > 65,535.
+        assert_eq!(
+            GtpuInnerFragmentRateLimit::new(16, Duration::from_nanos(3_892_000)),
+            None
+        );
+        // The bound is exact, not merely safe: 1,785 + 63,750 = 65,535 is
+        // accepted, and its worst case uses every Identification once.
+        let exact = GtpuInnerFragmentRateLimit::new(1_785, Duration::from_millis(4));
+        assert!(exact.is_some(), "the largest safe burst must be accepted");
+        assert_eq!(exact.map(worst_case_lifetime_admissions), Some(65_535));
+        // The default is accepted, and its bound is tight: 64 + 63,750.
+        let default = GtpuInnerFragmentRateLimit::default();
+        assert_eq!(
+            GtpuInnerFragmentRateLimit::new(64, Duration::from_millis(4)),
+            Some(default)
+        );
+        assert_eq!(worst_case_lifetime_admissions(default), 63_814);
+    }
+
+    /// Past 4,096 tracked destinations the least recently used one is
+    /// evicted, and a refused admission still counts as a use, so a flooding
+    /// destination stays tracked and limited.
+    #[test]
+    fn session_buckets_evict_the_least_recently_used_key() {
+        use std::time::{Duration, Instant};
+        let limit = GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap();
+        let mut budget = InnerFragmentBudget::new(limit);
+        let start = Instant::now();
+        let at = |step: u32| start + Duration::from_micros(u64::from(step));
+        // Fill the table; every bucket is then empty.
+        for key in 0..4_096_u32 {
+            assert!(budget.admit(key.to_be_bytes(), at(key), true).is_some());
+        }
+        // Key 0 is refused but used, so key 1 is now the oldest.
+        assert_eq!(budget.admit(0_u32.to_be_bytes(), at(4_096), true), None);
+        assert!(budget
+            .admit(4_096_u32.to_be_bytes(), at(4_097), true)
+            .is_some());
+        assert_eq!(budget.admit(0_u32.to_be_bytes(), at(4_098), true), None);
+        assert_eq!(budget.admit(2_u32.to_be_bytes(), at(4_099), true), None);
+        assert!(
+            budget.admit(1_u32.to_be_bytes(), at(4_100), true).is_some(),
+            "only the least recently used key was evicted"
+        );
+    }
+
+    /// A re-tracked destination's Identification sequence restarts from a
+    /// fresh keyed seed, not from the start it had before its eviction.
+    #[test]
+    fn a_retracked_destination_restarts_from_a_fresh_seed() {
+        use std::time::{Duration, Instant};
+        let limit = GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap();
+        let mut budget = InnerFragmentBudget::new(limit);
+        let start = Instant::now();
+        let mut starts = std::collections::HashSet::new();
+        for round in 0..3_u32 {
+            let now = start + Duration::from_secs(u64::from(round));
+            starts.insert(budget.admit(UE.octets(), now, true).unwrap().unwrap());
+            // 4,096 other destinations push it out of the table.
+            for index in 0..4_096_u32 {
+                let other = (0x0100_0000 + round * 4_096 + index).to_be_bytes();
+                let later = now + Duration::from_micros(u64::from(index) + 1);
+                assert!(budget.admit(other, later, true).is_some());
+            }
+        }
+        // Equal starts in all three rounds have probability 65,535^-2.
+        assert!(starts.len() > 1, "a re-tracked destination reused its seed");
     }
 }

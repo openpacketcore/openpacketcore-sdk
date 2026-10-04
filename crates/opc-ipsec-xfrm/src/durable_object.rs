@@ -25,7 +25,7 @@ use std::{
 };
 
 use rand::{rngs::SysRng, TryRng};
-use sha2_zeroize::{Digest, Sha256};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 

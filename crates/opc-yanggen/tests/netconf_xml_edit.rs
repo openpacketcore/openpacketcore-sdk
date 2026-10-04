@@ -28,7 +28,7 @@ fn build_input() -> CanonicalInput {
         ..Default::default()
     };
 
-    let nodes = vec![
+    let mut nodes = vec![
         SchemaNode {
             path: "/ex:system".to_string(),
             module: "example".to_string(),
@@ -285,6 +285,74 @@ fn build_input() -> CanonicalInput {
         },
     ];
 
+    // Independently authored SDK recovery fixture: multiple candidate values
+    // under distinct keyed APNs, with generated leafref validation.
+    nodes[0].child_paths.extend([
+        "/ex:system/ex:gateways".to_string(),
+        "/ex:system/ex:access".to_string(),
+    ]);
+    for (path, kind, children, keys, type_ref) in [
+        (
+            "/ex:system/ex:gateways",
+            SchemaNodeKind::List,
+            vec!["/ex:system/ex:gateways/ex:id"],
+            vec!["id"],
+            None,
+        ),
+        (
+            "/ex:system/ex:gateways/ex:id",
+            SchemaNodeKind::Leaf,
+            vec![],
+            vec![],
+            Some(TypeRef::Uint16),
+        ),
+        (
+            "/ex:system/ex:access",
+            SchemaNodeKind::Container,
+            vec!["/ex:system/ex:access/ex:apn"],
+            vec![],
+            None,
+        ),
+        (
+            "/ex:system/ex:access/ex:apn",
+            SchemaNodeKind::List,
+            vec![
+                "/ex:system/ex:access/ex:apn/ex:name",
+                "/ex:system/ex:access/ex:apn/ex:pgw-candidates",
+            ],
+            vec!["name"],
+            None,
+        ),
+        (
+            "/ex:system/ex:access/ex:apn/ex:name",
+            SchemaNodeKind::Leaf,
+            vec![],
+            vec![],
+            Some(TypeRef::String),
+        ),
+        (
+            "/ex:system/ex:access/ex:apn/ex:pgw-candidates",
+            SchemaNodeKind::LeafList,
+            vec![],
+            vec![],
+            Some(TypeRef::LeafRef {
+                target_path: "/ex:system/ex:gateways/ex:id".to_string(),
+            }),
+        ),
+    ] {
+        nodes.push(SchemaNode {
+            path: path.to_string(),
+            module: "example".to_string(),
+            kind,
+            config: true,
+            child_paths: children.into_iter().map(str::to_string).collect(),
+            key_leaves: keys.into_iter().map(str::to_string).collect(),
+            type_ref,
+            source: source.clone(),
+            ..Default::default()
+        });
+    }
+
     let input = GenerationInput {
         profile: "test".to_string(),
         lockfile: opc_yanggen::ir::ModuleLockfile {
@@ -380,6 +448,11 @@ opc-mgmt-limits = {{ path = "{}" }}
 opc-redaction = {{ path = "{}" }}
 opc-gnmi-server = {{ path = "{}" }}
 opc-netconf-server = {{ path = "{}" }}
+opc-config-bus = {{ path = "{}/crates/opc-config-bus" }}
+opc-mgmt-audit = {{ path = "{}/crates/opc-mgmt-audit" }}
+opc-mgmt-authz = {{ path = "{}/crates/opc-mgmt-authz" }}
+opc-nacm = {{ path = "{}/crates/opc-nacm" }}
+tokio = {{ version = "1", features = ["macros", "rt", "sync", "io-util", "time"] }}
 "#,
         time_version,
         config_model_path.display(),
@@ -390,6 +463,10 @@ opc-netconf-server = {{ path = "{}" }}
         redaction_path.display(),
         gnmi_server_path.display(),
         netconf_server_path.display(),
+        workspace_dir.display(),
+        workspace_dir.display(),
+        workspace_dir.display(),
+        workspace_dir.display(),
     );
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 
@@ -398,6 +475,12 @@ opc-netconf-server = {{ path = "{}" }}
     fs::write(
         tests_dir.join("netconf_xml_edit.rs"),
         include_str!("fixtures/netconf_xml_edit_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests_dir.join("netconf_leaf_list_service.rs"),
+        include_str!("fixtures/netconf_leaf_list_service_test.rs"),
     )
     .unwrap();
 

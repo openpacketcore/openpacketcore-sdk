@@ -10,7 +10,115 @@ eBPF, mock, and unsupported backends, and keeps raw syscalls in
 The crate does not implement GTP-C, PFCP, namespace management, route steering,
 XFRM policy, deployment defaults, or traffic-readiness policy.
 
+## Experimental N3 packet and intent boundary
+
+The `n3` module keeps received uplink UPF TNL information separate from
+locally supplied downlink N3IWF TNL information. `N3ForwardingIntent` records
+those directions and a caller-selected QFI/complete-mark association; it is
+not an authorized install request or readback receipt. `N3ForwardingRole` is
+separate from the Linux GTP netdevice role.
+
+`N3UplinkEncapsulation` appends a canonical G-PDU with one uplink PSC using
+the existing `opc-proto-gtpu` encoders. `N3PacketView` borrows a complete
+G-PDU and exposes validated direction/QFI/RQI/PPI metadata and an opaque
+nonempty inner payload. It rejects trailing datagrams, duplicate/missing PSC,
+unsupported required extensions, zero TEID, and direction mismatches. Parsing
+does not authenticate a packet or establish session/selector ownership.
+
+`GtpuSessionEntry::from_n3` projects an intent into the existing grouped
+selector-authority path. The eBPF attachment can expose
+`n3_fixed_flow_capability`: one fixed QFI per inner-family entry, uplink PSC
+insertion, matching downlink PSC, complete bearer marks, and exact atomic
+generation readback. Installation and retirement require the protected opaque
+selector namespace. See [fixed-flow forwarding](../../docs/n3-fixed-flow-forwarding.md)
+for the wire layout, native evidence and limits.
+
+`send_n3_end_markers` consumes an exact retired claim and submits markers on
+the original IPv4 tunnels after classifier quiescence. It reuses the managed
+UDP/2152 control socket. Its completion reports local submission; it grants
+no selector reuse or peer-delivery authority. See
+[End Marker retirement](../../docs/n3-end-marker-retirement.md) for unsupported
+profiles, cancellation, retry and ordering limits.
+
+All shipped adapters still return `GtpuCapability::Missing` from the broader
+`n3_forwarding_capability(N3ForwardingRole::N3iwf)`. Multiple QFIs for the same
+PAA, reflective QoS, in-place QFI replacement and full-profile End Marker
+support remain unavailable. Linux kernel-GTP, mock and unsupported
+adapters return `Missing` for the new attachment-scoped capability. The software
+packet helpers alone confer no install authority; see [N3 conformance](CONFORMANCE.md).
+
+## Grouped device shutdown for retained restart
+
+`EbpfGtpuDataplaneBackend::suspend_grouped_device` detaches both exact owned tc
+hooks while preserving the complete map graph and selector-authority markers.
+Use it after stopping producers when a protected grouped namespace must reopen
+its existing ledger. Success invalidates the backend's old managed attachment;
+recreate the exact stable device/endpoints and open the retained authority before
+resuming group work. Active and retired history remain subject to the existing
+ownership and selector-reuse checks.
+
+Ordinary `remove_device` still detaches and unpins its graph. It is unsuitable
+for a protected namespace that must retain kernel history across restart.
+Suspension refuses ordinary, cleanup-only and unadmitted successor handles,
+foreign hooks, replaced pins and incomplete identities. Cancellation before
+dispatch has no effect; after dispatch the owned worker completes under the
+operation/namespace locks. Partial detach remains an error with pins retained.
+
+This operation does not restore missing maps, relocate used authority to a new
+control root, reset a namespace, or prove packet continuity. The privileged
+dual-stack lane checks exact map-object preservation and retired-history reopen.
+The `selector_retained_restart` example additionally reopens an encrypted,
+file-backed ledger with active and retired groups. Run it only through an
+isolated, operator-authorized Linux mount/network namespace with private bpffs
+and the documented synthetic interface; it is not a live deployment command.
+
 ## API Shape
+
+The experimental protected selector coordinator exposes an explicit
+`relocate_never_admitted_protected` operation for a namespace whose complete
+permanent ledger proves no group has ever been admitted or sealed. It retains
+the same ledger and secret, commits an exact replacement before its backend
+effect, and resumes only that replacement after interruption. Ordinary open
+and provision operations remain strict. Any prior session history excludes
+this operation; it is not general restart or packet-continuity recovery. See
+[RFC 018](../../docs/rfc/018-never-admitted-selector-relocation.md).
+
+The [`control_port` module](docs/control-port.md) adds bounded control
+datagrams and response plans on the existing Linux IPv4 reassembly socket.
+One consumer shares its UDP/2152 queue with user-packet reassembly. Plans
+preserve message-specific response tuples and require the exact receiving
+socket; admission and aggregate rate policy remain with the caller. This
+does not yet expose Linux kernel-GTP sockets or qualify backend parity,
+End Marker ordering or N3 forwarding.
+On an eBPF attachment, `try_receive_downlink` on the same port is the
+backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
+it authorizes against the backend's own grouped and v5 maps (commit read
+last) and returns the exact inner packet and bearer mark, or a value-free
+drop. With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
+steers an over-MTU DF downlink IPv4 packet to a dedicated backend-owned queue
+instead of letting the host drop it with its own error. The consumer then
+applies the context's RFC 4459 policy:
+
+- **Default** (`GtpuDownlinkInnerMtu::new`): clear DF and fragment the inner
+  packet before encapsulation (RFC 4459 section 3.4). `try_receive_downlink`
+  returns RFC 791 fragments of at most the MTU, with the bearer mark, for the
+  caller to inject toward XFRM; the UE reassembles them. Fragmenting a DF
+  datagram is an owner-approved deviation from RFC 791, RFC 1191 and RFC 6864
+  DF semantics, and the originator's PMTUD never learns the tunnel MTU.
+- **Opt-in** (`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`): drop the
+  packet and signal it at most once inside the UE's default-bearer uplink
+  G-PDU (RFC 1191). The error's source is the subscriber's own PAA, the only
+  address the PGW's anti-spoofing admits; this departs from RFC 1812 4.3.2.4,
+  and the originator attributes the error to the subscriber.
+
+Inner IPv6 contexts refuse both policies: IPv6 has no in-network
+fragmentation (RFC 8200).
+
+Open the control port before installing an MTU-bearing context, and keep
+draining it. While its queues are not bound, the kernel may answer steered
+packets with rate-limited ICMP Port Unreachable toward the peer (#1019). MTU-bearing
+contexts must be drained before an SDK downgrade. See
+[control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
@@ -67,7 +175,11 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   backend-neutral parser can represent (including IPv4 and IPv6 semantics),
   and returns a pre-existing bearer mark or a silent drop. The unfiltered
   bearer is the explicit default fallback; absent one, no-match, malformed,
-  fragmented, unsafe-to-parse, and foreign-PAA packets drop.
+  fragmented, unsafe-to-parse, and foreign-PAA packets drop. Its typed
+  `TftUplinkPaaSet` holds at most one IPv4 `/32` and one canonical IPv6
+  `/64`; any inner source inside the IPv6 prefix matches, and an IPv4v6 PDN
+  uses one classifier for both families. The native eBPF ABI remains
+  IPv4-only and rejects an IPv6 or dual-family set.
   `GtpuDataplaneBackend::tft_uplink_classification_capability` is separate from
   `per_bearer_marking`: a backend must not advertise it until its actual
   dataplane program and exact readback ABI support it. The deterministic mock
@@ -76,8 +188,35 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   self-owned snapshot is replaced without a transient absent or wrong-bearer
   publication; foreign ownership conflicts and partial, mixed, or stale state
   is indeterminate. Native exact removal first publishes a SHA-256-bound
-  metadata tombstone that the tc program rejects, removes only canonical rows
-  under the current authority, and removes the tombstone last. Its durable
+  metadata tombstone, removes only canonical rows under the current
+  authority, and removes the tombstone last. The tc program classifies a
+  tombstone whose classifier has a default bearer as absent, so default-bearer
+  uplink continues through removal without any row being read; it rejects a
+  tombstone without a default bearer. Before deleting any row, each removal
+  attempt waits for every tc invocation that could have copied the active
+  selector before the tombstone. The adapter prefers the qualified GLOBAL
+  membarrier grace. If GLOBAL is unavailable, including on `nohz_full`, TFT
+  uses a successful userspace update of a private, unpinned ARRAY_OF_MAPS.
+  The reviewed kernel path waits for a full RCU grace for non-sleepable TC
+  readers. This fallback requires the recognized non-realtime SMP build
+  profile and Linux 6.8–6.19, 7.0–7.2, or `5.14.0-427.*el9_4*`; object
+  loadability and exact graph/schema readback remain separate prerequisites.
+  Both private map creation and a real update must succeed before the fallback
+  is offered, and every reclamation performs a fresh wait. Reusing a retained
+  inactive bank also waits before deleting or overwriting its rows. Where
+  neither grace is qualified and usable, TFT classification reports `Missing`,
+  and both reconciliation that
+  would install or replace a classifier and exact removal refuse with
+  `UnsupportedFeature` before any mutation, leaving any published classifier
+  complete. A wait that fails after the tombstone is published deletes
+  nothing and returns `Indeterminate` for a retry; a failed bank-reuse wait
+  preserves both banks and the active selector.
+  `tft_uplink_classification_unavailable_reason` adds a value-free diagnostic
+  reason without granting mutation authority. PREEMPT_RT, unreviewed fallback
+  releases, and unknown build profiles remain refused. This does not change
+  grouped-selector grace or qualify sleepable BPF, packet drain, or latency.
+  See the [kernel grace contract](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#tft-reader-grace).
+  Its durable
   dense-rank cursor authorizes each active-row deletion before it occurs, so a
   retry accepts only the exact remaining suffix plus any acknowledged-loss
   rows in the authorized prefix; an unexplained missing row fails closed.
@@ -228,6 +367,39 @@ that ownership check and will terminally revoke before returning
 ownership and returns unsupported without mutating another backend's authority.
 The publish transaction is crate-private, so only SDK-owned trusted adapters
 can complete rebind.
+
+For an unchanged canonical authority, `renew_gtpu_traffic_proof` starts a new
+assessment while the predecessor remains valid through its original expiry.
+Pass the current opaque proof and a lease from the same registered store. The
+eBPF adapter retains at most two attempts for that group, inside its existing
+global capacity: one issued predecessor and one successor. The successor gets
+a fresh registration, publication identity, secret and sample stream; it must
+collect its own paired bidirectional observations. Its traffic cannot extend
+the predecessor's assessment. Ordinary `begin_gtpu_traffic_proof` still
+supersedes the group's existing attempts.
+
+Keep the predecessor session until the successor has yielded an opaque proof
+and the product has validated and published it under its current guards. Then
+close the predecessor before another renewal. This exact cleanup cannot delete
+the successor registration. During collection, validation of the predecessor
+checks the SDK-owned successor relation and its current registration, source,
+attachment, group and canonical authority. Old challenges cannot prove the
+successor. Source loss, malformed or stale observations, hook drift and
+authority replacement still fail closed; no positive readiness flag is cached.
+
+Cancellation before session delivery leaves one pending successor recoverable
+by repeating renewal with the same current predecessor. No third registration
+is allocated. Closing or dropping the predecessor retires an undelivered
+successor; after delivery the new session owns its own cleanup. Expiry during
+the async handoff refuses delivery, and the caller must close the predecessor
+before beginning a fresh assessment. Failed publication remains terminal and
+exactly recoverable; renewal does not promise continuity across an uncertain
+kernel effect. Unsupported backends inherit a fail-closed default.
+
+Scheduling early enough to gather the replacement observations, publishing
+under product guards, and qualifying uninterrupted readiness remain CNF
+responsibilities. The renewal tests exercise the adapter with a fake runtime;
+they are not live packet-forwarding or carrier qualification evidence.
 
 The product drives an authenticated ICMP Echo challenge through the live
 session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero
@@ -795,10 +967,50 @@ peer contract. Missing state is never interpreted as `Any`.
 install. The eBPF adapter derives the rest of the public
 `GtpuDownlinkEndpoint` from the request's peer, the managed device's concrete
 local address, and the attachment ifindex. The semantic API accepts canonical
-IPv4 or IPv6 endpoint pairs so adapters can share one contract. The legacy
-single-context eBPF API remains IPv4-only. The grouped-session API and current
-tc object support independent inner and outer IPv4/IPv6 families, including
-cross-family transport and simultaneous IPv4v6 entries.
+IPv4 or IPv6 endpoint pairs so adapters can share one contract. The
+grouped-session API and current tc object support independent inner and outer
+IPv4/IPv6 families, including cross-family transport and simultaneous IPv4v6
+entries.
+
+### Inner IPv6 on an ordinary attachment
+
+The single-context PDP API (`install_pdp_context`,
+`install_pdp_context_classified`, `read_pdp_context`, `remove_pdp_context`,
+`remove_pdp_context_exact`) accepts an IPv6 `ms_address` on an ordinary eBPF
+attachment when `pdp_inner_ipv6_capability()` reports `Available`. The address
+must be the PDN connection's canonical `/64` prefix with a zero interface
+identifier (TS 23.401 clause 5.3.1.2.2, TS 29.274 clause 8.14); readback returns
+that canonical form. tc selects uplink traffic by the inner source `/64` plus
+the complete packet mark, so temporary and privacy addresses (RFC 8981) inside
+the prefix match, and decapsulates downlink only toward a destination inside
+it. The peer must use the attachment's IPv4 S2b-U family: inner IPv6 is carried
+over IPv4 GTP-U transport, and an IPv6 peer is `UnsupportedFeature`.
+
+An IPv4v6 PDN connection is two family-scoped contexts that may share the
+bearer's local and peer TEIDs, peer, mark, DSCP, and source-port policies.
+`PdpContextLocalTeidSelector` and `RemovePdpContextRequest` carry the address
+family, so reading or removing one family never touches the other.
+
+Each IPv6 context is stored in the family-tagged tc authority as one
+single-entry record and exactly its uplink and downlink selectors, under the
+ordinary per-device writer gate; IPv4 contexts keep their byte-exact v5 maps.
+The first IPv6 install publishes the attachment's IPv4 endpoint and a random
+device identity in `GTPU_CONFIG6` and then `GTPU_SCHEMA6`. The removal that
+drains the last IPv6 record, selector and journal retires both (schema, then
+config), so a drained attachment is identical to one that never carried inner
+IPv6 and legacy terminal-successor recovery accepts it. Publication writes the
+downlink selector, the uplink selector, then the record, so tc drops rather
+than falls back while it is incomplete; removal deletes the record, the uplink
+selector, then the downlink selector. The downlink selector is thus present in
+every interrupted state, and the family-scoped removal by local TEID always
+reaches the whole residue. An interrupted publication, removal or retirement
+reads back as indeterminate and is completed by the next ordinary install or
+family-scoped removal. Cleanup-only recovery accepts this ordinary family
+authority (its own IPv4 endpoint, no IPv6 endpoint, no grouped journal),
+including a config-only authority left between the two initialization writes,
+and removes stale IPv6 contexts exactly. Outer-IPv4 fragments carrying an inner
+IPv6 G-PDU are passed to the host, as for the grouped path, and are not
+reassembled into the datapath.
 
 After the complete outer IPv4/UDP/GTP-U envelope has passed its existing
 structural and checksum checks, the tc ingress program selects exactly one
@@ -1133,6 +1345,15 @@ external-writer canary `uplink_mtu_policy_corrupt`, both from the
 `uplink_pmtu_enforcement` missing and reject a configured policy fail
 closed; the netlink driver leaves outer MTU/fragmentation to the kernel
 routing layer.
+
+### Unknown required extensions
+
+The current tc IPv4/IPv6 parsers and post-reassembly parser hand complete
+unknown-required-extension chains to the control plane before tunnel lookup
+or decapsulation. Optional extensions retain their endpoint skip behavior;
+malformed chains still drop. The existing shared IPv4 control socket supplies
+bounded notification plans. See the [exact contract and native evidence](docs/required-extensions.md).
+This does not enable N3 forwarding or change selector authority.
 
 ### Downlink outer-fragment handling
 
@@ -2142,6 +2363,62 @@ reissuing a retired selector set. Product assertions do not qualify.
 Diagnostics expose only bounded state classifications,
 never selector, subscriber, or digest values.
 
+For a returning single-bearer session with the retired PAA/mark and a new local
+TEID, call `reconcile_reattached`. The SDK finds the unique completely retired
+predecessor in the same protected ledger, obtains exact backend retirement and
+reader-quiescence proof, and commits one successor edge plus the never-published
+TEID and complete install intent in one transaction. Active, stale, incomplete,
+changed, or already-consumed predecessors cannot authorize reuse. Old TEIDs and
+all history remain reserved. This bounded admission preserves the original
+`reconcile_fresh` and whole-set reuse checks; it does not implement general
+mixed-selector admission or backend-loss restore. Its first claim upgrades the
+ledger to `OPCSN17`, which older readers refuse. Pending intent recovery uses
+the same supervised exact recovery path after reopen or caller cancellation.
+The record and permanent-group capacity limits remain unchanged.
+
+For a marked voice bearer sharing a current unmarked IPv4 default, use
+`reconcile_bearer` with the exact parent claim, parent group and new child group.
+The bounded profile permits one live or unresolved child per default. It
+retains the default's installed context and authority rather than retiring it.
+The child has a distinct local TEID and owns its exact `(PAA, full-mask mark)`
+selector, so unrelated default PAAs may use the same numeric mark. Legacy
+canonical fingerprints and `Fresh` mark reservations are unchanged. The
+protected `OPCSN18` ledger records the immutable child-parent relationship;
+parent retirement waits for exact child retirement.
+
+When the caller needs no separate parent capability, use
+`reconcile_bearer_under_active_parent` with the complete parent and child
+groups. It resolves the exact existing Active parent inside the child
+operation's fenced lease, eliminating a separate `recover_active` operation.
+The protected parent descriptor and fresh backend qualification remain
+mandatory, as do all three child writes and their durable readbacks. Missing,
+changed, marked or retired parents are refused; this entry point cannot repair
+or reattach a parent. The concurrent operations handle reserves both groups
+and all conflicting selectors before resolution. Cancellation detaches only
+the observer, and independent groups retain the same bounded progress rules.
+
+Use the ordinary exact child recovery and retirement operations after a failed
+or cancelled call. Mark reuse requires source quiescence and a fresh local TEID;
+reuse after default reattach additionally requires the protected predecessor
+chain to the current parent. A stale parent or another subscriber cannot claim
+that history. Child changes invalidate issued and pending parent traffic proof
+before possible map mutation. Product classifier/owner settlement and new
+traffic proof remain necessary afterward. See
+[RFC 016 §5.5](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#55-marked-child-under-a-resident-default).
+`testkit::GroupedGtpuDataplaneSimulation` composes the protected coordinator,
+adapter codecs, index construction and inventory validation for structural
+consumer tests. Its in-memory effects are atomic; it does not model staged
+kernel IO faults or proof revocation and refuses live proof issuance.
+
+The built-in eBPF quiescence mechanism requires a qualified non-realtime Linux
+XDP/TC profile with non-expedited `MEMBARRIER_CMD_GLOBAL` available. Exact
+retirement and selector absence are checked before and after that boundary
+under the host effect lock and current durable lease. Realtime/unknown kernel
+profiles, `nohz_full`, denied syscalls, or changed authority fail closed; there
+is no delay or expedited-barrier fallback. See [RFC 016 §5.4](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#54-single-bearer-reattach)
+for the kernel assumptions and durable codec. Simulated adapter regressions
+prove lifecycle decisions, not real kernel RCU or forwarding qualification.
+
 Each process admits a bounded queue of selector operations but polls exactly
 one worker per protected storage-scope commitment from durable lease
 acquisition through release. This is part of the fence: a same-owner
@@ -2206,12 +2483,14 @@ A tc consumer retains the decoded index value first, extracts the group ID,
 performs one authority lookup, validates the selected generation and slot, and
 never re-reads the index. An old RCU holder may finish with its retained values.
 Consequently, `GtpuSessionGroupReconcileRequest` requires explicit selector
-provenance. `Fresh` attests through the caller's durable registry that an
+provenance. `Fresh` attests through the SDK's protected selector ledger that an
 introduced selector has never been published in the pin namespace. Reuse
 carries the complete exact retired source group plus an attestation that
 traffic was drained or an RCU grace period completed after exact removal.
-One retired proof must cover every selector introduced relative to the active
-base generation; combining selectors from several retired groups fails closed.
+For whole-set reuse, one retired proof must cover every selector introduced
+relative to the active base generation. The separately issued `Reattached`
+profile reserves one never-published local TEID with the exact retired PAA/mark
+as described above; combining selectors from several retired groups fails closed.
 Direct transfer from a live source group remains forbidden, and cross-device
 or same-group reuse evidence is rejected before mutation.
 
@@ -2345,3 +2624,13 @@ sudo modprobe wireguard
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture'
 ```
+
+The backend trait exposes `open_gtpu_control_port` for eBPF attachments with
+an IPv4 endpoint. Handles share one queue and lose access on removal,
+replacement, backend loss or observed hook loss. Linux kernel/mock adapters
+return an exact unsupported result. See the [control-port contract](docs/control-port.md)
+for socket lifetime, response budgets and the remaining backend limitations.
+Validated nonzero unknown-TEID G-PDUs can reach only the configured local
+control endpoint without decapsulation. Retained inconsistent ownership stays
+dropped. The consumer must establish current absence and its response policy;
+receiving a packet does not authorize a tunnel change or automatic reply.

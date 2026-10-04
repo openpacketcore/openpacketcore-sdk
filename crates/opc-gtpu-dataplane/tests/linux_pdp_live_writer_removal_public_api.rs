@@ -123,6 +123,7 @@ async fn linux_live_writer_removal_request_is_redaction_safe() {
             egress_dscp: None,
             uplink_source_port_policy:
                 opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         },
         proof,
     );

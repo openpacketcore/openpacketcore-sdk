@@ -5,6 +5,8 @@
 
 #[cfg(feature = "consumer-fixture")]
 pub mod authenticated_consumer_fixture;
+#[cfg(feature = "test-control")]
+mod consensus_observation;
 pub mod qualification;
 pub mod qualification_concurrent_v5;
 pub mod qualification_kubernetes;
@@ -15,7 +17,7 @@ pub mod qualification_sequential;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,9 +31,9 @@ use opc_session_store::{
     QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity, ReplicaEndpoint,
     ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreBlockReason,
     RestoreBlockReasonCode, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SqliteSessionBackend, SystemClock, TokioVirtualClock,
-    ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SqliteSessionBackend, SystemClock,
+    TokioVirtualClock, ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::Timestamp;
 
@@ -144,16 +146,26 @@ fn maximum_utc() -> time::OffsetDateTime {
 #[derive(Clone)]
 struct InProcessConsensusPeer {
     node_id: SessionConsensusNodeId,
+    scope: Option<SessionConsensusIdentity>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     online: Arc<AtomicBool>,
+    ordinary_read_barrier_online: Arc<AtomicBool>,
+    rejected_ordinary_read_barriers: Arc<AtomicUsize>,
+    #[cfg(feature = "test-control")]
+    rpc_observations: Arc<consensus_observation::Observations>,
 }
 
 impl InProcessConsensusPeer {
     fn new(node_id: SessionConsensusNodeId) -> Self {
         Self {
             node_id,
+            scope: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             online: Arc::new(AtomicBool::new(true)),
+            ordinary_read_barrier_online: Arc::new(AtomicBool::new(true)),
+            rejected_ordinary_read_barriers: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "test-control")]
+            rpc_observations: Arc::default(),
         }
     }
 
@@ -178,6 +190,10 @@ impl fmt::Debug for InProcessConsensusPeer {
 
 #[async_trait]
 impl SessionConsensusPeer for InProcessConsensusPeer {
+    fn scope_identity(&self) -> Option<SessionConsensusIdentity> {
+        self.scope
+    }
+
     fn node_id(&self) -> SessionConsensusNodeId {
         self.node_id
     }
@@ -186,7 +202,31 @@ impl SessionConsensusPeer for InProcessConsensusPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        #[cfg(feature = "test-control")]
+        let observation = self.rpc_observations.begin(&request);
+        let result = self.call_observed(request).await;
+        #[cfg(feature = "test-control")]
+        observation.finish(&result);
+        result
+    }
+}
+
+impl InProcessConsensusPeer {
+    async fn call_observed(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         if !self.online.load(Ordering::SeqCst) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        // The unit read-index request has an empty payload. Capability and
+        // profile probes share this family and must still reach the handler.
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && request.payload.is_empty()
+            && !self.ordinary_read_barrier_online.load(Ordering::SeqCst)
+        {
+            self.rejected_ordinary_read_barriers
+                .fetch_add(1, Ordering::SeqCst);
             return Err(SessionConsensusPeerError::Unavailable);
         }
         let handler = self
@@ -209,6 +249,8 @@ pub struct ConsensusTestCluster {
     stores: Vec<ConsensusSessionStore>,
     paths: BTreeMap<(usize, usize), Arc<InProcessConsensusPeer>>,
     identity: SessionConsensusIdentity,
+    #[cfg(feature = "test-control")]
+    rpc_observations: Arc<consensus_observation::Observations>,
     #[cfg(feature = "consumer-fixture")]
     consumer_roster: SessionConsumerRoster,
 }
@@ -220,6 +262,15 @@ impl ConsensusTestCluster {
     /// call sites retain the original failure rather than silently falling
     /// back to a fake coordinator.
     pub async fn start(member_count: usize) -> Self {
+        Self::start_with_authority(member_count, false).await
+    }
+
+    #[cfg(feature = "consumer-fixture")]
+    pub(crate) async fn start_fixed_durable() -> Self {
+        Self::start_with_authority(3, true).await
+    }
+
+    async fn start_with_authority(member_count: usize, fixed: bool) -> Self {
         assert!(
             member_count == 1 || member_count >= 3,
             "consensus test fleets require one or at least three members"
@@ -244,10 +295,29 @@ impl ConsensusTestCluster {
             .collect::<Vec<_>>();
         let configuration_id =
             opc_consensus::derive_configuration_id(cluster_id, epoch, &fingerprints);
-        let identity = opc_consensus::ConsensusIdentity::new(cluster_id, configuration_id, epoch);
+        let placement = opc_session_store::PlacementResiliencePolicy::AllowReducedResilience;
+        let identity = if fixed {
+            opc_session_store::derive_fixed_durable_quorum_consensus_identity(
+                cluster_id,
+                epoch,
+                &fingerprints,
+                placement,
+            )
+        } else {
+            opc_consensus::ConsensusIdentity::new(cluster_id, configuration_id, epoch)
+        };
         let topologies = (0..member_count)
             .map(|index| {
-                if member_count == 1 {
+                if fixed {
+                    ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+                        QuorumTopologyConfig::new_consensus(
+                            test_replica_id(index).expect("valid fixed fixture replica ID"),
+                            members.clone(),
+                            identity,
+                        ),
+                        placement,
+                    )
+                } else if member_count == 1 {
                     ValidatedQuorumTopology::try_new_consensus_lab_singleton(
                         test_replica_id(index).expect("valid consensus test replica ID"),
                         members.clone(),
@@ -276,13 +346,20 @@ impl ConsensusTestCluster {
             .session_consumer_roster()
             .expect("consensus test consumer roster");
 
+        #[cfg(feature = "test-control")]
+        let rpc_observations = Arc::default();
         let mut paths = BTreeMap::new();
         for source in 0..member_count {
             for (target, node_id) in node_ids.iter().copied().enumerate() {
                 if source != target {
                     paths.insert(
                         (source, target),
-                        Arc::new(InProcessConsensusPeer::new(node_id)),
+                        Arc::new(InProcessConsensusPeer {
+                            scope: fixed.then_some(identity),
+                            #[cfg(feature = "test-control")]
+                            rpc_observations: Arc::clone(&rpc_observations),
+                            ..InProcessConsensusPeer::new(node_id)
+                        }),
                     );
                 }
             }
@@ -300,7 +377,18 @@ impl ConsensusTestCluster {
                     (node_ids[target], peer)
                 })
                 .collect();
-            stores.push(
+            let store = if fixed {
+                // This fixture exercises fixed authority, not strict snapshot or
+                // independent physical failure-domain qualification.
+                ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                    opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
+                )
+                .await
+            } else {
                 ConsensusSessionStore::open_with_clock(
                     topologies[index].clone(),
                     backends[index].clone(),
@@ -310,8 +398,8 @@ impl ConsensusTestCluster {
                     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("open consensus test node"),
-            );
+            };
+            stores.push(store.expect("open consensus test node"));
         }
 
         for ((_, target), path) in &paths {
@@ -326,10 +414,12 @@ impl ConsensusTestCluster {
             stores,
             paths,
             identity,
+            #[cfg(feature = "test-control")]
+            rpc_observations,
             #[cfg(feature = "consumer-fixture")]
             consumer_roster,
         };
-        cluster.wait_ready().await;
+        cluster.wait_ready(fixed).await;
         cluster
     }
 
@@ -339,6 +429,18 @@ impl ConsensusTestCluster {
             .get(index)
             .unwrap_or_else(|| panic!("consensus test node {index} does not exist"))
             .clone()
+    }
+
+    /// Fixed numeric observations of actual in-process consensus peer calls.
+    ///
+    /// Counts include background heartbeats, retries and readiness work; they
+    /// are neither client-operation nor Raft proposal counts. Durations include
+    /// handler wait and execution, with cancellation recorded on future drop.
+    /// The snapshot issues no request and exposes no identities or payloads.
+    /// Fields are sampled independently; lifetime peaks are not interval peaks.
+    #[cfg(feature = "test-control")]
+    pub fn consensus_rpc_observation(&self) -> serde_json::Value {
+        self.rpc_observations.snapshot()
     }
 
     /// Exact cluster/configuration/epoch scope used by this test fleet.
@@ -367,6 +469,37 @@ impl ConsensusTestCluster {
         }
     }
 
+    /// Gate only ordinary read-index calls on one directed fixture path.
+    ///
+    /// Mutations, replication, and the nonempty capability/profile probes
+    /// carried by the same RPC family continue through the real handler.
+    pub fn set_ordinary_read_barrier_online(&self, source: usize, target: usize, online: bool) {
+        self.paths
+            .get(&(source, target))
+            .expect("consensus test path")
+            .ordinary_read_barrier_online
+            .store(online, Ordering::SeqCst);
+    }
+
+    /// Number of actual ordinary read-index calls rejected on a fixture path.
+    pub fn rejected_ordinary_read_barriers(&self, source: usize, target: usize) -> usize {
+        self.paths
+            .get(&(source, target))
+            .expect("consensus test path")
+            .rejected_ordinary_read_barriers
+            .load(Ordering::SeqCst)
+    }
+
+    /// Drain the real stores and break the fixture's handler ownership cycles.
+    pub async fn shutdown(self) {
+        for result in join_all(self.stores.iter().map(ConsensusSessionStore::shutdown)).await {
+            result.expect("shut down consensus test member");
+        }
+        for path in self.paths.values() {
+            path.handler.write().await.take();
+        }
+    }
+
     /// Wait until one member proves a fresh linearizable barrier.
     ///
     /// This lets failure tests separate election convergence from the
@@ -389,21 +522,24 @@ impl ConsensusTestCluster {
         }
     }
 
-    async fn wait_ready(&self) {
+    async fn wait_ready(&self, fixed: bool) {
         // Cluster formation can require one resampled election after a split
         // vote and then one complete profiled readiness operation.
         let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
         loop {
-            let reports = join_all(
-                self.stores
-                    .iter()
-                    .map(ConsensusSessionStore::probe_durable_readiness),
-            )
+            let reports = join_all(self.stores.iter().map(|store| async move {
+                if fixed {
+                    store
+                        .probe_fixed_durable_quorum_readiness()
+                        .await
+                        .traffic_authority()
+                        == opc_session_store::FixedQuorumTrafficAuthority::Granted
+                } else {
+                    store.probe_durable_readiness().await.state() == DurableReadinessState::Ready
+                }
+            }))
             .await;
-            if reports
-                .iter()
-                .all(|report| report.state() == DurableReadinessState::Ready)
-            {
+            if reports.iter().all(|ready| *ready) {
                 return;
             }
             assert!(

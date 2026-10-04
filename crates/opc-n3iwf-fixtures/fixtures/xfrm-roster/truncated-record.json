@@ -1,0 +1,47 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.truncated-record",
+  "subset": "xfrm-roster",
+  "case_class": "truncation",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Record ends inside the inbound SPI"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/truncated-record.hex",
+    "digest_sha256": "875d7e6daa48cd5f67aba71aa4fb9ff73a87c748dc8dc255e28fb6564f36f1d3"
+  },
+  "semantic_assertions": [
+    "truncated=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

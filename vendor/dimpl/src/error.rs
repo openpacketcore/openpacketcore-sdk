@@ -48,7 +48,7 @@ pub enum Error {
     Timeout(TimeoutError),
     /// Configuration error (e.g., invalid crypto provider).
     ConfigError(ConfigError),
-    /// Peer attempted renegotiation (not supported).
+    /// Renegotiation was not enabled and locally armed, or cannot start safely.
     RenegotiationAttempt,
     /// Application data cannot be sent because the handshake is not yet complete.
     ///
@@ -537,6 +537,10 @@ pub enum SecurityError {
     ServerFinishedVerificationFailed,
     /// Client Finished verification failed.
     ClientFinishedVerificationFailed,
+    /// The hello did not bind to the immediately preceding handshake.
+    RenegotiationBindingMismatch,
+    /// A required server name or its empty acknowledgement was invalid.
+    ServerNameMismatch,
     /// A fatal DTLS alert was received.
     FatalAlert {
         /// The DTLS alert description.
@@ -608,6 +612,10 @@ pub enum ConfigError {
     Rfc6083Dtls13Unsupported,
     /// Deterministic test randomness is unsafe for RFC 6083 connections.
     Rfc6083DeterministicRngUnsupported,
+    /// Rekey requires the mutually authenticated RFC 6083 certificate profile.
+    Rfc6083RekeyProfile,
+    /// The server name or its selected transport profile is unsupported.
+    ServerNameProfile,
     /// Crypto provider validation failed.
     CryptoProvider(CryptoProviderValidationError),
 }
@@ -1312,6 +1320,10 @@ impl fmt::Display for SecurityError {
             Self::ClientFinishedVerificationFailed => {
                 write!(f, "client Finished verification failed")
             }
+            Self::RenegotiationBindingMismatch => {
+                write!(f, "secure renegotiation binding mismatch")
+            }
+            Self::ServerNameMismatch => write!(f, "server name negotiation rejected"),
             Self::FatalAlert { description } => {
                 write!(f, "received fatal alert: description={description}")
             }
@@ -1393,6 +1405,13 @@ impl fmt::Display for ConfigError {
                 f,
                 "classic RFC 6083 mode does not permit deterministic test randomness"
             ),
+            Self::Rfc6083RekeyProfile => {
+                write!(
+                    f,
+                    "RFC 6083 rekey requires mutual certificate authentication"
+                )
+            }
+            Self::ServerNameProfile => write!(f, "server name profile rejected"),
             Self::CryptoProvider(err) => write!(f, "crypto provider validation failed: {err}"),
         }
     }

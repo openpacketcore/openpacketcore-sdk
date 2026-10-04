@@ -8,7 +8,8 @@
 //! version, tenant, or backend fails to decrypt instead of silently decoding.
 
 use opc_crypto::{
-    decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeV1,
+    decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeRef,
+    CryptoEnvelopeV1,
 };
 use opc_key::{
     decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad,
@@ -398,6 +399,34 @@ impl<'de> serde::Deserialize<'de> for EncryptedSessionPayload {
 }
 
 impl EncryptedSessionPayload {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_for_native_read(&self) -> Self {
+        // Preserve every already decoded byte and encoding tag while giving
+        // the caller an independent zeroizing allocation. This is a copy,
+        // not another admission or a shared Arc into decoder scratch.
+        Self::from_vec_unchecked(self.as_bytes().to_vec(), self.encoding)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn log_row_reuse_test_weak_bytes(&self) -> std::sync::Weak<Zeroizing<Vec<u8>>> {
+        Arc::downgrade(&self.bytes)
+    }
+
+    pub(crate) fn log_row_reuse_arc_allocation_bytes() -> Option<usize> {
+        // ArcInner contains two atomic counts followed by the value. Account
+        // for alignment between and after them, not just the Arc handle.
+        let counts = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+        let value = std::alloc::Layout::new::<Zeroizing<Vec<u8>>>();
+        let (layout, _) = counts.extend(value).ok()?;
+        Some(layout.pad_to_align().size())
+    }
+
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        self.bytes
+            .capacity()
+            .checked_add(Self::log_row_reuse_arc_allocation_bytes()?)
+    }
+
     /// Construct caller-facing plaintext payload bytes.
     ///
     /// This is intended for data above the persistence boundary before
@@ -527,24 +556,22 @@ impl EncryptedSessionPayload {
         Ok(())
     }
 
-    fn decode_valid_session_envelope(&self) -> Result<(CryptoEnvelopeV1, EnvelopeAad), StoreError> {
+    fn decode_valid_session_envelope(
+        &self,
+    ) -> Result<(CryptoEnvelopeRef<'_>, EnvelopeAad), StoreError> {
         if self.encoding != SessionPayloadEncoding::EnvelopeV1 || self.bytes.is_empty() {
             return Err(invalid_session_envelope());
         }
-        let envelope = CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice())
+        let envelope = CryptoEnvelopeRef::decode(self.bytes.as_ref().as_slice())
             .map_err(|_| invalid_session_envelope())?;
         if envelope.nonce.len() != envelope.algorithm.nonce_len()
             || envelope.ciphertext_and_tag.len() < AEAD_TAG_LEN
-            || envelope
-                .encode()
-                .map_err(|_| invalid_session_envelope())?
-                .as_slice()
-                != self.bytes.as_ref().as_slice()
+            || !envelope.matches_encoding(self.bytes.as_ref().as_slice())
         {
             return Err(invalid_session_envelope());
         }
         let (aad, aad_key_id) =
-            decode_bound_aad(&envelope.aad).map_err(|_| invalid_session_envelope())?;
+            decode_bound_aad(envelope.aad).map_err(|_| invalid_session_envelope())?;
         if aad_key_id != envelope.key_id
             || aad.purpose() != KeyPurpose::Session
             || aad.version() != SESSION_ENVELOPE_VERSION
@@ -914,6 +941,84 @@ mod tests {
     };
     use serde::{de, Deserialize};
     use std::sync::Arc;
+
+    #[test]
+    fn envelope_validation_allocation_is_independent_of_ciphertext_size() {
+        use opc_key::{AeadAlgorithm, EnvelopeAad, KeyId, SessionAad};
+        let key_id = KeyId::new("allocation-key").unwrap();
+        let aad = EnvelopeAad::session(
+            opc_types::TenantId::new("allocation-tenant").unwrap(),
+            1,
+            SessionAad::new(
+                "amf",
+                "session-digest",
+                "amf-state",
+                2,
+                3,
+                "allocation-scope",
+            )
+            .unwrap(),
+        );
+        let bound_aad = opc_key::serialize_bound_aad(&aad, &key_id).unwrap();
+        let payload = |length| {
+            let encoded = opc_crypto::CryptoEnvelopeV1 {
+                algorithm: AeadAlgorithm::Aes256GcmSiv,
+                key_id: key_id.clone(),
+                nonce: vec![0; 12],
+                aad: bound_aad.clone(),
+                ciphertext_and_tag: vec![0xA5; length],
+            }
+            .encode()
+            .unwrap();
+            super::EncryptedSessionPayload::try_envelope(encoded).unwrap()
+        };
+        // Construction is outside the measured original validation boundary.
+        // This check proves format/AAD admission, not keyed decryption.
+        let small = payload(opc_key::AEAD_TAG_LEN);
+        let large = payload(256 * 1024);
+        small.validate_envelope().unwrap();
+        large.validate_envelope().unwrap();
+        let small_memory = allocation_counter::measure(|| small.validate_envelope().unwrap());
+        let large_memory = allocation_counter::measure(|| large.validate_envelope().unwrap());
+        eprintln!("envelope_validation_allocation small_bytes={} large_bytes={} small_peak={} large_peak={} small_count={} large_count={}",
+            small_memory.bytes_total, large_memory.bytes_total, small_memory.bytes_max,
+            large_memory.bytes_max, small_memory.count_total, large_memory.count_total);
+        assert_eq!(small_memory.bytes_current, 0);
+        assert_eq!(large_memory.bytes_current, 0);
+        assert_eq!(
+            large_memory.bytes_total, small_memory.bytes_total,
+            "validating immutable envelope bytes must not copy the ciphertext"
+        );
+    }
+
+    #[test]
+    fn log_row_reuse_preparation_payload_charge_includes_capacity_and_arc() {
+        use super::{EncryptedSessionPayload, SessionPayloadEncoding};
+        let mut backing = Vec::with_capacity(65536);
+        backing.extend_from_slice(&[1, 2, 3]);
+        let capacity = backing.capacity();
+        let payload =
+            EncryptedSessionPayload::from_vec_unchecked(backing, SessionPayloadEncoding::Plaintext);
+        let allocation = EncryptedSessionPayload::log_row_reuse_arc_allocation_bytes().unwrap();
+        assert!(
+            allocation
+                >= std::mem::size_of::<zeroize::Zeroizing<Vec<u8>>>()
+                    + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+        );
+        assert_eq!(
+            payload.log_row_reuse_allocation_bytes(),
+            Some(capacity + allocation)
+        );
+        let shared = payload.clone();
+        assert!(Arc::ptr_eq(&payload.bytes, &shared.bytes));
+        assert_eq!(
+            shared.log_row_reuse_allocation_bytes(),
+            Some(capacity + allocation)
+        );
+        assert_eq!(Arc::strong_count(&payload.bytes), 2);
+        drop(shared);
+        assert_eq!(Arc::strong_count(&payload.bytes), 1);
+    }
 
     struct BytesOnlyDeserializer<'a>(&'a [u8]);
 

@@ -1402,6 +1402,7 @@ impl ConsensusSessionStore {
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        storage_shutdown.enable_runtime_write_handoff();
         let raft_handler =
             SessionRaftRpcHandler::new(raft.clone(), peer_directory.clone(), local_node_id);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
@@ -1440,7 +1441,11 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            persistence: SessionPersistenceMode::Durable,
+            persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
+            #[cfg(target_os = "linux")]
+            private_wal: None,
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),
@@ -1450,6 +1455,10 @@ impl ConsensusSessionStore {
             remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
+            #[cfg(feature = "test-control")]
+            restore_scan_unavailable_for_test: AtomicBool::new(false),
+            #[cfg(feature = "test-control")]
+            restore_scan_rejections_for_test: AtomicU64::new(0),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -1478,6 +1487,7 @@ impl ConsensusSessionStore {
             )),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
+            retirement: ConsensusRetirementCoordinator::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });

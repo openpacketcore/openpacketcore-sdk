@@ -592,10 +592,16 @@ impl client::Handler for SshSmokeClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &keys::ssh_key::PublicKey,
+        server_public_key: &keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         self.checked.store(true, Ordering::SeqCst);
-        let matched = server_public_key.key_data() == self.trusted_host_key.key_data();
+        // This client pins a raw host key; accepting a certificate requires a
+        // separate CA/validity/principal trust policy.
+        let matched = matches!(
+            server_public_key,
+            keys::PublicKeyOrCertificate::PublicKey { key, .. }
+                if key.key_data() == self.trusted_host_key.key_data()
+        );
         self.matched.store(matched, Ordering::SeqCst);
         Ok(matched)
     }
@@ -750,10 +756,7 @@ fn parse_server_hello_capabilities(
                 limits
                     .check_value_bytes(text.as_ref().len())
                     .map_err(map_limit_error)?;
-                let decoded = text
-                    .decode()
-                    .map_err(|_| NetconfSmokeError::ServerHelloInvalid)?;
-                let capability = decoded.trim();
+                let capability = text.trim();
                 if !capability.is_empty() {
                     capabilities.push(capability.to_string());
                 }
@@ -1028,16 +1031,11 @@ fn summarize_rpc_reply(reply: &str) -> NetconfSmokeRpcStatus {
                     current_text_element = None;
                 }
             }
-            Ok(Event::Text(text)) => {
-                let Ok(decoded) = text.decode() else {
-                    return NetconfSmokeRpcStatus::MalformedReply;
-                };
-                match current_text_element {
-                    Some("error-type") => error_type = Some(bounded_string(decoded.as_ref())),
-                    Some("error-tag") => error_tag = Some(bounded_string(decoded.as_ref())),
-                    _ => {}
-                }
-            }
+            Ok(Event::Text(text)) => match current_text_element {
+                Some("error-type") => error_type = Some(bounded_string(text.as_ref())),
+                Some("error-tag") => error_tag = Some(bounded_string(text.as_ref())),
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(_) => return NetconfSmokeRpcStatus::MalformedReply,
             _ => {}
@@ -1065,8 +1063,7 @@ fn summarize_rpc_reply(reply: &str) -> NetconfSmokeRpcStatus {
     }
 }
 
-fn local_name(raw_name: &[u8]) -> Option<&str> {
-    let name = std::str::from_utf8(raw_name).ok()?;
+fn local_name(name: &str) -> Option<&str> {
     Some(name.rsplit(':').next().unwrap_or(name))
 }
 
@@ -1711,6 +1708,39 @@ mod tests {
             .expect("listener join")
             .expect("listener result");
         assert_eq!(result.completed_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn ssh_host_key_pin_rejects_certificates_even_for_the_pinned_key() {
+        use keys::ssh_key::certificate::{Builder, CertType};
+
+        let fixture = NetconfSshTestKeyFixture::generate().expect("ssh fixture");
+        let key =
+            parse_ssh_public_key(fixture.host_public_key_openssh().as_bytes()).expect("host key");
+        let signer = parse_ssh_private_key(fixture.client_private_key_openssh().as_bytes())
+            .expect("certificate signer");
+        let mut builder = Builder::new(vec![7; 32], key.key_data().clone(), 0, u64::MAX)
+            .expect("certificate builder");
+        builder.cert_type(CertType::Host).expect("host certificate");
+        builder
+            .valid_principal("localhost")
+            .expect("host principal");
+        let certificate = builder.sign(&signer).expect("sign host certificate");
+        let mut handler = SshSmokeClientHandler {
+            trusted_host_key: key.clone(),
+            checked: Arc::new(AtomicBool::new(false)),
+            matched: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(client::Handler::check_server_key(&mut handler, &key.into())
+            .await
+            .expect("raw pinned key"));
+        assert!(
+            !client::Handler::check_server_key(&mut handler, &certificate.into())
+                .await
+                .expect("certificate is not raw-key trust")
+        );
+        assert!(handler.checked.load(Ordering::SeqCst));
+        assert!(!handler.matched.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

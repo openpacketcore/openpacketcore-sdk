@@ -343,6 +343,7 @@ pub fn render_qualification_kubernetes_manifest(
             snapshot_root_device: None,
             snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            isolated_scale: None,
             transport: QualificationTransportConfig::ProjectedMtls(
                 QualificationProjectedMtlsConfig {
                     projected_volume_root: PathBuf::from(PROJECTED_IDENTITY_ROOT),
@@ -399,7 +400,7 @@ fn content_addressed_config_map_name(
     let encoded = serde_json::to_vec(node_configs)
         .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
     let digest = Sha256::digest(encoded);
-    Ok(format!("{CONFIG_MAP_NAME_PREFIX}-{digest:x}"))
+    Ok(format!("{CONFIG_MAP_NAME_PREFIX}-{}", hex::encode(digest)))
 }
 
 fn production_lifecycle(

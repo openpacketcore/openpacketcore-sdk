@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     };
 
     let outcome = backend
@@ -84,6 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Linux keeps separate IPv4 and IPv6 rule lists. A rule with a source or
+destination prefix takes that prefix's family. A mark-only rule has no prefix,
+so `RuleRequest::family` selects its list: `None` keeps the IPv4 default used
+by `ip rule`, and `Some(RouteSteeringIpFamily::Ipv6)` creates the equivalent of
+`ip -6 rule add fwmark ...`. Steering one mark for both families takes two
+rules, one per family; they are distinct objects for readback, convergence,
+and exact removal. An explicit family that conflicts with a prefix is rejected.
 
 For a complete writer-owned set, use the collection API. This is also the API
 for provably disjoint source rules that intentionally share one family and
@@ -116,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     };
     let second = RuleRequest {
         source: Some(IpPrefix::new(
@@ -126,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     };
 
     let desired = OwnedRouteRuleSet::new(scope, Vec::new(), vec![first, second.clone()])?;
@@ -169,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   this crate. Convergence-owned Linux route `rtm_protocol` and rule
   `FRA_PROTOCOL` use `LINUX_ROUTE_STEERING_PROTOCOL` (`242`). Missing, legacy,
   or other protocol values are foreign conflicts, never exact resident state.
-- The Linux singleton rule readback path has one narrow exception to that broad
+- The Linux and mock singleton rule readback paths has one narrow exception to that broad
   family/priority key: stock, protocol-`242`-owned, same-table, source-only
   rules with non-`/0` source prefixes that are provably disjoint may coexist as
   siblings. It excludes only those proven siblings from the target's exact
@@ -185,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `InvalidConfig`; Linux treats those values as delete wildcards. Mark masks
   remain nonzero for both APIs.
 - Bounded readback returns `ExactPresent` only for one fully representable
-  candidate, after the Linux-only proven-disjoint source-only sibling exception
+  candidate, after the proven-disjoint source-only sibling exception
   above. A modeled difference returns `Conflict`; malformed, incomplete,
   oversized, unsupported, unmodeled, or otherwise unknown colliding state
   returns `Indeterminate`. `AlreadyExists` alone is never idempotent success.
@@ -207,7 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   removes only objects installed by the same call and only after the exact
   ownership check succeeds. Post-install races can report owned rule, route,
   or combined rollback; ambiguous rollback returns a typed failure.
-- Except for the narrow Linux-only proven-disjoint source-only sibling case,
+- Except for the narrow proven-disjoint source-only sibling case,
   singleton rule readback treats multiple candidates at one family/priority
   collision key as ambiguous. The collection API remains the additive path for
   siblings at that key: construction permits more than one rule only when every
@@ -244,11 +255,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   must durably reconstruct the complete desired set before reconciling; an
   empty desired set intentionally garbage-collects every representable owned
   object in that scope. The backend does not persist product intent.
-- Every Linux read, mutation, and convergence operation acquires one
-  clone-shared lock inside its blocking worker. A pair holds the lock once
-  through post-install verification and rollback. If its async waiter is
-  cancelled, the worker retains the lock and completes; the caller must retry
-  to obtain the resulting typed state.
+- Linux operations reserve their conflicting route/rule keys across clones
+  before dispatch. Exact routes at different canonical family/destination/table
+  keys and proven disjoint source-only rule siblings may proceed concurrently.
+  A pair reserves both keys together through verification and rollback. Complete
+  collections reserve their full route family/table and rule family/priority;
+  legacy mutations reserve the whole backend. At most 64 blocking workers run
+  per backend. Waiters remain async; the caller must bound ingress. Earlier
+  conflicting waiters retain order without blocking unrelated keys.
+  Cancellation before dispatch releases the queued reservation. After dispatch,
+  the worker retains exclusion and completes; the caller must use exact readback
+  to reconcile the result. See [ADR 0024](../../docs/adr/0024-route-operation-conflict-exclusion.md).
 - A Linux mutation is counted as acknowledged only after exactly one matching
   zero-error `NLMSG_ERROR` ACK. Empty or `NOOP`-only datagrams do not complete
   the operation; `DONE`, arbitrary payload messages, duplicate ACKs, timeout,
@@ -290,7 +307,7 @@ has exclusive writer authority for that scope and no other writer can
 impersonate protocol `242`. Within that boundary, the marker is eligible owned
 state. Outside it, the backend cannot authenticate marker provenance: do not
 invoke collection garbage collection, and treat the state operationally as
-conflicting or indeterminate. Clones of one backend are serialized. Separate
+conflicting or indeterminate. Conflicting operations across clones of one backend are serialized. Separate
 backend instances, direct `ip`/netlink writers, overlapping family/priority
 scopes, table/priority allocation, and replacement of intentionally stale
 foreign objects require external coordination. The API does not automatically

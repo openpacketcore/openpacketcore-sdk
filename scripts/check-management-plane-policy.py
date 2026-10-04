@@ -4,7 +4,7 @@
 This script backs ADR 0016 and ADR 0017 while those decisions are still gated by
 human acceptance. It enforces two mechanical invariants:
 
-* `tonic`, `prost`, `prost-types`, and `tonic-build` stay scoped to
+* `tonic`, `prost`, `prost-types`, and their codec/build adapters stay scoped to
   `opc-gnmi-server`.
 * Rust `unsafe` tokens stay scoped to explicitly reviewed Linux UAPI sys
   crates, where each token must be documented by a nearby `SAFETY:` comment
@@ -18,12 +18,14 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
 
-GRPC_STACK = {"tonic", "prost", "prost-types", "tonic-build"}
+GRPC_BUILD = {"tonic-build", "tonic-prost-build"}
+GRPC_STACK = {"tonic", "tonic-prost", "prost", "prost-types", *GRPC_BUILD}
 GRPC_ALLOWED_ROOTS = {"opc-gnmi-server"}
 UNSAFE_ALLOWED_ROOTS = {
     "opc-fs-verity-sys",
@@ -76,11 +78,11 @@ def check_grpc_boundary(metadata: dict) -> list[Violation]:
     for pkg in workspace_packages(metadata):
         if pkg["name"] in GRPC_ALLOWED_ROOTS:
             for dep in pkg.get("dependencies", []):
-                if dep.get("name") == "tonic-build" and dep.get("kind") != "build":
+                if dep.get("name") in GRPC_BUILD and dep.get("kind") != "build":
                     violations.append(
                         Violation(
                             pkg["manifest_path"],
-                            "`tonic-build` is allowed only as a build dependency "
+                            f"`{dep['name']}` is allowed only as a build dependency "
                             "of `opc-gnmi-server`",
                         )
                     )
@@ -304,7 +306,7 @@ def rust_sources(root: Path) -> list[Path]:
     return sorted(
         path
         for path in root.rglob("*.rs")
-        if not any(part in skip for part in path.parts)
+        if not any(part in skip for part in path.relative_to(root).parts)
     )
 
 
@@ -548,6 +550,39 @@ def assert_grpc_policy_fragments(
 
 
 def run_self_test() -> None:
+    # Exclusions belong to each audited crate, not to an ancestor directory
+    # chosen by its consumer. An ignored ancestor must not hide unsafe code.
+    with tempfile.TemporaryDirectory(prefix="management-source-audit-") as temporary:
+        for ancestor in ("workspace", "target", ".git"):
+            crate = Path(temporary) / ancestor / "checkout" / "crates" / "opc-core"
+            source = crate / "src" / "lib.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "fn prohibited() { unsafe { call(); } }\n", encoding="utf-8"
+            )
+            for ignored in ("target", ".git"):
+                generated = crate / ignored / "generated.rs"
+                generated.parent.mkdir()
+                generated.write_text("unsafe { generated(); }\n", encoding="utf-8")
+            if rust_sources(crate) != [source]:
+                raise SystemExit(
+                    "source audit self-test failed: checkout ancestor hid Rust source"
+                )
+            metadata = {
+                "workspace_members": ["opc-core"],
+                "packages": [{
+                    "id": "opc-core", "name": "opc-core",
+                    "manifest_path": str(crate / "Cargo.toml"),
+                }],
+            }
+            violations = check_unsafe_boundary(metadata)
+            if len(violations) != 1 or not violations[0].location.startswith(
+                str(source) + ":"
+            ):
+                raise SystemExit(
+                    "source audit self-test failed: prohibited unsafe code was not rejected"
+                )
+
     assert_grpc_policy_fragments(
         "opc-gnmi-server direct gRPC deps allowed",
         grpc_policy_fixture(
@@ -572,6 +607,35 @@ def run_self_test() -> None:
             {"opc-gnmi-server": ["tonic-build"]},
         ),
         ["`tonic-build` is allowed only as a build dependency"],
+    )
+    for dependency in ("tonic-prost", "tonic-prost-build"):
+        kind = "build" if dependency in GRPC_BUILD else None
+        assert_grpc_policy_fragments(
+            f"gNMI adapter {dependency} is allowed",
+            grpc_policy_fixture(
+                ["opc-gnmi-server"],
+                {"opc-gnmi-server": [(dependency, kind)]},
+                {"opc-gnmi-server": [dependency]},
+            ),
+            [],
+        )
+        assert_grpc_policy_fragments(
+            f"core cannot reach {dependency}",
+            grpc_policy_fixture(
+                ["opc-core"],
+                {"opc-core": [("third-party-helper", None)]},
+                {"opc-core": ["third-party-helper"], "third-party-helper": [dependency]},
+            ),
+            [f"transitively reaches `{dependency}`"],
+        )
+    assert_grpc_policy_fragments(
+        "tonic-prost-build is build-only",
+        grpc_policy_fixture(
+            ["opc-gnmi-server"],
+            {"opc-gnmi-server": [("tonic-prost-build", None)]},
+            {"opc-gnmi-server": ["tonic-prost-build"]},
+        ),
+        ["`tonic-prost-build` is allowed only as a build dependency"],
     )
     assert_grpc_policy_fragments(
         "workspace crate cannot directly depend on tonic",

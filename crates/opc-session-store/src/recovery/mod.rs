@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_config_model::{RequestId, TransportType, TrustedPrincipal};
 use opc_consensus::engine::LogId;
 use opc_mgmt_audit::{
@@ -1069,6 +1069,7 @@ fn map_live_terminal_recovery_handoff_error(error: SessionConsensusStorageError)
         SessionConsensusStorageError::UnsupportedPlatform
         | SessionConsensusStorageError::RecoveryRequired
         | SessionConsensusStorageError::IdentityMismatch
+        | SessionConsensusStorageError::PersistenceModeMismatch
         | SessionConsensusStorageError::SchemaVersionMismatch
         | SessionConsensusStorageError::CorruptState
         | SessionConsensusStorageError::InvalidIdentity => RecoveryError::BackupCorrupt,

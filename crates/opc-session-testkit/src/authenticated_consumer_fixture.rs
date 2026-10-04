@@ -1,10 +1,13 @@
 //! Production-shaped authenticated consumer fixture for downstream SDK tests.
 //!
 //! The fixture owns its OpenRaft voters, mTLS listeners, persistent clients,
-//! and prepared-request journal. It offers either the opaque
-//! [`SessionConsumerPreparedFencedTransitionBackend`] or a paired, ordinary
-//! durable consumer view that shares its exact authority; neither route
-//! exposes a physical client, prepared token, or activated roster.
+//! and prepared-request journals. It offers the opaque
+//! [`SessionConsumerPreparedFencedTransitionBackend`], the opaque protected V2
+//! [`SessionConsumerPreparedFencedTransitionV2Backend`], or a paired, ordinary
+//! durable consumer view that shares its exact authority; no route exposes a
+//! physical client, prepared token, or activated roster. Its listeners serve
+//! both the general `/1` and the epoch-fenced `/2` consumer lanes against the
+//! same real voters.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -12,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,20 +28,25 @@ use opc_session_net::{
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig, SessionConsumerAuthorizer,
     SessionConsumerLeaseMutationError, SessionConsumerMutationError,
     SessionConsumerPreparedFencedTransitionBackend,
-    SessionConsumerPreparedFencedTransitionBackendError, SessionQuorumConsumerServer,
+    SessionConsumerPreparedFencedTransitionBackendError,
+    SessionConsumerPreparedFencedTransitionV2Backend,
+    SessionConsumerPreparedFencedTransitionV2BackendError, SessionQuorumConsumerServer,
     SessionQuorumConsumerServerHandle, StatelessSessionConsumerClient,
 };
 use opc_session_store::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    FencedTransitionExecuteError, FencedTransitionOutcome, FencedTransitionRequest, LeaseError,
+    FencedTransitionExecuteError, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey, LeaseError,
     LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedFencedTransitionJournal,
     PreparedFencedTransitionJournalKey, RecordExpiryPreflight, RestoreScanCursorProfile,
     RestoreScanPage, RestoreScanRequest, SessionBackend, SessionConsumerAuthorization,
     SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
-    SessionConsumerChange, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerRoster,
-    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerVoterAuthority,
-    SessionKey, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, StoreError,
+    SessionConsumerChange, SessionConsumerOperation, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerRoster, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionLeaseManager,
+    SessionOp, SessionOpResult, SessionQuorumConsumer, StateClass, StateType, StoreError,
     StoredSessionRecord,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
@@ -66,6 +74,9 @@ pub enum AuthenticatedPreparedFencedTransitionFixtureError {
     /// The opaque local-AEAD facade could not be composed.
     #[error(transparent)]
     Facade(#[from] SessionConsumerPreparedFencedTransitionBackendError),
+    /// The opaque protected V2 facade could not be composed.
+    #[error(transparent)]
+    FacadeV2(#[from] SessionConsumerPreparedFencedTransitionV2BackendError),
     /// One ephemeral authenticated listener could not start.
     #[error(transparent)]
     Listener(#[from] io::Error),
@@ -181,14 +192,19 @@ impl<P: ?Sized> fmt::Debug for AuthenticatedPreparedFencedTransitionFixtureGener
 struct FixtureGeneralConsumerBackend {
     clients: Arc<[PersistentSessionConsumerClient]>,
     next_client: Arc<AtomicUsize>,
+    ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
 }
 
 impl FixtureGeneralConsumerBackend {
-    fn new(clients: Vec<PersistentSessionConsumerClient>) -> Self {
+    fn new(
+        clients: Vec<PersistentSessionConsumerClient>,
+        ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
+    ) -> Self {
         debug_assert_eq!(clients.len(), FIXTURE_VOTER_COUNT);
         Self {
             clients: Arc::from(clients),
             next_client: Arc::new(AtomicUsize::new(0)),
+            ordinary_cas_fault,
         }
     }
 
@@ -232,12 +248,17 @@ pub struct AuthenticatedPreparedFencedTransitionFixture {
     client_config: AuthenticatedClientConfig,
     voters: Vec<FixtureVoter>,
     lose_next_fenced_transition_response: Arc<AtomicBool>,
+    lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
     general_consumer_counters: Arc<FixtureGeneralConsumerCounters>,
+    ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     listeners: Vec<SessionQuorumConsumerServerHandle>,
-    _journal_directory: tempfile::TempDir,
+    journal_directory: tempfile::TempDir,
+    consumer_journal_directories: Mutex<Vec<tempfile::TempDir>>,
     journal_path: PathBuf,
     journal_key: PreparedFencedTransitionJournalKey,
+    recovery_journal_path: PathBuf,
+    recovery_journal_key: FencedTransitionV2RecoveryJournalKey,
 }
 
 /// Copy-only aggregate observation of fixture transport activity.
@@ -252,6 +273,437 @@ pub struct AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     forced_fenced_transition_status_misses: usize,
     general_mutation_calls: usize,
     general_compare_and_set_calls: usize,
+    fenced_transition_v2_calls: usize,
+    fenced_transition_v2_status_calls: usize,
+    fenced_transition_v2_history_state_calls: usize,
+}
+
+/// Fixed, nonidentifying evidence from one ordinary CAS response-loss fault.
+///
+/// Request correlation compares the complete encrypted CAS body, its original
+/// ID, and the exact consumer scope internally. No authority or payload value
+/// is returned. Array slots identify only the fixture's three private voters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuthenticatedOrdinaryCasResponseLossEvidence {
+    /// The authenticated handler received the exact client request.
+    pub request_correlated: bool,
+    /// The real consensus service returned CAS Success before suppression.
+    pub durable_success: bool,
+    /// The actual client returned OutcomeUnknown for that same request ID.
+    pub client_outcome_unknown: bool,
+    /// Server supervision dropped the suppressed-response future at timeout.
+    pub suppressed_response_finished: bool,
+    /// Physical dispatches of the original exact CAS, including any replay.
+    pub target_cas_dispatches: usize,
+    /// All ordinary mutation dispatches for the captured namespace key.
+    pub namespace_mutation_dispatches: usize,
+    /// All CAS dispatches for that key, including a different request ID.
+    pub namespace_cas_dispatches: usize,
+    /// Genuine durable read responses equal to the full encrypted replacement.
+    pub exact_readbacks: [usize; FIXTURE_VOTER_COUNT],
+    /// Exact-key read responses deliberately made unavailable, per voter.
+    pub unavailable_readbacks: [usize; FIXTURE_VOTER_COUNT],
+    /// Genuine exact read responses delivered after releasing the gate.
+    pub delivered_exact_readbacks: usize,
+    /// Real read responses still owned by a pending delivery gate.
+    pub pending_readback_responses: usize,
+    /// A request/result mismatch or unexpected real backend failure occurred.
+    pub failed: bool,
+}
+
+/// Fixed failure category for ordinary CAS fault setup or evidence collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("ordinary CAS response-loss evidence unavailable")]
+pub struct AuthenticatedOrdinaryCasResponseLossError;
+
+/// Owned control for one ordinary committed-CAS lost-success/timeout fault.
+///
+/// The real server withholds only a successful exact CAS response until the
+/// unchanged transport deadline. It never manufactures OutcomeUnknown. The
+/// next matching durable reads are held across all three listeners. Dropping
+/// this control makes held reads unavailable; existing listener supervision
+/// owns and bounds the suppressed response without an additional task.
+pub struct AuthenticatedOrdinaryCasResponseLoss {
+    gate: Arc<FixtureOrdinaryCasGate>,
+}
+
+impl fmt::Debug for AuthenticatedOrdinaryCasResponseLoss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedOrdinaryCasResponseLoss(<redacted>)")
+    }
+}
+
+impl AuthenticatedOrdinaryCasResponseLoss {
+    /// Await real committed success, the same client's unknown outcome, and
+    /// an exact durable read stopped before its response reaches the caller.
+    /// The test owner must supply its existing functional containment bound.
+    pub async fn wait_for_pending_readback(
+        &self,
+    ) -> Result<
+        AuthenticatedOrdinaryCasResponseLossEvidence,
+        AuthenticatedOrdinaryCasResponseLossError,
+    > {
+        loop {
+            let changed = self.gate.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let evidence = self.evidence();
+            if evidence.failed {
+                return Err(AuthenticatedOrdinaryCasResponseLossError);
+            }
+            if evidence.durable_success
+                && evidence.client_outcome_unknown
+                && evidence.suppressed_response_finished
+                && evidence.pending_readback_responses != 0
+            {
+                return Ok(evidence);
+            }
+            changed.await;
+        }
+    }
+
+    /// Release genuine exact read responses, or keep all matching reads
+    /// unavailable through poison/successor cleanup. This does not replay CAS.
+    pub fn release_readback(&self, exact: bool) {
+        self.gate.release_readback(exact);
+    }
+
+    /// Return a coherent fixed-value snapshot without touching transport.
+    pub fn evidence(&self) -> AuthenticatedOrdinaryCasResponseLossEvidence {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evidence
+    }
+
+    /// Verify released readback behavior on each existing private voter pool.
+    ///
+    /// These supplementary authenticated reads compare the real encrypted
+    /// row internally and return only fixed evidence. They do not dispatch a
+    /// mutation, fabricate a receipt, expose a key, or mint selector authority.
+    /// Public selector operations remain responsible for protected decryption
+    /// and acceptance. The owner must bound this diagnostic future.
+    pub async fn verify_released_readback_on_all_voters(
+        &self,
+        exact: bool,
+    ) -> Result<
+        AuthenticatedOrdinaryCasResponseLossEvidence,
+        AuthenticatedOrdinaryCasResponseLossError,
+    > {
+        let (clients, expected) = {
+            let state = self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.readback != Some(exact)
+                || state.evidence.failed
+                || !state.evidence.client_outcome_unknown
+            {
+                return Err(AuthenticatedOrdinaryCasResponseLossError);
+            }
+            let target = state
+                .target
+                .as_ref()
+                .ok_or(AuthenticatedOrdinaryCasResponseLossError)?;
+            (
+                Arc::clone(&target.clients),
+                target.operation.new_record.clone(),
+            )
+        };
+        for (voter, client) in clients.iter().enumerate() {
+            let before = self.evidence();
+            let observed = client.get(expected.key.clone()).await;
+            let after = self.evidence();
+            let result_matches = if exact {
+                matches!(observed, Ok(Some(record)) if record == expected)
+            } else {
+                matches!(observed, Err(StoreError::BackendUnavailable(_)))
+                    && after.unavailable_readbacks[voter] > before.unavailable_readbacks[voter]
+            };
+            if !result_matches
+                || after.failed
+                || after.exact_readbacks[voter] <= before.exact_readbacks[voter]
+            {
+                return Err(AuthenticatedOrdinaryCasResponseLossError);
+            }
+        }
+        Ok(self.evidence())
+    }
+}
+
+impl Drop for AuthenticatedOrdinaryCasResponseLoss {
+    fn drop(&mut self) {
+        self.gate.release_readback(false);
+    }
+}
+
+#[derive(Default)]
+struct FixtureOrdinaryCasFault {
+    active: Mutex<Option<Weak<FixtureOrdinaryCasGate>>>,
+}
+
+impl FixtureOrdinaryCasFault {
+    fn active(&self) -> Option<Arc<FixtureOrdinaryCasGate>> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+}
+
+struct FixtureOrdinaryCasGate {
+    tenant_nf: SessionConsumerTenantNfScope,
+    state_type: StateType,
+    state: Mutex<FixtureOrdinaryCasState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct FixtureOrdinaryCasState {
+    target: Option<FixtureOrdinaryCasTarget>,
+    evidence: AuthenticatedOrdinaryCasResponseLossEvidence,
+    readback: Option<bool>,
+}
+
+struct FixtureOrdinaryCasTarget {
+    scope: SessionConsumerScope,
+    request_id: SessionConsumerRequestId,
+    operation: CompareAndSet,
+    clients: Arc<[PersistentSessionConsumerClient]>,
+}
+
+struct FixtureOrdinaryCasPending<'a> {
+    gate: &'a FixtureOrdinaryCasGate,
+    readback: bool,
+}
+
+impl Drop for FixtureOrdinaryCasPending<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.readback {
+            state.evidence.pending_readback_responses =
+                state.evidence.pending_readback_responses.saturating_sub(1);
+        } else {
+            state.evidence.suppressed_response_finished = true;
+        }
+        drop(state);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FixtureOrdinaryCasCall {
+    Mutation,
+    Readback,
+    Other,
+}
+
+impl FixtureOrdinaryCasGate {
+    fn select_client_request(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: &CompareAndSet,
+        clients: Arc<[PersistentSessionConsumerClient]>,
+    ) -> bool {
+        if operation.key.tenant != *self.tenant_nf.tenant()
+            || operation.key.nf_kind != *self.tenant_nf.nf_kind()
+            || operation.new_record.state_type != self.state_type
+            || operation.new_record.state_class != StateClass::AuthoritativeSession
+            || operation.expected_generation.is_none()
+        {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.target.is_some() || state.readback.is_some() {
+            return false;
+        }
+        state.target = Some(FixtureOrdinaryCasTarget {
+            scope,
+            request_id,
+            operation: operation.clone(),
+            clients,
+        });
+        true
+    }
+
+    fn observe_client_result(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: &CompareAndSet,
+        result: &Result<CompareAndSetResult, SessionConsumerMutationError>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let same_request = state.target.as_ref().is_some_and(|target| {
+            target.scope == scope
+                && target.request_id == request_id
+                && target.operation == *operation
+        });
+        if same_request
+            && state.evidence.durable_success
+            && matches!(result, Err(SessionConsumerMutationError::OutcomeUnknown { request_id: observed }) if *observed == request_id)
+        {
+            state.evidence.client_outcome_unknown = true;
+        } else {
+            state.evidence.failed = true;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn observe_server_request(&self, request: &SessionConsumerRequest) -> FixtureOrdinaryCasCall {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(target) = state.target.as_ref() else {
+            return FixtureOrdinaryCasCall::Other;
+        };
+        if request.scope() != target.scope {
+            return FixtureOrdinaryCasCall::Other;
+        }
+        let key = match request.operation() {
+            SessionConsumerOperation::CompareAndSet { op } => &op.key,
+            SessionConsumerOperation::Get { key }
+            | SessionConsumerOperation::AcquireLease { key, .. } => key,
+            SessionConsumerOperation::RenewLease { lease, .. }
+            | SessionConsumerOperation::ReleaseLease { lease }
+            | SessionConsumerOperation::DeleteFenced { lease }
+            | SessionConsumerOperation::RefreshTtl { lease, .. } => lease.key(),
+            _ => return FixtureOrdinaryCasCall::Other,
+        };
+        if key != &target.operation.key {
+            return FixtureOrdinaryCasCall::Other;
+        }
+        if matches!(request.operation(), SessionConsumerOperation::Get { .. }) {
+            return if state.evidence.durable_success {
+                FixtureOrdinaryCasCall::Readback
+            } else {
+                FixtureOrdinaryCasCall::Other
+            };
+        }
+        let same_request = request.request_id() == target.request_id;
+        let same_body = matches!(request.operation(), SessionConsumerOperation::CompareAndSet { op } if **op == target.operation);
+        state.evidence.namespace_mutation_dispatches = state
+            .evidence
+            .namespace_mutation_dispatches
+            .saturating_add(1);
+        if matches!(
+            request.operation(),
+            SessionConsumerOperation::CompareAndSet { .. }
+        ) {
+            state.evidence.namespace_cas_dispatches =
+                state.evidence.namespace_cas_dispatches.saturating_add(1);
+        }
+        if same_request {
+            if !same_body {
+                state.evidence.failed = true;
+                self.changed.notify_waiters();
+                return FixtureOrdinaryCasCall::Other;
+            }
+            state.evidence.request_correlated = true;
+            state.evidence.target_cas_dispatches =
+                state.evidence.target_cas_dispatches.saturating_add(1);
+            FixtureOrdinaryCasCall::Mutation
+        } else {
+            FixtureOrdinaryCasCall::Other
+        }
+    }
+
+    fn observe_committed_success(&self, response: &SessionConsumerResponse) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let success = matches!(
+            response,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))
+        );
+        if success && state.evidence.request_correlated && !state.evidence.durable_success {
+            state.evidence.durable_success = true;
+        } else {
+            state.evidence.failed = true;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        success
+    }
+
+    async fn gate_readback(
+        &self,
+        voter: usize,
+        response: SessionConsumerResponse,
+    ) -> SessionConsumerResponse {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let exact = state.target.as_ref().is_some_and(|target| {
+                matches!(&response, SessionConsumerResponse::Get(Ok(Some(record))) if *record == target.operation.new_record)
+            });
+            if !exact {
+                state.evidence.failed = true;
+                self.changed.notify_waiters();
+                return SessionConsumerResponse::Get(Err(SessionConsumerStoreError::Unavailable));
+            }
+            state.evidence.exact_readbacks[voter] =
+                state.evidence.exact_readbacks[voter].saturating_add(1);
+            state.evidence.pending_readback_responses =
+                state.evidence.pending_readback_responses.saturating_add(1);
+        }
+        let _pending = FixtureOrdinaryCasPending {
+            gate: self,
+            readback: true,
+        };
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(exact) = state.readback {
+                    if exact {
+                        state.evidence.delivered_exact_readbacks =
+                            state.evidence.delivered_exact_readbacks.saturating_add(1);
+                        return response;
+                    }
+                    state.evidence.unavailable_readbacks[voter] =
+                        state.evidence.unavailable_readbacks[voter].saturating_add(1);
+                    return SessionConsumerResponse::Get(Err(
+                        SessionConsumerStoreError::Unavailable,
+                    ));
+                }
+            }
+            changed.await;
+        }
+    }
+
+    fn release_readback(&self, exact: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .readback = Some(exact);
+        self.changed.notify_waiters();
+    }
 }
 
 impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
@@ -285,6 +737,24 @@ impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     pub const fn general_compare_and_set_calls(self) -> usize {
         self.general_compare_and_set_calls
     }
+
+    /// Number of physical epoch-fenced V2 transition requests observed by
+    /// the real listener fleet on the `/2` lane.
+    pub const fn fenced_transition_v2_calls(self) -> usize {
+        self.fenced_transition_v2_calls
+    }
+
+    /// Number of physical V2 receipt-status requests observed by the real
+    /// listener fleet on the `/2` lane.
+    pub const fn fenced_transition_v2_status_calls(self) -> usize {
+        self.fenced_transition_v2_status_calls
+    }
+
+    /// Number of linearized V2 history-state reads observed by the real
+    /// listener fleet on the `/2` lane.
+    pub const fn fenced_transition_v2_history_state_calls(self) -> usize {
+        self.fenced_transition_v2_history_state_calls
+    }
 }
 
 impl fmt::Debug for AuthenticatedPreparedFencedTransitionFixture {
@@ -304,6 +774,22 @@ where
     #[must_use]
     pub fn general_backend(&self) -> AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P> {
         self.general_backend.clone()
+    }
+
+    /// Clone the already-open protected ordinary backend paired with this
+    /// facade. Both retain the same encrypted namespace, activated voter
+    /// authority and recovery journal; this never opens a second journal or
+    /// exports its key, physical clients or prepared transition tokens.
+    ///
+    /// The returned SDK backend can enter protected selector APIs while the
+    /// facade continues to own prepared-fenced transitions. Ordinary mutation
+    /// counters belong to the accounting wrapper from `general_backend`, not
+    /// to operations on this protected clone.
+    #[must_use]
+    pub fn protected_general_backend(
+        &self,
+    ) -> impl opc_session_store::ProtectedSessionBackend + Clone + 'static {
+        self.general_backend.inner.as_ref().clone()
     }
 
     /// Borrow the initial opaque prepared-fenced facade.
@@ -506,10 +992,16 @@ impl SessionBackend for FixtureGeneralConsumerBackend {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        self.client()
-            .compare_and_set_with_id(SessionConsumerRequestId::new(), &op)
-            .await
-            .map_err(fixture_mutation_error)
+        let client = self.client();
+        let request_id = SessionConsumerRequestId::new();
+        let fault = self.ordinary_cas_fault.active().filter(|gate| {
+            gate.select_client_request(client.scope(), request_id, &op, Arc::clone(&self.clients))
+        });
+        let result = client.compare_and_set_with_id(request_id, &op).await;
+        if let Some(fault) = fault {
+            fault.observe_client_result(client.scope(), request_id, &op, &result);
+        }
+        result.map_err(fixture_mutation_error)
     }
 
     async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
@@ -613,17 +1105,42 @@ impl AuthenticatedPreparedFencedTransitionFixture {
     pub async fn start(
         scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
     ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_authority(scopes, false).await
+    }
+
+    /// Start the sealed consumer lab with immutable fixed durable authority.
+    ///
+    /// Consumer sockets use real mTLS and every voter has a distinct file-backed
+    /// database. Raft peers remain in-process, placement explicitly allows reduced
+    /// resilience, and snapshots use `PortableVerified`. This constructor does
+    /// not qualify physical failure domains or strict fs-verity snapshots.
+    pub async fn start_fixed_durable(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_authority(scopes, true).await
+    }
+
+    async fn start_with_authority(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+        fixed: bool,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
         let client_identity = SpiffeId::new(FIXTURE_CLIENT_SPIFFE)
             .expect("fixture client SPIFFE is a complete workload identity");
         let grant = SessionConsumerAuthorizationGrant::try_new(client_identity, scopes)?;
-        let cluster = ConsensusTestCluster::start(FIXTURE_VOTER_COUNT).await;
+        let cluster = if fixed {
+            ConsensusTestCluster::start_fixed_durable().await
+        } else {
+            ConsensusTestCluster::start(FIXTURE_VOTER_COUNT).await
+        };
         let roster = cluster.consumer_roster().clone();
         debug_assert_eq!(roster.voter_count(), FIXTURE_VOTER_COUNT);
         let pki = FixturePki::new();
         let client_config = pki.client_config(FIXTURE_CLIENT_SPIFFE);
         let lose_next_fenced_transition_response = Arc::new(AtomicBool::new(false));
+        let lose_next_fenced_transition_v2_response = Arc::new(AtomicBool::new(false));
         let fenced_transition_status_misses_remaining = Arc::new(AtomicUsize::new(0));
         let general_consumer_counters = Arc::new(FixtureGeneralConsumerCounters::default());
+        let ordinary_cas_fault = Arc::new(FixtureOrdinaryCasFault::default());
 
         let store_indexes = (0..FIXTURE_VOTER_COUNT)
             .map(|index| (cluster.store(index).status().node_id, index))
@@ -640,7 +1157,10 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             let service = Arc::new(FixtureConsumer::new(
                 Arc::new(cluster.store(store_index).consumer_service()),
                 lose_next_fenced_transition_response.clone(),
+                lose_next_fenced_transition_v2_response.clone(),
                 fenced_transition_status_misses_remaining.clone(),
+                Arc::clone(&ordinary_cas_fault),
+                voters.len(),
             ));
             let (listener, address) =
                 start_fixture_listener(&pki, &roster, &grant, &authority, service.clone()).await?;
@@ -667,6 +1187,14 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         let journal_path = journal_directory.path().join("prepared-fenced.sqlite3");
         let journal_key = PreparedFencedTransitionJournalKey::from_bytes([0x43; 32]);
         PreparedFencedTransitionJournal::create_new(&journal_path, journal_key.clone())?;
+        let recovery_journal_path = journal_directory
+            .path()
+            .join("prepared-fenced-v2-recovery.sqlite3");
+        let recovery_journal_key = FencedTransitionV2RecoveryJournalKey::from_bytes([0x44; 32]);
+        FencedTransitionV2RecoveryJournal::create_new(
+            &recovery_journal_path,
+            recovery_journal_key.clone(),
+        )?;
 
         Ok(Self {
             cluster,
@@ -676,12 +1204,17 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             client_config,
             voters,
             lose_next_fenced_transition_response,
+            lose_next_fenced_transition_v2_response,
             fenced_transition_status_misses_remaining,
             general_consumer_counters,
+            ordinary_cas_fault,
             listeners,
-            _journal_directory: journal_directory,
+            journal_directory,
+            consumer_journal_directories: Mutex::new(Vec::new()),
             journal_path,
             journal_key,
+            recovery_journal_path,
+            recovery_journal_key,
         })
     }
 
@@ -731,9 +1264,71 @@ impl AuthenticatedPreparedFencedTransitionFixture {
     where
         P: KeyProvider + Send + Sync + 'static + ?Sized,
     {
+        self.local_aead_pair_with_journal(provider, backend_namespace, self.open_journal()?)
+            .await
+    }
+
+    /// Provision one additional consumer with its own retained prepared journal
+    /// against this fixture's existing authenticated three-voter store.
+    ///
+    /// Call once per independent consumer, before its workload begins. Keep the
+    /// returned pair or its reopener for that consumer's complete lifecycle;
+    /// creating another pair is not recovery or permission to discard history.
+    /// All consumers share the same voters, grants and aggregate observations.
+    /// The caller still supplies coherent encryption configuration and distinct
+    /// application ownership scopes. Journal limits and exclusive-open checks
+    /// are unchanged.
+    ///
+    /// The new private directory is retained until fixture shutdown, including
+    /// when activation is cancelled or fails. No path, key, client, prepared
+    /// token or activated roster is exposed. Existing `open_local_aead_pair`
+    /// continues to reopen only the fixture's original journal.
+    pub async fn create_local_aead_pair<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        AuthenticatedPreparedFencedTransitionFixturePair<'_, P>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let directory = tempfile::Builder::new()
+            .prefix("consumer-")
+            .tempdir_in(self.journal_directory.path())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        let journal = Arc::new(PreparedFencedTransitionJournal::create_new(
+            directory.path().join("prepared-fenced.sqlite3"),
+            self.journal_key.clone(),
+        )?);
+        self.consumer_journal_directories
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(directory);
+        self.local_aead_pair_with_journal(provider, backend_namespace, journal)
+            .await
+    }
+
+    async fn local_aead_pair_with_journal<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Result<
+        AuthenticatedPreparedFencedTransitionFixturePair<'_, P>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
         let backend_namespace: Arc<str> = Arc::from(backend_namespace.into());
         let clients = self.persistent_clients()?;
-        let journal = self.open_journal()?;
         let prepared_fenced_transition_facade = self
             .open_local_aead_from_clients(
                 clients.clone(),
@@ -745,7 +1340,10 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         let general_backend = AuthenticatedPreparedFencedTransitionFixtureGeneralBackend {
             inner: Arc::new(
                 EncryptingSessionBackend::new(
-                    Arc::new(FixtureGeneralConsumerBackend::new(clients)),
+                    Arc::new(FixtureGeneralConsumerBackend::new(
+                        clients,
+                        Arc::clone(&self.ordinary_cas_fault),
+                    )),
                     Arc::clone(&provider),
                     backend_namespace.to_string(),
                 )
@@ -763,6 +1361,63 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                 journal,
             },
         })
+    }
+
+    /// Open an opaque general backend that retains the SDK's sealed payload
+    /// protection proof, for public protected selector-namespace tests.
+    ///
+    /// Unlike the accounting facade returned by `open_local_aead_pair`, this
+    /// value can enter APIs requiring `ProtectedSessionBackend`. It is the same
+    /// SDK-owned local AEAD wrapper, with the same required exact-voter readiness
+    /// activation. Its physical clients and cryptographic material stay private.
+    pub async fn open_protected_local_aead<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        impl opc_session_store::ProtectedSessionBackend + Clone + 'static,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let pair = self
+            .open_local_aead_pair(provider, backend_namespace)
+            .await?;
+        Ok(pair.general_backend.inner.as_ref().clone())
+    }
+
+    /// Hold the next ordinary authoritative update in the exact tenant/NF and
+    /// state-type scope after its real consensus success. Call only after
+    /// provisioning and the test's precise pre-CAS phase gate: creation CAS,
+    /// other record types, leases, prepared transitions, and consensus traffic
+    /// cannot consume this fault. The first matching client request privately
+    /// fixes its complete encrypted body, key, ID, and consensus scope.
+    ///
+    /// This is a lost-success/unchanged-transport-timeout case, not an injected
+    /// socket EOF. One live control per fixture prevents cross-test arming.
+    pub fn hold_next_ordinary_cas_response(
+        &self,
+        tenant_nf: SessionConsumerTenantNfScope,
+        state_type: StateType,
+    ) -> Result<AuthenticatedOrdinaryCasResponseLoss, AuthenticatedOrdinaryCasResponseLossError>
+    {
+        let mut active = self
+            .ordinary_cas_fault
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(AuthenticatedOrdinaryCasResponseLossError);
+        }
+        let gate = Arc::new(FixtureOrdinaryCasGate {
+            tenant_nf,
+            state_type,
+            state: Mutex::new(FixtureOrdinaryCasState::default()),
+            changed: tokio::sync::Notify::new(),
+        });
+        *active = Some(Arc::downgrade(&gate));
+        Ok(AuthenticatedOrdinaryCasResponseLoss { gate })
     }
 
     fn open_journal(
@@ -828,6 +1483,96 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         )
     }
 
+    /// Construct a fresh local-AEAD protected V2 facade over the fixture's
+    /// real voters and its durable caller-keyed recovery journal.
+    ///
+    /// Every voter's `/2` lane is prewarmed and must prove
+    /// `FencedTransitionV2Capability::V2`. Calling this again after dropping a
+    /// previous V2 facade reopens the same recovery journal, modelling a new
+    /// process: `recover_fenced_transition_status` then yields only a
+    /// receipt-only handle. No method exposes a client, the journal key, or a
+    /// sealed request.
+    pub async fn open_local_aead_v2<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        SessionConsumerPreparedFencedTransitionV2Backend,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let activated =
+            SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(
+                self.persistent_clients()?,
+            )
+            .await?;
+        Ok(
+            SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(
+                activated,
+                provider,
+                backend_namespace,
+                self.open_recovery_journal()?,
+            )?,
+        )
+    }
+
+    /// Construct the protected V2 facade composed with a V1 facade over the
+    /// fixture's original prepared journal, modelling an upgraded consumer.
+    ///
+    /// Retained V1 transitions remain status-recoverable through the V2
+    /// facade, and V2 preparation rejects their caller IDs. The consumed V1
+    /// facade can no longer prepare transitions.
+    pub async fn open_local_aead_v2_with_legacy_v1<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        SessionConsumerPreparedFencedTransitionV2Backend,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let backend_namespace = backend_namespace.into();
+        let legacy = self
+            .open_local_aead_from_clients(
+                self.persistent_clients()?,
+                Arc::clone(&provider),
+                backend_namespace.clone(),
+                self.open_journal()?,
+            )
+            .await?;
+        Ok(self
+            .open_local_aead_v2(provider, backend_namespace)
+            .await?
+            .with_legacy_v1_recovery(legacy)?)
+    }
+
+    fn open_recovery_journal(
+        &self,
+    ) -> Result<
+        Arc<FencedTransitionV2RecoveryJournal>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    > {
+        Ok(Arc::new(FencedTransitionV2RecoveryJournal::open_existing(
+            &self.recovery_journal_path,
+            self.recovery_journal_key.clone(),
+        )?))
+    }
+
+    /// Withhold the next successful epoch-fenced V2 transition response from
+    /// whichever exact voter the protected V2 facade chooses.
+    ///
+    /// The real service commits the transition first; only its response is
+    /// withheld until the caller's unchanged physical-attempt deadline. The
+    /// production client alone classifies the loss as an unknown outcome.
+    pub fn lose_next_fenced_transition_v2_response(&self) {
+        self.lose_next_fenced_transition_v2_response
+            .store(true, Ordering::Release);
+    }
+
     /// Withhold the next successful fenced-transition response from whichever
     /// exact voter the opaque facade chooses.
     ///
@@ -850,6 +1595,21 @@ impl AuthenticatedPreparedFencedTransitionFixture {
     pub fn force_next_fenced_transition_status_round_to_miss(&self) {
         self.fenced_transition_status_misses_remaining
             .store(FIXTURE_VOTER_COUNT, Ordering::Release);
+    }
+
+    /// Stall every `/2` receipt lookup on the voter at `canonical_index` in
+    /// node-ordinal order, the order the protected facades route by.
+    #[cfg(test)]
+    pub(crate) fn stall_fenced_transition_v2_status_on_canonical_voter(
+        &self,
+        canonical_index: usize,
+    ) {
+        let mut canonical = self.voters.iter().collect::<Vec<_>>();
+        canonical.sort_unstable_by_key(|voter| voter.authority.node_id());
+        canonical[canonical_index]
+            .service
+            .stall_fenced_transition_v2_status
+            .store(true, Ordering::Release);
     }
 
     /// Return redacted aggregate transport activity for no-replay assertions.
@@ -888,7 +1648,90 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                 .general_consumer_counters
                 .compare_and_set
                 .load(Ordering::SeqCst),
+            fenced_transition_v2_calls: self
+                .voters
+                .iter()
+                .map(|voter| {
+                    voter
+                        .service
+                        .fenced_transition_v2_calls
+                        .load(Ordering::SeqCst)
+                })
+                .sum(),
+            fenced_transition_v2_status_calls: self
+                .voters
+                .iter()
+                .map(|voter| {
+                    voter
+                        .service
+                        .fenced_transition_v2_status_calls
+                        .load(Ordering::SeqCst)
+                })
+                .sum(),
+            fenced_transition_v2_history_state_calls: self
+                .voters
+                .iter()
+                .map(|voter| {
+                    voter
+                        .service
+                        .fenced_transition_v2_history_state_calls
+                        .load(Ordering::SeqCst)
+                })
+                .sum(),
         }
+    }
+
+    /// Observe bounded, numeric local storage costs without issuing a request.
+    ///
+    /// This is available only with Linux `test-control`; other configurations
+    /// return `None`. The observation carries no authority, endpoints, payloads,
+    /// or storage paths. Take it outside a timed request and compare its totals
+    /// with a preceding observation from the same fixture incarnation.
+    pub fn local_storage_timing(&self) -> io::Result<Option<serde_json::Value>> {
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        {
+            let mut observations = Vec::with_capacity(FIXTURE_VOTER_COUNT);
+            for index in 0..FIXTURE_VOTER_COUNT {
+                let costs = opc_session_store::test_support::consensus_local_wal_costs_for_test(
+                    &self.cluster.store(index),
+                )?;
+                observations.push(costs.map(|costs| {
+                    // Select only fixed numeric categories. Do not propagate
+                    // experimental diagnostics or underlying error text.
+                    serde_json::json!({
+                        "voter_slot": index,
+                        "groups": costs["groups"],
+                        "requests": costs["requests"],
+                        "sync_calls": costs["sync_calls"],
+                        "admission_us": costs["admission_us"],
+                        "admission_lock_wait_us": costs["admission_lock_wait_us"],
+                        "projection_us": costs["projection_us"],
+                        "write_us": costs["write_us"],
+                        "intent_us": costs["intent_us"],
+                        "data_sync_us": costs["data_sync_us"],
+                        "publication_us": costs["publication_us"],
+                        "queue_wait_us": costs["queue_wait_us"],
+                        "submit_to_callback_us": costs["submit_to_callback_us"],
+                        "application": costs["application"],
+                        "checkpoint": costs["checkpoint"],
+                    })
+                }));
+            }
+            Ok(Some(serde_json::Value::from(observations)))
+        }
+        #[cfg(not(all(target_os = "linux", feature = "test-control")))]
+        Ok(None)
+    }
+
+    /// Observe actual consensus peer round trips on this fixture's shared voters.
+    ///
+    /// Available with `test-control`. Fixed numeric fields contain no endpoint,
+    /// owner, payload or storage identity. Calls include background traffic;
+    /// they are not application-operation or proposal counts. Snapshot fields
+    /// are independently sampled and duration histograms include handler wait.
+    #[cfg(feature = "test-control")]
+    pub fn consensus_rpc_observation(&self) -> serde_json::Value {
+        self.cluster.consensus_rpc_observation()
     }
 
     /// Restart only the private authenticated listener frontends.
@@ -934,6 +1777,9 @@ impl AuthenticatedPreparedFencedTransitionFixture {
 
 impl Drop for AuthenticatedPreparedFencedTransitionFixture {
     fn drop(&mut self) {
+        if let Some(fault) = self.ordinary_cas_fault.active() {
+            fault.release_readback(false);
+        }
         for listener in &self.listeners {
             listener.abort();
         }
@@ -973,25 +1819,44 @@ async fn start_fixture_listener(
 struct FixtureConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
     lose_next_fenced_transition_response: Arc<AtomicBool>,
+    lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
     fenced_transition_calls: AtomicUsize,
     fenced_transition_status_calls: AtomicUsize,
     forced_fenced_transition_status_misses: AtomicUsize,
+    fenced_transition_v2_calls: AtomicUsize,
+    fenced_transition_v2_status_calls: AtomicUsize,
+    fenced_transition_v2_history_state_calls: AtomicUsize,
+    #[cfg(test)]
+    stall_fenced_transition_v2_status: AtomicBool,
+    ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
+    voter: usize,
 }
 
 impl FixtureConsumer {
     fn new(
         inner: Arc<dyn SessionQuorumConsumer>,
         lose_next_fenced_transition_response: Arc<AtomicBool>,
+        lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
         fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
+        ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
+        voter: usize,
     ) -> Self {
         Self {
             inner,
             lose_next_fenced_transition_response,
+            lose_next_fenced_transition_v2_response,
             fenced_transition_status_misses_remaining,
             fenced_transition_calls: AtomicUsize::new(0),
             fenced_transition_status_calls: AtomicUsize::new(0),
             forced_fenced_transition_status_misses: AtomicUsize::new(0),
+            fenced_transition_v2_calls: AtomicUsize::new(0),
+            fenced_transition_v2_status_calls: AtomicUsize::new(0),
+            fenced_transition_v2_history_state_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            stall_fenced_transition_v2_status: AtomicBool::new(false),
+            ordinary_cas_fault,
+            voter,
         }
     }
 }
@@ -1003,6 +1868,12 @@ impl SessionQuorumConsumer for FixtureConsumer {
         authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
+        let ordinary_fault = self.ordinary_cas_fault.active();
+        let ordinary_call = ordinary_fault
+            .as_ref()
+            .map_or(FixtureOrdinaryCasCall::Other, |gate| {
+                gate.observe_server_request(&request)
+            });
         let fenced_transition = matches!(
             request.operation(),
             opc_session_store::SessionConsumerOperation::FencedTransition { .. }
@@ -1019,6 +1890,25 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute(authorization, request).await;
+        if let Some(gate) = ordinary_fault {
+            match ordinary_call {
+                FixtureOrdinaryCasCall::Mutation if gate.observe_committed_success(&response) => {
+                    // Keep the actual successful response below the ordinary
+                    // server boundary until its unchanged bounded deadline.
+                    // Only the production client/server can classify timeout
+                    // as OutcomeUnknown. No replacement receipt is invented.
+                    let _pending = FixtureOrdinaryCasPending {
+                        gate: &gate,
+                        readback: false,
+                    };
+                    std::future::pending::<SessionConsumerResponse>().await;
+                }
+                FixtureOrdinaryCasCall::Readback => {
+                    return gate.gate_readback(self.voter, response).await;
+                }
+                FixtureOrdinaryCasCall::Mutation | FixtureOrdinaryCasCall::Other => {}
+            }
+        }
         if fenced_transition_status
             && matches!(
                 &response,
@@ -1044,6 +1934,63 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .is_ok()
         {
             std::future::pending::<SessionConsumerResponse>().await;
+        }
+        response
+    }
+
+    /// Forward every `/2` request to the real store-owned quorum service.
+    ///
+    /// The decorator only counts calls and, when armed, withholds one
+    /// committed V2 transition response. It never fabricates a response or
+    /// submits an operation itself.
+    async fn execute_v2(
+        &self,
+        authorization: &SessionConsumerAuthorization,
+        request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        let fenced_transition_v2 = matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2 { .. }
+        );
+        if fenced_transition_v2 {
+            self.fenced_transition_v2_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+        ) {
+            self.fenced_transition_v2_status_calls
+                .fetch_add(1, Ordering::SeqCst);
+            // A stalled voter never answers a read-only receipt lookup; the
+            // production client's own attempt deadline classifies it.
+            #[cfg(test)]
+            if self
+                .stall_fenced_transition_v2_status
+                .load(Ordering::Acquire)
+            {
+                std::future::pending::<()>().await;
+            }
+        }
+        if matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState
+        ) {
+            self.fenced_transition_v2_history_state_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        let response = self.inner.execute_v2(authorization, request).await;
+        if fenced_transition_v2
+            && matches!(
+                &response,
+                SessionConsumerV2Response::FencedTransitionV2(Ok(_))
+            )
+            && self
+                .lose_next_fenced_transition_v2_response
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            std::future::pending::<SessionConsumerV2Response>().await;
         }
         response
     }
@@ -1122,6 +2069,9 @@ impl FixturePki {
             .expect("construct fixture workload identity")
     }
 }
+
+#[cfg(test)]
+mod v2_facade_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1270,6 +2220,137 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_pair_shares_authenticated_authority_and_reopens_without_v1_lowering() {
+        assert_paired_fixture_authority_and_reopen(false).await;
+    }
+
+    #[tokio::test]
+    async fn fixture_pair_recovers_a_lost_response_before_shared_read_and_reopen() {
+        assert_paired_fixture_authority_and_reopen(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fixture_multiple_consumers_share_voters_with_separate_retained_journals() {
+        let tenants = [
+            TenantId::new("consumer-fixture-left").expect("synthetic tenant"),
+            TenantId::new("consumer-fixture-right").expect("synthetic tenant"),
+        ];
+        let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable(
+            tenants.iter().cloned().map(fixture_scope),
+        )
+        .await
+        .expect("start one authenticated durable three-voter store");
+        let mut parts = Vec::new();
+        let mut protected = Vec::new();
+        for (tenant, namespace) in tenants.iter().zip(["consumer-left", "consumer-right"]) {
+            let pair = fixture
+                .create_local_aead_pair(fixture_provider(tenant.clone()), namespace)
+                .await
+                .expect("provision a distinct consumer before its workload");
+            protected.push(pair.protected_general_backend());
+            parts.push(pair.into_parts());
+        }
+        {
+            let directories = fixture.consumer_journal_directories.lock().unwrap();
+            assert_eq!(directories.len(), 2);
+            for directory in directories.iter() {
+                assert!(
+                    PreparedFencedTransitionJournal::open_existing(
+                        directory.path().join("prepared-fenced.sqlite3"),
+                        fixture.journal_key.clone(),
+                    )
+                    .is_err(),
+                    "each consumer retains exclusive ownership of its exact journal"
+                );
+            }
+        }
+        let ids = [
+            FencedTransitionRequestId::from_bytes([0x41; 16]),
+            FencedTransitionRequestId::from_bytes([0x42; 16]),
+        ];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (left, right) = tokio::join!(
+            parts[0].1.prepare_fenced_transition(
+                fixture_request(ids[0], tenants[0].clone()),
+                fixture_budget(deadline),
+            ),
+            parts[1].1.prepare_fenced_transition(
+                fixture_request(ids[1], tenants[1].clone()),
+                fixture_budget(deadline),
+            ),
+        );
+        let mut left = left.expect("prepare first consumer request");
+        let mut right = right.expect("prepare second consumer request");
+        let (left_result, right_result) = tokio::join!(left.execute_once(), right.execute_once());
+        left_result.expect("first overlapping request commits");
+        right_result.expect("second overlapping request commits");
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            2,
+            "the same voter fleet observes exactly one mutation per consumer"
+        );
+        for index in 0..2 {
+            let record = parts[index]
+                .0
+                .get(&fixture_key(tenants[index].clone()))
+                .await
+                .expect("read the consumer's durable state")
+                .expect("the committed record remains present");
+            assert_eq!(record.generation, Generation::new(1));
+            assert_eq!(
+                protected[index]
+                    .get(&record.key)
+                    .await
+                    .expect("protected clone reads the same exact record"),
+                Some(record),
+            );
+            let foreign_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            assert!(
+                parts[index]
+                    .1
+                    .recover_fenced_transition_status(
+                        ids[1 - index],
+                        fixture_budget(foreign_deadline)
+                    )
+                    .await
+                    .expect("check the exact foreign request identity")
+                    .is_none(),
+                "a different consumer's journal cannot grant recovery authority"
+            );
+        }
+        drop(left);
+        drop(right);
+        for (index, (general, facade, reopener)) in parts.into_iter().enumerate() {
+            drop(facade);
+            let reopened = reopener
+                .reopen_prepared_fenced_transition_facade()
+                .await
+                .expect("reopen that consumer's retained journal");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let mut recovered = reopened
+                .recover_fenced_transition_status(ids[index], fixture_budget(deadline))
+                .await
+                .expect("recover the consumer's exact request")
+                .expect("the original local journal is retained");
+            assert!(matches!(
+                recovered.status_until_terminal(deadline).await.expect("read the exact receipt"),
+                FencedTransitionStatus::Recorded(result) if result.is_ok()
+            ));
+            drop(recovered);
+            drop(reopened);
+            drop(reopener);
+            drop(general);
+        }
+        assert_eq!(fixture.diagnostics().fenced_transition_calls(), 2);
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
+        drop(protected);
+        fixture
+            .shutdown()
+            .await
+            .expect("shut down the shared store");
+    }
+
+    async fn assert_paired_fixture_authority_and_reopen(lose_response: bool) {
         let tenant = fixture_tenant();
         let provider = fixture_provider(tenant.clone());
         let fixture =
@@ -1283,6 +2364,14 @@ mod tests {
         assert_session_store_backend::<
             AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<MemoryKeyProvider>,
         >();
+        let protected = pair.protected_general_backend();
+        assert!(
+            fixture
+                .open_protected_local_aead(Arc::clone(&provider), "fixture-paired-authority")
+                .await
+                .is_err(),
+            "a second journal open remains forbidden while paired authority is live"
+        );
         let (general, facade, reopener) = pair.into_parts();
         let request_id = FencedTransitionRequestId::from_bytes([0x30; 16]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1293,10 +2382,48 @@ mod tests {
             )
             .await
             .expect("prepare through the initial opaque facade");
-        prepared
-            .execute_once()
-            .await
-            .expect("the opaque facade commits through the shared authority");
+        if lose_response {
+            fixture.lose_next_fenced_transition_response();
+        }
+        let execution = prepared.execute_once().await;
+        if lose_response {
+            assert!(
+                matches!(&execution, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: observed }) if *observed == request_id),
+                "the real committed response loss must expose the exact unknown outcome"
+            );
+        }
+        match execution {
+            Ok(_) => {}
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: observed,
+            }) => {
+                assert!(
+                    observed == request_id,
+                    "only the exact retained request may recover"
+                );
+                // One physical attempt may lose its response. Recover only its
+                // receipt under the original outer deadline before shared reads.
+                let receipt = prepared.status_until_terminal(deadline).await.expect(
+                    "the exact ambiguous transition must reconcile before its original deadline",
+                );
+                assert!(
+                    matches!(receipt, FencedTransitionStatus::Recorded(result) if result.is_ok()),
+                    "only a successful authoritative receipt permits shared readback"
+                );
+            }
+            Err(error) => panic!("paired fixture dispatch failed before exact recovery: {error:?}"),
+        }
+        if lose_response {
+            assert!(
+                fixture.diagnostics().fenced_transition_status_calls() > 0,
+                "unknown completion must be proved with authoritative receipt reads"
+            );
+        }
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            1,
+            "shared readback follows exactly one physical mutation"
+        );
 
         let record = general
             .get(&fixture_key(tenant))
@@ -1304,6 +2431,13 @@ mod tests {
             .expect("the paired general mTLS backend reads the same authority")
             .expect("the opaque facade committed the authoritative record");
         assert_eq!(record.generation, Generation::new(1));
+        assert_eq!(
+            protected
+                .get(&record.key)
+                .await
+                .expect("protected clone observes the paired authenticated authority"),
+            Some(record.clone()),
+        );
         assert_eq!(
             general
                 .fenced_transition_capability()
@@ -1338,15 +2472,22 @@ mod tests {
             "recovery on the fresh facade never replays the original mutation"
         );
 
+        assert_eq!(
+            protected
+                .get(&record.key)
+                .await
+                .expect("protected clone remains on the same journal after facade recovery"),
+            Some(record),
+        );
         drop(recovered);
         drop(reopened);
         drop(reopener);
         drop(general);
+        drop(protected);
         fixture.shutdown().await.expect("shut down fixture");
     }
 
-    #[tokio::test]
-    async fn fixture_prepares_and_executes_a_real_authenticated_three_voter_transition() {
+    async fn assert_fresh_fixture_commits_without_replay(lose_response: bool) {
         let tenant = fixture_tenant();
         let fixture =
             AuthenticatedPreparedFencedTransitionFixture::start([fixture_scope(tenant.clone())])
@@ -1358,27 +2499,102 @@ mod tests {
             .expect("open opaque local-AEAD facade");
         let request_id = FencedTransitionRequestId::from_bytes([0x31; 16]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let request = fixture_request(request_id, tenant);
+        let expected_record = request.mutation().record().expect("create request").clone();
         let mut prepared = facade
-            .prepare_fenced_transition(
-                fixture_request(request_id, tenant),
-                fixture_budget(deadline),
-            )
+            .prepare_fenced_transition(request.clone(), fixture_budget(deadline))
             .await
             .expect("prepare through the production facade");
 
-        prepared
-            .execute_once()
-            .await
-            .expect("one real authenticated transition commits");
+        if lose_response {
+            fixture.lose_next_fenced_transition_response();
+        }
+        let execution = prepared.execute_once().await;
+        let ambiguous = matches!(
+            &execution,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        );
+        if lose_response {
+            assert!(
+                matches!(&execution, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: observed }) if *observed == request_id),
+                "withholding the real response must expose this exact request's unknown outcome"
+            );
+            assert!(
+                !fixture
+                    .lose_next_fenced_transition_response
+                    .load(Ordering::Acquire),
+                "the response-loss hook must run after the real service returns"
+            );
+        }
+        let outcome = match execution {
+            Ok(outcome) => outcome,
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: observed,
+            }) => {
+                assert!(
+                    observed == request_id,
+                    "only the exact retained request may recover"
+                );
+                // A capped physical attempt may commit without delivering its
+                // response. This same handle can only read its exact receipt
+                // under the original deadline; it cannot dispatch again.
+                let receipt = prepared.status_until_terminal(deadline).await.expect(
+                    "the exact transition receipt must resolve before its original deadline",
+                );
+                let FencedTransitionStatus::Recorded(result) = receipt else {
+                    panic!("only a successful authoritative receipt proves the transition: {receipt:?}");
+                };
+                (*result).expect("one real authenticated transition commits")
+            }
+            Err(error) => panic!("fresh fixture dispatch failed before exact recovery: {error:?}"),
+        };
+        assert!(
+            outcome.matches_request(&request),
+            "the committed outcome must match the complete request"
+        );
+        if ambiguous {
+            assert!(
+                fixture.diagnostics().fenced_transition_status_calls() > 0,
+                "unknown completion must be proved with authoritative receipt reads"
+            );
+        }
         assert_eq!(
             fixture.diagnostics().fenced_transition_calls(),
             1,
             "the fresh affine handle dispatches exactly one physical mutation"
         );
 
+        let observed = tokio::time::timeout_at(
+            deadline,
+            facade.observe_fenced_transition(&expected_record.key),
+        )
+        .await
+        .expect("authoritative readback must finish before the original deadline")
+        .expect("read the record through the same authenticated protected facade");
+        assert_eq!(observed.record(), Some(&expected_record));
+        assert_eq!(observed.current_fence(), outcome.lease().fence());
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            1,
+            "receipt recovery and readback never replay the mutation"
+        );
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
+
         drop(prepared);
         drop(facade);
         fixture.shutdown().await.expect("shut down fixture");
+    }
+
+    #[tokio::test]
+    async fn fixture_prepares_and_executes_a_real_authenticated_three_voter_transition() {
+        assert_fresh_fixture_commits_without_replay(false).await;
+    }
+
+    #[tokio::test]
+    async fn fixture_recovers_a_fresh_transition_response_loss_within_original_budget_without_replay(
+    ) {
+        assert_fresh_fixture_commits_without_replay(true).await;
     }
 
     #[tokio::test]

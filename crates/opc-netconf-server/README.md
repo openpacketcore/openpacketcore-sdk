@@ -56,6 +56,40 @@ durable sinks therefore await acknowledgement without parking a Tokio executor
 thread. The public registry-free synchronous helpers retain their synchronous
 behavior and accept borrowed sink adapters.
 
+### Required configuration audit
+
+`ReadOnlyNetconfServer::with_required_config_audit` installs the capability from
+the exact binding's `ConfigBus::required_config_audit`. For this profile,
+running `edit-config` and NMDA `edit-data` submit their
+original authenticated request together with its required intent. The encrypted
+datastore admits and checkpoints that intent before its effect. The protocol
+does not send a separate Intent to an observation sink or report a second
+terminal outcome after submission. Known commits remain successful when audit
+completion debt fences later writes; recovery resolves the original operation.
+
+This is a partial writable-running profile. Attachment returns
+`RequiredAuditProfileUnsupported` for candidate, confirmed-commit or startup
+bindings, and `RequiredAuditWorkerMismatch` for another bus worker, including
+one opened over the same store. It never hides capabilities. Changed capability
+answers after attachment also fail closed. Full candidate/startup/confirmation
+support remains tracked by #958 and the
+[contract proposal](../../docs/rfc/019-netconf-required-audit.md).
+
+The copy-to-running effect helper uses the same required submitter, but this
+profile has no supported distinct source datastore: candidate and startup are
+refused, and the XML parser does not support inline copy sources. Copying a
+datastore to itself returns `invalid-value` as required by
+[RFC 6241 section 7.3](https://www.rfc-editor.org/rfc/rfc6241.html#section-7.3).
+Helper qualification does not establish positive wire-protocol copy coverage;
+that remains part of the full-profile work in #958.
+
+The supplied legacy sink is replaced by that authority's observation port.
+Reads and denials use asynchronous observations; registry-free synchronous
+dispatch cannot drive the replicated port and fails closed. Atomic registry
+jobs await real asynchronous observation admission on their existing blocking
+worker while retaining the atomic gate and registry guard. They do not create
+configuration commits or acknowledge standalone configuration Intents.
+
 `<kill-session>`, `<lock>`, and `<unlock>` must make one audit-plus-registry
 decision that survives caller cancellation. Their async paths reserve a
 single, fail-fast gate owned by the shared `SessionRegistry`, then run the
@@ -168,8 +202,53 @@ The commit boundary contains unwinding from an `AuditSink` so a sink panic
 cannot reverse these reply semantics. A sink panic remains a trait-contract
 violation: Rust invokes the process panic hook before unwinding can be caught,
 so sink implementations must never place sensitive content in panic payloads.
-This contract describes candidate `<commit>`; it does not claim identical
-ordering for every NETCONF operation.
+The same containment applies to the configuration mutation paths listed below;
+read-only and registry operations retain their separately documented contracts.
+
+## Running edit audit intent
+
+`<edit-config>` and `<edit-data>` targeting running request an
+`AuditOutcome::Intent` after candidate construction and write authorization,
+before config-bus submission. The intent carries the canonical changed schema
+paths and request identity. A rejected intent or an unwinding sink prevents
+submission, returns a value-free `operation-failed`, and releases the running
+write reservation. The commit request retains its original deadline while
+waiting for the asynchronous audit result.
+
+Running edits now preserve a known successful commit when terminal recording
+fails. The optional `<cancel-commit>` and `<copy-config>` to running paths also
+require an acknowledged intent before submission and preserve known commit
+results. Terminal recording preserves the original configuration rejection
+instead of replacing it with an audit error. These paths use the same bounded,
+value-free terminal-failure signal as candidate commit.
+
+Candidate and startup `<edit-config>`/`<edit-data>`, copies to candidate/startup,
+`<discard-changes>`, and deletion of startup also require acknowledged Intent
+before modifying their local datastore. They preserve the applied result or
+original rejection if terminal recording fails. Cancellation while Intent is
+unacknowledged leaves the datastore unchanged and releases the write reservation.
+
+While the volatile candidate is locked, staged content is tied to that exact
+lock and session incarnation. Explicit unlock or loss of its owner invalidates staged
+content before later reads or writes can use it. Cleanup does not block session
+Drop. A rejected unlock preserves both lock and content. Delayed edits, copies
+and discards from an obsolete write lease fail without changing a replacement
+owner's stage, including numeric session-ID reuse. A successful running commit
+retires only the candidate generation it consumed; a newer stage remains
+available for explicit rebase or discard if its running base is now stale.
+These are process-local lifecycle guarantees, not retained encrypted target
+support or an expansion of the required-audit profile.
+
+Non-persistent confirmed-commit rollback on session exit follows the same
+pre-submit rule. Failed Intent keeps the pending confirmation available for
+retry without extending its original deadline. A known rollback result retires
+only the matching pending confirmation; a later confirmation cannot be cleared
+by an earlier completion.
+
+These handler guarantees do not by themselves provide durable terminal recovery.
+A local sink or process-local candidate is not a replicated operation authority;
+recoverable configuration outcomes require the SDK consensus audit composition
+tracked by #796 and #797.
 
 ## Relationships
 
@@ -181,6 +260,18 @@ ordering for every NETCONF operation.
 - Generated XML projection and edit support normally come from `opc-yanggen`.
 
 ## Status And Limits
+
+Schema-backed leaf-list edits support multiple values under containers and
+keyed lists, including complete root replacements. Entry operations use typed
+value identity; repeated values, conflicting edits, and repeated parents fail
+before publication. See [RFC 002's edit contract](../../docs/rfc/002-yang-projection.md#121-bounded-netconf-leaf-list-edits)
+for operation semantics, bounds, and the generated service regression fixture.
+
+Source migration: exhaustive matches on `EditConfigError` must handle the
+additive `DataExists` and `DataMissing` variants. The default generated binding
+maps supported leaf-list `create`/`delete` existence failures to these RFC-defined
+responses across running, candidate, and startup edits. Existing unsupported,
+invalid-value, and internal-failure variants keep their classifications.
 
 Implemented scope:
 

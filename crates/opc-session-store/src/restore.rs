@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aes_gcm_siv::{
-    aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
+    aead::{AeadInOut, KeyInit},
     Aes256GcmSiv,
 };
 use hmac::{Hmac, Mac};
@@ -245,9 +245,9 @@ impl RestoreScanCursor {
         let nonce_key =
             derive_restore_cursor_subkey(authentication_key, RESTORE_SCAN_CURSOR_NONCE_KEY_DOMAIN)?;
         let nonce = synthetic_restore_cursor_nonce(&nonce_key, &aad, &plaintext)?;
-        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(aead_key.as_ref()));
+        let cipher = Aes256GcmSiv::new((&*aead_key).into());
         let tag = cipher
-            .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut plaintext)
+            .encrypt_inout_detached((&nonce).into(), &aad, plaintext.as_mut_slice().into())
             .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
 
         let token_capacity = RESTORE_SCAN_CURSOR_ENVELOPE_BYTES
@@ -299,13 +299,17 @@ impl RestoreScanCursor {
         let aead_key =
             derive_restore_cursor_subkey(authentication_key, RESTORE_SCAN_CURSOR_AEAD_KEY_DOMAIN)
                 .map_err(|_| StoreError::RestoreScanCursorStale)?;
-        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(aead_key.as_ref()));
+        let cipher = Aes256GcmSiv::new((&*aead_key).into());
         cipher
-            .decrypt_in_place_detached(
-                GenericArray::from_slice(&self.token[nonce_start..ciphertext_start]),
+            .decrypt_inout_detached(
+                self.token[nonce_start..ciphertext_start]
+                    .try_into()
+                    .map_err(|_| StoreError::RestoreScanCursorStale)?,
                 &aad,
-                &mut plaintext,
-                GenericArray::from_slice(&self.token[tag_start..]),
+                plaintext.as_mut_slice().into(),
+                self.token[tag_start..]
+                    .try_into()
+                    .map_err(|_| StoreError::RestoreScanCursorStale)?,
             )
             .map_err(|_| StoreError::RestoreScanCursorStale)?;
         let nonce_key =
@@ -562,7 +566,7 @@ fn derive_restore_cursor_subkey(
     authentication_key: &[u8; 32],
     domain: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>, StoreError> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(authentication_key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(authentication_key)
         .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
     mac.update(domain);
     Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
@@ -573,7 +577,7 @@ fn synthetic_restore_cursor_nonce(
     aad: &[u8],
     canonical_plaintext: &[u8],
 ) -> Result<[u8; RESTORE_SCAN_CURSOR_NONCE_BYTES], StoreError> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(nonce_key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(nonce_key)
         .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
     mac.update(aad);
     mac.update(canonical_plaintext);

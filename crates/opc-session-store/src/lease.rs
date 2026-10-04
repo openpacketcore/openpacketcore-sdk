@@ -38,6 +38,16 @@ impl fmt::Debug for LeaseGuard {
 }
 
 impl LeaseGuard {
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        self.key
+            .log_row_reuse_allocation_bytes()?
+            .checked_add(self.owner.allocation_capacity())
+    }
+
+    pub(crate) fn normalize_log_row_reuse_backing(&mut self) {
+        self.key.normalize_log_row_reuse_backing();
+    }
+
     pub(crate) fn new(
         key: SessionKey,
         owner: OwnerId,

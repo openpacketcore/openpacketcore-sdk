@@ -93,6 +93,120 @@ impl std::fmt::Debug for AuthenticatedEnvelopeClaim {
     }
 }
 
+/// Decoded RFC 001 envelope with body slices borrowed from its input.
+///
+/// This proves the binary format only. Nonce policy, AAD binding and keyed
+/// authentication remain the caller's original validation responsibilities.
+/// The validated key identifier is owned; nonce, AAD and ciphertext are not copied.
+#[derive(Debug)]
+pub struct CryptoEnvelopeRef<'a> {
+    /// Algorithm declared by the versioned envelope header.
+    pub algorithm: AeadAlgorithm,
+    /// Validated key identifier declared by the envelope.
+    pub key_id: KeyId,
+    /// Borrowed nonce bytes; the caller validates the algorithm's nonce policy.
+    pub nonce: &'a [u8],
+    /// Borrowed bound AAD bytes; the caller validates their schema and binding.
+    pub aad: &'a [u8],
+    /// Borrowed ciphertext followed by its authentication tag.
+    pub ciphertext_and_tag: &'a [u8],
+}
+
+impl<'a> CryptoEnvelopeRef<'a> {
+    /// Decode under the same binary profile as [`CryptoEnvelopeV1::decode`].
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+
+        if bytes[..4] != ENVELOPE_MAGIC {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+
+        let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if version != ENVELOPE_VERSION {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+
+        let algorithm = AeadAlgorithm::from_id(u16::from_be_bytes([bytes[6], bytes[7]]))
+            .map_err(|_| CryptoError::InvalidEnvelope)?;
+        let key_id_len = usize::from(u16::from_be_bytes([bytes[8], bytes[9]]));
+        let nonce_len = usize::from(u16::from_be_bytes([bytes[10], bytes[11]]));
+        let aad_len = usize::try_from(u32::from_be_bytes([
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        ]))
+        .map_err(|_| CryptoError::InvalidEnvelope)?;
+
+        let payload_offset = HEADER_LEN
+            .checked_add(key_id_len)
+            .and_then(|value| value.checked_add(nonce_len))
+            .and_then(|value| value.checked_add(aad_len))
+            .ok_or(CryptoError::InvalidEnvelope)?;
+        if payload_offset > bytes.len() {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+
+        let key_id_end = HEADER_LEN + key_id_len;
+        let nonce_end = key_id_end + nonce_len;
+        let aad_end = nonce_end + aad_len;
+        let ciphertext_and_tag = &bytes[aad_end..];
+        if ciphertext_and_tag.len() < AEAD_TAG_LEN {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+
+        let key_id = std::str::from_utf8(&bytes[HEADER_LEN..key_id_end])
+            .map_err(|_| CryptoError::InvalidEnvelope)?;
+
+        Ok(Self {
+            algorithm,
+            key_id: KeyId::new(key_id.to_owned()).map_err(|_| CryptoError::InvalidEnvelope)?,
+            nonce: &bytes[key_id_end..nonce_end],
+            aad: &bytes[nonce_end..aad_end],
+            ciphertext_and_tag,
+        })
+    }
+
+    /// Compare every byte with the original V1 encoding without an output buffer.
+    ///
+    /// This is a canonical representation check, not keyed authentication.
+    pub fn matches_encoding(&self, bytes: &[u8]) -> bool {
+        let key_id = self.key_id.as_str().as_bytes();
+        let Ok(key_id_len) = u16::try_from(key_id.len()) else {
+            return false;
+        };
+        let Ok(nonce_len) = u16::try_from(self.nonce.len()) else {
+            return false;
+        };
+        let Ok(aad_len) = u32::try_from(self.aad.len()) else {
+            return false;
+        };
+        let mut remaining = bytes;
+        let mut matches = |part: &[u8]| {
+            if let Some(rest) = remaining.strip_prefix(part) {
+                remaining = rest;
+                true
+            } else {
+                false
+            }
+        };
+        matches(&ENVELOPE_MAGIC)
+            && matches(&ENVELOPE_VERSION.to_be_bytes())
+            && matches(&self.algorithm.id().to_be_bytes())
+            && matches(&key_id_len.to_be_bytes())
+            && matches(&nonce_len.to_be_bytes())
+            && matches(&aad_len.to_be_bytes())
+            && matches(key_id)
+            && matches(self.nonce)
+            && matches(self.aad)
+            && matches(self.ciphertext_and_tag)
+            && remaining.is_empty()
+    }
+}
+
+#[cfg(test)]
+#[path = "envelope_view_tests.rs"]
+mod envelope_view_tests;
+
 /// Decoded RFC 001 envelope structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CryptoEnvelopeV1 {
@@ -132,54 +246,13 @@ impl CryptoEnvelopeV1 {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if bytes.len() < HEADER_LEN {
-            return Err(CryptoError::InvalidEnvelope);
-        }
-
-        if bytes[..4] != ENVELOPE_MAGIC {
-            return Err(CryptoError::InvalidEnvelope);
-        }
-
-        let version = u16::from_be_bytes([bytes[4], bytes[5]]);
-        if version != ENVELOPE_VERSION {
-            return Err(CryptoError::InvalidEnvelope);
-        }
-
-        let algorithm = AeadAlgorithm::from_id(u16::from_be_bytes([bytes[6], bytes[7]]))
-            .map_err(|_| CryptoError::InvalidEnvelope)?;
-        let key_id_len = usize::from(u16::from_be_bytes([bytes[8], bytes[9]]));
-        let nonce_len = usize::from(u16::from_be_bytes([bytes[10], bytes[11]]));
-        let aad_len = usize::try_from(u32::from_be_bytes([
-            bytes[12], bytes[13], bytes[14], bytes[15],
-        ]))
-        .map_err(|_| CryptoError::InvalidEnvelope)?;
-
-        let payload_offset = HEADER_LEN
-            .checked_add(key_id_len)
-            .and_then(|value| value.checked_add(nonce_len))
-            .and_then(|value| value.checked_add(aad_len))
-            .ok_or(CryptoError::InvalidEnvelope)?;
-        if payload_offset > bytes.len() {
-            return Err(CryptoError::InvalidEnvelope);
-        }
-
-        let key_id_end = HEADER_LEN + key_id_len;
-        let nonce_end = key_id_end + nonce_len;
-        let aad_end = nonce_end + aad_len;
-        let ciphertext_and_tag = bytes[aad_end..].to_vec();
-        if ciphertext_and_tag.len() < AEAD_TAG_LEN {
-            return Err(CryptoError::InvalidEnvelope);
-        }
-
-        let key_id = std::str::from_utf8(&bytes[HEADER_LEN..key_id_end])
-            .map_err(|_| CryptoError::InvalidEnvelope)?;
-
+        let decoded = CryptoEnvelopeRef::decode(bytes)?;
         Ok(Self {
-            algorithm,
-            key_id: KeyId::new(key_id.to_owned()).map_err(|_| CryptoError::InvalidEnvelope)?,
-            nonce: bytes[key_id_end..nonce_end].to_vec(),
-            aad: bytes[nonce_end..aad_end].to_vec(),
-            ciphertext_and_tag,
+            algorithm: decoded.algorithm,
+            key_id: decoded.key_id,
+            nonce: decoded.nonce.to_vec(),
+            aad: decoded.aad.to_vec(),
+            ciphertext_and_tag: decoded.ciphertext_and_tag.to_vec(),
         })
     }
 }

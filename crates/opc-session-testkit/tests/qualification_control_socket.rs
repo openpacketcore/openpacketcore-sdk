@@ -192,6 +192,7 @@ fn write_configs(root: &Path, addresses: &[SocketAddr]) -> Vec<PathBuf> {
                 snapshot_root_device: None,
                 snapshot_root_inode: None,
                 operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+                isolated_scale: None,
                 transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
             };
             config.validate().expect("valid control config");
@@ -270,6 +271,7 @@ fn write_fleet_control_configs(
             snapshot_root_device: None,
             snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            isolated_scale: None,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         };
         config.validate().expect("valid concurrent control config");

@@ -13,6 +13,10 @@ keywords = ["5g", "gtpu", "gtp", "linux", "packet-core"]
 categories = ["network-programming", "os::linux-apis"]
 publish = false
 
+[features]
+# Optional conformance coverage for the explicitly volatile session-store lab.
+lab-memory = ["opc-session-store/lab-memory"]
+
 [dependencies]
 bytes = { workspace = true }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
@@ -37,11 +41,16 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 aya = { version = "0.14" }
 aya-obj = { version = "0.3" }
 sha1 = { workspace = true }
-rustix = { version = "1", features = ["fs", "process", "time"] }
+rustix = { version = "1", features = ["fs", "process", "system", "thread", "time"] }
 # recvmsg/IP_PKTINFO provenance extraction for the reassembly consumer.
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
+serde_json = { workspace = true }
+# SDK-owned encrypted mTLS/fixed-voter regression fixture with passive storage
+# timing so deadline failures retain their actual local persistence costs.
+opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0", features = ["consumer-fixture", "test-control"] }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

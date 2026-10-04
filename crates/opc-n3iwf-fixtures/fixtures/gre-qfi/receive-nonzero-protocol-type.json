@@ -1,0 +1,46 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gre-header",
+  "context": {
+    "max_qfi": 63
+  },
+  "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.receive-nonzero-protocol-type",
+  "subset": "gre-qfi",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.3.2",
+      "9.3.3"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "NWu GRE profile ignore rule",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Received Protocol Type 0x0800 must be ignored, not rejected"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/receive-nonzero-protocol-type.hex",
+    "digest_sha256": "a30edd013039ab12379629233204810a36fcad79fa2ba92a4692fab58e41704d"
+  },
+  "semantic_assertions": [
+    "protocol_type=0x0800",
+    "receiver_disposition=ignore",
+    "packet_disposition=receive"
+  ],
+  "expected_outcome": "ignore",
+  "runtime_claim": false
+}

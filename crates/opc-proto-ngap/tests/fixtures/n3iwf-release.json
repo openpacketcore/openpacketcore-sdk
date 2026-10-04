@@ -1,0 +1,1824 @@
+{
+  "source_sha256": "21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2",
+  "reference_tools": {
+    "pycrate": "0.8.1",
+    "pypdf": "6.1.0"
+  },
+  "fields": [
+    {
+      "name": "cause-radioNetwork-0",
+      "type": "Cause",
+      "wire_hex": "0000",
+      "wire_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+      "group": "radioNetwork",
+      "code": 0
+    },
+    {
+      "name": "cause-radioNetwork-1",
+      "type": "Cause",
+      "wire_hex": "0040",
+      "wire_sha256": "b8811852747cfa3620c3dd2af5d59498c240f208e689b4052bac934c29faf094",
+      "group": "radioNetwork",
+      "code": 1
+    },
+    {
+      "name": "cause-radioNetwork-2",
+      "type": "Cause",
+      "wire_hex": "0080",
+      "wire_sha256": "085edad400785fca7e7e90b1fac4beb776fc2beee5aa24352d5f39b5d57efcad",
+      "group": "radioNetwork",
+      "code": 2
+    },
+    {
+      "name": "cause-radioNetwork-3",
+      "type": "Cause",
+      "wire_hex": "00c0",
+      "wire_sha256": "81c2a21c99c2e261ad6d91443ffb383b57c321d7e33f09cb64c8b946bb14939b",
+      "group": "radioNetwork",
+      "code": 3
+    },
+    {
+      "name": "cause-radioNetwork-4",
+      "type": "Cause",
+      "wire_hex": "0100",
+      "wire_sha256": "47dc540c94ceb704a23875c11273e16bb0b8a87aed84de911f2133568115f254",
+      "group": "radioNetwork",
+      "code": 4
+    },
+    {
+      "name": "cause-radioNetwork-5",
+      "type": "Cause",
+      "wire_hex": "0140",
+      "wire_sha256": "dd1e2826c0124a6d4f7397a5a71f633928926c0608b62fb9e615ba778acc39ff",
+      "group": "radioNetwork",
+      "code": 5
+    },
+    {
+      "name": "cause-radioNetwork-6",
+      "type": "Cause",
+      "wire_hex": "0180",
+      "wire_sha256": "3be90d393f91241448d7dceadad32d91c1c94f307805937b46ed01ea669c17c3",
+      "group": "radioNetwork",
+      "code": 6
+    },
+    {
+      "name": "cause-radioNetwork-7",
+      "type": "Cause",
+      "wire_hex": "01c0",
+      "wire_sha256": "32444d1ca2314b6449d98ed53575e1d1dca3e826e1d622fee4502e355a21dd85",
+      "group": "radioNetwork",
+      "code": 7
+    },
+    {
+      "name": "cause-radioNetwork-8",
+      "type": "Cause",
+      "wire_hex": "0200",
+      "wire_sha256": "99be5efb88ca2013bd8e4eb035fd42d5245468fe9afa70d8ba9c1c419a48c4e8",
+      "group": "radioNetwork",
+      "code": 8
+    },
+    {
+      "name": "cause-radioNetwork-9",
+      "type": "Cause",
+      "wire_hex": "0240",
+      "wire_sha256": "ba3c702b24e4ef16c111bf92823170f6e81fd37fbafaccbeef52192a1c094380",
+      "group": "radioNetwork",
+      "code": 9
+    },
+    {
+      "name": "cause-radioNetwork-10",
+      "type": "Cause",
+      "wire_hex": "0280",
+      "wire_sha256": "61d7e4731e7a6546d92e99105ffce332c9ab905311cba8dbad8ac4f3bbc49447",
+      "group": "radioNetwork",
+      "code": 10
+    },
+    {
+      "name": "cause-radioNetwork-11",
+      "type": "Cause",
+      "wire_hex": "02c0",
+      "wire_sha256": "f5e0e61250dc5ca346e045ef9b8830ff510ceebd97829a9047efcaf584db9587",
+      "group": "radioNetwork",
+      "code": 11
+    },
+    {
+      "name": "cause-radioNetwork-12",
+      "type": "Cause",
+      "wire_hex": "0300",
+      "wire_sha256": "9b4fb24edd6d1d8830e272398263cdbf026b97392cc35387b991dc0248a628f9",
+      "group": "radioNetwork",
+      "code": 12
+    },
+    {
+      "name": "cause-radioNetwork-13",
+      "type": "Cause",
+      "wire_hex": "0340",
+      "wire_sha256": "23cfea09624d0880dc8dc30bf5fda8cd9ff7bf4770a119425a6995e15563b865",
+      "group": "radioNetwork",
+      "code": 13
+    },
+    {
+      "name": "cause-radioNetwork-14",
+      "type": "Cause",
+      "wire_hex": "0380",
+      "wire_sha256": "6191d6df2a4b8ad04a19ad70045422d4fb47b5bd189d2b63befde6043a9c9f11",
+      "group": "radioNetwork",
+      "code": 14
+    },
+    {
+      "name": "cause-radioNetwork-15",
+      "type": "Cause",
+      "wire_hex": "03c0",
+      "wire_sha256": "1f5c65186bd477aaa4180428209a0367735b83a7f227bf9beaa943d366ef8abc",
+      "group": "radioNetwork",
+      "code": 15
+    },
+    {
+      "name": "cause-radioNetwork-16",
+      "type": "Cause",
+      "wire_hex": "0400",
+      "wire_sha256": "c0ba8a33ac67f44abff5984dfbb6f56c46b880ac2b86e1f23e7fa9c402c53ae7",
+      "group": "radioNetwork",
+      "code": 16
+    },
+    {
+      "name": "cause-radioNetwork-17",
+      "type": "Cause",
+      "wire_hex": "0440",
+      "wire_sha256": "923500f6441159701590100a604278097d8dc488fc1f3d6649afca073b788fe4",
+      "group": "radioNetwork",
+      "code": 17
+    },
+    {
+      "name": "cause-radioNetwork-18",
+      "type": "Cause",
+      "wire_hex": "0480",
+      "wire_sha256": "bcc6284bff4fd180dea86badab851e5d605fa73856d625e280c0d9d2a5422b6e",
+      "group": "radioNetwork",
+      "code": 18
+    },
+    {
+      "name": "cause-radioNetwork-19",
+      "type": "Cause",
+      "wire_hex": "04c0",
+      "wire_sha256": "c71d8dffac39c548cc22783ca4700a234e8a23b719a7f5f118ed5848d36ad6ad",
+      "group": "radioNetwork",
+      "code": 19
+    },
+    {
+      "name": "cause-radioNetwork-20",
+      "type": "Cause",
+      "wire_hex": "0500",
+      "wire_sha256": "2921a11f25dadaa24aa79a548e4e81508c2e5e56af2d833d65e2bcce448ce2f5",
+      "group": "radioNetwork",
+      "code": 20
+    },
+    {
+      "name": "cause-radioNetwork-21",
+      "type": "Cause",
+      "wire_hex": "0540",
+      "wire_sha256": "4a092eda277e2cd5ac78afdc99416dfacd395dccb3aa7c5f9c1ac56ae2996ac4",
+      "group": "radioNetwork",
+      "code": 21
+    },
+    {
+      "name": "cause-radioNetwork-22",
+      "type": "Cause",
+      "wire_hex": "0580",
+      "wire_sha256": "57d61d20e98fa14f9aca8f5d4541ae316f561d1d2e4da5128e9e518e1a927db5",
+      "group": "radioNetwork",
+      "code": 22
+    },
+    {
+      "name": "cause-radioNetwork-23",
+      "type": "Cause",
+      "wire_hex": "05c0",
+      "wire_sha256": "a2bf6b389fd471bcfd39d6e63241d37f1c9074553377353ace8afa6e8076038f",
+      "group": "radioNetwork",
+      "code": 23
+    },
+    {
+      "name": "cause-radioNetwork-24",
+      "type": "Cause",
+      "wire_hex": "0600",
+      "wire_sha256": "ceb827ad3d3884fd4d50ae6099d6d50c09a21e72ebd309708e8b69d93df19e55",
+      "group": "radioNetwork",
+      "code": 24
+    },
+    {
+      "name": "cause-radioNetwork-25",
+      "type": "Cause",
+      "wire_hex": "0640",
+      "wire_sha256": "d7ca2aa00351926564026e2235856a45d02965bb3bf77d957958e6286de26451",
+      "group": "radioNetwork",
+      "code": 25
+    },
+    {
+      "name": "cause-radioNetwork-26",
+      "type": "Cause",
+      "wire_hex": "0680",
+      "wire_sha256": "9a19f655130b52c65ce058cb20655391dfbc3fd08125db11027bbb1745de17a2",
+      "group": "radioNetwork",
+      "code": 26
+    },
+    {
+      "name": "cause-radioNetwork-27",
+      "type": "Cause",
+      "wire_hex": "06c0",
+      "wire_sha256": "d51dc513cfe393df5b529104d8eb3eeca6d3fa8dd0f6f2674b4aa7558263279b",
+      "group": "radioNetwork",
+      "code": 27
+    },
+    {
+      "name": "cause-radioNetwork-28",
+      "type": "Cause",
+      "wire_hex": "0700",
+      "wire_sha256": "0a6361b3a802f55cd5ae06101c88a1e216320fe11cc0cfe1d791eed08a1200fd",
+      "group": "radioNetwork",
+      "code": 28
+    },
+    {
+      "name": "cause-radioNetwork-29",
+      "type": "Cause",
+      "wire_hex": "0740",
+      "wire_sha256": "4a86aec12d4de2fe7f289cb9d297e3d384b0cf0a926e9033d5435c5065977187",
+      "group": "radioNetwork",
+      "code": 29
+    },
+    {
+      "name": "cause-radioNetwork-30",
+      "type": "Cause",
+      "wire_hex": "0780",
+      "wire_sha256": "5c1c11effeaa238d128e624639e7a5f18af117464d181540b2d63a17c9c0ad06",
+      "group": "radioNetwork",
+      "code": 30
+    },
+    {
+      "name": "cause-radioNetwork-31",
+      "type": "Cause",
+      "wire_hex": "07c0",
+      "wire_sha256": "34b902c818ebdb547c4aa8d161dd701bd5f78ac3df6b5ab7fac3c35dae795e56",
+      "group": "radioNetwork",
+      "code": 31
+    },
+    {
+      "name": "cause-radioNetwork-32",
+      "type": "Cause",
+      "wire_hex": "0800",
+      "wire_sha256": "e545d395bb3fd971f91bf9a2b6722831df704efae6c1aa9da0989ed0970b77bb",
+      "group": "radioNetwork",
+      "code": 32
+    },
+    {
+      "name": "cause-radioNetwork-33",
+      "type": "Cause",
+      "wire_hex": "0840",
+      "wire_sha256": "bc13258ddf5cbee91238322390955c54d519a8e3d5736f720b812b216c13a446",
+      "group": "radioNetwork",
+      "code": 33
+    },
+    {
+      "name": "cause-radioNetwork-34",
+      "type": "Cause",
+      "wire_hex": "0880",
+      "wire_sha256": "960d01fd8733d5a5bc3e2287d7117bb761720e1e4c1744dc1651cd6a567e6dc2",
+      "group": "radioNetwork",
+      "code": 34
+    },
+    {
+      "name": "cause-radioNetwork-35",
+      "type": "Cause",
+      "wire_hex": "08c0",
+      "wire_sha256": "b4245e1880553d8150dee978e237c0f06d7b4b16d776c0816f07a3c2a7b6e361",
+      "group": "radioNetwork",
+      "code": 35
+    },
+    {
+      "name": "cause-radioNetwork-36",
+      "type": "Cause",
+      "wire_hex": "0900",
+      "wire_sha256": "a2c4aed1cf757cd9a509734a267ffc7b1166b55f4c8f9c3e3550c56e743328fc",
+      "group": "radioNetwork",
+      "code": 36
+    },
+    {
+      "name": "cause-radioNetwork-37",
+      "type": "Cause",
+      "wire_hex": "0940",
+      "wire_sha256": "1a5ead5227b449f9b23e4e270d413721dc548e28e2cabd190da44f5b625fe7c1",
+      "group": "radioNetwork",
+      "code": 37
+    },
+    {
+      "name": "cause-radioNetwork-38",
+      "type": "Cause",
+      "wire_hex": "0980",
+      "wire_sha256": "c26a944084d91d50301ef1c3479924137e2cede3c79a3f7a3216de06c625bcb9",
+      "group": "radioNetwork",
+      "code": 38
+    },
+    {
+      "name": "cause-radioNetwork-39",
+      "type": "Cause",
+      "wire_hex": "09c0",
+      "wire_sha256": "ab9b458331b0d16bdd7d4c86157d1d9ebb058209cc7dd27c9e9b74b380ba23ca",
+      "group": "radioNetwork",
+      "code": 39
+    },
+    {
+      "name": "cause-radioNetwork-40",
+      "type": "Cause",
+      "wire_hex": "0a00",
+      "wire_sha256": "102b51b9765a56a3e899f7cf0ee38e5251f9c503b357b330a49183eb7b155604",
+      "group": "radioNetwork",
+      "code": 40
+    },
+    {
+      "name": "cause-radioNetwork-41",
+      "type": "Cause",
+      "wire_hex": "0a40",
+      "wire_sha256": "a3c1739143402ed2fdd72b52c25362da39b281db04265a09dd96857fb78fcf22",
+      "group": "radioNetwork",
+      "code": 41
+    },
+    {
+      "name": "cause-radioNetwork-42",
+      "type": "Cause",
+      "wire_hex": "0a80",
+      "wire_sha256": "386866abef68b72156296521a6fc2f0ab4911e3c5ddb76a805d4ea03c7b9ce0d",
+      "group": "radioNetwork",
+      "code": 42
+    },
+    {
+      "name": "cause-radioNetwork-43",
+      "type": "Cause",
+      "wire_hex": "0ac0",
+      "wire_sha256": "f58d28d6f8b1cf5b48ffe8c1f8d521dd331cf18c01fb13da8cc20f30ffe854d6",
+      "group": "radioNetwork",
+      "code": 43
+    },
+    {
+      "name": "cause-radioNetwork-44",
+      "type": "Cause",
+      "wire_hex": "0b00",
+      "wire_sha256": "cbe2268747c9c8072c7f9926f2288f270637dc55bb9d14d3368361d5e47d25be",
+      "group": "radioNetwork",
+      "code": 44
+    },
+    {
+      "name": "cause-transport-0",
+      "type": "Cause",
+      "wire_hex": "20",
+      "wire_sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+      "group": "transport",
+      "code": 0
+    },
+    {
+      "name": "cause-transport-1",
+      "type": "Cause",
+      "wire_hex": "28",
+      "wire_sha256": "32ebb1abcc1c601ceb9c4e3c4faba0caa5b85bb98c4f1e6612c40faa528a91c9",
+      "group": "transport",
+      "code": 1
+    },
+    {
+      "name": "cause-nas-0",
+      "type": "Cause",
+      "wire_hex": "40",
+      "wire_sha256": "c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae",
+      "group": "nas",
+      "code": 0
+    },
+    {
+      "name": "cause-nas-1",
+      "type": "Cause",
+      "wire_hex": "44",
+      "wire_sha256": "3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+      "group": "nas",
+      "code": 1
+    },
+    {
+      "name": "cause-nas-2",
+      "type": "Cause",
+      "wire_hex": "48",
+      "wire_sha256": "44bd7ae60f478fae1061e11a7739f4b94d1daf917982d33b6fc8a01a63f89c21",
+      "group": "nas",
+      "code": 2
+    },
+    {
+      "name": "cause-nas-3",
+      "type": "Cause",
+      "wire_hex": "4c",
+      "wire_sha256": "72dfcfb0c470ac255cde83fb8fe38de8a128188e03ea5ba5b2a93adbea1062fa",
+      "group": "nas",
+      "code": 3
+    },
+    {
+      "name": "cause-protocol-0",
+      "type": "Cause",
+      "wire_hex": "60",
+      "wire_sha256": "8d33f520a3c4cef80d2453aef81b612bfe1cb44c8b2025630ad38662763f13d3",
+      "group": "protocol",
+      "code": 0
+    },
+    {
+      "name": "cause-protocol-1",
+      "type": "Cause",
+      "wire_hex": "62",
+      "wire_sha256": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+      "group": "protocol",
+      "code": 1
+    },
+    {
+      "name": "cause-protocol-2",
+      "type": "Cause",
+      "wire_hex": "64",
+      "wire_sha256": "18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4",
+      "group": "protocol",
+      "code": 2
+    },
+    {
+      "name": "cause-protocol-3",
+      "type": "Cause",
+      "wire_hex": "66",
+      "wire_sha256": "252f10c83610ebca1a059c0bae8255eba2f95be4d1d7bcfa89d7248a82d9f111",
+      "group": "protocol",
+      "code": 3
+    },
+    {
+      "name": "cause-protocol-4",
+      "type": "Cause",
+      "wire_hex": "68",
+      "wire_sha256": "aaa9402664f1a41f40ebbc52c9993eb66aeb366602958fdfaa283b71e64db123",
+      "group": "protocol",
+      "code": 4
+    },
+    {
+      "name": "cause-protocol-5",
+      "type": "Cause",
+      "wire_hex": "6a",
+      "wire_sha256": "189f40034be7a199f1fa9891668ee3ab6049f82d38c68be70f596eab2e1857b7",
+      "group": "protocol",
+      "code": 5
+    },
+    {
+      "name": "cause-protocol-6",
+      "type": "Cause",
+      "wire_hex": "6c",
+      "wire_sha256": "acac86c0e609ca906f632b0e2dacccb2b77d22b0621f20ebece1a4835b93f6f0",
+      "group": "protocol",
+      "code": 6
+    },
+    {
+      "name": "cause-misc-0",
+      "type": "Cause",
+      "wire_hex": "80",
+      "wire_sha256": "76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71",
+      "group": "misc",
+      "code": 0
+    },
+    {
+      "name": "cause-misc-1",
+      "type": "Cause",
+      "wire_hex": "82",
+      "wire_sha256": "a5ab782c805e8bfbe34cb65742a0471cf5a53a97f0a1160ab6cccbb64c9131ce",
+      "group": "misc",
+      "code": 1
+    },
+    {
+      "name": "cause-misc-2",
+      "type": "Cause",
+      "wire_hex": "84",
+      "wire_sha256": "aaa8e61e7faf37dd77cc5f907b38146741994b27d5b1978679af68b43f55e7c5",
+      "group": "misc",
+      "code": 2
+    },
+    {
+      "name": "cause-misc-3",
+      "type": "Cause",
+      "wire_hex": "86",
+      "wire_sha256": "3cbdaf66b3dd2b174788a2f17f938b52dda93a2a97440cead19332cbfacba7c8",
+      "group": "misc",
+      "code": 3
+    },
+    {
+      "name": "cause-misc-4",
+      "type": "Cause",
+      "wire_hex": "88",
+      "wire_sha256": "4f362f9093bb8e7012f466224ff1237c0746d8c8f660b16699f5036ccba9c64a",
+      "group": "misc",
+      "code": 4
+    },
+    {
+      "name": "cause-misc-5",
+      "type": "Cause",
+      "wire_hex": "8a",
+      "wire_sha256": "2d3193691934124461809fb9bc7e671215099fc7d961bfbe31943d40d477c890",
+      "group": "misc",
+      "code": 5
+    },
+    {
+      "name": "identifiers-0",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "0000c0ffffffff",
+      "wire_sha256": "ce1e9ccadb085fb2cf075c1fa0e0e59ebd5ca40b821c6797d08c9d19d1d2f01f",
+      "amf": 0,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-1",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "0001c0ffffffff",
+      "wire_sha256": "be2a4cc0e61186dd9e2518c24b22142149b23a5badd73d71d068723f3ed0f556",
+      "amf": 1,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-2",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "00ffc0ffffffff",
+      "wire_sha256": "6840d8d6a770eaf1aa5abe05ab79671833a974654d41606c4ddad31f1935db93",
+      "amf": 255,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-3",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "020100c0ffffffff",
+      "wire_sha256": "5710599c9f732dee7c8a2205094d3050377e8308231d16229124c407d4a8de60",
+      "amf": 256,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-4",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "02ffffc0ffffffff",
+      "wire_sha256": "818d1f6b2ae5b579e012fbe88dcd313c8bd3fb1900a93da8f38bc129fa3398b8",
+      "amf": 65535,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-5",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "04010000c0ffffffff",
+      "wire_sha256": "e2d018e35ad27d6d6c721c6ed4409f73f55ee12eae418192fe03cd8fdc927059",
+      "amf": 65536,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-6",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "04ffffffc0ffffffff",
+      "wire_sha256": "778daf06999eb07cc73d306c8b9299eba9aaf1074e0b352fa89b8b0eeb0947e8",
+      "amf": 16777215,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-7",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "0601000000c0ffffffff",
+      "wire_sha256": "12a7c1c4e6d03b1c0598c32f8ff47109df515b65d4dc497e0f3f0b118b05fd81",
+      "amf": 16777216,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-8",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "06ffffffffc0ffffffff",
+      "wire_sha256": "776f77cb4d4b840d787b5d52cde0be008f167797559f8a16e75f582855abc62d",
+      "amf": 4294967295,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-9",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "080100000000c0ffffffff",
+      "wire_sha256": "4e870bda949af67929510f9facf0737bf6c451e25d80fce11125e48afd85022d",
+      "amf": 4294967296,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-10",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffffc0ffffffff",
+      "wire_sha256": "ee37fa286e6e876430e6bf07ce614eb73b4bec714aacd2e8a32e76ec8b55933f",
+      "amf": 1099511627775,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-11",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff0000",
+      "wire_sha256": "fb842e21a19f69a350781ce166b374f643ef0f2dc745f91559f9e07616623910",
+      "amf": 1099511627775,
+      "ran": 0
+    },
+    {
+      "name": "identifiers-12",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff0001",
+      "wire_sha256": "c879ccf33d7950a889d330630d7101ca0d0692339bca1a7eea377ebde2498410",
+      "amf": 1099511627775,
+      "ran": 1
+    },
+    {
+      "name": "identifiers-13",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff00ff",
+      "wire_sha256": "07bed5dbe49d7fe31788aa29ed6715f3173935804b23bd845b3ab696c69547a4",
+      "amf": 1099511627775,
+      "ran": 255
+    },
+    {
+      "name": "identifiers-14",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff400100",
+      "wire_sha256": "b68e55a10971bfc11d45c8e323900fa6526dc12a5a3164f43a27545e5866c75c",
+      "amf": 1099511627775,
+      "ran": 256
+    },
+    {
+      "name": "identifiers-15",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff40ffff",
+      "wire_sha256": "cf28064e528ff93df4f55ef124ddcbf91974f3dcacf4f8c37d256628f71719b0",
+      "amf": 1099511627775,
+      "ran": 65535
+    },
+    {
+      "name": "identifiers-16",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff80010000",
+      "wire_sha256": "f846decb3e42c581dbe8ef24f99fd139a85914b883672257de576fb493fa0745",
+      "amf": 1099511627775,
+      "ran": 65536
+    },
+    {
+      "name": "identifiers-17",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffff80ffffff",
+      "wire_sha256": "6ec68ef9f9750051b1e3b30e8e88a3821a8980e636821a8072921b73ee2a6d9f",
+      "amf": 1099511627775,
+      "ran": 16777215
+    },
+    {
+      "name": "identifiers-18",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "08ffffffffffc001000000",
+      "wire_sha256": "353acff92debe9bdaf6f76495c1599bb70d7a2083fc00fd76d8f0c8710c3daba",
+      "amf": 1099511627775,
+      "ran": 16777216
+    },
+    {
+      "name": "identifiers-19",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "4000",
+      "wire_sha256": "eec4121f2a07b61aba16414812aa9afc39ab0a136360a5ace2240dc19b0464eb",
+      "amf": 0,
+      "ran": null
+    },
+    {
+      "name": "identifiers-20",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "4001",
+      "wire_sha256": "d2dbb1d582f0029c27ccaa9b62186a1d8e3af5daba05f629e4b13b3741f3795b",
+      "amf": 1,
+      "ran": null
+    },
+    {
+      "name": "identifiers-21",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "40ff",
+      "wire_sha256": "5f5df442506eba39ecaf964bc81b19c6727f39726cd676d7e5922359a5613626",
+      "amf": 255,
+      "ran": null
+    },
+    {
+      "name": "identifiers-22",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "480100",
+      "wire_sha256": "96e3adadafbdb04df55fa9cad3d3923bd5b8ce49e84372867011813b1f311102",
+      "amf": 256,
+      "ran": null
+    },
+    {
+      "name": "identifiers-23",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "48ffff",
+      "wire_sha256": "23fc346f73b84eadd1884e8e52742bc5591baa2d3d38d7195cb7588f3e90bb0b",
+      "amf": 65535,
+      "ran": null
+    },
+    {
+      "name": "identifiers-24",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "50010000",
+      "wire_sha256": "2e61bcea597570e82112505d266b413c3013bf4c8f40c2d096dc2584643eb1ce",
+      "amf": 65536,
+      "ran": null
+    },
+    {
+      "name": "identifiers-25",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "50ffffff",
+      "wire_sha256": "76c2fc64675bdc8fedd1116f3e946ccb7a2f64a9aa3dd56234253733372c9903",
+      "amf": 16777215,
+      "ran": null
+    },
+    {
+      "name": "identifiers-26",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "5801000000",
+      "wire_sha256": "ea345b851214b976bf61789cdae0e41fe5762776f82b94e44004bf8e59cb2e3a",
+      "amf": 16777216,
+      "ran": null
+    },
+    {
+      "name": "identifiers-27",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "58ffffffff",
+      "wire_sha256": "a3f6e70649f2dd0e572a68818b3ccbb86298f02199bb251d4725701fb7e930c4",
+      "amf": 4294967295,
+      "ran": null
+    },
+    {
+      "name": "identifiers-28",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "600100000000",
+      "wire_sha256": "a3f6395b7832c987e2db8c58ac959c68e2980c870da9cc4bc7d20a07f7b0a466",
+      "amf": 4294967296,
+      "ran": null
+    },
+    {
+      "name": "identifiers-29",
+      "type": "UE_NGAP_IDs",
+      "wire_hex": "60ffffffffff",
+      "wire_sha256": "3e898407463af985fd7e54129ac628d44c3b6f8d420da8772266121b89589ff8",
+      "amf": 1099511627775,
+      "ran": null
+    }
+  ],
+  "messages": [
+    {
+      "name": "base-UEContextReleaseCommand",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f40018a",
+      "wire_sha256": "c14fd0da051494f7ba33320b4cce93fd1074002d5657da8ec81bccfb217d6bbc",
+      "construct": true
+    },
+    {
+      "name": "missing-UEContextReleaseCommand-114",
+      "message": "UEContextReleaseCommand",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "00290008000001000f40018a",
+      "wire_sha256": "c1ac3b9a2fd0f6e8aa78fa2ab8e39627d5f7956233b242bf911107e8910a76fc",
+      "missing_id": 114
+    },
+    {
+      "name": "missing-UEContextReleaseCommand-15",
+      "message": "UEContextReleaseCommand",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "002900120000010072000b080102030405c010203040",
+      "wire_sha256": "dddf55d8653c81e760aeaffd69ea575c910c4ba168f71a5e341b6bfc289e842e",
+      "missing_id": 15
+    },
+    {
+      "name": "duplicate-UEContextReleaseCommand",
+      "message": "UEContextReleaseCommand",
+      "reference_error": "duplicate-ie",
+      "wire_hex": "002900260000030072000b080102030405c0102030400072000b080102030405c010203040000f40018a",
+      "wire_sha256": "3594c47836613535ac99203238496ec693d16055377b71f0ee01221179dae7a2",
+      "duplicate": true
+    },
+    {
+      "name": "unknown-UEContextReleaseCommand-ignore",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029001d0000030072000b080102030405c010203040000f40018afffa4002abcd",
+      "wire_sha256": "f3f5f76a14b81963bb9349a99f56a8a6a5df14e80d64b1d09c52fc27097a24be",
+      "unknown_criticality": "ignore"
+    },
+    {
+      "name": "unknown-UEContextReleaseCommand-notify",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029001d0000030072000b080102030405c010203040000f40018afffa8002abcd",
+      "wire_sha256": "efcb8abd26eaf9e0711f3ebb93bb3022a27a5a291f84c4cb1e37224405520187",
+      "unknown_criticality": "notify"
+    },
+    {
+      "name": "unknown-UEContextReleaseCommand-reject",
+      "message": "UEContextReleaseCommand",
+      "reference_error": "unknown-critical-ie",
+      "wire_hex": "0029001d0000030072000b080102030405c010203040000f40018afffa0002abcd",
+      "wire_sha256": "241a253d0298ada6cab584c7538153c4ad4a33a089c55cafe81982f23eb8c434",
+      "unknown_criticality": "reject"
+    },
+    {
+      "name": "base-UEContextReleaseComplete",
+      "message": "UEContextReleaseComplete",
+      "reference_error": null,
+      "wire_hex": "2029002f000003000a400680010203040500554005c0102030400079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "e0f809451ac1c8003af8755254f5c3d5cc1041598f607be9b581e7eba824eda8",
+      "construct": true
+    },
+    {
+      "name": "missing-UEContextReleaseComplete-10",
+      "message": "UEContextReleaseComplete",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "2029002500000200554005c0102030400079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "42947e43f61a74e8d803676ce9a12d7f536618bef84bb137bbd13c91aa571dcb",
+      "missing_id": 10
+    },
+    {
+      "name": "missing-UEContextReleaseComplete-85",
+      "message": "UEContextReleaseComplete",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "20290026000002000a40068001020304050079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "ee6a74886d248e3c2c4977dc090c79ab60d33c7b0cbc973a4abbe5dc1f8eb7da",
+      "missing_id": 85
+    },
+    {
+      "name": "duplicate-UEContextReleaseComplete",
+      "message": "UEContextReleaseComplete",
+      "reference_error": "duplicate-ie",
+      "wire_hex": "20290039000004000a4006800102030405000a400680010203040500554005c0102030400079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "ee647de82a576e42c00907c766041388b37559e6adbce2a1f22f8671246f3e60",
+      "duplicate": true
+    },
+    {
+      "name": "unknown-UEContextReleaseComplete-ignore",
+      "message": "UEContextReleaseComplete",
+      "reference_error": null,
+      "wire_hex": "20290035000004000a400680010203040500554005c0102030400079401590f8c00002011194000000d540070000f110000001fffa4002abcd",
+      "wire_sha256": "1d53c2c1c1fb8bb24143856c9b5718ed69b2b147b238f17c04720f27144d1523",
+      "unknown_criticality": "ignore"
+    },
+    {
+      "name": "unknown-UEContextReleaseComplete-notify",
+      "message": "UEContextReleaseComplete",
+      "reference_error": null,
+      "wire_hex": "20290035000004000a400680010203040500554005c0102030400079401590f8c00002011194000000d540070000f110000001fffa8002abcd",
+      "wire_sha256": "0946aa04c616f87627a78fb80454a138a62eb0acb27a751a0c4d7717f3565e59",
+      "unknown_criticality": "notify"
+    },
+    {
+      "name": "unknown-UEContextReleaseComplete-reject",
+      "message": "UEContextReleaseComplete",
+      "reference_error": "unknown-critical-ie",
+      "wire_hex": "20290035000004000a400680010203040500554005c0102030400079401590f8c00002011194000000d540070000f110000001fffa0002abcd",
+      "wire_sha256": "d0f1982eb4c167d0465f347ce9b1769af55dda41358fb1e2e292cf54206ea54d",
+      "unknown_criticality": "reject"
+    },
+    {
+      "name": "cause-radioNetwork-0",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020000",
+      "wire_sha256": "a87079e49509179382ecb70e8b47de649161077907a785717a2d7af385b379a8",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 0
+    },
+    {
+      "name": "cause-radioNetwork-1",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020040",
+      "wire_sha256": "cbf781107b122f3f7f44e886e3f4b7407dbb48bbcc7742954a00cc53389428df",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 1
+    },
+    {
+      "name": "cause-radioNetwork-2",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020080",
+      "wire_sha256": "f81488e6e22d7510de6fad55ac34db7616dc2ac2487f3263a2c726472b90cb9d",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 2
+    },
+    {
+      "name": "cause-radioNetwork-3",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400200c0",
+      "wire_sha256": "f80bf7fefd289fbc82b2668edf8b7b7224ef9e43275533869075bd0b684393e5",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 3
+    },
+    {
+      "name": "cause-radioNetwork-4",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020100",
+      "wire_sha256": "7a3db629334694280512a7ebd00343b2e3402ca8af1793bab918beb9cbc85ed5",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 4
+    },
+    {
+      "name": "cause-radioNetwork-5",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020140",
+      "wire_sha256": "d9846a585da4a301c07403b5dbda943afbd34adeadeaba4bf509c9c5a74e821e",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 5
+    },
+    {
+      "name": "cause-radioNetwork-6",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020180",
+      "wire_sha256": "e13447d890b64794381e96a8d6d39a17df39e18fa0e3baba164b49a4610995a8",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 6
+    },
+    {
+      "name": "cause-radioNetwork-7",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400201c0",
+      "wire_sha256": "c269bb9996867da35b407f384d6792fc06f136816282dcaf616a4e8ecdf1b1ca",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 7
+    },
+    {
+      "name": "cause-radioNetwork-8",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020200",
+      "wire_sha256": "4ffe04c19eca5c1e05fcfb4a48a304cf082932d8efccba7b1f107eea1e9750d0",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 8
+    },
+    {
+      "name": "cause-radioNetwork-9",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020240",
+      "wire_sha256": "9c6812415b99ac065a77c546c66e00c7f39c668a51d291cb2c029bd0a8e86a44",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 9
+    },
+    {
+      "name": "cause-radioNetwork-10",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020280",
+      "wire_sha256": "d12a783cb83489e3f69ffca6b47b3fd67a849eaa694c64037dc7ca3e751dc25b",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 10
+    },
+    {
+      "name": "cause-radioNetwork-11",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400202c0",
+      "wire_sha256": "99de16ac8df958a8bb1309b980af4f3c376096c20f3cc3c5d86a50f572be65be",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 11
+    },
+    {
+      "name": "cause-radioNetwork-12",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020300",
+      "wire_sha256": "461057afc1a2f355f82c8ba9e60812882d0f1fec7678b2d49c0a12cb69a064dc",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 12
+    },
+    {
+      "name": "cause-radioNetwork-13",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020340",
+      "wire_sha256": "5fd2f4222b4dfc1d1e6c523854dde7ddae759a07120c915c294c8d833a00ea4b",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 13
+    },
+    {
+      "name": "cause-radioNetwork-14",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020380",
+      "wire_sha256": "d38d75fd8660f139dee32b8311c917c48bcdcc428c760d8452ba264c8bb4d9d0",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 14
+    },
+    {
+      "name": "cause-radioNetwork-15",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400203c0",
+      "wire_sha256": "1f640483b661d86d3452b717d78d53c846b8ba9ab563f83c3c31f5a011aacd9f",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 15
+    },
+    {
+      "name": "cause-radioNetwork-16",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020400",
+      "wire_sha256": "0a1f8344312549caf054b644c59fc279c62f95e135f397aabbdd7fee789d85cd",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 16
+    },
+    {
+      "name": "cause-radioNetwork-17",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020440",
+      "wire_sha256": "9a6fc4b8c5f608c0222ad2390d530e146f70638eebf0b8c83de0da7a705a6ba3",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 17
+    },
+    {
+      "name": "cause-radioNetwork-18",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020480",
+      "wire_sha256": "2d2b2dd0c797788b1db9532f33968d8602bed63d7b109f6013b73ce57e3bdc50",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 18
+    },
+    {
+      "name": "cause-radioNetwork-19",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400204c0",
+      "wire_sha256": "b3c6adf066f55e19714ca5f280123361c9b27fff0bc1a290bb504148f2061880",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 19
+    },
+    {
+      "name": "cause-radioNetwork-20",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020500",
+      "wire_sha256": "a50ccef03ace3b7fd39bac5d50b89ef570009d71193cca6ea4fe569b9d32eeec",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 20
+    },
+    {
+      "name": "cause-radioNetwork-21",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020540",
+      "wire_sha256": "76bde708fd5fb00ae75610f534a322fd6bbaabaa0bfc098c4ebd4392146d23ea",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 21
+    },
+    {
+      "name": "cause-radioNetwork-22",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020580",
+      "wire_sha256": "3f2f0f19e9c9ebe1bf080d57cacd5157055208ed69ccc802bc3b3576e38b99b4",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 22
+    },
+    {
+      "name": "cause-radioNetwork-23",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400205c0",
+      "wire_sha256": "1e6c63df06490361a77f4d87370eee5b2d4b6e74b6a93ec1e2012364c75613ec",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 23
+    },
+    {
+      "name": "cause-radioNetwork-24",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020600",
+      "wire_sha256": "cdaeaeee40f646cedbdc7bbc49b6d500ff894b2bc82d422779e2550320135804",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 24
+    },
+    {
+      "name": "cause-radioNetwork-25",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020640",
+      "wire_sha256": "72840131271933ce52073b2260b8bb5ecf46fa72475536ff42e401c2fa423256",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 25
+    },
+    {
+      "name": "cause-radioNetwork-26",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020680",
+      "wire_sha256": "828a0a10891f01e107d01c325fd6fbbc93a72c87c6c2e93b21137946c4603c7e",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 26
+    },
+    {
+      "name": "cause-radioNetwork-27",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400206c0",
+      "wire_sha256": "daf78e4651ba1359249b5ac2a44eb14b75a05f373c680a9dd2c4313e403d9063",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 27
+    },
+    {
+      "name": "cause-radioNetwork-28",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020700",
+      "wire_sha256": "dee33894e4d38512545c9e20692c089f616c24e44da126acfc6888d8cdccc96f",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 28
+    },
+    {
+      "name": "cause-radioNetwork-29",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020740",
+      "wire_sha256": "59bd92dabd15adc7fa3f2930200ea80c7105c5269b5f02d5d3165c1925d56d99",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 29
+    },
+    {
+      "name": "cause-radioNetwork-30",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020780",
+      "wire_sha256": "89ea84c9a62e6c5c6ca2d44a839b9e076d158b17be601d35d33da53d48bd327d",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 30
+    },
+    {
+      "name": "cause-radioNetwork-31",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400207c0",
+      "wire_sha256": "7bcebf51f958d081203abedf25c4821e1a0671cd5e26163d905e0f3455222a70",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 31
+    },
+    {
+      "name": "cause-radioNetwork-32",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020800",
+      "wire_sha256": "9dfce8ad511de8a062886aace8dfc73ec8b9d9785083d3d22ab3427940f23cbe",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 32
+    },
+    {
+      "name": "cause-radioNetwork-33",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020840",
+      "wire_sha256": "471a39b13df1dd0f1ea29e78871747aeb809e772b7b00528c470543f898f3cb5",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 33
+    },
+    {
+      "name": "cause-radioNetwork-34",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020880",
+      "wire_sha256": "fe8b7e80189569ba3a0f0eeb8fb9fd6c6514bf478f674df02280315cc0c41012",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 34
+    },
+    {
+      "name": "cause-radioNetwork-35",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400208c0",
+      "wire_sha256": "15a40d277626647760b74ae51d57b9ef109e2f50c25aac57b3af9ebb326c918d",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 35
+    },
+    {
+      "name": "cause-radioNetwork-36",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020900",
+      "wire_sha256": "4849508701f172126d688e071f818adf4243e7ec067a69249e6152af295d9525",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 36
+    },
+    {
+      "name": "cause-radioNetwork-37",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020940",
+      "wire_sha256": "6e3548f9ae849611aeb7b307c602df9fab3584994cec849260435d7095163874",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 37
+    },
+    {
+      "name": "cause-radioNetwork-38",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020980",
+      "wire_sha256": "8902169e074ef2e5c09e564f767fa4cf37ef4e201ad550b6619eaba0fcde8b42",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 38
+    },
+    {
+      "name": "cause-radioNetwork-39",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f400209c0",
+      "wire_sha256": "203430a03ca3ca39bbbd7affb784d0dd9c896500ff18aeb35dc01c6d76ec3380",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 39
+    },
+    {
+      "name": "cause-radioNetwork-40",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020a00",
+      "wire_sha256": "8fc947b8d3e5a4dec49ab49fb5d7b563cba569c17b6c5bbdc77b66eb2f5fff59",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 40
+    },
+    {
+      "name": "cause-radioNetwork-41",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020a40",
+      "wire_sha256": "4f4b80c70c990f251a23d6edb113d76b553611b5b7277dd8d3e06798981758e7",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 41
+    },
+    {
+      "name": "cause-radioNetwork-42",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020a80",
+      "wire_sha256": "5d9ca7a290f27df069e2f7217af2dbe2dad8553f00450508500a219120df5cd3",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 42
+    },
+    {
+      "name": "cause-radioNetwork-43",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020ac0",
+      "wire_sha256": "3f838c0ef02d27877054ef4fbe29f82f9e87a6ce1c12df57baba0ff5ba39699c",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 43
+    },
+    {
+      "name": "cause-radioNetwork-44",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900180000020072000b080102030405c010203040000f40020b00",
+      "wire_sha256": "de456c5613e33d0b2625cc965510dd15ccbeb1c53321df76240d732644a948ea",
+      "construct": true,
+      "group": "radioNetwork",
+      "code": 44
+    },
+    {
+      "name": "cause-transport-0",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400120",
+      "wire_sha256": "4dba3f9252ded7504a9f2e2ad84358636a5aa288ba8e8c30ba4457b960dc9a87",
+      "construct": true,
+      "group": "transport",
+      "code": 0
+    },
+    {
+      "name": "cause-transport-1",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400128",
+      "wire_sha256": "3ae582fb0de9cb6fa67884dd5fdaf9650c89e96f1571492afab237d67345136f",
+      "construct": true,
+      "group": "transport",
+      "code": 1
+    },
+    {
+      "name": "cause-nas-0",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400140",
+      "wire_sha256": "cbd343bede0095dea03fcee1a52d52c2d5a44e7d44373824699851da252e34dd",
+      "construct": true,
+      "group": "nas",
+      "code": 0
+    },
+    {
+      "name": "cause-nas-1",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400144",
+      "wire_sha256": "b0403e8e856d1b3485f7306563533117970d11ebfa69ee87c4710b36ebf7567d",
+      "construct": true,
+      "group": "nas",
+      "code": 1
+    },
+    {
+      "name": "cause-nas-2",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400148",
+      "wire_sha256": "f36479686420dff221c9012bf3178e28b3d1c5bc5e1d24f278be9843cc75ab27",
+      "construct": true,
+      "group": "nas",
+      "code": 2
+    },
+    {
+      "name": "cause-nas-3",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f40014c",
+      "wire_sha256": "223be4c50d5fe4f83ccf704e73d79cd981fb760fd50b340beb5e5e5f24d4d849",
+      "construct": true,
+      "group": "nas",
+      "code": 3
+    },
+    {
+      "name": "cause-protocol-0",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400160",
+      "wire_sha256": "7cceeb97feff37b242e1e31712d9bd56a2926014bd833de922aeacd6d2e4ed47",
+      "construct": true,
+      "group": "protocol",
+      "code": 0
+    },
+    {
+      "name": "cause-protocol-1",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400162",
+      "wire_sha256": "6530e071fbf9677cf4f8ebf618eeedd13ff206d297f8f823c28b9e2f4d34a940",
+      "construct": true,
+      "group": "protocol",
+      "code": 1
+    },
+    {
+      "name": "cause-protocol-2",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400164",
+      "wire_sha256": "aa723be1dc5c109a7be229debf40702dcce54889b61d2b9085d72032c1061d6e",
+      "construct": true,
+      "group": "protocol",
+      "code": 2
+    },
+    {
+      "name": "cause-protocol-3",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400166",
+      "wire_sha256": "0d903284d3db9b8b948666dd119bb96f28a8b4d4219d30b5b06e80e05d81f9df",
+      "construct": true,
+      "group": "protocol",
+      "code": 3
+    },
+    {
+      "name": "cause-protocol-4",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400168",
+      "wire_sha256": "909cfd2da57c735540832273a2ace4de6d4f2795dc8e001a5b0fd510c1e6c3ff",
+      "construct": true,
+      "group": "protocol",
+      "code": 4
+    },
+    {
+      "name": "cause-protocol-5",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f40016a",
+      "wire_sha256": "6e5843251f0a02f651bff8e458ffa5435af65489bca4b9a7d13ce3a81ea1347c",
+      "construct": true,
+      "group": "protocol",
+      "code": 5
+    },
+    {
+      "name": "cause-protocol-6",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f40016c",
+      "wire_sha256": "cfbe4224a0314c6c59a81c220dad6ccc2e51105c7518c8ffe1c94c77bd2d280e",
+      "construct": true,
+      "group": "protocol",
+      "code": 6
+    },
+    {
+      "name": "cause-misc-0",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400180",
+      "wire_sha256": "ab85598c316448c9d38eccf11702e0d3231eb0698640daf9eef63b325c527815",
+      "construct": true,
+      "group": "misc",
+      "code": 0
+    },
+    {
+      "name": "cause-misc-1",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400182",
+      "wire_sha256": "941daf6e0253d534f5704f18c6aaec210031fc96680502991442cd38244d3f35",
+      "construct": true,
+      "group": "misc",
+      "code": 1
+    },
+    {
+      "name": "cause-misc-2",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400184",
+      "wire_sha256": "0e16cf21a563e699dac4ffa1ff50fbca79c879e304e6544535d1ae94e4aece0f",
+      "construct": true,
+      "group": "misc",
+      "code": 2
+    },
+    {
+      "name": "cause-misc-3",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400186",
+      "wire_sha256": "6057b60bc0d5bb7992dd6fde239be5e924619815750578b520bedef356ef8e53",
+      "construct": true,
+      "group": "misc",
+      "code": 3
+    },
+    {
+      "name": "cause-misc-4",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f400188",
+      "wire_sha256": "f80f86c841df5436c2d4d34474a4a0f7824e9616e0be0540ef39b40295e88c70",
+      "construct": true,
+      "group": "misc",
+      "code": 4
+    },
+    {
+      "name": "cause-misc-5",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080102030405c010203040000f40018a",
+      "wire_sha256": "c14fd0da051494f7ba33320b4cce93fd1074002d5657da8ec81bccfb217d6bbc",
+      "construct": true,
+      "group": "misc",
+      "code": 5
+    },
+    {
+      "name": "identifiers-0",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "00290013000002007200070000c0ffffffff000f40018a",
+      "wire_sha256": "1ed03838e38b22810eff4beb65c891448b15a17e8df976b4bf15ad80d900d7b6",
+      "construct": true,
+      "amf": 0,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-1",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "00290013000002007200070001c0ffffffff000f40018a",
+      "wire_sha256": "80a9d309721c172e20fa685baede00a732ee6815a09e77407a6e3c715a101237",
+      "construct": true,
+      "amf": 1,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-2",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900130000020072000700ffc0ffffffff000f40018a",
+      "wire_sha256": "a84104e685a94fece9bbdc9597da5127fc5056241b2adf253da06b7238f5abb1",
+      "construct": true,
+      "amf": 255,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-3",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029001400000200720008020100c0ffffffff000f40018a",
+      "wire_sha256": "0fd810d1972610f5c17f0549a08dea929b4da742b3a7ef6a031b0f7ae1ee813a",
+      "construct": true,
+      "amf": 256,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-4",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900140000020072000802ffffc0ffffffff000f40018a",
+      "wire_sha256": "5484624eb88cfd5fd7d2ad230c98554d13ea3dae35abb67c2dd3da2a206298ab",
+      "construct": true,
+      "amf": 65535,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-5",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900150000020072000904010000c0ffffffff000f40018a",
+      "wire_sha256": "661837adcf41bd53e5db21949f292558205e9e16e9750e67555aab51aaecd636",
+      "construct": true,
+      "amf": 65536,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-6",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900150000020072000904ffffffc0ffffffff000f40018a",
+      "wire_sha256": "fe9a48bbb9cb8186f1d0c2d1d480bf521b7fb0029185431ac4dec25e0c7b98a7",
+      "construct": true,
+      "amf": 16777215,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-7",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900160000020072000a0601000000c0ffffffff000f40018a",
+      "wire_sha256": "e6f684e4d1d308603fabff9d90cfcb3033c8346fcc6e4005cc9cf8ce6aba5af9",
+      "construct": true,
+      "amf": 16777216,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-8",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900160000020072000a06ffffffffc0ffffffff000f40018a",
+      "wire_sha256": "c3d29b1b0ed69c8c2bfbedf916faf44e8a0aaf100f1cb1eae9a272d07bfb3f8b",
+      "construct": true,
+      "amf": 4294967295,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-9",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b080100000000c0ffffffff000f40018a",
+      "wire_sha256": "004f4f2aab75137c619ade7258ccc2e40a71d604c64f618589ee4d8c42c00320",
+      "construct": true,
+      "amf": 4294967296,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-10",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b08ffffffffffc0ffffffff000f40018a",
+      "wire_sha256": "fb7ab25cd31d583dded27fdfc88a181a900b409e9427b948e99bc38bd655f668",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 4294967295
+    },
+    {
+      "name": "identifiers-11",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900140000020072000808ffffffffff0000000f40018a",
+      "wire_sha256": "859490054829c6be008b9ecd29e6174bf9f10c11a03a6f7be975b971ecd0b8eb",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 0
+    },
+    {
+      "name": "identifiers-12",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900140000020072000808ffffffffff0001000f40018a",
+      "wire_sha256": "ba35c174173e8f58a1747186e32f6b339f4ff7480ab669b8af616cce46272cb7",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 1
+    },
+    {
+      "name": "identifiers-13",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900140000020072000808ffffffffff00ff000f40018a",
+      "wire_sha256": "3b2f7d6858ac6229876bfa88faa5fe2d6beeb7a6704102360105b2a7505d0127",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 255
+    },
+    {
+      "name": "identifiers-14",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900150000020072000908ffffffffff400100000f40018a",
+      "wire_sha256": "a959dedfbc3363db3b1078801c730ac98ee134faf0e11ff2a8cd25f91bf35f4e",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 256
+    },
+    {
+      "name": "identifiers-15",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900150000020072000908ffffffffff40ffff000f40018a",
+      "wire_sha256": "e08dfeb9c51d2b24a3460c9b42fb798cf72858fe5d9ba4c9e0f792d0c48f3489",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 65535
+    },
+    {
+      "name": "identifiers-16",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900160000020072000a08ffffffffff80010000000f40018a",
+      "wire_sha256": "c786c56d2c521f70a8635993120dca2b6d0ce04191036381c7a590020154f378",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 65536
+    },
+    {
+      "name": "identifiers-17",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900160000020072000a08ffffffffff80ffffff000f40018a",
+      "wire_sha256": "d3bb8ad14b9d62e65fe93e683de28f4445afb0851be2d99b2ef3ce328e870525",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 16777215
+    },
+    {
+      "name": "identifiers-18",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900170000020072000b08ffffffffffc001000000000f40018a",
+      "wire_sha256": "bba823f0d2ec4c959e2a3b1e7f3f52922f9dd345255efc90c17b9f93c968f640",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": 16777216
+    },
+    {
+      "name": "identifiers-19",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029000e000002007200024000000f40018a",
+      "wire_sha256": "b37d38b8892cc08989ceb109fb4be032a4e6c6cc8877f6437c439d65dd25972c",
+      "construct": true,
+      "amf": 0,
+      "ran": null
+    },
+    {
+      "name": "identifiers-20",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029000e000002007200024001000f40018a",
+      "wire_sha256": "44e872c164dbad7f8de55ce372ee26f4e21a08e55b9ed2534147a4c574808155",
+      "construct": true,
+      "amf": 1,
+      "ran": null
+    },
+    {
+      "name": "identifiers-21",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029000e0000020072000240ff000f40018a",
+      "wire_sha256": "d9d3fd08d45784d5469226d0dfd1eda651ae1f611d98d3f5beb03b803f647578",
+      "construct": true,
+      "amf": 255,
+      "ran": null
+    },
+    {
+      "name": "identifiers-22",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029000f00000200720003480100000f40018a",
+      "wire_sha256": "e059747af114d897472d1a34db7a2eff9168b961fe8524de47a96301c25f7f4b",
+      "construct": true,
+      "amf": 256,
+      "ran": null
+    },
+    {
+      "name": "identifiers-23",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029000f0000020072000348ffff000f40018a",
+      "wire_sha256": "5f096c8d5dfa91dbfbb7a80d13aba7635a13e62c275de30fbc3e39b194185d0b",
+      "construct": true,
+      "amf": 65535,
+      "ran": null
+    },
+    {
+      "name": "identifiers-24",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900100000020072000450010000000f40018a",
+      "wire_sha256": "9a28bca4a0acaea8e06b07f0d59672e8d7f61b853a6eb2be7f535a016b8648e8",
+      "construct": true,
+      "amf": 65536,
+      "ran": null
+    },
+    {
+      "name": "identifiers-25",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900100000020072000450ffffff000f40018a",
+      "wire_sha256": "6e2a2dfb0993f84cec8b20838bc3a022f45f7ecc649d3163eb50b0a957bdffca",
+      "construct": true,
+      "amf": 16777215,
+      "ran": null
+    },
+    {
+      "name": "identifiers-26",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "00290011000002007200055801000000000f40018a",
+      "wire_sha256": "d36d8c2fecb3400b4e283c5aa938bf93178459f8b02c53521e4c924bfc67cad2",
+      "construct": true,
+      "amf": 16777216,
+      "ran": null
+    },
+    {
+      "name": "identifiers-27",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900110000020072000558ffffffff000f40018a",
+      "wire_sha256": "8c63eaf5747cf45128266cc68e8f3455b5c32ee05ba3e2fbc8449fd373a54d8b",
+      "construct": true,
+      "amf": 4294967295,
+      "ran": null
+    },
+    {
+      "name": "identifiers-28",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "0029001200000200720006600100000000000f40018a",
+      "wire_sha256": "0f57de6b979eba32585571fa4209b09049a05eb83f4d76800c51485ca29c99e6",
+      "construct": true,
+      "amf": 4294967296,
+      "ran": null
+    },
+    {
+      "name": "identifiers-29",
+      "message": "UEContextReleaseCommand",
+      "reference_error": null,
+      "wire_hex": "002900120000020072000660ffffffffff000f40018a",
+      "wire_sha256": "3ee8f7d4ebbb95bc87253537c1f5dd3260c9bf652e7c1aa6c4ea5ff29d00ba66",
+      "construct": true,
+      "amf": 1099511627775,
+      "ran": null
+    },
+    {
+      "name": "complete-without-location",
+      "message": "UEContextReleaseComplete",
+      "reference_error": null,
+      "wire_hex": "20290016000002000a400680010203040500554005c010203040",
+      "wire_sha256": "1853f903338ece260b227e87755fed90ace63cc4f5b7e86ba010fef5b2898a59",
+      "construct": true,
+      "location": false
+    }
+  ]
+}
