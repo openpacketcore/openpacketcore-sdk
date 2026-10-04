@@ -9086,7 +9086,12 @@ fn read_bounded_candidate_git_pipe<R: Read>(
                 }
                 encoded.extend_from_slice(&buffer[..read]);
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
                 if stop.load(Ordering::Acquire) {
                     return Err(io::Error::other(
                         "candidate Git pipe remained open after termination",
@@ -12189,6 +12194,92 @@ fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
         64,
     )
     .is_err());
+}
+
+struct CandidateGitPipeReadFn<F>(F);
+
+impl<F: FnMut(&mut [u8]) -> io::Result<usize>> Read for CandidateGitPipeReadFn<F> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        (self.0)(buffer)
+    }
+}
+
+fn scripted_candidate_git_pipe_reader(
+    steps: impl IntoIterator<Item = io::Result<&'static [u8]>>,
+) -> impl Read {
+    let mut steps = steps.into_iter();
+    CandidateGitPipeReadFn(move |buffer: &mut [u8]| {
+        let bytes = steps.next().unwrap_or(Ok(b""))?;
+        assert!(bytes.len() <= buffer.len(), "scripted chunk fits the read");
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    })
+}
+
+#[test]
+fn bounded_candidate_git_pipe_reader_preserves_bytes_across_interruptions() {
+    let reader = scripted_candidate_git_pipe_reader([
+        Err(io::ErrorKind::Interrupted.into()),
+        Err(io::ErrorKind::Interrupted.into()),
+        Ok(b"prefix-".as_slice()),
+        Err(io::ErrorKind::Interrupted.into()),
+        Err(io::ErrorKind::Interrupted.into()),
+        Ok(b"suffix".as_slice()),
+    ]);
+    let output = read_bounded_candidate_git_pipe(reader, 13, Arc::new(AtomicBool::new(false)))
+        .expect("interrupted reads retain every byte at the exact cap");
+    assert_eq!(output, b"prefix-suffix");
+}
+
+#[test]
+fn bounded_candidate_git_pipe_reader_counts_bytes_across_interruptions() {
+    let reader = scripted_candidate_git_pipe_reader([
+        Ok(b"prefix-".as_slice()),
+        Err(io::ErrorKind::Interrupted.into()),
+        Ok(b"suffix".as_slice()),
+    ]);
+    let error = read_bounded_candidate_git_pipe(reader, 12, Arc::new(AtomicBool::new(false)))
+        .expect_err("chunks on both sides of an interruption share the original cap");
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "candidate Git pipe exceeds its bound");
+}
+
+#[test]
+fn bounded_candidate_git_pipe_reader_stops_during_repeated_interruptions() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut reads = 0;
+    let reader = CandidateGitPipeReadFn(|_: &mut [u8]| {
+        reads += 1;
+        assert!(reads <= 3, "the stop request must end interrupted reads");
+        if reads == 3 {
+            stop.store(true, Ordering::Release);
+        }
+        Err(io::ErrorKind::Interrupted.into())
+    });
+    let error = read_bounded_candidate_git_pipe(reader, 64, Arc::clone(&stop))
+        .expect_err("repeated interruptions observe the existing stop flag");
+    assert_eq!(reads, 3);
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "candidate Git pipe remained open after termination"
+    );
+}
+
+#[test]
+fn bounded_candidate_git_pipe_reader_preserves_terminal_error() {
+    let reader = scripted_candidate_git_pipe_reader([
+        Ok(b"prefix-".as_slice()),
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "synthetic terminal read failure",
+        )),
+        Ok(b"suffix".as_slice()),
+    ]);
+    let error = read_bounded_candidate_git_pipe(reader, 64, Arc::new(AtomicBool::new(false)))
+        .expect_err("terminal errors do not yield partial or retried output");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(error.to_string(), "synthetic terminal read failure");
 }
 
 fn write_candidate_git_helper_script(path: &Path, body: &[u8]) {
