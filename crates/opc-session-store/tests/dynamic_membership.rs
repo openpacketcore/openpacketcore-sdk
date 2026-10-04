@@ -25,8 +25,9 @@ use opc_session_store::test_support::{
     close_consensus_application_admission_for_test, consensus_local_durable_progress_for_test,
     is_replayed_joint_voting_for_test, observe_next_unstage_supervisor_for_test,
     pause_next_learner_barrier_snapshot_for_test, pause_next_outbound_learner_barrier_for_test,
-    pause_next_outbound_voting_barrier_for_test, pause_next_staged_reconciliation_for_test,
-    recover_signed_roster_terminal_authority_for_test,
+    pause_next_outbound_voting_barrier_for_test,
+    pause_next_reconciliation_after_staging_check_for_test,
+    pause_next_staged_reconciliation_for_test, recover_signed_roster_terminal_authority_for_test,
     release_signed_fresh_roster_admission_for_test, replay_applied_learner_barrier_for_test,
     replay_joint_voting_barrier_for_test, replay_joint_voting_barrier_request_for_test,
     replay_joint_voting_barrier_with_gate_probe_for_test,
@@ -3618,6 +3619,104 @@ async fn stale_reconciliation_cannot_reopen_admission_while_successor_is_in_flig
     fleet.commit(&contract, &contract_proof, &contracted).await;
     wait_completed_and_admitted(&fleet.stores, &contract, &contracted, &[3, 4]).await;
     prove_read_write_on_every_active_store(&fleet.stores, &contracted, "post-stale-reopen").await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_reconciliation_cannot_reopen_admission_for_successor_staged_after_its_check() {
+    let expanded = [0, 1, 2, 3, 4];
+    let contracted = [0, 1, 2];
+    let mut fleet = DynamicFleet::start_three().await;
+    let expand = fleet.transition_request(1, &expanded, 0xBE);
+    fleet.provision_expansion(&expand).await;
+    let expand_proof = fleet.prepare(&expand, &expanded).await;
+    let leader = fleet.wait_transition_caller(&contracted).await;
+    let target = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower");
+
+    let stale = pause_next_staged_reconciliation_for_test(&fleet.stores[target])
+        .expect("hold the real reconciler before its operation gate");
+    let deadline = stale
+        .entered
+        .await
+        .expect("reconciler captured the first request");
+    complete_and_resume_on_held_member(&fleet, &expand, &expand_proof, &expanded, target, deadline)
+        .await;
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    // Let the stale pass take the operation gate and check staging while no
+    // successor exists, then hold it before its admission-gate wait.
+    let (checked, release_checked) =
+        pause_next_reconciliation_after_staging_check_for_test(&fleet.stores[target])
+            .expect("hold the stale pass after its staging check");
+    stale
+        .release
+        .send(())
+        .expect("resume the stale pass through its staging check");
+    tokio::time::timeout_at(deadline, checked)
+        .await
+        .expect("the stale pass reaches its staging check before its deadline")
+        .expect("the stale pass saw no staged request");
+
+    // Staging is synchronous and needs neither gate, and incoming barriers
+    // need only the admission gate, so a pure-removal successor can be staged,
+    // prepared elsewhere, and fence this member while the stale pass is held.
+    let contract = fleet.transition_request(2, &contracted, 0xBF);
+    fleet.stage_on_all(&contract);
+    let contract_proof = fleet.prepare(&contract, &contracted).await;
+    wait_for_applied_learner_marker_for_test(&fleet.stores[target], &contract, deadline)
+        .await
+        .expect("target durably applied the successor's Prepare and learner marker");
+    assert!(
+        replay_applied_learner_barrier_for_test(
+            &fleet.stores[target],
+            &contract,
+            fleet.network.node_ids[leader],
+        )
+        .await
+        .expect("replay the successor's durable learner marker"),
+        "the staged target acknowledges the successor's learner barrier"
+    );
+    let fenced = topology_admission_state_for_test(&fleet.stores[target], &contract)
+        .expect("target admission after the successor's learner barrier");
+    assert!(
+        fenced.staged && !fenced.admitted_latch,
+        "the successor's learner barrier fenced the target: {fenced:?}"
+    );
+
+    // Hold the next pass too, so the stale pass's effect is observed alone.
+    let next = pause_next_staged_reconciliation_for_test(&fleet.stores[target])
+        .expect("hold the pass that follows the stale one");
+    assert!(
+        tokio::time::Instant::now() < deadline,
+        "the stale pass must resume inside its own deadline"
+    );
+    release_checked
+        .send(())
+        .expect("resume the stale pass after the successor fenced the target");
+    tokio::time::timeout_at(deadline, next.entered)
+        .await
+        .expect("the stale pass returns before its deadline")
+        .expect("the stale pass returned and the successor's pass began");
+    let after = topology_admission_state_for_test(&fleet.stores[target], &contract)
+        .expect("target admission after the stale pass");
+    assert!(
+        after.staged && !after.admitted_latch,
+        "a stale reconciliation reopened admission for a successor staged after its check: {after:?}"
+    );
+
+    next.release
+        .send(())
+        .expect("resume the successor's own reconciliation");
+    fleet.commit(&contract, &contract_proof, &contracted).await;
+    wait_completed_and_admitted(&fleet.stores, &contract, &contracted, &[3, 4]).await;
+    prove_read_write_on_every_active_store(
+        &fleet.stores,
+        &contracted,
+        "post-stale-reopen-after-check",
+    )
+    .await;
 }
 
 #[cfg(feature = "test-control")]

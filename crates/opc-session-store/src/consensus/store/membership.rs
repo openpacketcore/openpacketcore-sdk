@@ -387,6 +387,8 @@ pub(super) struct SessionTopologyCoordinatorState {
     #[cfg(feature = "test-control")]
     reconciliation_pause_for_test: Mutex<Option<ReconciliationPauseForTest>>,
     #[cfg(feature = "test-control")]
+    reconciliation_staging_check_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
+    #[cfg(feature = "test-control")]
     outbound_learner_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
     #[cfg(feature = "test-control")]
     outbound_voting_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
@@ -568,6 +570,39 @@ pub fn pause_next_staged_reconciliation_for_test(
         release,
         first_poll: polled,
     })
+}
+
+/// Pause the next background reconciliation after its staging recheck.
+///
+/// The pass owns the operation gate and has not yet waited for the admission
+/// gate. The receiver reports its original absolute deadline; dropping the
+/// sender makes the pass fail closed.
+#[cfg(feature = "test-control")]
+pub fn pause_next_reconciliation_after_staging_check_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<
+    (
+        tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    SessionTopologyTransitionError,
+> {
+    let mut slot = store
+        .inner
+        .topology_coordinator
+        .reconciliation_staging_check_pause_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if slot.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *slot = Some(LocalTransitionPauseForTest {
+        entered,
+        release: released,
+    });
+    Ok((observed, release))
 }
 
 /// Pause a real caller after its local learner barrier, before outbound calls.
@@ -963,6 +998,8 @@ impl SessionTopologyCoordinatorState {
             learner_barrier_snapshot_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             reconciliation_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            reconciliation_staging_check_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             outbound_learner_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
@@ -1408,6 +1445,72 @@ impl SessionTopologyCoordinatorState {
             return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
         }
         Ok(request.clone())
+    }
+
+    /// Close application admission while `request` is still exactly staged.
+    ///
+    /// Staging is synchronous and takes neither async gate. The staging check
+    /// and the latch write therefore share the bindings lock, so no staging
+    /// change can separate them. Returns whether the request is still staged;
+    /// a different staged request is `TransitionInProgress`.
+    fn fence_admission_while_exactly_staged(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        admitted: &AtomicBool,
+    ) -> Result<bool, SessionTopologyTransitionError> {
+        let state = self
+            .bindings
+            .read()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        match state.staged.as_ref() {
+            None => Ok(false),
+            Some(staged)
+                if staged.transition_id == request.transition_id()
+                    && staged.request_digest == request.request_digest() =>
+            {
+                admitted.store(false, Ordering::Release);
+                Ok(true)
+            }
+            Some(_) => Err(SessionTopologyTransitionError::TransitionInProgress),
+        }
+    }
+
+    /// Settle application admission for a request whose bindings are already
+    /// current, unless a different request is staged.
+    ///
+    /// A successor's barrier closes admission only once that successor is
+    /// staged here, and staging takes neither async gate. The staging check
+    /// and the latch write share the bindings lock inside the caller's
+    /// admission-gate hold, so a pass for the predecessor cannot reopen
+    /// admission behind that barrier. Returns `false` when the bindings are
+    /// not current for `request`; a different staged request is
+    /// `TransitionInProgress`.
+    fn settle_current_request_admission(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        admitted: &AtomicBool,
+        local_is_member: bool,
+    ) -> Result<bool, SessionTopologyTransitionError> {
+        let desired_descriptors =
+            descriptors_by_node_id(request.desired_identity(), request.desired_members())
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let state = self
+            .bindings
+            .read()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        if state.current_identity != request.desired_identity()
+            || state.current_descriptors != desired_descriptors
+        {
+            return Ok(false);
+        }
+        if state.staged.as_ref().is_some_and(|staged| {
+            staged.transition_id != request.transition_id()
+                || staged.request_digest != request.request_digest()
+        }) {
+            return Err(SessionTopologyTransitionError::TransitionInProgress);
+        }
+        admitted.store(local_is_member, Ordering::Release);
+        Ok(true)
     }
 
     fn is_current_request(
@@ -2430,10 +2533,14 @@ impl ConsensusSessionStore {
         // repeats idempotent terminal admission, which reopens a node whose
         // commit stopped after finalizing its bindings. A different staged
         // request owns admission through its own reconciliation.
+        //
+        // For a request that is still exactly staged: once Prepare applies,
+        // application authority remains closed until an exact uniform
+        // successor or durable pre-joint abort is reconciled.
         let still_staged = match self
             .inner
             .topology_coordinator
-            .has_exact_staged_request(request)
+            .fence_admission_while_exactly_staged(request, &self.inner.admitted)
         {
             Ok(still_staged) => still_staged,
             Err(SessionTopologyTransitionError::TransitionInProgress) => return Ok(()),
@@ -2450,11 +2557,23 @@ impl ConsensusSessionStore {
         {
             return Ok(());
         }
-        if still_staged {
-            // Once Prepare applies, application authority remains closed until
-            // an exact uniform successor or durable pre-joint abort is
-            // reconciled.
-            self.inner.admitted.store(false, Ordering::Release);
+        #[cfg(feature = "test-control")]
+        {
+            let pause = {
+                self.inner
+                    .topology_coordinator
+                    .reconciliation_staging_check_pause_for_test
+                    .lock()
+                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                    .take()
+            };
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(deadline);
+                tokio::time::timeout_at(deadline, pause.release)
+                    .await
+                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            }
         }
 
         match status.phase() {
@@ -2876,13 +2995,13 @@ impl ConsensusSessionStore {
         // already finalized, or no longer stages, keeps the admission its
         // terminal path settled: without staging, no reconciliation would
         // reopen it.
-        if matches!(
-            self.inner
-                .topology_coordinator
-                .has_exact_staged_request(request),
-            Ok(true)
-        ) {
-            self.inner.admitted.store(false, Ordering::Release);
+        match self
+            .inner
+            .topology_coordinator
+            .fence_admission_while_exactly_staged(request, &self.inner.admitted)
+        {
+            Ok(_) | Err(SessionTopologyTransitionError::TransitionInProgress) => {}
+            Err(error) => return Err(error),
         }
         if status.phase() == SessionTopologyTransitionPhase::Completed {
             self.finish_local_successor_admission(request, &status, deadline)
@@ -4053,17 +4172,22 @@ impl ConsensusSessionStore {
                 ) {
                     return Err(SessionTopologyTransitionError::Unavailable);
                 }
+                // A reconciliation pass for an already finalized request reaches
+                // this point after waiting for the admission gate. A successor
+                // may have been staged and its barrier may have closed admission
+                // meanwhile, so the staging decision is made here, together with
+                // the write, and not before the wait.
                 if self
                     .inner
                     .topology_coordinator
-                    .is_current_request(request)?
-                {
-                    self.inner.admitted.store(
+                    .settle_current_request_admission(
+                        request,
+                        &self.inner.admitted,
                         request
                             .desired_consensus_node_ids()
                             .contains(&self.inner.local_node_id),
-                        Ordering::Release,
-                    );
+                    )?
+                {
                     return Ok(());
                 }
                 tokio::time::timeout_at(
@@ -4464,6 +4588,9 @@ impl ConsensusSessionStore {
                 )
                 .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
         }
+        // finalize_bindings rejects a different staged request. One staged
+        // after it cannot have closed admission yet: its barrier needs this
+        // admission gate, which is held from the check through the write.
         self.inner.topology_coordinator.finalize_bindings(request)?;
         let desired_members = request.desired_consensus_node_ids();
         self.inner.admitted.store(
@@ -4480,6 +4607,9 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<(), SessionTopologyTransitionError> {
         let _admission_guard = self.lock_local_admission_before(deadline).await?;
+        // A different staged request is rejected here, inside the admission
+        // gate. One staged after this check cannot have closed admission yet:
+        // its barrier needs the gate held from this check through the write.
         if !self
             .inner
             .topology_coordinator
@@ -4741,6 +4871,8 @@ mod scope_refresh_tests {
             learner_barrier_snapshot_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             reconciliation_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            reconciliation_staging_check_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             outbound_learner_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
