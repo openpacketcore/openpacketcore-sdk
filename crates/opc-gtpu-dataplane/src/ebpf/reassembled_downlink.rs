@@ -21,7 +21,13 @@
 //! backend-owned hand-off queues for a session with a downlink inner MTU:
 //! over-MTU Don't Fragment packets, which leave as a fragmentation or Packet
 //! Too Big plan, and every other inner IPv4 fragment, which is decapsulated
-//! like any authorized G-PDU and returned exactly as it arrived.
+//! like any authorized G-PDU and returned unmodified.
+//!
+//! tc leaves one thing to the kernel that this consumer has to do itself:
+//! after tc decapsulates a packet, the kernel's IPv4 input validates the
+//! inner header. A packet returned here is injected by the caller instead,
+//! with a checksum and total length that the kernel rewrites, so the same
+//! validation runs before any inner IPv4 packet is decapsulated.
 
 use bytes::Bytes;
 use opc_gtpu_ebpf_common::{
@@ -283,6 +289,10 @@ pub(super) enum ProcessedDownlink {
 /// Authorize and decapsulate one received datagram, recording exactly one
 /// outcome counter. A decapsulated inner IPv4 fragment is also counted in
 /// `decapsulated_inner_fragments`, a subset of `decapsulated`.
+///
+/// An authorized inner IPv4 packet is decapsulated only with a header that
+/// the kernel's IPv4 input would accept, and is returned trimmed to its total
+/// length; otherwise it is a `Malformed` drop.
 pub(super) fn process_downlink_datagram(
     runtime: &dyn EbpfGtpuRuntime,
     scope: DownlinkAuthorityScope,
@@ -302,8 +312,28 @@ pub(super) fn process_downlink_datagram(
             bearer_mark,
             family,
         } => {
+            let mut inner: Bytes = datagram.bytes_handle().slice(payload_offset..);
+            if family == GtpAddressFamily::Ipv4 {
+                // This consumer stands in for tc and for the kernel's IPv4
+                // input, which validated every inner packet that tc
+                // decapsulated (`ip_rcv_core`; RFC 1122 section 3.2.1.2, RFC
+                // 1812 section 5.2.2): version 4, a header of at least five
+                // words within the packet, the header checksum, and a total
+                // length that covers the header and is not truncated. The
+                // caller's `IP_HDRINCL` injection rewrites the checksum and
+                // the total length, so a header the kernel discarded would
+                // otherwise be repaired and sent on. Octets after the total
+                // length are not part of the datagram and are trimmed, as the
+                // kernel trims them.
+                let Some((_, total_len)) = crate::inner_fragment::valid_ipv4_header(&inner) else {
+                    counters.record_drop(GtpuDownlinkDrop::Malformed);
+                    return ProcessedDownlink::Event(GtpuDownlinkEvent::Dropped(
+                        GtpuDownlinkDrop::Malformed,
+                    ));
+                };
+                inner.truncate(total_len);
+            }
             counters.decapsulated = counters.decapsulated.saturating_add(1);
-            let inner: Bytes = datagram.bytes_handle().slice(payload_offset..);
             if family == GtpAddressFamily::Ipv4
                 && inner.get(6..8).is_some_and(|flags_fragment| {
                     downlink_ipv4_is_fragment(u16::from_be_bytes([
@@ -659,9 +689,10 @@ fn authorize_legacy(
     // needs no decision here: a fragment carries the same authorization data
     // as any G-PDU (its tunnel, outer endpoints and inner destination, none
     // of which is in a transport header), so it was authorized above on its
-    // own and is decapsulated below exactly as it arrived, with its tunnel's
-    // bearer mark. It takes no token from either rate limit: nothing is
-    // fragmented and no error is sent for it.
+    // own and is decapsulated below unmodified, with its tunnel's bearer
+    // mark, once `process_downlink_datagram` has validated its header. It
+    // takes no token from either rate limit: nothing is fragmented and no
+    // error is sent for it.
     let total_length = u16::from_be_bytes([payload[2], payload[3]]);
     let flags_fragment = u16::from_be_bytes([payload[6], payload[7]]);
     let mtu = pdp_commit_wire_downlink_inner_mtu(&commit);
