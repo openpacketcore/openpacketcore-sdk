@@ -64,9 +64,12 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// This is the production consumer for G-PDUs that the kernel delivers to
     /// the backend-owned queues. The shared UDP/2152 queue carries
     /// outer-fragmented downlink G-PDUs after kernel reassembly (TS 29.281
-    /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is always
-    /// served first. Two more queues carry G-PDUs that tc steered for a
-    /// session with a downlink inner MTU, and are served in turn after it:
+    /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is served
+    /// first, for at most eight datagrams in a row. Two more queues carry
+    /// G-PDUs that tc steered for a session with a downlink inner MTU. They
+    /// get one turn after every full run of the shared queue and whenever it
+    /// is empty, and take those turns alternately, so that sustained input
+    /// on the shared queue cannot starve them:
     /// UDP/2153 when the inner IPv4 packet has Don't Fragment set and exceeds
     /// that MTU, and UDP/2154 when it is any other inner fragment (More
     /// Fragments set, or a non-zero fragment offset). An authorized G-PDU is

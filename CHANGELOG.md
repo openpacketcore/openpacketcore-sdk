@@ -152,9 +152,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     receive buffer (`net.core.rmem_default`), so a flood of inner fragments
     overflows only the inner-fragment queue. The kernel counts the drops
     (`GtpuDownlinkCounters::inner_fragment_queue_drops`), and
-    `decapsulated_inner_fragments` counts the returned fragments. The shared
-    queue is still served first; the two hand-off queues are then served in
-    turn, so neither backlog can starve the other.
+    `decapsulated_inner_fragments` counts the returned fragments. The two
+    hand-off queues are served alternately, so neither backlog can starve
+    the other.
+  - **Service order.** The shared UDP/2152 queue is still served first, but
+    now for at most eight datagrams in a row: then the hand-off queues get
+    one turn. Before, its priority was absolute, and sustained Echo or
+    unknown-TEID input, which tc passes from any source, kept the consumer
+    from the hand-off queues altogether. A hand-off backlog delays the
+    shared queue by at most one datagram per run.
   - **Authorization.** A non-first fragment needs no transport header: like
     any G-PDU it is authorized by its tunnel, outer endpoints, complete
     Active graph and inner destination, on its own.
@@ -168,9 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     forwarded them on its own:
     - while nothing drains the queues (before the first open, while the
       process is down, after a retirement) they are not forwarded (#1019);
-    - a sender that reaches UDP/2154 directly, or keeps the shared UDP/2152
-      queue busy, can crowd them out before the consumer refuses its
-      datagrams;
+    - a sender that reaches UDP/2154 directly can fill their queue before
+      the consumer refuses its datagrams, and one that keeps the shared
+      UDP/2152 queue busy slows the hand-off queues to one datagram in nine;
     - a fragment above the MTU without Don't Fragment is returned
       unfragmented. An `IP_HDRINCL` injection then fragments the ESP packet
       on the outer header, or fails with `EMSGSIZE` above the egress device

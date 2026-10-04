@@ -316,11 +316,23 @@ same way to the backend-owned inner-fragment queue
 (`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154); see
 [Inner fragments](#inner-fragments).
 
-**Queue priority.** `try_receive_downlink` always serves the shared UDP/2152
-queue first. A backlog of hand-offs therefore cannot delay or crowd out Echo
-or reassembled G-PDUs. When the shared queue is empty, it serves the two
-hand-off queues in turn: a hand-off queue that holds a datagram is served at
-least every second such call, however long the other queue's backlog is.
+**Queue priority.** `try_receive_downlink` serves the shared UDP/2152 queue
+first, so a backlog of hand-offs cannot crowd out Echo or reassembled G-PDUs.
+That priority holds for a run of at most eight datagrams. After a full run,
+the hand-off queues get one turn, and they also get a turn whenever the
+shared queue is empty:
+
+- Echo and unknown-TEID G-PDUs reach the shared queue from any source. With
+  absolute priority, sustained input there would keep the consumer from both
+  hand-off queues, and the packets waiting in them would overflow. With the
+  bounded run, the hand-off queues together receive at least one of every
+  nine datagrams served.
+- A hand-off backlog delays the shared queue by at most one hand-off
+  datagram per run of eight. A hand-off turn that finds both queues empty
+  costs the shared queue nothing.
+- The two hand-off queues take their turns alternately: a hand-off queue
+  that holds a datagram is served at least every second hand-off turn,
+  however long the other queue's backlog is.
 
 **No authority in the port.** A datagram is authorized in full whatever queue
 delivered it. A queue's port neither grants nor replaces any check.
@@ -429,14 +441,15 @@ The three decisions that this hand-off needed:
   - the hand-off queues are unconnected UDP sockets on the S2b-U address. A
     sender that reaches UDP/2154 directly uses the queue's buffer, and one of
     the consumer's turns per datagram, before the consumer can refuse it;
-  - the shared queue is always served first, and tc passes Echo and
-    unknown-TEID G-PDUs to it from any source. A sender that keeps UDP/2152
-    busy keeps the consumer from both hand-off queues.
+  - the shared queue is served first for runs of eight, and tc passes Echo
+    and unknown-TEID G-PDUs to it from any source. A sender that keeps
+    UDP/2152 busy takes eight of every nine of the consumer's turns. The
+    hand-off queues keep the ninth, so they are slowed but not starved.
 
-  Inner fragments then overflow their queue, where tc used to forward them
-  whatever the consumer was doing. UDP/2153 has always been exposed in the
-  same way. Admit UDP/2152 to UDP/2154 on the S2b-U address only from the
-  GTP-U peers.
+  Inner fragments that arrive faster than the remaining share overflow their
+  queue, where tc used to forward them whatever the consumer was doing.
+  UDP/2153 has always been exposed in the same way. Admit UDP/2152 to
+  UDP/2154 on the S2b-U address only from the GTP-U peers.
 - **Contexts without a downlink inner MTU** are unchanged: tc decapsulates
   their fragments. One of their datagrams can still be split when a G-PDU is
   fragmented on the outer path and the application drains this port. Give
@@ -680,8 +693,10 @@ rule active in the gateway namespace:
 - the queue budget: with nobody draining, a flood larger than the receive
   buffer leaves at most one buffer of fragments queued, and every other one
   dropped and counted (on Linux 7.1 with a 212,992-octet buffer, 92 of 272
-  queued and 180 dropped). Echo is served first, and three over-MTU packets
-  alternate with the fragment backlog, none lost;
+  queued and 180 dropped). Twenty Echo Requests are served in runs of eight
+  with one hand-off turn after each run, and three over-MTU packets
+  alternate with the fragment backlog. No Echo and no over-MTU packet is
+  lost;
 - an Echo Request and a G-PDU for no tunnel sent straight to UDP/2154, which
   are dropped;
 - zero plaintext ICMP toward the core, and an unchanged host
