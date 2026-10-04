@@ -2564,6 +2564,78 @@ async fn current_voting_ack_requires_live_application_admission() {
 
 #[cfg(feature = "test-control")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_voting_ack_rejects_while_successor_is_durably_pending() {
+    let expanded = [0, 1, 2, 3, 4];
+    let contracted = [0, 1, 2];
+    let mut fleet = DynamicFleet::start_three().await;
+    let expand = fleet.transition_request(1, &expanded, 0xAC);
+    fleet.provision_expansion(&expand).await;
+    let expand_proof = fleet.prepare(&expand, &expanded).await;
+    fleet.commit(&expand, &expand_proof, &expanded).await;
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    let leader = fleet.wait_transition_caller(&expanded).await;
+    let follower = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower");
+    let store = &fleet.stores[follower];
+    let sender = fleet.network.node_ids[leader];
+    assert!(
+        replay_joint_voting_barrier_for_test(store, &expand, sender).await,
+        "the retained request acknowledges before any successor exists"
+    );
+
+    // A pure-removal successor is staged everywhere, withdrawn on this
+    // follower before Prepare, then prepared through the remaining quorum.
+    let contract = fleet.transition_request(2, &contracted, 0xAD);
+    fleet.stage_on_all(&contract);
+    store
+        .unstage_topology_transition_peers(&contract)
+        .await
+        .expect("withdraw the successor on one retained follower before Prepare");
+    let contract_proof = fleet.prepare(&contract, &contracted).await;
+    wait_for_applied_learner_marker_for_test(
+        store,
+        &contract,
+        tokio::time::Instant::now() + TRANSITION_OPERATION_TIMEOUT,
+    )
+    .await
+    .expect("follower durably applied the successor's Prepare and learner marker");
+
+    // Every process-local fact still names the finalized request: it is
+    // retained, its bindings are current, nothing is staged and admission is
+    // open. Only the durable scope says a successor is pending.
+    let local = topology_admission_state_for_test(store, &expand)
+        .expect("follower admission while the successor is pending");
+    assert!(
+        local.current_request && !local.staged && local.admitted_latch,
+        "the unstaged follower keeps the finalized request current: {local:?}"
+    );
+    assert!(
+        !replay_joint_voting_barrier_for_test(store, &expand, sender).await,
+        "a retained request acknowledged voting while its successor was durably pending"
+    );
+    assert_eq!(
+        topology_admission_state_for_test(store, &expand)
+            .expect("follower admission after the rejected acknowledgment"),
+        local
+    );
+
+    // Exact restaging rejoins the successor, which then completes normally.
+    store
+        .stage_topology_transition_peers(
+            &contract,
+            fleet.network.peers_for_request(follower, &contract),
+        )
+        .expect("exact restage after Prepare");
+    fleet.commit(&contract, &contract_proof, &contracted).await;
+    wait_completed_and_admitted(&fleet.stores, &contract, &contracted, &[3, 4]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &contracted, "post-pending-successor")
+        .await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn current_voting_ack_after_restart_requires_exact_completed_request_resume() {
     let active = [0, 1, 2, 3, 4];
     let mut fleet = DynamicFleet::start_three().await;
