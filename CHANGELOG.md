@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts, so receipt fallback cannot hide a broken direct-success path or
   persistent physical-attempt timeouts. Fixes #1012.
 
+- CI: restore the latest stable Rust toolchain after migrating the deprecated
+  atomic update calls, and remove the temporary Dependabot toolchain exclusion.
+  Keep the separate Rust 1.89 MSRV check. Fixes #1041.
+
 - `opc-proto-diameter`: tolerate received successful SWm emergency
   Diameter-EAP answers carrying subscription APN-Configuration and/or
   APN-OI-Replacement, following the GTPv2-based S2b receiver rule in TS 29.273

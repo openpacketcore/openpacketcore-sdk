@@ -87,7 +87,9 @@ and all CI shard plans. This preserves CI's test isolation and profile choices.
 Run the commands produced by
 `python3 ci/test-shards.py plan --shard ID` for every ID from
 `python3 ci/test-shards.py ids`; first run `precheck --shard ID` for each shard.
-Use the same Rust version as the CI run and set `CARGO_INCREMENTAL=0`,
+General CI lanes follow the latest stable Rust release; the separate MSRV
+lane checks Rust 1.89. Use the same Rust version as the CI run and set
+`CARGO_INCREMENTAL=0`,
 `CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
 
 The native IPsec, i686 session-net, and egress host-source jobs are separate
