@@ -35,6 +35,15 @@
 //! authoritative absence, conflicting replacement identity, structural
 //! repair, or retryable authority unavailability — without reading,
 //! installing, or deleting any PDP context.
+//! Linux readiness and classified-install capability recognize an already
+//! owned IPv4 UDP/2152 socket after rechecking the current namespace and live
+//! device identity. Userspace sockets may bind any IPv4 address; recoverable
+//! kernel sockets still require wildcard IPv4 and the verified v2 incarnation.
+//! Exact retained-device acquisition can establish this ownership after restart;
+//! name-only resolution and PDP cleanup APIs do not implicitly acquire it.
+//! Kernel ownership records are scoped by namespace and interface index without
+//! replacing held userspace sockets. Probes and synchronous capability getters
+//! wait behind in-flight device and PDP operations.
 //!
 //! A separate maintenance-only drained-v2 teardown accepts an explicit typed
 //! drain attestation, proves the complete frozen legacy program/map identity,

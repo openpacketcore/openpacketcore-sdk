@@ -649,6 +649,45 @@ family lookup fails closed rather than reporting absence. Mainline Linux
 exposes unconditional `DELPDP` but no compare-delete primitive, so exact removal
 is built on a cross-process recovery authority instead; see the next section.
 
+### Linux kernel-GTP readiness
+
+`probe().mutation_ready` and the `classified_install` reconciliation capability
+accept IPv4 UDP/2152 already owned by this backend or its clones. Ordinary
+creation may bind any IPv4 address and retains the exclusive userspace socket
+through the probe; recoverable creation requires wildcard IPv4 and records the
+verified v2 kernel-socket incarnation. Every probe rechecks the current network
+namespace and live name/ifindex, plus the exact incarnation for a recoverable
+device. Deleted, renamed, replaced or unreadable identity evidence cannot
+establish socket ownership.
+
+After restart, successful exact `acquire_retained_device_identity` records the
+same kernel-socket ownership. Name-only resolution and PDP cleanup APIs do
+not implicitly adopt a device for serving. Kernel ownership records are keyed
+by namespace and interface index separately from held userspace sockets;
+recoverable creation or acquisition does not replace a held socket at the same
+index in another namespace. Removal releases only records whose namespace
+matches the namespace captured before deletion. Missing namespace evidence
+does not change successful creation or acquisition, but cannot establish
+ownership or authorize closing an unproven socket.
+
+Without proven ownership of an IPv4 service socket, the probe still requires
+a fresh wildcard bind, so a foreign socket alone cannot establish readiness.
+A foreign socket on another IPv4 address does not withdraw readiness for the
+backend's proven endpoint. IPv6 sockets and other ports do not substitute for
+IPv4 UDP/2152 readiness. Identity read failures also use the fresh-bind path;
+they never reuse cached positive ownership and have no separate probe
+diagnostic. Read-only probes retain stale records to avoid closing a held
+socket after a transient identity failure or rename. Normal matched removal
+or dropping the last shared backend reference releases held userspace sockets;
+clones and admitted blocking operations retain that shared reference. An
+externally deleted userspace-socket device can leave its port occupied until
+then. Kernel ownership metadata alone retains no socket descriptor.
+
+Platform, netlink, GTP-module and `CAP_NET_ADMIN` prerequisites remain required.
+Probes and the synchronous capability getters wait behind in-flight device and
+PDP operations while they revalidate ownership; readiness is an observation,
+not a reservation for a later mutation.
+
 ### Linux PDP restart recovery authority
 
 `LinuxGtpuDataplaneBackend::recover_pdp_context_exact` is the supported

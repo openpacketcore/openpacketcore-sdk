@@ -6848,7 +6848,11 @@ pub struct GtpuProbe {
     /// Only probed by the eBPF backend; the netlink backend leaves it false.
     pub btf_present: bool,
     /// Mutating operations appear ready: kernel reachable, module present,
-    /// NET_ADMIN available, and the UDP GTP-U socket can be bound.
+    /// NET_ADMIN available, and the UDP GTP-U socket can be bound or is already
+    /// owned by the backend. Linux kernel-GTP ownership covers userspace sockets
+    /// on any IPv4 address at UDP/2152 with revalidated namespace and live device
+    /// identity. Recoverable kernel sockets additionally require wildcard IPv4
+    /// and the exact v2 incarnation.
     pub mutation_ready: bool,
     /// Ability to stamp a fixed per-PDP DSCP on uplink outer IP headers.
     pub egress_dscp_marking: GtpuCapability,

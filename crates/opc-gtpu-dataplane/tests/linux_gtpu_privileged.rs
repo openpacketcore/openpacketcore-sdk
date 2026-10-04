@@ -1,5 +1,5 @@
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -10,8 +10,192 @@ use opc_gtpu_dataplane::{
     PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
     PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
     RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome,
-    RetainedDeviceIdentityRequest, Teid,
+    RetainedDeviceIdentityRequest, Teid, GTPU_PORT,
 };
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn probe_recognizes_owned_userspace_socket_in_current_netns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    probe_owned_socket_lifecycle(false, Ipv4Addr::UNSPECIFIED).await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn probe_recognizes_owned_specific_ipv4_socket_in_current_netns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    probe_owned_socket_lifecycle(false, Ipv4Addr::LOCALHOST).await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn probe_recognizes_owned_kernel_sockets_in_current_netns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    probe_owned_socket_lifecycle(true, Ipv4Addr::UNSPECIFIED).await
+}
+
+async fn probe_owned_socket_lifecycle(
+    recoverable: bool,
+    bind_address: Ipv4Addr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh CAP_NET_ADMIN netns");
+        return Ok(());
+    }
+
+    let root = std::env::temp_dir().join(format!("opc-gtpu-probe-{}", std::process::id()));
+    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(root.clone())?;
+    require_equal(
+        backend.probe().await?.mutation_ready,
+        true,
+        "fresh probe failed",
+    )?;
+    let foreign = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, GTPU_PORT))?;
+    require_equal(
+        backend.probe().await?.mutation_ready,
+        false,
+        "foreign socket accepted",
+    )?;
+    require_equal(
+        backend
+            .pdp_context_reconciliation_capabilities()
+            .classified_install,
+        GtpuCapability::Missing,
+        "foreign socket enabled classified install",
+    )?;
+    drop(foreign);
+
+    // A foreign socket on another address is insufficient by itself, but it
+    // does not invalidate this backend's own specific IPv4 service socket.
+    let foreign_specific = if bind_address.is_unspecified() {
+        None
+    } else {
+        let foreign = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), GTPU_PORT))?;
+        require_equal(
+            backend.probe().await?.mutation_ready,
+            false,
+            "foreign specific IPv4 socket accepted",
+        )?;
+        Some(foreign)
+    };
+    let mut request = CreateGtpDeviceRequest::new(format!("gprobe{}", std::process::id() % 10_000));
+    request.bind_address = IpAddr::V4(bind_address);
+    let device = if recoverable {
+        backend
+            .create_recoverable_device(
+                request,
+                PdpDeviceIncarnation::from_bytes([0x93; 16]).ok_or("invalid incarnation")?,
+            )
+            .await?
+    } else {
+        backend.create_device(request).await?
+    };
+    let result = async {
+        require_equal(
+            UdpSocket::bind((Ipv4Addr::UNSPECIFIED, GTPU_PORT)).is_err(),
+            true,
+            "device socket did not occupy the service port",
+        )?;
+        let probe = backend.clone().probe().await?;
+        if !probe.mutation_ready {
+            return Err(format!("owned socket made the backend unavailable: {probe:?}").into());
+        }
+        require_equal(
+            backend
+                .pdp_context_reconciliation_capabilities()
+                .classified_install,
+            GtpuCapability::Available,
+            "owned socket did not enable classified install",
+        )?;
+        let independent = LinuxGtpuDataplaneBackend::new();
+        require_equal(
+            independent.resolve_device(&device.name).await?,
+            device.clone(),
+            "independent backend resolved the wrong device",
+        )?;
+        require_equal(
+            independent.probe().await?.mutation_ready,
+            false,
+            "name-only resolution granted socket ownership",
+        )?;
+        require_equal(
+            independent
+                .pdp_context_reconciliation_capabilities()
+                .classified_install,
+            GtpuCapability::Missing,
+            "name-only resolution enabled classified install",
+        )?;
+        let context = privileged_recovery_context(&device)?;
+        require_equal(
+            backend
+                .install_pdp_context_classified(context.clone())
+                .await?,
+            PdpContextInstallOutcome::Installed,
+            "classified PDP install failed",
+        )?;
+        require_equal(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context)
+                        .ok_or("invalid local selector")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone()),
+            "installed PDP readback differed",
+        )?;
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+            .await?;
+
+        if recoverable {
+            // An externally changed incarnation must withdraw readiness even
+            // while the very same kernel socket still owns the service port.
+            let output = Command::new("ip")
+                .args(["link", "set", "dev", &device.name, "alias", "foreign"])
+                .output()?;
+            if !output.status.success() {
+                return Err("failed to change fixture device alias".into());
+            }
+            require_equal(
+                backend.probe().await?.mutation_ready,
+                false,
+                "changed recoverable incarnation retained readiness",
+            )?;
+            require_equal(
+                backend
+                    .pdp_context_reconciliation_capabilities()
+                    .classified_install,
+                GtpuCapability::Missing,
+                "changed recoverable incarnation enabled classified install",
+            )?;
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    let cleanup = backend.remove_device(&device).await;
+    let _ = std::fs::remove_dir_all(root);
+    result?;
+    cleanup?;
+
+    require_equal(
+        backend.probe().await?.mutation_ready,
+        foreign_specific.is_none(),
+        "probe retained ownership after device removal",
+    )?;
+    drop(foreign_specific);
+    require_equal(
+        backend.probe().await?.mutation_ready,
+        true,
+        "removed socket still occupied",
+    )?;
+    let _foreign = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, GTPU_PORT))?;
+    require_equal(
+        backend.probe().await?.mutation_ready,
+        false,
+        "foreign socket accepted after removal",
+    )?;
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
@@ -416,6 +600,9 @@ async fn retained_device_identity_acquisition_classifies_without_mutation_in_cur
     // of the restart-recovery fixture running in the same test binary.
     let recovery_root = privileged_retained_device_root();
     let creator = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
+    // Complete fallible setup before creating the retained link so every
+    // later failure reaches the device cleanup below.
+    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
     let incarnation = PdpDeviceIncarnation::from_bytes([0xc3; 16])
         .ok_or("privileged fixture incarnation must be nonzero")?;
     let name = format!("ga{}", std::process::id() % 10_000);
@@ -448,7 +635,6 @@ async fn retained_device_identity_acquisition_classifies_without_mutation_in_cur
     // creator models process loss after the link was created and stamped but
     // before its returned ifindex was durably published.
     drop(creator);
-    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
 
     let retained_request = RetainedDeviceIdentityRequest::new(
         device.name.clone(),
@@ -460,6 +646,18 @@ async fn retained_device_identity_acquisition_classifies_without_mutation_in_cur
     let result = async {
         // Exact retained name, ifindex, and kernel-bound incarnation return
         // the retained identity, and the classification is idempotent.
+        require_equal(
+            backend.probe().await?.mutation_ready,
+            false,
+            "fresh backend assumed retained socket ownership",
+        )?;
+        require_equal(
+            backend
+                .pdp_context_reconciliation_capabilities()
+                .classified_install,
+            GtpuCapability::Missing,
+            "fresh backend enabled classified install before acquisition",
+        )?;
         let prepared = backend
             .acquire_retained_device_identity(prepared_request.clone())
             .await?;
@@ -472,6 +670,18 @@ async fn retained_device_identity_acquisition_classifies_without_mutation_in_cur
             prepared.into_retained_device(),
             Some(device.clone()),
             "prepared acquisition returned the wrong device",
+        )?;
+        require_equal(
+            backend.clone().probe().await?.mutation_ready,
+            true,
+            "retained acquisition did not establish readiness",
+        )?;
+        require_equal(
+            backend
+                .pdp_context_reconciliation_capabilities()
+                .classified_install,
+            GtpuCapability::Available,
+            "retained acquisition did not enable classified install",
         )?;
         require_equal(
             backend
