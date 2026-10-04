@@ -278,12 +278,63 @@ and a V1-only peer fails before V2 dispatch. Deploy listener support and any
 required V2 store/journal provisioning before enabling the explicit V2 API,
 then drain V2 callers before removing it.
 
-The separately authorized protected-roster family uses only
+The separately authorized V1 protected-roster family uses only
 `opc-session-consumer/3` with transport revision 5. When roster ingress is
 enabled, the listener advertises `/3` before `/2` and `/1`; a client offers
 exactly one ALPN. `/3` accepts only its roster operation set and exact
 tenant/scope/fence authority, never shares a lane or fallback path with `/1`
 or `/2`, and is excluded from `/2` capacity accounting and idle reclaim.
+
+The additive V2 protected-roster profile uses `opc-session-consumer/4` at
+transport revision 6. A V2 publication adapter can opt into authority-read
+failover through
+`PersistentSessionConsumerClient::into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters`.
+Supply the complete startup-fixed set of authenticated V2 voter pools,
+including the primary's voter exactly once. Construction rejects empty,
+incomplete, duplicate, foreign-roster, profile-mismatched or differently
+authenticated caller sets before claiming the primary executor. All pools
+must bind the same scope, roster commitment and attestation root.
+
+Each publication precheck and postcheck reads the original primary first,
+then the remaining voters in canonical node-ID order. Each attempt gets an
+equal share of the remaining time per voter not yet tried, with the last voter
+receiving the remainder. One absolute deadline from the primary's operation
+budget covers pool waits, connection setup and responses. Reads are sequential;
+a late response from an abandoned attempt cannot authorize publication.
+
+The opt-in traversal continues after distinguishable client faults: a shut-down
+pool, local certificate/trust or peer-authentication setup failure, explicit
+ALPN `no_application_protocol` refusal, I/O failure, unavailability, deadline
+or overload. Other TLS protocol failures, missing or different ALPN after a
+completed handshake, and an authenticated peer with a different identity stop
+traversal. Every rejection received from a server, including during Hello,
+also stops traversal. Generic `Rejected(Unavailable)` returns the retryable
+`AuthorityUnavailable` class before a provider operation; authority, scope and
+protocol verdicts return `AuthorityRejected`. Opaque storage or traffic-authority
+rejections remain terminal. A voter that answers while being retired ends
+the traversal: the client cannot distinguish that rejection from a durable
+membership or activation failure. A restarting voter's connection failure
+permits traversal to continue. Server-side classification of confirmed
+retirement is deferred; no opaque rejection is guessed to be temporary.
+Every successful reader still proves the exact current binding through an
+authenticated linearizable barrier.
+
+The original pool keeps mutation execution, the capsule's permit ledger and
+provider scheduler, even if the supplied set represents its voter with a
+different pool object. Reads through alternates share those pools' connection
+lanes, pending admission and counters with their other users and executors.
+`diagnostics_with_pool` reports only the primary;
+`publication_pool_diagnostics` reports all reader pools in traversal order.
+These shared counters include other users' operations, and the snapshots are
+not an atomic combined observation. Retain client clones to shut down shared
+alternate pools.
+
+Publication keeps the same capsule and provider journal identity;
+authority-read failover cannot repeat a provider effect or restore begin-retry
+permission. Begin-retry restoration remains deferred. Postcheck failure still
+requires recovery, and cancellation retains the existing conservative
+publication state. The existing single-pool V1 and V2 constructors retain
+their error classification.
 
 For a recovered mutation roster, the first provider-authenticated Applied
 observation from status or adoption becomes conclusive under the current

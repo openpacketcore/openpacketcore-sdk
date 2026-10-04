@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-net`: add opt-in V2 publication authority reads across the
+  complete authenticated fixed voter set and per-reader shared-pool diagnostics.
+  `into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters`
+  retains the original executor and providers, tries the primary then canonical
+  roster order, and divides one barrier deadline among remaining voters.
+  Distinguishable client transport and pool faults permit advancement; every
+  server rejection stays terminal, including opaque retirement, storage and
+  traffic-authority failures. Late responses cannot authorize publication.
+  Begin-retry restoration and server-side retirement classification are
+  deferred. Refs #1051.
+
 - `opc-ipsec-xfrm`: add explicit startup reset for an exclusively owned
   namespace whose caller retains no predecessor state. The namespace actor
   flushes every policy type and SA protocol, proves empty tables, then durably
@@ -19,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Fixed
+
+- `opc-session-store`: ordinary SQLite committed-frontier writes no longer
+  strand unrelated tasks on current-thread Tokio runtimes after startup.
+  Process-wide admission bounds queued and active owned writes; jobs retain
+  the original transaction resources and shutdown ownership through completion
+  after caller cancellation. Successful commits still signal checkpoints;
+  rejected commits roll back, and writes are never replayed. Native WAL routing and
+  startup/LocalSet behavior are unchanged. Fixes #829.
 
 - `opc-session-testkit`: require direct protected V2 facade successes in a
   non-ignored authenticated three-voter test. Six nominal transitions permit

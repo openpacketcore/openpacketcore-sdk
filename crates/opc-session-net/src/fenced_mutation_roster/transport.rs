@@ -1,7 +1,8 @@
 //! Private client-side canonical wire codec and concrete quorum port.
 //!
 //! No trait in this module is implementable by downstream code. The sole port
-//! is built by consuming the exact revision-five persistent client.
+//! is built by consuming an exact-profile persistent client, with optional
+//! same-roster publication authority readers.
 
 use super::{
     canonical::{
@@ -106,8 +107,10 @@ impl fmt::Debug for ProtectedRosterTransportError {
 
 /// Fixed numeric, nonidentifying diagnostics for one consumed roster adapter.
 ///
-/// The pool and roster snapshots share the same startup-owned persistent
-/// consumer pool. Taking this snapshot performs no remote I/O and retains no
+/// The pool snapshot covers only the startup-owned primary, including when
+/// publication reads use alternates. Use
+/// [`FencedMutationRosterProviderAdapter::publication_pool_diagnostics`] for
+/// every reader pool. Taking this snapshot performs no remote I/O and retains no
 /// caller, tenant, scope, roster, member, or provider identifiers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FencedMutationRosterProviderAdapterDiagnostics {
@@ -115,12 +118,14 @@ pub struct FencedMutationRosterProviderAdapterDiagnostics {
     pub pool: PersistentSessionConsumerDiagnostics,
 }
 
-/// Startup-fixed member and publication providers backed by one consumed pool.
+/// Startup-fixed providers and mutation executor backed by one consumed pool.
+/// Publication authority reads may additionally use a validated fixed voter set.
 pub struct FencedMutationRosterProviderAdapter<Q> {
     client: FencedMutationRosterClient,
     publication: PublicationAdapter<Q, RosterQuorumPort>,
     diagnostics: RosterDiagnostics,
     pool_diagnostics: PersistentSessionConsumerClient,
+    publication_pool_observers: Arc<[PersistentSessionConsumerClient]>,
 }
 
 impl<Q> Clone for FencedMutationRosterProviderAdapter<Q> {
@@ -130,6 +135,7 @@ impl<Q> Clone for FencedMutationRosterProviderAdapter<Q> {
             publication: self.publication.clone(),
             diagnostics: self.diagnostics.clone(),
             pool_diagnostics: self.pool_diagnostics.clone(),
+            publication_pool_observers: self.publication_pool_observers.clone(),
         }
     }
 }
@@ -154,7 +160,7 @@ where
         self.diagnostics.snapshot()
     }
 
-    /// Return one fixed, redaction-safe roster and persistent-pool snapshot.
+    /// Return one fixed, redaction-safe roster and primary-pool snapshot.
     ///
     /// The retained pool observer is an ordinary shared clone. It creates no
     /// connection, executor, task, channel, or second roster authority.
@@ -163,6 +169,20 @@ where
             roster: self.diagnostics(),
             pool: self.pool_diagnostics.diagnostics_without_io(),
         }
+    }
+
+    /// Snapshot every publication reader's shared pool without remote I/O.
+    ///
+    /// Entries follow read order: primary first, then canonical alternate
+    /// node-ID order. A single-pool adapter returns one entry. Each snapshot
+    /// includes all users of that pool, including another adapter's calls;
+    /// these are neither per-adapter counters nor an atomic combined snapshot.
+    /// Retain caller-owned client clones to shut down shared alternate pools.
+    pub fn publication_pool_diagnostics(&self) -> Vec<PersistentSessionConsumerDiagnostics> {
+        self.publication_pool_observers
+            .iter()
+            .map(PersistentSessionConsumerClient::diagnostics_without_io)
+            .collect()
     }
 
     /// Publish an exact SDK-issued established publication locally.
@@ -237,6 +257,7 @@ where
     Q: EstablishedPublicationProvider,
 {
     let pool_diagnostics = consumer.diagnostics_observer();
+    let publication_pool_observers = Arc::from([pool_diagnostics.clone()]);
     let port = Arc::new(RosterQuorumPort::new(consumer)?);
     let executor = RosterExecutor::new(member_provider, port.clone(), attestor, max_in_flight);
     let publication = executor.publication_adapter(publication_provider);
@@ -247,11 +268,13 @@ where
         publication,
         diagnostics,
         pool_diagnostics,
+        publication_pool_observers,
     })
 }
 
 pub(crate) fn compose_provider_adapter_v2<P, Q>(
     consumer: AuthenticatedRosterConsumer,
+    publication_voters: Vec<AuthenticatedRosterConsumer>,
     member_provider: Arc<P>,
     publication_provider: Arc<Q>,
     attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
@@ -262,7 +285,17 @@ where
     Q: EstablishedPublicationProvider,
 {
     let pool_diagnostics = consumer.diagnostics_observer();
-    let port = Arc::new(RosterQuorumPort::new_v2(consumer)?);
+    let publication_pool_observers = std::iter::once(pool_diagnostics.clone())
+        .chain(
+            publication_voters
+                .iter()
+                .map(AuthenticatedRosterConsumer::diagnostics_observer),
+        )
+        .collect::<Vec<_>>()
+        .into();
+    let mut port = RosterQuorumPort::new_v2(consumer)?;
+    port.publication_voters = publication_voters.into();
+    let port = Arc::new(port);
     let executor = RosterExecutor::new_v2(member_provider, port.clone(), attestor, max_in_flight);
     let publication = executor.publication_adapter(publication_provider);
     let client = FencedMutationRosterClient::new_v2(executor, port.scope);
@@ -272,6 +305,7 @@ where
         publication,
         diagnostics,
         pool_diagnostics,
+        publication_pool_observers,
     })
 }
 
@@ -282,6 +316,7 @@ fn protected_roster_scope_from_consumer_scope(scope: SessionConsumerScope) -> Sc
 #[derive(Clone)]
 pub(crate) struct RosterQuorumPort {
     consumer: AuthenticatedRosterConsumer,
+    publication_voters: Arc<[AuthenticatedRosterConsumer]>,
     scope: Scope,
     configuration_identity: SessionConsensusIdentity,
     roster_attestation_root_identity: RosterAttestationTrustRootIdentityV1,
@@ -311,6 +346,7 @@ impl RosterQuorumPort {
         let configuration_identity = consumer.scope().consensus_identity();
         Ok(Self {
             consumer,
+            publication_voters: Arc::from([]),
             scope,
             configuration_identity,
             roster_attestation_root_identity,
@@ -356,19 +392,6 @@ impl RosterQuorumPort {
         capsule: SessionConsumerRosterTerminalCapsule,
     ) -> Result<SessionConsumerRosterTerminalReadResponse, ProtectedRosterTransportError> {
         self.consumer.terminal_status(request_id, capsule).await
-    }
-
-    async fn current_publication_authority(
-        &self,
-        request_id: SessionConsumerRequestId,
-        capsule: SessionConsumerRosterCurrentPublicationAuthorityCapsule,
-    ) -> Result<
-        SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
-        crate::consumer::SessionConsumerClientError,
-    > {
-        self.consumer
-            .current_publication_authority(request_id, capsule)
-            .await
     }
 }
 
@@ -551,24 +574,121 @@ impl PublicationAuthorityReader for RosterQuorumPort {
             request.current_lease_expires_at(),
         )
         .map_err(|_| PublicationAuthorityCheckError::Rejected)?;
-        match self
-            .current_publication_authority(
-                recovery_request_id(
-                    AdmissionRequestKind::CurrentPublicationAuthority,
-                    authority.ingress_scope(),
-                    request.roster_id(),
-                ),
-                capsule,
-            )
-            .await
-            .map_err(publication_authority_client_error)?
-        {
-            SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current => Ok(()),
-            SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected => {
-                Err(PublicationAuthorityCheckError::Rejected)
-            }
-            _ => Err(PublicationAuthorityCheckError::Rejected),
+        let request_id = recovery_request_id(
+            AdmissionRequestKind::CurrentPublicationAuthority,
+            authority.ingress_scope(),
+            request.roster_id(),
+        );
+        let deadline = self
+            .consumer
+            .publication_authority_deadline()
+            .map_err(publication_authority_client_error)?;
+        read_publication_authority_from_voters(
+            std::iter::once(self.consumer.clone()).chain(self.publication_voters.iter().cloned()),
+            deadline,
+            |consumer, deadline| {
+                let capsule = capsule.clone();
+                async move {
+                    match consumer
+                        .current_publication_authority_before(request_id, capsule, deadline)
+                        .await
+                        .map_err(|error| {
+                            publication_authority_read_error(
+                                error,
+                                !self.publication_voters.is_empty(),
+                            )
+                        })? {
+                        SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current => {
+                            Ok(())
+                        }
+                        _ => Err(PublicationAuthorityAttemptError::Stop(
+                            PublicationAuthorityCheckError::Rejected,
+                        )),
+                    }
+                }
+            },
+        )
+        .await
+    }
+}
+
+/// Traversal policy is separate from the caller's retry classification: a
+/// server's Unavailable response stops this barrier but remains unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationAuthorityAttemptError {
+    TryNextVoter,
+    Stop(PublicationAuthorityCheckError),
+}
+
+/// Traverse only fixed readers under one absolute budget. Dropping the barrier
+/// drops its current read; no detached work can advance to another voter.
+async fn read_publication_authority_from_voters<T, F, Fut>(
+    voters: impl IntoIterator<Item = T>,
+    deadline: tokio::time::Instant,
+    mut read: F,
+) -> Result<(), PublicationAuthorityCheckError>
+where
+    F: FnMut(T, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<(), PublicationAuthorityAttemptError>>,
+{
+    // Composition already bounds the fixed set. Retain its exact length so
+    // every untried voter receives a share even when earlier reads stall.
+    let voters: Vec<_> = voters.into_iter().collect();
+    let count = voters.len();
+    for (index, voter) in voters.into_iter().enumerate() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(PublicationAuthorityCheckError::Unavailable);
         }
+        let remaining =
+            u32::try_from(count - index).map_err(|_| PublicationAuthorityCheckError::Rejected)?;
+        let attempt_deadline = now + (deadline - now) / remaining;
+        let result = tokio::time::timeout_at(attempt_deadline, read(voter, attempt_deadline)).await;
+        // timeout_at polls the inner future first. A reply ready on the same
+        // poll as expiry must not authorize an effect after its allotted time.
+        if tokio::time::Instant::now() >= attempt_deadline {
+            continue;
+        }
+        match result {
+            Ok(Err(PublicationAuthorityAttemptError::TryNextVoter)) | Err(_) => {}
+            Ok(Err(PublicationAuthorityAttemptError::Stop(error))) => return Err(error),
+            Ok(Ok(())) => return Ok(()),
+        }
+    }
+    Err(PublicationAuthorityCheckError::Unavailable)
+}
+
+fn publication_authority_read_error(
+    error: crate::consumer::PublicationAuthorityReadError,
+    failover: bool,
+) -> PublicationAuthorityAttemptError {
+    use crate::consumer::{PublicationAuthorityReadError, SessionConsumerClientError};
+    use opc_session_store::SessionConsumerRejection;
+    if !failover {
+        // Preserve the existing single-pool V1/V2 error contract.
+        return PublicationAuthorityAttemptError::Stop(publication_authority_client_error(
+            error.into_client_error(),
+        ));
+    }
+    match error {
+        PublicationAuthorityReadError::NoApplicationProtocol
+        | PublicationAuthorityReadError::Local(
+            SessionConsumerClientError::Unavailable
+            | SessionConsumerClientError::Deadline
+            | SessionConsumerClientError::Overloaded
+            | SessionConsumerClientError::Authentication
+            | SessionConsumerClientError::ShuttingDown,
+        ) => PublicationAuthorityAttemptError::TryNextVoter,
+        PublicationAuthorityReadError::ServerRejected(SessionConsumerRejection::Unavailable) => {
+            PublicationAuthorityAttemptError::Stop(PublicationAuthorityCheckError::Unavailable)
+        }
+        PublicationAuthorityReadError::ServerRejected(_)
+        | PublicationAuthorityReadError::Local(
+            SessionConsumerClientError::AuthorityRevoked
+            | SessionConsumerClientError::Scope
+            | SessionConsumerClientError::Protocol
+            | SessionConsumerClientError::Unsupported,
+        ) => PublicationAuthorityAttemptError::Stop(PublicationAuthorityCheckError::Rejected),
     }
 }
 
@@ -1677,6 +1797,247 @@ fn encode_terminal_response_v2(wire: &TerminalResponseWireV2) -> Result<Vec<u8>,
 mod tests {
     use super::*;
     use crate::fenced_mutation_roster::{client::ClientError, runtime::ExecutorError};
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_authority_failover_shares_one_deadline_across_voters() {
+        use std::{sync::Mutex, time::Duration};
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(120);
+        let calls = Mutex::new(Vec::new());
+        let result = read_publication_authority_from_voters([2, 0, 1], deadline, |voter, limit| {
+            calls.lock().expect("calls").push((voter, limit));
+            async move {
+                // No voter cooperates with its allotted deadline.
+                std::future::pending::<Result<(), PublicationAuthorityAttemptError>>().await
+            }
+        })
+        .await;
+        assert_eq!(result, Err(PublicationAuthorityCheckError::Unavailable));
+        let calls = calls.lock().expect("calls");
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [2, 0, 1]
+        );
+        assert_eq!(calls[0].1, started + Duration::from_millis(40));
+        assert!(calls[1].1 > calls[0].1 && calls[1].1 < deadline);
+        assert_eq!(calls[2].1, deadline);
+        // Tokio's timer wheel can round a wakeup to the next millisecond.
+        assert!(tokio::time::Instant::now() <= deadline + Duration::from_millis(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_authority_failover_exhaustion_and_expiry_do_not_restart_budget() {
+        use std::{sync::Mutex, time::Duration};
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(120);
+        let calls = Mutex::new(Vec::new());
+        let result = read_publication_authority_from_voters([2, 0, 1], deadline, |voter, limit| {
+            let calls = &calls;
+            async move {
+                calls.lock().expect("calls").push((voter, limit));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Err(PublicationAuthorityAttemptError::TryNextVoter)
+            }
+        })
+        .await;
+        assert_eq!(result, Err(PublicationAuthorityCheckError::Unavailable));
+        {
+            let calls = calls.lock().expect("calls");
+            assert_eq!(
+                calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+                [2, 0, 1]
+            );
+            assert_eq!(calls[0].1, started + Duration::from_millis(40));
+            assert!(calls[1].1 > started + Duration::from_millis(60));
+            assert_eq!(calls[2].1, deadline, "last voter gets unused time");
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep_until(deadline).await;
+        assert_eq!(
+            read_publication_authority_from_voters([2, 0, 1], deadline, |_, _| async {
+                panic!("an expired barrier cannot enter any voter")
+            })
+            .await,
+            Err(PublicationAuthorityCheckError::Unavailable)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_authority_failover_abandons_late_primary_answer() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
+        struct Dropped<'a>(&'a AtomicBool);
+        impl Drop for Dropped<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = AtomicBool::new(false);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+        let result = read_publication_authority_from_voters([2, 0, 1], deadline, |voter, _| {
+            let dropped = &dropped;
+            async move {
+                if voter == 2 {
+                    let _guard = Dropped(dropped);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    panic!("abandoned primary answer must never be applied");
+                }
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "drop primary before alternate"
+                );
+                assert_eq!(voter, 0, "first healthy alternate terminates traversal");
+                Ok(())
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        tokio::time::sleep_until(deadline).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_authority_failover_discards_answer_at_attempt_expiry() {
+        use std::{sync::Mutex, time::Duration};
+        let calls = Mutex::new(Vec::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+        let result = read_publication_authority_from_voters([2, 0, 1], deadline, |voter, limit| {
+            calls.lock().expect("calls").push(voter);
+            async move {
+                if voter == 2 {
+                    tokio::time::sleep_until(limit).await;
+                }
+                Ok(())
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [2, 0],
+            "expiry and reply readiness on the same poll cannot accept primary"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_authority_failover_stops_at_first_success_or_rejection() {
+        use std::{sync::Mutex, time::Duration};
+        for terminal in [
+            Ok(()),
+            Err(PublicationAuthorityCheckError::Rejected),
+            Err(PublicationAuthorityCheckError::Unavailable),
+        ] {
+            let calls = Mutex::new(Vec::new());
+            let result = read_publication_authority_from_voters(
+                [2, 0, 1],
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                |voter, _| {
+                    calls.lock().expect("calls").push(voter);
+                    std::future::ready(if voter == 2 {
+                        Err(PublicationAuthorityAttemptError::TryNextVoter)
+                    } else {
+                        terminal.map_err(PublicationAuthorityAttemptError::Stop)
+                    })
+                },
+            )
+            .await;
+            assert_eq!(result, terminal);
+            assert_eq!(*calls.lock().expect("calls"), [2, 0]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_authority_failover_cancellation_drops_current_read() {
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Mutex,
+            },
+            time::Duration,
+        };
+        struct Dropped<'a>(&'a AtomicBool);
+        impl Drop for Dropped<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let calls = Mutex::new(Vec::new());
+        let dropped = AtomicBool::new(false);
+        let mut barrier = Box::pin(read_publication_authority_from_voters(
+            [2, 0, 1],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            |voter, _| {
+                let calls = &calls;
+                let dropped = &dropped;
+                async move {
+                    calls.lock().expect("calls").push(voter);
+                    if voter == 2 {
+                        return Err(PublicationAuthorityAttemptError::TryNextVoter);
+                    }
+                    let _drop_guard = Dropped(dropped);
+                    std::future::pending().await
+                }
+            },
+        ));
+        assert!(futures_util::poll!(&mut barrier).is_pending());
+        drop(barrier);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(*calls.lock().expect("calls"), [2, 0]);
+    }
+
+    #[test]
+    fn publication_authority_failover_distinguishes_transport_faults_from_server_rejections() {
+        use crate::consumer::{
+            PublicationAuthorityReadError as ReadError, SessionConsumerClientError as ClientError,
+        };
+        use opc_session_store::SessionConsumerRejection;
+        for error in [
+            ClientError::Unavailable,
+            ClientError::Deadline,
+            ClientError::Overloaded,
+            ClientError::Authentication,
+            ClientError::ShuttingDown,
+        ] {
+            assert_eq!(
+                publication_authority_read_error(ReadError::Local(error), true),
+                PublicationAuthorityAttemptError::TryNextVoter
+            );
+        }
+        assert_eq!(
+            publication_authority_read_error(ReadError::NoApplicationProtocol, true),
+            PublicationAuthorityAttemptError::TryNextVoter
+        );
+        for error in [
+            ClientError::AuthorityRevoked,
+            ClientError::Scope,
+            ClientError::Protocol,
+            ClientError::Unsupported,
+        ] {
+            assert_eq!(
+                publication_authority_read_error(ReadError::Local(error), true),
+                PublicationAuthorityAttemptError::Stop(PublicationAuthorityCheckError::Rejected)
+            );
+        }
+        for rejection in [
+            SessionConsumerRejection::Unavailable,
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+            SessionConsumerRejection::Unauthorized,
+        ] {
+            assert_eq!(
+                publication_authority_read_error(ReadError::ServerRejected(rejection), true),
+                PublicationAuthorityAttemptError::Stop(
+                    if rejection == SessionConsumerRejection::Unavailable {
+                        PublicationAuthorityCheckError::Unavailable
+                    } else {
+                        PublicationAuthorityCheckError::Rejected
+                    }
+                )
+            );
+        }
+    }
 
     #[test]
     fn publication_client_failures_preserve_authority_rejection() {

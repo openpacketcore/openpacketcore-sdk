@@ -1721,18 +1721,72 @@ umbrella until that fleet evidence passes.
 
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
-application-consumer boundary. They MUST use mutual TLS and three independent
+application-consumer boundary. They MUST use mutual TLS and four independent
 exact lanes: the general `opc-session-consumer/1` ALPN at transport revision 6,
-the epoch-fenced V2 `opc-session-consumer/2` ALPN at transport revision 5, and
-the protected-roster `opc-session-consumer/3` ALPN at transport revision 5.
+the epoch-fenced V2 `opc-session-consumer/2` ALPN at transport revision 5,
+the V1 protected-roster `opc-session-consumer/3` ALPN at transport revision 5,
+and the V2 protected-roster `opc-session-consumer/4` ALPN at transport revision 6.
 These are separate exact protocols from both `opc-session-consensus/2` and the
 quarantined `opc-session-net/5` compatibility protocol. `/2` MUST NOT fall back
 to `/1`, and a lane authenticated for one ALPN MUST NOT carry or be reused for
-another lane's Hello or request envelope. When protected-roster ingress is
+another lane's Hello or request envelope. When V1 protected-roster ingress is
 enabled, the listener advertises `/3` before `/2` and `/1`; each client offers
 exactly one ALPN. `/3` admits only its protected roster operation set under its
 tenant/scope/fence authority, and `/2` MUST NOT count or reclaim `/3` lanes.
 The server MUST reject every `/2` Hello revision other than 5 before dispatch.
+
+The additive V2 protected-roster `/4` lane uses transport revision 6. Its
+publication adapter MAY retain a complete startup-fixed set of authenticated
+V2 voter pools for current-publication-authority reads. Composition MUST
+validate the exact roster, scope, attestation root, transport profile and
+local caller identity, and reject missing, duplicate or foreign voters before
+claiming the original pool's executor. A second pool representing the original
+primary's voter MUST NOT replace that original pool.
+
+Each pre-effect and post-effect publication barrier MUST try the original
+primary, followed by other fixed voters in canonical node-ID order. Each
+attempt MUST receive an equal share of the remaining time per untried voter;
+the final voter receives the remainder. All physical reads in a barrier MUST
+share one absolute deadline derived from the primary's operation budget,
+including pool admission, connection setup and response time. Reads MUST stay
+sequential, and an abandoned read's late response MUST NOT authorize an effect.
+Exhaustion MUST NOT restart a budget. Success from any reader still MUST prove
+the exact current authority through a linearizable read barrier.
+
+The opt-in traversal MAY advance after distinguishable client pool shutdown,
+local certificate/trust or peer-authentication setup failure, explicit ALPN
+`no_application_protocol` refusal, I/O failure, unavailability, deadline or
+overload. Other TLS protocol failures, missing or different ALPN after a
+completed handshake, and an authenticated peer with a different identity MUST
+stop traversal. Every server rejection, including during Hello, MUST also stop
+traversal. Generic `Rejected(Unavailable)` MUST retain the retryable
+`AuthorityUnavailable` class before a provider operation; authority, scope and
+protocol verdicts remain `AuthorityRejected`. Opaque storage or traffic-authority
+rejections MUST remain terminal. A voter answering while being retired ends the
+traversal because its combined rejection cannot be distinguished from durable
+membership or activation failure. A restarting voter's connection failure
+permits advancement. A future store-side classification must report confirmed
+retirement separately before a client may treat it differently; the client
+MUST NOT infer retirement from an opaque rejection.
+
+The serving voter evaluates expiry against the later of its wall clock and
+replicated logical time. Failover changes which existing voter clock answers;
+it MUST NOT extend lease bounds or introduce clock-skew tolerance. Replicated
+logical time remains a floor; this does not promise synchronized voter clocks.
+
+This composition changes only authority-read routing. The original executor
+MUST retain mutation execution, its local permit ledger and provider-work
+scheduler. Alternate reads share their pools' lanes, pending admission and
+counters with other users. `diagnostics_with_pool` reports the primary only;
+`publication_pool_diagnostics` reports all readers in traversal order, including
+other users' operations rather than per-adapter counts. The snapshots are not
+atomic across pools. Callers retain their own clones to shut shared pools down.
+Publication MUST retain its existing capsule, journal identity, provider
+invocation rules, pre/post local ledger validation, effect timeout and
+cancellation semantics. A failed precheck MUST NOT grant new begin-retry
+authority, and a failed postcheck MUST remain recovery-required. Begin-retry
+restoration is deferred. The original single-pool constructors retain their
+existing error classification.
 
 General revision 6 does not interoperate with older general revisions. Because
 this SDK is unreleased, a general-lane revision cutover MUST drain consumer

@@ -1009,9 +1009,9 @@ pub enum SessionConsumerClientError {
     ShuttingDown,
 }
 
-/// Private setup classification retained only until the protected-roster port
-/// can convert a conclusively rejected ALPN into its existing capability
-/// rejection. All public consumer surfaces collapse it to `Protocol`.
+/// Private setup classification retained for operation-specific roster
+/// capability rejection and publication-read failover. Public consumer error
+/// surfaces collapse it to `Protocol`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsumerSetupError {
     Client(SessionConsumerClientError),
@@ -1477,6 +1477,34 @@ impl SessionConsumerCallError {
         match self {
             Self::BeforeCallWrite(error) | Self::MayHaveSent(error) => error,
             Self::NoApplicationProtocol => SessionConsumerClientError::Protocol,
+        }
+    }
+}
+
+/// Preserve the origin of publication read failures until the fixed-roster
+/// reader decides whether it may try another voter. Server rejections must
+/// never become retryable merely because they share a public client error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationAuthorityReadError {
+    Local(SessionConsumerClientError),
+    NoApplicationProtocol,
+    ServerRejected(SessionConsumerRejection),
+}
+
+impl PublicationAuthorityReadError {
+    fn from_call(error: SessionConsumerCallError) -> Self {
+        match error {
+            SessionConsumerCallError::BeforeCallWrite(error)
+            | SessionConsumerCallError::MayHaveSent(error) => Self::Local(error),
+            SessionConsumerCallError::NoApplicationProtocol => Self::NoApplicationProtocol,
+        }
+    }
+
+    pub(crate) fn into_client_error(self) -> SessionConsumerClientError {
+        match self {
+            Self::Local(error) => error,
+            Self::NoApplicationProtocol => SessionConsumerClientError::Protocol,
+            Self::ServerRejected(rejection) => consumer_rejection_into_client_error(rejection),
         }
     }
 }
@@ -14060,8 +14088,7 @@ pub struct PersistentSessionConsumerClient {
     v2_pool: Arc<PersistentSessionConsumerV2Pool>,
 }
 
-/// Consumed revision-five persistent consumer capability for one protected
-/// roster runtime.
+/// Consumed persistent consumer capability for one exact protected-roster runtime.
 ///
 /// This opaque value retains the exact shared bounded pool selected at
 /// startup. Its only dispatcher is the crate-private roster transport port;
@@ -14208,18 +14235,32 @@ impl AuthenticatedRosterConsumer {
             .map_err(|_| ProtectedRosterTransportError)
     }
 
+    /// Start one publication read barrier using the original pool's budget.
+    pub(crate) fn publication_authority_deadline(
+        &self,
+    ) -> Result<tokio::time::Instant, SessionConsumerClientError> {
+        tokio::time::Instant::now()
+            .checked_add(effective_consumer_operation_timeout(
+                self.client.pool.client.operation_timeout,
+            ))
+            .ok_or(SessionConsumerClientError::Deadline)
+    }
+
     /// Read only whether the exact Established publication binding remains
-    /// the backend's current unexpired authority.
-    pub(crate) async fn current_publication_authority(
+    /// current, within the original pool's shared absolute barrier deadline.
+    pub(crate) async fn current_publication_authority_before(
         &self,
         request_id: SessionConsumerRequestId,
         capsule: SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+        deadline: tokio::time::Instant,
     ) -> Result<
         SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
-        SessionConsumerClientError,
+        PublicationAuthorityReadError,
     > {
         self.client
-            .fenced_mutation_roster_current_publication_authority(request_id, &capsule)
+            .fenced_mutation_roster_current_publication_authority_before(
+                request_id, &capsule, deadline,
+            )
             .await
     }
 }
@@ -14556,6 +14597,10 @@ impl PersistentSessionConsumerClient {
     /// Consume this exact V2 pool into an opaque roster client with both
     /// startup-owned provider seams and one terminal attestor fixed for its
     /// lifetime.
+    ///
+    /// Publication authority reads use this pool only. To opt into reads
+    /// across the complete fixed roster, use
+    /// [`Self::into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters`].
     pub fn into_fenced_mutation_roster_v2_provider_adapter<P, Q>(
         self,
         member_provider: Arc<P>,
@@ -14569,6 +14614,123 @@ impl PersistentSessionConsumerClient {
     {
         compose_provider_adapter_v2(
             self.try_into_authenticated_roster_v2_consumer()?,
+            Vec::new(),
+            member_provider,
+            publication_provider,
+            attestor,
+            max_in_flight,
+        )
+    }
+
+    /// Compose a V2 adapter whose publication authority reads can use every
+    /// voter in the same startup-fixed authenticated roster.
+    ///
+    /// `voters` must contain the complete roster, including this pool's voter,
+    /// exactly once. Every pool must use the V2 protected-roster profile, the
+    /// same scope, roster commitment, attestation root and local SPIFFE
+    /// identity. Invalid sets fail before this pool's executor is claimed and
+    /// without remote I/O. Caller order does not affect traversal order.
+    ///
+    /// Each pre-effect and post-effect authority barrier tries this original
+    /// pool first, then other voters in canonical node-ID order. Each attempt
+    /// gets an equal share of the remaining time per untried voter; the last
+    /// voter gets what remains. One absolute operation deadline includes pool
+    /// waits, connection setup and responses. Reads are sequential, and a late
+    /// response from an abandoned attempt cannot authorize publication.
+    ///
+    /// Only distinguishable client faults permit advancement: pool shutdown,
+    /// local certificate/trust or peer-authentication setup failure, explicit
+    /// ALPN `no_application_protocol` refusal, I/O failure, unavailability,
+    /// deadline and overload. Other TLS protocol failures, missing or different
+    /// ALPN after a completed handshake, and an authenticated peer with a
+    /// different identity stop traversal. Every server rejection, including
+    /// during Hello, also stops traversal. Generic `Rejected(Unavailable)`
+    /// returns `AuthorityUnavailable` before a provider operation; authority,
+    /// scope and protocol verdicts return `AuthorityRejected`. Opaque storage
+    /// or traffic-authority rejections remain terminal. A voter answering while
+    /// being retired also stops traversal: its rejection cannot be distinguished
+    /// from a durable membership or activation failure. A restarting voter's
+    /// connection failure permits advancement. No server rejection is inferred
+    /// to mean retirement or temporary failure.
+    ///
+    /// This pool remains the mutation executor and read primary even if
+    /// `voters` represents its voter with another pool. Other pools are retained
+    /// only for publication reads and are not claimed as executors. Reads share
+    /// those pools' lanes, pending admission and counters with their other
+    /// users. Retain client clones to shut down the shared alternate pools.
+    /// The adapter's `diagnostics_with_pool` reports only the primary; its
+    /// `publication_pool_diagnostics` reports every reader in traversal order.
+    ///
+    /// The capsule, local permit ledger, provider scheduler and provider calls
+    /// remain with this adapter; a failed barrier or cancellation grants no
+    /// new publication retry authority. The single-pool constructor
+    /// [`Self::into_fenced_mutation_roster_v2_provider_adapter`] retains its
+    /// existing error classification.
+    pub fn into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters<P, Q>(
+        self,
+        voters: impl IntoIterator<Item = Self>,
+        member_provider: Arc<P>,
+        publication_provider: Arc<Q>,
+        attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
+        max_in_flight: NonZeroUsize,
+    ) -> Result<FencedMutationRosterProviderAdapter<Q>, ProtectedRosterTransportError>
+    where
+        P: FencedMutationRosterMemberProvider,
+        Q: FencedMutationRosterEstablishedPublicationProvider,
+    {
+        let primary = persistent_fenced_transition_voter_readiness(&self)
+            .ok_or(ProtectedRosterTransportError)?;
+        let root = self
+            .pool
+            .client
+            .voter
+            .roster_attestation_trust_root_identity()
+            .ok_or(ProtectedRosterTransportError)?;
+        let mut voters: Vec<_> = voters
+            .into_iter()
+            .take(QUORUM_TOPOLOGY_MAX_MEMBERS + 1)
+            .collect();
+        if voters.is_empty()
+            || voters.len() != primary.voter_count
+            || voters.len() > QUORUM_TOPOLOGY_MAX_MEMBERS
+        {
+            return Err(ProtectedRosterTransportError);
+        }
+        let bindings: Vec<_> = voters
+            .iter()
+            .map(persistent_fenced_transition_voter_readiness)
+            .collect::<Option<_>>()
+            .ok_or(ProtectedRosterTransportError)?;
+        if !bindings.contains(&primary)
+            || bindings.iter().any(|voter| {
+                voter.scope != primary.scope
+                    || voter.voter_count != primary.voter_count
+                    || voter.roster_commitment != primary.roster_commitment
+                    || voter.local_spiffe_identity_commitment
+                        != primary.local_spiffe_identity_commitment
+            })
+            || !consumer_fenced_transition_readiness_roster_is_exact(&bindings)
+            || voters.iter().any(|voter| {
+                !voter.fenced_mutation_roster_v2_transport_enabled()
+                    || voter
+                        .pool
+                        .client
+                        .voter
+                        .roster_attestation_trust_root_identity()
+                        != Some(root)
+            })
+        {
+            return Err(ProtectedRosterTransportError);
+        }
+        voters.sort_unstable_by_key(|voter| voter.pool.client.voter.node_id());
+        let publication_voters = voters
+            .into_iter()
+            .filter(|voter| voter.pool.client.voter.node_id() != primary.node_id)
+            .map(Self::try_into_authenticated_roster_v2_consumer)
+            .collect::<Result<Vec<_>, _>>()?;
+        compose_provider_adapter_v2(
+            self.try_into_authenticated_roster_v2_consumer()?,
+            publication_voters,
             member_provider,
             publication_provider,
             attestor,
@@ -14858,30 +15020,38 @@ impl PersistentSessionConsumerClient {
     /// Perform the dedicated backend-current publication-authority read. The
     /// response contains no durable authority material; callers accept only
     /// the exact `Current` discriminator.
-    pub(crate) async fn fenced_mutation_roster_current_publication_authority(
+    pub(crate) async fn fenced_mutation_roster_current_publication_authority_before(
         &self,
         request_id: SessionConsumerRequestId,
         capsule: &SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+        deadline: tokio::time::Instant,
     ) -> Result<
         SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
-        SessionConsumerClientError,
+        PublicationAuthorityReadError,
     > {
         match self
-            .execute_roster_read(self.request(
-                request_id,
-                SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
-                    request: Box::new(capsule.clone()),
-                },
-            ))
-            .await?
+            .execute_classified_before(
+                &self.request(
+                    request_id,
+                    SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                        request: Box::new(capsule.clone()),
+                    },
+                ),
+                deadline,
+                self.pool.config.connect_attempts,
+            )
+            .await
+            .map_err(PublicationAuthorityReadError::from_call)?
         {
             SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(response) => {
                 Ok(response)
             }
             SessionConsumerResponse::Rejected(rejection) => {
-                Err(consumer_rejection_into_client_error(rejection))
+                Err(PublicationAuthorityReadError::ServerRejected(rejection))
             }
-            _ => Err(SessionConsumerClientError::Protocol),
+            _ => Err(PublicationAuthorityReadError::Local(
+                SessionConsumerClientError::Protocol,
+            )),
         }
     }
 
