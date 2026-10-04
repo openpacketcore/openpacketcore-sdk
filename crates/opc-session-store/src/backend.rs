@@ -2527,6 +2527,7 @@ pub enum PreparedLeaseAcquireStatusError {
 /// quorum checks remain mandatory. This does not establish storage freshness
 /// or prevent rollback.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EnvelopeReadPolicy {
     /// Preserve migration decoding, including plaintext and unclassified rows.
     #[default]
