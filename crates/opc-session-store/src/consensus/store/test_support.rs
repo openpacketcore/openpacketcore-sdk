@@ -18,6 +18,20 @@ pub use super::activation_evidence::{
     observe_capability_activation_for_test, CapabilityActivationFailureForTest,
     CapabilityActivationFailureStageForTest,
 };
+pub use super::membership::{
+    is_replayed_joint_voting_for_test, observe_next_unstage_supervisor_for_test,
+    pause_next_learner_barrier_snapshot_for_test, pause_next_outbound_learner_barrier_for_test,
+    pause_next_outbound_voting_barrier_for_test,
+    pause_next_reconciliation_after_staging_check_for_test,
+    pause_next_staged_reconciliation_for_test, replay_applied_learner_barrier_for_test,
+    replay_joint_voting_barrier_for_test, replay_joint_voting_barrier_request_for_test,
+    replay_joint_voting_barrier_with_gate_probe_for_test,
+    replay_learner_barrier_with_gate_probe_for_test,
+    replay_staging_barrier_with_gate_probe_for_test, topology_admission_state_for_test,
+    wait_for_applied_learner_marker_for_test, wait_for_applied_uniform_membership_for_test,
+    wait_for_completed_staged_transition_for_test, LocalAdmissionGatePollForTest,
+    StagedReconciliationProbeForTest, TopologyAdmissionStateForTest, UnstageSupervisorProbeForTest,
+};
 use super::*;
 use crate::backend::{CompareAndSet, CompareAndSetResult, SessionBackend};
 use crate::consensus::SessionConsensusClusterId;
@@ -52,6 +66,16 @@ use crate::fenced_mutation_roster_executor::{
 use crate::lease::SessionLeaseManager;
 use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
 use crate::record::EncryptedSessionPayload;
+
+/// Clear only the application-admission latch on a real initialized store.
+///
+/// This models the state left by an initialization attempt before readmission.
+/// It cannot grant authority; callers must restore admission through a supported
+/// initialization or completed-transition resume. Durable membership and local
+/// bindings are untouched.
+pub fn close_consensus_application_admission_for_test(store: &ConsensusSessionStore) {
+    store.inner.admitted.store(false, Ordering::Release);
+}
 
 /// Make this store's restore-scan dispatch return a fixed unavailable result
 /// after its real logical-time barrier, without changing exact-record reads.
