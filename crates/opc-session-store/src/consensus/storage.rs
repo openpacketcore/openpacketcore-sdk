@@ -4165,11 +4165,12 @@ async fn validate_and_clean_snapshot_directory(
     let mut durable_survivors = 0_usize;
     let mut removed = false;
     // `begin_receiving_snapshot` intentionally releases the mutation mutex
-    // while its one permitted receiver owns an incoming descriptor. A build
+    // while admitted receivers own their incoming descriptors. A build
     // or install recovery pass must count that live namespace entry but may
     // never reclaim it. The semaphore is per core, so this relies on the
     // existing one-writer-per-snapshot-directory construction contract.
-    let live_receiver = core.snapshot_receive_admission.available_permits() == 0;
+    let live_receiver = core.snapshot_receive_admission.available_permits()
+        < super::snapshot::SNAPSHOT_RECEIVER_SLOTS;
     for entry_name in entries {
         let Some(file_name) = entry_name.to_str().map(str::to_owned) else {
             durable_survivors = durable_survivors
@@ -5366,8 +5367,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             })?;
         // Serialize receive creation with build/install admission. The file
         // returned below remains its durable reservation after this guard is
-        // released, while `snapshot_receive_admission` prevents a second
-        // receiver from taking another slot for this core.
+        // released. OpenRaft retains an interrupted receiver until its new
+        // receiver has been returned, so admit that bounded two-handle overlap.
+        // The next chunk is serialized by OpenRaft's streaming mutex; a third
+        // receiver cannot consume another slot for this core.
         let _snapshot_guard = self.core.snapshot_gate.lock().await;
         let receive_admission = Arc::clone(&self.core.snapshot_receive_admission)
             .try_acquire_owned()
@@ -5377,7 +5380,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     ErrorVerb::Write,
                     io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "session consensus snapshot receiver is already active",
+                        "session consensus snapshot receiver capacity is exhausted",
                     ),
                 )
             })?;
@@ -11351,6 +11354,24 @@ mod tests {
         SqliteConsensusLogStore,
         SqliteConsensusStateMachine,
     )> {
+        open_private_snapshot_store_with_integrity(
+            directory,
+            token,
+            SnapshotIntegrityPolicy::FsVerity,
+        )
+        .await
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn open_private_snapshot_store_with_integrity(
+        directory: &FixedRawReadStoreFixture,
+        token: Arc<consensus::wal::integration::PrivateWalTest>,
+        snapshot_integrity: SnapshotIntegrityPolicy,
+    ) -> io::Result<(
+        SqliteSessionBackend,
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+    )> {
         let mut backend =
             SqliteSessionBackend::open(directory.path().join("snapshot-cache.sqlite"))
                 .map_err(|error| io::Error::other(format!("{error:?}")))?;
@@ -11373,7 +11394,7 @@ mod tests {
         )
         .await
         .map_err(|error| io::Error::other(format!("{error:?}")))?;
-        core.snapshot_integrity = SnapshotIntegrityPolicy::FsVerity;
+        core.snapshot_integrity = snapshot_integrity;
         // The same private attachment and scavenger used by the constructor.
         // Earlier generic constructor migrations have their separate audit.
         attach_private_wal_before_snapshot_cleanup(&mut core, &token, Arc::clone(&lease)).await?;
@@ -15623,6 +15644,259 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn portable_snapshot_stream_survives_successor_publication() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let source_directory = portable_fixed_fixture();
+        let (mut source_log, mut source, _) = open_fixed_raw_read_store_with_integrity(
+            &source_directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [fixed_initial_membership_entry(), blank_entry(1)],
+            "portable predecessor cut",
+        )
+        .await;
+        let mut built = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build portable predecessor");
+        let predecessor_path = built.snapshot.path().to_path_buf();
+        let predecessor = std::fs::File::open(&predecessor_path).expect("retain predecessor");
+        let expected = std::fs::read(&predecessor_path).expect("predecessor bytes");
+        let mut current = source
+            .get_current_snapshot()
+            .await
+            .expect("admit predecessor stream")
+            .expect("published predecessor");
+        let mut cloned = current.snapshot.try_clone().await.expect("clone stream");
+        let mut observed = vec![0; 1024];
+        current
+            .snapshot
+            .read_exact(&mut observed)
+            .await
+            .expect("stream predecessor prefix");
+        assert!(expected.len() > observed.len());
+
+        // Hold the stream between reads while the real builder publishes and
+        // retires its predecessor. This fixes the interleaving without sleeps.
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [blank_entry(2)],
+            "portable successor cut",
+        )
+        .await;
+        let successor = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish successor while predecessor streams remain live");
+        assert_eq!(Some(log_id(2)), successor.meta.last_log_id);
+        assert!(!predecessor_path.exists(), "normal retirement unlinks S1");
+        assert_eq!(0, predecessor.metadata().expect("retired metadata").nlink());
+        current
+            .snapshot
+            .read_to_end(&mut observed)
+            .await
+            .expect("finish admitted predecessor after retirement");
+        assert_eq!(expected, observed);
+        for reader in [&mut *built.snapshot, &mut cloned] {
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .expect("builder and cloned handles retain predecessor bytes");
+            assert_eq!(expected, bytes);
+        }
+        assert_eq!(built.meta, current.meta);
+        assert_eq!(
+            successor.meta,
+            source
+                .get_current_snapshot()
+                .await
+                .expect("select successor")
+                .expect("published successor")
+                .meta
+        );
+
+        let target_directory = portable_fixed_fixture();
+        let (mut target_log, mut target, _) = open_fixed_raw_read_store_with_integrity(
+            &target_directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        append_commit_and_apply(
+            &mut target_log,
+            &mut target,
+            [fixed_initial_membership_entry()],
+            "lagging target membership",
+        )
+        .await;
+        let mut receiver = target.begin_receiving_snapshot().await.expect("receiver");
+        current
+            .snapshot
+            .rewind()
+            .await
+            .expect("retry retired stream");
+        tokio::io::copy(&mut current.snapshot, &mut receiver)
+            .await
+            .expect("transfer retired predecessor to lagging target");
+        target
+            .install_snapshot(&current.meta, receiver)
+            .await
+            .expect("install exact predecessor image");
+        assert_eq!(Some(log_id(1)), target.applied_state().await.unwrap().0);
+        drop(target_log);
+        drop(target);
+        let (_target_log, mut reopened, _) = open_fixed_raw_read_store_with_integrity(
+            &target_directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        validate_and_clean_snapshot_directory(
+            &reopened.core,
+            Some(&reopened._snapshot_directory_lease),
+        )
+        .await
+        .expect("restart accepts transferred predecessor");
+        assert_eq!(Some(log_id(1)), reopened.applied_state().await.unwrap().0);
+        assert_eq!(Some(log_id(2)), source.applied_state().await.unwrap().0);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn portable_native_snapshot_stream_survives_successor_publication() {
+        Box::pin(portable_native_snapshot_stream_survives_retirement(false)).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn portable_native_snapshot_stream_survives_successor_install() {
+        Box::pin(portable_native_snapshot_stream_survives_retirement(true)).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn portable_native_snapshot_stream_survives_retirement(install: bool) {
+        use consensus::wal::integration::PrivateWalTest;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = portable_fixed_fixture();
+        let token = Arc::new(PrivateWalTest::new_native(
+            directory.path().join("wal"),
+            [0xA7; 32],
+        ));
+        let (_backend, mut log, mut machine) =
+            Box::pin(open_private_snapshot_store_with_integrity(
+                &directory,
+                Arc::clone(&token),
+                SnapshotIntegrityPolicy::PortableVerified,
+            ))
+            .await
+            .expect("open portable store with native log attached");
+        assert!(machine.core.private_wal.as_ref().unwrap().is_native());
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry(), blank_entry(1)],
+            "native predecessor cut",
+        )
+        .await;
+        let mut built = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let predecessor_path = built.snapshot.path().to_path_buf();
+        let predecessor = std::fs::File::open(&predecessor_path).unwrap();
+        let expected = std::fs::read(&predecessor_path).unwrap();
+        let mut current = machine.get_current_snapshot().await.unwrap().unwrap();
+        let mut cloned = current.snapshot.try_clone().await.unwrap();
+        let mut observed = vec![0; 1024];
+        current.snapshot.read_exact(&mut observed).await.unwrap();
+        assert!(expected.len() > observed.len());
+
+        if install {
+            let donor_directory = portable_fixed_fixture();
+            let donor_token = Arc::new(PrivateWalTest::new_native(
+                donor_directory.path().join("wal"),
+                [0xA7; 32],
+            ));
+            let (_donor_backend, mut donor_log, mut donor) =
+                Box::pin(open_private_snapshot_store_with_integrity(
+                    &donor_directory,
+                    Arc::clone(&donor_token),
+                    SnapshotIntegrityPolicy::PortableVerified,
+                ))
+                .await
+                .unwrap();
+            append_commit_and_apply(
+                &mut donor_log,
+                &mut donor,
+                [
+                    fixed_initial_membership_entry(),
+                    blank_entry(1),
+                    blank_entry(2),
+                ],
+                "native incoming successor cut",
+            )
+            .await;
+            let mut incoming = donor
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            let mut receiver = machine.begin_receiving_snapshot().await.unwrap();
+            tokio::io::copy(&mut incoming.snapshot, &mut receiver)
+                .await
+                .unwrap();
+            Box::pin(machine.install_snapshot(&incoming.meta, receiver))
+                .await
+                .expect("install successor while predecessor streams are admitted");
+            donor_token.current().unwrap().shutdown().unwrap();
+        } else {
+            append_commit_and_apply(&mut log, &mut machine, [blank_entry(2)], "native successor")
+                .await;
+            machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+        }
+        assert!(
+            !predecessor_path.exists(),
+            "native retirement removes the local predecessor"
+        );
+        assert_eq!(0, predecessor.metadata().unwrap().nlink());
+        assert_eq!(Some(log_id(2)), machine.applied_state().await.unwrap().0);
+        current
+            .snapshot
+            .read_to_end(&mut observed)
+            .await
+            .expect("admitted native predecessor stream survives retirement");
+        assert_eq!(expected, observed);
+        for reader in [&mut *built.snapshot, &mut cloned] {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(expected, bytes);
+        }
+        token.current().unwrap().shutdown().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn portable_fixed_snapshot_installs_restarts_and_rejects_changed_generation() {
         use std::os::unix::fs::FileExt as _;
         let source_directory = portable_fixed_fixture();
@@ -18784,7 +19058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_one_incoming_snapshot_receiver_is_admitted_per_core() {
+    async fn incoming_snapshot_receiver_replacement_is_bounded_and_keeps_live_artifacts() {
         let directory = tempfile::tempdir().expect("receiver admission directory");
         let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
             .expect("receiver admission backend");
@@ -18800,9 +19074,42 @@ mod tests {
             .begin_receiving_snapshot()
             .await
             .expect("first receiver");
+        validate_and_clean_snapshot_directory(
+            &state_machine.core,
+            Some(&state_machine._snapshot_directory_lease),
+        )
+        .await
+        .expect("cleanup recognizes one occupied slot in the two-handle limit");
+        assert!(receiver.path().exists());
+        let successor = state_machine
+            .begin_receiving_snapshot()
+            .await
+            .expect("replacement is allocated before predecessor drop");
         assert!(state_machine.begin_receiving_snapshot().await.is_err());
+        validate_and_clean_snapshot_directory(
+            &state_machine.core,
+            Some(&state_machine._snapshot_directory_lease),
+        )
+        .await
+        .expect("cleanup preserves both live receiver reservations");
+        assert!(receiver.path().exists());
+        assert!(successor.path().exists());
         drop(receiver);
-        assert!(state_machine.begin_receiving_snapshot().await.is_ok());
+        let replacement = state_machine.begin_receiving_snapshot().await.unwrap();
+        assert!(
+            successor.path().exists(),
+            "one live receiver is still protected"
+        );
+        assert!(state_machine.begin_receiving_snapshot().await.is_err());
+        drop(successor);
+        drop(replacement);
+        assert_eq!(
+            crate::consensus::snapshot::SNAPSHOT_RECEIVER_SLOTS,
+            state_machine
+                .core
+                .snapshot_receive_admission
+                .available_permits()
+        );
     }
 
     #[tokio::test]

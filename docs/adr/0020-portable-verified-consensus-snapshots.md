@@ -37,6 +37,14 @@ advisory lock, and SQLite's `immutable=1` URI flag do not close that race.
   extraction, and SQLite reads must consume owned buffers checked against
   that retained index. Never reconstruct the index from a changed artifact
   inside a publication or consumption operation.
+- Admission requires a linked regular file at both capture boundaries.
+  Once admitted, a snapshot stream may finish through its original descriptor
+  after successor publication or installation unlinks the predecessor. A new
+  object at the old pathname never redirects that stream. Descriptor identity,
+  extent and block digests still govern its bytes; change time invalidates
+  cached blocks. This exception is explicit in the snapshot stream reader used
+  by transport and local extraction during install: ordinary SQLite, recovery
+  re-admission, native basis reads and commits still require links.
 - Use a bounded adaptive block size: 64 KiB normally, up to 2 MiB for the
   largest supported images, with at most 16 MiB of digests per pinned image.
   Clones share the index. The file remains file-backed; this is not a
@@ -46,6 +54,20 @@ advisory lock, and SQLite's `immutable=1` URI flag do not close that race.
   Exhaustion rejects work before allocation; detached workers retain their
   reservation until completion. Each transport handle has at most one pending
   64 KiB read, including across cancellation and seek.
+  Retired images retain their disk blocks, index and cache reservations until
+  their last owning handles and pending workers finish. Their unlinked inodes
+  are outside the 32-entry directory budget; no separate retired-byte bound is
+  established by that pathname limit.
+- Admit at most two receiver handles during a snapshot-ID replacement. The
+  pinned consensus library requests a new receiver before releasing the old
+  incomplete transfer, under its serial streaming mutex. Each receiver owns
+  its original size and directory-entry reservation; total staged bytes can
+  briefly reach two receiver limits. Cleanup counts and keeps either live
+  receiver. A third concurrent receiver returns a storage error that stops
+  the engine, not a retryable admission response. The current library cannot
+  construct that third handle through its serialized replacement path. The
+  increase from one to two handles avoids making an ordinary interrupted
+  transfer replacement a fatal storage admission error.
 - Keep the existing durable envelope and checksum format. The index is
   reconstructed and authenticated on reopen, not a second durable authority
   or an unauthenticated sidecar. Explicit portable selection can consume an
@@ -85,8 +107,16 @@ the existing management-plane policy gate remains mandatory.
 
 - Preserve the non-fs-verity snapshot creation RED and demonstrate build,
   transfer, install, restart, and recovery with fixed membership unchanged.
-- Reject same-inode writes, truncation, path replacement, corrupt envelopes,
+- Reject changed bytes from same-inode writes, truncation, corrupt envelopes,
   and corruption after validation but before SQLite or transport consumption.
+  Reject path substitution at admission/publication boundaries. An already
+  admitted transport stream must continue to return its original verified
+  bytes after unlink or path replacement, never consume the replacement.
+- Exercise native-log publication and installation while predecessor streams
+  remain open, and a live leader streaming to a lagging voter while publishing
+  a newer snapshot. Verify continued engine operation and a later commit.
+  Interrupt a voter's transfer, start a new snapshot ID, and verify receiver
+  replacement and continued engine operation with the receiver bound intact.
 - Cover seek/retry/cancellation, descriptor and registration lifetimes,
   short-read zero filling, disabled mmap, read-only enforcement, and bounded
   digest allocation at the exact physical image ceiling.

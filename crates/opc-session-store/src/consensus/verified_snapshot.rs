@@ -3,6 +3,9 @@
 //! The retained digest index is process-owned authority for one byte image.
 //! A changed file can cause an error, but can never change the bytes returned
 //! for that image. No whole-snapshot buffer or on-disk proof sidecar is used.
+//! Admission and ordinary readers require a linked source. Admitted snapshot
+//! streams used by transport and local install extraction may finish after
+//! publication retires the descriptor's name.
 
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -158,7 +161,11 @@ struct Generation {
 
 impl Generation {
     fn read(metadata: &Metadata) -> io::Result<Self> {
-        if !metadata.is_file() || metadata.nlink() == 0 {
+        // An admitted snapshot stream owns the descriptor and digest index.
+        // Other readers use read_linked, including SQLite and native recovery.
+        // Ctime still invalidates cached blocks, and reloaded bytes must
+        // match the captured digests even through a pre-opened writable alias.
+        if !metadata.is_file() {
             return Err(invalid());
         }
         Ok(Self {
@@ -168,6 +175,13 @@ impl Generation {
             change_seconds: metadata.ctime(),
             change_nanoseconds: metadata.ctime_nsec(),
         })
+    }
+
+    fn read_linked(metadata: &Metadata) -> io::Result<Self> {
+        if metadata.nlink() == 0 {
+            return Err(invalid());
+        }
+        Self::read(metadata)
     }
 
     fn same_object_and_length(self, other: Self) -> bool {
@@ -215,7 +229,7 @@ impl VerifiedFile {
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Arc<Self>> {
         check()?;
-        let before = Generation::read(&file.metadata()?)?;
+        let before = Generation::read_linked(&file.metadata()?)?;
         if before.length == 0 || before.length > maximum {
             return Err(invalid());
         }
@@ -245,7 +259,7 @@ impl VerifiedFile {
             offset = offset.checked_add(bytes as u64).ok_or_else(invalid)?;
         }
         check()?;
-        if Generation::read(&file.metadata()?)? != before || blocks.len() != count {
+        if Generation::read_linked(&file.metadata()?)? != before || blocks.len() != count {
             return Err(invalid());
         }
         Ok(Arc::new(Self {
@@ -270,29 +284,53 @@ impl VerifiedFile {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        let current = Generation::read(&self.file.metadata()?)?;
+        self.validate_generation(Generation::read_linked)
+            .map(|_| ())
+    }
+
+    /// A previously admitted snapshot stream may outlive its directory entry.
+    pub(crate) fn validate_retained(&self) -> io::Result<()> {
+        self.validate_generation(Generation::read).map(|_| ())
+    }
+
+    fn validate_generation(
+        &self,
+        read_generation: fn(&Metadata) -> io::Result<Generation>,
+    ) -> io::Result<Generation> {
+        let current = read_generation(&self.file.metadata()?)?;
         if !self.generation.same_object_and_length(current) {
             return Err(invalid());
         }
-        Ok(())
+        Ok(current)
     }
 
     pub(crate) fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        self.read_exact_at_with(offset, output, Generation::read_linked)
+    }
+
+    /// Read the admitted byte image after snapshot publication retires its name.
+    pub(crate) fn read_exact_at_retained(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        self.read_exact_at_with(offset, output, Generation::read)
+    }
+
+    fn read_exact_at_with(
+        &self,
+        offset: u64,
+        output: &mut [u8],
+        read_generation: fn(&Metadata) -> io::Result<Generation>,
+    ) -> io::Result<()> {
         let end = offset
             .checked_add(output.len() as u64)
             .ok_or_else(invalid)?;
         if end > self.length() {
             return Err(invalid());
         }
-        self.validate()?;
+        self.validate_generation(read_generation)?;
         let mut position = offset;
         let mut output_offset = 0;
         let mut cache = self.cache.lock().map_err(|_| invalid())?;
         while position < end {
-            let generation = Generation::read(&self.file.metadata()?)?;
-            if !self.generation.same_object_and_length(generation) {
-                return Err(invalid());
-            }
+            let generation = self.validate_generation(read_generation)?;
             let index =
                 usize::try_from(position / self.block_bytes as u64).map_err(|_| invalid())?;
             let block_start = (index as u64)
@@ -674,6 +712,18 @@ mod tests {
         assert_eq!(allocations.count_total, 0);
     }
 
+    fn model_prior_cached_generation(source: &VerifiedFile) {
+        // Exercise generation invalidation deterministically even when unlink
+        // and a later write share a coarse filesystem ctime tick. The file is
+        // not mutated again before the checked read; both cache slots represent
+        // a strictly older generation and must be reloaded and verified.
+        let metadata = source.file.metadata().unwrap();
+        let mut cache = source.cache.lock().unwrap();
+        for block in cache.blocks.iter_mut().flatten() {
+            block.generation.change_seconds = metadata.ctime().checked_sub(1).unwrap();
+        }
+    }
+
     #[test]
     fn portable_snapshot_both_cached_blocks_reject_changed_padding() {
         for index in 0..2 {
@@ -693,6 +743,7 @@ mod tests {
                 .write_all_at(&[0x7e], ((index + 1) * MIN_BLOCK_BYTES - 1) as u64)
                 .unwrap();
             artifact.as_file().sync_all().unwrap();
+            model_prior_cached_generation(&source);
             assert!(
                 source
                     .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut [0; 1])
@@ -745,6 +796,89 @@ mod tests {
             "each actual miss reuses a charged buffer"
         );
         assert_eq!(misses.count_total, 0);
+    }
+
+    #[test]
+    fn verified_reads_retain_unlinked_bytes_and_reject_later_corruption() {
+        let mut artifact = tempfile::NamedTempFile::new().expect("snapshot fixture");
+        let expected = vec![0x51; MIN_BLOCK_BYTES * 3];
+        artifact
+            .write_all(&expected)
+            .expect("write snapshot fixture");
+        artifact.flush().expect("flush snapshot fixture");
+        let source = VerifiedFile::capture(artifact.reopen().expect("read descriptor"), u64::MAX)
+            .expect("capture linked generation");
+        source
+            .read_exact_at(0, &mut [0; 1])
+            .expect("warm first block");
+        std::fs::remove_file(artifact.path()).expect("retire captured pathname");
+        std::fs::write(artifact.path(), vec![0x62; expected.len()])
+            .expect("replace pathname with different bytes");
+        assert_eq!(0, artifact.as_file().metadata().unwrap().nlink());
+        assert!(
+            source.validate().is_err(),
+            "ordinary readers still require a link"
+        );
+        assert!(source.read_exact_at(0, &mut [0; 1]).is_err());
+        assert!(source.reader().read_exact(&mut [0; 1]).is_err());
+        assert!(
+            VerifiedSnapshotSource::validate(source.as_ref()).is_err(),
+            "SQLite must report the unlinked image as moved"
+        );
+        assert!(VerifiedSnapshotSource::read_exact_at(source.as_ref(), 0, &mut [0; 1]).is_err());
+        let mut actual = vec![0; MIN_BLOCK_BYTES * 2];
+        source
+            .read_exact_at_retained(0, &mut actual)
+            .expect("retained descriptor survives unlink and pathname replacement");
+        assert_eq!(expected[..actual.len()], actual);
+
+        for index in [1, 2] {
+            artifact
+                .as_file()
+                .write_all_at(&[0x7e], ((index + 1) * MIN_BLOCK_BYTES - 1) as u64)
+                .expect("mutate retired inode through retained writer");
+            artifact
+                .as_file()
+                .sync_all()
+                .expect("sync retired mutation");
+            model_prior_cached_generation(&source);
+            assert!(
+                source
+                    .read_exact_at_retained((index * MIN_BLOCK_BYTES) as u64, &mut [0; 1])
+                    .is_err(),
+                "cached and uncached blocks reject changed bytes after unlink"
+            );
+        }
+        artifact
+            .as_file()
+            .set_len(1)
+            .expect("truncate retired inode");
+        assert!(source.validate_retained().is_err());
+        assert!(source.read_exact_at_retained(0, &mut [0; 1]).is_err());
+    }
+
+    #[test]
+    fn verified_capture_requires_linked_source_through_admission() {
+        for unlink_during_capture in [false, true] {
+            let mut artifact = tempfile::NamedTempFile::new().expect("snapshot fixture");
+            artifact
+                .write_all(b"snapshot")
+                .expect("write snapshot fixture");
+            artifact.flush().expect("flush snapshot fixture");
+            let file = artifact.reopen().expect("retain capture descriptor");
+            if !unlink_during_capture {
+                std::fs::remove_file(artifact.path()).expect("unlink before capture");
+            }
+            let mut checks = 0;
+            assert!(VerifiedFile::capture_checked(file, u64::MAX, || {
+                checks += 1;
+                if unlink_during_capture && checks == 2 {
+                    std::fs::remove_file(artifact.path())?;
+                }
+                Ok(())
+            })
+            .is_err());
+        }
     }
 
     #[test]

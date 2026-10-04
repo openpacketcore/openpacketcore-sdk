@@ -2504,6 +2504,8 @@ mod tests {
         _temp: tempfile::TempDir,
         backend: SqliteSessionBackend,
         raft: SessionRaft,
+        #[cfg(target_os = "linux")]
+        state_machine: storage::SqliteConsensusStateMachine,
         handler: SessionRaftRpcHandler,
         scope: SessionConsensusIdentity,
         leader: SessionConsensusNodeId,
@@ -2589,6 +2591,8 @@ mod tests {
                 .await
                 .expect("apply exact fixed membership");
         }
+        #[cfg(target_os = "linux")]
+        let snapshot_state_machine = state_machine.clone();
         let raft = SessionRaft::new(
             local,
             Arc::new(
@@ -2620,10 +2624,162 @@ mod tests {
             _temp: temp,
             backend,
             raft,
+            #[cfg(target_os = "linux")]
+            state_machine: snapshot_state_machine,
             handler,
             scope,
             leader,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_voter_engine_accepts_new_snapshot_after_interrupted_transfer() {
+        let mut source =
+            fixed_follower_fixture(Duration::from_secs(1), true, FixedAuthorityBackend::Native)
+                .await;
+        let last_log_id = LogId::new(CommittedLeaderId::new(1, source.leader), 1);
+        let prev_log_id = source.state_machine.applied_state().await.unwrap().0;
+        assert_eq!(
+            AppendEntriesResponse::Success,
+            source
+                .raft
+                .append_entries(AppendEntriesRequest {
+                    vote: Vote::new_committed(1, source.leader),
+                    prev_log_id,
+                    entries: vec![Entry {
+                        log_id: last_log_id,
+                        payload: EntryPayload::Blank,
+                    }],
+                    leader_commit: Some(last_log_id),
+                })
+                .await
+                .expect("commit source snapshot cut")
+        );
+        source
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index(Some(last_log_id.index), "source snapshot cut")
+            .await
+            .unwrap();
+        let snapshot = source
+            .state_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build valid native replacement snapshot");
+        let bytes = std::fs::read(snapshot.snapshot.path()).unwrap();
+        let split = bytes.len() / 2;
+        assert!(split > 0);
+        source.raft.shutdown().await.unwrap();
+
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), true, FixedAuthorityBackend::Native)
+                .await;
+        let mut previous_receiver: Option<std::path::PathBuf> = None;
+        // A partial transfer stays in OpenRaft's Streaming slot. Starting a
+        // different snapshot requests its receiver before dropping the old one.
+        for (id, offset, data, done) in [
+            ("interrupted", 0, vec![0x51], false),
+            ("successor", 0, vec![0x51], false),
+            ("successor", 1, vec![0x51], false),
+            (
+                snapshot.meta.snapshot_id.as_str(),
+                0,
+                bytes[..split].to_vec(),
+                false,
+            ),
+            (
+                snapshot.meta.snapshot_id.as_str(),
+                split as u64,
+                bytes[split..].to_vec(),
+                true,
+            ),
+        ] {
+            let rpc = InstallSnapshotRequest::<SessionRaftTypeConfig> {
+                vote: Vote::new_committed(1, fixture.leader),
+                meta: opc_consensus::engine::SnapshotMeta {
+                    snapshot_id: id.into(),
+                    ..snapshot.meta.clone()
+                },
+                offset,
+                data,
+                done,
+            };
+            let wire = SessionConsensusWireRequest::try_new(
+                fixture.scope,
+                fixture.leader,
+                SessionConsensusRpcFamily::InstallSnapshot,
+                encode_bounded(&rpc).unwrap(),
+            )
+            .unwrap();
+            let response = fixture.handler.handle(fixture.leader, wire).await;
+            let result: Result<
+                opc_consensus::engine::raft::InstallSnapshotResponse<SessionConsensusNodeId>,
+                opc_consensus::engine::error::RaftError<
+                    SessionConsensusNodeId,
+                    opc_consensus::engine::error::InstallSnapshotError,
+                >,
+            > = decode_bounded(&response.result.expect("snapshot RPC reaches native voter"))
+                .unwrap();
+            assert!(result.is_ok(), "snapshot {id} at {offset}: {result:?}");
+            assert!(fixture.raft.metrics().borrow().running_state.is_ok());
+            if offset == 0 || done {
+                if let Some(path) = previous_receiver.take() {
+                    assert!(
+                        !path.exists(),
+                        "replaced or installed receiver must remove its original file: {path:?}"
+                    );
+                }
+            }
+            let incoming: Vec<_> = std::fs::read_dir(fixture._temp.path().join("snapshots"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("incoming-")
+                })
+                .collect();
+            if done {
+                assert!(
+                    incoming.is_empty(),
+                    "completed receiver is no longer staged"
+                );
+            } else {
+                assert_eq!(1, incoming.len(), "only the active receiver file remains");
+                if let Some(path) = &previous_receiver {
+                    assert_eq!(path, &incoming[0], "later chunks use the same receiver");
+                }
+                previous_receiver = Some(incoming[0].clone());
+            }
+        }
+        fixture
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .snapshot(last_log_id, "replacement snapshot installed")
+            .await
+            .expect("replacement transfer completes and installs through the engine");
+        let installed = fixture
+            .state_machine
+            .clone()
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("replacement is the durable current snapshot");
+        assert_eq!(snapshot.meta, installed.meta);
+        assert_eq!(
+            Some(last_log_id),
+            fixture.raft.metrics().borrow().last_applied
+        );
+        fixture
+            .raft
+            .vote(vote_request(fixture.leader))
+            .await
+            .expect("voter engine still handles protocol traffic after receiver replacement");
+        fixture.raft.shutdown().await.unwrap();
     }
 
     #[tokio::test]

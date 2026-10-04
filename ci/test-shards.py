@@ -91,6 +91,10 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
     "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
     "compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart",
 )
+QUIESCENT_FIXED_QUORUM_TARGET = "fixed_quorum_authority"
+QUIESCENT_FIXED_QUORUM_TESTS = (
+    "snapshot_retirement::native_leader_streams_retired_snapshot_without_stopping_engine",
+)
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
         "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
@@ -332,6 +336,18 @@ def quiescent_consensus_openraft_command(name: str) -> list[str]:
     ]
 
 
+def quiescent_fixed_quorum_command(name: str) -> list[str]:
+    """Keep lagging-voter isolation inside the unchanged election budget."""
+    return SELECTION + [
+        "--test",
+        QUIESCENT_FIXED_QUORUM_TARGET,
+        "--",
+        "--test-threads=1",
+        "--exact",
+        name,
+    ]
+
+
 def quiescent_contracts() -> tuple:
     """Integration-target contracts that require a fresh test process."""
     return (
@@ -339,6 +355,11 @@ def quiescent_contracts() -> tuple:
             QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
             QUIESCENT_CONSENSUS_OPENRAFT_TESTS,
             quiescent_consensus_openraft_command,
+        ),
+        (
+            QUIESCENT_FIXED_QUORUM_TARGET,
+            QUIESCENT_FIXED_QUORUM_TESTS,
+            quiescent_fixed_quorum_command,
         ),
     )
 

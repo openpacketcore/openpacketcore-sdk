@@ -135,6 +135,35 @@ class ManifestTestSourceAuditTests(unittest.TestCase):
 class QuiescentShardPlanTests(unittest.TestCase):
     """The protected private-lib contracts must remain total and disjoint."""
 
+    def test_retired_snapshot_runs_once_outside_the_shared_process(self) -> None:
+        name = (
+            "snapshot_retirement::"
+            "native_leader_streams_retired_snapshot_without_stopping_engine"
+        )
+        plan = TEST_SHARDS.load_plan()
+        targets = TEST_SHARDS.integration_targets()
+        commands = [
+            command
+            for shard in TEST_SHARDS.shard_ids(plan)
+            for command in TEST_SHARDS.commands(plan, shard, targets)
+        ]
+        mentions = [command for command in commands if name in command]
+
+        self.assertEqual(len(mentions), 2)
+        self.assertEqual(mentions[0].count(name), 1)
+        self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
+        self.assertIn("--test-threads=4", mentions[0])
+        self.assertIn("--exact", mentions[0])
+        self.assertEqual(
+            mentions[1],
+            [
+                "cargo", "test", "--locked", "--workspace", "--exclude",
+                "opc-persist", "--all-features", "--quiet", "--test",
+                "fixed_quorum_authority", "--", "--test-threads=1",
+                "--exact", name,
+            ],
+        )
+
     def test_plan_stdout_contains_only_executable_commands(self) -> None:
         for shard in TEST_SHARDS.shard_ids(TEST_SHARDS.load_plan()):
             with self.subTest(shard=shard):

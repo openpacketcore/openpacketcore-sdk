@@ -2765,6 +2765,12 @@ impl io::Seek for PinnedSnapshotReader {
     }
 }
 
+/// OpenRaft allocates a successor receiver before dropping its interrupted
+/// predecessor. Only that two-handle overlap is admitted; each staging file
+/// independently consumes the unchanged snapshot directory and size budgets.
+/// A third receiver returns a storage error that OpenRaft treats as fatal.
+pub(crate) const SNAPSHOT_RECEIVER_SLOTS: usize = 2;
+
 /// A seekable, chunkable snapshot file and its SDK-controlled staging path.
 pub(crate) struct SessionSnapshotFile {
     file: tokio::fs::File,
@@ -2777,7 +2783,7 @@ pub(crate) struct SessionSnapshotFile {
     receiving: bool,
     receive_limit_exceeded: bool,
     // Kept by a receiving artifact so cloned state-machine handles cannot
-    // retain more than one unvalidated snapshot stream for one core.
+    // retain more than the bounded receiver handoff for one core.
     _receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     // The snapshot namespace authority outlives state-machine/log wrappers
     // while a receiver is still writable.  It is intentionally opaque here:
@@ -4139,10 +4145,10 @@ impl SessionSnapshotFile {
                 }
             };
             self.verified_read = Some(tokio::task::spawn_blocking(move || {
-                portable.source.validate()?;
+                portable.source.validate_retained()?;
                 let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
                 if length != 0 {
-                    portable.source.read_exact_at(offset, &mut bytes)?;
+                    portable.source.read_exact_at_retained(offset, &mut bytes)?;
                 }
                 Ok(VerifiedReadBuffer {
                     bytes,

@@ -13,6 +13,9 @@ pub enum SnapshotIntegrityPolicy {
     ///
     /// This works on supported ordinary Linux filesystems without fs-verity.
     /// It includes SQLite reads and does not rely on chmod or advisory locks.
+    /// An admitted stream retains its exact image after a newer snapshot
+    /// retires its pathname. Block verification and length checks continue
+    /// through the owned descriptor; new admission still requires a linked file.
     PortableVerified,
     /// Require the kernel's fixed fs-verity profile and reject unsupported
     /// snapshot storage during admission. There is no portable fallback.
