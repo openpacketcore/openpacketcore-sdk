@@ -3432,6 +3432,32 @@ async fn commit_of_aborted_request_keeps_predecessor_admission() {
         .await;
 }
 
+/// Complete `request`, then finalize it on `member` through an exact resume
+/// while that member's reconciler is held before its operation gate.
+#[cfg(feature = "test-control")]
+async fn complete_and_resume_on_held_member(
+    fleet: &DynamicFleet,
+    request: &SessionTopologyTransitionRequest,
+    proof: &SessionTopologyLearnersReadyAdmissionProof,
+    desired: &[usize],
+    member: usize,
+    deadline: tokio::time::Instant,
+) {
+    let caller = fleet.commit(request, proof, desired).await;
+    if caller == member {
+        // The member coordinated the commit and already finalized itself.
+        return;
+    }
+    wait_for_completed_staged_transition_for_test(&fleet.stores[member], request, deadline)
+        .await
+        .expect("held member durably applied completion with staging retained");
+    let resumed = fleet.stores[member]
+        .commit_topology_transition(request, proof)
+        .await
+        .expect("exact completed-request resume finalizes the held member");
+    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+}
+
 #[cfg(feature = "test-control")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_reconciliation_cannot_close_admission_after_a_later_transition() {
@@ -3456,31 +3482,23 @@ async fn stale_reconciliation_cannot_close_admission_after_a_later_transition() 
         .await
         .expect("reconciler captured the staged request");
 
-    let status = fleet.stores[leader]
-        .commit_topology_transition(&expand, &expand_proof)
-        .await
-        .expect("leader completes the expansion");
-    assert_eq!(status.phase(), SessionTopologyTransitionPhase::Completed);
-    wait_for_completed_staged_transition_for_test(&fleet.stores[target], &expand, deadline)
-        .await
-        .expect("target durably applied completion with staging retained");
-    let resumed = fleet.stores[target]
-        .commit_topology_transition(&expand, &expand_proof)
-        .await
-        .expect("exact completed-request resume finalizes the target");
-    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    complete_and_resume_on_held_member(&fleet, &expand, &expand_proof, &expanded, target, deadline)
+        .await;
     wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
 
     // A second transition completes while the first request's pass still waits.
     let contract = fleet.transition_request(2, &contracted, 0xB8);
     fleet.stage_on_all(&contract);
     let contract_proof = fleet.prepare(&contract, &contracted).await;
-    fleet.commit(&contract, &contract_proof, &contracted).await;
-    let resumed = fleet.stores[target]
-        .commit_topology_transition(&contract, &contract_proof)
-        .await
-        .expect("exact completed-request resume of the second transition");
-    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    complete_and_resume_on_held_member(
+        &fleet,
+        &contract,
+        &contract_proof,
+        &contracted,
+        target,
+        deadline,
+    )
+    .await;
     wait_completed_and_admitted(&fleet.stores, &contract, &contracted, &[3, 4]).await;
     let before = topology_admission_state_for_test(&fleet.stores[target], &contract)
         .expect("target admission before the stale pass resumes");
@@ -3542,19 +3560,8 @@ async fn stale_reconciliation_cannot_reopen_admission_while_successor_is_in_flig
         .entered
         .await
         .expect("reconciler captured the first request");
-    let status = fleet.stores[leader]
-        .commit_topology_transition(&expand, &expand_proof)
-        .await
-        .expect("leader completes the expansion");
-    assert_eq!(status.phase(), SessionTopologyTransitionPhase::Completed);
-    wait_for_completed_staged_transition_for_test(&fleet.stores[target], &expand, deadline)
-        .await
-        .expect("target durably applied completion with staging retained");
-    let resumed = fleet.stores[target]
-        .commit_topology_transition(&expand, &expand_proof)
-        .await
-        .expect("exact completed-request resume finalizes the target");
-    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    complete_and_resume_on_held_member(&fleet, &expand, &expand_proof, &expanded, target, deadline)
+        .await;
     wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
 
     // The successor is a pure removal: until joint membership its durable
@@ -3562,8 +3569,23 @@ async fn stale_reconciliation_cannot_reopen_admission_while_successor_is_in_flig
     let contract = fleet.transition_request(2, &contracted, 0xBA);
     fleet.stage_on_all(&contract);
     let contract_proof = fleet.prepare(&contract, &contracted).await;
+    // The coordinator needs only a quorum of learner acknowledgments. Deliver
+    // the successor's barrier to the target explicitly so its fence is certain.
+    wait_for_applied_learner_marker_for_test(&fleet.stores[target], &contract, deadline)
+        .await
+        .expect("target durably applied the successor's Prepare and learner marker");
+    assert!(
+        replay_applied_learner_barrier_for_test(
+            &fleet.stores[target],
+            &contract,
+            fleet.network.node_ids[leader],
+        )
+        .await
+        .expect("replay the successor's durable learner marker"),
+        "the staged target acknowledges the successor's learner barrier"
+    );
     let fenced = topology_admission_state_for_test(&fleet.stores[target], &contract)
-        .expect("target admission after the successor's Prepare");
+        .expect("target admission after the successor's learner barrier");
     assert!(
         fenced.staged && !fenced.admitted_latch,
         "the successor's learner barrier fenced the target: {fenced:?}"
