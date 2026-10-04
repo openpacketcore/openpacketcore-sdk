@@ -5,6 +5,10 @@
 //! metadata, digests, and completion records only. It does not activate a
 //! codec, adapter, key handle, or transport runtime.
 //!
+//! Tests decode the published SCTP DATA chunk through `opc_sctp::DataChunk`
+//! and apply the existing unprotected N2 admission profile, checking the
+//! manifest's ordering, stream, PPID and opaque user-data length claims.
+//!
 //! @spec 3GPP TS24502 V18.8.0
 //! @spec 3GPP TS29413 V18.5.0
 //! @spec 3GPP TS38413 V18.10.0

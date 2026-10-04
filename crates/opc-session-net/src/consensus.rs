@@ -270,6 +270,8 @@ fn bootstrap_protocol_error_to_peer_error(error: ProtocolError) -> SessionConsen
 fn record_consensus_server_connection_failure(error: &ProtocolError) {
     match error {
         ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
+            #[cfg(test)]
+            crate::test_support::record_connection_timeout_failure();
             &METRICS.session_net_connection_failure_timeout
         }
         ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
@@ -299,6 +301,8 @@ fn record_consensus_server_connection_outcome(result: &Result<(), ProtocolError>
             METRICS
                 .session_net_connection_successes
                 .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            crate::test_support::record_connection_success();
         }
         Err(error) => record_consensus_server_connection_failure(error),
     }
@@ -993,15 +997,24 @@ struct ConsensusConnectionLaneState {
     changed: Arc<Notify>,
     reaper_started: AtomicBool,
     in_flight: Semaphore,
+    /// Test-only notification when the reaper clears this lane. Waiters
+    /// recheck the current connection so an earlier retirement cannot satisfy
+    /// a wait after the lane has been reused.
+    #[cfg(test)]
+    retired_for_test: tokio::sync::watch::Sender<()>,
 }
 
 impl ConsensusConnectionLaneState {
     fn new() -> Self {
+        #[cfg(test)]
+        let (retired_for_test, _) = tokio::sync::watch::channel(());
         Self {
             connection: Mutex::new(None),
             changed: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
             in_flight: Semaphore::new(1),
+            #[cfg(test)]
+            retired_for_test,
         }
     }
 }
@@ -1204,6 +1217,8 @@ async fn reap_cached_consensus_connection(
                             )
                             .await;
                     }
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 if consensus_connection_idle_expired(connection, now) {
@@ -1213,6 +1228,8 @@ async fn reap_cached_consensus_connection(
                     let retired = cached.take();
                     drop(cached);
                     drop(retired);
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 Some(
@@ -6535,9 +6552,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_explicit_retirement_before_dropping_stale_ready_connection() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let control = SessionReauthenticationControl::new();
         let resolver: RemoteAddrResolver =
@@ -6601,9 +6615,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_material_retirement_before_dropping_stale_ready_connection() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let material = crate::test_support::RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/1",
@@ -6886,13 +6897,15 @@ mod tests {
             "cancelling the caller must leave its detached replacement setup alive"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached replacement setup");
+        .expect("pool shutdown must settle the detached replacement setup")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -6997,13 +7010,15 @@ mod tests {
             "caller cancellation must not supersede the detached new-epoch setup"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached new-epoch setup");
+        .expect("pool shutdown must settle the detached new-epoch setup")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -7153,21 +7168,20 @@ mod tests {
             "cancelling the original caller must not terminalize the material-successor attempt"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached material-successor attempt");
+        .expect("pool shutdown must settle the detached material-successor attempt")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
     #[tokio::test(start_paused = true)]
     async fn consensus_soft_timeout_classifies_pending_connect_without_abandoning() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let resolver: RemoteAddrResolver =
             Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
@@ -7213,9 +7227,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn configured_ceiling_also_reserves_post_connect_rpc_time() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let resolver: RemoteAddrResolver =
             Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
@@ -7255,13 +7266,15 @@ mod tests {
         assert_eq!(superseded, 0);
         assert_eq!(abandoned, 0);
         drop(peer);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < attempts {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= attempts),
+        )
         .await
-        .expect("pool shutdown must settle detached attempt accounting");
+        .expect("pool shutdown must settle detached attempt accounting")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (attempts, attempts, 0, attempts));
     }
 
@@ -7365,42 +7378,90 @@ mod tests {
         bytes
     }
 
-    #[derive(Clone, Copy)]
-    struct ConnectionOutcomeMetricSnapshot {
-        idle_retirements: u64,
-        timeout_failures: u64,
-        successes: u64,
-        drain_started: u64,
-        drain_completed: u64,
+    fn connection_outcome_metrics() -> crate::test_support::ConnectionOutcomeMetricSnapshot {
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .try_with(|accounting| accounting.snapshot())
+            .expect("connection outcome accounting scope")
     }
 
-    fn connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
-        ConnectionOutcomeMetricSnapshot {
-            idle_retirements: METRICS
-                .session_net_lifecycle_retirement_idle_timeout
-                .load(Ordering::Relaxed),
-            timeout_failures: METRICS
-                .session_net_connection_failure_timeout
-                .load(Ordering::Relaxed),
-            successes: METRICS
-                .session_net_connection_successes
-                .load(Ordering::Relaxed),
-            drain_started: METRICS
-                .session_net_lifecycle_drain_started
-                .load(Ordering::Relaxed),
-            drain_completed: METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed),
-        }
+    fn record_test_connection_outcomes() {
+        let lifecycle = ConnectionLifecycle::new(
+            test_consensus_lifecycle_policy(),
+            tokio::time::Instant::now(),
+            None,
+            None,
+            0,
+            None,
+        )
+        .expect("test connection lifecycle");
+        lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+        record_consensus_server_connection_outcome(&Ok(()));
+        record_consensus_server_connection_outcome(&Err(ProtocolError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "test connection timeout",
+        ))));
     }
 
-    async fn wait_for_drain_completion(minimum: u64) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_outcome_delta_isolated_from_concurrent_test_writers() {
+        let accounting = Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        let other_accounting =
+            Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(accounting, async {
+                let before = connection_outcome_metrics();
+                let start = Arc::new(tokio::sync::Barrier::new(3));
+                let outside_writer = tokio::spawn({
+                    let start = Arc::clone(&start);
+                    async move {
+                        start.wait().await;
+                        record_test_connection_outcomes();
+                    }
+                });
+                let other_writer = tokio::spawn({
+                    let start = Arc::clone(&start);
+                    crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING.scope(
+                        Arc::clone(&other_accounting),
+                        async move {
+                            start.wait().await;
+                            record_test_connection_outcomes();
+                            record_test_connection_outcomes();
+                        },
+                    )
+                });
+                start.wait().await;
+                record_test_connection_outcomes();
+                outside_writer.await.expect("unscoped metric writer");
+                other_writer
+                    .await
+                    .expect("independently scoped metric writer");
+
+                let after = connection_outcome_metrics();
+                assert_eq!(after.idle_retirements, before.idle_retirements + 1);
+                assert_eq!(after.timeout_failures, before.timeout_failures + 1);
+                assert_eq!(after.successes, before.successes + 1);
+                assert_eq!(after.drain_started, before.drain_started + 1);
+                assert_eq!(after.drain_completed, before.drain_completed + 1);
+                assert_eq!(
+                    other_accounting.snapshot(),
+                    crate::test_support::ConnectionOutcomeMetricSnapshot {
+                        idle_retirements: 2,
+                        timeout_failures: 2,
+                        successes: 2,
+                        drain_started: 2,
+                        drain_completed: 2,
+                    }
+                );
+            })
+            .await;
+    }
+
+    async fn wait_for_drain_completion(
+        minimum: u64,
+        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
+    ) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed)
-                < minimum
-            {
+            while snapshot_metrics().drain_completed < minimum {
                 tokio::task::yield_now().await;
             }
         })
@@ -7445,26 +7506,36 @@ mod tests {
         (result, writer)
     }
 
-    #[tokio::test]
-    async fn consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
-
-        let before_idle = connection_outcome_metrics();
+    async fn assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
+    ) {
+        let before_idle = snapshot_metrics();
         let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
         record_consensus_server_connection_outcome(&idle_result);
         idle_result.expect("byte-idle authenticated consensus connection is a policy retirement");
-        wait_for_drain_completion(before_idle.drain_completed + 1).await;
-        let after_idle = connection_outcome_metrics();
+        wait_for_drain_completion(before_idle.drain_completed + 1, snapshot_metrics).await;
+        let after_idle = snapshot_metrics();
         assert_eq!(
             after_idle.idle_retirements,
-            before_idle.idle_retirements + 1
+            before_idle.idle_retirements + 1,
+            "authenticated idle retirement increments the idle counter exactly once"
         );
         assert_eq!(after_idle.timeout_failures, before_idle.timeout_failures);
-        assert!(after_idle.successes > before_idle.successes);
-        assert!(after_idle.drain_started > before_idle.drain_started);
-        assert!(after_idle.drain_completed > before_idle.drain_completed);
+        assert_eq!(
+            after_idle.successes,
+            before_idle.successes + 1,
+            "authenticated idle retirement records one successful connection"
+        );
+        assert_eq!(
+            after_idle.drain_started,
+            before_idle.drain_started + 1,
+            "authenticated idle retirement starts one drain"
+        );
+        assert_eq!(
+            after_idle.drain_completed,
+            before_idle.drain_completed + 1,
+            "dropping the retired connection completes one drain"
+        );
         let mut acknowledgement = std::io::Cursor::new(acknowledgement);
         assert!(matches!(
             read_frame::<_, SessionConsensusBootstrapResponse>(
@@ -7476,21 +7547,26 @@ mod tests {
             SessionConsensusBootstrapResponse::Accepted(_)
         ));
 
-        let before_partial = connection_outcome_metrics();
+        let before_partial = snapshot_metrics();
         let (partial_result, _acknowledgement) = dispatch_after_authentication(&[0]).await;
         assert!(matches!(
             partial_result,
             Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
         ));
         record_consensus_server_connection_outcome(&partial_result);
-        let after_partial = connection_outcome_metrics();
+        let after_partial = snapshot_metrics();
         assert_eq!(
             after_partial.idle_retirements, before_partial.idle_retirements,
             "one active consensus frame byte must preserve the slowloris timeout failure"
         );
-        assert!(after_partial.timeout_failures > before_partial.timeout_failures);
+        assert_eq!(
+            after_partial.timeout_failures,
+            before_partial.timeout_failures + 1,
+            "a partial active frame records one timeout failure"
+        );
+        assert_eq!(after_partial.successes, before_partial.successes);
 
-        let before_handshake = connection_outcome_metrics();
+        let before_handshake = snapshot_metrics();
         let (server_binding, _client_binding) = bindings();
         let reauthentication = SessionReauthenticationControl::new();
         let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
@@ -7521,12 +7597,69 @@ mod tests {
             Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
         ));
         record_consensus_server_connection_outcome(&handshake_result);
-        let after_handshake = connection_outcome_metrics();
+        let after_handshake = snapshot_metrics();
         assert_eq!(
             after_handshake.idle_retirements,
             before_handshake.idle_retirements
         );
-        assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
+        assert_eq!(
+            after_handshake.timeout_failures,
+            before_handshake.timeout_failures + 1,
+            "bootstrap silence records one timeout failure"
+        );
+        assert_eq!(after_handshake.successes, before_handshake.successes);
+    }
+
+    #[tokio::test]
+    async fn consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
+        let accounting = Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(
+                accounting,
+                assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+                    connection_outcome_metrics,
+                ),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn consensus_server_records_production_connection_outcome_metrics() {
+        const CHILD_MARKER: &str = "OPC_SESSION_NET_CONSENSUS_OUTCOME_METRICS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current session-net test executable"),
+            )
+            .args([
+                "--exact",
+                "consensus::tests::consensus_server_records_production_connection_outcome_metrics",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated consensus outcome metrics child");
+            assert!(
+                status.success(),
+                "isolated consensus outcome metrics child passes"
+            );
+            return;
+        }
+
+        let transport_before = METRICS
+            .session_net_connection_failure_transport
+            .load(Ordering::Relaxed);
+        assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+            crate::test_support::production_connection_outcome_metrics,
+        )
+        .await;
+        assert_eq!(
+            METRICS
+                .session_net_connection_failure_transport
+                .load(Ordering::Relaxed),
+            transport_before,
+            "idle retirement and timeouts are not transport failures"
+        );
     }
 
     #[tokio::test]
@@ -9209,8 +9342,10 @@ mod tests {
         assert!(pool.overflow.connection.lock().await.is_some());
 
         tokio::time::advance(Duration::from_millis(1)).await;
+        let at_reuse_boundary = tokio::time::Instant::now();
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Overflow).await;
+        assert_eq!(tokio::time::Instant::now(), at_reuse_boundary);
         for probe in [primary_probe, overflow_probe] {
             assert_eq!(probe.recorded_retirement_count(), 1);
             assert_eq!(
@@ -9546,20 +9681,90 @@ mod tests {
         );
     }
 
+    /// Waits until the cached-connection reaper empties `lane`.
+    ///
+    /// Subscribe before inspecting the connection to avoid a lost wakeup.
+    /// Recheck after every retirement notification, including when this lane
+    /// was used by an earlier connection. Parking lets a paused clock advance.
     async fn wait_for_cached_lane_to_empty(
         pool: &ConsensusConnectionPool,
         lane: ConsensusConnectionLane,
     ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let lane = pool.lane(lane);
+        let mut retired = lane.retired_for_test.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async move {
             loop {
-                if pool.lane(lane).connection.lock().await.is_none() {
+                if lane.connection.lock().await.is_none() {
                     return;
                 }
-                tokio::task::yield_now().await;
+                retired
+                    .changed()
+                    .await
+                    .expect("lane retirement watch channel must outlive the waiter");
             }
         })
         .await
         .expect("cached consensus lane retirement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_lane_wait_parks_until_current_connection_retires_after_lane_reuse() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("short cached lifecycle policy");
+        let pool = Arc::new(ConsensusConnectionPool::new(policy));
+        for lane in [
+            ConsensusConnectionLane::Primary,
+            ConsensusConnectionLane::Overflow,
+        ] {
+            // Reuse the lane after a lifecycle retirement, then exercise the
+            // idle-retirement notification with that older signal retained.
+            for reason in [RetirementReason::MaximumAge, RetirementReason::IdleTimeout] {
+                let now = tokio::time::Instant::now();
+                let lifecycle = ConnectionLifecycle::new(policy, now, None, None, 0, None)
+                    .expect("cached lifecycle");
+                let probe = lifecycle.clone();
+                let mut connection = cached_consensus_connection(lifecycle);
+                let retire_at = if reason == RetirementReason::IdleTimeout {
+                    connection.last_successful_correlated_use = Some(
+                        now - DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit()
+                            + Duration::from_millis(20),
+                    );
+                    now + Duration::from_millis(20)
+                } else {
+                    probe.retire_at()
+                };
+                *pool.lane(lane).connection.lock().await = Some(connection);
+                pool.ensure_cached_connection_reaper(
+                    lane,
+                    None,
+                    SessionReauthenticationControl::new(),
+                    [0; 32],
+                    test_cold_epoch(),
+                );
+                pool.lane(lane).changed.notify_one();
+
+                // No manual clock advance: the waiter must park for the
+                // reaper's timer, including on the second use of this lane.
+                wait_for_cached_lane_to_empty(&pool, lane).await;
+                assert!(tokio::time::Instant::now() >= retire_at);
+                assert!(pool.lane(lane).connection.lock().await.is_none());
+                assert_eq!(probe.recorded_retirement_count(), 1);
+                assert_eq!(probe.recorded_retirement_reason(), Some(reason));
+
+                let retired_at = tokio::time::Instant::now();
+                wait_for_cached_lane_to_empty(&pool, lane).await;
+                assert_eq!(tokio::time::Instant::now(), retired_at);
+            }
+        }
     }
 
     #[tokio::test]
@@ -9675,7 +9880,9 @@ mod tests {
             "the reaper must wait for the in-flight lane owner"
         );
         drop(in_flight);
+        let released_at = tokio::time::Instant::now();
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+        assert_eq!(tokio::time::Instant::now(), released_at);
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
             retirement_probe.recorded_retirement_reason(),

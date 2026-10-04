@@ -8,26 +8,50 @@ fi
 
 violated=0
 check() {
-  local message="$1"
-  shift
-  if rg "$@"; then
+  local message="$1" pattern="$2"
+  shift 2
+  local -a scan_options=(--no-ignore --hidden --text --follow)
+  local status path count
+  if rg "${scan_options[@]}" -n -- "${pattern}" "$@"; then
     echo "::error::${message}"
     violated=1
   else
-    local status=$?
+    status=$?
     if [[ ${status} -ne 1 ]]; then
       echo "::error::vendored DTLS source scan failed with rg exit ${status}: ${message}" >&2
       violated=1
+      return
     fi
   fi
+
+  for path in "$@"; do
+    status=0
+    count=$(rg "${scan_options[@]}" --files --null -- "${path}" | {
+      count=0
+      while IFS= read -r -d '' _; do
+        ((count += 1))
+      done
+      printf '%s' "${count}"
+    }) || status=$?
+    if [[ ${status} -ne 0 && ${status} -ne 1 ]]; then
+      echo "::error::vendored DTLS source scan failed with rg exit ${status}: ${path}" >&2
+      violated=1
+      continue
+    fi
+    echo "Scanned ${count} files in ${path}: ${message}"
+    if [[ ${count} -eq 0 ]]; then
+      echo "::error::vendored DTLS source scan found no files in ${path}: ${message}" >&2
+      violated=1
+    fi
+  done
 }
 
 check "vendored DTLS source must not panic on unreachable paths" \
-  -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src
+  '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src
 check "the DTLS 1.3 path must not reference RFC 6083" \
-  -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13
+  'Rfc6083|rfc6083' vendor/dimpl/src/dtls13
 check "Config must be constructed explicitly, never defaulted" \
-  -n 'impl Default for Config|Config::default\(\)' \
+  'impl Default for Config|Config::default\(\)' \
   vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md
 
 exit "${violated}"

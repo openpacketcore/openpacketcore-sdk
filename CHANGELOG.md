@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-linux-xfrm-sys`: correct `XFRMA_SA_DIR` to Linux UAPI attribute 33
+  and expose the adjacent timer, NAT keepalive, and per-CPU SA constants.
+  `opc-ipsec-xfrm` now recognizes direction-tagged GETSA replies and rejects
+  attribute 34 as unmodeled NAT keepalive. Literal-number decoding tests and
+  a privileged Linux 6.10+ install/GETSA regression cover the distinction.
+  Fixes #1053.
+
+- `opc-session-testkit`: preserve bounded candidate Git output across
+  interrupted pipe reads, including accumulated byte limits and termination
+  requests. Retries resume the same pipe under the existing command deadline;
+  overflow and terminal I/O errors still fail qualification. Fixes #831.
+
 - `opc-gtpu-dataplane`: TFT classification can use a qualified private
   map-in-map RCU grace when GLOBAL membarrier is unavailable, including
   `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
@@ -122,6 +134,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested route or scope. IPv6 routes require 1280 bytes. Breaking:
   struct-literal constructors must add
   `locked_mtu: None`, and `RouteMismatch` literals `mtu`. Refs #991.
+
+- `opc-proto-ngap`: expose const `UnsupportedProcedure` accessors for the
+  procedure code, triggering outcome and criticality. Value-free envelope
+  metadata is available for every criticality, including silently ignored
+  procedures. Routing, actions and Error Indication diagnostics are unchanged.
+  Fixes #1025.
+
+- `opc-proto-eap`: add typed EAP Success and Failure values with exact
+  four-octet encoding and identifier-correlation helpers. Method-independent
+  admission classifies all four EAP codes, rejects invalid lengths and declared
+  terminal Data, and ignores receive padding outside Length per RFC 3748.
+  Request/Response packets delegate to the existing AKA and EAP-5G parsers;
+  new diagnostics omit packet values and identifiers. Fixes #1026.
+
+- `opc-sctp`: add allocation-free `DataChunk::decode` for one bounded,
+  exactly padded RFC 9260 DATA chunk, exposing typed flags, host-order metadata
+  and borrowed user data with redacted diagnostics. Complete chunks can be
+  copied into `InboundMessage` for existing N2 PPID, ordering and size checks;
+  fragments return an explicit conversion error without reassembly.
+  `opc-n3iwf-fixtures` now decodes its published DATA vector through this API
+  and checks ordered stream-zero delivery as well as PPID and payload length.
+  Fixes #1027.
 
 - `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
   reads to local encryption and remote sealing wrappers. Every returned

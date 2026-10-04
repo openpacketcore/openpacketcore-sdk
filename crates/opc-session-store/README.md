@@ -1413,8 +1413,11 @@ record. It runs after the inner backend returns: standalone SQLite may perform
 its normal expiry pruning, and a batch's requested sibling mutations may
 already have taken effect before returned read slots are checked. A failed
 batch read slot therefore does not imply rollback of the whole batch. This
-policy establishes payload format admission and authentication, not storage
-freshness or anti-rollback protection.
+policy establishes payload format admission and authentication. Strict reads
+do not authenticate `owner`, `state_class`, or `expires_at`. A returned record
+is authenticated against its own header rather than the requested key; the
+SDK's own backends enforce key equality. This policy does not establish
+storage freshness or anti-rollback protection.
 
 `EnvelopeV1` is a validated boundary, not a caller assertion. Construction and
 deserialization require the canonical RFC 003 envelope and session AAD; the

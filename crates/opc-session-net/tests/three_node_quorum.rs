@@ -353,6 +353,11 @@ struct ReplicationDispatchSpy {
     rebuild_calls: Arc<AtomicUsize>,
     acquire_calls: Arc<AtomicUsize>,
     renew_calls: Arc<AtomicUsize>,
+    /// Count of compare-and-set effects committed (`Success`) to the inner
+    /// backend, published on a watch channel so tests park on the transition
+    /// instead of spin-yielding against the rest of the test binary. Mirrors
+    /// the `CancellableStallBackend::active` convention.
+    cas_effects: Arc<watch::Sender<usize>>,
 }
 
 impl ReplicationDispatchSpy {
@@ -366,7 +371,21 @@ impl ReplicationDispatchSpy {
             rebuild_calls: Arc::new(AtomicUsize::new(0)),
             acquire_calls: Arc::new(AtomicUsize::new(0)),
             renew_calls: Arc::new(AtomicUsize::new(0)),
+            cas_effects: Arc::new(watch::Sender::new(0)),
         }
+    }
+
+    /// Parks until the committed compare-and-set effect count satisfies
+    /// `predicate`. `watch::Receiver::wait_for` evaluates the predicate against
+    /// the current value before awaiting, so an effect already committed
+    /// resolves immediately with no lost wakeup (same convention as
+    /// [`CancellableStallBackend::wait_for_active`]).
+    async fn wait_for_cas_effects(&self, predicate: impl FnMut(&usize) -> bool) {
+        let mut observed = self.cas_effects.subscribe();
+        observed
+            .wait_for(predicate)
+            .await
+            .expect("cas-effect watch channel closed: spy backend must outlive its waiters");
     }
 }
 
@@ -386,7 +405,11 @@ impl SessionBackend for ReplicationDispatchSpy {
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         self.compare_and_set_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.compare_and_set(op).await
+        let result = self.inner.compare_and_set(op).await;
+        if matches!(result, Ok(CompareAndSetResult::Success)) {
+            self.cas_effects.send_modify(|count| *count += 1);
+        }
+        result
     }
 
     async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
@@ -4295,6 +4318,69 @@ async fn direct_cas_dropped_response_stops_unsafe_retry() {
     server.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn cas_effect_wait_requires_a_commit_and_retains_it_for_late_subscribers() {
+    let backend = ReplicationDispatchSpy::new();
+    let key = test_key_with_stable_id(b"watched-cas");
+    let owner = OwnerId::new("watched-cas-owner").expect("owner");
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("lease");
+    let record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    let mut operation = CompareAndSet {
+        key: key.clone(),
+        lease,
+        expected_generation: Some(Generation::new(1)),
+        new_record: record.clone(),
+    };
+    assert_eq!(
+        backend.compare_and_set(operation.clone()).await,
+        Ok(CompareAndSetResult::Conflict { current: None })
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            backend.wait_for_cas_effects(|effects| *effects >= 1),
+        )
+        .await
+        .is_err(),
+        "a dispatched but rejected CAS is not a committed effect"
+    );
+
+    operation.expected_generation = None;
+    let writer = backend.clone();
+    let commit_at = tokio::time::Instant::now() + Duration::from_millis(20);
+    let commit = tokio::spawn(async move {
+        tokio::time::sleep_until(commit_at).await;
+        writer.compare_and_set(operation).await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_cas_effects(|effects| *effects == 1),
+    )
+    .await
+    .expect("parked watch lets the paused commit timer advance");
+    assert_eq!(
+        commit.await.expect("commit task"),
+        Ok(CompareAndSetResult::Success)
+    );
+    assert!(tokio::time::Instant::now() >= commit_at);
+    assert_eq!(
+        backend.get(&key).await.expect("committed record"),
+        Some(record)
+    );
+
+    let committed_at = tokio::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_cas_effects(|effects| *effects == 1),
+    )
+    .await
+    .expect("a late subscriber observes the retained committed effect");
+    assert_eq!(tokio::time::Instant::now(), committed_at);
+}
+
 #[tokio::test]
 async fn historical_cas_is_rejected_after_server_restart_without_redispatch() {
     use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
@@ -4327,14 +4413,10 @@ async fn historical_cas_is_rejected_after_server_restart_without_redispatch() {
     write_frame(&mut first, &historical)
         .await
         .expect("send historical CAS");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if backend.get(&key).await.expect("inspect backend").is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.wait_for_cas_effects(|effects| *effects >= 1),
+    )
     .await
     .expect("CAS effect before response is intentionally abandoned");
     drop(first);

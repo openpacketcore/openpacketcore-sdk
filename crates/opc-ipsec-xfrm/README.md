@@ -715,6 +715,16 @@ Readback rejects mixed, duplicated, or flag-inconsistent replay
 representations. Dynamic counters and last-used timestamps are permitted, but
 unmodeled semantic SA or policy attributes fail closed.
 
+Binding and inbound peer-observation readback recognize the Linux 6.10+
+`XFRMA_SA_DIR` attribute at its UAPI number 33 and validate its one-byte
+direction against the requested role. Number 34 is
+`XFRMA_NAT_KEEPALIVE_INTERVAL`; it remains unmodeled and is rejected by these
+validators. Ordinary installs omit an explicit SA direction. The privileged
+`linux::tests::sa_direction_attribute_round_trips_on_kernel` regression appends
+the direction to an install and independently checks raw GETSA attribute 33.
+It requires Linux 6.10+, CAP_NET_ADMIN, and a fresh network namespace; missing
+support or opt-in fails the explicitly selected test.
+
 ## Sealed outbound ESP counter authority
 
 Same-SPI failover must use
@@ -1414,6 +1424,7 @@ excludes the old key material needed for rollback.
 ```sh
 cargo test -p opc-ipsec-xfrm
 cargo test -p opc-ipsec-xfrm --features ikev2
+sudo unshare -n -- env OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --lib -- --ignored --exact linux::tests::sa_direction_attribute_round_trips_on_kernel --nocapture
 ./scripts/build-ipsec-xfrm-ebpf.sh
 # Requires named-netns support, iproute2, ping, tcpdump with EN10MB capture,
 # Linux XFRM, and effective CAP_NET_ADMIN/CAP_NET_RAW. The in-memory capture

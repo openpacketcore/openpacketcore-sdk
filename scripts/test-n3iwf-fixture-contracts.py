@@ -678,7 +678,10 @@ class SemanticMutations(unittest.TestCase):
             ("unknown-ppid66", ("ppid", "port")),
             ("ordering-port-before-ppid", ("ppid", "port")),
             ("duplicate-association-tuple", ("ppid", "port")),
-            ("positive-data-chunk", ("ppid", "user_data_len", "chunk")),
+            (
+                "positive-data-chunk",
+                ("ppid", "user_data_len", "chunk", "order", "stream_id"),
+            ),
         ):
             path = FIXTURES / "n2-sctp" / (name + ".json")
             original = json.loads(path.read_text())
@@ -718,17 +721,41 @@ class SemanticMutations(unittest.TestCase):
             oracle.validate(manifest, data)
 
     def test_n2_contradictory_repeated_claim_cannot_hide_behind_the_last_value(self):
+        for name, fields in (
+            ("positive-ppid60-port", ("port", "ppid")),
+            ("positive-data-chunk", ("order", "stream_id")),
+        ):
+            original = json.loads((FIXTURES / "n2-sctp" / (name + ".json")).read_text())
+            data = wire("n2-sctp", name)
+            for field in fields:
+                changed = json.loads(json.dumps(original))
+                changed["semantic_assertions"].insert(0, field + "=999")
+                with self.subTest(case=name, field=field), self.assertRaisesRegex(
+                    oracle.Invalid, "^field-claim$"
+                ):
+                    oracle.validate(changed, data)
+
+    def test_n2_data_order_and_stream_mutations_fail_with_refreshed_digests(self):
         original = json.loads(
-            (FIXTURES / "n2-sctp/positive-ppid60-port.json").read_text()
+            (FIXTURES / "n2-sctp/positive-data-chunk.json").read_text()
         )
-        data = wire("n2-sctp", "positive-ppid60-port")
-        for field in ("port", "ppid"):
-            changed = json.loads(json.dumps(original))
-            changed["semantic_assertions"].insert(0, field + "=999")
-            with self.subTest(field=field), self.assertRaisesRegex(
-                oracle.Invalid, "^field-claim$"
-            ):
-                oracle.validate(changed, data)
+        data = wire("n2-sctp", "positive-data-chunk")
+        oracle.validate(original, data)
+        for field, offset, value in (
+            ("order", 1, 7),
+            ("stream_id", 8, 1),
+            ("stream_id", 9, 1),
+        ):
+            with self.subTest(field=field, offset=offset):
+                changed = json.loads(json.dumps(original))
+                payload = bytearray(data)
+                payload[offset] = value
+                changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                # Check the claim independently of the fixture's exact flag policy.
+                with self.assertRaisesRegex(oracle.Invalid, "^field-claim$"):
+                    oracle.verify_field_claims(changed, payload)
+                with self.assertRaises(oracle.Invalid):
+                    oracle.validate(changed, payload)
 
     def test_n2_port_mutation_with_refreshed_digest_fails_semantic_gate(self):
         original = json.loads(

@@ -75,6 +75,13 @@ wire capability and leaves all pending codecs disabled. `Outcome` is public
 metadata. See [the receive/error and trigger matrix](N3IWF-PROCEDURES.md) for
 required caller behavior and value-free unsupported-procedure diagnostics.
 
+`UnsupportedProcedure` exposes the validated envelope through the const
+accessors `procedure_code() -> u8`, `triggering_message() -> Outcome` and
+`criticality() -> Criticality`. They are available for every criticality,
+including `ignore`, whose `diagnostics()` returns `None`. These value-free
+fields support logs and per-procedure counters without re-reading wire bytes.
+`action()` and `diagnostics()` retain their existing reporting behavior.
+
 ## Typed IE policy boundary
 
 Each currently typed procedure/outcome has pinned ASN.1 metadata for its known

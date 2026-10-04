@@ -15,11 +15,19 @@
 //! before the receive operation completes. Partial DATA stays socket-owned
 //! across receive cancellation and non-lifecycle notifications, with the same
 //! cumulative byte bound. Close clears it without waiting for receive polling.
+//!
+//! [`DataChunk::decode`] inspects one exactly padded RFC 9260 DATA chunk from a
+//! fixture or capture without allocating. It borrows user data and exposes
+//! typed flags and metadata. Complete chunks can be copied to [`InboundMessage`]
+//! for the existing [`n2::UnprotectedN2Profile`] admission checks; fragments
+//! remain explicit and are not reassembled by the decoder.
 
 #![forbid(unsafe_code)]
 
+mod data_chunk;
 mod lifecycle;
 pub mod n2;
+pub use data_chunk::{DataChunk, DataChunkError, DataChunkFlags};
 pub use lifecycle::{
     SctpAssociationState, SctpReconfigurationStatus, SctpResetStreams, MAX_RESET_STREAM_IDS,
 };

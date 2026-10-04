@@ -106,6 +106,12 @@ cargo build -p opc-session-testkit --bin opc-session-quorum-node --no-default-fe
 cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features
 ```
 
+The harness reads candidate Git provenance through capped stdout/stderr pipes
+under one fixed command deadline. An interrupted read resumes the same pipe
+with its accumulated bytes and original cap intact; repeated interruptions
+observe termination requests. Overflow and terminal read errors fail
+qualification.
+
 Projected mTLS can use either exact loopback sockets for the existing
 single-host tests or `canonical_endpoint_dns` for a deployed fleet. The DNS
 profile omits every `dial_addr`, requires each manifest endpoint to already be
