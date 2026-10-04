@@ -130,6 +130,11 @@ jobs:
           python3 ci/test-sdk702-release-attest.py
           bash -n ci/setup-fsverity-tmp.sh
 
+      - name: Test nohz guest reboot handoff
+        run: |
+          python3 ci/test-qualify-tft-nohz-vm.py
+          bash -n ci/qualify-tft-nohz-vm.sh
+
       - name: Test live voter memory evidence validators
         run: python3 scripts/test-observe-session-store-live-memory.py
 

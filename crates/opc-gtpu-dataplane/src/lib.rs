@@ -212,9 +212,10 @@ pub use selector_namespace_v2::{
     GtpuSessionSelectorRetiredDrainRequest,
 };
 pub use tft_classifier::{
-    TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
-    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,
-    TftUplinkPaaSet, TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
+    TftUplinkBearer, TftUplinkClassification, TftUplinkClassificationUnavailableReason,
+    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome, TftUplinkDropReason, TftUplinkPaaSet,
+    TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
 };
 pub use traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
