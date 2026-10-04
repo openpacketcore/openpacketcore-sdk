@@ -652,20 +652,32 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     // 3b. The same corrupt first fragment, now handed to the consumer. It
     //     must be dropped as the kernel dropped it above. Returned as
     //     `Decapsulated`, the injection would repair its checksum and send
-    //     it on.
+    //     it on. So must a fragment whose total length, under a correct
+    //     checksum, claims one octet more than arrived: the injection would
+    //     rewrite the length and send the truncated datagram as complete.
+    let mut truncated = core_fragments(&datagram(0x6b, 9), 28, 0x6b00).swap_remove(0);
+    truncated[2..4].copy_from_slice(&29_u16.to_be_bytes());
+    truncated[10..12].fill(0);
+    let mut header = [0_u8; 20];
+    header.copy_from_slice(&truncated[..20]);
+    truncated[10..12].copy_from_slice(&ipv4_header_checksum(&header).to_be_bytes());
+    assert_eq!(truncated.len(), 28);
     let _ = captured_ipv4(&ue_capture);
-    send(&[&frame(LOCAL_TEID, &corrupt)]);
+    send(&[&frame(LOCAL_TEID, &corrupt), &frame(LOCAL_TEID, &truncated)]);
     let events = serve_consumer(port.as_ref(), window);
     assert!(
         matches!(
             &events[..],
-            [GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::Malformed)]
+            [
+                GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::Malformed),
+                GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::Malformed)
+            ]
         ),
-        "a fragment with a wrong inner header checksum: {events:?}"
+        "fragments with a wrong header checksum and an inconsistent total length: {events:?}"
     );
     assert!(
         wire_inner_packets(&captured_ipv4(&ue_capture)).is_empty(),
-        "a fragment with a wrong header checksum must not be repaired and sent"
+        "a fragment with an invalid inner header must not be repaired and sent"
     );
 
     // 3c. Octets after the inner total length are not part of the datagram.
@@ -925,8 +937,8 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(counters.state_unavailable, 2);
     assert_eq!(counters.packet_too_big, 0);
     assert_eq!(
-        counters.malformed, 1,
-        "the fragment with the wrong header checksum"
+        counters.malformed, 2,
+        "the fragments with a wrong header checksum and an inconsistent total length"
     );
     assert_eq!(counters.binding_drops, 0);
 

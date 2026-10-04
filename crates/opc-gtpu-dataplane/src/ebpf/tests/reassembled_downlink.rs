@@ -1932,6 +1932,30 @@ async fn an_inner_header_with_options_is_validated_over_its_whole_length() {
     );
 }
 
+/// The consumer never rewrites a returned fragment: an Identification of
+/// zero stays zero. What an `IP_HDRINCL` send does with it is the injector's
+/// concern and is documented with the injection.
+#[tokio::test]
+async fn a_fragment_with_identification_zero_is_returned_unmodified() {
+    let (_backend, runtime) = ordinary_fixture(fragment_context(576)).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    for flags_fragment in [0x2000_u16, 0x0003] {
+        let mut fragment = inner_fragment(60, flags_fragment);
+        fragment[4..6].fill(0);
+        let fragment = checksummed(fragment);
+        let GtpuDownlinkEvent::Decapsulated(decapsulated) = process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &fragment),
+            &mut counters,
+        ) else {
+            panic!("a fragment with Identification zero must decapsulate");
+        };
+        assert_eq!(decapsulated.inner_packet(), fragment.as_slice());
+        assert_eq!(&decapsulated.inner_packet()[4..6], &[0, 0]);
+    }
+}
+
 /// The grouped path returns an inner IPv4 packet for the same injection, so
 /// its header checksum is validated too. Its exact-length rule is unchanged.
 #[tokio::test]

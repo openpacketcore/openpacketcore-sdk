@@ -683,7 +683,8 @@ rule active in the gateway namespace:
 - a 28-octet first fragment with one flipped header checksum octet. Without
   a downlink inner MTU, tc decapsulates it and the kernel's IPv4 input
   discards it (`InHdrErrors`). With one, the consumer drops it as
-  `Malformed`, and nothing is sent toward the UE;
+  `Malformed`, and nothing is sent toward the UE. The same holds for a
+  fragment whose total length claims one octet more than arrived;
 - two fragments followed by six octets beyond their total length. They come
   back trimmed, and the UE reassembles the exact datagram;
 - a dedicated bearer through its real ESP Child SA: one dedicated-SPI ESP
