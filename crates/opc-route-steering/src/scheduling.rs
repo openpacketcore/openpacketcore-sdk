@@ -277,6 +277,7 @@ mod tests {
             oif_ifindex: 42,
             table: 1000,
             priority: None,
+            locked_mtu: None,
         };
         let scope = OperationScope::Route(first.clone());
         first.destination.address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));

@@ -45,6 +45,47 @@ pub struct FirewallMark {
     pub mask: u32,
 }
 
+/// Locked route MTU.
+///
+/// A route carrying a locked MTU makes the kernel enforce that MTU for every
+/// packet it forwards over the route, and answer an oversized packet the
+/// sender asked not to be fragmented with ICMP: an ICMPv6 Packet Too Big
+/// (RFC 4443 section 3.2, RFC 8201) for IPv6, and a Destination Unreachable
+/// Fragmentation Needed carrying the next-hop MTU (RFC 792, RFC 1191) for an
+/// IPv4 packet with DF set. The kernel's ICMP source selection and rate limits
+/// apply. Locking keeps a learned path MTU from replacing the configured value.
+///
+/// The value is bounded by the Linux FIB, which clamps larger metrics to
+/// [`Self::MAX`]. [`RouteRequest`] validation additionally requires the IPv6
+/// minimum link MTU of 1280 (RFC 8200 section 5) for an IPv6 destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct RouteMtu(u32);
+
+impl RouteMtu {
+    /// Smallest IPv4 MTU (RFC 791).
+    pub const IPV4_MIN: u32 = 68;
+    /// Smallest IPv6 link MTU (RFC 8200 section 5).
+    pub const IPV6_MIN: u32 = 1280;
+    /// Largest route MTU the Linux FIB represents exactly.
+    pub const MAX: u32 = 65_520;
+
+    /// Build a locked route MTU, or `None` outside `IPV4_MIN..=MAX`.
+    #[must_use]
+    pub const fn new(mtu: u32) -> Option<Self> {
+        if mtu >= Self::IPV4_MIN && mtu <= Self::MAX {
+            Some(Self(mtu))
+        } else {
+            None
+        }
+    }
+
+    /// MTU in bytes.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Route installation/removal request.
 #[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct RouteRequest {
@@ -63,6 +104,14 @@ pub struct RouteRequest {
     /// Linux canonicalizes IPv4 `None`/zero to no metric and IPv6
     /// `None`/zero to the effective metric `1024`.
     pub priority: Option<u32>,
+    /// Optional locked route MTU; see [`RouteMtu`].
+    ///
+    /// `None` installs no route metrics and keeps the previous wire bytes.
+    /// Readback compares it exactly: a resident route whose MTU differs, or
+    /// is absent, is a conflict with [`RouteMismatch::mtu`] set, and a
+    /// resident route with an unlocked MTU or any other metric is
+    /// unrepresentable.
+    pub locked_mtu: Option<RouteMtu>,
 }
 
 impl fmt::Debug for RouteRequest {
@@ -72,6 +121,7 @@ impl fmt::Debug for RouteRequest {
             .field("oif_ifindex", &self.oif_ifindex)
             .field("table", &self.table)
             .field("priority", &self.priority)
+            .field("locked_mtu", &self.locked_mtu)
             .finish()
     }
 }
@@ -241,6 +291,8 @@ pub struct RouteMismatch {
     pub table: bool,
     /// The optional route metric/priority differs.
     pub priority: bool,
+    /// The locked route MTU differs, or is present on only one side.
+    pub mtu: bool,
     /// Fixed kernel semantics or extra attributes cannot match the request.
     pub kernel_semantics: bool,
 }
@@ -604,6 +656,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: Some(7),
+            locked_mtu: None,
         };
         let rule = RuleRequest {
             source: Some(route.destination),

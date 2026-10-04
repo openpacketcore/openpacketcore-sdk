@@ -110,6 +110,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-route-steering`: `RouteRequest` gains `locked_mtu`, a validated
+  `RouteMtu` installed as one `RTA_METRICS` nest with `RTAX_MTU` and exactly
+  its lock bit, the equivalent of `ip route add ... mtu lock`. The forwarding
+  kernel then answers an oversized packet with an ICMPv6 Packet Too Big
+  (RFC 4443) or, for IPv4 with DF set, an ICMP Fragmentation Needed carrying
+  the next-hop MTU (RFC 1191), proven live on the host and RHEL 9.4 kernels.
+  Readback, convergence, the owned collection and the mock compare it exactly
+  (`RouteMismatch::mtu`); any other resident metric, of any width (such as
+  the `congctl` string metric), is unrepresentable and is ignored outside the
+  requested route or scope. IPv6 routes require 1280 bytes. Breaking:
+  struct-literal constructors must add
+  `locked_mtu: None`, and `RouteMismatch` literals `mtu`. Refs #991.
+
 - `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
   reads to local encryption and remote sealing wrappers. Every returned
   physical record requires a canonical envelope and the existing authenticated

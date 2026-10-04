@@ -76,6 +76,7 @@ mod tests {
             oif_ifindex: 2,
             table: 100,
             priority: None,
+            locked_mtu: None,
         };
         let rule = RuleRequest {
             source: Some(prefix),

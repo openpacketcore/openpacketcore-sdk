@@ -56,9 +56,9 @@ pub use linux::{
 pub use mock::{MockFailurePoint, MockObservation, MockOperation, MockRouteSteeringBackend};
 pub use model::{
     FirewallMark, IpPrefix, ReadbackIndeterminateReason, RouteConflict, RouteConvergenceOutcome,
-    RouteMismatch, RouteReadback, RouteRequest, RouteRuleConvergenceOutcome, RouteRuleRollback,
-    RouteSteeringBackendKind, RouteSteeringCapabilities, RouteSteeringProbe, RuleConflict,
-    RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
+    RouteMismatch, RouteMtu, RouteReadback, RouteRequest, RouteRuleConvergenceOutcome,
+    RouteRuleRollback, RouteSteeringBackendKind, RouteSteeringCapabilities, RouteSteeringProbe,
+    RuleConflict, RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
 };
 pub use unsupported::UnsupportedRouteSteeringBackend;
 
@@ -80,6 +80,7 @@ mod integration_tests {
             oif_ifindex: 42,
             table: 100,
             priority: Some(10),
+            locked_mtu: None,
         };
         let rule = RuleRequest {
             source: Some(prefix([10, 23, 0, 0], 24)),

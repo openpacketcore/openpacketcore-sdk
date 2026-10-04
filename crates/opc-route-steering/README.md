@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oif_ifindex: 42,
         table: 100,
         priority: Some(10),
+        locked_mtu: None,
     };
     let rule = RuleRequest {
         source: Some(prefix),
@@ -93,6 +94,25 @@ by `ip rule`, and `Some(RouteSteeringIpFamily::Ipv6)` creates the equivalent of
 `ip -6 rule add fwmark ...`. Steering one mark for both families takes two
 rules, one per family; they are distinct objects for readback, convergence,
 and exact removal. An explicit family that conflicts with a prefix is rejected.
+
+`RouteRequest::locked_mtu` installs a route whose MTU the forwarding kernel
+enforces, the equivalent of `ip route add ... mtu lock <mtu>`. A forwarded
+packet larger than that MTU is answered by the kernel itself: an ICMPv6 Packet
+Too Big (RFC 4443 section 3.2) for IPv6, and an ICMP Fragmentation Needed
+carrying the next-hop MTU (RFC 1191) for IPv4 with DF set, using the kernel's
+ICMP source selection and rate limits. This is how a consumer signals path MTU
+for traffic it forwards into an encapsulating tunnel: route the inner
+destinations over the tunnel's route with the link MTU minus the outer
+overhead. The lock keeps a learned path MTU from replacing the value. IPv6
+routes require at least 1280 bytes; `None` installs no metrics and keeps the
+previous wire bytes. The node needs a unicast address on the ingress interface
+of each family to source the ICMP error. Readback compares the MTU exactly, so
+changing it on a resident route is a conflict (`RouteMismatch::mtu`); an owned
+collection refuses an MTU change for a resident destination before mutation.
+Removal proves the exact MTU by readback before the delete: IPv4 deletion also
+compares metrics in the kernel, but IPv6 deletion does not. A route carrying
+any other metric, such as `congctl`, is unrepresentable: readback of it fails
+closed, and it is ignored when it lies outside the requested route or scope.
 
 For a complete writer-owned set, use the collection API. This is also the API
 for provably disjoint source rules that intentionally share one family and
@@ -166,8 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   effective destination network prefix, and routing table. Route convergence,
   readback, and mock resident state clear IPv4/IPv6 host bits before comparison,
   matching the Linux FIB. Equality within that key also compares the output
-  interface, optional metric, fixed unicast kernel semantics, and namespace
-  ownership protocol emitted by this crate. IPv4 `None`/zero metrics
+  interface, optional metric, locked MTU, fixed unicast kernel semantics, and
+  namespace ownership protocol emitted by this crate. A resident route whose
+  metrics are anything other than absent or one MTU with exactly its lock bit
+  is unrepresentable. IPv4 `None`/zero metrics
   canonicalize to an absent attribute; IPv6 `None`/zero canonicalize to the
   kernel's effective metric `1024`. The public mismatch evidence retains a
   table field for external backends that use a broader collision key. This does

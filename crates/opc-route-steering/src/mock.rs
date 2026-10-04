@@ -567,11 +567,13 @@ impl MockRouteSteeringBackend {
                 output_interface: candidate.request.oif_ifindex != request.oif_ifindex,
                 table: candidate.request.table != request.table,
                 priority: candidate.request.priority != request.priority,
+                mtu: candidate.request.locked_mtu != request.locked_mtu,
                 kernel_semantics: !candidate.owned,
             };
             aggregate.output_interface |= mismatch.output_interface;
             aggregate.table |= mismatch.table;
             aggregate.priority |= mismatch.priority;
+            aggregate.mtu |= mismatch.mtu;
             aggregate.kernel_semantics |= mismatch.kernel_semantics;
             if candidate.owned && candidate.request == *request {
                 exact_count = exact_count.saturating_add(1);
@@ -1569,6 +1571,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: Some(10),
+            locked_mtu: None,
         }
     }
 
@@ -1579,6 +1582,7 @@ mod tests {
                 oif_ifindex: 42,
                 table: 100,
                 priority: Some(10),
+                locked_mtu: None,
             },
             RouteRequest {
                 destination: IpPrefix::new(
@@ -1588,6 +1592,7 @@ mod tests {
                 oif_ifindex: 42,
                 table: 100,
                 priority: Some(10),
+                locked_mtu: None,
             },
         ]
     }
@@ -1623,6 +1628,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: Some(10),
+            locked_mtu: None,
         }
     }
 
@@ -1635,6 +1641,69 @@ mod tests {
             priority: 100,
             family: None,
         }
+    }
+
+    #[tokio::test]
+    async fn mock_locked_route_mtu_is_part_of_exact_route_identity() {
+        let backend = MockRouteSteeringBackend::new();
+        let locked = RouteRequest {
+            locked_mtu: Some(crate::model::RouteMtu::new(1300).unwrap()),
+            ..route()
+        };
+        assert_eq!(
+            backend.converge_route(locked.clone()).await.unwrap(),
+            RouteConvergenceOutcome::Installed
+        );
+        assert_eq!(
+            backend.read_route(&locked).await.unwrap(),
+            RouteReadback::ExactPresent
+        );
+        for desired in [
+            route(),
+            RouteRequest {
+                locked_mtu: Some(crate::model::RouteMtu::new(1400).unwrap()),
+                ..route()
+            },
+        ] {
+            let conflict = match backend.read_route(&desired).await.unwrap() {
+                RouteReadback::Conflict(conflict) => conflict,
+                other => panic!("unexpected locked MTU readback: {other:?}"),
+            };
+            assert_eq!(
+                conflict.mismatch(),
+                RouteMismatch {
+                    output_interface: false,
+                    table: false,
+                    priority: false,
+                    mtu: true,
+                    kernel_semantics: false,
+                }
+            );
+            assert_eq!(conflict.resident(), &locked);
+        }
+        let ipv6_below_minimum = RouteRequest {
+            destination: crate::model::IpPrefix::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
+                64,
+            ),
+            locked_mtu: Some(crate::model::RouteMtu::new(1279).unwrap()),
+            ..route()
+        };
+        assert!(matches!(
+            backend.converge_route(ipv6_below_minimum).await,
+            Err(RouteSteeringError::InvalidConfig {
+                field: "route.locked_mtu",
+                ..
+            })
+        ));
+        backend
+            .remove_converged_route(locked.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.read_route(&locked).await.unwrap(),
+            RouteReadback::Absent
+        );
     }
 
     #[tokio::test]
@@ -1660,18 +1729,21 @@ mod tests {
                 oif_ifindex: 42,
                 table: 100,
                 priority: Some(0),
+                locked_mtu: None,
             },
             RouteRequest {
                 destination: IpPrefix::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
                 oif_ifindex: 42,
                 table: 100,
                 priority: None,
+                locked_mtu: None,
             },
             RouteRequest {
                 destination: IpPrefix::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
                 oif_ifindex: 42,
                 table: 100,
                 priority: Some(0),
+                locked_mtu: None,
             },
         ];
 
@@ -1741,6 +1813,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: None,
+            locked_mtu: None,
         };
         assert_eq!(
             backend.converge_route(request.clone()).await.unwrap(),
@@ -1895,6 +1968,7 @@ mod tests {
                 output_interface: true,
                 table: false,
                 priority: true,
+                mtu: false,
                 kernel_semantics: false,
             }
         );
@@ -2042,6 +2116,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: None,
+            locked_mtu: None,
         };
         backend.seed_route(ipv6_none.clone()).unwrap();
         let mut ipv6_zero = ipv6_none.clone();
@@ -2319,6 +2394,45 @@ mod tests {
             assert!(backend.remove_converged_rule(target).await.is_err());
             assert!(backend.operations().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn owned_collection_carries_locked_route_mtu_and_refuses_changing_it_in_place() {
+        let backend = MockRouteSteeringBackend::new();
+        let locked = |mtu| RouteRequest {
+            locked_mtu: crate::model::RouteMtu::new(mtu),
+            ..sibling_route(10)
+        };
+        let desired =
+            OwnedRouteRuleSet::new(owned_scope(), vec![locked(1300)], Vec::new()).unwrap();
+        let installed = backend
+            .reconcile_owned_route_rules(desired.clone())
+            .await
+            .unwrap();
+        assert_eq!(installed.installed_routes, 1);
+        assert_eq!(
+            backend
+                .snapshot_owned_route_rules(owned_scope())
+                .await
+                .unwrap()
+                .routes(),
+            &[locked(1300)]
+        );
+        let operations = backend.operations().len();
+        let changed =
+            OwnedRouteRuleSet::new(owned_scope(), vec![locked(1400)], Vec::new()).unwrap();
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(changed).await,
+            Err(RouteSteeringError::InvalidConfig {
+                field: "owned.routes",
+                ..
+            })
+        ));
+        assert_eq!(backend.operations().len(), operations);
+        assert_eq!(
+            backend.read_route(&locked(1300)).await.unwrap(),
+            RouteReadback::ExactPresent
+        );
     }
 
     #[tokio::test]
@@ -2618,6 +2732,7 @@ mod tests {
                 oif_ifindex: 42,
                 table: 2000,
                 priority: Some(10),
+                locked_mtu: None,
             });
             rules.push(RuleRequest {
                 source: Some(prefix),

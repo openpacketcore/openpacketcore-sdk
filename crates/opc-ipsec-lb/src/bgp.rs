@@ -90,6 +90,7 @@ where
             oif_ifindex: self.config.oif_ifindex,
             table: self.config.route_table,
             priority: self.config.priority,
+            locked_mtu: None,
         })
     }
 }
@@ -196,6 +197,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: Some(10),
+            locked_mtu: None,
         };
         assert_eq!(
             backend.operations(),
@@ -214,6 +216,7 @@ mod tests {
             oif_ifindex: 42,
             table: 100,
             priority: Some(10),
+            locked_mtu: None,
         };
         backend.install_route(route).await.unwrap();
         let advertiser = BgpRouteVipAdvertiser::with_backend(backend, config()).unwrap();

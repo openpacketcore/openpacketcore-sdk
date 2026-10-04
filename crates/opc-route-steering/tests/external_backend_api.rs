@@ -59,6 +59,7 @@ fn route() -> RouteRequest {
         oif_ifindex: 1,
         table: 100,
         priority: Some(10),
+        locked_mtu: None,
     }
 }
 
