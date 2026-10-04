@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::applicability::{
     inspect, ApplicableMessage, Association, Direction, Endpoint, ReceiveDisposition, TriggerGate,
-    UnsupportedAction, APPLICABLE_MESSAGES,
+    UnsupportedAction, UnsupportedProcedure, APPLICABLE_MESSAGES,
 };
 use opc_proto_ngap::n3iwf::nas::NasMessage;
 use opc_proto_ngap::n3iwf::reset_fields::CriticalityDiagnostics;
@@ -53,6 +53,15 @@ fn criticality(value: &Value) -> Criticality {
         "notify" => Criticality::notify,
         _ => panic!("reference criticality"),
     }
+}
+
+// Calling the public accessors here also verifies that all three remain const.
+const fn unsupported_metadata(value: UnsupportedProcedure) -> (u8, Outcome, Criticality) {
+    (
+        value.procedure_code(),
+        value.triggering_message(),
+        value.criticality(),
+    )
 }
 
 #[test]
@@ -152,6 +161,14 @@ fn all_codes_outcomes_criticalities_and_independent_error_diagnostics() {
                     };
                     assert_eq!(value.reference_known(), row["reference_known"]);
                     assert_eq!(
+                        unsupported_metadata(value),
+                        (
+                            row["procedure_code"].as_u64().unwrap() as u8,
+                            outcome(&row["outcome"]),
+                            criticality(&row["criticality"]),
+                        )
+                    );
+                    assert_eq!(
                         value.action(),
                         match action {
                             "unsupported-reject" => UnsupportedAction::RejectAndReport,
@@ -173,6 +190,59 @@ fn all_codes_outcomes_criticalities_and_independent_error_diagnostics() {
                         assert!(diagnostic.is_none());
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_metadata_is_const_and_value_free() {
+    let body = b"synthetic-unsupported-body-value";
+    for (code, criticality_octet, criticality, known) in [
+        (12, 0, Criticality::reject, true),  // Handover Preparation
+        (24, 64, Criticality::ignore, true), // Paging
+        (250, 0, Criticality::reject, false),
+        (250, 64, Criticality::ignore, false),
+        (250, 128, Criticality::notify, false),
+    ] {
+        for (outcome_octet, outcome) in [
+            (0, Outcome::Initiating),
+            (32, Outcome::Successful),
+            (64, Outcome::Unsuccessful),
+        ] {
+            if code == 24 && outcome != Outcome::Initiating {
+                continue; // Paging has only an initiating message.
+            }
+            let mut wire = vec![outcome_octet, code, criticality_octet, body.len() as u8];
+            wire.extend_from_slice(body);
+            for receiver in [Endpoint::N3iwf, Endpoint::Amf] {
+                let ReceiveDisposition::Unsupported(value) =
+                    inspect(&wire, receiver, context()).unwrap()
+                else {
+                    panic!("non-applicable procedure reached handler");
+                };
+                assert_eq!(unsupported_metadata(value), (code, outcome, criticality));
+                assert_eq!(value.reference_known(), known);
+                assert_eq!(
+                    format!("{value:?}"),
+                    format!(
+                        "UnsupportedProcedure {{ procedure_code: {code}, outcome: {outcome:?}, criticality: {criticality:?}, reference_known: {known} }}"
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn known_procedures_with_notify_criticality_remain_rejected() {
+    // Release 18 assigns reject or ignore to every known procedure; notify
+    // remains a metadata error, even for procedures outside N3IWF applicability.
+    for code in [12, 24] {
+        for outcome_octet in [0, 32, 64] {
+            let wire = [outcome_octet, code, 128, 3, 0, 0, 0];
+            for receiver in [Endpoint::N3iwf, Endpoint::Amf] {
+                assert!(inspect(&wire, receiver, context()).is_err());
             }
         }
     }

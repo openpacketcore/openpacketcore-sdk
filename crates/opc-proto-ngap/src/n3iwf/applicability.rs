@@ -8,6 +8,11 @@
 //! they never become the unsupported-procedure fallback. Local triggers for
 //! those messages remain disabled in this SDK boundary.
 //!
+//! [`UnsupportedProcedure`] exposes the envelope's procedure code, triggering
+//! message and criticality as value-free metadata, including for silently
+//! ignored procedures whose [`diagnostics`](UnsupportedProcedure::diagnostics)
+//! are absent.
+//!
 //! Direction and signalling describe the protocol, not association ownership.
 //! The caller supplies transport context, request correlation, state, timers and
 //! resource effects. No function here sends a packet or changes endpoint state.
@@ -189,6 +194,8 @@ pub enum UnsupportedAction {
 
 /// Value-free reporting metadata for a framed, non-applicable procedure.
 /// Fields are private so applicable messages cannot construct this disposition.
+/// The envelope metadata is available for every criticality, including
+/// [`Criticality::ignore`], for which [`Self::diagnostics`] returns `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnsupportedProcedure {
     procedure_code: u8,
@@ -197,6 +204,18 @@ pub struct UnsupportedProcedure {
     reference_known: bool,
 }
 impl UnsupportedProcedure {
+    /// Procedure code from the validated NGAP-PDU envelope.
+    pub const fn procedure_code(self) -> u8 {
+        self.procedure_code
+    }
+    /// Triggering message's outcome class from the validated NGAP-PDU envelope.
+    pub const fn triggering_message(self) -> Outcome {
+        self.outcome
+    }
+    /// Procedure criticality from the validated NGAP-PDU envelope.
+    pub const fn criticality(self) -> Criticality {
+        self.criticality
+    }
     /// Whether the procedure code occurs in the pinned Release 18 schema.
     pub const fn reference_known(self) -> bool {
         self.reference_known

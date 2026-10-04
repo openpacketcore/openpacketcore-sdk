@@ -110,6 +110,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ngap`: expose const `UnsupportedProcedure` accessors for the
+  procedure code, triggering outcome and criticality. Value-free envelope
+  metadata is available for every criticality, including silently ignored
+  procedures. Routing, actions and Error Indication diagnostics are unchanged.
+  Fixes #1025.
+
 - `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
   reads to local encryption and remote sealing wrappers. Every returned
   physical record requires a canonical envelope and the existing authenticated
