@@ -5906,6 +5906,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_downlink_hands_inner_fragments_to_the_backend_before_decapsulation() {
+        // A host unit test cannot execute a loaded tc classifier, so prove
+        // the legacy downlink subprogram's order directly. An authorized
+        // inner IPv4 packet reaches the hand-off decision only after the
+        // complete Active graph and the inner destination are proven, and
+        // before the outer envelope is stripped. A fragment of a session
+        // with a downlink inner MTU therefore leaves for the backend-owned
+        // queue undecapsulated, and an unauthorized one is never handed off.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, legacy) = source
+            .split_once("\nfn authorize_and_decap_legacy_downlink(")
+            .expect("legacy downlink subprogram is present");
+        let (legacy, _) = legacy
+            .split_once("\n#[cfg(test)]")
+            .expect("legacy downlink subprogram has a bounded body");
+        let position = |needle: &str| {
+            legacy
+                .find(needle)
+                .unwrap_or_else(|| panic!("legacy downlink subprogram contains `{needle}`"))
+        };
+        let authorized = position("!pdp_commit_wire_authorizes_downlink(commit, teid, binding)");
+        let destination = position("if inner_dst != pdr.ue_ip {");
+        let decision = position("downlink_inner_hand_off_port(ctx, commit, payload_offset)");
+        let hand_off = position("return hand_off_to_backend_queue(ctx, l4_offset, hand_off_port);");
+        let decapsulation = position(".adjust_room(-(strip as i32), BPF_ADJ_ROOM_MAC, 0)");
+        assert!(authorized < destination, "the graph is proven first");
+        assert!(
+            destination < decision,
+            "only a packet for the session's own address is handed off"
+        );
+        assert!(decision < hand_off && hand_off < decapsulation);
+
+        // tc decides with the shared predicate the consumer's tests pin, and
+        // reads the same two inner header fields: Total Length and the
+        // flags/fragment offset word.
+        let (_, decision) = source
+            .split_once("\nfn downlink_inner_hand_off_port(")
+            .expect("hand-off decision subprogram is present");
+        let (decision, _) = decision
+            .split_once("\n}\n")
+            .expect("hand-off decision subprogram has a bounded body");
+        assert!(decision.contains("pdp_commit_wire_downlink_inner_mtu(commit)"));
+        assert!(decision.contains("ctx.load::<u16>(payload_offset + 2)"));
+        assert!(decision.contains("ctx.load::<u16>(payload_offset + 6)"));
+        assert!(decision.contains("downlink_ipv4_hand_off_port("));
+
+        // The hand-off rewrites nothing but the UDP destination port and
+        // its checksum compensation.
+        let (_, steer) = source
+            .split_once("\nfn hand_off_to_backend_queue(")
+            .expect("hand-off subprogram is present");
+        let (steer, _) = steer
+            .split_once("\n}\n")
+            .expect("hand-off subprogram has a bounded body");
+        assert!(steer.contains(".l4_csum_replace("));
+        assert!(steer.contains("BPF_F_MARK_MANGLED_0"));
+        assert!(steer.contains("ctx.store(l4_offset + 2, &to, 0)"));
+        assert_eq!(steer.matches(".store(").count(), 1);
+        assert!(!steer.contains("adjust_room") && !steer.contains("set_mark"));
+    }
+
+    #[test]
     fn successor_traffic_gate_passes_packets_before_exact_activation() {
         // A host unit test cannot execute a loaded tc classifier, so prove the
         // actual classifier-root contract directly: every disabled successor

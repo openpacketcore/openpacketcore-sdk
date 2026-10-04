@@ -42,6 +42,8 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/backend_inner_fragment_hand_off.rs"]
+mod backend_inner_fragment_hand_off;
 #[path = "ebpf_gtpu_privileged/backend_inner_fragmentation.rs"]
 mod backend_inner_fragmentation;
 #[path = "ebpf_gtpu_privileged/backend_packet_too_big.rs"]
@@ -9145,6 +9147,13 @@ async fn ebpf_gtpu_downlink_packet_too_big_baseline_without_opt_in(
 async fn ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel(
 ) -> Result<(), Box<dyn std::error::Error>> {
     backend_inner_fragmentation::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_inner_fragments_take_the_backend_queue(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_inner_fragment_hand_off::qualify().await
 }
 
 #[tokio::test]
