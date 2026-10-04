@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oif_ifindex: 42,
         table: 100,
         priority: Some(10),
+        locked_mtu: None,
     };
     let rule = RuleRequest {
         source: Some(prefix),
