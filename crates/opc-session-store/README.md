@@ -1383,6 +1383,39 @@ envelope key ID for historical-key lookup. A provider outage therefore blocks
 a new plaintext write before consensus submission but does not prevent already
 sealed Raft traffic, replay, or quorum formation.
 
+Both protection wrappers default to `EnvelopeReadPolicy::MigrationCompatible`,
+which retains intentional legacy/plaintext reads and unclassified-row probing.
+Configure `.with_read_policy(EnvelopeReadPolicy::RequireEnvelopeV1)` to require
+the physical payload's `EnvelopeV1` encoding and canonical envelope structure
+before any compatibility decoding or plaintext normalization. Strict reads
+reject `Plaintext`, `LegacyPlaintext`, and `Unclassified` even when their bytes
+contain a valid application record or a valid encrypted envelope. Canonical
+structure alone does not authenticate a record: the existing local AEAD or
+remote unseal and record/namespace AAD checks still run. Failures retain the
+fixed, value-free crypto errors. Clones, trait-object handles, and watch
+streams preserve the configured policy.
+
+The selection covers point reads, CAS-conflict records, individual batch
+get/CAS results, restore scans, replication-log pages, watch items, and fenced
+observations. Ordinary successful records still carry caller-facing
+`Plaintext`. Protected-roster replication operations retain their exact
+physical records for replay: strict reads authenticate the predecessor,
+`Put` successor, and creation record using each record's own header, discard
+the temporary plaintext, and return the original ciphertext unchanged. This
+includes records nested in replication batches; a failed record rejects its
+complete log page or watch item. Previously yielded watch items remain valid.
+The stronger protected-observation and quorum guards remain mandatory under
+either policy. Outbound encryption, remote sealing, and exact protected
+replication bytes are unchanged.
+
+Read admission does not repair, normalize in storage, or delete a rejected
+record. It runs after the inner backend returns: standalone SQLite may perform
+its normal expiry pruning, and a batch's requested sibling mutations may
+already have taken effect before returned read slots are checked. A failed
+batch read slot therefore does not imply rollback of the whole batch. This
+policy establishes payload format admission and authentication, not storage
+freshness or anti-rollback protection.
+
 `EnvelopeV1` is a validated boundary, not a caller assertion. Construction and
 deserialization require the canonical RFC 003 envelope and session AAD; the
 consensus adapter additionally matches the visible tenant, NF kind, state
