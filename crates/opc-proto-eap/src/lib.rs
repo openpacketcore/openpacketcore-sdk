@@ -1,4 +1,29 @@
-//! Typed EAP-AKA projections and bounded EAP-5G bootstrap envelopes.
+//! Typed EAP admission, Success/Failure, AKA projections and EAP-5G envelopes.
+//!
+//! [`EapPacket::parse`] classifies Request, Response, Success and Failure from
+//! common header framing. It ignores lower-layer padding beyond the declared
+//! Length (RFC 3748 section 4). Success/Failure require Length 4 and no Data;
+//! Request/Response retain only the declared packet for explicit method parsing
+//! through [`EapMethodPacket::parse_aka`] or [`EapMethodPacket::parse_eap5g`].
+//! The direct method parsers retain their exact complete-packet length contract.
+//!
+//! [`EapSuccess`] and [`EapFailure`] encode exactly four octets without allocating.
+//! Their identifier must equal the last Response being answered (RFC 3748 section
+//! 4.2); each provides a `matches_response_identifier` helper. Equality checks
+//! correlation only, and a parsed terminal packet does not prove authentication.
+//! Admission and terminal diagnostics omit identifiers and packet values.
+//!
+//! ```
+//! use opc_proto_eap::{EapPacket, EapPacketError, EapSuccess};
+//!
+//! let wire = EapSuccess::new(7).encode();
+//! assert_eq!(wire, [3, 7, 0, 4]);
+//! assert!(matches!(
+//!     EapPacket::parse(&wire)?,
+//!     EapPacket::Success(success) if success.matches_response_identifier(7)
+//! ));
+//! # Ok::<(), EapPacketError>(())
+//! ```
 //!
 //! [`eap5g`] constructs and parses TS 24.502 bootstrap messages with typed AN
 //! parameters, explicit caller bounds and opaque NAS. Its public value wrappers
@@ -10,8 +35,8 @@
 //! method/subtype direction, RFC-defined attribute combinations, EAP-AKA-prime
 //! KDF negotiation shapes, and Notification S/P semantics.
 //!
-//! Parsing is allocation-free and the source bytes remain private. Public
-//! evidence contains only numeric identifiers, booleans, counts, and typed
+//! AKA parsing is allocation-free and the source bytes remain private. Public
+//! AKA evidence contains only numeric identifiers, booleans, counts, and typed
 //! enums, with one deliberate exception: the identity a peer asserts in
 //! `AT_IDENTITY` is reachable through
 //! [`EapAkaPacket::asserted_identity`](model::EapAkaPacket::asserted_identity),
@@ -25,7 +50,7 @@
 //! packets; derive keys; or declare an authentication complete. Those
 //! stateful/cryptographic operations remain caller-owned.
 //!
-//! @spec IETF RFC3748 4.1
+//! @spec IETF RFC3748 4-4.2
 //! @spec IETF RFC4187 6-10
 //! @spec IETF RFC9048 3-6
 //! @spec IETF RFC5998 3, 4, 6.1
@@ -38,6 +63,7 @@
 
 mod error;
 mod model;
+mod packet;
 mod parser;
 
 pub mod eap5g;
@@ -49,3 +75,4 @@ pub use model::{
     EapAkaNotificationEvidence, EapAkaNotificationPhase, EapAkaPacket, EapAkaPacketKind,
     EapAkaSubtype, EapCode, EAP_AKA_HEADER_LEN, EAP_AKA_MAX_ATTRIBUTES, EAP_AKA_MAX_KDF_ATTRIBUTES,
 };
+pub use packet::{EapFailure, EapMethodPacket, EapPacket, EapPacketError, EapSuccess};
