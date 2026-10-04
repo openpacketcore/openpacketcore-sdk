@@ -43,6 +43,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Keep the Rust 1.98.1 pin until the MSRV-aware migration in #1041.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions-minor-and-patch:
         patterns:
