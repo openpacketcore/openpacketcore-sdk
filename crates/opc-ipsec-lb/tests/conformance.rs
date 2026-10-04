@@ -739,6 +739,7 @@ async fn bgp_vip_advertiser_programs_host_route_for_export() {
             oif_ifindex: 42,
             table: 100,
             priority: Some(10),
+            locked_mtu: None,
         })]
     );
 }

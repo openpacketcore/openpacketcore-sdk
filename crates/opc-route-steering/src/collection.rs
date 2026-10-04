@@ -98,6 +98,7 @@ impl OwnedRouteRuleScope {
             oif_ifindex: output_interface,
             table,
             priority: route_priority,
+            locked_mtu: None,
         };
         validate_route_request(&representative)?;
         if rule_priority == 0 {

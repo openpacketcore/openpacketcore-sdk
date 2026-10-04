@@ -4,12 +4,21 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::collection::RouteSteeringIpFamily;
 use crate::error::RouteSteeringError;
-use crate::model::{FirewallMark, IpPrefix, RouteRequest, RuleRequest};
+use crate::model::{FirewallMark, IpPrefix, RouteMtu, RouteRequest, RuleRequest};
 
 pub(crate) fn validate_route_request(request: &RouteRequest) -> Result<(), RouteSteeringError> {
     validate_prefix(request.destination, "route.destination")?;
     validate_ifindex(request.oif_ifindex, "route.oif_ifindex")?;
-    validate_table(request.table, "route.table")
+    validate_table(request.table, "route.table")?;
+    if let Some(mtu) = request.locked_mtu {
+        if !request.destination.is_ipv4() && mtu.get() < RouteMtu::IPV6_MIN {
+            return Err(RouteSteeringError::invalid_config(
+                "route.locked_mtu",
+                "IPv6 route MTU is below the 1280-byte minimum link MTU",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Canonical route metric as represented by the Linux FIB.
@@ -36,6 +45,7 @@ pub(crate) fn canonical_route_request(request: &RouteRequest) -> RouteRequest {
         oif_ifindex: request.oif_ifindex,
         table: request.table,
         priority: canonical_route_priority(request),
+        locked_mtu: request.locked_mtu,
     }
 }
 

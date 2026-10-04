@@ -31,6 +31,7 @@ async fn live_absent_documentation_prefix_readback_completes() {
         oif_ifindex: 1,
         table: 4_000_000_001,
         priority: Some(u32::MAX - 1),
+        locked_mtu: None,
     };
     assert_eq!(
         backend.read_route(&request).await.unwrap(),
@@ -77,6 +78,7 @@ async fn live_default_route_readback_is_table_scoped_and_same_table_fail_closed(
         oif_ifindex: ifindex,
         table: OWNED_TABLE,
         priority: None,
+        locked_mtu: None,
     };
 
     ip(&[
@@ -168,6 +170,7 @@ async fn live_privileged_pair_converges_retries_and_removes_exact_state() {
         oif_ifindex: 1,
         table: 4_000_000_001,
         priority: Some(u32::MAX - 1),
+        locked_mtu: None,
     };
     let rule = RuleRequest {
         source: Some(prefix),
@@ -258,6 +261,7 @@ async fn live_privileged_pair_converges_retries_and_removes_exact_state() {
         oif_ifindex: 1,
         table: route.table,
         priority: Some(u32::MAX - 3),
+        locked_mtu: None,
     };
     let ipv6_rule = RuleRequest {
         source: Some(ipv6_prefix),
@@ -357,6 +361,7 @@ async fn live_multiple_candidates_are_conflicts_and_exact_removal_preserves_them
         oif_ifindex: 1,
         table: 4_000_000_101,
         priority: Some(101),
+        locked_mtu: None,
     };
     ip(&[
         "route",
@@ -455,6 +460,7 @@ async fn live_foreign_protocol_and_zero_mark_rules_are_never_adopted_or_deleted(
         oif_ifindex: 1,
         table: 4_000_000_102,
         priority: Some(201),
+        locked_mtu: None,
     };
     ip(&[
         "route",
@@ -599,6 +605,7 @@ async fn live_default_route_priorities_and_cancelled_clone_pair_are_stable() {
         oif_ifindex: 1,
         table: 4_000_000_104,
         priority: None,
+        locked_mtu: None,
     };
     assert_eq!(
         backend.converge_route(ipv4.clone()).await.unwrap(),
@@ -620,6 +627,7 @@ async fn live_default_route_priorities_and_cancelled_clone_pair_are_stable() {
         oif_ifindex: 1,
         table: 4_000_000_105,
         priority: None,
+        locked_mtu: None,
     };
     assert_eq!(
         backend.converge_route(ipv6.clone()).await.unwrap(),
@@ -638,6 +646,7 @@ async fn live_default_route_priorities_and_cancelled_clone_pair_are_stable() {
         oif_ifindex: 1,
         table: 4_000_000_106,
         priority: Some(301),
+        locked_mtu: None,
     };
     let pair_rule = RuleRequest {
         source: Some(pair_route.destination),

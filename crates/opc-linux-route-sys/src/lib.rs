@@ -137,6 +137,12 @@ pub const RTA_DST: u16 = 1;
 pub const RTA_OIF: u16 = 4;
 /// Route attribute: metric/priority.
 pub const RTA_PRIORITY: u16 = 6;
+/// Route attribute: nested route metrics (`RTAX_*`).
+pub const RTA_METRICS: u16 = 8;
+/// Route metric: bitmask of locked metrics, indexed by `RTAX_*` value.
+pub const RTAX_LOCK: u16 = 1;
+/// Route metric: path MTU.
+pub const RTAX_MTU: u16 = 2;
 /// Route attribute: non-identity kernel cache metadata.
 pub const RTA_CACHEINFO: u16 = 12;
 /// Route attribute: route table as u32.
