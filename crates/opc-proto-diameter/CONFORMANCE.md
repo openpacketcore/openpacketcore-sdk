@@ -507,7 +507,7 @@ authorization-success signal.
 
 | AVP | TS 29.273 presence/condition | Wire identity, flags, and typed field | Positive / negative evidence |
 |:----|:-----------------------------|:--------------------------------------|:-----------------------------|
-| `APN-OI-Replacement` | Conditional on exact `DIAMETER_SUCCESS`, non-emergency access, and proven network-based mobility | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton; understood outer M mismatch accepted; `SwmApnOiReplacement` | Checked construction and raw parse require case-insensitive `[prefix.]mncNNN.mccNNN.gprs`, with exactly three PLMN digits. Empty/overlong/malformed suffixes, P/vendor, duplicate occurrence, direct-builder use, emergency/result/local-assignment/absent-provenance, and explicit AAA override cases are covered. |
+| `APN-OI-Replacement` | Exact `DIAMETER_SUCCESS`; origination and ordinary correlation require non-emergency access and proven network-based mobility; received emergency profiles are retained and ignored | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton; understood outer M mismatch accepted; `SwmApnOiReplacement` | Checked construction and raw parse require case-insensitive `[prefix.]mncNNN.mccNNN.gprs`, with exactly three PLMN digits. Empty/overlong/malformed suffixes, P/vendor, duplicate occurrence, direct-builder use, originating emergency/result/local-assignment/absent-provenance, and explicit AAA override cases are covered. Receive-only emergency tolerance is covered alone and with APN-Configuration. |
 | `Subscription-Id` (MSISDN) | Conditional only on the MSISDN being available | IETF 443 Grouped, canonical V clear/M set/P permitted, singleton; understood outer M mismatch accepted. Required IETF 450 `END_USER_E164` and 444 UTF8String children remain V clear/M set/P permitted; `SwmSubscriptionId` / `SwmE164Number` | One-to-fifteen decimal digits beginning 1..9 round trip in redacted zeroize-on-drop storage. Wrong type, zero prefix/dummy, `+`/separator syntax, overlength, missing/duplicate child, strict child flags, unknown M-set child, and duplicate outer group fail. Optional unknown children are bounded and sealed under Preserve, discarded under Drop, and replayed after the canonical required children. |
 | `3GPP-Charging-Characteristics` | Optional subscriber charging fact | 3GPP 10415/13, UTF8String, canonical V set/M clear/P permitted, singleton; understood outer M mismatch accepted; `SwmChargingCharacteristics` | Exactly four upper/lowercase hexadecimal characters decode to two octets; builders emit uppercase and P clear. Non-hex, wrong length/vendor, and duplicates fail. Diagnostics do not expose the value. |
 | `UE-Usage-Type` | Conditional on subscription information being available | 3GPP 10415/1680, Unsigned32, V set/P clear and understood M mismatch accepted, singleton; `SwmUeUsageType` | Values 0..=255 round trip; 256, wrong width/vendor/P, and duplicates fail. Builders emit M clear and diagnostics hide the classification. |
@@ -870,7 +870,7 @@ shape, public typed boundary, and independent positive/negative fixture module.
 
 | AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
 |:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
-| `APN-OI-Replacement` | Conditional on successful non-emergency network-based authorization | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton | `SwmDeaSubscriberAuthorization::apn_oi_replacement` | `swm_diameter_eap_subscriber_authorization.rs`: valid PLMN suffix and request-bound mobility provenance pass; syntax/length, vendor/flags, duplicate, result/emergency/mobility contradictions fail |
+| `APN-OI-Replacement` | Successful non-emergency network-based origination and ordinary correlation; successful received emergency profiles are ignored | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton | `SwmDeaSubscriberAuthorization::apn_oi_replacement` (raw wire value) | `swm_diameter_eap_subscriber_authorization.rs`: valid PLMN suffix and request-bound mobility provenance pass; syntax/length, vendor/flags, duplicate, result/originating-emergency/mobility contradictions fail. `swm_diameter_eap_apn_completion.rs` covers ignored received emergency profiles, alone and with APN-Configuration. |
 | `APN-Configuration` and remaining children | Conditional authorized subscription profile | 3GPP 10415/1430, Grouped, canonical V/M set and P clear; baseline 0-1, ordered repetition only in the explicit projected profile | `SwmDiameterEapAnswer::apn_configurations`, `SwmAuthorizedApnConfiguration`, correlated authorization views | `swm_diameter_eap_apn_completion.rs`: complete core/supplement and Specific-APN-Info pass; missing/duplicate/misnested children, vendor/flags/type/length, prohibited SWm children, retention limits, mutation/transplant, and mobility/address contradictions fail |
 | `MIP6-Feature-Vector` | Conditional successful mobility selection | IETF 124, Unsigned64, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mip6_feature_vector` / correlated effective mobility | `app_dictionaries.rs`: offered PMIPv6/GTPv2 collective selection and RFC 5447 success-with-omitted-vector local fallback pass; unsolicited/non-success, local-address plus NBM contradiction, wrong width/flags/vendor, and duplicate fail |
 | `Mobile-Node-Identifier` | Conditional permanent identity | IETF 506, UTF8String, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mobile_node_identifier` | `app_dictionaries.rs`: synthetic UTF-8 identity round trip passes; malformed UTF-8, flags/vendor, duplicate, and request/correlated-identity mismatch fail with redacted diagnostics |
@@ -1041,6 +1041,37 @@ DER/DEA transaction and application facts. Its
 `authorized_apn_configurations` method additionally rejects wildcard parents
 and unsupported PDN enum values as broad authorization grants. Both remain
 preserved and re-encodable on the raw answer core surface.
+
+For GTPv2-based S2b, TS 29.273 section 7.1.2.1.4 and TS 23.402 section 7.2.5
+require a receiver to ignore subscription information in an emergency answer.
+The consumer uses local Emergency Configuration Data (TS 23.402 section 13.5)
+to select the emergency APN; that table has no PDN-type field. Parsed exact
+`DIAMETER_SUCCESS` answers therefore tolerate APN-Configuration and top-level
+APN-OI-Replacement, alone or together, irrespective of subscription APN/PDN
+authorization or ordinary APN mobility conditions. This is receiver tolerance,
+not authorization to use emergency service on another access protocol.
+
+Both correlated types expose `subscription_apn_configurations_ignored()` for
+either ignored AVP, including APN-OI-Replacement alone. The response's
+`default_apn_configuration_view()` and `authorized_apn_configurations()` return
+`EmergencyRequest` for that profile. `apn_configuration_views()` and the
+answer-local `default_apn_configuration()` remain raw wire accessors; the
+top-level subscriber bundle also retains its raw APN-OI value. Consumers must
+not use those raw values to authorize or select emergency service. Emergency
+status comes only from the retained request: every DER in a multi-round
+emergency exchange must carry Emergency-Services, including the final request.
+The codec does not infer or retain session-wide emergency policy.
+
+TS 29.273 table 7.1.2.1.1/2 still prohibits sending APN-Configuration and
+APN-OI-Replacement for an emergency DER. The request-bound answer builders and
+`correlate_answer` for locally built answers enforce that rule. Immutable parsed
+replay retains the received wire facts. Full AVP validation, authenticated peer,
+session, transaction, application, mobility offer, and EAP verification remain
+required. Ordinary APN authorization and non-success answer rules are unchanged.
+Synthetic integration and correlation unit tests cover APN/PDN differences,
+APN-OI alone/together, several APNs, local-assignment receive context, sender
+rejection, malformed profiles at parsing and correlation, non-success answers,
+both ignored-profile queries, and retained binding and terminal EAP checks.
 
 The understood outer `APN-Configuration` requires V, clears P, and accepts
 either inbound M shape under TS 29.273 table 7.2.3.1/1 note 2; canonical

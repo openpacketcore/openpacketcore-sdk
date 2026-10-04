@@ -650,7 +650,25 @@ caller policy.
   after authenticated connection generation, expected Origin-Host/Realm, and
   complete DER/DEA correlation. Its `apn_configuration_views` method preserves
   wildcard and future-PDN wire facts; its `authorized_apn_configurations`
-  method additionally rejects both as broad policy grants.
+  method additionally rejects both as broad policy grants. For a successful
+  received emergency answer, `subscription_apn_configurations_ignored()` on
+  both `SwmCorrelatedDiameterEapResponse` and `SwmCorrelatedDiameterEapExchange`
+  reports whether `APN-Configuration` or top-level `APN-OI-Replacement` was
+  present and ignored, alone or together. The response's
+  `default_apn_configuration_view` and `authorized_apn_configurations` both
+  return `SwmApnConfigurationErrorCode::EmergencyRequest` for that profile.
+  `apn_configuration_views` and the answer-local `default_apn_configuration`
+  remain raw wire accessors; the subscriber bundle's APN-OI getter likewise
+  retains a raw value. None authorizes the emergency service.
+
+  TS 29.273 section 7.1.2.1.4 states this receiver tolerance for GTPv2-based
+  S2b; TS 23.402 section 7.2.5 keeps received subscription information unused.
+  The consumer selects the emergency APN using local Emergency Configuration
+  Data (TS 23.402 section 13.5); that table does not define a PDN-type field.
+  The codec does not authorize emergency service on another access protocol.
+  Emergency status is determined per retained DER, with no session-wide memory:
+  the consumer must set Emergency-Services on every request of a multi-round
+  emergency exchange, including the request answered by the final DEA.
 
   APN network identifiers follow TS 23.003 section 9.1.1, including the
   63-octet label-encoded limit and reserved-name restrictions. An exact `*`
@@ -695,8 +713,13 @@ caller policy.
   # }
   ```
 
-  APN profile material requires exact base `DIAMETER_SUCCESS` and is forbidden
-  for an emergency DER. Network-based-only fields require explicit AAA NBM
+  APN profile material requires exact base `DIAMETER_SUCCESS`. The sender rule
+  in TS 29.273 table 7.1.2.1.1/2 prohibits APN-Configuration and
+  APN-OI-Replacement for an emergency DER. Request-bound builders, the checked
+  authorization mutator, and `correlate_answer` for locally built answers retain
+  that rule. Receive tolerance applies only to answers parsed from wire bytes;
+  malformed AVPs still fail, and immutable parsed replay preserves wire facts.
+  For ordinary requests, network-based-only fields require explicit AAA NBM
   selection, or trusted local `NetworkBased` provenance when the DEA omits its
   mobility vector. Local address assignment permits only the HA-APN core plus
   a gateway identity for IKEv2 Home-Agent discovery. If the DEA carries an
@@ -1151,11 +1174,15 @@ present on SWm, `MPS-EPS-Priority` must be set; all-zero and CS- or
 messaging-only masks fail on parse and build.
 
 `APN-OI-Replacement` is the one request/result-conditioned value in this
-bundle: it requires exact base `DIAMETER_SUCCESS`, a non-emergency DER, and a
-correlated effective network-based mobility mode. A DER offer of either PMIPv6
-or GTPv2 permits the collective network-based mobility selection defined by TS
-29.273. An explicit DEA `MIP6-Feature-Vector` is AAA-derived and always takes
-precedence. When the DEA omits that vector, an application may attach trusted
+bundle: origination and ordinary request correlation require exact base
+`DIAMETER_SUCCESS`, a non-emergency DER, and a correlated effective
+network-based mobility mode. A successful received emergency answer instead
+retains and ignores the value, even without APN-Configuration; both correlated
+types report it through `subscription_apn_configurations_ignored()`. The raw
+getter remains a wire observation, not emergency authorization. A DER offer of
+either PMIPv6 or GTPv2 permits the collective network-based mobility selection
+defined by TS 29.273. An explicit DEA `MIP6-Feature-Vector` is AAA-derived and
+always takes precedence. When the DEA omits that vector, an application may attach trusted
 local mode provenance to the retained request envelope with
 `with_locally_configured_mobility_mode`; parsed and default envelopes invent no
 such provenance and fail closed for APN-OI. Originate APN-OI only through

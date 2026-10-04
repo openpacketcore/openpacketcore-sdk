@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `opc-ipsec-xfrm`: add explicit startup reset for an exclusively owned
+  namespace whose caller retains no predecessor state. The namespace actor
+  flushes every policy type and SA protocol, proves empty tables, then durably
+  resets bound recovery stores under their leases while advancing writer
+  epochs. Failure or an unobserved reply keeps mutations closed for retry;
+  reset is refused after ordinary command admission. Includes mock parity and
+  a privileged process-loss proof. Never combine reset with predecessor
+  adoption or recovery; stop plaintext sources until protection is reinstalled.
+
 ### Fixed
+
+- `opc-proto-diameter`: tolerate received successful SWm emergency
+  Diameter-EAP answers carrying subscription APN-Configuration and/or
+  APN-OI-Replacement, following the GTPv2-based S2b receiver rule in TS 29.273
+  section 7.1.2.1.4 and TS 23.402 sections 7.2.5 and 13.5. Both correlated
+  types report the profile as present and ignored; the response's default-APN
+  resolver and authorization accessor refuse it. `apn_configuration_views`
+  and the answer-local `default_apn_configuration` remain raw wire accessors,
+  and the subscriber bundle retains raw APN-OI, without emergency authorization.
+  Request-bound builders and locally built answer correlation retain the sender
+  prohibition. Emergency status is per request, so consumers must mark every
+  DER in the exchange. Malformed AVPs and non-success profiles still fail;
+  ordinary APN authorization and peer, session, transaction, and EAP checks
+  remain required.
 
 - `opc-linux-xfrm-sys`: correct `XFRMA_SA_DIR` to Linux UAPI attribute 33
   and expose the adjacent timer, NAT keepalive, and per-CPU SA constants.

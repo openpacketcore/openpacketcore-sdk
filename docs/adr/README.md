@@ -38,3 +38,4 @@ accepted.
 | [0023](0023-bounded-configuration-history.md) | Configuration history is pruned only by an acknowledged, exact-head consensus decision with authenticated boundaries, protected references, and atomic capacity rejection. |
 | [0024](0024-route-operation-conflict-exclusion.md) | Route operations exclude intersecting kernel keys while independent operations use bounded concurrent workers; dispatched inverses retain exclusion after cancellation. |
 | [0025](0025-management-audit-continuity.md) | Management signing transitions, complete frozen exports and acknowledged pruning share the configuration authority and verify an independently stored monotonic checkpoint. |
+| [0026](0026-exclusive-xfrm-namespace-reset.md) | An exclusive writer retaining no predecessor state can reset namespace XFRM tables and bound stores before ordinary actor commands, with ordered empty readback and monotonic writer epochs. |

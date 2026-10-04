@@ -2114,6 +2114,28 @@ impl XfrmObjectRosterRecoveryStore {
         lease.advance_epoch(&inventory)
     }
 
+    /// Forget all predecessor rosters after the actor proved the namespace
+    /// empty. The epoch witness is durable before journal replacement or any
+    /// legacy record unlink, so an interrupted reset never rewinds authority.
+    pub(crate) fn reset_after_namespace_empty(&self) -> Result<(), XfrmObjectRosterDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        let epoch = lease.advance_epoch(&inventory)?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = epoch;
+        if inventory.journal {
+            #[cfg(target_os = "linux")]
+            compact_journal(lease.store, &[], epoch)?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(XfrmObjectRosterDurableError::Storage);
+        } else {
+            for (name, _) in &inventory.records {
+                lease.remove_record(name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// True only for clones sharing this exact open store lease.
     pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -6951,6 +6973,115 @@ mod tests {
         ] {
             assert!(!phase.as_str().is_empty());
             assert!(!phase.as_str().contains('-'));
+        }
+    }
+    #[test]
+    fn exclusive_reset_clears_unresolved_journals_and_fences_old_handles() {
+        for phase in [
+            XfrmObjectRosterDurablePhase::Prepared,
+            XfrmObjectRosterDurablePhase::Issuing,
+            XfrmObjectRosterDurablePhase::Applied,
+            XfrmObjectRosterDurablePhase::Compensating,
+        ] {
+            for interrupted_epoch in [false, true] {
+                let root = TestRoot::new();
+                let store = store(&root);
+                let prepared = store
+                    .prepare(group(0x71), generation(1), &members(2))
+                    .unwrap();
+                let handle = match phase {
+                    XfrmObjectRosterDurablePhase::Prepared => prepared,
+                    XfrmObjectRosterDurablePhase::Issuing => advance(
+                        &store,
+                        &prepared,
+                        XfrmObjectRosterDurablePhase::Prepared,
+                        enter_issuing(2),
+                    ),
+                    XfrmObjectRosterDurablePhase::Applied => run_to_applied(&store, &prepared, 2),
+                    XfrmObjectRosterDurablePhase::Compensating => {
+                        let applied = run_to_applied(&store, &prepared, 2);
+                        advance(
+                            &store,
+                            &applied,
+                            XfrmObjectRosterDurablePhase::Applied,
+                            XfrmObjectRosterTransition::new(
+                                XfrmObjectRosterDurablePhase::Compensating,
+                                1,
+                            ),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let epoch = store.lease().unwrap().inventory().unwrap().epoch;
+                if interrupted_epoch {
+                    let lease = store.lease().unwrap();
+                    lease.advance_epoch(&lease.inventory().unwrap()).unwrap();
+                }
+                drop(store);
+                let reopened = self::store(&root);
+                reopened.reset_after_namespace_empty().unwrap();
+                assert!(reopened.inspect(&handle).is_err());
+                assert!(!reopened.has_unresolved_writer_authority().unwrap());
+                let inventory = reopened.lease().unwrap().inventory().unwrap();
+                assert!(inventory.records.is_empty());
+                assert!(inventory.epoch > epoch);
+                drop(reopened);
+                let reopened = self::store(&root);
+                assert_eq!(
+                    reopened.lease().unwrap().inventory().unwrap().epoch,
+                    inventory.epoch
+                );
+                let fresh = reopened
+                    .prepare(group(0x71), generation(1), &members(2))
+                    .unwrap();
+                assert!(reopened.inspect(&handle).is_err());
+                assert_eq!(
+                    reopened.inspect(&fresh).unwrap(),
+                    XfrmObjectRosterDurablePhase::Prepared
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exclusive_reset_clears_every_legacy_roster_phase_without_rewinding_epoch() {
+        for (_, mut record) in valid_records() {
+            let root = TestRoot::new();
+            let mut store = store(&root);
+            // Synthetic pre-journal store, retaining its original control/epoch.
+            if store.inner.journal_enabled {
+                fs::remove_file(root.path().join(JOURNAL_NAME)).unwrap();
+                Arc::get_mut(&mut store.inner).unwrap().journal_enabled = false;
+            }
+            record.store_incarnation = store.inner.control.store_incarnation;
+            record.namespace_seal = store.inner.control.namespace_seal;
+            record.actor_incarnation = store.inner.control.actor_incarnation;
+            let lease = store.lease().unwrap();
+            record.writer_epoch = lease.inventory().unwrap().epoch;
+            lease
+                .publish_record(&record, PublicationClass::Prepare)
+                .unwrap();
+            drop(lease);
+            let handle = record.handle(&store.inner.proof_key).unwrap();
+            store.reset_after_namespace_empty().unwrap();
+            assert!(store.inspect(&handle).is_err());
+            let inventory = store.lease().unwrap().inventory().unwrap();
+            assert!(inventory.records.is_empty());
+            assert!(inventory.epoch > record.writer_epoch);
+            drop(store);
+            let reopened = self::store(&root);
+            assert!(reopened
+                .lease()
+                .unwrap()
+                .inventory()
+                .unwrap()
+                .records
+                .is_empty());
+            assert_eq!(
+                reopened.lease().unwrap().inventory().unwrap().epoch,
+                inventory.epoch
+            );
+            reopened.advance_writer_epoch().unwrap();
         }
     }
 }

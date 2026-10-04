@@ -2751,6 +2751,9 @@ impl SwmDiameterEapRequestEnvelope {
     /// This checks both Diameter identifiers plus Session-Id, application, and
     /// Auth-Request-Type. Live transports must consume their pending-request
     /// entry before calling this codec-level correlation step.
+    /// Parsed successful emergency answers tolerate ignored subscription APN
+    /// data; locally built answers retain the sender prohibition. Every DER
+    /// of an emergency exchange must carry its own emergency indication.
     pub fn correlate_answer(
         self,
         answer: SwmDiameterEapAnswerEnvelope,
@@ -2836,7 +2839,11 @@ impl SwmCorrelatedDiameterEapExchange {
         self.request.request()
     }
 
-    /// Borrow the correlated DEA facts.
+    /// Borrow the correlated DEA wire facts, not an emergency policy grant.
+    ///
+    /// The answer's public APN fields, raw default resolver, and subscriber
+    /// bundle retain ignored subscription information. Check
+    /// [`Self::subscription_apn_configurations_ignored`] before applying policy.
     pub const fn answer(&self) -> &SwmDiameterEapAnswer {
         self.answer.answer()
     }
@@ -6228,6 +6235,9 @@ impl SwmDiameterEapRequest {
     }
 
     /// Return whether the DER requests a PDN connection for emergency services.
+    ///
+    /// This checks only this request. Consumers must mark every DER in a
+    /// multi-round emergency exchange; no session-wide emergency state is inferred.
     pub fn requests_emergency_services(&self) -> bool {
         self.emergency_services
             .is_some_and(SwmEmergencyServices::is_emergency_indicated)
@@ -6748,7 +6758,9 @@ impl SwmDiameterEapAnswer {
     /// exact `DIAMETER_SUCCESS` and the profile has a pointer that resolves
     /// without violating any child identifier or Service-Selection invariant.
     /// Its return value is still an uncorrelated wire core; authorization code
-    /// must use the correlated exchange's checked APN surface.
+    /// must use the correlated response's checked APN surface.
+    /// This raw resolver also retains an ignored emergency subscription default.
+    /// The correlated response's default resolver refuses that profile instead.
     pub fn default_apn_configuration(&self) -> Option<&ApnConfiguration> {
         validate_apn_profile(self).ok()?;
         let default_context_identifier = self.default_context_identifier?;
@@ -8325,6 +8337,9 @@ fn build_swm_diameter_eap_answer_internal(
 ///
 /// This helper copies both Diameter correlation identifiers from `request`
 /// and rejects mismatched application-level request facts before encoding.
+/// Emergency requests prohibit originating subscription `APN-Configuration`
+/// and `APN-OI-Replacement` (TS 29.273 table 7.1.2.1.1/2). Receive tolerance
+/// for those AVPs does not grant sender permission.
 pub fn build_swm_diameter_eap_answer_for(
     request: &SwmDiameterEapRequestEnvelope,
     answer: &SwmDiameterEapAnswer,
@@ -8401,14 +8416,23 @@ fn validate_swm_diameter_eap_answer_for(
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
         )
-        || !subscriber_authorization_matches_request(request, answer)
+        || !subscriber_authorization_matches_request(
+            request,
+            answer,
+            SwmDiameterEapAnswerEnvelopeProvenance::Outbound,
+        )
         || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
             request_facts.oc_supported_features.as_ref(),
             answer.oc_supported_features.as_ref(),
             answer.oc_olr.as_ref(),
         )
         .is_err()
-        || apn::validate_for_request(request, answer).is_err()
+        || apn::validate_for_request(
+            request,
+            answer,
+            SwmDiameterEapAnswerEnvelopeProvenance::Outbound,
+        )
+        .is_err()
     {
         return Err(encode_structural_error(
             "SWm DEA does not correlate to the supplied DER",
@@ -10913,6 +10937,7 @@ fn mobility_answer_matches_offer(
 fn subscriber_authorization_matches_request(
     request: &SwmDiameterEapRequestEnvelope,
     answer: &SwmDiameterEapAnswer,
+    provenance: SwmDiameterEapAnswerEnvelopeProvenance,
 ) -> bool {
     let network_based_mobility_authorized = matches!(
         effective_mobility_mode(request, answer),
@@ -10923,6 +10948,7 @@ fn subscriber_authorization_matches_request(
         answer.result.is_diameter_success(),
         request.request().requests_emergency_services(),
         network_based_mobility_authorized,
+        provenance,
     )
     .is_ok()
 }
@@ -11286,14 +11312,18 @@ fn ensure_correlated_answer(
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
         )
-        || !subscriber_authorization_matches_request(request_envelope, answer)
+        || !subscriber_authorization_matches_request(
+            request_envelope,
+            answer,
+            answer_envelope.provenance,
+        )
         || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
             request.oc_supported_features.as_ref(),
             answer.oc_supported_features.as_ref(),
             answer.oc_olr.as_ref(),
         )
         .is_err()
-        || apn::validate_for_request(request_envelope, answer).is_err()
+        || apn::validate_for_request(request_envelope, answer, answer_envelope.provenance).is_err()
     {
         return Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch);
     }
@@ -11378,7 +11408,11 @@ fn ensure_correlated_response(
         ) {
             return Err(SwmDiameterEapCorrelationError::MobilityFeatureMismatch);
         }
-        if !subscriber_authorization_matches_request(request_envelope, answer) {
+        if !subscriber_authorization_matches_request(
+            request_envelope,
+            answer,
+            SwmDiameterEapAnswerEnvelopeProvenance::Parsed,
+        ) {
             return Err(SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch);
         }
         if lifecycle::validate_diameter_eap_answer_overload_control_for_request(
@@ -11390,7 +11424,13 @@ fn ensure_correlated_response(
         {
             return Err(SwmDiameterEapCorrelationError::OverloadControlMismatch);
         }
-        if apn::validate_for_request(request_envelope, answer).is_err() {
+        if apn::validate_for_request(
+            request_envelope,
+            answer,
+            SwmDiameterEapAnswerEnvelopeProvenance::Parsed,
+        )
+        .is_err()
+        {
             return Err(SwmDiameterEapCorrelationError::ApnAuthorizationMismatch);
         }
         if answer.validate_for_correlation().is_err() {
@@ -11951,6 +11991,78 @@ mod diameter_eap_correlation_tests {
             ambr: None,
         });
         answer
+    }
+
+    #[test]
+    fn malformed_emergency_subscription_apns_are_still_rejected() {
+        let mut request = bound_request();
+        request.request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+        for invalid_profile in 0..4 {
+            let mut answer = authorized_apn_answer();
+            match invalid_profile {
+                0 => answer.default_context_identifier = Some(99),
+                1 => answer.apn_configurations[0].context_identifier = 0,
+                2 => answer.apn_configurations[0].service_selection = "".to_owned().into(),
+                _ => answer
+                    .apn_configurations
+                    .push(answer.apn_configurations[0].clone()),
+            }
+            // Public parsers reject these profiles first. Exercise correlation's
+            // own structural defense too, past the receive-only emergency skip.
+            assert_correlation_error(
+                correlate_application(request.clone(), answer.clone()),
+                SwmDiameterEapCorrelationError::AnswerValidationFailure,
+            );
+            let parsed = SwmDiameterEapAnswerEnvelope {
+                transaction: TRANSACTION,
+                proxiable: true,
+                answer,
+                proxy_infos: Vec::new(),
+                provenance: SwmDiameterEapAnswerEnvelopeProvenance::Parsed,
+            };
+            assert_eq!(
+                request.clone().correlate_answer(parsed).err(),
+                Some(SwmEmergencyAuthorizationError::AnswerInvalid)
+            );
+        }
+    }
+
+    #[test]
+    fn non_success_emergency_answers_keep_their_apn_rules() {
+        let mut request = bound_request();
+        request.request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+        for result in [base::RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY, 2002] {
+            let mut answer = authorized_apn_answer();
+            answer.result = SwmDiameterResult::Base(result);
+            assert_correlation_error(
+                correlate_application(request.clone(), answer.clone()),
+                SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+            );
+            let parsed = SwmDiameterEapAnswerEnvelope {
+                transaction: TRANSACTION,
+                proxiable: true,
+                answer,
+                proxy_infos: Vec::new(),
+                provenance: SwmDiameterEapAnswerEnvelopeProvenance::Parsed,
+            };
+            assert_eq!(
+                request.clone().correlate_answer(parsed).err(),
+                Some(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
+            );
+
+            let mut answer = answer_facts();
+            answer.result = SwmDiameterResult::Base(result);
+            let apn_oi = match SwmApnOiReplacement::new("mnc001.mcc001.gprs") {
+                Ok(value) => value,
+                Err(error) => panic!("synthetic APN-OI-Replacement failed: {error}"),
+            };
+            answer.subscriber_authorization =
+                SwmDeaSubscriberAuthorization::new().with_apn_oi_replacement(apn_oi);
+            assert_correlation_error(
+                correlate_application(request.clone(), answer),
+                SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
+            );
+        }
     }
 
     #[test]

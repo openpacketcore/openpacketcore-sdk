@@ -3145,6 +3145,56 @@ fn swm_direct_emergency_evidence_requires_correlated_exact_success() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_emergency_subscription_apn_preserves_terminal_eap_validation() {
+    let imei = emergency_imei();
+    let identity = apps::swm::emergency_nai(&imei);
+    let mut request = sample_swm_request();
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    request.user_name = Some(identity.clone().into());
+    request.eap_payload = eap_response_identity(0x17, &identity).into();
+
+    let correlate_received = |answer: &SwmDiameterEapAnswer| {
+        // The unbound encoder supplies synthetic peer bytes; a request-bound
+        // originating server must not send this emergency subscription profile.
+        let message =
+            apps::swm::build_swm_diameter_eap_answer(answer, 1, 2, EncodeContext::default())
+                .expect("synthetic peer message");
+        let wire = encode_message(&message);
+        let parsed = apps::swm::parse_swm_diameter_eap_answer_envelope(
+            &decode_message(&wire),
+            DecodeContext::conservative(),
+        )
+        .expect("received answer");
+        request_envelope(&request, 1, 2).correlate_answer(parsed)
+    };
+    for pdn_type in [PdnType::Ipv4, PdnType::Ipv6] {
+        let mut answer = sample_final_emergency_answer(&imei);
+        answer.apn_configurations = vec![ApnConfiguration {
+            context_identifier: 7,
+            service_selection: "subscription.synthetic.invalid".into(),
+            pdn_type,
+            eps_subscribed_qos_profile: None,
+            ambr: None,
+        }];
+        let exchange = correlate_received(&answer)
+            .expect("subscription APN must not reject an emergency exchange");
+        assert!(exchange.subscription_apn_configurations_ignored());
+        SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
+            .expect("complete emergency authentication remains usable");
+
+        answer.eap_payload = Some(vec![3, 0x18, 0, 4].into());
+        let exchange = correlate_received(&answer)
+            .expect("Diameter correlation precedes terminal EAP verification");
+        assert_eq!(
+            SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
+                .expect_err("ignored APN must not bypass EAP identifier correlation"),
+            SwmEmergencyAuthorizationError::FinalEapIdentifierMismatch
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_identity_recovery_evidence_accepts_only_the_complete_correlated_sequence() {
     let imei = emergency_imei();
     let mut initial = sample_swm_request();

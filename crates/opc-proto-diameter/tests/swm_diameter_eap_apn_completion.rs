@@ -438,7 +438,7 @@ fn sample_request(emergency: bool) -> swm::SwmDiameterEapRequest {
         destination_host: Some(AAA_HOST.to_owned().into()),
         user_name: Some("subscriber@synthetic.invalid".to_owned().into()),
         rat_type: None,
-        service_selection: Some(APN.to_owned().into()),
+        service_selection: (!emergency).then(|| APN.to_owned().into()),
         mip6_feature_vector: Some(swm::SwmMip6FeatureVector::gtpv2_only()),
         qos_capability: None,
         visited_network_identifier: None,
@@ -531,6 +531,513 @@ fn correlate_wire(
     outbound
         .correlate_response(response)
         .expect("authenticated peer and complete DER/DEA correlation")
+}
+
+fn bound_apn_request(emergency: bool) -> swm::SwmDiameterEapRequestEnvelope {
+    let request = sample_request(emergency);
+    // The emergency APN is local; neither APN nor requested PDN type is in the DER.
+    swm::build_swm_diameter_eap_request(&request, HOP_BY_HOP, END_TO_END, EncodeContext::default())
+        .expect("valid synthetic DER");
+    swm::SwmDiameterEapRequestEnvelope::for_outbound_on(
+        request,
+        swm::SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+        swm::SwmExpectedAnswerPeer::direct(CONNECTION, AAA_HOST.to_owned(), AAA_REALM.to_owned()),
+    )
+}
+
+fn subscription_apn(pdn_type: u32, service_selection: &str) -> Vec<u8> {
+    subscription_apn_with_context(7, pdn_type, service_selection)
+}
+
+fn subscription_apn_with_context(
+    context_identifier: u32,
+    pdn_type: u32,
+    service_selection: &str,
+) -> Vec<u8> {
+    apn_configuration(&[
+        vendor_u32(swm::AVP_CONTEXT_IDENTIFIER, true, context_identifier),
+        vendor_u32(swm::AVP_PDN_TYPE, true, pdn_type),
+        raw_avp(
+            swm::AVP_SERVICE_SELECTION,
+            AvpFlags::MANDATORY,
+            None,
+            service_selection.as_bytes(),
+        ),
+    ])
+}
+
+#[test]
+fn emergency_subscription_apns_correlate_as_wire_facts_not_authorization() {
+    for (service_selection, pdn_type) in [
+        ("subscription.synthetic.invalid", 0),
+        ("subscription.synthetic.invalid", 1),
+        (APN, 1),
+        (APN, 99),
+    ] {
+        let wire = answer_wire(
+            base::RESULT_CODE_DIAMETER_SUCCESS,
+            &[
+                vendor_u32(swm::AVP_CONTEXT_IDENTIFIER, true, 7),
+                subscription_apn(pdn_type, service_selection),
+            ],
+        );
+        let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+            &decode(&wire),
+            CONNECTION,
+            typed_context(),
+        )
+        .expect("well-formed subscription APN");
+        let correlated = bound_apn_request(true)
+            .correlate_response(response)
+            .expect("emergency correlation ignores subscription APN and PDN authorization");
+        assert!(correlated.subscription_apn_configurations_ignored());
+        let view = correlated
+            .apn_configuration_views()
+            .expect("subscription APN remains a wire fact")
+            .next()
+            .expect("subscription APN is present");
+        assert_eq!(view.core().service_selection.as_ref(), service_selection);
+        assert_eq!(view.core().pdn_type.value(), pdn_type);
+        assert_eq!(
+            correlated
+                .default_apn_configuration_view()
+                .expect_err("the subscription default must not select the emergency APN")
+                .code(),
+            swm::SwmApnConfigurationErrorCode::EmergencyRequest
+        );
+        assert!(matches!(
+            correlated.authorized_apn_configurations(),
+            Err(error) if error.code() == swm::SwmApnConfigurationErrorCode::EmergencyRequest
+        ));
+    }
+}
+
+#[test]
+fn emergency_apn_oi_alone_or_with_apns_is_ignored_only_on_receive() {
+    let apn_oi = raw_avp(
+        swm::AVP_APN_OI_REPLACEMENT,
+        AvpFlags::VENDOR | AvpFlags::MANDATORY,
+        Some(VENDOR_ID_3GPP),
+        APN_OI.as_bytes(),
+    );
+    for extras in [vec![apn_oi.clone()], vec![apn_oi, subscription_apn(1, APN)]] {
+        let wire = answer_wire(base::RESULT_CODE_DIAMETER_SUCCESS, &extras);
+        let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+            &decode(&wire),
+            CONNECTION,
+            typed_context(),
+        )
+        .expect("synthetic subscription profile parses");
+        let ordinary = bound_apn_request(false)
+            .correlate_response(response.clone())
+            .expect("ordinary matching APN and NBM still correlate");
+        assert!(!ordinary.subscription_apn_configurations_ignored());
+        let correlated = bound_apn_request(true)
+            .with_locally_configured_mobility_mode(
+                swm::SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment,
+            )
+            .correlate_response(response)
+            .expect("received emergency subscription data is ignored");
+        assert!(correlated.subscription_apn_configurations_ignored());
+        assert_eq!(
+            correlated
+                .default_apn_configuration_view()
+                .expect_err("ignored subscription data cannot select the emergency APN")
+                .code(),
+            swm::SwmApnConfigurationErrorCode::EmergencyRequest
+        );
+        assert!(matches!(
+            correlated.authorized_apn_configurations(),
+            Err(error) if error.code() == swm::SwmApnConfigurationErrorCode::EmergencyRequest
+        ));
+        let swm::SwmDiameterEapResponse::Application(answer) = correlated.response() else {
+            panic!("synthetic application answer");
+        };
+        assert_eq!(
+            answer
+                .subscriber_authorization
+                .apn_oi_replacement()
+                .expect("APN-OI remains a raw wire fact")
+                .as_str(),
+            APN_OI
+        );
+
+        let parsed = swm::parse_swm_diameter_eap_answer_envelope(&decode(&wire), typed_context())
+            .expect("parsed answer envelope");
+        let exchange = bound_apn_request(true)
+            .with_locally_configured_mobility_mode(
+                swm::SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment,
+            )
+            .correlate_answer(parsed)
+            .expect("the parsed exchange path also ignores subscription data");
+        assert!(exchange.subscription_apn_configurations_ignored());
+    }
+}
+
+#[test]
+fn emergency_multiple_subscription_apns_remain_raw_in_local_assignment_mode() {
+    let wire = answer_wire(
+        base::RESULT_CODE_DIAMETER_SUCCESS,
+        &[
+            vendor_u32(swm::AVP_CONTEXT_IDENTIFIER, true, 8),
+            subscription_apn_with_context(7, 0, "first.synthetic.invalid"),
+            subscription_apn_with_context(8, 1, "second.synthetic.invalid"),
+            subscription_apn_with_context(9, 2, "third.synthetic.invalid"),
+        ],
+    );
+    let (_, message) =
+        Message::decode_with_dictionary(&wire, typed_context(), SWM_PROJECTED_PROFILE_DICTIONARIES)
+            .expect("explicit repeated-APN profile");
+    let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+        &message,
+        CONNECTION,
+        typed_context(),
+    )
+    .expect("well-formed repeated APNs");
+    for emergency in [false, true] {
+        let mut facts = sample_request(emergency);
+        facts.service_selection = None;
+        facts.mip6_feature_vector = None;
+        let request = swm::SwmDiameterEapRequestEnvelope::for_outbound_on(
+            facts,
+            swm::SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+            swm::SwmExpectedAnswerPeer::direct(
+                CONNECTION,
+                AAA_HOST.to_owned(),
+                AAA_REALM.to_owned(),
+            ),
+        )
+        .with_locally_configured_mobility_mode(
+            swm::SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment,
+        );
+        let result = request.correlate_response(response.clone());
+        if emergency {
+            let correlated = result.expect("ignored APNs do not impose ordinary mobility policy");
+            assert!(correlated.subscription_apn_configurations_ignored());
+            let contexts: Vec<_> = correlated
+                .apn_configuration_views()
+                .expect("raw subscription entries")
+                .map(|view| view.core().context_identifier)
+                .collect();
+            assert_eq!(contexts, [7, 8, 9]);
+            assert_eq!(
+                correlated
+                    .default_apn_configuration_view()
+                    .expect_err("subscription default remains unavailable")
+                    .code(),
+                swm::SwmApnConfigurationErrorCode::EmergencyRequest
+            );
+        } else {
+            assert_eq!(
+                result.expect_err("ordinary HA discovery still requires per-APN gateways"),
+                swm::SwmDiameterEapCorrelationError::ApnAuthorizationMismatch
+            );
+        }
+    }
+}
+
+#[test]
+fn request_bound_origination_refuses_emergency_subscription_profiles() {
+    let request = bound_apn_request(true);
+    let gateway =
+        swm::SwmRequestBoundDeaGatewayContext::authenticated_non_roaming_emergency_from_hss(
+            &request,
+            sample_gateway(),
+        )
+        .expect("valid emergency gateway provenance");
+    let mut answer = sample_answer();
+    answer.default_context_identifier = None;
+    swm::build_swm_diameter_eap_answer_for(&request, &answer, EncodeContext::default())
+        .expect("emergency answer without subscription data can be originated");
+    swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+        &request,
+        &answer,
+        &gateway,
+        EncodeContext::default(),
+    )
+    .expect("emergency gateway context alone can be originated");
+    let apn_oi = swm::SwmDeaSubscriberAuthorization::new()
+        .with_apn_oi_replacement(swm::SwmApnOiReplacement::new(APN_OI).expect("synthetic APN-OI"));
+    for (apns, subscriber_authorization) in [
+        (
+            vec![sample_core(swm::PdnType::Ipv6, APN)],
+            Default::default(),
+        ),
+        (Vec::new(), apn_oi.clone()),
+        (vec![sample_core(swm::PdnType::Ipv6, APN)], apn_oi),
+    ] {
+        answer.apn_configurations = apns;
+        answer.subscriber_authorization = subscriber_authorization;
+        assert!(swm::build_swm_diameter_eap_answer_for(
+            &request,
+            &answer,
+            EncodeContext::default(),
+        )
+        .is_err());
+        assert!(swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+            &request,
+            &answer,
+            &gateway,
+            EncodeContext::default(),
+        )
+        .is_err());
+        assert_eq!(
+            request
+                .clone()
+                .correlate_answer(swm::SwmDiameterEapAnswerEnvelope::for_outbound(
+                    answer.clone(),
+                    request.transaction(),
+                ))
+                .expect_err("locally built answers retain the sender prohibition"),
+            swm::SwmEmergencyAuthorizationError::AnswerRequestMismatch
+        );
+    }
+}
+
+#[test]
+fn structurally_invalid_local_emergency_answer_still_fails_correlation() {
+    let request = bound_apn_request(true);
+    let mut answer = sample_answer();
+    answer.default_context_identifier = None;
+    answer.eap_payload = None;
+    assert_eq!(
+        request
+            .clone()
+            .correlate_answer(swm::SwmDiameterEapAnswerEnvelope::for_outbound(
+                answer,
+                request.transaction(),
+            ))
+            .expect_err("success without EAP or MSK remains structurally invalid"),
+        swm::SwmEmergencyAuthorizationError::AnswerInvalid
+    );
+}
+
+#[test]
+fn ordinary_subscription_apns_still_require_the_requested_apn() {
+    for pdn_type in [0, 1] {
+        let wire = answer_wire(
+            base::RESULT_CODE_DIAMETER_SUCCESS,
+            &[subscription_apn(pdn_type, "subscription.synthetic.invalid")],
+        );
+        let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+            &decode(&wire),
+            CONNECTION,
+            typed_context(),
+        )
+        .expect("well-formed subscription APN");
+        assert_eq!(
+            bound_apn_request(false)
+                .correlate_response(response)
+                .expect_err("ordinary request still requires its APN"),
+            swm::SwmDiameterEapCorrelationError::ApnAuthorizationMismatch
+        );
+    }
+}
+
+#[test]
+fn absent_emergency_and_ordinary_apn_profiles_are_not_marked_ignored() {
+    for (emergency, extras, expected_count) in [
+        (true, Vec::new(), 0),
+        (false, Vec::new(), 0),
+        (false, vec![subscription_apn(1, APN)], 1),
+    ] {
+        let wire = answer_wire(base::RESULT_CODE_DIAMETER_SUCCESS, &extras);
+        let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+            &decode(&wire),
+            CONNECTION,
+            typed_context(),
+        )
+        .expect("valid answer");
+        let correlated = bound_apn_request(emergency)
+            .correlate_response(response)
+            .expect("valid response correlation");
+        assert!(!correlated.subscription_apn_configurations_ignored());
+        assert_eq!(
+            correlated
+                .authorized_apn_configurations()
+                .expect("ordinary authorization and empty profiles retain their behavior")
+                .len(),
+            expected_count
+        );
+        let parsed = swm::parse_swm_diameter_eap_answer_envelope(&decode(&wire), typed_context())
+            .expect("parsed ordinary or empty answer");
+        let exchange = bound_apn_request(emergency)
+            .correlate_answer(parsed)
+            .expect("ordinary or empty parsed exchange");
+        assert!(!exchange.subscription_apn_configurations_ignored());
+    }
+}
+
+#[test]
+fn emergency_subscription_apns_preserve_peer_and_request_correlation() {
+    let wire = answer_wire(
+        base::RESULT_CODE_DIAMETER_SUCCESS,
+        &[subscription_apn(1, "subscription.synthetic.invalid")],
+    );
+    let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+        &decode(&wire),
+        CONNECTION,
+        typed_context(),
+    )
+    .expect("well-formed subscription APN");
+    let transaction = swm::SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END);
+    for (connection, origin_host, expected) in [
+        (
+            swm::SwmDiameterConnectionToken::new(NonZeroU64::new(2).expect("nonzero")),
+            AAA_HOST,
+            swm::SwmDiameterEapCorrelationError::PeerConnectionMismatch,
+        ),
+        (
+            CONNECTION,
+            "other.synthetic.invalid",
+            swm::SwmDiameterEapCorrelationError::PeerIdentityMismatch,
+        ),
+    ] {
+        let request = swm::SwmDiameterEapRequestEnvelope::for_outbound_on(
+            sample_request(true),
+            transaction,
+            swm::SwmExpectedAnswerPeer::direct(
+                connection,
+                origin_host.to_owned(),
+                AAA_REALM.to_owned(),
+            ),
+        );
+        assert_eq!(
+            request.correlate_response(response.clone()).unwrap_err(),
+            expected
+        );
+    }
+    for (request, transaction, expected) in [
+        (
+            sample_request(true),
+            swm::SwmDiameterTransaction::new(HOP_BY_HOP + 1, END_TO_END),
+            swm::SwmDiameterEapCorrelationError::TransactionMismatch,
+        ),
+        (
+            swm::SwmDiameterEapRequest {
+                session_id: "other;synthetic;session".to_owned().into(),
+                ..sample_request(true)
+            },
+            transaction,
+            swm::SwmDiameterEapCorrelationError::SessionMismatch,
+        ),
+        (
+            swm::SwmDiameterEapRequest {
+                auth_request_type: AuthRequestType::AuthorizeOnly,
+                ..sample_request(true)
+            },
+            transaction,
+            swm::SwmDiameterEapCorrelationError::AuthRequestTypeMismatch,
+        ),
+    ] {
+        let request = swm::SwmDiameterEapRequestEnvelope::for_outbound_on(
+            request,
+            transaction,
+            swm::SwmExpectedAnswerPeer::direct(
+                CONNECTION,
+                AAA_HOST.to_owned(),
+                AAA_REALM.to_owned(),
+            ),
+        );
+        assert_eq!(
+            request.correlate_response(response.clone()).unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn malformed_subscription_apn_wire_values_are_still_rejected() {
+    let valid_children = vec![
+        vendor_u32(swm::AVP_CONTEXT_IDENTIFIER, true, 7),
+        vendor_u32(swm::AVP_PDN_TYPE, true, 1),
+        raw_avp(
+            swm::AVP_SERVICE_SELECTION,
+            AvpFlags::MANDATORY,
+            None,
+            b"subscription.synthetic.invalid",
+        ),
+    ];
+    let mut duplicate = valid_children.clone();
+    duplicate.push(valid_children[1].clone());
+    let mut bad_width = valid_children.clone();
+    bad_width[1] = raw_avp(
+        swm::AVP_PDN_TYPE,
+        AvpFlags::VENDOR | AvpFlags::MANDATORY,
+        Some(VENDOR_ID_3GPP),
+        &[1],
+    );
+    let mut bad_address = valid_children.clone();
+    bad_address.push(raw_avp(
+        swm::AVP_SERVED_PARTY_IP_ADDRESS,
+        AvpFlags::VENDOR | AvpFlags::MANDATORY,
+        Some(VENDOR_ID_3GPP),
+        &address_value(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+    ));
+    for children in [
+        valid_children[..2].to_vec(),
+        duplicate,
+        bad_width,
+        bad_address,
+    ] {
+        let wire = answer_wire(
+            base::RESULT_CODE_DIAMETER_SUCCESS,
+            &[apn_configuration(&children)],
+        );
+        // The connection parser must reject malformed ignored AVPs before
+        // they can reach emergency request correlation.
+        assert!(
+            swm::parse_swm_diameter_eap_response_envelope_from_connection(
+                &decode(&wire),
+                CONNECTION,
+                typed_context(),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn non_success_emergency_wire_answers_keep_their_apn_rules() {
+    for result in [base::RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY, 2002] {
+        let mut extras = Vec::new();
+        if result == 2002 {
+            extras.push(raw_avp(
+                swm::AVP_EAP_PAYLOAD,
+                AvpFlags::MANDATORY,
+                None,
+                &[3, 0x35, 0, 4],
+            ));
+        }
+        let wire = answer_wire(result, &extras);
+        let response = swm::parse_swm_diameter_eap_response_envelope_from_connection(
+            &decode(&wire),
+            CONNECTION,
+            typed_context(),
+        )
+        .expect("non-success without APN remains valid");
+        let correlated = bound_apn_request(true)
+            .correlate_response(response)
+            .expect("non-success emergency answer still correlates");
+        assert!(!correlated.subscription_apn_configurations_ignored());
+        let parsed = swm::parse_swm_diameter_eap_answer_envelope(&decode(&wire), typed_context())
+            .expect("parsed non-success answer");
+        let exchange = bound_apn_request(true)
+            .correlate_answer(parsed)
+            .expect("non-success emergency exchange still correlates");
+        assert!(!exchange.subscription_apn_configurations_ignored());
+
+        extras.push(subscription_apn(1, APN));
+        let with_apn = answer_wire(result, &extras);
+        assert!(
+            swm::parse_swm_diameter_eap_response_envelope_from_connection(
+                &decode(&with_apn),
+                CONNECTION,
+                typed_context(),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

@@ -1,5 +1,7 @@
 //! Safe Linux XFRM backend over the raw netlink sys boundary.
 
+mod namespace_reset;
+
 use std::fmt;
 use std::io;
 use std::mem::size_of;
@@ -1707,6 +1709,17 @@ pub(crate) enum NetlinkDumpCompletion {
 }
 
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
+    fn verify_empty(
+        &self,
+        _message_type: u16,
+        _sequence: u32,
+        _config: LinuxXfrmBackendConfig,
+    ) -> Result<(), XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "exclusive_namespace_reset",
+        })
+    }
+
     fn transact(
         &self,
         operation: &'static str,
@@ -1772,6 +1785,15 @@ impl LinuxXfrmSession for NetlinkXfrmSession {
 struct NetlinkXfrmTransport;
 
 impl LinuxXfrmTransport for NetlinkXfrmTransport {
+    fn verify_empty(
+        &self,
+        message_type: u16,
+        sequence: u32,
+        config: LinuxXfrmBackendConfig,
+    ) -> Result<(), XfrmError> {
+        namespace_reset::verify_empty(message_type, sequence, config)
+    }
+
     fn transact(
         &self,
         operation: &'static str,

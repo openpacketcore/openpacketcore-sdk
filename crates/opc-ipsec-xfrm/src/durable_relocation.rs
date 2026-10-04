@@ -1299,6 +1299,19 @@ impl XfrmSaRelocationRecoveryStore {
         Ok(record.writer_epoch == lease.current_epoch(&inventory)?)
     }
 
+    /// Forget all predecessor records only after the actor proved an empty
+    /// namespace. Keep the existing lease and monotonically burn the epoch
+    /// before unlinking anything, including unresolved cleanup authorities.
+    pub(crate) fn reset_after_namespace_empty(&self) -> Result<(), XfrmSaRelocationDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        lease.advance_epoch(&inventory)?;
+        for (name, _) in &inventory.records {
+            lease.remove_record(name)?;
+        }
+        Ok(())
+    }
+
     /// True only for clones sharing this exact open store lease.
     pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -4091,5 +4104,62 @@ mod tests {
             Err(XfrmSaRelocationDurableError::Malformed)
         ));
         assert!(backend.operations().is_empty());
+    }
+    #[test]
+    fn exclusive_reset_erases_every_phase_and_fences_predecessor_handles() {
+        for phase in [
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::Relocated,
+            XfrmSaRelocationDurablePhase::NoMutation,
+            XfrmSaRelocationDurablePhase::Indeterminate,
+            XfrmSaRelocationDurablePhase::StateAbsent,
+            XfrmSaRelocationDurablePhase::RemovalAdmitted,
+            XfrmSaRelocationDurablePhase::Retired,
+        ] {
+            let root = TestRoot::new();
+            let store = store(&root);
+            let lease = store.lease().unwrap();
+            let old = DurableRelocationRecord {
+                store_incarnation: store.inner.control.store_incarnation,
+                namespace_seal: store.inner.control.namespace_seal,
+                actor_incarnation: store.inner.control.actor_incarnation,
+                writer_epoch: lease.inventory().unwrap().epoch,
+                ..record(phase)
+            };
+            lease.publish_record(&old).unwrap();
+            let handle = old.handle(&store.inner.proof_key).unwrap();
+            drop(lease);
+            assert_eq!(store.inspect(&handle).unwrap(), phase);
+            store.reset_after_namespace_empty().unwrap();
+            assert!(store.inspect(&handle).is_err());
+            assert!(!store.has_unresolved_writer_authority().unwrap());
+            let epoch = store.lease().unwrap().inventory().unwrap().epoch;
+            assert!(epoch > old.writer_epoch);
+            drop(store);
+            let reopened = self::store(&root);
+            assert!(reopened
+                .lease()
+                .unwrap()
+                .inventory()
+                .unwrap()
+                .records
+                .is_empty());
+            assert_eq!(reopened.lease().unwrap().inventory().unwrap().epoch, epoch);
+            // Reusing even the same caller labels cannot resurrect an old handle.
+            reopened
+                .prepare(
+                    old.operation_id,
+                    old.operation_generation,
+                    DurableRelocationFingerprints {
+                        deletion_identity: old.deletion_identity_fingerprint,
+                        relocation_request: old.relocation_request_fingerprint,
+                    },
+                )
+                .unwrap();
+            assert!(reopened.inspect(&handle).is_err());
+            reopened.reset_after_namespace_empty().unwrap();
+            assert!(reopened.lease().unwrap().inventory().unwrap().epoch > epoch);
+        }
     }
 }
