@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 
 use crate::model::{
-    validate_exact_remove_policy_request, AllocateSpiRequest, ExactRemovePolicyRequest,
-    InstallPolicyRequest, InstallSaRequest, PolicyParameters, QueryPolicyRequest, QuerySaRequest,
-    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
+    validate_exact_remove_policy_request, validate_exact_remove_sa_request, AllocateSpiRequest,
+    ExactRemovePolicyRequest, ExactRemoveSaRequest, InstallPolicyRequest, InstallSaRequest,
+    PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
+    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaKeySnapshot, SaLookupKey,
     SaRelocationIdentity, SaState, SpiAllocation, XfrmCapability, XfrmProbe,
 };
 use crate::XfrmError;
@@ -111,6 +112,66 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Read every SA state at one lookup key, whatever its lookup mark.
+    ///
+    /// Linux GETSA, DELSA, UPDSA, and MIGRATE_STATE all select their state
+    /// with `__xfrm_state_lookup`: the first state in an SPI hash chain whose
+    /// stored mark satisfies `(lookup & mask) == value`. An unmarked state
+    /// satisfies every lookup, new states go to the chain head, and a hash
+    /// resize can reverse the chain. When two states at one key match a
+    /// lookup, no point query can prove which one the next lookup selects.
+    /// This read does not depend on chain order. Apply the predicate with
+    /// [`SaKeySnapshot::lookup_candidates`].
+    ///
+    /// # Completeness contract
+    ///
+    /// - The caller excludes every other userspace SA writer in the network
+    ///   namespace, at any key, for the duration of the read.
+    /// - Kernel ACQUIRE activity is detected and makes the read
+    ///   indeterminate.
+    ///
+    /// Under this contract, a returned snapshot holds exactly the states that
+    /// were at the key when the read began. Any of them may have expired
+    /// since.
+    ///
+    /// A finished Linux dump is not proof of a complete one: Linux ends a
+    /// state dump with a successful `NLMSG_DONE` after silently dropping a
+    /// state too large for a dump batch, together with every older state. The
+    /// Linux backend therefore dumps every state in the namespace and accepts
+    /// the dump only when it returned as many states as the kernel's SAD count
+    /// read just before and just after it. A state that the dump returned but
+    /// that was inserted after the first count could stand in for a dropped
+    /// one. Another userspace writer could insert one, which the first clause
+    /// excludes. Linux itself inserts one kind of state: the larval state of
+    /// an ACQUIRE, when outbound traffic matches a policy template that no SA
+    /// satisfies while a key manager listens. The backend classifies every
+    /// dumped state, and a larval state, or one it cannot classify, makes the
+    /// read indeterminate. A larval state that Linux inserts after the dump
+    /// starts is never returned, so it cannot stand in. SPI allocation also
+    /// leaves a larval state until its SA is installed or the allocation
+    /// expires, so a pending allocation anywhere in the namespace makes the
+    /// read indeterminate too.
+    ///
+    /// This is a read and changes no kernel state. Through the namespace
+    /// actor a lost reply is `Unavailable`, as for other reads. Backends
+    /// without a complete key read fail closed with
+    /// [`XfrmError::UnsupportedFeature`].
+    ///
+    /// # Errors
+    ///
+    /// [`XfrmError::InvalidConfig`] for a zero SPI or a protocol other than
+    /// AH, ESP, or IPComp. A Linux read whose dump the kernel flags as
+    /// interrupted, whose state count disagrees with the SAD count, or whose
+    /// dump holds a larval or unclassifiable state is repeated a bounded
+    /// number of times, then reported as [`XfrmError::StateIndeterminate`]. A
+    /// state at the key that the SDK cannot represent, such as one with an
+    /// unaddressable lookup mark, fails the read instead of being left out.
+    async fn query_sa_key_snapshot(&self, _key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "sa_key_snapshot",
+        })
+    }
+
     /// Rekey (update) an existing Security Association.
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError>;
 
@@ -156,6 +217,44 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
     /// Remove a Security Association.
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError>;
 
+    /// Remove one SA only when the backend can exclude every competing state
+    /// change throughout its observation and deletion.
+    ///
+    /// [`Self::remove_sa`] deletes whatever state the kernel lookup selects
+    /// first, which need not be the caller's state when another state at the
+    /// key also matches the lookup mark (for example an unmarked state, which
+    /// matches every mark). A snapshot showing one matching candidate does
+    /// not exclude a later insertion or replacement before that lookup.
+    ///
+    /// The default, Linux and namespace-bound Linux implementations validate
+    /// the request, then return [`XfrmError::UnsupportedFeature`] with feature
+    /// `exact_sa_removal` before any snapshot, deletion or actor admission.
+    /// Linux has no conditional SA deletion, and these implementations cannot
+    /// exclude kernel ACQUIRE insertion throughout a read-and-delete sequence.
+    /// A nonzero SPI and userspace writer serialization do not close that gap.
+    ///
+    /// [`crate::MockXfrmBackend`] implements the operation under one state
+    /// lock: it removes a sole lookup candidate only when every
+    /// [`SaRelocationIdentity`] field matches. That identity omits algorithm,
+    /// key, lifetime and replay fingerprints; matching it does not establish
+    /// installation ownership or authorize cleanup of kernel state.
+    ///
+    /// # Errors
+    ///
+    /// The default and Linux implementations return [`XfrmError::InvalidConfig`]
+    /// for an invalid key or zero interface identifier before reporting the
+    /// unsupported capability. The locked mock also returns
+    /// [`XfrmError::StateIndeterminate`] for several candidates,
+    /// [`XfrmError::StateMismatch`] for one different candidate, and
+    /// [`XfrmError::NotFound`] when no candidate exists, without deleting any
+    /// state in those cases.
+    async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
+        validate_exact_remove_sa_request(&request)?;
+        Err(XfrmError::UnsupportedFeature {
+            feature: "exact_sa_removal",
+        })
+    }
+
     /// Install a new Security Policy.
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError>;
 
@@ -195,4 +294,195 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
 
     /// Probe backend capability and reachability.
     async fn probe(&self) -> Result<XfrmProbe, XfrmError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::{IpAddress, SaRelocationSelector, XfrmId, XfrmLookupMark, XfrmMode};
+
+    fn expected_sa() -> SaRelocationIdentity {
+        let source = IpAddress::Ipv4([192, 0, 2, 10]);
+        let destination = IpAddress::Ipv4([192, 0, 2, 20]);
+        SaRelocationIdentity {
+            selector: SaRelocationSelector {
+                source,
+                destination,
+                source_port: 0,
+                source_port_mask: 0,
+                destination_port: 0,
+                destination_port_mask: 0,
+                protocol: 0,
+                source_prefix_len: 32,
+                destination_prefix_len: 32,
+                ifindex: 0,
+                user_id: 0,
+            },
+            id: XfrmId {
+                destination,
+                spi: 0x1234_5678,
+                protocol: 50,
+            },
+            source_address: source,
+            request_id: None,
+            mode: XfrmMode::Tunnel,
+            encap: None,
+            mark: Some(XfrmLookupMark::full(0x42)),
+            if_id: None,
+            output_mark: None,
+        }
+    }
+
+    /// Supports snapshots and unconditional removal, but deliberately uses
+    /// the trait's default exact-removal implementation.
+    #[derive(Debug)]
+    struct UnfencedBackend {
+        target: Mutex<Option<SaRelocationIdentity>>,
+        snapshot_error: Option<XfrmError>,
+        snapshot_calls: AtomicUsize,
+        removal_calls: AtomicUsize,
+    }
+
+    impl UnfencedBackend {
+        fn new(snapshot_error: Option<XfrmError>) -> Self {
+            Self {
+                target: Mutex::new(Some(expected_sa())),
+                snapshot_error,
+                snapshot_calls: AtomicUsize::new(0),
+                removal_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn assert_untouched(&self) {
+            assert_eq!(
+                (
+                    self.snapshot_calls.load(Ordering::SeqCst),
+                    self.removal_calls.load(Ordering::SeqCst),
+                    self.target.lock().unwrap().clone(),
+                ),
+                (0, 0, Some(expected_sa())),
+                "refusal must precede both backend calls and retain the target",
+            );
+        }
+    }
+
+    #[async_trait]
+    impl XfrmBackend for UnfencedBackend {
+        async fn allocate_spi(
+            &self,
+            _request: AllocateSpiRequest,
+        ) -> Result<SpiAllocation, XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn query_sa(&self, _request: QuerySaRequest) -> Result<SaState, XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn query_sa_key_snapshot(
+            &self,
+            key: SaLookupKey,
+        ) -> Result<SaKeySnapshot, XfrmError> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = &self.snapshot_error {
+                return Err(error.clone());
+            }
+            SaKeySnapshot::new(
+                key,
+                self.target.lock().unwrap().clone().into_iter().collect(),
+            )
+        }
+
+        async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn remove_sa(&self, _request: RemoveSaRequest) -> Result<(), XfrmError> {
+            self.removal_calls.fetch_add(1, Ordering::SeqCst);
+            self.target
+                .lock()
+                .unwrap()
+                .take()
+                .map(|_| ())
+                .ok_or(XfrmError::NotFound)
+        }
+
+        async fn install_policy(&self, _request: InstallPolicyRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn rekey_policy(&self, _request: RekeyPolicyRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn remove_policy(&self, _request: RemovePolicyRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::Unavailable)
+        }
+
+        async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
+            Ok(XfrmProbe::unsupported())
+        }
+    }
+
+    #[tokio::test]
+    async fn unfenced_exact_removal_default_refuses_even_with_a_matching_snapshot() {
+        let backend = UnfencedBackend::new(None);
+        let result = backend
+            .remove_sa_exact(ExactRemoveSaRequest::new(expected_sa()))
+            .await;
+        backend.assert_untouched();
+        assert!(matches!(
+            result,
+            Err(XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unfenced_exact_removal_default_never_calls_an_unavailable_snapshot() {
+        let backend = UnfencedBackend::new(Some(XfrmError::Unavailable));
+        let result = backend
+            .remove_sa_exact(ExactRemoveSaRequest::new(expected_sa()))
+            .await;
+        backend.assert_untouched();
+        assert!(matches!(
+            result,
+            Err(XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unfenced_exact_removal_default_validates_before_refusing() {
+        let backend = UnfencedBackend::new(Some(XfrmError::Unavailable));
+        let mut zero_spi = expected_sa();
+        zero_spi.id.spi = 0;
+        let mut wrong_protocol = expected_sa();
+        wrong_protocol.id.protocol = 17;
+        let mut zero_if_id = expected_sa();
+        zero_if_id.if_id = Some(0);
+        for (expected, field) in [
+            (zero_spi, "sa_key.spi"),
+            (wrong_protocol, "sa_key.protocol"),
+            (zero_if_id, "sa.if_id"),
+        ] {
+            let result = backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(expected))
+                .await;
+            assert!(
+                matches!(result, Err(XfrmError::InvalidConfig { field: actual, .. }) if actual == field),
+                "{result:?}"
+            );
+            backend.assert_untouched();
+        }
+    }
 }
