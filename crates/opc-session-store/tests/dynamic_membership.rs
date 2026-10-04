@@ -1411,12 +1411,13 @@ impl DynamicFleet {
         .expect("prepare transition deadline")
     }
 
+    /// Returns the member whose commit observed `Completed`.
     async fn commit(
         &self,
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyLearnersReadyAdmissionProof,
         desired_indices: &[usize],
-    ) {
+    ) -> usize {
         tokio::time::timeout(TEST_DEADLINE, async {
             loop {
                 let Some(caller) = self.transition_caller(desired_indices) else {
@@ -1428,7 +1429,7 @@ impl DynamicFleet {
                     .await
                 {
                     Ok(status) if status.phase() == SessionTopologyTransitionPhase::Completed => {
-                        return;
+                        return caller;
                     }
                     Ok(status) => panic!("commit returned nonterminal status: {status:?}"),
                     Err(
@@ -1441,10 +1442,15 @@ impl DynamicFleet {
             }
         })
         .await
-        .expect("commit transition deadline");
+        .expect("commit transition deadline")
     }
 
-    async fn abort(&self, request: &SessionTopologyTransitionRequest, current_indices: &[usize]) {
+    /// Returns the member whose abort observed `Aborted`.
+    async fn abort(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        current_indices: &[usize],
+    ) -> usize {
         let aborted = tokio::time::timeout(TEST_DEADLINE, async {
             loop {
                 let Some(caller) = self.transition_caller(current_indices) else {
@@ -1453,7 +1459,7 @@ impl DynamicFleet {
                 };
                 match self.stores[caller].abort_topology_transition(request).await {
                     Ok(status) if status.phase() == SessionTopologyTransitionPhase::Aborted => {
-                        return;
+                        return caller;
                     }
                     Ok(status) => panic!("abort returned nonterminal status: {status:?}"),
                     Err(
@@ -1466,7 +1472,7 @@ impl DynamicFleet {
             }
         })
         .await;
-        if aborted.is_err() {
+        let Ok(caller) = aborted else {
             for (index, store) in self.stores.iter().enumerate() {
                 eprintln!(
                     "abort node {index}: transition={:?}, consensus={:?}",
@@ -1475,7 +1481,8 @@ impl DynamicFleet {
                 );
             }
             panic!("abort transition deadline elapsed");
-        }
+        };
+        caller
     }
 
     fn transition_caller(&self, desired_indices: &[usize]) -> Option<usize> {
@@ -3182,6 +3189,421 @@ async fn pre_prepare_unstage_cleanup_survives_caller_cancellation_and_exact_rest
         "post-unstage-cancellation-restage",
     )
     .await;
+}
+
+/// Fail as soon as `store` reports closed application admission during `window`.
+async fn assert_admission_stays_open(
+    store: &ConsensusSessionStore,
+    window: Duration,
+    context: &str,
+) {
+    let started = Instant::now();
+    loop {
+        assert!(store.status().admitted, "{context}");
+        if started.elapsed() >= window {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_staged_after_abort_keeps_coordinator_admitted() {
+    let expanded = [0, 1, 2, 3, 4];
+    let current = [0, 1, 2];
+    let mut fleet = DynamicFleet::start_three().await;
+    let first = fleet.transition_request(1, &expanded, 0xB1);
+    let replacement = fleet.transition_request(1, &expanded, 0xB2);
+    assert_ne!(first.request_digest(), replacement.request_digest());
+    fleet.provision_expansion(&first).await;
+    let _proof = fleet.prepare(&first, &expanded).await;
+
+    // The coordinator's reconciler captured `first` and waits behind the
+    // abort's operation gate. The caller stages the replacement before that
+    // pass runs, as a controller that retries with a corrected request does.
+    let coordinator = fleet.abort(&first, &current).await;
+    let store = &fleet.stores[coordinator];
+    assert!(
+        store.status().admitted,
+        "abort returned Aborted without restoring predecessor admission"
+    );
+    store
+        .stage_topology_transition_peers(
+            &replacement,
+            fleet.network.peers_for_request(coordinator, &replacement),
+        )
+        .expect("stage the replacement request right after the abort");
+    assert_admission_stays_open(
+        store,
+        Duration::from_millis(500),
+        "an unprepared replacement request closed the coordinator's application admission",
+    )
+    .await;
+    assert_eq!(
+        store.topology_transition_status(&replacement).await,
+        Ok(None),
+        "the replacement has no durable Prepare"
+    );
+
+    store
+        .unstage_topology_transition_peers(&replacement)
+        .await
+        .expect("withdraw the unprepared replacement");
+    assert_admission_stays_open(
+        store,
+        Duration::from_millis(250),
+        "the coordinator lost application admission after the replacement was withdrawn",
+    )
+    .await;
+    wait_aborted_and_admitted(&fleet.stores, &first, &current, &[3, 4]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &current, "replacement-withdrawn").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_commit_leaves_coordinator_admission_open() {
+    let expanded = [0, 1, 2, 3, 4];
+    let mut fleet = DynamicFleet::start_three().await;
+    let request = fleet.transition_request(1, &expanded, 0xB3);
+    fleet.provision_expansion(&request).await;
+    let proof = fleet.prepare(&request, &expanded).await;
+    let coordinator = fleet.commit(&request, &proof, &expanded).await;
+    assert!(
+        fleet.stores[coordinator].status().admitted,
+        "commit returned Completed without local admission"
+    );
+
+    // The coordinator's reconciler waited behind that commit with the request
+    // it captured while staged. Watch admission continuously while it runs.
+    let store = fleet.stores[coordinator].clone();
+    let closed_after = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(250) {
+            if !store.status().admitted {
+                return Some(started.elapsed());
+            }
+        }
+        None
+    })
+    .await
+    .expect("admission sampler");
+    assert_eq!(
+        closed_after, None,
+        "application admission closed again after the coordinator's commit returned Completed"
+    );
+    wait_completed_and_admitted(&fleet.stores, &request, &expanded, &[]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &expanded, "post-completed-commit").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_completed_commit_keeps_admission_while_next_request_is_staged() {
+    let expanded = [0, 1, 2, 3, 4];
+    let mut fleet = DynamicFleet::start_three().await;
+    let request = fleet.transition_request(1, &expanded, 0xB4);
+    fleet.provision_expansion(&request).await;
+    let proof = fleet.prepare(&request, &expanded).await;
+    fleet.commit(&request, &proof, &expanded).await;
+    wait_completed_and_admitted(&fleet.stores, &request, &expanded, &[]).await;
+
+    // Closing the Raft leader's admission would stop the whole cluster.
+    let leader = fleet.wait_transition_caller(&expanded).await;
+    let store = &fleet.stores[leader];
+    let next = fleet.transition_request(2, &[0, 1, 2], 0xB5);
+    store
+        .stage_topology_transition_peers(&next, fleet.network.peers_for_request(leader, &next))
+        .expect("stage the next request without preparing it");
+
+    // The duplicate's own result is not the subject: while a different request
+    // is staged it reports a conflict. It must not fence the node, because the
+    // staged request has no durable Prepare and nothing would reopen admission.
+    let _duplicate = store.commit_topology_transition(&request, &proof).await;
+    assert_admission_stays_open(
+        store,
+        Duration::from_millis(250),
+        "a duplicate completed commit closed application admission while the next request was only staged",
+    )
+    .await;
+    assert_eq!(
+        store.topology_transition_status(&next).await,
+        Ok(None),
+        "the next request has no durable Prepare"
+    );
+
+    store
+        .unstage_topology_transition_peers(&next)
+        .await
+        .expect("withdraw the unprepared next request");
+    wait_completed_and_admitted(&fleet.stores, &request, &expanded, &[]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &expanded, "post-duplicate-commit").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_of_aborted_request_keeps_predecessor_admission() {
+    let expanded = [0, 1, 2, 3, 4];
+    let current = [0, 1, 2];
+    let mut fleet = DynamicFleet::start_three().await;
+    let request = fleet.transition_request(1, &expanded, 0xB6);
+    fleet.provision_expansion(&request).await;
+    let proof = fleet.prepare(&request, &expanded).await;
+    fleet.abort(&request, &current).await;
+    wait_aborted_and_admitted(&fleet.stores, &request, &current, &[3, 4]).await;
+
+    // A caller that still holds the learners-ready proof commits too late.
+    for index in current {
+        assert_eq!(
+            fleet.stores[index]
+                .commit_topology_transition(&request, &proof)
+                .await,
+            Err(SessionTopologyTransitionError::IdempotencyConflict),
+            "node {index} accepted a commit of the aborted request"
+        );
+        assert!(
+            fleet.stores[index].status().admitted,
+            "a late commit of the aborted request closed predecessor admission on node {index}"
+        );
+    }
+    wait_aborted_and_admitted(&fleet.stores, &request, &current, &[3, 4]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &current, "late-commit-after-abort")
+        .await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_reconciliation_cannot_close_admission_after_a_later_transition() {
+    let expanded = [0, 1, 2, 3, 4];
+    let contracted = [0, 1, 2];
+    let mut fleet = DynamicFleet::start_three().await;
+    let expand = fleet.transition_request(1, &expanded, 0xB7);
+    fleet.provision_expansion(&expand).await;
+    let expand_proof = fleet.prepare(&expand, &expanded).await;
+    let leader = fleet.wait_transition_caller(&contracted).await;
+    // A retained voter that stays a member through both transitions.
+    let target = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower");
+
+    // The real reconciler captures the staged request, then stops before its
+    // operation gate.
+    let reconciliation = pause_next_staged_reconciliation_for_test(&fleet.stores[target])
+        .expect("hold the real reconciler before its operation gate");
+    let deadline = reconciliation
+        .entered
+        .await
+        .expect("reconciler captured the staged request");
+
+    let status = fleet.stores[leader]
+        .commit_topology_transition(&expand, &expand_proof)
+        .await
+        .expect("leader completes the expansion");
+    assert_eq!(status.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_for_completed_staged_transition_for_test(&fleet.stores[target], &expand, deadline)
+        .await
+        .expect("target durably applied completion with staging retained");
+    let resumed = fleet.stores[target]
+        .commit_topology_transition(&expand, &expand_proof)
+        .await
+        .expect("exact completed-request resume finalizes the target");
+    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    // A second transition completes while the first request's pass still waits.
+    let contract = fleet.transition_request(2, &contracted, 0xB8);
+    fleet.stage_on_all(&contract);
+    let contract_proof = fleet.prepare(&contract, &contracted).await;
+    fleet.commit(&contract, &contract_proof, &contracted).await;
+    let resumed = fleet.stores[target]
+        .commit_topology_transition(&contract, &contract_proof)
+        .await
+        .expect("exact completed-request resume of the second transition");
+    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_completed_and_admitted(&fleet.stores, &contract, &contracted, &[3, 4]).await;
+    let before = topology_admission_state_for_test(&fleet.stores[target], &contract)
+        .expect("target admission before the stale pass resumes");
+    assert!(before.admitted_latch && before.current_request && !before.staged);
+    assert!(
+        tokio::time::Instant::now() < deadline,
+        "the stale pass must resume inside its own deadline"
+    );
+
+    reconciliation
+        .release
+        .send(())
+        .expect("resume the same stale reconciliation");
+    // The pass either polls the admission gate or returns without one; both
+    // happen after the point where it would have closed admission.
+    let first_poll = reconciliation.first_poll.await;
+    let after = topology_admission_state_for_test(&fleet.stores[target], &contract)
+        .expect("target admission after the stale pass");
+    eprintln!(
+        "stale_reconciliation later_transition first_admission_poll={first_poll:?} latch={}",
+        after.admitted_latch
+    );
+    assert!(
+        after.admitted_latch,
+        "a stale reconciliation of a superseded request closed a completed member's admission"
+    );
+    assert_admission_stays_open(
+        &fleet.stores[target],
+        Duration::from_millis(250),
+        "a stale reconciliation left a completed member without application admission",
+    )
+    .await;
+    assert_eq!(
+        topology_admission_state_for_test(&fleet.stores[target], &contract)
+            .expect("target admission readback"),
+        before
+    );
+    prove_read_write_on_every_active_store(&fleet.stores, &contracted, "post-stale-reconcile")
+        .await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_reconciliation_cannot_reopen_admission_while_successor_is_in_flight() {
+    let expanded = [0, 1, 2, 3, 4];
+    let contracted = [0, 1, 2];
+    let mut fleet = DynamicFleet::start_three().await;
+    let expand = fleet.transition_request(1, &expanded, 0xB9);
+    fleet.provision_expansion(&expand).await;
+    let expand_proof = fleet.prepare(&expand, &expanded).await;
+    let leader = fleet.wait_transition_caller(&contracted).await;
+    let target = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower");
+
+    let stale = pause_next_staged_reconciliation_for_test(&fleet.stores[target])
+        .expect("hold the real reconciler before its operation gate");
+    let deadline = stale
+        .entered
+        .await
+        .expect("reconciler captured the first request");
+    let status = fleet.stores[leader]
+        .commit_topology_transition(&expand, &expand_proof)
+        .await
+        .expect("leader completes the expansion");
+    assert_eq!(status.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_for_completed_staged_transition_for_test(&fleet.stores[target], &expand, deadline)
+        .await
+        .expect("target durably applied completion with staging retained");
+    let resumed = fleet.stores[target]
+        .commit_topology_transition(&expand, &expand_proof)
+        .await
+        .expect("exact completed-request resume finalizes the target");
+    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    // The successor is a pure removal: until joint membership its durable
+    // voter set is still the first request's desired uniform set.
+    let contract = fleet.transition_request(2, &contracted, 0xBA);
+    fleet.stage_on_all(&contract);
+    let contract_proof = fleet.prepare(&contract, &contracted).await;
+    let fenced = topology_admission_state_for_test(&fleet.stores[target], &contract)
+        .expect("target admission after the successor's Prepare");
+    assert!(
+        fenced.staged && !fenced.admitted_latch,
+        "the successor's learner barrier fenced the target: {fenced:?}"
+    );
+
+    // Hold the next pass too, so the stale pass's effect is observed alone.
+    let next = pause_next_staged_reconciliation_for_test(&fleet.stores[target])
+        .expect("hold the pass that follows the stale one");
+    assert!(
+        tokio::time::Instant::now() < deadline,
+        "the stale pass must resume inside its own deadline"
+    );
+    stale
+        .release
+        .send(())
+        .expect("resume the stale reconciliation of the completed request");
+    next.entered
+        .await
+        .expect("the stale pass returned and the successor's pass began");
+    let after = topology_admission_state_for_test(&fleet.stores[target], &contract)
+        .expect("target admission after the stale pass");
+    assert!(
+        after.staged && !after.admitted_latch,
+        "a stale reconciliation of the completed request reopened admission while its successor was in flight: {after:?}"
+    );
+
+    next.release
+        .send(())
+        .expect("resume the successor's own reconciliation");
+    fleet.commit(&contract, &contract_proof, &contracted).await;
+    wait_completed_and_admitted(&fleet.stores, &contract, &contracted, &[3, 4]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &contracted, "post-stale-reopen").await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_reconciliation_cannot_fence_member_that_unstaged_before_prepare() {
+    let expanded = [0, 1, 2, 3, 4];
+    let mut fleet = DynamicFleet::start_three().await;
+    let request = fleet.transition_request(1, &expanded, 0xBB);
+    fleet.provision_expansion(&request).await;
+    let leader = fleet.wait_transition_caller(&[0, 1, 2]).await;
+    let target = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower whose absence keeps both quorums");
+
+    // The reconciler captures the staged request, then the member withdraws
+    // that staging before any durable Prepare exists.
+    let stale = pause_next_staged_reconciliation_for_test(&fleet.stores[target])
+        .expect("hold the real reconciler before its operation gate");
+    let deadline = stale
+        .entered
+        .await
+        .expect("reconciler captured the staged request");
+    fleet.stores[target]
+        .unstage_topology_transition_peers(&request)
+        .await
+        .expect("withdraw exact unprepared staging");
+
+    // Prepare applies through the remaining current quorum. The unstaged
+    // member answers its barriers NotReady and keeps predecessor admission.
+    let proof = fleet.prepare(&request, &expanded).await;
+    wait_for_applied_learner_marker_for_test(&fleet.stores[target], &request, deadline)
+        .await
+        .expect("target durably applied Prepare and the learner marker");
+    let before = topology_admission_state_for_test(&fleet.stores[target], &request)
+        .expect("unstaged target admission before the stale pass resumes");
+    assert!(
+        !before.staged && before.admitted_latch,
+        "an unstaged member keeps predecessor admission: {before:?}"
+    );
+
+    stale
+        .release
+        .send(())
+        .expect("resume the stale reconciliation");
+    // The pass either polls the admission gate or returns without one; both
+    // happen after the point where it would have closed admission.
+    let first_poll = stale.first_poll.await;
+    let after = topology_admission_state_for_test(&fleet.stores[target], &request)
+        .expect("unstaged target admission after the stale pass");
+    eprintln!(
+        "stale_reconciliation unstaged_member first_admission_poll={first_poll:?} latch={}",
+        after.admitted_latch
+    );
+    assert!(
+        after.admitted_latch && !after.staged,
+        "a stale reconciliation fenced a member that no longer stages the request: {after:?}"
+    );
+    assert_admission_stays_open(
+        &fleet.stores[target],
+        Duration::from_millis(250),
+        "a stale reconciliation left an unstaged member without application admission",
+    )
+    .await;
+
+    // Exact restaging rejoins the transition, which then completes normally.
+    fleet.stores[target]
+        .stage_topology_transition_peers(
+            &request,
+            fleet.network.peers_for_request(target, &request),
+        )
+        .expect("exact restage after Prepare");
+    fleet.commit(&request, &proof, &expanded).await;
+    wait_completed_and_admitted(&fleet.stores, &request, &expanded, &[]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &expanded, "post-unstaged-member").await;
 }
 
 async fn wait_ready(stores: &[ConsensusSessionStore], active: &[usize]) {

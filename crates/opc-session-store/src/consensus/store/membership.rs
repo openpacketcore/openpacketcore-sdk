@@ -2423,9 +2423,39 @@ impl ConsensusSessionStore {
             return Ok(());
         };
 
-        // Once Prepare applies, application authority remains closed until an
-        // exact uniform successor or durable pre-joint abort is reconciled.
-        self.inner.admitted.store(false, Ordering::Release);
+        // The supervisor captured this request before it waited for the fence.
+        // A caller that held the fence may have consumed that staging and
+        // settled admission, and no later pass reconciles a request that is no
+        // longer staged. Such a pass therefore never closes admission. It only
+        // repeats idempotent terminal admission, which reopens a node whose
+        // commit stopped after finalizing its bindings. A different staged
+        // request owns admission through its own reconciliation.
+        let still_staged = match self
+            .inner
+            .topology_coordinator
+            .has_exact_staged_request(request)
+        {
+            Ok(still_staged) => still_staged,
+            Err(SessionTopologyTransitionError::TransitionInProgress) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !still_staged
+            && !matches!(
+                status.phase(),
+                SessionTopologyTransitionPhase::UniformCommitted
+                    | SessionTopologyTransitionPhase::Finalizing
+                    | SessionTopologyTransitionPhase::Completed
+                    | SessionTopologyTransitionPhase::Aborted
+            )
+        {
+            return Ok(());
+        }
+        if still_staged {
+            // Once Prepare applies, application authority remains closed until
+            // an exact uniform successor or durable pre-joint abort is
+            // reconciled.
+            self.inner.admitted.store(false, Ordering::Release);
+        }
 
         match status.phase() {
             SessionTopologyTransitionPhase::Prepared
@@ -2804,6 +2834,11 @@ impl ConsensusSessionStore {
     /// Dropping this future does not request abort. A retry uses durable phase
     /// evidence and may continue on a successor leader. Completion is returned
     /// only after `FinalizeTopologyTransition` itself commits and applies.
+    ///
+    /// The call closes local application admission only while this node still
+    /// stages the exact request. A commit of an aborted request, or a repeat
+    /// for a request this node already finalized, leaves admission as its
+    /// terminal path settled it.
     pub async fn commit_topology_transition(
         &self,
         request: &SessionTopologyTransitionRequest,
@@ -2831,12 +2866,23 @@ impl ConsensusSessionStore {
                 _ => Err(SessionTopologyTransitionError::InvalidEvidenceState),
             };
         }
-        self.inner.admitted.store(false, Ordering::Release);
         if matches!(
             status.phase(),
             SessionTopologyTransitionPhase::Aborting | SessionTopologyTransitionPhase::Aborted
         ) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict);
+        }
+        // Commit fences only a request this node still stages. A request it
+        // already finalized, or no longer stages, keeps the admission its
+        // terminal path settled: without staging, no reconciliation would
+        // reopen it.
+        if matches!(
+            self.inner
+                .topology_coordinator
+                .has_exact_staged_request(request),
+            Ok(true)
+        ) {
+            self.inner.admitted.store(false, Ordering::Release);
         }
         if status.phase() == SessionTopologyTransitionPhase::Completed {
             self.finish_local_successor_admission(request, &status, deadline)
