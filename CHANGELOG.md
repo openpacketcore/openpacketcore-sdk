@@ -110,6 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-eap`: add typed EAP Success and Failure values with exact
+  four-octet encoding and identifier-correlation helpers. Method-independent
+  admission classifies all four EAP codes, rejects invalid lengths and declared
+  terminal Data, and ignores receive padding outside Length per RFC 3748.
+  Request/Response packets delegate to the existing AKA and EAP-5G parsers;
+  new diagnostics omit packet values and identifiers. Fixes #1026.
+
 - `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
   reads to local encryption and remote sealing wrappers. Every returned
   physical record requires a canonical envelope and the existing authenticated
