@@ -48,8 +48,9 @@ const CORE_MTU: usize = 1_500;
 /// 20 + 8 + 2,572 = the 2,600-octet inner datagram of the reproduction.
 const LARGE_PAYLOAD: usize = 2_572;
 const SIP_PORT: u16 = 5060;
-/// `ipfrag_time` in the gateway namespace: a fragment stranded in a host
-/// reassembly queue is counted as failed this soon.
+/// `ipfrag_time` in the gateway namespace while this test runs: should a
+/// fragment be stranded in a host reassembly queue, it expires this soon and
+/// is not left behind for the tests that follow.
 const REASSEMBLY_TIMEOUT_SECONDS: u32 = 1;
 
 fn application_payload(tag: u8, length: usize) -> Vec<u8> {
@@ -123,6 +124,22 @@ impl Reassembly {
             self.failed - earlier.failed,
         )
     }
+}
+
+/// IPv4 reassembly queues currently held in this namespace, by local
+/// reassembly or by netfilter defragmentation (`/proc/net/sockstat`).
+fn ipv4_reassembly_queues() -> u64 {
+    let sockstat = std::fs::read_to_string("/proc/net/sockstat").expect("read /proc/net/sockstat");
+    let mut fields = sockstat
+        .lines()
+        .find(|line| line.starts_with("FRAG:"))
+        .expect("FRAG row")
+        .split_whitespace()
+        .skip_while(|field| *field != "inuse");
+    fields
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .expect("FRAG inuse counter")
 }
 
 /// Host-generated ICMP Destination Unreachable messages in this netns.
@@ -363,6 +380,17 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _fragment_limits =
         FragmentSysctlGuard::configure(REASSEMBLY_TIMEOUT_SECONDS, 4 * 1024 * 1024)?;
+    // The exact reassembly counts below must be this test's own. Every test
+    // of this binary shares the gateway namespace, and an earlier one may
+    // have left incomplete reassembly queues behind: wait until they expire.
+    let leftovers_deadline = Instant::now() + Duration::from_secs(35);
+    while ipv4_reassembly_queues() != 0 {
+        assert!(
+            Instant::now() < leftovers_deadline,
+            "reassembly queues left by an earlier test did not expire"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let net = TestNet::provision();
     // One connection-tracking rule activates netfilter's IPv4 defragmentation
     // at PRE_ROUTING and LOCAL_OUT for the whole gateway namespace, as some
@@ -463,6 +491,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         (2, 1, 0),
         "connection tracking must be active: netfilter reassembles the fast-path fragments"
     );
+    assert_eq!(ipv4_reassembly_queues(), 0);
 
     // The same session now carries a downlink inner MTU, as does a dedicated
     // bearer of the same UE.
@@ -531,6 +560,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         (2, 1, 0),
         "the host reassembles the two outer fragments and no inner fragment"
     );
+    assert_eq!(
+        ipv4_reassembly_queues(),
+        0,
+        "no fragment may be held in a host reassembly queue"
+    );
 
     // 3. Three fragments whose G-PDUs all fit the S2b-U link, sent in reverse
     //    order: offset only, More Fragments with an offset, More Fragments
@@ -564,6 +598,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         (0, 0, 0),
         "no inner fragment enters a host reassembly queue"
     );
+    assert_eq!(ipv4_reassembly_queues(), 0);
     assert_eq!(
         pinned_counter(&pin_dir, COUNTER_DL_DECAP),
         decapsulated_before
@@ -580,10 +615,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Nothing was left behind in a host reassembly queue: past the
-    // reassembly timeout, no reassembly has failed.
+    // reassembly timeout, none is held and no reassembly has failed.
     std::thread::sleep(Duration::from_millis(
         u64::from(REASSEMBLY_TIMEOUT_SECONDS) * 1_000 + 500,
     ));
+    assert_eq!(ipv4_reassembly_queues(), 0);
     assert_eq!(
         ipv4_reassembly_stat("ReasmFails"),
         hand_off_start.failed,
@@ -642,6 +678,12 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "datagrams sent to the inner-fragment queue: {events:?}"
     );
 
+    // So far no hand-off has met an unbound queue: no plaintext ICMP crossed
+    // the core. The capture cannot hold the flood below, so from here on the
+    // host's own Destination Unreachable counter is the evidence.
+    core_packets.extend(captured_ipv4(&pgw_capture));
+    assert_eq!(plaintext_icmp(&core_packets), 0, "no ICMP toward the core");
+
     // 7. The queue budget. With nobody draining, a flood of inner fragments
     //    larger than the queue's receive buffer arrives, then three over-MTU
     //    Don't Fragment datagrams and an Echo Request. The flood overflows
@@ -685,9 +727,19 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         oversized.len(),
         "the fragment flood must not cost the over-MTU path a packet"
     );
+    // Both hand-off queues hold a backlog, so they are served strictly in
+    // turn: three over-MTU packets and three fragments alternate, whichever
+    // queue has the first turn. Neither class waits for the other's backlog.
+    let turns: Vec<bool> = events
+        .iter()
+        .skip(1)
+        .take(6)
+        .map(|event| matches!(event, GtpuDownlinkEvent::Fragmented(_)))
+        .collect();
     assert!(
-        fragmented.iter().all(|index| (1..=6).contains(index)),
-        "the over-MTU packets are served in turn with the fragment backlog, at {fragmented:?}"
+        turns == [true, false, true, false, true, false]
+            || turns == [false, true, false, true, false, true],
+        "the hand-off queues must be served in turn, over-MTU packets at {fragmented:?}"
     );
     let accepted = events
         .iter()
@@ -729,10 +781,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(counters.shared_queue_drops, 0);
 
     // No hand-off met an unbound queue, and an overflowing queue is silent:
-    // no plaintext ICMP crossed the core, and the host generated no
-    // Destination Unreachable.
-    core_packets.extend(captured_ipv4(&pgw_capture));
-    assert_eq!(plaintext_icmp(&core_packets), 0, "no ICMP toward the core");
+    // over the whole test the host generated no Destination Unreachable.
     assert_eq!(
         host_icmp_destination_unreachable(),
         host_icmp_before,
