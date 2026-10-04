@@ -7435,9 +7435,12 @@ mod tests {
             .await;
     }
 
-    async fn wait_for_drain_completion(minimum: u64) {
+    async fn wait_for_drain_completion(
+        minimum: u64,
+        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
+    ) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while connection_outcome_metrics().drain_completed < minimum {
+            while snapshot_metrics().drain_completed < minimum {
                 tokio::task::yield_now().await;
             }
         })
@@ -7482,21 +7485,36 @@ mod tests {
         (result, writer)
     }
 
-    async fn assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
-        let before_idle = connection_outcome_metrics();
+    async fn assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
+    ) {
+        let before_idle = snapshot_metrics();
         let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
         record_consensus_server_connection_outcome(&idle_result);
         idle_result.expect("byte-idle authenticated consensus connection is a policy retirement");
-        wait_for_drain_completion(before_idle.drain_completed + 1).await;
-        let after_idle = connection_outcome_metrics();
+        wait_for_drain_completion(before_idle.drain_completed + 1, snapshot_metrics).await;
+        let after_idle = snapshot_metrics();
         assert_eq!(
             after_idle.idle_retirements,
-            before_idle.idle_retirements + 1
+            before_idle.idle_retirements + 1,
+            "authenticated idle retirement increments the idle counter exactly once"
         );
         assert_eq!(after_idle.timeout_failures, before_idle.timeout_failures);
-        assert_eq!(after_idle.successes, before_idle.successes + 1);
-        assert_eq!(after_idle.drain_started, before_idle.drain_started + 1);
-        assert_eq!(after_idle.drain_completed, before_idle.drain_completed + 1);
+        assert_eq!(
+            after_idle.successes,
+            before_idle.successes + 1,
+            "authenticated idle retirement records one successful connection"
+        );
+        assert_eq!(
+            after_idle.drain_started,
+            before_idle.drain_started + 1,
+            "authenticated idle retirement starts one drain"
+        );
+        assert_eq!(
+            after_idle.drain_completed,
+            before_idle.drain_completed + 1,
+            "dropping the retired connection completes one drain"
+        );
         let mut acknowledgement = std::io::Cursor::new(acknowledgement);
         assert!(matches!(
             read_frame::<_, SessionConsensusBootstrapResponse>(
@@ -7508,25 +7526,26 @@ mod tests {
             SessionConsensusBootstrapResponse::Accepted(_)
         ));
 
-        let before_partial = connection_outcome_metrics();
+        let before_partial = snapshot_metrics();
         let (partial_result, _acknowledgement) = dispatch_after_authentication(&[0]).await;
         assert!(matches!(
             partial_result,
             Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
         ));
         record_consensus_server_connection_outcome(&partial_result);
-        let after_partial = connection_outcome_metrics();
+        let after_partial = snapshot_metrics();
         assert_eq!(
             after_partial.idle_retirements, before_partial.idle_retirements,
             "one active consensus frame byte must preserve the slowloris timeout failure"
         );
         assert_eq!(
             after_partial.timeout_failures,
-            before_partial.timeout_failures + 1
+            before_partial.timeout_failures + 1,
+            "a partial active frame records one timeout failure"
         );
         assert_eq!(after_partial.successes, before_partial.successes);
 
-        let before_handshake = connection_outcome_metrics();
+        let before_handshake = snapshot_metrics();
         let (server_binding, _client_binding) = bindings();
         let reauthentication = SessionReauthenticationControl::new();
         let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
@@ -7557,14 +7576,15 @@ mod tests {
             Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
         ));
         record_consensus_server_connection_outcome(&handshake_result);
-        let after_handshake = connection_outcome_metrics();
+        let after_handshake = snapshot_metrics();
         assert_eq!(
             after_handshake.idle_retirements,
             before_handshake.idle_retirements
         );
         assert_eq!(
             after_handshake.timeout_failures,
-            before_handshake.timeout_failures + 1
+            before_handshake.timeout_failures + 1,
+            "bootstrap silence records one timeout failure"
         );
         assert_eq!(after_handshake.successes, before_handshake.successes);
     }
@@ -7576,9 +7596,49 @@ mod tests {
             .scope(
                 accounting,
                 assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+                    connection_outcome_metrics,
                 ),
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn consensus_server_records_production_connection_outcome_metrics() {
+        const CHILD_MARKER: &str = "OPC_SESSION_NET_CONSENSUS_OUTCOME_METRICS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current session-net test executable"),
+            )
+            .args([
+                "--exact",
+                "consensus::tests::consensus_server_records_production_connection_outcome_metrics",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated consensus outcome metrics child");
+            assert!(
+                status.success(),
+                "isolated consensus outcome metrics child passes"
+            );
+            return;
+        }
+
+        let transport_before = METRICS
+            .session_net_connection_failure_transport
+            .load(Ordering::Relaxed);
+        assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+            crate::test_support::production_connection_outcome_metrics,
+        )
+        .await;
+        assert_eq!(
+            METRICS
+                .session_net_connection_failure_transport
+                .load(Ordering::Relaxed),
+            transport_before,
+            "idle retirement and timeouts are not transport failures"
+        );
     }
 
     #[tokio::test]

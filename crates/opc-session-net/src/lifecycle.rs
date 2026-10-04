@@ -1549,6 +1549,14 @@ mod tests {
         assert_eq!(lifecycle.hard_deadline().expect("hard deadline"), deadline);
     }
 
+    #[test]
+    fn idle_timeout_retirement_uses_dedicated_counter() {
+        assert!(std::ptr::eq(
+            RetirementReason::IdleTimeout.retirement_counter(),
+            &METRICS.session_net_lifecycle_retirement_idle_timeout
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn earlier_chain_expiry_uses_distinct_local_and_peer_reasons() {
         let now = tokio::time::Instant::now();

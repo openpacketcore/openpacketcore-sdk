@@ -2,9 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+use opc_redaction::metrics::METRICS;
 
-// Retained for tests outside the #576 outcome-accounting seam that still assert
-// process-global metrics. Outcome assertions below use task-local accounting.
+// Serializes cooperating connection metric tests. Exact global assertions also
+// run in isolated single-test children to exclude unrelated test writers.
 pub(crate) static SESSION_CONNECTION_METRICS_TEST_LOCK: std::sync::LazyLock<
     tokio::sync::Mutex<()>,
 > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -16,6 +17,28 @@ pub(crate) struct ConnectionOutcomeMetricSnapshot {
     pub(crate) successes: u64,
     pub(crate) drain_started: u64,
     pub(crate) drain_completed: u64,
+}
+
+// Use only from an isolated test child: these are the real process-global
+// counters, independent of the task-scoped accounting below.
+pub(crate) fn production_connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
+    ConnectionOutcomeMetricSnapshot {
+        idle_retirements: METRICS
+            .session_net_lifecycle_retirement_idle_timeout
+            .load(Ordering::Relaxed),
+        timeout_failures: METRICS
+            .session_net_connection_failure_timeout
+            .load(Ordering::Relaxed),
+        successes: METRICS
+            .session_net_connection_successes
+            .load(Ordering::Relaxed),
+        drain_started: METRICS
+            .session_net_lifecycle_drain_started
+            .load(Ordering::Relaxed),
+        drain_completed: METRICS
+            .session_net_lifecycle_drain_completed
+            .load(Ordering::Relaxed),
+    }
 }
 
 #[derive(Debug, Default)]
