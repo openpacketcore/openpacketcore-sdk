@@ -112,6 +112,30 @@ Its selector functional test must resolve exactly once and run alone after
 the other cfg tests finish. Use a separate `CARGO_TARGET_DIR` for this profile,
 as the workflow does.
 
+### Non-Linux compile checks
+
+The required **Rust clippy** job in [ci.yml](.github/workflows/ci.yml) also
+checks selected retained non-Linux code with default features. These checks
+compile code and tests but do not execute them on non-Linux hosts:
+
+```bash
+rustup target add x86_64-unknown-freebsd aarch64-apple-darwin
+cargo clippy --locked \
+  -p opc-gtpu-dataplane -p opc-linux-gtpu-sys -p opc-session-store \
+  -p opc-fs-verity-sys -p opc-sqlite-file-control-sys \
+  -p opc-session-testkit -p opc-persist \
+  --all-targets --target x86_64-unknown-freebsd -- -D warnings
+# The other five crates above need an Apple C toolchain for bundled
+# SQLite and/or ring. Keep the two sys crates checked on Apple too.
+cargo clippy --locked -p opc-linux-gtpu-sys -p opc-fs-verity-sys \
+  --all-targets --target aarch64-apple-darwin -- -D warnings
+# Runtime test targets pull in AWS-LC through opc-sbi and need a
+# target C toolchain. Its library can be checked on both targets.
+for target in x86_64-unknown-freebsd aarch64-apple-darwin; do
+  cargo clippy --locked -p opc-runtime --lib --target "$target" -- -D warnings
+done
+```
+
 ### CNF performance qualification
 
 Required CI checks durable completion, exact receipts/readback, quorum and

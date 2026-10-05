@@ -108,8 +108,9 @@ an SCTP-terminating CNF is in scope:
    exception cannot silently spread or become undocumented.
 4. **ABI safety.** Every C struct crossing the boundary has a struct-layout
    (size/alignment/offset) test. Kernel-UAPI sys crates build and run their
-   admitted Linux tests in CI. Non-Linux coverage is compile-only and limited
-   to the crate/target combinations in [CI](../../.github/workflows/ci.yml).
+   admitted Linux tests in CI and fail explicitly on other platforms.
+   Non-Linux coverage is compile-only and limited to the crate/target
+   combinations in [CI](../../.github/workflows/ci.yml).
    In particular,
    `opc-fs-verity-sys` exposes its descriptor API only on Unix: Linux provides
    the reviewed ioctl implementation, non-Linux Unix targets compile an

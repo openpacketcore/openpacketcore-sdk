@@ -811,9 +811,9 @@ Internal path-based snapshot helpers MUST NOT be treated as a portable
 consensus fallback. Standalone `SqliteSessionBackend` retains
 platform-independent code. Linux is the SDK's only supported platform.
 
-Since the macOS and FreeBSD CI lanes were removed, these off-Linux requirements
-and the public-constructor and core-initializer rejection tests are
-compile-checked for `x86_64-unknown-freebsd`, not executed in CI.
+The code and tests behind these off-Linux requirements are compiled for
+`x86_64-unknown-freebsd` but not executed, so CI does not verify the
+requirements. Until #1116, these tests ran on the macOS lane.
 
 HA topology admission MUST start from the complete descriptor set and one
 explicit logical self `ReplicaId`. It MUST bind a cluster ID, the exact
@@ -956,9 +956,11 @@ epoch-derived and do not include the fixed-profile or placement-policy binding.
 `ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
 where descriptor-pinned SQLite snapshots are available; other platforms MUST
 return `FixedQuorumUnsupportedPlatform` before durable initialization.
-Since the macOS and FreeBSD CI lanes were removed, this off-Linux requirement
-and its fixed-quorum rejection test are compile-checked for
-`x86_64-unknown-freebsd`, not executed in CI.
+
+The code and test behind this off-Linux requirement are compiled for
+`x86_64-unknown-freebsd` but not executed, so CI does not verify the
+requirement. Until #1116, this test ran on the macOS lane.
+
 The local snapshot integrity mechanism is an explicit construction policy,
 independent of fixed membership and placement. The legacy opener selects
 `SnapshotIntegrityPolicy::FsVerity`: the filesystem MUST support the exact

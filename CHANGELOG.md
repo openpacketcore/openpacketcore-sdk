@@ -44,8 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hosted CI runs on Linux only: the macOS host lane, FreeBSD GTP-U cross-lint
   lane and Darwin runtime cross-lint step were removed in #1116. Retained
-  non-Linux code now receives compile-only, warnings-denied Clippy checks with
-  default features in the existing Linux `Rust clippy` job. All targets of
+  non-Linux code in the following crates now receives compile-only,
+  warnings-denied Clippy checks with default features in the existing Linux
+  `Rust clippy` job. All targets of
   `opc-gtpu-dataplane`, `opc-linux-gtpu-sys`, `opc-session-store`,
   `opc-fs-verity-sys`, `opc-sqlite-file-control-sys`, `opc-session-testkit` and
   `opc-persist` are checked for `x86_64-unknown-freebsd`; the two sys crates

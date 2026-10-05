@@ -139,7 +139,8 @@ consensus identity remains for dynamic profiles. This constructor is supported
 only on Linux because fixed quorum recovery uses descriptor-pinned SQLite
 snapshots; on other platforms it returns
 `ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform` before
-initializing durable Raft state.
+initializing durable Raft state. The off-Linux rejection code and test are
+compile-checked for FreeBSD, not executed in CI.
 
 ```rust
 let members = vec![
