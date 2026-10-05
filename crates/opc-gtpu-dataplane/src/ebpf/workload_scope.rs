@@ -13,6 +13,29 @@ use std::{fmt, path::PathBuf};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EbpfWorkloadScope([u8; 32]);
 
+/// Identifier-free counts from a completed strict exclusive workload reset.
+///
+/// Counts describe removals in this call, not proof that an object was foreign.
+/// Ordinary map/program pins and non-marker directories are not counted.
+/// Errors may follow partial cleanup and return no completion report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EbpfStrictWorkloadResetReport {
+    /// Selector-authority, decommission and legacy selector-terminal entries.
+    pub selector_markers: usize,
+    /// Detached tc filters, including those removed by the ordinary exclusive reset.
+    pub tc_filters: usize,
+    /// Exclusion-marker directories removed anywhere in the scope, including
+    /// valid exclusions that reset subsequently recreates.
+    pub exclusion_marker_directories: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkloadReset {
+    Conservative,
+    Exclusive,
+    StrictExclusive,
+}
+
 impl EbpfWorkloadScope {
     /// Construct a workload scope from a nonzero opaque identity digest.
     ///
@@ -87,7 +110,9 @@ impl EbpfGtpuDataplaneBackend {
         scope: EbpfWorkloadScope,
         interface: &str,
     ) -> Result<(), GtpuError> {
-        self.reset_workload(scope, interface, false).await
+        self.reset_workload(scope, interface, WorkloadReset::Conservative)
+            .await
+            .map(|_| ())
     }
 
     /// Reconcile an exclusively owned workload scope to absence.
@@ -133,7 +158,8 @@ impl EbpfGtpuDataplaneBackend {
     /// and handle `0:1` in a nonzero chain, or a directory named
     /// `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside a retained writer or
     /// operation-lock directory. Existing SDK generations create neither layout;
-    /// the writer responsible must correct it.
+    /// [`Self::reset_strict_exclusive_workload_graph`] also removes these
+    /// layouts when the caller can make its additional ownership assertions.
     ///
     /// # Environment and interruption
     /// Requires `CAP_NET_ADMIN` for tc and `CAP_SYS_ADMIN` for global program
@@ -176,15 +202,58 @@ impl EbpfGtpuDataplaneBackend {
         scope: EbpfWorkloadScope,
         interface: &str,
     ) -> Result<(), GtpuError> {
-        self.reset_workload(scope, interface, true).await
+        self.reset_workload(scope, interface, WorkloadReset::Exclusive)
+            .await
+            .map(|_| ())
+    }
+
+    /// Reset an unbound, exclusively owned scope, including foreign residue.
+    ///
+    /// Calling this method asserts all ownership and quiescence requirements of
+    /// [`Self::reset_exclusive_workload_graph`] and, additionally, that:
+    ///
+    /// - **No selector namespace is bound in this scope.** Selector-authority,
+    ///   decommission and legacy selector-terminal markers protect no valid
+    ///   history here and may be removed, including their contents.
+    /// - **Every configured tc slot belongs to the caller in every chain.** On
+    ///   declared interfaces, any clsact ingress/egress filter at the configured
+    ///   priority and handle `0:1` may be detached, regardless of origin, chain
+    ///   or protocol. This adds no tc authority over other interfaces/namespaces.
+    ///
+    /// Every exclusion-marker directory in the root is also removed, including
+    /// those nested inside retained writer or operation locks. Lock inodes stay
+    /// held and unchanged; valid ordinary exclusions are recreated before success.
+    /// All other cleanup, reference guards and interruption rules remain those
+    /// of the ordinary exclusive reset. Repeat this strict reset after an
+    /// interrupted call, before ordinary attachment. No sessions survive;
+    /// callers must drain or transfer emergency sessions before voluntary teardown.
+    ///
+    /// A false assertion can erase permanent selector fencing/retirement history,
+    /// permit reuse of a retired namespace, or detach another owner's forwarding
+    /// or security policy. A writer/reference scan cannot prove the assertion.
+    /// Do not use this API to bypass a bound selector's separate lifecycle.
+    ///
+    /// # Errors
+    /// Preserves the distinct writer-busy and program-reference errors of
+    /// [`Self::reset_exclusive_workload_graph`], as well as its root, interface,
+    /// inspection and pending-terminal-admission guards. Selector marker names
+    /// alone no longer refuse. An error may follow partial cleanup: keep ingress
+    /// isolated and do not attach or serve until reset succeeds.
+    pub async fn reset_strict_exclusive_workload_graph(
+        &self,
+        scope: EbpfWorkloadScope,
+        interface: &str,
+    ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
+        self.reset_workload(scope, interface, WorkloadReset::StrictExclusive)
+            .await
     }
 
     async fn reset_workload(
         &self,
         scope: EbpfWorkloadScope,
         interface: &str,
-        exclusive: bool,
-    ) -> Result<(), GtpuError> {
+        mode: WorkloadReset,
+    ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
         if self.inner.config.bpffs_pin_root != scope.bpffs_pin_root() {
             return Err(GtpuError::invalid_config(
                 "ebpf.workload_scope",
@@ -203,7 +272,7 @@ impl EbpfGtpuDataplaneBackend {
                 Err(GtpuError::NotFound) => None,
                 Err(error) => return Err(error),
             };
-            if exclusive {
+            if mode != WorkloadReset::Conservative {
                 if backend
                     .terminal_admissions()?
                     .keys()
@@ -213,17 +282,33 @@ impl EbpfGtpuDataplaneBackend {
                         feature: "exclusive_workload_cleanup_pending_terminal_admission",
                     });
                 }
-                backend.inner.runtime.reset_exclusive_workload_graph(
-                    ifindex,
-                    &backend.pin_dir(&interface),
-                    backend.inner.config.tc_priority,
-                )
+                if mode == WorkloadReset::StrictExclusive {
+                    backend.inner.runtime.reset_strict_exclusive_workload_graph(
+                        ifindex,
+                        &backend.pin_dir(&interface),
+                        backend.inner.config.tc_priority,
+                    )
+                } else {
+                    backend
+                        .inner
+                        .runtime
+                        .reset_exclusive_workload_graph(
+                            ifindex,
+                            &backend.pin_dir(&interface),
+                            backend.inner.config.tc_priority,
+                        )
+                        .map(|()| EbpfStrictWorkloadResetReport::default())
+                }
             } else {
-                backend.inner.runtime.reset_workload_graph(
-                    ifindex,
-                    &backend.pin_dir(&interface),
-                    backend.inner.config.tc_priority,
-                )
+                backend
+                    .inner
+                    .runtime
+                    .reset_workload_graph(
+                        ifindex,
+                        &backend.pin_dir(&interface),
+                        backend.inner.config.tc_priority,
+                    )
+                    .map(|()| EbpfStrictWorkloadResetReport::default())
             }
         })
         .await

@@ -100,9 +100,9 @@ pub use ebpf::{
     ClassifierLoadBlocker, ClassifierLoadCapability, EbpfGtpuDatapathCounters,
     EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig,
     EbpfManagedDeviceIdentity, EbpfManagedDeviceInventory, EbpfManagedDeviceInventoryCompleteness,
-    EbpfWorkloadScope, ATTACHMENT_BELOW_STACKED_DEVICE, ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
-    ATTACHMENT_ON_ENSLAVED_INTERFACE, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
-    MAX_EBPF_MANAGED_DEVICE_IDENTITIES,
+    EbpfStrictWorkloadResetReport, EbpfWorkloadScope, ATTACHMENT_BELOW_STACKED_DEVICE,
+    ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE, ATTACHMENT_ON_ENSLAVED_INTERFACE,
+    DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY, MAX_EBPF_MANAGED_DEVICE_IDENTITIES,
 };
 pub use error::{GtpuError, ProgramLoadRefusal};
 pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};

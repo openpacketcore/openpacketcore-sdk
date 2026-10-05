@@ -66,10 +66,33 @@ mod n3_end_marker;
 mod n3_fixed_flow;
 #[path = "ebpf_gtpu_privileged/packet_too_big_baseline.rs"]
 mod packet_too_big_baseline;
+#[path = "ebpf_gtpu_privileged/strict_workload_reset.rs"]
+mod strict_workload_reset;
 #[path = "ebpf_gtpu_privileged/tft_classifier_removal.rs"]
 mod tft_classifier_removal;
 #[path = "ebpf_gtpu_privileged/tft_fragment_affinity.rs"]
 mod tft_fragment_affinity;
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_layout_matrix_and_forwarding(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::layout_matrix_and_forwarding().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_writer_and_reference_guards(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::writer_and_reference_guards().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_external_namespace_guard() -> Result<(), Box<dyn std::error::Error>>
+{
+    strict_workload_reset::external_namespace_guard().await
+}
 
 #[tokio::test]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]

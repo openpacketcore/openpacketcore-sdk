@@ -5,6 +5,7 @@ use crate::ebpf::validate_interface_name;
 use crate::ebpf::workload_scope::{
     cleanup_exclusive, ExclusiveCleanupInventory, ExclusiveWorkloadCleanup,
 };
+use crate::ebpf::EbpfStrictWorkloadResetReport;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStringExt;
@@ -59,9 +60,8 @@ impl Filter {
         })
     }
 
-    fn exact_slot(&self, priority: u16) -> bool {
-        self.chain == 0
-            && self.protocol == TC_PROTOCOL_ALL
+    fn owned_slot(&self, priority: u16, strict: bool) -> bool {
+        (strict || self.chain == 0 && self.protocol == TC_PROTOCOL_ALL)
             && self.priority == priority
             && self.handle == u32::from(TC_HANDLE)
     }
@@ -106,7 +106,8 @@ pub(super) fn reset(
     ifindex: Option<u32>,
     pin_dir: &Path,
     priority: u16,
-) -> Result<(), GtpuError> {
+    strict: bool,
+) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
     if !runtime
         .devices
         .lock()
@@ -173,9 +174,12 @@ pub(super) fn reset(
             hooks: Vec::new(),
         }],
         priority,
+        strict,
+        report: EbpfStrictWorkloadResetReport::default(),
         retired_programs: HashSet::new(),
     };
-    cleanup_exclusive(&mut port)
+    cleanup_exclusive(&mut port)?;
+    Ok(port.report)
 }
 
 fn io_error(error: impl Into<io::Error>) -> GtpuError {
@@ -298,6 +302,16 @@ fn entries(directory: &File) -> Result<Vec<OsString>, GtpuError> {
     Ok(names)
 }
 
+fn selector_marker(name: &OsStr) -> bool {
+    [
+        b"SELECTOR_AUTHORITY_".as_slice(),
+        b"SELECTOR_DECOMMISSIONED_",
+        b"SELECTOR_TERMINAL_FENCE_",
+    ]
+    .iter()
+    .any(|prefix| name.as_bytes().starts_with(prefix))
+}
+
 struct Node {
     path: PathBuf,
     parent: usize,
@@ -321,6 +335,8 @@ struct ExclusiveCleanup {
     leaves: BTreeSet<String>,
     interfaces: Vec<Interface>,
     priority: u16,
+    strict: bool,
+    report: EbpfStrictWorkloadResetReport,
     retired_programs: HashSet<u32>,
 }
 
@@ -341,16 +357,9 @@ impl ExclusiveCleanup {
 
     fn inventory_directory(&mut self, parent: usize) -> Result<bool, GtpuError> {
         for name in entries(self.directory(parent)?)? {
-            // Permanent selector history cannot be erased by a declaration
-            // about the ordinary workload graph, even if the marker is torn.
-            if [
-                b"SELECTOR_AUTHORITY_".as_slice(),
-                b"SELECTOR_DECOMMISSIONED_",
-                b"SELECTOR_TERMINAL_FENCE_",
-            ]
-            .iter()
-            .any(|prefix| name.as_bytes().starts_with(prefix))
-            {
+            // Only the strict assertion says these cannot protect a bound
+            // selector's permanent history, including torn marker layouts.
+            if !self.strict && selector_marker(&name) {
                 return Ok(true);
             }
             let path = self.nodes[parent].path.join(&name);
@@ -433,7 +442,8 @@ impl ExclusiveCleanup {
             let keep = directory.is_some()
                 && (path == Path::new(RECONCILER_CONTROL_DIRECTORY)
                     || direct_control_child && lock_name
-                    || self.nodes[parent].keep
+                    || !self.strict
+                        && self.nodes[parent].keep
                         && self.nodes[parent].parent != 0
                         && self.nodes[self.nodes[parent].parent].path
                             == Path::new(RECONCILER_CONTROL_DIRECTORY)
@@ -580,7 +590,7 @@ impl ExclusiveCleanup {
                     .into_iter()
                     .filter(|filter| {
                         filter.sdk
-                            || filter.exact_slot(self.priority)
+                            || filter.owned_slot(self.priority, self.strict)
                             || filter.program_id.is_some_and(|id| referenced.contains(&id))
                     })
                     .collect();
@@ -704,7 +714,8 @@ impl ExclusiveCleanup {
         for interface in &self.interfaces {
             if let Some(ifindex) = interface.ifindex {
                 if self.filters(ifindex)?.iter().any(|filter| {
-                    interface.by_name && (filter.sdk || filter.exact_slot(self.priority))
+                    interface.by_name
+                        && (filter.sdk || filter.owned_slot(self.priority, self.strict))
                         || interface.hooks.iter().any(|old| {
                             (
                                 old.parent,
@@ -796,6 +807,7 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
                     return Err(state_indeterminate(OPERATION));
                 }
                 hook.detach(ifindex)?;
+                self.report.tc_filters += 1;
                 if let Some(id) = hook.program_id {
                     self.retired_programs.insert(id);
                 }
@@ -824,6 +836,12 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
             },
         )
         .map_err(io_error)?;
+        if selector_marker(name) {
+            self.report.selector_markers += 1;
+        }
+        if node.directory.is_some() && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER {
+            self.report.exclusion_marker_directories += 1;
+        }
         if let Some(id) = node.program_id {
             self.retired_programs.insert(id);
         }
@@ -859,9 +877,9 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
         self.revalidate()?;
         self.require_unreferenced()?;
         self.verify_detached_hooks()?;
-        // Preserve all earlier exclusions and finish every inventoried leaf,
-        // including names from before a rename. A later reset of another
-        // interface must not make ordinary attachment bounce between markers.
+        // Finish every inventoried leaf, including names from before a rename.
+        // The ordinary form preserves earlier exclusions; strict reset rebuilds
+        // them. Resetting another interface must not strand ordinary attachment.
         let control = self
             .nodes
             .iter()
@@ -930,6 +948,36 @@ mod tests {
             },
             state,
         )
+    }
+
+    #[test]
+    fn strict_slot_includes_every_chain_and_protocol_only_at_declared_placement() {
+        let mut filter = Filter {
+            parent: sys::TC_H_CLSACT_INGRESS,
+            chain: 0,
+            protocol: TC_PROTOCOL_ALL,
+            priority: 50,
+            handle: u32::from(TC_HANDLE),
+            kind: b"matchall\0".to_vec(),
+            sdk: false,
+            program_id: None,
+        };
+        for chain in [0, 7, u32::MAX] {
+            for protocol in [TC_PROTOCOL_ALL, 0x0800_u16.to_be(), 0x86dd_u16.to_be()] {
+                filter.chain = chain;
+                filter.protocol = protocol;
+                assert!(filter.owned_slot(50, true));
+                assert_eq!(
+                    filter.owned_slot(50, false),
+                    chain == 0 && protocol == TC_PROTOCOL_ALL
+                );
+                assert!(!filter.owned_slot(51, true));
+            }
+        }
+        filter.handle = 2;
+        assert!(!filter.owned_slot(50, true));
+        filter.handle = 0;
+        assert!(!filter.owned_slot(50, true));
     }
 
     #[test]

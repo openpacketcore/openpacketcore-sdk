@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: explicit strict exclusive workload reset for callers
+  asserting an unbound selector scope and ownership of configured tc slots in
+  every chain. Removes selector markers, filters at those slots and nested
+  exclusion directories, with identifier-free removal counts and unchanged
+  live-writer and program-reference guards.
+
 - `opc-crypto` and `opc-persist`: add opt-in exact configuration byte evidence
   and eight-slot, destination-specific preparation leases retained through
   encryption claims and envelope aliases. Existing encryption and storage

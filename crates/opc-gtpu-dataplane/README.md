@@ -1986,8 +1986,53 @@ Two foreign-only layouts can survive a successful reset and still make ordinary
 attachment refuse: a non-SDK `ETH_P_ALL` filter at the configured priority and
 handle `0:1` in another chain, and a directory named
 `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside a retained writer or operation-lock
-directory. Existing SDK generations create neither layout. Their presence needs
-correction by the writer responsible for it; this reset does not repair them.
+directory. Existing SDK generations create neither layout. The strict form below
+also removes them when the caller can assert its additional ownership contract.
+
+##### Strict reset of an unbound scope
+
+Call `reset_strict_exclusive_workload_graph(scope, interface)` to make two
+additional assertions: **no selector namespace is bound in the scope**, and
+**the caller owns every tc slot at the configured priority and handle `0:1`,
+in every chain and protocol, on the declared interfaces**. This is a separate
+entry point; existing reset calls retain their behavior and errors.
+
+With that assertion, selector-authority, decommission and legacy
+selector-terminal markers protect no valid selector history in the scope and
+are removed, including partial contents. Every clsact ingress/egress filter at
+the asserted placement is removable regardless of its origin or chain.
+Exclusion-marker directories are removed anywhere in the scope, including
+inside retained writer/operation locks and other exclusion directories. Held
+lock inodes remain unchanged; reset recreates valid ordinary exclusions before
+returning success. Other cleanup ordering and scope boundaries are unchanged.
+
+**A false assertion can erase permanent selector authority and retirement
+fences, permit reuse of a retired namespace, detach another owner's forwarding
+or security policy, or destroy its recovery exclusion.** Writer and reference
+guards cannot prove the absence of selector authority elsewhere. A caller that
+binds selectors must use their separate lifecycle.
+
+The returned `EbpfStrictWorkloadResetReport` has three identifier-free counts:
+
+| Field | Removed during this successful call |
+|:---|:---|
+| `selector_markers` | Authority, decommission and legacy terminal marker entries. |
+| `tc_filters` | All detached filters, including those the ordinary exclusive reset removes. |
+| `exclusion_marker_directories` | All removed exclusion directories, including valid markers subsequently recreated. |
+
+These counts do not claim foreign provenance. Ordinary pins and other directory
+removals are not counted. Errors can follow partial cleanup and return no
+completion report. Busy writers and surviving program references retain the
+distinct errors and bounded wait above; pending terminal admissions still refuse.
+Descriptor-relative traversal still refuses symlinks and cross-device paths.
+
+Strict startup cleanup and repetition after interruption need no manual node
+cleanup or replacement Pod for these three layouts. Keep ingress isolated until
+it succeeds, then attach normally. Sessions and in-flight traffic are discarded:
+drain or transfer emergency sessions before any voluntary teardown. Reset does
+not implement drain or cross-node collection. See
+[ADR 0028](../../docs/adr/0028-strict-exclusive-workload-reset.md) for the safety
+argument and lifecycle contract.
 
 #### Orphaned current-schema graph recovery
 
