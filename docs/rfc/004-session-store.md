@@ -808,8 +808,8 @@ inspection and before creating a snapshot directory, consensus schema, or
 other consensus-owned filesystem state. The core initializer MUST independently
 return its typed `UnsupportedPlatform` storage error before those effects.
 Internal path-based snapshot helpers MUST NOT be treated as a portable
-consensus fallback. Standalone `SqliteSessionBackend` use remains
-cross-platform.
+consensus fallback. Standalone `SqliteSessionBackend` retains
+platform-independent code. Linux is the SDK's only supported platform.
 
 HA topology admission MUST start from the complete descriptor set and one
 explicit logical self `ReplicaId`. It MUST bind a cluster ID, the exact

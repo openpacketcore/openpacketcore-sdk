@@ -4,6 +4,9 @@ Thank you for your interest in contributing to the OpenPacketCore SDK. This docu
 
 ## Development setup
 
+Linux is the only supported development and runtime platform. Hosted CI runs
+Linux builds and tests; macOS and FreeBSD are outside the supported platform set.
+
 ### Required toolchain
 
 - **Rust** ≥ 1.89 (install via [rustup](https://rustup.rs/))
@@ -100,10 +103,11 @@ Run the protected prepared-transition functional test alone with
 assertions and overflow checks remain enabled. The selector functional test
 retains its ordinary test profile.
 
-The separate **Rust GTP-U unsupported-platform cfg tests** job in
-[ci.yml](.github/workflows/ci.yml) also uses
+The separate **Rust GTP-U unsupported-platform cfg** job in
+[ci.yml](.github/workflows/ci.yml) runs on Linux with
 `RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
-`--no-default-features`. The ordinary workspace run does not cover that profile.
+`--no-default-features` to exercise behavior when the Linux GTP-U backend is
+unavailable. The ordinary workspace run does not cover that profile.
 Its selector functional test must resolve exactly once and run alone after
 the other cfg tests finish. Use a separate `CARGO_TARGET_DIR` for this profile,
 as the workflow does.
