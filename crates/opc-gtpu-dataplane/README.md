@@ -1989,49 +1989,72 @@ handle `0:1` in another chain, and a directory named
 directory. Existing SDK generations create neither layout. The strict form below
 also removes them when the caller can assert its additional ownership contract.
 
-##### Strict reset of an unbound scope
+##### Strict reset of a never-provisioned scope
 
 Call `reset_strict_exclusive_workload_graph(scope, interface)` to make two
-additional assertions: **no selector namespace is bound in the scope**, and
-**the caller owns every tc slot at the configured priority and handle `0:1`,
-in every chain and protocol, on the declared interfaces**. This is a separate
-entry point; existing reset calls retain their behavior and errors.
+additional assertions: **no selector namespace has ever been provisioned in
+this scope**, and **the caller owns the whole configured tc priority on the
+interface named in this call, in every chain**. This is a separate entry point;
+existing reset calls retain their behavior and errors.
 
 With that assertion, selector-authority, decommission and legacy
 selector-terminal markers protect no valid selector history in the scope and
-are removed, including partial contents. Every clsact ingress/egress filter at
-the asserted placement is removable regardless of its origin or chain.
-Exclusion-marker directories are removed anywhere in the scope, including
-inside retained writer/operation locks and other exclusion directories. Held
-lock inodes remain unchanged; reset recreates valid ordinary exclusions before
-returning success. Other cleanup ordering and scope boundaries are unchanged.
+are removed, including partial contents. On the named interface, every clsact
+ingress/egress filter at the configured priority is removed, regardless of
+classifier kind, protocol, handle or chain. Other priorities on that interface
+are never touched by strict reset.
+
+Declared interfaces are the name passed to the call and interface-shaped names
+of scope-root entries. A scope entry cannot grant foreign-filter authority:
+on other declared interfaces only SDK hooks and filters referencing scope maps
+are removed; discovery by map reference authorizes only referencing filters.
+Alternative names of the named interface resolve to the same kernel index.
+Direct tc deletion stays in the calling network namespace. Scope-wide pin and
+pinned-link cleanup retains the ordinary exclusive reset's contract.
+
+Misplaced exclusion-marker directories are removed throughout the scope. Inside
+a retained lock directory the ordinary preservation rule remains, except for an
+operation lock or the writer lock of an interface known to this call. Valid
+ordinary exclusions keep their inodes even for interfaces absent from the
+namespace. Unfinished exclusions of known interfaces are completed before
+success. Lock inodes stay held and unchanged. Resetting every intended interface
+before creating any of them therefore preserves each completed exclusion.
 
 **A false assertion can erase permanent selector authority and retirement
 fences, permit reuse of a retired namespace, detach another owner's forwarding
 or security policy, or destroy its recovery exclusion.** Writer and reference
-guards cannot prove the absence of selector authority elsewhere. A caller that
-binds selectors must use their separate lifecycle.
+guards cannot prove the absence of selector authority elsewhere. This reset is
+outside [RFC 016's lifecycle](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#12-security-and-privacy-analysis)
+and must never be used in a selector-provisioned scope, including after
+decommission.
 
-The returned `EbpfStrictWorkloadResetReport` has three identifier-free counts:
+The non-exhaustive `EbpfStrictWorkloadResetReport` has identifier-free counts of
+confirmed removals that indicate foreign origin:
 
-| Field | Removed during this successful call |
+| Field | Removed during this attempt |
 |:---|:---|
 | `selector_markers` | Authority, decommission and legacy terminal marker entries. |
-| `tc_filters` | All detached filters, including those the ordinary exclusive reset removes. |
-| `exclusion_marker_directories` | All removed exclusion directories, including valid markers subsequently recreated. |
+| `tc_filters` | Kernel filter entries that do not match the SDK's ordinary attach predicate. |
+| `exclusion_marker_directories` | Misplaced exclusion directories, excluding valid ordinary exclusions. |
 
-These counts do not claim foreign provenance. Ordinary pins and other directory
-removals are not counted. Errors can follow partial cleanup and return no
-completion report. Busy writers and surviving program references retain the
-distinct errors and bounded wait above; pending terminal admissions still refuse.
-Descriptor-relative traversal still refuses symlinks and cross-device paths.
+A clean repeated call or a restart with only SDK leftovers reports all zeros.
+Ordinary pins and other directories are not counted. If an attempt fails after
+confirmed foreign removals, `GtpuError::StrictWorkloadResetIncomplete` carries
+its report and original error as `source`; other errors keep their original
+variant. Retain reports across retries: a later success cannot recount earlier
+removals. Failed-attempt counts are lower bounds, and ACK-uncertain removals
+remain unknown; a zero retry report does not establish that the whole sequence
+found nothing foreign. Busy writers and surviving program references keep their
+distinct underlying reasons and bounded wait above; pending terminal admissions
+still refuse. Descriptor-relative traversal still refuses symlinks and
+cross-device paths.
 
 Strict startup cleanup and repetition after interruption need no manual node
-cleanup or replacement Pod for these three layouts. Keep ingress isolated until
-it succeeds, then attach normally. Sessions and in-flight traffic are discarded:
-drain or transfer emergency sessions before any voluntary teardown. Reset does
-not implement drain or cross-node collection. See
-[ADR 0028](../../docs/adr/0028-strict-exclusive-workload-reset.md) for the safety
+cleanup or replacement Pod for these three layouts under these assertions.
+Keep ingress isolated until it succeeds, then attach normally. Sessions and
+in-flight traffic are discarded: drain or transfer emergency sessions before any
+voluntary teardown. Reset does not implement drain or cross-node collection.
+See [ADR 0028](../../docs/adr/0028-strict-exclusive-workload-reset.md) for the safety
 argument and lifecycle contract.
 
 #### Orphaned current-schema graph recovery

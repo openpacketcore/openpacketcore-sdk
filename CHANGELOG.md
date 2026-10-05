@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `opc-gtpu-dataplane`: explicit strict exclusive workload reset for callers
-  asserting an unbound selector scope and ownership of configured tc slots in
-  every chain. Removes selector markers, filters at those slots and nested
-  exclusion directories, with identifier-free removal counts and unchanged
-  live-writer and program-reference guards.
+- `opc-gtpu-dataplane`: add `reset_strict_exclusive_workload_graph` for callers
+  asserting a never-provisioned selector scope and ownership of the configured
+  tc priority on the named interface in every chain. Remove selector markers,
+  foreign filters at that priority and misplaced exclusion directories, retaining
+  valid ordinary exclusions and writer/reference guards. Return identifier-free
+  foreign-removal counts in the non-exhaustive `EbpfStrictWorkloadResetReport`,
+  including partial counts in `GtpuError::StrictWorkloadResetIncomplete` on
+  failure. Refs #1118.
 
 - `opc-crypto` and `opc-persist`: add opt-in exact configuration byte evidence
   and eight-slot, destination-specific preparation leases retained through

@@ -9,6 +9,7 @@ use std::io;
 
 use thiserror::Error;
 
+use crate::ebpf::EbpfStrictWorkloadResetReport;
 use crate::model::EbpfDatapathGeneration;
 
 /// Why a `BPF_PROG_LOAD` was refused before the kernel's verifier reached a
@@ -167,6 +168,19 @@ pub enum GtpuError {
         /// Stable operation label.
         operation: &'static str,
     },
+    /// A strict workload reset failed after confirmed foreign-object removals.
+    ///
+    /// Retain these counts when retrying; the next call cannot recount objects
+    /// already removed. The source preserves the underlying error classification
+    /// and stable operation label. Counts exclude ACK-uncertain removals.
+    #[error("GTP-U strict workload reset failed after foreign cleanup: {source}")]
+    StrictWorkloadResetIncomplete {
+        /// Confirmed removals during the failed attempt, without identifiers.
+        report: EbpfStrictWorkloadResetReport,
+        /// The original failure, including its distinct writer/reference reason.
+        #[source]
+        source: Box<GtpuError>,
+    },
     /// A live tc hook runs a different generation of the datapath program than
     /// this build attaches.
     ///
@@ -303,6 +317,7 @@ impl GtpuError {
             Self::Io { kind, .. }
             | Self::ProgramLoadRejected { kind, .. }
             | Self::ProgramLoadRefused { kind, .. } => Some(*kind),
+            Self::StrictWorkloadResetIncomplete { source, .. } => source.io_kind(),
             _ => None,
         }
     }
@@ -314,6 +329,7 @@ impl GtpuError {
             Self::Io { raw_os_error, .. }
             | Self::ProgramLoadRejected { raw_os_error, .. }
             | Self::ProgramLoadRefused { raw_os_error, .. } => *raw_os_error,
+            Self::StrictWorkloadResetIncomplete { source, .. } => source.raw_os_error(),
             _ => None,
         }
     }
@@ -329,6 +345,7 @@ impl GtpuError {
     pub fn load_refusal(&self) -> Option<ProgramLoadRefusal> {
         match self {
             Self::ProgramLoadRefused { class, .. } => Some(*class),
+            Self::StrictWorkloadResetIncomplete { source, .. } => source.load_refusal(),
             _ => None,
         }
     }
@@ -341,7 +358,11 @@ impl GtpuError {
     /// errno rules.
     #[must_use]
     pub fn is_verifier_rejection(&self) -> bool {
-        matches!(self, Self::ProgramLoadRejected { .. })
+        match self {
+            Self::ProgramLoadRejected { .. } => true,
+            Self::StrictWorkloadResetIncomplete { source, .. } => source.is_verifier_rejection(),
+            _ => false,
+        }
     }
 }
 
@@ -435,6 +456,59 @@ mod tests {
             error.to_string(),
             "GTP-U install_pdp_context must be retried"
         );
+    }
+
+    #[test]
+    fn strict_reset_failure_preserves_counts_and_source_classification() {
+        let report = EbpfStrictWorkloadResetReport {
+            tc_filters: 3,
+            ..EbpfStrictWorkloadResetReport::default()
+        };
+        let error = GtpuError::StrictWorkloadResetIncomplete {
+            report,
+            source: Box::new(GtpuError::StateIndeterminate {
+                operation: "ebpf_exclusive_workload_detached_program_reference",
+            }),
+        };
+        let GtpuError::StrictWorkloadResetIncomplete { report, source } = &error else {
+            panic!("strict reset must retain its partial report");
+        };
+        assert_eq!(report.selector_markers, 0);
+        assert_eq!(report.tc_filters, 3);
+        assert_eq!(report.exclusion_marker_directories, 0);
+        assert!(matches!(
+            source.as_ref(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_exclusive_workload_detached_program_reference"
+            }
+        ));
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            source.to_string()
+        );
+        assert_eq!(error.to_string(), "GTP-U strict workload reset failed after foreign cleanup: GTP-U ebpf_exclusive_workload_detached_program_reference outcome is indeterminate");
+
+        for rejected in [false, true] {
+            let wrapped = GtpuError::StrictWorkloadResetIncomplete {
+                report: *report,
+                source: Box::new(GtpuError::program_load_outcome(
+                    "ebpf_program_load",
+                    &io::Error::from_raw_os_error(13),
+                    rejected,
+                )),
+            };
+            assert_eq!(wrapped.io_kind(), Some(io::ErrorKind::PermissionDenied));
+            assert_eq!(wrapped.raw_os_error(), Some(13));
+            assert_eq!(wrapped.is_verifier_rejection(), rejected);
+            assert_eq!(
+                wrapped.load_refusal(),
+                if rejected {
+                    None
+                } else {
+                    Some(ProgramLoadRefusal::PolicyDenied)
+                }
+            );
+        }
     }
 
     /// The defect in #547: a load refused for want of `CAP_BPF` is `EPERM`,

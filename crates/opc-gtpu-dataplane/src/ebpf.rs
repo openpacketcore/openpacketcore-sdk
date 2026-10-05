@@ -73122,12 +73122,15 @@ mod tests {
     async fn strict_workload_reset_dispatches_only_explicit_assertion_and_returns_counts() {
         let scope = EbpfWorkloadScope::new([0x53; 32]).unwrap();
         let runtime = Arc::new(FakeRuntime::new());
-        let report = EbpfStrictWorkloadResetReport {
-            selector_markers: 3,
-            tc_filters: 5,
-            exclusion_marker_directories: 7,
+        let report = {
+            let mut state = runtime.state();
+            state.strict_workload_reset_report.selector_markers = 3;
+            state.strict_workload_reset_report.tc_filters = 5;
+            state
+                .strict_workload_reset_report
+                .exclusion_marker_directories = 7;
+            state.strict_workload_reset_report
         };
-        runtime.state().strict_workload_reset_report = report;
         let backend = EbpfGtpuDataplaneBackend::with_runtime_and_config(
             runtime.clone(),
             EbpfGtpuDataplaneBackendConfig {
@@ -73148,20 +73151,15 @@ mod tests {
             })
         ));
         assert!(runtime.state().strict_workload_resets.is_empty());
-        assert_eq!(
-            backend
-                .reset_strict_exclusive_workload_graph(scope, "s2bu")
+        for interface in ["s2bu", "missing"] {
+            let actual = backend
+                .reset_strict_exclusive_workload_graph(scope, interface)
                 .await
-                .unwrap(),
-            report
-        );
-        assert_eq!(
-            backend
-                .reset_strict_exclusive_workload_graph(scope, "missing")
-                .await
-                .unwrap(),
-            report
-        );
+                .unwrap();
+            assert_eq!(actual.selector_markers, 3);
+            assert_eq!(actual.tc_filters, 5);
+            assert_eq!(actual.exclusion_marker_directories, 7);
+        }
         assert_eq!(
             runtime.state().strict_workload_resets,
             vec![

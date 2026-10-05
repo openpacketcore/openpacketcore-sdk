@@ -13,19 +13,22 @@ use std::{fmt, path::PathBuf};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EbpfWorkloadScope([u8; 32]);
 
-/// Identifier-free counts from a completed strict exclusive workload reset.
+/// Identifier-free counts of foreign objects removed by a strict workload reset.
 ///
-/// Counts describe removals in this call, not proof that an object was foreign.
-/// Ordinary map/program pins and non-marker directories are not counted.
-/// Errors may follow partial cleanup and return no completion report.
+/// Zero counts on a completed attempt mean no foreign objects of these classes
+/// were found. SDK hooks, valid ordinary exclusions, ordinary pins and other
+/// directories are not counted. Failed attempts with confirmed removals return
+/// these counts in [`GtpuError::StrictWorkloadResetIncomplete`]; accumulate them
+/// across retries. Uncertain effects of a failed mutation remain unknown.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EbpfStrictWorkloadResetReport {
     /// Selector-authority, decommission and legacy selector-terminal entries.
     pub selector_markers: usize,
-    /// Detached tc filters, including those removed by the ordinary exclusive reset.
+    /// Detached kernel filter entries that do not match the SDK attach predicate.
+    /// Includes u32 table entries, but excludes classifier summaries.
     pub tc_filters: usize,
-    /// Exclusion-marker directories removed anywhere in the scope, including
-    /// valid exclusions that reset subsequently recreates.
+    /// Removed exclusion-marker directories outside valid ordinary exclusions.
     pub exclusion_marker_directories: usize,
 }
 
@@ -207,38 +210,57 @@ impl EbpfGtpuDataplaneBackend {
             .map(|_| ())
     }
 
-    /// Reset an unbound, exclusively owned scope, including foreign residue.
+    /// Reset an exclusively owned scope that has never provisioned a selector.
     ///
     /// Calling this method asserts all ownership and quiescence requirements of
     /// [`Self::reset_exclusive_workload_graph`] and, additionally, that:
     ///
-    /// - **No selector namespace is bound in this scope.** Selector-authority,
-    ///   decommission and legacy selector-terminal markers protect no valid
-    ///   history here and may be removed, including their contents.
-    /// - **Every configured tc slot belongs to the caller in every chain.** On
-    ///   declared interfaces, any clsact ingress/egress filter at the configured
-    ///   priority and handle `0:1` may be detached, regardless of origin, chain
-    ///   or protocol. This adds no tc authority over other interfaces/namespaces.
+    /// - **No selector namespace has ever been provisioned in this scope.**
+    ///   Selector-authority, decommission and legacy selector-terminal markers
+    ///   protect no valid history here and may be removed with their contents.
+    /// - **The configured tc priority on the named interface belongs to the
+    ///   caller in every chain.** Every clsact ingress/egress filter at that
+    ///   priority may be detached, of any origin, classifier kind, protocol or
+    ///   handle. Other priorities on the named interface are not touched.
     ///
-    /// Every exclusion-marker directory in the root is also removed, including
-    /// those nested inside retained writer or operation locks. Lock inodes stay
-    /// held and unchanged; valid ordinary exclusions are recreated before success.
-    /// All other cleanup, reference guards and interruption rules remain those
-    /// of the ordinary exclusive reset. Repeat this strict reset after an
+    /// Declared interfaces are the name passed to this call and interface-shaped
+    /// scope-root entry names. Only the interface named in the call receives
+    /// foreign-filter removal authority, including when named by an alternative
+    /// name. On other declared interfaces, SDK hooks and filters referencing scope
+    /// maps are removed. Discovery by map reference authorizes only referencing
+    /// filters. No foreign-filter authority follows a scope entry or map reference.
+    /// All direct tc operations stay in the calling network namespace; scope-wide
+    /// pin cleanup, including pinned-link release, follows the ordinary contract.
+    ///
+    /// Misplaced exclusion-marker directories are removed throughout the root.
+    /// Inside retained lock directories the ordinary preservation rule remains,
+    /// except for operation locks and writer locks of interfaces known to this
+    /// call. Valid ordinary exclusions therefore retain their inodes, including
+    /// those of absent interfaces; unfinished exclusions of known interfaces are
+    /// completed before success. Lock inodes stay held and unchanged.
+    /// Reference guards and interruption rules remain those of the ordinary
+    /// exclusive reset. Repeat this strict reset after an
     /// interrupted call, before ordinary attachment. No sessions survive;
     /// callers must drain or transfer emergency sessions before voluntary teardown.
     ///
     /// A false assertion can erase permanent selector fencing/retirement history,
     /// permit reuse of a retired namespace, or detach another owner's forwarding
     /// or security policy. A writer/reference scan cannot prove the assertion.
-    /// Do not use this API to bypass a bound selector's separate lifecycle.
+    /// This operation is outside RFC 016's selector lifecycle. Do not use it in
+    /// a scope that ever provisioned a selector, even after decommission.
     ///
     /// # Errors
-    /// Preserves the distinct writer-busy and program-reference errors of
+    /// Preserves the distinct writer-busy and program-reference reasons of
     /// [`Self::reset_exclusive_workload_graph`], as well as its root, interface,
     /// inspection and pending-terminal-admission guards. Selector marker names
-    /// alone no longer refuse. An error may follow partial cleanup: keep ingress
-    /// isolated and do not attach or serve until reset succeeds.
+    /// alone no longer refuse. After confirmed foreign removals, an error is
+    /// [`GtpuError::StrictWorkloadResetIncomplete`], carrying this attempt's
+    /// counts and the original failure as its source. Other failures retain
+    /// their original variant. Retain reports across retries: a later successful
+    /// call cannot recount objects already removed. Failed-attempt counts are
+    /// lower bounds; an ACK-uncertain removal remains unknown, so a zero retry
+    /// report does not prove the whole sequence found nothing foreign.
+    /// Keep ingress isolated and do not attach or serve until reset succeeds.
     pub async fn reset_strict_exclusive_workload_graph(
         &self,
         scope: EbpfWorkloadScope,

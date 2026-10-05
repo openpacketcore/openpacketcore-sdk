@@ -60,15 +60,21 @@ impl Filter {
         })
     }
 
-    fn owned_slot(&self, priority: u16, strict: bool) -> bool {
-        (strict || self.chain == 0 && self.protocol == TC_PROTOCOL_ALL)
+    fn exact_slot(&self, priority: u16) -> bool {
+        self.chain == 0
+            && self.protocol == TC_PROTOCOL_ALL
             && self.priority == priority
             && self.handle == u32::from(TC_HANDLE)
     }
 
-    fn detach(&self, ifindex: u32) -> Result<(), GtpuError> {
-        // Zero would delete the whole priority rather than one filter.
-        if self.handle == 0 {
+    fn classifier(&self) -> (u32, u32, u16, u16) {
+        (self.parent, self.chain, self.protocol, self.priority)
+    }
+
+    fn detach(&self, ifindex: u32, entire_priority: bool) -> Result<(), GtpuError> {
+        // Only the strict assertion on the named interface authorizes deleting
+        // a complete classifier, including u32 tables and all their rules.
+        if self.handle == 0 && !entire_priority {
             return Err(state_indeterminate(OPERATION));
         }
         let socket = sys::open_route_netlink_socket().map_err(io_error)?;
@@ -81,7 +87,7 @@ impl Filter {
             TC_NETLINK_SEQUENCE,
             socket.port_id(),
             tc_ifindex(ifindex).map_err(io_error)?,
-            self.handle,
+            if entire_priority { 0 } else { self.handle },
             self.parent,
             (u32::from(self.priority) << 16) | u32::from(self.protocol),
             &attributes,
@@ -171,6 +177,7 @@ pub(super) fn reset(
                 .to_owned(),
             ifindex,
             by_name: true,
+            exclusive_priority: strict,
             hooks: Vec::new(),
         }],
         priority,
@@ -178,7 +185,15 @@ pub(super) fn reset(
         report: EbpfStrictWorkloadResetReport::default(),
         retired_programs: HashSet::new(),
     };
-    cleanup_exclusive(&mut port)?;
+    if let Err(source) = cleanup_exclusive(&mut port) {
+        if strict && port.report != EbpfStrictWorkloadResetReport::default() {
+            return Err(GtpuError::StrictWorkloadResetIncomplete {
+                report: port.report,
+                source: Box::new(source),
+            });
+        }
+        return Err(source);
+    }
     Ok(port.report)
 }
 
@@ -344,7 +359,19 @@ struct Interface {
     name: String,
     ifindex: Option<u32>,
     by_name: bool,
+    exclusive_priority: bool,
     hooks: Vec<Filter>,
+}
+
+impl Interface {
+    fn owns_filter_by_name(&self, filter: &Filter, priority: u16, strict: bool) -> bool {
+        self.by_name
+            && if self.exclusive_priority {
+                filter.priority == priority
+            } else {
+                filter.sdk || !strict && filter.exact_slot(priority)
+            }
+    }
 }
 
 impl ExclusiveCleanup {
@@ -439,16 +466,20 @@ impl ExclusiveCleanup {
                 && stem
                     .iter()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+            let retained_exclusion = directory.is_some()
+                && self.nodes[parent].keep
+                && self.nodes[parent].parent != 0
+                && self.nodes[self.nodes[parent].parent].path
+                    == Path::new(RECONCILER_CONTROL_DIRECTORY)
+                && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER;
             let keep = directory.is_some()
                 && (path == Path::new(RECONCILER_CONTROL_DIRECTORY)
                     || direct_control_child && lock_name
-                    || !self.strict
-                        && self.nodes[parent].keep
-                        && self.nodes[parent].parent != 0
-                        && self.nodes[self.nodes[parent].parent].path
-                            == Path::new(RECONCILER_CONTROL_DIRECTORY)
-                        && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER);
-            if keep {
+                    || retained_exclusion);
+            // Strict marker classification waits until every known interface
+            // has been discovered. A foreign marker in a writer/operation lock
+            // is removable; an absent interface's valid exclusion is not.
+            if keep && !(self.strict && retained_exclusion) {
                 AyaGtpuRuntime::verify_control_directory(
                     directory
                         .as_ref()
@@ -564,15 +595,23 @@ impl ExclusiveCleanup {
 
     fn inventory_interfaces(&mut self) -> Result<(), GtpuError> {
         self.revalidate_interface()?;
+        let named_ifindex = self
+            .interfaces
+            .first()
+            .and_then(|interface| interface.ifindex);
         let mut referenced = self.referencing_programs()?;
         let declared = self.leaves.clone();
         let mut interfaces = declared
             .iter()
             .map(|name| {
+                let ifindex = interface_index(name)?;
                 Ok(Interface {
                     name: name.clone(),
-                    ifindex: interface_index(name)?,
+                    ifindex,
                     by_name: true,
+                    exclusive_priority: self.strict
+                        && ifindex.is_some()
+                        && ifindex == named_ifindex,
                     hooks: Vec::new(),
                 })
             })
@@ -589,9 +628,9 @@ impl ExclusiveCleanup {
                     .filters(ifindex)?
                     .into_iter()
                     .filter(|filter| {
-                        filter.sdk
-                            || filter.owned_slot(self.priority, self.strict)
-                            || filter.program_id.is_some_and(|id| referenced.contains(&id))
+                        interface.owns_filter_by_name(filter, self.priority, self.strict)
+                            || !interface.exclusive_priority
+                                && filter.program_id.is_some_and(|id| referenced.contains(&id))
                     })
                     .collect();
                 for hook in &interface.hooks {
@@ -646,12 +685,62 @@ impl ExclusiveCleanup {
                     name: name.to_owned(),
                     ifindex: Some(interface.index()),
                     by_name: false,
+                    exclusive_priority: false,
                     hooks,
                 });
             }
         }
         self.interfaces = interfaces;
         self.revalidate_interface()
+    }
+
+    fn retain_ordinary_exclusions(&mut self) -> Result<(), GtpuError> {
+        if !self.strict {
+            return Ok(());
+        }
+        let control = self
+            .nodes
+            .iter()
+            .find(|node| node.path == Path::new(RECONCILER_CONTROL_DIRECTORY))
+            .ok_or_else(|| state_indeterminate(OPERATION))?;
+        let writer_names = self
+            .leaves
+            .iter()
+            .map(|leaf| {
+                AyaGtpuRuntime::selector_namespace_pin_commitment(
+                    control.identity.0,
+                    control.identity.1,
+                    OsStr::new(leaf),
+                )
+                .map(|namespace| AyaGtpuRuntime::lower_hex(&namespace))
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        for index in 1..self.nodes.len() {
+            let node = &self.nodes[index];
+            if !node.keep
+                || node.path.file_name()
+                    != Some(OsStr::new(HISTORICAL_25_ORDINARY_EXCLUSION_MARKER))
+            {
+                continue;
+            }
+            let parent = self.nodes[node.parent]
+                .path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            if parent.ends_with(RECONCILER_OPERATION_LOCK_SUFFIX) || writer_names.contains(parent) {
+                self.nodes[index].keep = false;
+            } else {
+                // An unknown 64-hex lock can be an absent interface's legacy
+                // exclusion. Preserve its marker exactly as ordinary reset does.
+                AyaGtpuRuntime::verify_control_directory(
+                    self.directory(index)?,
+                    Some(node.identity),
+                    OPERATION,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn revalidate_interface(&self) -> Result<(), GtpuError> {
@@ -714,8 +803,7 @@ impl ExclusiveCleanup {
         for interface in &self.interfaces {
             if let Some(ifindex) = interface.ifindex {
                 if self.filters(ifindex)?.iter().any(|filter| {
-                    interface.by_name
-                        && (filter.sdk || filter.owned_slot(self.priority, self.strict))
+                    interface.owns_filter_by_name(filter, self.priority, self.strict)
                         || interface.hooks.iter().any(|old| {
                             (
                                 old.parent,
@@ -785,6 +873,7 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
             );
         }
         self.inventory_interfaces()?;
+        self.retain_ordinary_exclusions()?;
         self.revalidate()?;
         let (object_pins, pins) = (1..self.nodes.len())
             .rev()
@@ -800,16 +889,42 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
 
     fn detach_interface(&mut self, index: usize) -> Result<(), GtpuError> {
         let hooks = self.interfaces[index].hooks.clone();
+        let entire_priority = self.interfaces[index].exclusive_priority;
         if let Some(ifindex) = self.interfaces[index].ifindex {
-            for hook in hooks {
+            let mut detached_classifiers = HashSet::new();
+            for hook in &hooks {
+                if entire_priority && !detached_classifiers.insert(hook.classifier()) {
+                    continue;
+                }
                 self.revalidate()?;
-                if !self.filters(ifindex)?.contains(&hook) {
+                let current = self.filters(ifindex)?;
+                let removing = if entire_priority {
+                    hooks
+                        .iter()
+                        .filter(|other| other.classifier() == hook.classifier())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![hook]
+                };
+                if removing.iter().any(|filter| !current.contains(filter))
+                    || entire_priority
+                        && current
+                            .iter()
+                            .filter(|filter| filter.classifier() == hook.classifier())
+                            .count()
+                            != removing.len()
+                {
                     return Err(state_indeterminate(OPERATION));
                 }
-                hook.detach(ifindex)?;
-                self.report.tc_filters += 1;
-                if let Some(id) = hook.program_id {
-                    self.retired_programs.insert(id);
+                hook.detach(ifindex, entire_priority)?;
+                for filter in removing {
+                    // Handle zero is the dump's classifier summary, not a
+                    // filter. Counting it would report foreign residue even
+                    // for a classifier containing only the SDK's own hooks.
+                    self.report.tc_filters += usize::from(filter.handle != 0 && !filter.sdk);
+                    if let Some(id) = filter.program_id {
+                        self.retired_programs.insert(id);
+                    }
                 }
             }
         }
@@ -878,8 +993,8 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
         self.require_unreferenced()?;
         self.verify_detached_hooks()?;
         // Finish every inventoried leaf, including names from before a rename.
-        // The ordinary form preserves earlier exclusions; strict reset rebuilds
-        // them. Resetting another interface must not strand ordinary attachment.
+        // Both forms preserve earlier ordinary exclusions, including those of
+        // absent interfaces whose hashed lock names this call cannot recover.
         let control = self
             .nodes
             .iter()
@@ -951,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_slot_includes_every_chain_and_protocol_only_at_declared_placement() {
+    fn strict_priority_authority_requires_the_named_interface() {
         let mut filter = Filter {
             parent: sys::TC_H_CLSACT_INGRESS,
             chain: 0,
@@ -962,22 +1077,39 @@ mod tests {
             sdk: false,
             program_id: None,
         };
+        let named = Interface {
+            name: "named0".into(),
+            ifindex: Some(17),
+            by_name: true,
+            exclusive_priority: true,
+            hooks: Vec::new(),
+        };
+        let discovered = Interface {
+            name: "scope0".into(),
+            ifindex: Some(19),
+            by_name: true,
+            exclusive_priority: false,
+            hooks: Vec::new(),
+        };
         for chain in [0, 7, u32::MAX] {
             for protocol in [TC_PROTOCOL_ALL, 0x0800_u16.to_be(), 0x86dd_u16.to_be()] {
-                filter.chain = chain;
-                filter.protocol = protocol;
-                assert!(filter.owned_slot(50, true));
-                assert_eq!(
-                    filter.owned_slot(50, false),
-                    chain == 0 && protocol == TC_PROTOCOL_ALL
-                );
-                assert!(!filter.owned_slot(51, true));
+                for handle in [0, u32::from(TC_HANDLE), 2, 0x8000_0800] {
+                    filter.chain = chain;
+                    filter.protocol = protocol;
+                    filter.handle = handle;
+                    assert!(named.owns_filter_by_name(&filter, 50, true));
+                    assert!(!named.owns_filter_by_name(&filter, 51, true));
+                    assert!(!discovered.owns_filter_by_name(&filter, 50, true));
+                    assert_eq!(
+                        discovered.owns_filter_by_name(&filter, 50, false),
+                        chain == 0 && protocol == TC_PROTOCOL_ALL && handle == u32::from(TC_HANDLE)
+                    );
+                }
             }
         }
-        filter.handle = 2;
-        assert!(!filter.owned_slot(50, true));
-        filter.handle = 0;
-        assert!(!filter.owned_slot(50, true));
+        filter.sdk = true;
+        assert!(discovered.owns_filter_by_name(&filter, 50, true));
+        assert!(!named.owns_filter_by_name(&filter, 51, true));
     }
 
     #[test]

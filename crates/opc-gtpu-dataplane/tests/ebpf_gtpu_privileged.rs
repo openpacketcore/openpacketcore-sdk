@@ -95,6 +95,40 @@ async fn workload_strict_reset_external_namespace_guard() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_absent_interfaces_and_interruption(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::absent_interfaces_and_interruption().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_entire_priority_then_attach(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::entire_priority_then_attach().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_scope_entry_does_not_grant_foreign_filter_authority(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::scope_entry_does_not_grant_foreign_filter_authority().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_selector_marker_shapes() -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::selector_marker_shapes().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_owned_restart_reports_zero() -> Result<(), Box<dyn std::error::Error>>
+{
+    strict_workload_reset::owned_restart_reports_zero().await
+}
+
+#[tokio::test]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_tft_fragmented_esp_pair() -> Result<(), Box<dyn std::error::Error>> {
     tft_fragment_affinity::qualify_pair().await?;
