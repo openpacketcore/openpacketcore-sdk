@@ -1479,6 +1479,18 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         })
     }
 
+    /// Reset an explicitly exclusive scope without interpreting its graph.
+    fn reset_exclusive_workload_graph(
+        &self,
+        _ifindex: Option<u32>,
+        _pin_dir: &Path,
+        _tc_priority: u16,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "exclusive_workload_cleanup",
+        })
+    }
+
     /// Resolve an interface index by name in the current netns.
     fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError>;
 
@@ -15953,6 +15965,7 @@ mod aya_runtime {
     //! aya-based kernel runtime: loads the committed CO-RE object, attaches
     //! tc clsact filters, and performs pinned BPF map operations.
 
+    mod exclusive_workload_scope;
     mod workload_scope;
 
     use std::collections::{HashMap, HashSet};
@@ -38749,6 +38762,8 @@ mod aya_runtime {
     #[derive(Default)]
     struct TfilterDumpState {
         owner: Option<FilterOwner>,
+        workload_filters: Vec<exclusive_workload_scope::Filter>,
+        workload_filters_indeterminate: bool,
         sdk_programs: Vec<SdkProgramOccupant>,
         unexpected_legacy_v2_program_seen: bool,
     }
@@ -38937,6 +38952,22 @@ mod aya_runtime {
                                 name: String::from("<non-bpf-filter>"),
                                 program_id: None,
                             })?;
+                        }
+                    }
+                    if expected.protocol.is_none() && !state.workload_filters_indeterminate {
+                        // Additional evidence for the exclusive adapter. Keep
+                        // failures out of the conservative parser's contract,
+                        // and bound non-SDK entries just as SDK entries are.
+                        const MAX_WORKLOAD_FILTERS_PER_HOOK: usize = 64;
+                        if state.workload_filters.len() == MAX_WORKLOAD_FILTERS_PER_HOOK {
+                            state.workload_filters_indeterminate = true;
+                        } else {
+                            match exclusive_workload_scope::Filter::from_attributes(
+                                attributes, parent, chain, protocol, priority, handle,
+                            ) {
+                                Ok(filter) => state.workload_filters.push(filter),
+                                Err(()) => state.workload_filters_indeterminate = true,
+                            }
                         }
                     }
                 }
@@ -39841,6 +39872,15 @@ mod aya_runtime {
             tc_priority: u16,
         ) -> Result<(), GtpuError> {
             workload_scope::reset(self, ifindex, pin_dir, tc_priority)
+        }
+
+        fn reset_exclusive_workload_graph(
+            &self,
+            ifindex: Option<u32>,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<(), GtpuError> {
+            exclusive_workload_scope::reset(self, ifindex, pin_dir, tc_priority)
         }
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
@@ -71209,6 +71249,53 @@ mod tests {
 
     fn current_recovery_authority() -> crate::CurrentEbpfGraphRecoveryAuthority {
         current_recovery_authority_with_values(0x91, 0x92, 1, 0x93)
+    }
+
+    #[tokio::test]
+    async fn exclusive_workload_reset_refuses_pending_terminal_admission_without_consuming_it() {
+        let scope = EbpfWorkloadScope::new([0x51; 32]).unwrap();
+        let backend = EbpfGtpuDataplaneBackend::with_runtime_and_config(
+            Arc::new(FakeRuntime::new()),
+            EbpfGtpuDataplaneBackendConfig {
+                bpffs_pin_root: scope.bpffs_pin_root(),
+                ..EbpfGtpuDataplaneBackendConfig::default()
+            },
+        );
+        let pin_dir = scope.bpffs_pin_root().join("s2bu");
+        let authority = current_recovery_authority();
+        let receipt = crate::CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            authority.binding(),
+            crate::CurrentEbpfGraphRecoveryOutcome::Removed,
+            crate::CurrentEbpfGraphRecoveryCommitment::new([0x52; 32]).unwrap(),
+            crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            None,
+        );
+        backend.terminal_admissions().unwrap().insert(
+            pin_dir.clone(),
+            PendingCurrentTerminalAdmission {
+                intent: crate::CurrentEbpfGraphRecoveryIntent::new(
+                    "s2bu",
+                    crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+                ),
+                receipt,
+                authority,
+            },
+        );
+        assert!(matches!(
+            backend.reset_exclusive_workload_graph(scope, "s2bu").await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "exclusive_workload_cleanup_pending_terminal_admission"
+            })
+        ));
+        assert_eq!(
+            backend
+                .terminal_admissions()
+                .unwrap()
+                .get(&pin_dir)
+                .unwrap()
+                .receipt,
+            receipt
+        );
     }
 
     fn current_recovery_authority_for_successor_receipt(
