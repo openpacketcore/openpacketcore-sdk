@@ -4,16 +4,19 @@ use crate::consensus::types::*;
 use crate::consensus::PreparedAuditedMutation;
 use serde::Serialize;
 
-// Golden production source: 2523e9c514d7e3c1c100c9ddc52d86b730650bf3.
-// Reproduce in a clean checkout of that commit with this revision's Git objects
-// available. The two immutable blobs below contain only the committed legacy
-// test harness; neither depends on bounded representations or changes production.
+// Golden production source: 3863855aaf04c38a69fd50985e3d89d5d0773683.
+// Run from a clean worktree with the harness Git object below available. This
+// switches to the baseline, extends only its capture harness, then restores the
+// original branch. The output is tmp/legacy-capture/legacy.json. The package
+// selection keeps serde_json's original default-feature text semantics.
 //
-// mkdir -p crates/opc-persist/src/consensus/capacity_tests
-// git cat-file blob a4cc6966fae5933b8ff75b8210124db968705b48 > crates/opc-persist/src/consensus/capacity_tests/legacy_support.rs
-// git cat-file blob 279812504da680051a732393b59358951775ccd3 > crates/opc-persist/src/consensus/capacity_tests/legacy_fixtures.rs
-// printf '\n#[cfg(test)]\n#[path = "capacity_tests/legacy_support.rs"]\nmod legacy_support;\n#[cfg(test)]\n#[path = "capacity_tests/legacy_fixtures.rs"]\nmod legacy_fixtures;\n' >> crates/opc-persist/src/consensus/mod.rs
-// OPC_PERSIST_LEGACY_CAPTURE="$PWD/crates/opc-persist/src/consensus/capacity_tests/legacy.json" timeout 120s cargo test --locked -p opc-persist --lib consensus::legacy_fixtures::capture_legacy_bytes -- --exact --ignored
+// git switch --detach 3863855aaf04c38a69fd50985e3d89d5d0773683
+// git cat-file blob 5fca6a84403c734a2f10354807a7486681940101 > crates/opc-persist/src/consensus/capacity_tests/legacy_fixtures.rs
+// mkdir -p tmp/legacy-capture tmp/t
+// chmod 700 tmp/t
+// env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 TMPDIR="$PWD/tmp/t" OPC_PERSIST_LEGACY_CAPTURE="$PWD/tmp/legacy-capture/legacy.json" timeout 300s cargo test --locked -p opc-persist --lib consensus::capacity_tests::legacy_fixtures::capture_legacy_bytes -- --exact --ignored --test-threads=1
+// git restore --source=HEAD -- crates/opc-persist/src/consensus/capacity_tests/legacy_fixtures.rs
+// git switch -
 //
 // The ordinary regression only compares; capture requires the ignored test and
 // an explicit destination. Preserve the original rows when extending the shapes.

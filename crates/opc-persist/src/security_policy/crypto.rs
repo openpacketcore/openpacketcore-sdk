@@ -190,48 +190,47 @@ pub(crate) fn validate_principal_tenant_and_roles(
     principal_str: &str,
     target_tenant: &str,
 ) -> Result<(String, Vec<String>, Vec<String>), SecurityPolicyError> {
-    let (spiffe_str, mut roles, groups) =
-        if let Ok(tp) = serde_json::from_str::<serde_json::Value>(principal_str) {
-            let principal_val = tp.get("principal").unwrap_or(&tp);
-            let roles = principal_val
-                .get("roles")
-                .and_then(|r| r.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let groups = principal_val
-                .get("groups")
-                .and_then(|g| g.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+    let (spiffe_str, mut roles, groups) = if let Ok(tp) = crate::json_text::parse(principal_str) {
+        let principal_val = tp.get("principal").unwrap_or(&tp);
+        let roles = principal_val
+            .get("roles")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let groups = principal_val
+            .get("groups")
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-            let spiffe_str = principal_val
-                .get("identity")
-                .and_then(|id| id.get("Internal").or_else(|| id.get("Spiffe")))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    principal_val
-                        .get("spiffe_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| principal_str.to_string())
-                });
+        let spiffe_str = principal_val
+            .get("identity")
+            .and_then(|id| id.get("Internal").or_else(|| id.get("Spiffe")))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                principal_val
+                    .get("spiffe_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| principal_str.to_string())
+            });
 
-            (spiffe_str, roles, groups)
-        } else {
-            let spiffe_str = principal_str.to_string();
-            let roles = Vec::new();
-            let groups = Vec::new();
-            (spiffe_str, roles, groups)
-        };
+        (spiffe_str, roles, groups)
+    } else {
+        let spiffe_str = principal_str.to_string();
+        let roles = Vec::new();
+        let groups = Vec::new();
+        (spiffe_str, roles, groups)
+    };
 
     let spiffe = SpiffeId::new(&spiffe_str).map_err(|e| {
         SecurityPolicyError::Unauthorized(format!("Invalid SPIFFE ID: {}", e.message()))

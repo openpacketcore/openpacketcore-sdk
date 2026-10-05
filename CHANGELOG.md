@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: make stored-principal validation, tenant attribution, policy
+  identity parsing and audit redaction independent of JSON dependency features.
+  Private marker keys now remain ordinary object keys in every build, preserving
+  the original default-feature number, duplicate-key and nesting rules. Fixes #1104.
+
+- `opc-types`: return a timestamp parse error when UTC normalization is outside
+  the supported range; infallible datetime conversion saturates at the nearest
+  UTC bound instead of panicking. Refs #1101.
+
 - **A hand-off from tc needs a bound consumer -- `opc-gtpu-dataplane`,
   `opc-gtpu-dataplane-ebpf`, `opc-gtpu-ebpf-common` (breaking to
   `EbpfGtpuDatapathCounters`; a retained pin graph needs a drained
