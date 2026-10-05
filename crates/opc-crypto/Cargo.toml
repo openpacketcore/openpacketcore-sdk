@@ -16,7 +16,10 @@ categories = ["cryptography", "network-programming"]
 [dependencies]
 opc-key = { path = "../opc-key", version = "0.2.0" }
 rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

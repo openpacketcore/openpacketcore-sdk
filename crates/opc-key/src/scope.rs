@@ -608,11 +608,49 @@ pub fn decode_bound_aad(bound_aad: &[u8]) -> Result<(EnvelopeAad, KeyId), KeyErr
         metadata: parsed.metadata,
     };
     aad.validate()?;
-    let canonical = serialize_bound_aad(&aad, &parsed.key_id)?;
-    if canonical.as_slice() != bound_aad {
+    let mut canonical = CanonicalAadComparison {
+        remaining: bound_aad,
+        equal: true,
+    };
+    serde_json::to_writer(
+        &mut canonical,
+        &BoundEnvelopeAad {
+            tenant: &aad.tenant,
+            purpose: aad.purpose,
+            version: aad.version,
+            key_id: &parsed.key_id,
+            metadata: &aad.metadata,
+        },
+    )
+    .map_err(|_| KeyError::invalid_metadata("aad", "failed to serialize"))?;
+    if !canonical.equal || !canonical.remaining.is_empty() {
         return Err(KeyError::invalid_metadata("aad", "must be canonical"));
     }
     Ok((aad, parsed.key_id))
+}
+
+// Compare the complete canonical serialization without retaining a second AAD
+// encoding. Continue after a mismatch to preserve serializer error behavior.
+struct CanonicalAadComparison<'a> {
+    remaining: &'a [u8],
+    equal: bool,
+}
+
+impl std::io::Write for CanonicalAadComparison<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some((prefix, remaining)) = self.remaining.split_at_checked(bytes.len()) {
+            self.equal &= prefix == bytes;
+            self.remaining = remaining;
+        } else {
+            self.equal = false;
+            self.remaining = &[];
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_key_id(value: &str) -> Result<(), KeyError> {
@@ -641,6 +679,10 @@ pub(crate) fn validate_key_id(value: &str) -> Result<(), KeyError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "bounded_aad_tests.rs"]
+mod bounded_aad_tests;
 
 fn validate_nul_free_session_field(field: &'static str, value: &str) -> Result<(), KeyError> {
     if value.contains('\0') {

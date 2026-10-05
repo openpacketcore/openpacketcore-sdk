@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-crypto` and `opc-persist`: add opt-in exact configuration byte evidence
+  and eight-slot, destination-specific preparation leases retained through
+  encryption claims and envelope aliases. Existing encryption and storage
+  profiles keep their limits and byte formats.
+
 - `opc-session-net`: add opt-in V2 publication authority reads across the
   complete authenticated fixed voter set and per-reader shared-pool diagnostics.
   `into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters`
