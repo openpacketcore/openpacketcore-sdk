@@ -2937,10 +2937,12 @@ offload support.
 - The userspace crate forbids `unsafe`; raw kernel UAPI work is isolated in
   `opc-linux-gtpu-sys`, while verifier-bound packet/map/helper access and the
   isolated ingress-mark read remain in the standalone eBPF program crate.
-- Linux is the supported platform. Platform-conditional code remains, but
-  builds and tests on other operating systems are not qualified.
-  `aya`, `aya-obj`, `rustix`, `nix`,
-  `sha1` and `sha2` are declared only under `cfg(target_os = "linux")`, and so
+- Linux is the supported platform. Retained non-Linux code and tests are
+  compile-checked for `x86_64-unknown-freebsd` with default features and
+  `--all-targets`; CI does not execute them on non-Linux hosts. The Apple check
+  excludes this crate because its dependencies require an Apple C toolchain.
+  `aya`, `aya-obj`, `rustix`, `nix` and `sha1`
+  are declared only under `cfg(target_os = "linux")`, and so
   are the kernel runtime, the reassembly socket, and the `/proc` and sysctl
   readers. The Linux-only part of the public surface is the eBPF backend's
   `new`, `with_config` and `Default` constructors and the `reassembly` sysctl,
@@ -2955,10 +2957,11 @@ offload support.
   `GtpuDownlinkFragmentContract::Unsupported` off Linux and never a kernel
   reassembly handoff -- the handoff names a Linux `ipfrag` stack that is not
   present, and its `bounds: None` would say only that the stack's limits were
-  unreadable -- so the contract cannot drift if a portable constructor is ever
-  added. That is a crate-internal invariant pinned by the unit test
-  `downlink_fragment_contract_reports_kernel_handoff_only_on_linux`, not a
-  consumer-observable one. CI validates Linux, including a separate build with
+  unreadable. The unit test
+  `downlink_fragment_contract_reports_kernel_handoff_only_on_linux` contains
+  the off-Linux assertion for this crate-internal invariant; CI compiles that
+  assertion for FreeBSD but does not execute it. CI validates Linux, including
+  a separate build with
   `RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
   `--no-default-features` that exercises unsupported-backend behavior on Linux.
 - The Linux netdevice backend follows mainline `gtp` behavior and is not the

@@ -60,7 +60,9 @@ let _len = receive_message(&socket, &mut response)?;
 - Unpublished workspace crate (`publish = false`).
 - Contains the syscall `unsafe` allowed by its lint configuration.
 - Non-Linux or `opc_linux_gtpu_sys_force_unsupported` builds compile to
-  unsupported stubs.
+  unsupported stubs. CI compile-checks the non-Linux code and tests for
+  `x86_64-unknown-freebsd` and `aarch64-apple-darwin`; it does not execute them
+  on non-Linux hosts. The forced-unavailable Linux build is tested separately.
 - `receive_message` uses `MSG_TRUNC` handling and returns `InvalidData` rather
   than silently accepting truncated datagrams.
 

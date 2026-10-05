@@ -42,6 +42,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Hosted CI runs on Linux only: the macOS host lane, FreeBSD GTP-U cross-lint
+  lane and Darwin runtime cross-lint step were removed in #1116. Retained
+  non-Linux code in the following crates now receives compile-only,
+  warnings-denied Clippy checks with default features in the existing Linux
+  `Rust clippy` job. All targets of
+  `opc-gtpu-dataplane`, `opc-linux-gtpu-sys`, `opc-session-store`,
+  `opc-fs-verity-sys`, `opc-sqlite-file-control-sys`, `opc-session-testkit` and
+  `opc-persist` are checked for `x86_64-unknown-freebsd`; the two sys crates
+  `opc-linux-gtpu-sys` and `opc-fs-verity-sys` are also checked for
+  `aarch64-apple-darwin`. The other five crates require an Apple C toolchain for
+  bundled SQLite and/or ring and are excluded from that target's check.
+  `opc-runtime` receives library-only checks for both targets: its test targets
+  depend on AWS-LC through `opc-sbi` and require a target C toolchain. No
+  non-Linux tests execute in hosted CI, and Linux remains the only supported
+  platform. The expanded test-kit check fixes previously unchecked FreeBSD
+  permission types and gates Linux-only test helpers; the removed FreeBSD
+  lane checked GTP-U targets, not the test-kit targets. Linux behavior is
+  unchanged.
+
 - `opc-persist`: add inert internal bounded record and command representations
   without changing any public API or behavior.
 
@@ -2585,17 +2604,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not have. Linux behaviour is unchanged -- the Linux branch evaluates the same
   expression, and the existing Linux probe assertions still run unchanged on
   Linux, having gained a `cfg` so that a non-Linux host asserts the
-  `Unsupported` answer instead. Two CI lanes hold the line off Linux, both
-  `--all-targets`, both linted with `-D warnings` so the unused-import half of
-  this regression fails them too, and both required by the aggregate
-  `Rust workspace` gate: an `x86_64-unknown-freebsd` cross lint, which cannot
-  execute a FreeBSD binary and so proves compilation only, and a `macos-latest`
-  host lane, which also runs the crate's unit tests and is therefore the one
-  place the off-Linux contract assertion executes rather than merely compiling.
-  Integration and privileged suites remain Linux-only. The lanes are
-  orthogonal to the existing
-  forced-unavailable Linux backend lane, which exercises a disabled backend on
-  Linux rather than a host with no Linux datapath at all.
+  `Unsupported` answer instead. The FreeBSD cross-lint and macOS host lanes
+  added by this fix were later removed when hosted CI became Linux-only.
+  The retained non-Linux code now receives the compile-only coverage described
+  above; its off-Linux assertions no longer execute in CI.
 - **Documentation corrections in the PCO codec — `opc-proto-gtpv2c`:** the RFC
   1661 citation on the Configure-Ack option-echo rule said §5.3, which is
   Configure-Nak; §5.2 is Configure-Ack. `dns_server_ipv4_all` and the crate

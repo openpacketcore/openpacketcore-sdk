@@ -12,7 +12,11 @@ maturity and deployment boundary; this repository does not currently claim a
 workspace-wide high-assurance production profile.
 
 Linux is the SDK's only supported platform. Hosted CI validates Linux builds
-and tests, including configurations that exercise unsupported-backend behavior.
+and tests, including a configuration that forces the Linux GTP-U backend
+unavailable. Selected retained non-Linux code is compile-checked from Linux;
+non-Linux tests are not executed in CI. The target coverage and C-toolchain
+exclusions are recorded in the
+[contributor guide](CONTRIBUTING.md#non-linux-compile-checks).
 
 The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The SDK
 now includes experimental, transport-neutral protocol crates: the
