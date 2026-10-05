@@ -864,6 +864,674 @@ async fn workload_cleanup_refuses_old_netns_and_foreign_pins_then_reclaims_parti
     Ok(())
 }
 
+fn install_exclusive_predecessor(
+    pin_dir: &Path,
+    interface: &str,
+    priority: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_clsact(interface);
+    create_test_owned_private_directory_tree(pin_dir, "exclusive predecessor pins");
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(pin_dir)
+        .load(FROZEN_PRE_REDIRECT_OBJECT)?;
+    for (name, direction) in [
+        (PROG_UPLINK, TcAttachType::Egress),
+        (PROG_DOWNLINK, TcAttachType::Ingress),
+    ] {
+        let program: &mut SchedClassifier = ebpf.program_mut(name).unwrap().try_into()?;
+        program.load()?;
+        let link = program.attach_with_options(
+            interface,
+            direction,
+            TcAttachOptions::Netlink(NlOptions {
+                priority,
+                handle: if priority == 50 {
+                    SDK_TC_HANDLE
+                } else {
+                    TcHandle::new(0, 7)
+                },
+                classid: None,
+            }),
+        )?;
+        std::mem::forget(program.take_link(link)?);
+    }
+    Ok(())
+}
+
+struct ExclusiveTestInterface(std::ffi::OsString);
+
+impl ExclusiveTestInterface {
+    fn new(name: &std::ffi::OsStr) -> Self {
+        let output = Command::new("ip")
+            .args(["link", "add"])
+            .arg(name)
+            .args(["type", "dummy"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self(name.to_owned())
+    }
+}
+
+impl Drop for ExclusiveTestInterface {
+    fn drop(&mut self) {
+        let _ = Command::new("ip")
+            .args(["link", "del"])
+            .arg(&self.0)
+            .output();
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_ignores_unrelated_interfaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Allocate this interface first so discovery meets its unsupported parent
+    // before it can find the renamed workload by program reference.
+    let _other = ExclusiveTestInterface::new(std::ffi::OsStr::new("other0"));
+    run("tc", &["qdisc", "add", "dev", "other0", "ingress"]);
+    run(
+        "tc",
+        &[
+            "filter", "add", "dev", "other0", "parent", "ffff:", "protocol", "all", "pref", "1",
+            "matchall", "action", "pass",
+        ],
+    );
+    let before = Command::new("tc")
+        .args(["filter", "show", "dev", "other0", "parent", "ffff:"])
+        .output()?;
+    assert!(
+        before.status.success() && String::from_utf8_lossy(&before.stdout).contains("matchall")
+    );
+    let net = TestNet::provision();
+    for renamed in [false, true] {
+        let scoped = WorkloadTestScope::new();
+        install_exclusive_predecessor(&scoped.scope.bpffs_pin_root().join("s2bu"), "s2bu", 50)?;
+        if renamed {
+            run("ip", &["link", "set", "s2bu", "name", "s2bx"]);
+        }
+        let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await?;
+        if renamed {
+            run("ip", &["link", "set", "s2bx", "name", "s2bu"]);
+        }
+        let after = Command::new("tc")
+            .args(["filter", "show", "dev", "other0", "parent", "ffff:"])
+            .output()?;
+        assert!(after.status.success());
+        assert_eq!(
+            after.stdout, before.stdout,
+            "unrelated ingress filter must survive"
+        );
+        assert_workload_attach_forwards(&backend, &net).await?;
+    }
+    let _non_utf8 = ExclusiveTestInterface::new(std::ffi::OsStr::from_bytes(b"other\xff"));
+    let scoped = WorkloadTestScope::new();
+    let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+    backend
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    assert_workload_attach_forwards(&backend, &net).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_alternative_name_without_pins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let net = TestNet::provision();
+    run(
+        "ip",
+        &["link", "property", "add", "dev", "s2bu", "altname", "s2alt"],
+    );
+    let scoped = WorkloadTestScope::new();
+    let graph = scoped.scope.bpffs_pin_root().join("s2bu");
+    install_exclusive_predecessor(&graph, "s2bu", 53)?;
+    for entry in fs::read_dir(&graph)? {
+        fs::remove_file(entry?.path())?;
+    }
+    fs::remove_dir(&graph)?;
+    let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+    backend
+        .reset_exclusive_workload_graph(scoped.scope, "s2alt")
+        .await?;
+    assert_workload_attach_forwards(&backend, &net).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_all_interfaces_and_rename_converge(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let net = TestNet::provision();
+    for (named, renamed) in [("s2bu", false), ("s2bv", false), ("s2bu", true)] {
+        let scoped = WorkloadTestScope::new();
+        run("ip", &["link", "add", "s2bv", "type", "dummy"]);
+        let root = scoped.scope.bpffs_pin_root();
+        install_exclusive_predecessor(&root.join("s2bu"), "s2bu", 50)?;
+        install_exclusive_predecessor(&root.join("s2bv"), "s2bv", 50)?;
+        let other = if renamed {
+            run("ip", &["link", "set", "s2bv", "name", "s2bw"]);
+            "s2bw"
+        } else {
+            "s2bv"
+        };
+        let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+        // One call must take both graphs, even when the stale leaf no longer
+        // names its interface. No caller-side retry hides a failed first call.
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, named)
+            .await?;
+        for interface in ["s2bu", other] {
+            for direction in ["ingress", "egress"] {
+                let output = Command::new("tc")
+                    .args(["filter", "show", "dev", interface, direction])
+                    .output()?;
+                assert!(output.status.success());
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("opc_gtpu"));
+            }
+        }
+        assert!(!root.join("s2bu").exists() && !root.join("s2bv").exists());
+        // Finishing another leaf must not remove this leaf's exclusion marker.
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, other)
+            .await?;
+        // Reproduce interruption after graph removal but before this other
+        // leaf's exclusion marker was finished. Its lock inode remembers it
+        // even though no graph or live program can identify it any longer.
+        let legacy_name = Sha256::digest(other.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let marker = root
+            .join("GTPU_RECONCILER_LOCKS")
+            .join(legacy_name)
+            .join("GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1");
+        fs::remove_dir(&marker)?;
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await?;
+        assert!(
+            marker.is_dir(),
+            "finish the other leaf's interrupted marker"
+        );
+        assert_workload_attach_forwards(&backend, &net).await?;
+        let mut request = CreateGtpDeviceRequest::new(other);
+        request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+        let device = backend.create_device(request).await?;
+        backend.remove_device(&device).await?;
+        run("ip", &["link", "del", other]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_predecessor_priority_with_and_without_pins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let net = TestNet::provision();
+    for pins_present in [true, false] {
+        let scoped = WorkloadTestScope::new();
+        let graph = scoped.scope.bpffs_pin_root().join("s2bu");
+        install_exclusive_predecessor(&graph, "s2bu", 53)?;
+        if !pins_present {
+            for entry in fs::read_dir(&graph)? {
+                fs::remove_file(entry?.path())?;
+            }
+            fs::remove_dir(&graph)?;
+        }
+        let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await?;
+        assert!(!tc_filters("ingress").contains("opc_gtpu"));
+        assert!(!tc_filters("egress").contains("opc_gtpu"));
+        assert_workload_attach_forwards(&backend, &net).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_pinned_program_and_link_converge(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aya::programs::links::{FdLink, LinkOrder};
+
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let net = TestNet::provision();
+    let scoped = WorkloadTestScope::new();
+    let graph = scoped.scope.bpffs_pin_root().join("s2bu");
+    create_test_owned_private_directory_tree(&graph, "pinned link fixture");
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(&graph)
+        .load(FROZEN_PRE_REDIRECT_OBJECT)?;
+    let program: &mut SchedClassifier = ebpf.program_mut(PROG_UPLINK).unwrap().try_into()?;
+    program.load()?;
+    program.pin(graph.join("FUTURE_PROGRAM"))?;
+    match program.attach_with_options(
+        "s2bu",
+        TcAttachType::Egress,
+        TcAttachOptions::TcxOrder(LinkOrder::first()),
+    ) {
+        Ok(link) => {
+            let link: FdLink = program.take_link(link)?.try_into()?;
+            drop(link.pin(graph.join("FUTURE_LINK"))?);
+            assert!(graph.join("FUTURE_LINK").exists());
+            println!("OPC_GTPU_EXCLUSIVE_PINNED_LINK_EXERCISED");
+        }
+        Err(aya::programs::ProgramError::SyscallError(error))
+            if matches!(error.io_error.raw_os_error(), Some(22 | 95))
+                && aya::util::KernelVersion::current()?
+                    < aya::util::KernelVersion::new(6, 6, 0) =>
+        {
+            eprintln!("kernel does not support TCX links; program pin remains covered");
+        }
+        Err(error) => return Err(error.into()),
+    }
+    drop(ebpf);
+    let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+    backend
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    assert!(!graph.exists());
+    assert_workload_attach_forwards(&backend, &net).await?;
+    Ok(())
+}
+
+fn synthetic_workload_pin(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let map = MapData::create(
+        aya_obj::Map::new_from_params(2, 4, 8, 1, 0),
+        "reset_fixture",
+        None,
+    )?;
+    map.pin(path)?;
+    Ok(())
+}
+
+async fn assert_workload_attach_forwards(
+    backend: &EbpfGtpuDataplaneBackend,
+    net: &TestNet,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    backend
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+    let receiver = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
+    });
+    let sender = in_netns(&net.ue_ns, || UdpSocket::bind((UE_PAA, 5000)).unwrap());
+    let payload = b"exclusive-reset-forwarding";
+    let mut buffer = [0_u8; 2048];
+    let (len, _) = send_until_received(
+        || {
+            sender.send_to(payload, (REMOTE_HOST, 53)).unwrap();
+        },
+        &receiver,
+        &mut buffer,
+    )
+    .expect("ordinary attach must forward after exclusive reset");
+    assert!(buffer[..len].ends_with(payload));
+    backend.remove_device(&device).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_unknown_layouts_then_attach_forwards(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let net = TestNet::provision();
+    let neighbor = WorkloadTestScope::new();
+    let neighbor_pin = neighbor.scope.bpffs_pin_root().join("neighbor");
+    synthetic_workload_pin(&neighbor_pin)?;
+    let neighbor_id = MapInfo::from_pin(&neighbor_pin)?.id();
+    for kind in [
+        "unknown",
+        "shape",
+        "recovery",
+        "terminal",
+        "successor",
+        "handoff",
+        "partial",
+    ] {
+        let scoped = WorkloadTestScope::new();
+        let root = scoped.scope.bpffs_pin_root();
+        let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+        backend.reset_workload_graph(scoped.scope, "s2bu").await?;
+        let controls = root.join("GTPU_RECONCILER_LOCKS");
+        let writer = fs::read_dir(&controls)?
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().as_encoded_bytes().len() == 64)
+            .unwrap();
+        let graph = root.join("s2bu");
+        fs::DirBuilder::new().mode(0o700).create(&graph)?;
+        let path = match kind {
+            "shape" => graph.join(MAP_UPLINK_FAR),
+            "recovery" => graph.join("GTPU_V2_TEARDOWN"),
+            "terminal" => writer.join("GTPU_CURRENT_RECOVERY_TERMINAL_V1"),
+            "successor" => writer.join("GTPU_CURRENT_RECOVERY_FINALIZED_RECEIPT_V1"),
+            "handoff" => writer.join("GTPU_HISTORICAL_25_ROOT_HANDOFF"),
+            "partial" => {
+                fs::DirBuilder::new()
+                    .mode(0o755)
+                    .create(graph.join("partial"))?;
+                graph.join("partial").join("future_map")
+            }
+            _ => graph.join("UNKNOWN_PIN"),
+        };
+        synthetic_workload_pin(&path)?;
+        // Include a root-level unknown map, independently of the graph shape.
+        synthetic_workload_pin(&root.join("UNKNOWN_ROOT_PIN"))?;
+        let map_id = MapInfo::from_pin(&path)?.id();
+        assert!(
+            backend
+                .reset_workload_graph(scoped.scope, "s2bu")
+                .await
+                .is_err(),
+            "{kind}"
+        );
+        assert_eq!(MapInfo::from_pin(&path)?.id(), map_id);
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await?;
+        assert_eq!(MapInfo::from_pin(&neighbor_pin)?.id(), neighbor_id);
+        assert!(!path.exists() && !graph.exists() && !root.join("UNKNOWN_ROOT_PIN").exists());
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await?;
+        assert_workload_attach_forwards(&backend, &net).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_foreign_generation_preserves_other_slots(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let net = TestNet::provision();
+    let scoped = WorkloadTestScope::new();
+    let graph = scoped.scope.bpffs_pin_root().join("s2bu");
+    let (uplink, _, _) = install_pre_redirect_generation(&graph);
+    let referenced = MapData::from_pin(graph.join(MAP_UPLINK_FAR))?;
+    let program = loaded_programs()
+        .map(Result::unwrap)
+        .find(|info| info.id() == uplink)
+        .unwrap()
+        .fd()?;
+    for entry in fs::read_dir(&graph)? {
+        fs::remove_file(entry?.path())?;
+    }
+    fs::remove_dir(&graph)?;
+    run(
+        "tc",
+        &[
+            "filter", "add", "dev", "s2bu", "ingress", "pref", "49", "handle", "1", "matchall",
+            "action", "pass",
+        ],
+    );
+    run(
+        "tc",
+        &[
+            "filter",
+            "add",
+            "dev",
+            "s2bu",
+            "ingress",
+            "pref",
+            "50",
+            "handle",
+            "2",
+            "bpf",
+            "bytecode",
+            "1,6 0 0 0",
+            "action",
+            "pass",
+        ],
+    );
+    let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+    assert!(matches!(
+        backend.reset_workload_graph(scoped.scope, "s2bu").await,
+        Err(GtpuError::DatapathGenerationMismatch { .. })
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&graph)?;
+    referenced.pin(graph.join("REFERENCED_UNKNOWN_PIN"))?;
+    assert!(matches!(
+        backend
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await,
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_exclusive_workload_detached_program_reference"
+        })
+    ));
+    assert!(graph.join("REFERENCED_UNKNOWN_PIN").exists());
+    assert!(!tc_filters("egress").contains("opc_gtpu"));
+    drop(program);
+    backend
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    let remaining = tc_filters("ingress");
+    assert!(
+        remaining.contains("pref 49") && remaining.contains("handle 0x2"),
+        "{remaining}"
+    );
+    assert!(!remaining.contains("opc_gtpu"));
+    assert_workload_attach_forwards(&backend, &net).await?;
+    // A pin may itself keep an old program loaded after both tc hooks have
+    // gone. It must be unpinned before the map-reference guard can converge.
+    fs::DirBuilder::new().mode(0o700).create(&graph)?;
+    let mut pinned = EbpfLoader::new()
+        .default_map_pin_directory(&graph)
+        .load(FROZEN_V1_OBJECT)?;
+    let program: &mut SchedClassifier = pinned.program_mut(PROG_UPLINK).unwrap().try_into()?;
+    program.load()?;
+    program.pin(graph.join("UNKNOWN_PROGRAM_PIN"))?;
+    drop(pinned);
+    backend
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    assert!(!graph.exists());
+    assert_workload_attach_forwards(&backend, &net).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_exclusive_reset_preserves_writer_selector_and_reference_guards(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let net = TestNet::provision();
+    let scoped = WorkloadTestScope::new();
+    let owner = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    owner.create_device(request).await?;
+    let graph = scoped.scope.bpffs_pin_root().join("s2bu");
+    let before = pin_directory_listing(&graph);
+    let hooks = [tc_filters("ingress"), tc_filters("egress")];
+    let replacement = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+    assert!(matches!(
+        replacement
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await,
+        Err(GtpuError::RetryRequired { .. })
+    ));
+    assert!(matches!(
+        owner
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await,
+        Err(GtpuError::AlreadyExists)
+    ));
+    assert!(EbpfGtpuDataplaneBackend::new()
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&graph), before);
+    assert_eq!([tc_filters("ingress"), tc_filters("egress")], hooks);
+    drop(owner);
+    let controls = scoped.scope.bpffs_pin_root().join("GTPU_RECONCILER_LOCKS");
+    let writer = fs::read_dir(&controls)?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("-operation-v1")
+        })
+        .map(|path| {
+            controls.join(
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .trim_end_matches("-operation-v1"),
+            )
+        })
+        .unwrap();
+    let marker = writer.join(format!("SELECTOR_AUTHORITY_V1_{}", "b".repeat(64)));
+    let operation_path = controls.join(format!(
+        "{}-operation-v1",
+        writer.file_name().unwrap().to_str().unwrap()
+    ));
+    let operation_lock = fs::File::open(&operation_path)?;
+    rustix::fs::flock(
+        &operation_lock,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )?;
+    assert!(matches!(
+        replacement
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await,
+        Err(GtpuError::RetryRequired { .. })
+    ));
+    drop(operation_lock);
+    fs::DirBuilder::new().mode(0o700).create(&marker)?;
+    assert!(matches!(
+        replacement
+            .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "workload_cleanup_bound_selector_namespace"
+        })
+    ));
+    assert_eq!(pin_directory_listing(&graph), before);
+    assert_eq!([tc_filters("ingress"), tc_filters("egress")], hooks);
+    fs::remove_dir(marker)?;
+    replacement
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    // Keep the same map graph alive in a different namespace. No local hook
+    // removal or local interface absence can authorize unpinning these maps.
+    run("ip", &["link", "set", "s2bu", "netns", &net.pgw_ns]);
+    let scope = scoped.scope;
+    let remote_hooks = in_netns(&net.pgw_ns, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let remote = EbpfGtpuDataplaneBackend::for_workload(scope);
+            let mut request = CreateGtpDeviceRequest::new("s2bu");
+            request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+            remote.create_device(request).await.unwrap();
+            drop(remote);
+            [tc_filters("ingress"), tc_filters("egress")]
+        })
+    });
+    let before = pin_directory_listing(&graph);
+    let refused = replacement
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_exclusive_workload_external_program_reference"
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(pin_directory_listing(&graph), before);
+    assert_eq!(
+        in_netns(&net.pgw_ns, || [
+            tc_filters("ingress"),
+            tc_filters("egress")
+        ]),
+        remote_hooks
+    );
+    // Keep one of the old namespace's programs alive past link deletion, then
+    // release it during the next reset. This call has no locally retired IDs:
+    // it must wait before classifying that disappearing reference as external.
+    let map_id = MapInfo::from_pin(graph.join(MAP_UPLINK_FAR))?.id();
+    let program = loaded_programs()
+        .map(Result::unwrap)
+        .find(|info| {
+            info.map_ids()
+                .unwrap()
+                .is_some_and(|ids| ids.contains(&map_id))
+        })
+        .unwrap()
+        .fd()?;
+    run("ip", &["-n", &net.pgw_ns, "link", "del", "s2bu"]);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(program);
+    });
+    let result = replacement
+        .reset_exclusive_workload_graph(scoped.scope, "s2bu")
+        .await;
+    release.join().expect("release old program descriptor");
+    result?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TestOwnedDirectoryIdentity {
     dev: u64,

@@ -1735,8 +1735,12 @@ reusable. These retained records have the old width and codec commitments,
 and this version rejects them, including finalized receipts. If any
 incompatible proof, WAL, or finalized receipt remains, preserve it and use a
 separate, freshly authorized namespace. Do not delete or rewrite authority
-evidence to force attachment. Rollback has the same constraint in the opposite
-direction; no cross-version record conversion is implemented.
+evidence to force attachment through an authority-bearing recovery flow. An
+unbound, exclusively owned workload may instead discard its entire graph using
+[`reset_exclusive_workload_graph`](#isolated-workload-lifecycle), after abandoning
+retained-graph recovery and stopping the old writer. This never erases selector
+history. Rollback has the same constraint in the opposite direction; no
+cross-version record conversion is implemented.
 
 Ordinary fresh creation in a previously used namespace requires exact graph
 cleanup, no selector-authority markers, no recovery proof, terminal WAL, or
@@ -1836,6 +1840,89 @@ active; local interface absence is never treated as proof of their absence.
 This API scans loaded programs and refuses references outside the verified local
 hooks. Shared-root and historical migration continue to use their separate
 authority-bearing APIs below.
+
+For a workload that exclusively owns its entire scope root, use
+`reset_exclusive_workload_graph(scope, interface)` instead. Stop the previous
+writer, invalidate its forwarding generation and isolate ingress on all of its
+interfaces first. Do not combine reset with externally authorized retained-graph
+recovery. A scope that was ever bound to a selector namespace cannot use this
+operation; its permanent history has a separate lifecycle.
+
+For several interfaces in one scope, reset each intended interface before the
+first `create_device`. With missing pins, neither leaf names nor map references
+can identify the other interfaces, so naming each one matters. Once this backend
+manages any device, every reset is refused until its managed devices are removed.
+
+This declaration covers the named interface and every root leaf that resolves
+to an interface in the current network namespace. On those devices the reset
+removes the configured clsact ingress/egress slots (chain zero, `ETH_P_ALL`,
+configured priority, handle `0:1`), every SDK-named filter that ordinary attach
+would reject, and any filter whose program references a scope map. SDK detection
+uses exactly the ordinary attach predicate; it does not depend on program tags,
+generations, priorities, handles, protocols or chains. Map references also locate
+renamed interfaces in the current namespace; only the referencing filters on
+such a device are removed. Filters meeting none of these rules remain untouched.
+Declared interfaces are inspected first by their kernel index, including when
+the caller uses an alternative name. Discovery visits other interfaces only for
+unaccounted scope-map references, skips failed or oversized dumps and non-UTF-8
+names, and leaves the map-reference guard to refuse any unresolved reference.
+Direct tc deletion stays in the calling network namespace.
+
+The reset removes unknown names, incompatible map shapes, recovery/terminal/
+successor records, partial nested layouts, and program and link pins throughout
+the root. Unlinking a scope's pinned link detaches that link's attachment wherever
+it is, including another interface, namespace or hook type, when the final link
+reference ends. The declaration that every object pinned in the root belongs to
+the workload covers this effect. Empty
+writer-lock directories and all existing exclusion markers retain their inodes;
+all inventoried interface names receive an ordinary-attach exclusion marker.
+After detaching and removing object pins, the reset waits up to **250 ms** for
+retired program IDs and scope-map references to disappear, then checks references
+before each map unpin. A retry also waits when it detached nothing itself, so a
+previous call's deferred kernel teardown can settle before being classified as
+external. Normal hook teardown needs no caller retry loop.
+
+Refusals are distinct:
+
+- `RetryRequired` with `ebpf_workload_cleanup_writer_busy`: a writer or operation
+  lock is held. It ends when the holder releases the lock or exits.
+- `StateIndeterminate` with `ebpf_exclusive_workload_external_program_reference`:
+  a program this reset did not detach still uses a scope map after the bounded
+  wait. Both reference errors can be retried with back-off while ingress stays
+  isolated. Delayed kernel release may finish, but a live external namespace,
+  program pin or descriptor must retire; repeated reset does not force it away.
+- `StateIndeterminate` with `ebpf_exclusive_workload_detached_program_reference`:
+  a detached or unpinned program still uses a scope map after the bounded wait.
+  Delayed kernel release may finish by itself; an external holder must release
+  its reference. Both reference errors keep maps pinned and block attachment.
+- Selector-authority, decommission or legacy selector-terminal markers, and a
+  pending terminal admission on this backend, return `UnsupportedFeature`.
+  They require the separate authority-bearing lifecycle, not repeated reset.
+- Wrong root, invalid interface and locally managed devices require correcting
+  the caller's setup. Inspection or identity failures fail closed. A concurrent
+  rename/replacement can settle, but denied permissions, missing procfs,
+  symlinks, nested mounts or invalid retained lock metadata require correcting
+  the environment. Repetition alone does not fix them.
+
+The operation needs `CAP_NET_ADMIN` for tc and `CAP_SYS_ADMIN` for system-wide
+program enumeration whenever a map or retired program must be inspected;
+`CAP_BPF` alone is insufficient. It also needs access to bpffs and procfs and
+permission to use `bpf`, netlink, `openat2` and filesystem operations. Scope and
+retained lock directories must have the current effective uid/gid and mode
+`0700`.
+
+An absent scope may acquire a root and empty lock hierarchy before inspection.
+If reset is interrupted, complete it with the next **exclusive** reset; ordinary
+attach and conservative reset may refuse its unfinished exclusion marker until
+then. Success is repeatable and permits ordinary attachment on the same backend.
+`reset_workload_graph` keeps its conservative contract.
+
+Two foreign-only layouts can survive a successful reset and still make ordinary
+attachment refuse: a non-SDK `ETH_P_ALL` filter at the configured priority and
+handle `0:1` in another chain, and a directory named
+`GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside a retained writer or operation-lock
+directory. Existing SDK generations create neither layout. Their presence needs
+correction by the writer responsible for it; this reset does not repair them.
 
 #### Orphaned current-schema graph recovery
 
@@ -2809,7 +2896,9 @@ offload support.
 - The Linux netdevice backend follows mainline `gtp` behavior and is not the
   ePDG uplink datapath.
 - The eBPF backend requires bpffs, kernel BTF, tc/eBPF privileges
-  (`CAP_NET_ADMIN` and `CAP_BPF` or `CAP_SYS_ADMIN`), and enough MTU headroom
+  (`CAP_NET_ADMIN` and `CAP_BPF` or `CAP_SYS_ADMIN` for loading;
+  `CAP_SYS_ADMIN` for the global program scans used by reset and retained-graph
+  inspection), and enough MTU headroom
   for 36 bytes of outer IPv4/UDP/GTP-U headers or 56 bytes of outer
   IPv6/UDP/GTP-U headers. The current object also uses the bounded `bpf_loop`
   helper (available in mainline Linux 5.17 and newer) to checksum the complete
@@ -2839,7 +2928,7 @@ offload support.
   kernel in a fresh network namespace: attach, encap/decap, PMTU and fragment
   handling, checksum boundaries, counter aggregation and ownership-safe
   teardown. It says nothing about a node's SELinux policy for a confined
-  container domain, whether `CAP_BPF` alone suffices (CI runs as root),
+  container domain or a reduced-capability deployment (CI runs as root),
   in-pod bpffs availability under an immutable host, MTU headroom against a
   given CNI, or coexistence with another tc/eBPF program on the same
   interface. It also runs one digest-pinned z-build: the guest assertion
