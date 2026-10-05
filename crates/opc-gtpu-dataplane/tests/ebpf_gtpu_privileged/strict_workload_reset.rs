@@ -181,6 +181,23 @@ pub(super) async fn interrupted_exclusion_publication() -> Result<(), Box<dyn st
     );
     assert!(!staging.exists());
     assert_eq!(fs::metadata(&marker).map(|m| (m.dev(), m.ino()))?, identity);
+    // The same staging-shaped name outside the control directory is foreign.
+    let misplaced = root.join(staging.file_name().unwrap());
+    create_test_owned_private_directory_tree(&misplaced, "misplaced staging-shaped directory");
+    create_test_owned_private_directory_tree(
+        &misplaced.join(EXCLUSION),
+        "misplaced staging-shaped exclusion",
+    );
+    assert_counts(
+        backend
+            .reset_strict_exclusive_workload_graph(scoped.scope, "s2bu")
+            .await?,
+        0,
+        0,
+        1,
+    );
+    assert!(!misplaced.exists());
+    assert_eq!(fs::metadata(&marker).map(|m| (m.dev(), m.ino()))?, identity);
     assert_counts(
         backend
             .reset_strict_exclusive_workload_graph(scoped.scope, "s2bu")
@@ -229,13 +246,15 @@ pub(super) async fn map_reference_authority() -> Result<(), Box<dyn std::error::
         .unwrap_or_else(|e| e.into_inner());
     // An unknown name and a known name with the wrong definition are both
     // foreign. Matching both makes this a product scope map, regardless of the
-    // program's name; a foreign program on another interface must then refuse.
-    for (pin_name, map_name, wrong_capacity, named) in [
-        ("UNKNOWN_MAP", MAP_UPLINK_FAR, false, false),
-        (MAP_UPLINK_FAR, MAP_CONFIG, false, false),
-        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, true, false),
-        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, false, false),
-        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, false, true),
+    // program's name. Its references authorize per-handle cleanup on named,
+    // declared and discovered interfaces of the calling namespace.
+    for (pin_name, map_name, wrong_capacity, named, declared) in [
+        ("UNKNOWN_MAP", MAP_UPLINK_FAR, false, false, false),
+        (MAP_UPLINK_FAR, MAP_CONFIG, false, false, false),
+        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, true, false, false),
+        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, false, false, false),
+        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, false, false, true),
+        (MAP_UPLINK_FAR, MAP_UPLINK_FAR, false, true, false),
     ] {
         let net = TestNet::provision();
         let _other = ExclusiveTestInterface::new(std::ffi::OsStr::new("other0"));
@@ -260,7 +279,10 @@ pub(super) async fn map_reference_authority() -> Result<(), Box<dyn std::error::
         let before = filters(interface, "ingress");
         assert!(String::from_utf8_lossy(&before).contains(FOREIGN_PROGRAM));
         assert!(!String::from_utf8_lossy(&before).contains("opc_gtpu"));
-        let graph = scoped.scope.bpffs_pin_root().join("s2bu");
+        let graph = scoped
+            .scope
+            .bpffs_pin_root()
+            .join(if declared { interface } else { "s2bu" });
         create_test_owned_private_directory_tree(&graph, "scope map alias");
         let pin = graph.join(pin_name);
         let map = MapData::from_pin(outside.join(map_name))?;
@@ -271,38 +293,19 @@ pub(super) async fn map_reference_authority() -> Result<(), Box<dyn std::error::
         drop(ebpf);
         let backend = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
         let own_map = pin_name == MAP_UPLINK_FAR && map_name == MAP_UPLINK_FAR && !wrong_capacity;
-        if own_map && !named {
-            assert!(matches!(
-                backend
-                    .reset_strict_exclusive_workload_graph(scoped.scope, "s2bu")
-                    .await,
-                Err(GtpuError::StateIndeterminate {
-                    operation: "ebpf_exclusive_workload_external_program_reference"
-                })
-            ));
-            assert!(pin.exists());
-            assert_eq!(filters(interface, "ingress"), before);
-            run(
-                "tc",
-                &["filter", "del", "dev", interface, "ingress", "pref", "53"],
-            );
+        assert_counts(
+            backend
+                .reset_strict_exclusive_workload_graph(scoped.scope, "s2bu")
+                .await?,
+            0,
+            usize::from(own_map),
+            0,
+        );
+        assert!(!pin.exists());
+        if own_map {
+            assert!(!String::from_utf8(filters(interface, "ingress"))?.contains(FOREIGN_PROGRAM));
         } else {
-            assert_counts(
-                backend
-                    .reset_strict_exclusive_workload_graph(scoped.scope, "s2bu")
-                    .await?,
-                0,
-                usize::from(named),
-                0,
-            );
-            assert!(!pin.exists());
-            if named {
-                assert!(
-                    !String::from_utf8(filters(interface, "ingress"))?.contains(FOREIGN_PROGRAM)
-                );
-            } else {
-                assert_eq!(filters(interface, "ingress"), before);
-            }
+            assert_eq!(filters(interface, "ingress"), before);
         }
         assert_counts(
             backend

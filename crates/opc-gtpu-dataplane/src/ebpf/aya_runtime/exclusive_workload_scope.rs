@@ -686,8 +686,8 @@ impl ExclusiveCleanup {
             .and_then(|interface| interface.ifindex);
         let mut referenced = self.referencing_programs()?;
         // A map of any shape can identify the SDK's own hook after a rename.
-        // Only SDK maps confer reference authority on the named interface or
-        // participate in the strict external-reference guard.
+        // Only recognized SDK maps confer authority independent of the SDK
+        // attach predicate or participate in the strict reference guard.
         let mut discovery_references = if self.strict {
             self.programs_referencing_maps(false)?
         } else {
@@ -722,8 +722,7 @@ impl ExclusiveCleanup {
                     .into_iter()
                     .filter(|filter| {
                         interface.owns_filter_by_name(filter, self.priority, self.strict)
-                            || (!self.strict || interface.exclusive_priority)
-                                && filter.program_id.is_some_and(|id| referenced.contains(&id))
+                            || filter.program_id.is_some_and(|id| referenced.contains(&id))
                     })
                     .collect();
                 for hook in &interface.hooks {
@@ -735,9 +734,8 @@ impl ExclusiveCleanup {
             }
         }
         // Map references recover the identity of a renamed interface even
-        // when no pin leaf has its new name. On unrelated devices, only that
-        // reference grants ordinary authority; strict also requires the SDK
-        // attach predicate so a foreign program stays an external reference.
+        // when no pin leaf has its new name. Ordinary cleanup follows every
+        // scope-map reference; strict requires a recognized map or an SDK hook.
         for interface in nix::net::if_::if_nameindex().map_err(io_error)?.iter() {
             let Ok(name) = interface.name().to_str() else {
                 continue;
@@ -768,10 +766,10 @@ impl ExclusiveCleanup {
             let hooks = filters
                 .into_iter()
                 .filter(|filter| {
-                    (!self.strict || filter.sdk)
-                        && filter
-                            .program_id
-                            .is_some_and(|id| discovery_references.contains(&id))
+                    filter.program_id.is_some_and(|id| {
+                        discovery_references.contains(&id)
+                            && (!self.strict || filter.sdk || referenced.contains(&id))
+                    })
                 })
                 .collect::<Vec<_>>();
             if !hooks.is_empty() {
@@ -1061,11 +1059,9 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
         if selector_marker(name) {
             self.report.selector_markers += 1;
         }
-        let sdk_staging = self.nodes[node.parent]
-            .path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(
+        let parent_path = &self.nodes[node.parent].path;
+        let sdk_staging = parent_path.parent() == Some(Path::new(RECONCILER_CONTROL_DIRECTORY))
+            && parent_path.file_name().and_then(OsStr::to_str).is_some_and(
                 AyaGtpuRuntime::historical_25_ordinary_exclusion_staging_name_is_globally_reserved,
             );
         if node.directory.is_some()

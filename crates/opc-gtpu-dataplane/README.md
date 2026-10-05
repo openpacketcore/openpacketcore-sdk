@@ -2011,14 +2011,24 @@ strand the next ordinary attach, including when its map pins are already gone.
 
 Declared interfaces are the name passed to the call and interface-shaped names
 of scope-root entries. Alternative names resolve to the same kernel index.
-On other interfaces, only SDK hooks found through those entries or scope-map
-references are removed. A foreign map is unpinned, but its references grant no
-detach authority and do not block reset. Product maps are recognized by their
-known pin names and definitions; a foreign program on another interface that
-references such a map remains an external-reference refusal. Direct tc deletion
-stays in the calling network namespace. A link pinned in the scope is released
-when the reset removes its pin, wherever it is attached, regardless of who
-created it. Scope-wide pin cleanup otherwise follows ordinary exclusive reset.
+On other interfaces in the calling network namespace, SDK hooks found through
+those entries or scope-map references are removed, as are filters whose
+programs reference recognized product maps. These removals use individual
+handles; non-SDK filters count as foreign. Other namespace references, outside
+program/link pins and live descriptors keep the ordinary reference refusals.
+Direct tc deletion stays in the calling network namespace.
+
+A map is the product's when this build recognizes its pin name, kernel name
+and definition. An unrecognized map is treated as foreign and unpinned without
+an external-reference wait, even if it is a product map whose pin was renamed
+or whose generation is unknown after a rollback. Another SDK workload's
+recognized map pinned into this scope counts as this product's, as in ordinary
+reset; recognition does not prove workload ownership. Foreign-map references
+only locate filters matching the SDK attach predicate, which are removed as
+the product's own hooks. They confer no authority over other filters and do not
+block map unpinning. A link pinned in the scope is released when the reset
+removes its pin, wherever it is attached, regardless of who created it.
+Scope-wide pin cleanup otherwise follows ordinary exclusive reset.
 
 Misplaced exclusion-marker directories are removed throughout the scope. Inside
 a retained lock directory the ordinary preservation rule remains, except for an
@@ -2043,21 +2053,21 @@ confirmed removals that indicate foreign origin:
 |:---|:---|
 | `selector_markers` | Authority, decommission and legacy terminal marker entries. |
 | `tc_filters` | Kernel filter entries that do not match the SDK's ordinary attach predicate. |
-| `exclusion_marker_directories` | Misplaced exclusion directories, excluding valid ordinary exclusions and SDK publication staging directories. |
+| `exclusion_marker_directories` | Misplaced exclusion directories, excluding valid ordinary exclusions and SDK publication staging directories directly under the control directory. |
 
 A clean repeated call or a restart with only SDK leftovers reports all zeros.
 Ordinary pins and other directories are not counted. Released pinned links are
 also uncounted: the SDK has no ownership catalog to classify them as foreign.
-If an attempt fails after
-confirmed foreign removals, `GtpuError::StrictWorkloadResetIncomplete` carries
-its report and original error as `source`; the variant is non-exhaustive, so
-external matches include `..`. Other errors keep their original variant. Retain reports across retries: a later success cannot recount earlier
-removals. Failed-attempt counts are lower bounds, and ACK-uncertain removals
-remain unknown; a zero retry report does not establish that the whole sequence
-found nothing foreign. Busy writers and surviving program references keep their
-distinct underlying reasons and bounded wait above; pending terminal admissions
-still refuse. Descriptor-relative traversal still refuses symlinks and
-cross-device paths.
+If an attempt fails after confirmed foreign removals,
+`GtpuError::StrictWorkloadResetIncomplete` carries its report and original error
+as `source`; the variant is non-exhaustive, so external matches include `..`.
+Other errors keep their original variant. Retain reports across retries: a
+later success cannot recount earlier removals. Failed-attempt counts are lower
+bounds, and ACK-uncertain removals remain unknown; a zero retry report does not
+establish that the whole sequence found nothing foreign. Busy writers and
+surviving program references keep their distinct underlying reasons and bounded
+wait above; pending terminal admissions still refuse. Descriptor-relative
+traversal still refuses symlinks and cross-device paths.
 
 Strict startup cleanup and repetition after interruption need no manual node
 cleanup or replacement Pod for these three layouts under these assertions.

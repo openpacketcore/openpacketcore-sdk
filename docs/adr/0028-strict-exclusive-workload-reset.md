@@ -29,8 +29,9 @@ Three removals are safe only with an additional caller assertion:
    on the named interface, SDK hooks and filters referencing the product's own
    scope maps are removed individually, preserving foreign filters sharing a
    classifier. This retains ordinary reset's ability to clear an old priority,
-   even when the predecessor's pins are gone. A scope entry or map reference
-   does not grant foreign-filter authority on another interface.
+   even when the predecessor's pins are gone. Recognized product-map references
+   also authorize per-handle cleanup on other interfaces of this namespace, as
+   in ordinary reset; a scope entry alone only identifies SDK hooks there.
 3. The caller owns every object in the scope and abandons predecessor recovery.
    Misplaced exclusion-marker directories can be removed with their contents,
    including within operation locks and writer locks of known interfaces.
@@ -50,21 +51,33 @@ without a boolean at existing call sites.
 
 Declared interfaces are the explicitly named interface and interface-shaped
 scope-root entry names. Only the named interface, resolved to its kernel index
-including alternative names, receives whole-priority cleanup. Other declared
-interfaces receive SDK-hook cleanup; discovery by scope-map reference also
-requires the SDK attach predicate. Product maps are recognized by known pin
-names and map definitions. A foreign map is unpinned, and its references grant
-no detach authority or refusal. A foreign program on another interface that
-references a product map remains an external-reference refusal. Direct tc
-operations stay in the calling network namespace. A link pinned in the scope
-is released when the reset removes its pin, wherever it is attached, regardless
-of its creator. This is the pinned-link lifetime contract of ADR 0027.
+including alternative names, receives whole-priority cleanup. Other interfaces
+in the calling network namespace receive per-handle cleanup of SDK hooks found
+through those entries or scope-map references, and of filters whose programs
+reference recognized product maps. Non-SDK filters count as foreign. Other
+namespace references, outside program/link pins and live descriptors keep the
+ordinary reference refusals. Direct tc operations stay in this namespace.
+
+A map is the product's when this build recognizes its pin name, kernel name and
+definition. An unrecognized map is treated as foreign and unpinned without an
+external-reference wait, even if it is a product map whose pin was renamed or
+whose generation is unknown after a rollback. Another SDK workload's recognized
+map pinned into this scope counts as this product's, as in ordinary reset;
+recognition does not prove workload ownership. Foreign-map references only
+locate filters matching the SDK attach predicate, which are removed as the
+product's own hooks. They confer no authority over other filters and do not
+block map unpinning. No map ownership record is introduced.
+
+A link pinned in the scope is released when the reset removes its pin, wherever
+it is attached, regardless of its creator. This is the pinned-link lifetime
+contract of ADR 0027.
 
 `EbpfStrictWorkloadResetReport` is non-exhaustive. Its identifier-free counts
 cover selector entries, kernel filter entries that do not match the SDK attach
 predicate, and misplaced exclusion directories. SDK hooks, valid exclusions
-and interrupted SDK exclusion-publication staging directories do not contribute:
-a clean repeat and a restart containing only SDK leftovers report zeros.
+and interrupted SDK exclusion-publication staging directories directly under
+the control directory do not contribute: a clean repeat and a restart containing
+only SDK leftovers report zeros.
 Ordinary pins and other directories are not counted. Released pinned links are
 uncounted because the SDK has no catalog to classify their ownership.
 

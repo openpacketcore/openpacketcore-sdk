@@ -17,7 +17,8 @@ pub struct EbpfWorkloadScope([u8; 32]);
 ///
 /// Zero counts on a completed attempt mean no foreign objects of these classes
 /// were found. SDK hooks, valid ordinary exclusions, SDK exclusion-publication
-/// staging directories, ordinary pins and other directories are not counted.
+/// staging directories directly under the control directory, ordinary pins and
+/// other directories are not counted.
 /// Released pinned links are uncounted because the SDK has no ownership catalog
 /// to classify them as foreign. Failed attempts with confirmed removals return
 /// these counts in [`GtpuError::StrictWorkloadResetIncomplete`]; accumulate them
@@ -31,7 +32,8 @@ pub struct EbpfStrictWorkloadResetReport {
     /// Includes u32 table entries, but excludes classifier summaries.
     pub tc_filters: usize,
     /// Removed exclusion-marker directories outside valid ordinary exclusions
-    /// and SDK exclusion-publication staging directories.
+    /// and SDK exclusion-publication staging directories directly under the
+    /// control directory.
     pub exclusion_marker_directories: usize,
 }
 
@@ -234,12 +236,23 @@ impl EbpfGtpuDataplaneBackend {
     ///
     /// Declared interfaces are the name passed to this call and interface-shaped
     /// scope-root entry names. Alternative names resolve to the same kernel
-    /// index. On other interfaces, only SDK hooks found through those entries
-    /// or scope-map references are removed. Product maps are recognized by known
-    /// pin names and map definitions. Foreign maps are unpinned; their references
-    /// confer no detach authority and do not block reset. A foreign program on
-    /// another interface referencing a product map remains an external-reference
-    /// refusal. All direct tc operations stay in the calling network namespace.
+    /// index. On other interfaces in the calling network namespace, SDK hooks
+    /// found through those entries or scope-map references are removed, as are
+    /// filters whose programs reference recognized product maps. These removals
+    /// use individual handles; non-SDK filters count as foreign. Other namespace
+    /// references, outside program/link pins and live descriptors keep the
+    /// ordinary reference refusals. All direct tc operations stay in the calling
+    /// network namespace.
+    ///
+    /// A map is the product's when this build recognizes its pin name, kernel
+    /// name and definition. An unrecognized map is treated as foreign and
+    /// unpinned without an external-reference wait, even if it is a product map
+    /// whose pin was renamed or whose generation is unknown after a rollback.
+    /// Another SDK workload's recognized map pinned into this scope counts as
+    /// this product's, as in ordinary reset; recognition does not prove workload
+    /// ownership. Foreign-map references only locate filters matching the SDK
+    /// attach predicate, which are removed as the product's own hooks. They
+    /// confer no authority over other filters and do not block map unpinning.
     /// A link pinned in the scope is released when the reset removes its pin,
     /// wherever it is attached, regardless of who created it. Scope-wide pin
     /// cleanup otherwise follows the ordinary exclusive reset contract.
@@ -250,10 +263,11 @@ impl EbpfGtpuDataplaneBackend {
     /// call. Valid ordinary exclusions therefore retain their inodes, including
     /// those of absent interfaces; unfinished exclusions of known interfaces are
     /// completed before success. Lock inodes stay held and unchanged.
-    /// The ordinary reference guards apply to product maps; interruption rules
-    /// remain those of the ordinary exclusive reset. Repeat this strict reset
-    /// after an interrupted call, before ordinary attachment. No sessions survive;
-    /// callers must drain or transfer emergency sessions before voluntary teardown.
+    /// The ordinary reference guards apply to recognized product maps;
+    /// interruption rules remain those of the ordinary exclusive reset. Repeat
+    /// this strict reset after an interrupted call, before ordinary attachment.
+    /// No sessions survive; callers must drain or transfer emergency sessions
+    /// before voluntary teardown.
     ///
     /// A false assertion can erase permanent selector fencing/retirement history,
     /// permit reuse of a retired namespace, or detach another owner's forwarding
