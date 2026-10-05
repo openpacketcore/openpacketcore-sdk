@@ -3,9 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::{ConfigMutationIntent, PreparedConfigCommit};
-use crate::audit_authority::ledger::{authenticate, verify};
 use crate::audit_authority::{AuditAuthorityError, AuditOperationHandle};
 use crate::{AuditKey, ConfirmedCommitResolution};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 const MUTATION_DOMAIN: &[u8] = b"openpacketcore/management-audit/config-mutation/v1\0";
 
@@ -22,11 +23,37 @@ pub(crate) enum AuditedConfigEffect {
         tx_id: opc_types::TxId,
         label: Option<super::types::ValidatedRollbackLabel>,
     },
+    /// Reserved index 3; the legacy recovery decoder cannot admit it.
+    #[allow(dead_code)] // No public preparation path selects the bounded profile yet.
+    #[serde(skip_deserializing)]
+    BoundedAppend {
+        #[serde(serialize_with = "super::types::record_encoding::serialize_commit")]
+        commit: Box<PreparedConfigCommit>,
+        binding: super::capacity_record::CapacityRecordBinding,
+        resolution: Option<ConfirmedCommitResolution>,
+    },
 }
 
 impl AuditedConfigEffect {
+    pub(super) const fn minimum_command_version(&self) -> u16 {
+        if matches!(self, Self::BoundedAppend { .. }) {
+            8
+        } else {
+            5
+        }
+    }
+
     pub(crate) fn intent(&self) -> ConfigMutationIntent {
         match self {
+            Self::BoundedAppend {
+                commit,
+                binding,
+                resolution,
+            } => ConfigMutationIntent::BoundedAppend {
+                commit: commit.clone(),
+                binding: *binding,
+                resolution: *resolution,
+            },
             Self::Append {
                 commit,
                 resolution: Some(resolution),
@@ -47,7 +74,10 @@ impl AuditedConfigEffect {
     }
 
     pub(crate) fn digest(&self, key: &AuditKey) -> Result<[u8; 32], AuditAuthorityError> {
-        authenticate(key, MUTATION_DOMAIN, self)
+        Ok(effect_authenticator(self, key)?
+            .finalize()
+            .into_bytes()
+            .into())
     }
 
     pub(crate) fn verify(
@@ -55,7 +85,9 @@ impl AuditedConfigEffect {
         key: &AuditKey,
         expected: &[u8; 32],
     ) -> Result<(), AuditAuthorityError> {
-        verify(key, MUTATION_DOMAIN, self, expected)
+        effect_authenticator(self, key)?
+            .verify_slice(expected)
+            .map_err(|_| AuditAuthorityError::BindingMismatch)
     }
 
     pub(crate) fn updates_existing_records(&self) -> bool {
@@ -64,6 +96,10 @@ impl AuditedConfigEffect {
             Self::Confirm { .. }
                 | Self::RollbackPoint { .. }
                 | Self::Append {
+                    resolution: Some(_),
+                    ..
+                }
+                | Self::BoundedAppend {
                     resolution: Some(_),
                     ..
                 }
@@ -92,10 +128,24 @@ impl PreparedAuditedMutation {
 
     /// Encode for protected caller recovery storage, never diagnostics.
     pub fn encode(&self) -> Result<Vec<u8>, AuditAuthorityError> {
-        let encoded = serde_json::to_vec(self).map_err(|_| AuditAuthorityError::InvalidInput)?;
-        if encoded.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
-            return Err(AuditAuthorityError::InvalidInput);
+        if !matches!(self.effect, AuditedConfigEffect::BoundedAppend { .. }) {
+            let encoded =
+                serde_json::to_vec(self).map_err(|_| AuditAuthorityError::InvalidInput)?;
+            if encoded.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+                return Err(AuditAuthorityError::InvalidInput);
+            }
+            return Ok(encoded);
         }
+        let mut count =
+            super::encoding::ByteCount::new(super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES);
+        super::encoding::to_writer(&mut count, self)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(count.bytes)
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        super::encoding::to_writer(&mut encoded, self)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         Ok(encoded)
     }
 
@@ -117,6 +167,25 @@ impl PreparedAuditedMutation {
                 .ok_or(AuditAuthorityError::BindingMismatch)?,
         )
     }
+}
+
+// Preserve the original domain, big-endian JSON length, bytes and inclusive
+// 16 MiB ceiling, without retaining the complete expanded ciphertext array.
+fn effect_authenticator(
+    effect: &AuditedConfigEffect,
+    key: &AuditKey,
+) -> Result<Hmac<Sha256>, AuditAuthorityError> {
+    let mut count =
+        super::encoding::ByteCount::new(crate::audit_authority::ledger::MAX_STATE_BYTES);
+    super::encoding::to_writer(&mut count, effect)
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+        .map_err(|_| AuditAuthorityError::KeyUnavailable)?;
+    mac.update(MUTATION_DOMAIN);
+    mac.update(&(count.bytes as u64).to_be_bytes());
+    super::encoding::digest_json(&mut mac, effect)
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
+    Ok(mac)
 }
 
 impl std::fmt::Debug for PreparedAuditedMutation {

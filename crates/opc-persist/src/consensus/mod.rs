@@ -9,6 +9,11 @@ mod audit;
 #[cfg(test)]
 pub(crate) use audit::{applied_receipt_sync, apply_sync, read_sync, write_sync, AuditCommand};
 mod audit_mutation;
+// Representation code is compiled in every profile, but has no production
+// preparation caller until bounded store admission is implemented.
+#[allow(dead_code)]
+mod capacity_record;
+mod encoding;
 pub use audit_mutation::PreparedAuditedMutation;
 pub(crate) mod history;
 mod raft_adapter;
@@ -18,6 +23,9 @@ pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
 mod store;
 mod types;
+
+#[cfg(test)]
+mod capacity_tests;
 
 pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 

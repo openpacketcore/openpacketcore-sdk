@@ -3,6 +3,9 @@
 //! These functions persist decisions made by Openraft. None implements an
 //! election, quorum, commit-index, read-index, membership, or repair policy.
 
+#[cfg(test)]
+mod capacity_tests;
+
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -2674,6 +2677,31 @@ fn create_rollback_point_sync(
     Ok(Ok(()))
 }
 
+fn updates_existing_records(intent: &ConfigMutationIntent) -> bool {
+    match intent {
+        ConfigMutationIntent::BoundedAppend { resolution, .. } => resolution.is_some(),
+        ConfigMutationIntent::AppendCommit(_)
+        | ConfigMutationIntent::RetainHistory(_)
+        | ConfigMutationIntent::ManagementAudit(_)
+        | ConfigMutationIntent::AuditedMutation(_) => false,
+        ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
+        | ConfigMutationIntent::ClearRecoveryRequired { .. }
+        | ConfigMutationIntent::MarkConfirmed { .. }
+        | ConfigMutationIntent::CreateRollbackPoint { .. } => true,
+    }
+}
+
+fn requires_audit(intent: &ConfigMutationIntent) -> bool {
+    matches!(
+        intent,
+        ConfigMutationIntent::AppendCommit(_)
+            | ConfigMutationIntent::BoundedAppend { .. }
+            | ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
+            | ConfigMutationIntent::MarkConfirmed { .. }
+            | ConfigMutationIntent::CreateRollbackPoint { .. }
+    )
+}
+
 fn execute_intent_sync(
     conn: &Connection,
     intent: &ConfigMutationIntent,
@@ -2683,6 +2711,9 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
+        ConfigMutationIntent::BoundedAppend { .. } => {
+            Err(invalid_data("invalid committed config consensus command"))
+        }
         ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
             invalid_data("audit command requires its authority dispatcher"),
         ),
@@ -2964,16 +2995,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                         .map_err(|_| invalid_data("config consensus applied digest failed"))?;
                     tx.execute_batch("SAVEPOINT config_history_command")
                         .map_err(db_error)?;
-                    let updates_existing_records = match &command.intent {
-                        ConfigMutationIntent::AppendCommit(_)
-                        | ConfigMutationIntent::RetainHistory(_)
-                        | ConfigMutationIntent::ManagementAudit(_)
-                        | ConfigMutationIntent::AuditedMutation(_) => false,
-                        ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
-                        | ConfigMutationIntent::ClearRecoveryRequired { .. }
-                        | ConfigMutationIntent::MarkConfirmed { .. }
-                        | ConfigMutationIntent::CreateRollbackPoint { .. } => true,
-                    };
+                    let updates_existing_records = updates_existing_records(&command.intent);
                     if updates_existing_records {
                         super::history::validate_record_chain_sync(&tx, audit_key, cancellation)?;
                     }
@@ -3003,14 +3025,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                             super::history::retain_sync(&tx, audit_key, retention, cancellation)?
                         }
                         _ => {
-                            let requires_audit = matches!(
-                                command.intent,
-                                ConfigMutationIntent::AppendCommit(_)
-                                    | ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
-                                    | ConfigMutationIntent::MarkConfirmed { .. }
-                                    | ConfigMutationIntent::CreateRollbackPoint { .. }
-                            );
-                            if requires_audit
+                            if requires_audit(&command.intent)
                                 && (audit_keys.is_some()
                                     || super::audit::read_sync(&tx, audit_key, identity)?.is_some())
                             {

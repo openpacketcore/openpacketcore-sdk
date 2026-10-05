@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a privileged process-loss proof. Never combine reset with predecessor
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
+### Changed
+
+- `opc-persist`: add inert internal bounded record and command representations
+  without changing any public API or behavior.
+
 ### Fixed
 
 - `opc-session-store`: portable snapshot streams retain their verified image
