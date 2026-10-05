@@ -486,8 +486,53 @@ pub const COUNTER_DL_DST_MISMATCH: u32 = 5;
 /// it, because every discriminator available here is in-band and therefore
 /// forgeable by a local sender.
 pub const COUNTER_UL_REDIRECT_RESOLVED: u32 = 6;
-/// Number of datapath counters.
-pub const COUNTER_SLOTS: u32 = 7;
+/// Counter index: downlink hand-offs that tc gave to no UDP socket, because
+/// none was bound for them or they arrived in a VLAN above the device.
+///
+/// tc leaves some datagrams to a socket on this host instead of decapsulating
+/// them: an over-MTU Don't Fragment packet and an inner fragment, steered to
+/// [`GTPU_PACKET_TOO_BIG_QUEUE_PORT`] and [`GTPU_INNER_FRAGMENT_QUEUE_PORT`];
+/// a G-PDU for no tunnel or with a required unknown extension, left on
+/// [`GTPU_UDP_PORT`]; and an outer-fragmented datagram for [`GTPU_UDP_PORT`],
+/// which tc judges by its first fragment. Each is passed on only while a
+/// socket is bound for it. Without one the kernel would answer with ICMP Port
+/// Unreachable toward the peer, quoting the start of the subscriber's inner
+/// packet, so tc drops the datagram and counts it here. An outer-fragmented
+/// datagram is not dropped by tc itself: its first fragment is marked with
+/// [`UDP_LENGTH_OF_NO_DATAGRAM`], and UDP input discards the reassembled
+/// datagram unanswered.
+///
+/// A nonzero value means hand-offs arrived while nothing drained their
+/// queue: before the control port was first opened, while the process was
+/// down, or after a restart and before the port was reopened. Or they
+/// arrived in a frame with a VLAN ID, which a VLAN device above the
+/// attachment's device receives, or nothing does: tc counts such a hand-off
+/// here without looking for a socket, whatever is bound (see
+/// [`vlan_tag_takes_frame_away`]).
+///
+/// A G-PDU for no tunnel is counted under [`COUNTER_DL_UNKNOWN_TEID`] first,
+/// as before, so one such datagram can raise both counters.
+///
+/// A socket counts only when UDP input will accept it for a datagram that
+/// arrives on the attachment's device, which can be enslaved to a VRF. A
+/// datagram whose socket tc cannot establish as eligible is not counted
+/// here: tc leaves it to the stack's own socket lookup, in a frame that the
+/// host does not answer (see [`PACKET_TYPE_MULTICAST`]).
+pub const COUNTER_DL_MISSING_CONSUMER: u32 = 7;
+/// Number of datapath counter slots that carry a counter.
+///
+/// The slots from here up to [`COUNTER_SLOTS`] are reserved. No program
+/// writes them and they read zero, so a later counter can take the next one
+/// without changing the width of the pinned map.
+pub const COUNTER_SLOTS_IN_USE: u32 = 8;
+/// Number of slots in the pinned per-CPU datapath counter map.
+///
+/// This is the map's `max_entries`, and part of the retained pin graph's ABI:
+/// a graph retained from a build with another value is refused, not adopted
+/// (see the test of the counter indices). It is deliberately larger than
+/// [`COUNTER_SLOTS_IN_USE`], so that adding a counter does not change it.
+pub const COUNTER_SLOTS: u32 = 16;
+const _: () = assert!(COUNTER_SLOTS_IN_USE <= COUNTER_SLOTS);
 
 /// Binding-drop counter index: no canonical binding exists for the PDR.
 pub const COUNTER_DL_BINDING_INVALID: u32 = 0;
@@ -2013,6 +2058,188 @@ pub const fn downlink_ipv4_hand_off_port(
     None
 }
 
+/// Whether an outer IPv4 packet that is a fragment is the first fragment of
+/// its datagram, given its flags and fragment offset word in host order.
+///
+/// Only the first fragment carries the UDP header, so it is the only one tc
+/// can attribute to a UDP port, and the only place where tc can act on the
+/// whole datagram.
+#[must_use]
+#[inline(always)]
+pub const fn outer_ipv4_is_first_fragment(flags_fragment: u16) -> bool {
+    flags_fragment & 0x1fff == 0
+}
+
+/// The UDP Length that tc writes into the first fragment of an
+/// outer-fragmented datagram for which no socket is bound.
+///
+/// No IPv4 datagram can have it: an IPv4 packet holds at most 65,515 octets
+/// of UDP. UDP input discards a datagram whose Length exceeds its size before
+/// it looks for a socket, and it sends nothing in return. The other fragments
+/// therefore still complete the datagram, the reassembly queue is freed at
+/// once, and the host answers neither with Port Unreachable nor with a
+/// reassembly timeout.
+///
+/// Dropping the first fragment instead would strand the other fragments of
+/// every such datagram in the reassembly queue until they expire. A steady
+/// stream of them fills the namespace's reassembly budget
+/// (`ipfrag_high_thresh`), and every other IPv4 reassembly there then fails.
+pub const UDP_LENGTH_OF_NO_DATAGRAM: u16 = u16::MAX;
+
+/// `-ESOCKTNOSUPPORT`: what `bpf_sk_assign` returns on Linux before v6.6 for
+/// a socket with `SO_REUSEPORT` set.
+pub const SK_ASSIGN_REUSEPORT_UNSUPPORTED: i64 = -94;
+
+/// Whether tc passes a hand-off on after `bpf_sk_assign` returned `result`
+/// for the socket that the lookup found.
+///
+/// Zero means the datagram now carries that socket, so the stack delivers it
+/// there without a second lookup. A kernel before v6.6 cannot assign a
+/// `SO_REUSEPORT` socket ([`SK_ASSIGN_REUSEPORT_UNSUPPORTED`]): the socket is
+/// bound, so the datagram is passed on and the stack looks the socket up
+/// itself. Every other result means the socket has gone since the lookup, and
+/// the datagram is dropped like one that found no socket.
+#[must_use]
+#[inline(always)]
+pub const fn hand_off_assignment_keeps_datagram(result: i64) -> bool {
+    result == 0 || result == SK_ASSIGN_REUSEPORT_UNSUPPORTED
+}
+
+/// `IPSKB_L3SLAVE`: the flag of the IPv4 control block that says the packet
+/// arrived on a device that is enslaved to a VRF.
+pub const IPV4_CONTROL_BLOCK_L3_SLAVE: u16 = 1 << 7;
+
+/// `IP6SKB_L3SLAVE`: the same flag of the IPv6 control block.
+pub const IPV6_CONTROL_BLOCK_L3_SLAVE: u16 = 64;
+
+/// tc's scratch word that shares its octets with the flags of the IPv4
+/// control block: `__sk_buff.cb[3]`.
+pub const IPV4_CONTROL_BLOCK_FLAGS_WORD: usize = 3;
+
+/// tc's scratch word that shares its octets with the flags of the IPv6
+/// control block: `__sk_buff.cb[2]`.
+pub const IPV6_CONTROL_BLOCK_FLAGS_WORD: usize = 2;
+
+/// The value of a scratch word whose first two octets are the control-block
+/// flags `flags`, in the byte order of the machine.
+///
+/// Before Linux 6.5 the socket lookup that tc can use takes its VRF scope
+/// from the IP control block of the packet. At tc that block is not
+/// initialized: its flags share their octets with one of the program's
+/// scratch words, so the program decides which scope the lookup applies.
+///
+/// - With the flags clear the lookup applies no VRF scope. It finds a socket
+///   bound to the device of the hook and a socket bound to no device, whatever
+///   VRF the device belongs to.
+/// - With the L3 slave flag set it applies the scope of a device that is
+///   enslaved to a VRF. It finds a socket bound to the device, and a socket
+///   bound to no device only with `udp_l3mdev_accept`. tc cannot choose the
+///   device index of that scope: the lookup takes it from a field that holds
+///   the length of the packet at tc, which is never zero.
+///
+/// From Linux 6.5 the lookup takes the scope from the device and ignores the
+/// word.
+#[must_use]
+#[inline(always)]
+pub const fn control_block_flags_word(flags: u16) -> u32 {
+    let flags = flags.to_ne_bytes();
+    u32::from_ne_bytes([flags[0], flags[1], 0, 0])
+}
+
+/// Whether the socket that the lookup found without a VRF scope is the one
+/// UDP input chooses whatever VRF the attachment's device belongs to, given
+/// the device the socket is bound to (zero for none) and the device of the
+/// attachment.
+///
+/// UDP input accepts a socket bound to the device a datagram arrived on in
+/// every VRF, and this lookup preferred it to every socket bound to no
+/// device. A socket bound to no device is not established by this lookup:
+/// inside a VRF it is eligible only with `udp_l3mdev_accept`.
+#[must_use]
+#[inline(always)]
+pub const fn consumer_is_bound_to_attachment(bound_device: u32, attachment_device: u32) -> bool {
+    bound_device == attachment_device
+}
+
+/// Whether the socket that the lookup found with the VRF scope engaged is
+/// the one UDP input chooses whatever VRF the attachment's device belongs
+/// to, given the device the socket is bound to (zero for none).
+///
+/// This is the second lookup, made after the first found a socket that is
+/// not bound to the attachment's device.
+///
+/// - A socket bound to no device is found under the VRF scope only when
+///   `udp_l3mdev_accept` admits it to every VRF. The lookup then considers
+///   the same sockets as the first one, so it is the same socket, and UDP
+///   input chooses it inside and outside a VRF.
+/// - A socket bound to a device means that the scope hid the first socket.
+///   Outside a VRF UDP input still chooses the first socket; inside one it
+///   chooses this one. Neither is established. Before Linux 6.5 the scope's
+///   device index is not under tc's control either, so a socket bound to
+///   another device can match by accident.
+#[must_use]
+#[inline(always)]
+pub const fn scoped_consumer_is_established(bound_device: u32) -> bool {
+    bound_device == 0
+}
+
+/// The VLAN ID in the control word of a VLAN tag; the other bits carry the
+/// priority.
+pub const VLAN_ID_MASK: u32 = 0x0fff;
+
+/// Whether the VLAN tag of a frame at tc ingress takes the frame away from
+/// the device that tc runs on, given the context's `vlan_present` and
+/// `vlan_tci`.
+///
+/// The kernel takes the outermost VLAN tag out of a received frame before tc
+/// runs, and keeps it beside the frame. It does so whether or not the adapter
+/// stripped the tag itself, so the frame looks untagged to the program in
+/// either case. After tc:
+///
+/// - A tag with a VLAN ID other than 0 gives the frame to the VLAN device of
+///   that ID above the receiving device. Without such a device the kernel
+///   marks the frame as one for another host, and IP input discards it. IP
+///   input never receives the frame on the device that tc runs on.
+/// - A tag with the VLAN ID 0 carries only a priority. The kernel receives
+///   the frame on the device itself, unless a VLAN device with the ID 0
+///   exists above it, which the loader refuses.
+///
+/// `vlan_present` decides whether there is a tag. An older kernel, Linux 5.14
+/// among them, leaves the control word of a tag that it has consumed in
+/// place, so the word alone says nothing.
+///
+/// tc uses this for a hand-off. A socket lookup on the device that tc runs
+/// on does not describe the delivery of a datagram in a frame that is taken
+/// away, so tc treats the datagram as one without a consumer.
+#[must_use]
+#[inline(always)]
+pub const fn vlan_tag_takes_frame_away(vlan_present: u32, vlan_tci: u32) -> bool {
+    vlan_present != 0 && vlan_tci & VLAN_ID_MASK != 0
+}
+
+/// `PACKET_HOST`: the type of a frame that is addressed to this host.
+pub const PACKET_TYPE_HOST: u32 = 0;
+
+/// `PACKET_MULTICAST`: the type of a frame that is addressed to a link-layer
+/// group.
+///
+/// The host delivers a unicast datagram that arrived in such a frame to the
+/// socket that UDP input chooses for it. It does not answer one with an ICMP
+/// error: IPv4 sends none for a frame that is not `PACKET_HOST`, and IPv6
+/// sends only Packet Too Big and a Parameter Problem for an unrecognized
+/// option, neither of which a hand-off raises. tc gives this type to a
+/// hand-off when it cannot establish which socket UDP input chooses, because
+/// that depends on the VRF of the attachment's device. The stack's own
+/// socket lookup then decides, and a datagram for which it finds no socket
+/// is discarded unanswered.
+///
+/// The type has side effects on the way to the socket. IP input drops such a
+/// datagram when `drop_unicast_in_l2_multicast` is set for the interface, and
+/// IPv4 input also when it is set for `all`. IPv6 input drops one that
+/// carries a Routing header. A packet filter's packet-type match sees a
+/// multicast frame, and UDP early demultiplexing is skipped.
+pub const PACKET_TYPE_MULTICAST: u32 = 2;
+
 /// Return the committed UDP source port when an encoded Active record
 /// authorizes the exact live uplink FAR and DSCP state.
 ///
@@ -2314,8 +2541,13 @@ mod tests {
     /// operator-facing number rather than as an error. This is what caught the
     /// slot growth when the uplink redirect counter
     /// ([`COUNTER_UL_REDIRECT_RESOLVED`]) was added, and it is what catches a
-    /// reused index or a forgotten `COUNTER_SLOTS` bump the next time the map
-    /// grows.
+    /// reused index or a forgotten `COUNTER_SLOTS_IN_USE` bump the next time
+    /// a counter is added.
+    ///
+    /// The map grew a second time, from 7 to 16 slots, for the
+    /// missing-consumer counter ([`COUNTER_DL_MISSING_CONSUMER`]). That
+    /// growth reserves the slots above [`COUNTER_SLOTS_IN_USE`], so that the
+    /// next counter does not grow the map again.
     ///
     /// Growing `COUNTER_SLOTS` is not only a CI drift-gate refresh. It changes
     /// `GTPU_COUNTERS.max_entries` in the committed object's `maps` section
@@ -2351,18 +2583,152 @@ mod tests {
             COUNTER_DL_MALFORMED,
             COUNTER_DL_DST_MISMATCH,
             COUNTER_UL_REDIRECT_RESOLVED,
+            COUNTER_DL_MISSING_CONSUMER,
         ];
         let mut seen = std::vec::Vec::new();
         for index in indices {
-            assert!(index < COUNTER_SLOTS, "index {index} is outside the map");
+            assert!(
+                index < COUNTER_SLOTS_IN_USE,
+                "index {index} is outside the slots in use"
+            );
             assert!(!seen.contains(&index), "index {index} is used twice");
             seen.push(index);
         }
         assert_eq!(
             seen.len() as u32,
-            COUNTER_SLOTS,
-            "every slot must be claimed, or the map is larger than the counters"
+            COUNTER_SLOTS_IN_USE,
+            "every slot in use must be claimed by exactly one counter"
         );
+        // The map is wider than the counters on purpose: the slots above
+        // `COUNTER_SLOTS_IN_USE` are reserved, so the next counter raises
+        // only `COUNTER_SLOTS_IN_USE` and leaves the pinned map's width, and
+        // with it every retained graph, as it is. The width itself is frozen
+        // here. Changing it is a pin ABI change with the consequence
+        // described above, and must be a deliberate edit of this test.
+        assert_eq!(COUNTER_SLOTS, 16);
+    }
+
+    #[test]
+    fn only_the_first_outer_fragment_can_be_attributed_to_a_port() {
+        // (flags and fragment offset, first fragment). The caller has
+        // established that the packet is a fragment.
+        for (flags_fragment, first) in [
+            (0x2000_u16, true), // More Fragments, offset 0
+            (0x6000, true),     // with Don't Fragment set as well
+            (0x2001, false),    // a middle fragment
+            (0x00b9, false),    // the last fragment
+            (0x1fff, false),    // the largest offset
+            (0x3fff, false),
+        ] {
+            assert_eq!(
+                outer_ipv4_is_first_fragment(flags_fragment),
+                first,
+                "flags and offset {flags_fragment:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_datagram_can_have_the_udp_length_that_marks_one_for_discard() {
+        // The largest UDP datagram an IPv4 packet can carry: the largest
+        // Total Length less the smallest header.
+        let largest = usize::from(u16::MAX) - IPV4_MIN_HDR_LEN;
+        assert_eq!(largest, 65_515);
+        assert!(usize::from(UDP_LENGTH_OF_NO_DATAGRAM) > largest);
+        // And it is not below the UDP header length either, so the only
+        // check it fails is the one against the datagram's size.
+        assert!(usize::from(UDP_LENGTH_OF_NO_DATAGRAM) >= UDP_HDR_LEN);
+    }
+
+    #[test]
+    fn a_hand_off_survives_only_an_assignment_that_leaves_its_socket_bound() {
+        // Assigned: the stack delivers to the socket the lookup found.
+        assert!(hand_off_assignment_keeps_datagram(0));
+        // A kernel before v6.6 refuses a SO_REUSEPORT socket. It is bound, so
+        // the stack's own lookup finds it.
+        assert_eq!(SK_ASSIGN_REUSEPORT_UNSUPPORTED, -94);
+        assert!(hand_off_assignment_keeps_datagram(-94));
+        // The socket has gone since the lookup: EOPNOTSUPP for an unhashed
+        // socket (v6.6 and later), ENOENT for a reference count of zero,
+        // ENETUNREACH for another namespace, EINVAL.
+        for gone in [-95_i64, -2, -101, -22, -1, 1, i64::MIN, i64::MAX] {
+            assert!(!hand_off_assignment_keeps_datagram(gone), "result {gone}");
+        }
+    }
+
+    #[test]
+    fn the_scope_word_sets_only_the_control_block_flags() {
+        // The flags are the first two octets of the word in memory, in the
+        // byte order of the machine; the two octets after them belong to
+        // another field and stay clear.
+        for flags in [
+            0_u16,
+            IPV4_CONTROL_BLOCK_L3_SLAVE,
+            IPV6_CONTROL_BLOCK_L3_SLAVE,
+            0x1234,
+        ] {
+            let octets = control_block_flags_word(flags).to_ne_bytes();
+            assert_eq!(u16::from_ne_bytes([octets[0], octets[1]]), flags);
+            assert_eq!([octets[2], octets[3]], [0, 0]);
+        }
+        assert_eq!(control_block_flags_word(0), 0);
+        // IPSKB_L3SLAVE and IP6SKB_L3SLAVE.
+        assert_eq!(IPV4_CONTROL_BLOCK_L3_SLAVE, 0x80);
+        assert_eq!(IPV6_CONTROL_BLOCK_L3_SLAVE, 0x40);
+        // `struct inet_skb_parm` keeps its flags after a 4-octet interface
+        // index and 16 octets of options; `struct inet6_skb_parm` after a
+        // 4-octet interface index and six 16-bit fields. tc's scratch words
+        // start 8 octets into the same block.
+        assert_eq!(8 + 4 * IPV4_CONTROL_BLOCK_FLAGS_WORD, 4 + 16);
+        assert_eq!(8 + 4 * IPV6_CONTROL_BLOCK_FLAGS_WORD, 4 + 6 * 2);
+    }
+
+    #[test]
+    fn a_consumer_is_established_only_where_no_vrf_can_exclude_it() {
+        const ATTACHMENT: u32 = 7;
+        const OTHER: u32 = 9;
+        // Found without a VRF scope: only a socket on the attachment's own
+        // device is eligible in every VRF. A socket bound to no device is
+        // not: a VRF without `udp_l3mdev_accept` excludes it.
+        assert!(consumer_is_bound_to_attachment(ATTACHMENT, ATTACHMENT));
+        assert!(!consumer_is_bound_to_attachment(0, ATTACHMENT));
+        assert!(!consumer_is_bound_to_attachment(OTHER, ATTACHMENT));
+        // Found with the VRF scope engaged, after the first lookup found a
+        // socket that is not on the attachment's device. A socket bound to
+        // no device was admitted by `udp_l3mdev_accept`: it is the socket
+        // the first lookup found. A socket on the attachment's device means
+        // that the scope hid the first socket: outside a VRF UDP input
+        // chooses the hidden one. A socket on another device matched the
+        // scope's device index by accident.
+        assert!(scoped_consumer_is_established(0));
+        assert!(!scoped_consumer_is_established(ATTACHMENT));
+        assert!(!scoped_consumer_is_established(OTHER));
+    }
+
+    #[test]
+    fn a_vlan_tag_takes_a_frame_away_only_with_a_vlan_id() {
+        // No tag: the frame is the device's own, whatever a consumed tag
+        // left in the control word.
+        assert!(!vlan_tag_takes_frame_away(0, 0));
+        assert!(!vlan_tag_takes_frame_away(0, 100));
+        // A tag with a VLAN ID, with and without a priority.
+        assert!(vlan_tag_takes_frame_away(1, 100));
+        assert!(vlan_tag_takes_frame_away(1, 1));
+        assert!(vlan_tag_takes_frame_away(1, 0x0fff));
+        assert!(vlan_tag_takes_frame_away(1, (5 << 13) | 100));
+        // A priority tag has the VLAN ID 0, with any priority and with the
+        // drop-eligible bit.
+        assert!(!vlan_tag_takes_frame_away(1, 0));
+        assert!(!vlan_tag_takes_frame_away(1, 5 << 13));
+        assert!(!vlan_tag_takes_frame_away(1, 0xf000));
+        assert_eq!(VLAN_ID_MASK, 0x0fff);
+    }
+
+    #[test]
+    fn the_unanswered_packet_type_is_a_link_layer_group() {
+        // PACKET_HOST and PACKET_MULTICAST of the socket API.
+        assert_eq!(PACKET_TYPE_HOST, 0);
+        assert_eq!(PACKET_TYPE_MULTICAST, 2);
     }
 
     fn far() -> UplinkFar {

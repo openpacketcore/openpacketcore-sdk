@@ -16,8 +16,25 @@
 //!   grouped PDR lookup, validates the independent inner IP family, and strips
 //!   the proven outer envelope. It then stamps any dedicated-bearer packet
 //!   mark and lets the inner packet continue through the ePDG's XFRM output
-//!   policy. Unknown-TEID G-PDUs are dropped and counted; non-G-PDU GTP-U
-//!   (echo, error indication) passes through to the control plane. IPv6 UDP
+//!   policy. A G-PDU for no tunnel, or with a required unknown extension, is
+//!   left on UDP/2152 for the local control consumer. An over-MTU Don't
+//!   Fragment packet and an inner fragment of a session with a downlink inner
+//!   MTU are steered to their backend-owned queues. Each of these hand-offs
+//!   is passed on only while a UDP socket is bound for it that UDP input
+//!   will accept on this device, and is dropped and counted otherwise, so
+//!   that the host never answers one with an ICMP error. The device can be
+//!   enslaved to a VRF: where the kernel cannot tell the program whether a
+//!   socket is eligible there, the program leaves the datagram to the
+//!   stack's own socket lookup, in a frame that the host does not answer.
+//!   A frame that carries a VLAN tag with a VLAN ID is received by a VLAN
+//!   device above the interface after tc ran, or by nothing, and a lookup
+//!   on this device does not describe that delivery. The program treats a
+//!   hand-off in such a frame as one without a consumer, whatever is bound,
+//!   and handles everything else in such a frame as in any other.
+//!   Non-G-PDU GTP-U (echo, error indication) that is not fragmented on the
+//!   outer path passes through to the control plane. An outer-fragmented
+//!   UDP/2152 datagram is judged by its first fragment, whatever GTP-U
+//!   message it carries. IPv6 UDP
 //!   checksums are mandatory. Zero IPv4 UDP omission and software-verified
 //!   nonzero checksums are accepted only after a reversible checksum-field
 //!   probe excludes any pending `CHECKSUM_PARTIAL` operation and restores the
@@ -35,16 +52,18 @@
 
 use aya_ebpf::{
     bindings::{
-        __sk_buff, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, bpf_spin_lock as BpfSpinLock,
+        __sk_buff, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, bpf_sock, bpf_spin_lock as BpfSpinLock,
         BPF_CSUM_LEVEL_QUERY, BPF_F_ADJ_ROOM_DECAP_L3_IPV4, BPF_F_ADJ_ROOM_DECAP_L3_IPV6,
         BPF_F_ADJ_ROOM_ENCAP_L3_IPV4, BPF_F_ADJ_ROOM_ENCAP_L3_IPV6, BPF_F_ADJ_ROOM_ENCAP_L4_UDP,
-        BPF_F_MARK_MANGLED_0, TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
+        BPF_F_CURRENT_NETNS, BPF_F_MARK_MANGLED_0, BPF_F_RECOMPUTE_CSUM, TC_ACT_OK,
+        TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
     btf_maps::Array as BtfArray,
     cty::c_void,
     helpers::{
         bpf_csum_diff, bpf_csum_level, bpf_ktime_get_boot_ns, bpf_loop, bpf_redirect_neigh,
-        bpf_skb_change_tail, bpf_skb_load_bytes, bpf_spin_lock, bpf_spin_unlock,
+        bpf_sk_assign, bpf_sk_lookup_udp, bpf_sk_release, bpf_skb_change_tail, bpf_skb_change_type,
+        bpf_skb_load_bytes, bpf_spin_lock, bpf_spin_unlock,
     },
     macros::{btf_map, classifier, map},
     maps::{Array, HashMap, PerCpuArray, RingBuf},
@@ -55,16 +74,19 @@ use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
 };
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
-    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
+    classify_udp_checksum, consumer_is_bound_to_attachment, control_block_flags_word,
+    decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
     downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
-    internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
-    marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
+    hand_off_assignment_keeps_datagram, internet_checksum_sum_is_valid,
+    marked_owner_wire_authorizes_downlink, marked_owner_wire_authorizes_uplink,
+    n3_downlink_psc_matches, n3_uplink_extension, outer_ipv4_is_first_fragment,
     pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
     pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
-    pdp_commit_wire_downlink_inner_mtu, select_gtpu_session_entry_wire,
-    tft_classifier_filter_matches, tft_classifier_schema_is_current,
-    uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
+    pdp_commit_wire_downlink_inner_mtu, scoped_consumer_is_established,
+    select_gtpu_session_entry_wire, tft_classifier_filter_matches,
+    tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
+    validate_ipv4_downlink_binding_wire, vlan_tag_takes_frame_away, DownlinkBindingMismatch,
     DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
     GtpuSessionAuthorityWireView, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
     GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
@@ -75,10 +97,11 @@ use opc_gtpu_ebpf_common::{
     UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
-    COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED,
-    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
-    COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
+    COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_INVALID_STATE,
+    COUNTER_TFT_CLASSIFIER_MALFORMED, COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP,
+    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
@@ -92,19 +115,21 @@ use opc_gtpu_ebpf_common::{
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
     GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAX_ENTRIES,
-    GTPU_TRAFFIC_OBSERVATION_RING_BYTES, GTPU_UDP_PORT, IPV4_MIN_HDR_LEN, IPV6_HDR_LEN,
-    IPV6_MAX_EXT_HEADERS, IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS,
-    IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, N3_UPLINK_EXTENSION_LEN,
-    TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
-    TFT_CLASSIFIER_MAX_FILTERS, TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
-    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, TFT_FRAGMENT_BUCKETS, TFT_FRAGMENT_BUCKET_VALUE_LEN,
-    UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    GTPU_TRAFFIC_OBSERVATION_RING_BYTES, GTPU_UDP_PORT, IPV4_CONTROL_BLOCK_FLAGS_WORD,
+    IPV4_CONTROL_BLOCK_L3_SLAVE, IPV4_MIN_HDR_LEN, IPV6_CONTROL_BLOCK_FLAGS_WORD,
+    IPV6_CONTROL_BLOCK_L3_SLAVE, IPV6_HDR_LEN, IPV6_MAX_EXT_HEADERS, IPV6_MAX_OPTIONS_PER_HEADER,
+    IPV6_NH_DESTINATION_OPTIONS, IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE,
+    IPV6_NH_ROUTING, IPV6_NH_UDP, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+    N3_UPLINK_EXTENSION_LEN, PACKET_TYPE_HOST, PACKET_TYPE_MULTICAST, TFT_CLASSIFIER_COUNTER_SLOTS,
+    TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_MAX_FILTERS,
+    TFT_CLASSIFIER_META_MAP_MAX_ENTRIES, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, TFT_FRAGMENT_BUCKETS,
+    TFT_FRAGMENT_BUCKET_VALUE_LEN, UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_gtpu_ebpf_common::{
     classify_ipv6_extension_step, gtpu_endpoint_requires_extension_control,
+    UDP_LENGTH_OF_NO_DATAGRAM,
 };
 #[cfg(test)]
 use opc_gtpu_ebpf_common::{internet_checksum, udp_ipv6_checksum};
@@ -332,6 +357,9 @@ const IPV6_FIXED_AND_UDP_GTP_LEN: usize = IPV6_HDR_LEN + 8 + GTPU_MANDATORY_HDR_
 const IPV6_PARSE_PASS: i32 = 0;
 const IPV6_PARSE_ACCEPT: i32 = 1;
 const IPV6_PARSE_DROP: i32 = -1;
+/// A G-PDU with a required unknown extension: the caller decides whether a
+/// consumer is bound for it. Only the UDP offset of the result is filled in.
+const IPV6_PARSE_CONTROL: i32 = 2;
 const GROUPED_LOOKUP_MISS: u8 = 0;
 const GROUPED_LOOKUP_ERROR: u8 = 1;
 const GROUPED_LOOKUP_AUTHORIZED: u8 = 2;
@@ -1201,6 +1229,19 @@ fn packet_mark(ctx: &TcContext) -> u32 {
     unsafe { (*ctx.skb.skb).mark }
 }
 
+/// Whether the kernel takes this frame away from the device that the
+/// classifier runs on because of its VLAN tag: a VLAN device above the
+/// interface receives it, or nothing does. No socket lookup on this device
+/// describes its delivery.
+#[inline(always)]
+fn frame_belongs_to_a_vlan_device(ctx: &TcContext) -> bool {
+    // SAFETY: the kernel supplies a verifier-checked, non-null `__sk_buff`
+    // context for the lifetime of this classifier invocation. Both fields
+    // are fixed-width and readable at this boundary.
+    let (present, control) = unsafe { ((*ctx.skb.skb).vlan_present, (*ctx.skb.skb).vlan_tci) };
+    vlan_tag_takes_frame_away(present, control)
+}
+
 /// Read the exact interface on which this tc classifier is executing.
 #[inline(always)]
 fn packet_ifindex(ctx: &TcContext) -> u32 {
@@ -1759,27 +1800,446 @@ fn local_outer_endpoint_is_ipv6(ctx: &TcContext, address: &[u8; 16]) -> bool {
     gtpu_session_config_wire_owns_local_ipv6(unsafe { &*config_ptr }, packet_ifindex(ctx), address)
 }
 
-/// Preserve an unselected G-PDU for the local control consumer. The caller
-/// has validated its full envelope and excluded retained invalid ownership.
-/// This is an observed lookup miss, not an absence receipt or permission to
-/// respond: the consumer must establish current absence and peer/rate policy.
-#[inline(never)]
-fn unknown_teid_control(ctx: &TcContext, family: GtpuSessionIpFamily) -> i32 {
-    count(COUNTER_DL_UNKNOWN_TEID);
-    let local = match family {
+/// Whether the outer destination is one of this attachment's own endpoints.
+#[inline(always)]
+fn outer_destination_is_local(ctx: &TcContext, family: GtpuSessionIpFamily) -> bool {
+    match family {
         GtpuSessionIpFamily::Ipv4 => ctx
             .load::<[u8; 4]>(ETH_HDR_LEN + 16)
             .is_ok_and(|address| local_outer_endpoint_is_ipv4(ctx, &address)),
         GtpuSessionIpFamily::Ipv6 => ctx
             .load::<[u8; 16]>(ETH_HDR_LEN + 24)
             .is_ok_and(|address| local_outer_endpoint_is_ipv6(ctx, &address)),
+    }
+}
+
+/// Drop a datagram that tc would leave to a UDP socket on this host while no
+/// socket is bound for it, and count the drop.
+///
+/// Passing it on would make the kernel answer with ICMP Port Unreachable
+/// toward the peer, quoting the outer headers and the start of the
+/// subscriber's inner packet.
+#[inline(always)]
+fn missing_consumer() -> i32 {
+    count(COUNTER_DL_MISSING_CONSUMER);
+    TC_ACT_SHOT
+}
+
+/// What tc could establish about the UDP socket of this host that takes a
+/// hand-off.
+enum Consumer {
+    /// No socket is bound for the datagram.
+    Missing,
+    /// UDP input delivers the datagram to this socket, whatever VRF the
+    /// attachment's device belongs to. The holder gives its reference back.
+    Eligible(*mut bpf_sock),
+    /// A socket is bound for the datagram, and tc cannot establish which
+    /// socket UDP input chooses, or whether it accepts one at all: that
+    /// depends on the VRF of the attachment's device.
+    Undetermined,
+}
+
+/// Write the scratch word that a kernel before Linux 6.5 reads as the flags
+/// of the IP control block when it scopes the socket lookup.
+#[inline(always)]
+fn set_lookup_scope(ctx: &TcContext, word: usize, flags: u16) {
+    // SAFETY: the tc verifier supplies a live, writable `__sk_buff` context;
+    // `cb` is program scratch at this hook, and IP input clears it again.
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*ctx.skb.skb).cb[word]),
+            control_block_flags_word(flags),
+        );
+    }
+}
+
+/// Look up the UDP socket for `tuple` in the namespace and on the device of
+/// this hook.
+#[inline(always)]
+fn lookup_udp_socket(ctx: &TcContext, tuple: *mut u8, tuple_len: u32) -> *mut bpf_sock {
+    // SAFETY: the caller passes exactly `tuple_len` initialized stack octets,
+    // and the helper only reads them.
+    unsafe {
+        bpf_sk_lookup_udp(
+            ctx.skb.skb.cast(),
+            tuple.cast(),
+            tuple_len,
+            BPF_F_CURRENT_NETNS as u64,
+            0,
+        )
+    }
+}
+
+/// The device that `socket` is bound to, or zero for none.
+#[inline(always)]
+fn socket_bound_device(socket: *mut bpf_sock) -> u32 {
+    // SAFETY: `socket` is a live socket that a lookup returned and that has
+    // not been released; the verifier permits reading this field of it.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*socket).bound_dev_if)) }
+}
+
+/// Find the UDP socket that takes the datagram `tuple` describes, and
+/// establish that UDP input will accept it for a datagram that arrives on
+/// this attachment's device.
+///
+/// The lookup runs on the device of this hook. It describes the delivery
+/// only while IP input receives on that device. The loader refuses an
+/// interface that has a master other than a VRF, and one below a device that
+/// can take its frames. A frame that carries a VLAN tag with a VLAN ID is
+/// received by a VLAN device above this one, or by nothing. A lookup here
+/// does not describe its delivery, and no socket bound to this device takes
+/// it: its hand-off has no consumer, and no lookup is made for it.
+///
+/// The device can be enslaved to a VRF. UDP input then accepts a socket bound
+/// to the device, and a socket bound to no device only with
+/// `udp_l3mdev_accept`. From Linux 6.5 the lookup applies that scope itself.
+/// Before, it takes the scope from the IP control block, which is not
+/// initialized at tc, and it cannot tell tc whether the device is enslaved.
+/// So tc asks twice and accepts only a socket that UDP input chooses in
+/// either case:
+///
+/// 1. Without a VRF scope. A socket bound to this device is eligible in every
+///    VRF, and the lookup preferred it to every socket bound to no device. A
+///    socket bound to no device is not established yet.
+/// 2. With the VRF scope engaged. The lookup then finds a socket bound to no
+///    device only with `udp_l3mdev_accept`, which admits it to every VRF; it
+///    is the socket the first lookup found.
+///
+/// Everything else is undetermined before Linux 6.5. A socket bound to no
+/// device that only the first lookup finds is eligible outside a VRF and not
+/// inside one. If the second lookup finds a socket bound to a device
+/// instead, UDP input chooses the first socket outside a VRF and the second
+/// inside one. tc cannot know which holds. From Linux 6.5 both lookups apply
+/// the device's scope, so the second returns what the first found.
+///
+/// `flags_word` and `l3_slave` name the scratch word and the flag of the
+/// family's control block. Once written, the word is clear again on return.
+#[inline(always)]
+fn hand_off_consumer(
+    ctx: &TcContext,
+    tuple: *mut u8,
+    tuple_len: u32,
+    flags_word: usize,
+    l3_slave: u16,
+) -> Consumer {
+    if frame_belongs_to_a_vlan_device(ctx) {
+        return Consumer::Missing;
+    }
+    let device = packet_ifindex(ctx);
+    set_lookup_scope(ctx, flags_word, 0);
+    let socket = lookup_udp_socket(ctx, tuple, tuple_len);
+    if socket.is_null() {
+        return Consumer::Missing;
+    }
+    if consumer_is_bound_to_attachment(socket_bound_device(socket), device) {
+        return Consumer::Eligible(socket);
+    }
+    // SAFETY: gives back the reference of the first lookup, which is not
+    // used again.
+    unsafe { bpf_sk_release(socket.cast()) };
+    set_lookup_scope(ctx, flags_word, l3_slave);
+    let socket = lookup_udp_socket(ctx, tuple, tuple_len);
+    set_lookup_scope(ctx, flags_word, 0);
+    if socket.is_null() {
+        return Consumer::Undetermined;
+    }
+    if scoped_consumer_is_established(socket_bound_device(socket)) {
+        return Consumer::Eligible(socket);
+    }
+    // SAFETY: gives back the reference of the second lookup, which is not
+    // used again.
+    unsafe { bpf_sk_release(socket.cast()) };
+    Consumer::Undetermined
+}
+
+/// Leave a hand-off to the socket lookup of UDP input, in a form that the
+/// host never answers with an ICMP error.
+///
+/// This is the verdict when a socket is bound for the datagram and tc cannot
+/// establish which socket UDP input chooses for it (see
+/// [`hand_off_consumer`]). tc assigns nothing: an assignment would deliver
+/// the datagram to a socket of tc's choice, even across a VRF boundary. The
+/// stack's own lookup applies the real scope and delivers the datagram to
+/// the socket it chooses. If it finds none, it would answer with ICMP Port
+/// Unreachable, so the frame is given the type of a link-layer multicast:
+/// the host sends no ICMP error about a datagram in such a frame. Reassembly
+/// keeps the type of the first fragment, so this holds for an
+/// outer-fragmented datagram as well.
+///
+/// The type must reach UDP input unchanged, which holds as long as no
+/// receive handler takes the frame after this hook. A bridge's handler, for
+/// one, moves the frame to the bridge and sets the type back to "host". This
+/// program cannot see a receive handler. The loader refuses an interface
+/// that has a master other than a VRF; a handler without a master is beyond
+/// its sight too, and the control-port guide names those.
+///
+/// The type has other effects on the way to the socket, which the
+/// control-port guide of `opc-gtpu-dataplane` lists: IP input drops the
+/// datagram while `drop_unicast_in_l2_multicast` is set, IPv6 input drops
+/// one that carries a Routing header, and packet-type matches of a packet
+/// filter see a multicast frame.
+#[inline(always)]
+fn leave_to_host_lookup(ctx: &TcContext) -> i32 {
+    // SAFETY: the kernel supplies a verifier-checked, non-null `__sk_buff`
+    // context; `pkt_type` is a fixed-width read-only field at this boundary.
+    let packet_type = unsafe { (*ctx.skb.skb).pkt_type };
+    // A frame of any other type is never answered as it is.
+    if packet_type == PACKET_TYPE_HOST
+        // SAFETY: the helper only rewrites the frame's type.
+        && unsafe { bpf_skb_change_type(ctx.skb.skb.cast(), PACKET_TYPE_MULTICAST) } != 0
+    {
+        return missing_consumer();
+    }
+    TC_ACT_OK
+}
+
+/// Pass an outer-IPv4 datagram on to the UDP socket that is bound for its
+/// source address and port, its destination address and `port`; drop and
+/// count it when none is.
+///
+/// `port` is the destination port the datagram carries when the stack sees
+/// it: the caller has already rewritten it for a steered hand-off.
+///
+/// The socket is found with the kernel's own UDP socket lookup, in the
+/// namespace and on the device of this hook, and it counts only when UDP
+/// input will accept it for a datagram that arrives on this device (see
+/// [`hand_off_consumer`]). A lookup alone is a snapshot: the stack looks
+/// again when it delivers, and a socket that closed in between would still
+/// earn an ICMP error. With `assign`, the datagram therefore carries the
+/// socket that was found, and UDP input delivers to it without a second
+/// lookup. A socket that closes after that receives the datagram in a queue
+/// that is freed with it, and nothing is sent.
+///
+/// The first fragment of an outer-fragmented datagram passes `assign` as
+/// false: reassembly drops the socket of every fragment, so only the lookup
+/// is possible there. Its caller does not drop that fragment either; see
+/// [`outer_fragment_control`].
+///
+/// The lookup is available to tc since Linux 4.20 and the assignment since
+/// Linux 5.7. Neither is GPL-only.
+#[inline(never)]
+fn ipv4_consumer_verdict(ctx: &TcContext, l4_offset: usize, port: u16, assign: bool) -> i32 {
+    // The IPv4 form of `struct bpf_sock_tuple`: source and destination
+    // address, source and destination port, in network order.
+    let mut tuple = [0_u8; 12];
+    let port = port.to_be_bytes();
+    tuple[10] = port[0];
+    tuple[11] = port[1];
+    // SAFETY: each load writes only the initialized stack octets whose
+    // length it is given: the two addresses, then the source port.
+    let loaded = unsafe {
+        bpf_skb_load_bytes(
+            ctx.skb.skb.cast(),
+            (ETH_HDR_LEN + 12) as u32,
+            tuple.as_mut_ptr().cast(),
+            8,
+        ) == 0
+            && bpf_skb_load_bytes(
+                ctx.skb.skb.cast(),
+                l4_offset as u32,
+                tuple.as_mut_ptr().add(8).cast(),
+                2,
+            ) == 0
     };
-    if !local {
+    if !loaded {
+        return malformed_downlink();
+    }
+    let socket = match hand_off_consumer(
+        ctx,
+        tuple.as_mut_ptr(),
+        tuple.len() as u32,
+        IPV4_CONTROL_BLOCK_FLAGS_WORD,
+        IPV4_CONTROL_BLOCK_L3_SLAVE,
+    ) {
+        Consumer::Missing => return missing_consumer(),
+        Consumer::Undetermined => return leave_to_host_lookup(ctx),
+        Consumer::Eligible(socket) => socket,
+    };
+    let assigned = if assign {
+        // SAFETY: `socket` is the live socket the lookup returned. The
+        // helper does not consume it.
+        unsafe { bpf_sk_assign(ctx.skb.skb.cast(), socket.cast(), 0) }
+    } else {
+        0
+    };
+    // SAFETY: gives back the one reference that is still held, on the only
+    // path that holds it.
+    unsafe { bpf_sk_release(socket.cast()) };
+    if hand_off_assignment_keeps_datagram(assigned) {
+        TC_ACT_OK
+    } else {
+        missing_consumer()
+    }
+}
+
+/// Pass an outer-IPv6 G-PDU on to the UDP socket that is bound for its
+/// source address and port and its destination address on UDP/2152; drop and
+/// count it when none is. See [`ipv4_consumer_verdict`].
+#[inline(never)]
+fn ipv6_consumer_verdict(ctx: &TcContext, l4_offset: usize) -> i32 {
+    // The IPv6 form of `struct bpf_sock_tuple`: source and destination
+    // address, source and destination port, in network order.
+    let mut tuple = [0_u8; 36];
+    let port = GTPU_UDP_PORT.to_be_bytes();
+    tuple[34] = port[0];
+    tuple[35] = port[1];
+    // SAFETY: each load writes only the initialized stack octets whose
+    // length it is given: the two addresses, then the source port.
+    let loaded = unsafe {
+        bpf_skb_load_bytes(
+            ctx.skb.skb.cast(),
+            (ETH_HDR_LEN + 8) as u32,
+            tuple.as_mut_ptr().cast(),
+            32,
+        ) == 0
+            && bpf_skb_load_bytes(
+                ctx.skb.skb.cast(),
+                l4_offset as u32,
+                tuple.as_mut_ptr().add(32).cast(),
+                2,
+            ) == 0
+    };
+    if !loaded {
+        return malformed_downlink();
+    }
+    let socket = match hand_off_consumer(
+        ctx,
+        tuple.as_mut_ptr(),
+        tuple.len() as u32,
+        IPV6_CONTROL_BLOCK_FLAGS_WORD,
+        IPV6_CONTROL_BLOCK_L3_SLAVE,
+    ) {
+        Consumer::Missing => return missing_consumer(),
+        Consumer::Undetermined => return leave_to_host_lookup(ctx),
+        Consumer::Eligible(socket) => socket,
+    };
+    // SAFETY: `socket` is the live socket the lookup returned. The helper
+    // does not consume it.
+    let assigned = unsafe { bpf_sk_assign(ctx.skb.skb.cast(), socket.cast(), 0) };
+    // SAFETY: gives back the one reference that is still held, on the only
+    // path that holds it.
+    unsafe { bpf_sk_release(socket.cast()) };
+    if hand_off_assignment_keeps_datagram(assigned) {
+        TC_ACT_OK
+    } else {
+        missing_consumer()
+    }
+}
+
+/// The verdict for a G-PDU that tc leaves on the shared UDP/2152 queue of
+/// one of this attachment's endpoints: passed on while a socket is bound for
+/// it, dropped and counted otherwise.
+#[inline(always)]
+fn shared_queue_verdict(ctx: &TcContext, family: GtpuSessionIpFamily, l4_offset: usize) -> i32 {
+    match family {
+        GtpuSessionIpFamily::Ipv4 => ipv4_consumer_verdict(ctx, l4_offset, GTPU_UDP_PORT, true),
+        GtpuSessionIpFamily::Ipv6 => ipv6_consumer_verdict(ctx, l4_offset),
+    }
+}
+
+/// Preserve an unselected G-PDU for the local control consumer. The caller
+/// has validated its full envelope and excluded retained invalid ownership.
+/// This is an observed lookup miss, not an absence receipt or permission to
+/// respond: the consumer must establish current absence and peer/rate policy.
+///
+/// The original outer packet is kept. The inner payload is never
+/// decapsulated, and no Error Indication is sent from the packet path. The
+/// packet is passed on only while a socket is bound for it.
+#[inline(never)]
+fn unknown_teid_control(ctx: &TcContext, family: GtpuSessionIpFamily, l4_offset: usize) -> i32 {
+    count(COUNTER_DL_UNKNOWN_TEID);
+    if !outer_destination_is_local(ctx, family) {
         return binding_drop(DownlinkBindingMismatch::LocalAddress);
     }
-    // TC_ACT_OK keeps the original outer packet. Never decapsulate the inner
-    // payload or send an automatic Error Indication from the packet path.
+    shared_queue_verdict(ctx, family, l4_offset)
+}
+
+/// Leave a G-PDU with a required unknown extension to the local control
+/// consumer, which answers it with a Supported Extension Headers
+/// Notification. The caller has validated the complete extension chain.
+///
+/// A G-PDU for one of this attachment's endpoints is passed on only while a
+/// socket is bound for it. Any other destination is not handed off by tc at
+/// all: the packet stays with the host, as before.
+#[inline(never)]
+fn required_extension_control(
+    ctx: &TcContext,
+    family: GtpuSessionIpFamily,
+    l4_offset: usize,
+) -> i32 {
+    if !outer_destination_is_local(ctx, family) {
+        return TC_ACT_OK;
+    }
+    shared_queue_verdict(ctx, family, l4_offset)
+}
+
+/// Let the first fragment of a datagram without a consumer pass, marked so
+/// that UDP input discards the reassembled datagram unanswered.
+///
+/// Dropping this fragment would strand the other fragments of every such
+/// datagram in the host's reassembly queue until they expire. A steady
+/// stream of them fills the namespace's reassembly budget, and every other
+/// IPv4 reassembly there then fails. So the datagram is allowed to complete,
+/// with a UDP Length that no datagram can have: UDP input discards a datagram
+/// whose Length exceeds its size before it looks for a socket, and it sends
+/// nothing in return.
+#[inline(always)]
+fn discard_after_reassembly(ctx: &TcContext, l4_offset: usize) -> i32 {
+    if ctx
+        .store(
+            l4_offset + 4,
+            &UDP_LENGTH_OF_NO_DATAGRAM.to_be_bytes(),
+            u64::from(BPF_F_RECOMPUTE_CSUM),
+        )
+        .is_err()
+    {
+        return TC_ACT_SHOT;
+    }
     TC_ACT_OK
+}
+
+/// The verdict for an outer IPv4 fragment, which goes to the stack for
+/// reassembly.
+///
+/// The kernel delivers the reassembled datagram to the socket that is bound
+/// for it, and answers with ICMP Port Unreachable when there is none. Only
+/// the first fragment carries the UDP header, so tc judges the datagram by
+/// that fragment: the first fragment of a UDP/2152 datagram for one of this
+/// attachment's endpoints passes unchanged only while a socket is bound for
+/// the datagram. Otherwise tc counts the datagram and marks that fragment, so
+/// that the host discards the reassembled datagram unanswered (see
+/// [`discard_after_reassembly`]).
+///
+/// Every other fragment is passed on as before. It carries no UDP header, so
+/// it cannot be attributed to a port.
+///
+/// The socket can close while the datagram is being reassembled, and
+/// reassembly drops an assigned socket. That window cannot be closed here: tc
+/// sees fragments, not the reassembled datagram.
+#[inline(never)]
+fn outer_fragment_control(ctx: &TcContext, flags_fragment: u16, ip_header_len: usize) -> i32 {
+    if !outer_ipv4_is_first_fragment(flags_fragment) {
+        return TC_ACT_OK;
+    }
+    let Ok(protocol) = ctx.load::<u8>(ETH_HDR_LEN + 9) else {
+        return TC_ACT_OK;
+    };
+    if protocol != IPV4_PROTO_UDP {
+        return TC_ACT_OK;
+    }
+    let l4_offset = ETH_HDR_LEN + ip_header_len;
+    let Ok(destination_port) = ctx.load::<u16>(l4_offset + 2) else {
+        return TC_ACT_OK;
+    };
+    if u16::from_be(destination_port) != GTPU_UDP_PORT
+        || !outer_destination_is_local(ctx, GtpuSessionIpFamily::Ipv4)
+    {
+        return TC_ACT_OK;
+    }
+    if ipv4_consumer_verdict(ctx, l4_offset, GTPU_UDP_PORT, false) == TC_ACT_OK {
+        return TC_ACT_OK;
+    }
+    discard_after_reassembly(ctx, l4_offset)
 }
 
 /// Return whether this frame is one of this datapath's own re-emitted outer
@@ -3183,10 +3643,16 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
             }
         }
     }
+    // The caller needs the UDP offset to find the socket for a G-PDU that
+    // goes to the shared control queue.
+    let Ok(parsed_udp_offset) = u32::try_from(udp_offset) else {
+        return IPV6_PARSE_DROP;
+    };
+    parsed.udp_offset = parsed_udp_offset;
     // Validate the entire chain before handing the original packet to the
     // shared control queue, without any PDR lookup or decapsulation.
     if requires_control {
-        return IPV6_PARSE_PASS;
+        return IPV6_PARSE_CONTROL;
     }
     if payload_offset >= gtp_end
         || payload_offset
@@ -3217,6 +3683,13 @@ fn handle_downlink_ipv6(ctx: &mut TcContext) -> i32 {
     match parse_downlink_ipv6(ctx, &mut parsed) {
         IPV6_PARSE_PASS => return TC_ACT_OK,
         IPV6_PARSE_DROP => return malformed_downlink(),
+        IPV6_PARSE_CONTROL => {
+            return required_extension_control(
+                ctx,
+                GtpuSessionIpFamily::Ipv6,
+                parsed.udp_offset as usize,
+            );
+        }
         IPV6_PARSE_ACCEPT => {}
         _ => return malformed_downlink(),
     }
@@ -3273,7 +3746,7 @@ fn handle_downlink_ipv6(ctx: &mut TcContext) -> i32 {
             // The frozen v5 schema has no outer-IPv6 selector. A valid G-PDU
             // with no grouped selector can reach only the configured local
             // control endpoint; retained invalid grouped state was refused.
-            unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv6)
+            unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv6, udp_offset)
         }
     }
 }
@@ -4286,9 +4759,9 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
         return u64::from(TC_ACT_OK as u32);
     };
     let frag = u16::from_be(frag);
+    // Fragmented outer packets go to the stack for reassembly.
     if frag & IPV4_FRAG_MASK != 0 {
-        // Fragmented outer packets go to the stack for reassembly.
-        return u64::from(TC_ACT_OK as u32);
+        return u64::from(outer_fragment_control(ctx, frag, ip_header_len) as u32);
     }
     let Ok(protocol) = ctx.load::<u8>(ETH_HDR_LEN + 9) else {
         return u64::from(TC_ACT_OK as u32);
@@ -4419,7 +4892,9 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
     // Validate the entire chain before handing the original packet to the
     // shared control queue, without any PDR lookup or decapsulation.
     if requires_control {
-        return u64::from(TC_ACT_OK as u32);
+        return u64::from(
+            required_extension_control(ctx, GtpuSessionIpFamily::Ipv4, l4_offset) as u32,
+        );
     }
     if payload_offset >= gtp_end {
         return u64::from(malformed_downlink() as u32);
@@ -4475,6 +4950,10 @@ fn downlink_inner_hand_off_port(
 /// the port change and its compensation cancel in any complete-checksum
 /// state. A flood of such packets can then fill only that hand-off queue,
 /// never the shared UDP/2152 queue carrying Echo and reassembled G-PDUs.
+///
+/// The G-PDU is steered only while a socket is bound on `port` for it. The
+/// backend binds its queues when the control port is first opened, and they
+/// close with the process, while tc keeps steering from the pinned graph.
 #[inline(never)]
 fn hand_off_to_backend_queue(ctx: &mut TcContext, l4_offset: usize, port: u16) -> i32 {
     let from = u16::from_ne_bytes(GTPU_UDP_PORT.to_be_bytes());
@@ -4492,7 +4971,7 @@ fn hand_off_to_backend_queue(ctx: &mut TcContext, l4_offset: usize, port: u16) -
         count(COUNTER_DL_MALFORMED);
         return TC_ACT_SHOT;
     }
-    TC_ACT_OK
+    ipv4_consumer_verdict(ctx, l4_offset, port, true)
 }
 
 /// Authorize the complete downlink forwarding identity and perform decap.
@@ -4517,7 +4996,7 @@ fn authorize_and_decap_legacy_downlink(
                 // its retained binding fail-closed until reconciliation.
                 return binding_drop(DownlinkBindingMismatch::Invalid);
             }
-            return unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv4);
+            return unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv4, l4_offset);
         }
         (Some(_), Some(_)) => {
             // A TEID must exist in exactly one schema. Treat externally
@@ -6214,6 +6693,252 @@ mod tests {
         assert!(steer.contains("ctx.store(l4_offset + 2, &to, 0)"));
         assert_eq!(steer.matches(".store(").count(), 1);
         assert!(!steer.contains("adjust_room") && !steer.contains("set_mark"));
+    }
+
+    #[test]
+    fn hand_offs_to_a_local_queue_require_a_bound_consumer() {
+        // A host unit test cannot execute a loaded tc classifier, so prove
+        // the structure directly. tc leaves a downlink datagram to a UDP
+        // socket on this host at five sites. None of them may return a host
+        // pass of its own: each ends in the consumer verdict, which passes
+        // the datagram only while a socket is bound for it and otherwise
+        // drops and counts it. Without a bound socket the kernel would answer
+        // with ICMP Port Unreachable toward the core, quoting the start of
+        // the subscriber's inner packet.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (source, _) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("production code precedes the tests");
+        let body = |signature: &str| {
+            let (_, body) = source
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("`{signature}` is present"));
+            let (body, _) = body
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("`{signature}` has a bounded body"));
+            body
+        };
+
+        // 1. The steered hand-offs to UDP/2153 and UDP/2154.
+        let steer = body("\nfn hand_off_to_backend_queue(");
+        assert!(steer.contains("ipv4_consumer_verdict(ctx, l4_offset, port, true)"));
+        assert!(!steer.contains("TC_ACT_OK"));
+
+        // 2. A G-PDU for no tunnel, either outer family.
+        let unknown = body("\nfn unknown_teid_control(");
+        assert!(unknown.contains("shared_queue_verdict(ctx, family, l4_offset)"));
+        assert!(!unknown.contains("TC_ACT_OK"));
+
+        // 3. A G-PDU with a required unknown extension, either outer family.
+        //    A destination that is not this attachment's endpoint is not
+        //    handed off by tc and stays with the host, as before.
+        let required = body("\nfn required_extension_control(");
+        assert!(required.contains("shared_queue_verdict(ctx, family, l4_offset)"));
+        assert_eq!(required.matches("TC_ACT_OK").count(), 1);
+        let ipv4 = body("\nfn parse_downlink(");
+        assert!(ipv4.contains(
+            "if requires_control {\n        return u64::from(\n            required_extension_control(ctx, GtpuSessionIpFamily::Ipv4, l4_offset) as u32"
+        ));
+        let ipv6 = body("\nfn parse_downlink_ipv6(");
+        assert!(ipv6.contains("if requires_control {\n        return IPV6_PARSE_CONTROL;"));
+        assert!(!ipv6.contains("if requires_control {\n        return IPV6_PARSE_PASS;"));
+        let handler = body("\nfn handle_downlink_ipv6(");
+        assert!(handler
+            .contains("IPV6_PARSE_CONTROL => {\n            return required_extension_control("));
+
+        // 4. The first fragment of an outer-fragmented datagram, the only
+        //    one that carries the UDP header. Reassembly drops an assigned
+        //    socket, so this site looks the socket up without assigning it.
+        //    Without a socket it does not drop the fragment, which would
+        //    strand the others in the reassembly queue: it marks the
+        //    datagram, so that UDP input discards it unanswered.
+        assert!(ipv4.contains(
+            "if frag & IPV4_FRAG_MASK != 0 {\n        return u64::from(outer_fragment_control(ctx, frag, ip_header_len) as u32);"
+        ));
+        let fragment = body("\nfn outer_fragment_control(");
+        assert!(fragment.contains("outer_ipv4_is_first_fragment(flags_fragment)"));
+        assert!(fragment.contains(
+            "if ipv4_consumer_verdict(ctx, l4_offset, GTPU_UDP_PORT, false) == TC_ACT_OK {\n        return TC_ACT_OK;\n    }\n    discard_after_reassembly(ctx, l4_offset)"
+        ));
+        let mark = body("\nfn discard_after_reassembly(");
+        assert!(mark.contains("l4_offset + 4,"));
+        assert!(mark.contains("&UDP_LENGTH_OF_NO_DATAGRAM.to_be_bytes(),"));
+        assert_eq!(mark.matches(".store(").count(), 1);
+
+        // The shared-queue verdict assigns the socket it finds.
+        let shared = body("\nfn shared_queue_verdict(");
+        assert!(shared.contains("ipv4_consumer_verdict(ctx, l4_offset, GTPU_UDP_PORT, true)"));
+        assert!(shared.contains("ipv6_consumer_verdict(ctx, l4_offset)"));
+        assert!(!shared.contains("TC_ACT_OK"));
+
+        // The consumer verdict itself. It assigns a socket only after
+        // `hand_off_consumer` has established that UDP input will accept it,
+        // drops and counts when no socket is bound, and leaves the datagram
+        // to the host's own lookup, unanswerable, when that cannot be
+        // established. It gives back exactly the one reference it holds.
+        for verdict in [
+            body("\nfn ipv4_consumer_verdict("),
+            body("\nfn ipv6_consumer_verdict("),
+        ] {
+            assert_eq!(verdict.matches("hand_off_consumer(").count(), 1);
+            assert!(!verdict.contains("bpf_sk_lookup_udp("));
+            assert!(!verdict.contains("set_lookup_scope("));
+            let consumer = verdict.find("hand_off_consumer(").expect("consumer");
+            let missing = verdict
+                .find("Consumer::Missing => return missing_consumer(),")
+                .expect("a missing socket is a counted drop");
+            let undetermined = verdict
+                .find("Consumer::Undetermined => return leave_to_host_lookup(ctx),")
+                .expect("an unestablished socket is left to the host's lookup");
+            let eligible = verdict
+                .find("Consumer::Eligible(socket) => socket,")
+                .expect("an eligible socket is kept");
+            assert_eq!(verdict.matches("bpf_sk_assign(").count(), 1);
+            assert_eq!(verdict.matches("bpf_sk_release(").count(), 1);
+            let assign = verdict.find("bpf_sk_assign(").expect("assignment");
+            let release = verdict.find("bpf_sk_release(").expect("release");
+            assert!(consumer < missing && missing < undetermined && undetermined < eligible);
+            assert!(eligible < assign && assign < release);
+            assert!(verdict.contains("hand_off_assignment_keeps_datagram("));
+        }
+
+        // Eligibility. The device of the attachment can be enslaved to a
+        // VRF, and before Linux 6.5 the lookup cannot tell. A socket is
+        // taken for the consumer only if the first lookup found it on that
+        // device, or if it is bound to no device and the lookup still finds
+        // it with the VRF scope engaged. Never because the lookup without a
+        // scope found a socket that is bound to no device: inside a VRF that
+        // socket belongs to the default VRF. And never because the scoped
+        // lookup found another socket on a device: outside a VRF UDP input
+        // chooses the first one.
+        let consumer = body("\nfn hand_off_consumer(");
+        assert_eq!(
+            consumer
+                .matches("lookup_udp_socket(ctx, tuple, tuple_len)")
+                .count(),
+            2
+        );
+        let unscoped = consumer
+            .find("set_lookup_scope(ctx, flags_word, 0);")
+            .expect("the first lookup has no VRF scope");
+        let missing = consumer
+            .find("if socket.is_null() {\n        return Consumer::Missing;")
+            .expect("no socket at all is a missing consumer");
+        let bound = consumer
+            .find(
+                "if consumer_is_bound_to_attachment(socket_bound_device(socket), device) {\n        return Consumer::Eligible(socket);",
+            )
+            .expect("a socket on the attachment's device is eligible");
+        let scoped = consumer
+            .find("set_lookup_scope(ctx, flags_word, l3_slave);")
+            .expect("the second lookup engages the VRF scope");
+        let confirmed = consumer
+            .find(
+                "if scoped_consumer_is_established(socket_bound_device(socket)) {\n        return Consumer::Eligible(socket);",
+            )
+            .expect("a socket bound to no device, found under the VRF scope, is eligible");
+        assert!(unscoped < missing && missing < bound && bound < scoped && scoped < confirmed);
+        assert_eq!(consumer.matches("Consumer::Eligible(").count(), 2);
+        // No socket at all, and a frame that a VLAN device receives.
+        assert_eq!(consumer.matches("Consumer::Missing").count(), 2);
+        assert_eq!(consumer.matches("Consumer::Undetermined").count(), 2);
+        // Each lookup's reference is given back unless its socket is
+        // returned, and the scratch word is clear again after each lookup.
+        assert_eq!(consumer.matches("bpf_sk_release(").count(), 2);
+        assert_eq!(
+            consumer
+                .matches("set_lookup_scope(ctx, flags_word, 0);")
+                .count(),
+            2
+        );
+        assert!(!consumer.contains("bpf_sk_assign("));
+        let lookup = body("\nfn lookup_udp_socket(");
+        assert_eq!(lookup.matches("bpf_sk_lookup_udp(").count(), 1);
+        assert!(lookup.contains("BPF_F_CURRENT_NETNS as u64,"));
+
+        // What tc cannot establish it does not decide: it assigns nothing
+        // and gives the frame a type that the host never answers with an
+        // ICMP error. If it cannot, the datagram is dropped and counted.
+        let host = body("\nfn leave_to_host_lookup(");
+        assert!(host.contains("bpf_skb_change_type(ctx.skb.skb.cast(), PACKET_TYPE_MULTICAST)"));
+        assert!(host.contains("if packet_type == PACKET_TYPE_HOST"));
+        assert!(host.contains("return missing_consumer();"));
+        assert!(!host.contains("bpf_sk_assign(") && !host.contains("bpf_sk_lookup_udp("));
+        // The frame type is rewritten at this one place only.
+        assert_eq!(source.matches("bpf_skb_change_type(").count(), 1);
+        let missing = body("\nfn missing_consumer(");
+        assert!(missing.contains("count(COUNTER_DL_MISSING_CONSUMER);"));
+        assert!(missing.contains("TC_ACT_SHOT"));
+    }
+
+    #[test]
+    fn a_hand_off_in_a_frame_of_a_vlan_device_has_no_consumer() {
+        // A host unit test cannot execute a loaded tc classifier, so prove
+        // the structure on the source. A frame whose VLAN tag takes it to a
+        // VLAN device is not received on this interface, so a lookup here
+        // does not describe the delivery of its hand-off. The consumer
+        // decision answers "missing" for it before the first lookup, which
+        // every hand-off site turns into a counted drop, or into a counted
+        // and marked first fragment. Nothing else judges the tag: the
+        // downlink root handles such a frame as any other, and the uplink
+        // root runs at egress, where no frame is received.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (source, _) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("production code precedes the tests");
+        let body = |signature: &str| {
+            let (_, body) = source
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("`{signature}` is present"));
+            let (body, _) = body
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("`{signature}` has a bounded body"));
+            body
+        };
+
+        let consumer = body("\nfn hand_off_consumer(");
+        let (before, after) = consumer
+            .split_once("if frame_belongs_to_a_vlan_device(ctx) {")
+            .expect("the consumer decision judges the VLAN tag");
+        assert!(!before.contains("lookup_udp_socket("));
+        assert!(!before.contains("set_lookup_scope("));
+        assert!(after.trim_start().starts_with("return Consumer::Missing;"));
+        // The tag is judged here and nowhere else.
+        assert_eq!(
+            source.matches("frame_belongs_to_a_vlan_device(").count(),
+            2,
+            "the definition and its one use"
+        );
+        // No hand-off site looks for a socket by itself. The kernel's lookup
+        // is called at one place, and only the consumer decision uses that
+        // place, after it has judged the tag.
+        assert_eq!(source.matches("bpf_sk_lookup_udp(").count(), 1);
+        assert!(body("\nfn lookup_udp_socket(").contains("bpf_sk_lookup_udp("));
+        assert_eq!(
+            source.matches("lookup_udp_socket(").count(),
+            3,
+            "the definition and its two uses"
+        );
+        assert_eq!(after.matches("lookup_udp_socket(").count(), 2);
+
+        let judge = body("\nfn frame_belongs_to_a_vlan_device(");
+        assert!(judge.contains("(*ctx.skb.skb).vlan_present"));
+        assert!(judge.contains("(*ctx.skb.skb).vlan_tci"));
+        assert!(judge.contains("vlan_tag_takes_frame_away(present, control)"));
+
+        // Both verdicts turn "missing" into the counted drop, and the
+        // fragment site turns that drop into the mark.
+        for verdict in [
+            body("\nfn ipv4_consumer_verdict("),
+            body("\nfn ipv6_consumer_verdict("),
+        ] {
+            assert!(verdict.contains("Consumer::Missing => return missing_consumer(),"));
+        }
+        let fragment = body("\nfn outer_fragment_control(");
+        assert!(fragment.contains(
+            "if ipv4_consumer_verdict(ctx, l4_offset, GTPU_UDP_PORT, false) == TC_ACT_OK {"
+        ));
+        assert!(fragment.contains("discard_after_reassembly(ctx, l4_offset)"));
     }
 
     #[test]
