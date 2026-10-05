@@ -67,7 +67,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
-          targets: aarch64-apple-darwin
 
       - name: Install pinned eBPF Rust
         run: |
@@ -124,13 +123,6 @@ jobs:
             -p opc-session-store \
             --all-targets \
             --all-features \
-            -- \
-            -D warnings
-          cargo clippy --locked \
-            -p opc-runtime \
-            --lib \
-            --all-features \
-            --target aarch64-apple-darwin \
             -- \
             -D warnings
           optimized_sqlite_contracts=(

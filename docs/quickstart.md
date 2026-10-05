@@ -4,6 +4,7 @@ This guide shows how to build a minimal 5G CNF using the `opc-sdk` facade crate 
 
 ## Prerequisites
 
+- Linux (the SDK's supported platform)
 - Rust 1.89 or later
 - `cargo` and `rustc` on your PATH
 - (Optional) `tokio-console` for async task introspection

@@ -106,7 +106,8 @@ evidence.
   construction is Linux-only: dynamic construction returns the typed
   `DynamicConsensusUnsupportedPlatform` error on other platforms before
   creating snapshot directories or consensus schema state. Standalone
-  `SqliteSessionBackend` use remains cross-platform. Callers install its
+  `SqliteSessionBackend` retains platform-independent code; Linux is the SDK's
+  only supported platform. Callers install its
   consensus RPC handler, then call `initialize_cluster` for pristine storage.
   Every member may make that call concurrently. On clean first formation only
   the canonical lowest node initializes Openraft; the other pristine members

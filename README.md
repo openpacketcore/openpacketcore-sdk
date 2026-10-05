@@ -11,6 +11,9 @@ release-assurance schemas and policy APIs. Each surface has its own documented
 maturity and deployment boundary; this repository does not currently claim a
 workspace-wide high-assurance production profile.
 
+Linux is the SDK's only supported platform. Hosted CI validates Linux builds
+and tests, including configurations that exercise unsupported-backend behavior.
+
 The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The SDK
 now includes experimental, transport-neutral protocol crates: the
 `opc-proto-gtpv2c` crate, limited to an S2b typed GTPv2-C subset; the

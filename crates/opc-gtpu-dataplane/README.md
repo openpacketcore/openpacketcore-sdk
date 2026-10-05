@@ -2937,7 +2937,9 @@ offload support.
 - The userspace crate forbids `unsafe`; raw kernel UAPI work is isolated in
   `opc-linux-gtpu-sys`, while verifier-bound packet/map/helper access and the
   isolated ingress-mark read remain in the standalone eBPF program crate.
-- The crate compiles for non-Linux targets. `aya`, `aya-obj`, `rustix`, `nix`,
+- Linux is the supported platform. Platform-conditional code remains, but
+  builds and tests on other operating systems are not qualified.
+  `aya`, `aya-obj`, `rustix`, `nix`,
   `sha1` and `sha2` are declared only under `cfg(target_os = "linux")`, and so
   are the kernel runtime, the reassembly socket, and the `/proc` and sysctl
   readers. The Linux-only part of the public surface is the eBPF backend's
@@ -2956,11 +2958,9 @@ offload support.
   unreadable -- so the contract cannot drift if a portable constructor is ever
   added. That is a crate-internal invariant pinned by the unit test
   `downlink_fragment_contract_reports_kernel_handoff_only_on_linux`, not a
-  consumer-observable one. CI lints the crate with `-D warnings` for
-  `x86_64-unknown-freebsd` and on `macos-latest`, and runs the crate's unit
-  tests on the macOS lane, which is where that assertion actually executes.
-  Integration and privileged suites stay Linux-only, so off Linux this is a
-  compile-and-unit-test guarantee, not a validated non-Linux datapath runtime.
+  consumer-observable one. CI validates Linux, including a separate build with
+  `RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
+  `--no-default-features` that exercises unsupported-backend behavior on Linux.
 - The Linux netdevice backend follows mainline `gtp` behavior and is not the
   ePDG uplink datapath.
 - The eBPF backend requires bpffs, kernel BTF, tc/eBPF privileges
@@ -3040,8 +3040,6 @@ offload support.
 
 ```sh
 cargo test -p opc-gtpu-dataplane
-rustup target add x86_64-unknown-freebsd
-cargo clippy -p opc-gtpu-dataplane --all-targets --target x86_64-unknown-freebsd -- -D warnings
 sudo modprobe gtp
 sudo modprobe wireguard
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1'
