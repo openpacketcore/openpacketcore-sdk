@@ -2015,8 +2015,9 @@ On other interfaces in the calling network namespace, SDK hooks found through
 those entries or scope-map references are removed, as are filters whose
 programs reference recognized product maps. These removals use individual
 handles; non-SDK filters count as foreign. Other namespace references, outside
-program/link pins and live descriptors keep the ordinary reference refusals.
-Direct tc deletion stays in the calling network namespace.
+program/link pins, live descriptors, non-tc attachments and references on
+interfaces whose filter dumps are skipped during discovery keep the ordinary
+reference refusals. Direct tc deletion stays in the calling network namespace.
 
 A map is the product's when this build recognizes its pin name, kernel name
 and definition. An unrecognized map is treated as foreign and unpinned without

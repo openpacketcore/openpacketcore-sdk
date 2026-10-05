@@ -55,8 +55,10 @@ including alternative names, receives whole-priority cleanup. Other interfaces
 in the calling network namespace receive per-handle cleanup of SDK hooks found
 through those entries or scope-map references, and of filters whose programs
 reference recognized product maps. Non-SDK filters count as foreign. Other
-namespace references, outside program/link pins and live descriptors keep the
-ordinary reference refusals. Direct tc operations stay in this namespace.
+namespace references, outside program/link pins, live descriptors, non-tc
+attachments and references on interfaces whose filter dumps are skipped during
+discovery keep the ordinary reference refusals. Direct tc operations stay in
+this namespace.
 
 A map is the product's when this build recognizes its pin name, kernel name and
 definition. An unrecognized map is treated as foreign and unpinned without an
