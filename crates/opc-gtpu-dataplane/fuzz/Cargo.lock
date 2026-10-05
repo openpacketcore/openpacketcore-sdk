@@ -1190,7 +1190,10 @@ version = "0.2.0"
 dependencies = [
  "opc-key",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "sha2",
+ "subtle",
  "thiserror 2.0.20",
 ]
 

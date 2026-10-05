@@ -8,6 +8,18 @@
 
 #![forbid(unsafe_code)]
 
+mod config_capacity;
+mod config_preparation;
+
+pub use config_capacity::{
+    encrypt_bounded_config_envelope, encrypt_bounded_config_envelope_with_handle_and_nonce,
+    encrypt_reserved_bounded_config_envelope, ConfigCapacityError, ConfigCapacityEvidence,
+    ConfigCapacityProfile, CONFIG_CAPACITY_V1_AAD_BYTES, CONFIG_CAPACITY_V1_ENVELOPE_BYTES,
+    CONFIG_CAPACITY_V1_LOGICAL_BYTES, CONFIG_CAPACITY_V1_PLAINTEXT_BYTES,
+    CONFIG_CAPACITY_V1_REPLAY_BYTES,
+};
+pub use config_preparation::{ConfigPreparationPool, ConfigPreparationReservation};
+
 use opc_key::{
     AeadAlgorithm, EnvelopeAad, KeyHandle, KeyId, KeyProvider, Zeroizing, AEAD_TAG_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
@@ -16,6 +28,7 @@ use rand::{rngs::SysRng, TryRng};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 const ENVELOPE_MAGIC: [u8; 4] = *b"OPCE";
@@ -28,7 +41,9 @@ const HEADER_LEN: usize = 4 + 2 + 2 + 2 + 2 + 4;
 #[derive(Clone)]
 pub struct AuthenticatedEnvelope {
     encoded: Arc<[u8]>,
-    plaintext_digest: [u8; 32],
+    plaintext_digest: Zeroizing<[u8; 32]>,
+    capacity_evidence: Option<ConfigCapacityEvidence>,
+    preparation: Option<Arc<config_preparation::ConfigPreparationLease>>,
     unclaimed: Arc<AtomicBool>,
 }
 
@@ -36,7 +51,9 @@ impl AuthenticatedEnvelope {
     fn new(encoded: Vec<u8>, plaintext: &[u8]) -> Self {
         Self {
             encoded: Arc::from(encoded),
-            plaintext_digest: Sha256::digest(plaintext).into(),
+            plaintext_digest: Zeroizing::new(Sha256::digest(plaintext).into()),
+            capacity_evidence: None,
+            preparation: None,
             unclaimed: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -53,8 +70,36 @@ impl AuthenticatedEnvelope {
             .map_err(|_| CryptoError::EncryptionFailed)?;
         Ok(AuthenticatedEnvelopeClaim {
             encoded: self.encoded.clone(),
-            plaintext_digest: self.plaintext_digest,
+            plaintext_digest: self.plaintext_digest.clone(),
+            capacity_evidence: self.capacity_evidence,
+            preparation: self
+                .preparation
+                .as_ref()
+                .map(|lease| ConfigPreparationReservation {
+                    lease: Arc::clone(lease),
+                }),
         })
+    }
+
+    /// Claim a reserved encryption for its exact destination pool.
+    ///
+    /// A foreign pool or unreserved envelope is refused without consuming the
+    /// claim. A successful claim remains one-shot across all envelope aliases.
+    /// Receiving adapters must also check the retained reservation against their
+    /// own private pool; this method does not enable a storage profile.
+    pub fn claim_reserved(
+        &self,
+        pool: &ConfigPreparationPool,
+    ) -> Result<AuthenticatedEnvelopeClaim, ConfigCapacityError> {
+        if !self
+            .preparation
+            .as_ref()
+            .is_some_and(|lease| pool.owns_lease(lease))
+        {
+            return Err(ConfigCapacityError::ResourceAdmission);
+        }
+        self.claim()
+            .map_err(|_| ConfigCapacityError::ResourceAdmission)
     }
 }
 
@@ -72,10 +117,32 @@ impl std::fmt::Debug for AuthenticatedEnvelope {
 /// proposal constructor.
 pub struct AuthenticatedEnvelopeClaim {
     encoded: Arc<[u8]>,
-    plaintext_digest: [u8; 32],
+    plaintext_digest: Zeroizing<[u8; 32]>,
+    capacity_evidence: Option<ConfigCapacityEvidence>,
+    preparation: Option<ConfigPreparationReservation>,
 }
 
 impl AuthenticatedEnvelopeClaim {
+    /// Exact plaintext lengths issued by bounded encryption; absent for legacy
+    /// encryption. Copying lengths grants no authority over another envelope.
+    pub const fn capacity_evidence(&self) -> Option<ConfigCapacityEvidence> {
+        self.capacity_evidence
+    }
+
+    /// Consume the size evidence and process-local preparation ownership.
+    ///
+    /// Persistence constructors must first check [`Self::matches`] and
+    /// [`Self::matches_plaintext_digest`]. These parts alone cannot attest a
+    /// different record. Envelope aliases continue to retain the same lease.
+    pub fn into_capacity_parts(
+        self,
+    ) -> (
+        Option<ConfigCapacityEvidence>,
+        Option<ConfigPreparationReservation>,
+    ) {
+        (self.capacity_evidence, self.preparation)
+    }
+
     /// Verify that record bytes are exactly the successfully encrypted bytes.
     pub fn matches(&self, encoded: &[u8]) -> bool {
         self.encoded.as_ref() == encoded
@@ -83,7 +150,7 @@ impl AuthenticatedEnvelopeClaim {
 
     /// Verify the digest of the plaintext input that was encrypted.
     pub fn matches_plaintext_digest(&self, digest: &[u8]) -> bool {
-        self.plaintext_digest.as_slice() == digest
+        self.plaintext_digest.as_slice().ct_eq(digest).into()
     }
 }
 

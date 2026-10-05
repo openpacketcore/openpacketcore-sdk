@@ -154,13 +154,15 @@ pub struct StoredConfig {
 /// A config commit bound to one successful outer-adapter AEAD encryption.
 ///
 /// The one-shot encryption claim is consumed by [`Self::try_new`] and is not
-/// retained or serialized. Consensus therefore receives only ciphertext and
-/// deterministic metadata, while unauthenticated raw bytes cannot enter its
-/// proposal API.
+/// serialized. SDK-issued capacity evidence and preparation ownership, when
+/// present, transfer only after the exact ciphertext and plaintext digest match.
+/// This does not change a receiving store's capacity or admission policy.
 pub struct AttestedConfigCommit {
     record: CommitRecord,
     audit: Vec<AuditRecord>,
     confirmed_resolution: Option<ConfirmedCommitResolution>,
+    capacity_evidence: Option<opc_crypto::ConfigCapacityEvidence>,
+    preparation: Option<opc_crypto::ConfigPreparationReservation>,
 }
 
 impl AttestedConfigCommit {
@@ -174,10 +176,13 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
+        let (capacity_evidence, preparation) = claim.into_capacity_parts();
         Ok(Self {
             record,
             audit,
             confirmed_resolution: None,
+            capacity_evidence,
+            preparation,
         })
     }
 
@@ -202,11 +207,27 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
+        let (capacity_evidence, preparation) = claim.into_capacity_parts();
         Ok(Self {
             record,
             audit,
             confirmed_resolution: Some(resolution),
+            capacity_evidence,
+            preparation,
         })
+    }
+
+    /// Exact plaintext lengths from bounded encryption; absent for legacy
+    /// encryption. This evidence grants no larger storage or command limit.
+    pub const fn capacity_evidence(&self) -> Option<opc_crypto::ConfigCapacityEvidence> {
+        self.capacity_evidence
+    }
+
+    /// Retained preparation lease, if encryption used one. A receiving adapter
+    /// must check its own private pool's [`opc_crypto::ConfigPreparationPool::owns`]
+    /// before effects. Envelope aliases may retain the same lease independently.
+    pub fn preparation(&self) -> Option<&opc_crypto::ConfigPreparationReservation> {
+        self.preparation.as_ref()
     }
 
     pub(crate) fn into_parts(
