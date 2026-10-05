@@ -6344,6 +6344,12 @@ fn validate_control_socket_path(
 
 #[cfg(unix)]
 fn prepare_control_directory(control_directory: &Path) -> Result<(), NodeFailure> {
+    #[cfg(target_os = "linux")]
+    let directory_mode = QUALIFICATION_CONTROL_DIRECTORY_MODE;
+    #[cfg(not(target_os = "linux"))]
+    let directory_mode = QUALIFICATION_CONTROL_DIRECTORY_MODE
+        .try_into()
+        .map_err(|_| NodeFailure)?;
     let mut builder = DirBuilder::new();
     builder.mode(QUALIFICATION_CONTROL_DIRECTORY_MODE);
     let created = match builder.create(control_directory) {
@@ -6358,16 +6364,11 @@ fn prepare_control_directory(control_directory: &Path) -> Result<(), NodeFailure
     )
     .map_err(|_| NodeFailure)?;
     if created {
-        fchmod(
-            &descriptor,
-            Mode::from_raw_mode(QUALIFICATION_CONTROL_DIRECTORY_MODE),
-        )
-        .map_err(|_| NodeFailure)?;
+        fchmod(&descriptor, Mode::from_raw_mode(directory_mode)).map_err(|_| NodeFailure)?;
     }
     let metadata = fstat(&descriptor).map_err(|_| NodeFailure)?;
     if !FileType::from_raw_mode(metadata.st_mode).is_dir()
-        || Mode::from_raw_mode(metadata.st_mode).bits() & 0o777
-            != QUALIFICATION_CONTROL_DIRECTORY_MODE
+        || Mode::from_raw_mode(metadata.st_mode).bits() & 0o777 != directory_mode
     {
         return Err(NodeFailure);
     }

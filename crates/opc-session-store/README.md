@@ -107,7 +107,8 @@ evidence.
   `DynamicConsensusUnsupportedPlatform` error on other platforms before
   creating snapshot directories or consensus schema state. Standalone
   `SqliteSessionBackend` retains platform-independent code; Linux is the SDK's
-  only supported platform. Callers install its
+  only supported platform. The off-Linux rejection tests are compile-checked
+  for FreeBSD, not executed in CI. Callers install the `ConsensusSessionStore`
   consensus RPC handler, then call `initialize_cluster` for pristine storage.
   Every member may make that call concurrently. On clean first formation only
   the canonical lowest node initializes Openraft; the other pristine members
@@ -873,7 +874,7 @@ All public durable consensus constructors are Linux-only. Dynamic construction
 returns `DynamicConsensusUnsupportedPlatform` before consensus-owned filesystem
 or schema initialization; fixed construction retains its distinct
 `FixedQuorumUnsupportedPlatform` error. This boundary does not restrict
-standalone `SqliteSessionBackend` use.
+standalone `SqliteSessionBackend` use on Linux.
 
 Build the complete descriptor set first, derive its order-independent
 configuration digest with `opc_consensus::derive_configuration_id`, and pass

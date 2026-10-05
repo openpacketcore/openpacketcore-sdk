@@ -148,6 +148,11 @@ return `io::ErrorKind::Unsupported` instead of silently binding in the default
 routing domain. The original `bind_udp_socket_with_destination_metadata`
 constructor remains unchanged in behavior and does not select a device.
 
+CI compile-checks the runtime library for `x86_64-unknown-freebsd` and
+`aarch64-apple-darwin` with default features. Non-Linux test targets are
+excluded because their AWS-LC dependency needs a target C toolchain; CI does
+not execute non-Linux tests.
+
 ### Linux `SO_BINDTODEVICE` capability contract
 
 The kernel's own check lives in `sock_bindtoindex_locked()`

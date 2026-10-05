@@ -2040,6 +2040,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn passing_outcome_for_artifact_test(
         member_count: usize,
     ) -> QualificationKubernetesConcurrentV5Outcome {
@@ -2056,6 +2057,7 @@ pub(crate) mod tests {
         .expect("valid artifact-test campaign")
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn cancelled_artifact_outcome() -> QualificationKubernetesConcurrentV5Outcome {
         let config = config(3);
         let clock = Arc::new(FakeClock::new());
@@ -2072,6 +2074,7 @@ pub(crate) mod tests {
         .expect("valid cancelled artifact-test campaign")
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn active_cancelled_artifact_result(
         artifact_config: &crate::qualification_kubernetes_concurrent_v5_artifacts::QualificationKubernetesConcurrentV5ArtifactConfig,
     ) -> Result<
