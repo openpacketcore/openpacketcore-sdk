@@ -42,6 +42,8 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/attachment_leaf_namespace.rs"]
+mod attachment_leaf_namespace;
 #[path = "ebpf_gtpu_privileged/attachment_receive_interface.rs"]
 mod attachment_receive_interface;
 #[path = "ebpf_gtpu_privileged/attachment_stacked_device.rs"]
@@ -10116,6 +10118,12 @@ async fn ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tun
 async fn ebpf_gtpu_downlink_inner_fragments_take_the_backend_queue(
 ) -> Result<(), Box<dyn std::error::Error>> {
     backend_inner_fragment_hand_off::qualify().await
+}
+
+#[test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+fn ebpf_gtpu_attachment_leaf_other_namespace() {
+    attachment_leaf_namespace::qualify();
 }
 
 #[tokio::test]
