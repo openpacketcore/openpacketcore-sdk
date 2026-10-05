@@ -143,6 +143,84 @@ use crate::{RetainedGraphCleanupClassification, RetainedGraphCleanupRequest};
 pub const DEFAULT_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-gtpu";
 /// Default tc filter priority for the datapath programs.
 pub const DEFAULT_TC_PRIORITY: u16 = 50;
+/// The feature that [`GtpuError::UnsupportedFeature`] names when the backend
+/// refuses an interface because it has a master other than a VRF.
+///
+/// An attachment's interface must be the one on which the host receives the
+/// endpoint's packets. A port of a bridge, a bond, a team or a virtual switch
+/// is not: the master's receive handler takes its frames after tc ran. The
+/// backend refuses every interface whose master is not a VRF, with this
+/// feature:
+///
+/// - in `create_device`, `create_device_with_endpoints` and `resolve_device`;
+/// - in the inspection and the admission of a sealed successor, and in the
+///   activation of a cleanup-only attachment;
+/// - before it binds the control port (`open_gtpu_control_port`) or the
+///   socket that sends N3 End Markers.
+///
+/// A refusal changes nothing. `remove_device` does not ask, so the process
+/// that manages an attachment can remove it after its interface was
+/// enslaved. Attach to the device that receives: for a bridge, a bond or a
+/// team, the master itself.
+///
+/// A device that takes the interface's frames without being its master is
+/// refused with [`ATTACHMENT_BELOW_STACKED_DEVICE`], and every interface of
+/// a namespace that holds an HSR or PRP device with
+/// [`ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`].
+pub const ATTACHMENT_ON_ENSLAVED_INTERFACE: &str = "attachment_on_enslaved_interface";
+/// The feature that [`GtpuError::UnsupportedFeature`] names when the backend
+/// refuses an interface because another device of the namespace is stacked
+/// on it and can take the frames that it receives.
+///
+/// A macvlan, an ipvlan and a MACsec device take frames from the interface
+/// below them after tc ran, through a receive handler, without becoming its
+/// master. The backend asks the kernel for every link of the namespace and
+/// refuses the interface, in the calls that
+/// [`ATTACHMENT_ON_ENSLAVED_INTERFACE`] lists and with this feature, when
+/// another device names it as its lower link, unless that device is of a
+/// kind that leaves the frames of its link alone: a VLAN device with a VLAN
+/// ID other than 0, the peer of a `veth`, `vxcan` or `netkit` pair, and a
+/// tunnel or XFRM interface that is bound to it (`ipip`, `gre`, `gretap`,
+/// `erspan`, `ip6gre`, `ip6gretap`, `ip6erspan`, `sit`, `ip6tnl`, `vti`,
+/// `vti6`, `xfrm`).
+///
+/// A device of a kind that is not in that list is refused, whatever it does
+/// with the frames. A VLAN device with a VLAN ID other than 0 is accepted
+/// because tc gives a hand-off that arrives in its VLAN to no socket; one
+/// with the ID 0 takes the frames that carry a priority tag, which are the
+/// interface's own. An HSR or PRP device names no lower link; see
+/// [`ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`].
+///
+/// A refusal changes nothing, and `remove_device` does not ask. The backend
+/// sees what the kernel's answer for the links of the namespace reports. It
+/// cannot see a device that lives in another network namespace or one that
+/// takes frames without reporting a lower link, and it does not notice a
+/// device that is stacked on the interface after the call; the control-port
+/// guide says what follows from each.
+pub const ATTACHMENT_BELOW_STACKED_DEVICE: &str = "attachment_below_stacked_device";
+/// The feature that [`GtpuError::UnsupportedFeature`] names when the backend
+/// refuses an interface because its network namespace holds an HSR or PRP
+/// device.
+///
+/// An HSR device takes frames from its ports after tc ran, through a receive
+/// handler. From Linux 6.10 it can have a third port, the interlink, and
+/// from Linux 6.10 to 6.17 nothing in the kernel's answer for the links ties
+/// that port to the device: the device names only its two ring ports, and
+/// the port names no master. So the backend cannot tell which interfaces of
+/// the namespace the device takes frames from. It refuses every interface of
+/// a namespace that holds a link of the kind `hsr`: an interface that the
+/// device names as a port, one that it does not name, and the device itself.
+/// A PRP device is a link of the same kind and refuses the interfaces of its
+/// namespace in the same way, although the kernel names both of its ports.
+///
+/// The refusal applies in the calls that [`ATTACHMENT_ON_ENSLAVED_INTERFACE`]
+/// lists, on every kernel, and after the two other refusals. From Linux 6.18
+/// a port names the device as its master, and is refused as an enslaved
+/// interface.
+///
+/// A refusal changes nothing, and `remove_device` does not ask. Keep an HSR
+/// or PRP device out of the network namespace of an attachment.
+pub const ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE: &str = "attachment_in_namespace_with_hsr_device";
 /// Number of map pins in the current eBPF GTP-U graph.
 ///
 /// The Linux manifest uses this constant as its array length, so changing the
@@ -440,6 +518,59 @@ pub struct EbpfGtpuDatapathCounters {
     /// `uplink_encapsulated` rising while this stays flat is the signature of
     /// a total uplink outage caused downstream of the classifier.
     pub uplink_redirects_resolved: u64,
+    /// Downlink hand-offs that tc gave to no UDP socket, because none was
+    /// bound to receive them or they arrived in a VLAN above the interface.
+    ///
+    /// tc leaves some datagrams to a socket on this host instead of
+    /// decapsulating them:
+    ///
+    /// - an over-MTU Don't Fragment packet and an inner fragment of a context
+    ///   with a downlink inner MTU, steered to the backend-owned queues on
+    ///   UDP/2153 and UDP/2154;
+    /// - a G-PDU for no tunnel, or with a required unknown extension, left
+    ///   on UDP/2152 of one of the attachment's endpoints;
+    /// - an outer-fragmented UDP/2152 datagram for an IPv4 endpoint, which
+    ///   the kernel reassembles for that port and tc judges by its first
+    ///   fragment.
+    ///
+    /// Each is passed on only while a socket is bound for it. Without one
+    /// the kernel would answer with ICMP Port Unreachable toward the peer,
+    /// quoting the start of the subscriber's inner packet, so the datagram
+    /// is dropped and counted here. tc drops an unfragmented datagram
+    /// itself; a fragmented one is reassembled by the host and discarded by
+    /// UDP input, unanswered.
+    ///
+    /// The backend binds its sockets when the control port is first opened
+    /// and keeps them until the attachment is removed or retired; they close
+    /// with the process, while tc keeps running from the pinned graph. A
+    /// rising value therefore means that hand-offs are arriving while nothing
+    /// drains them: the port was not opened yet, the process was down, or it
+    /// restarted and has not reopened the port. Those packets are lost, as
+    /// they were before; what changed is that the host no longer answers
+    /// them. On an IPv6 endpoint the backend binds nothing, so there the
+    /// counter also rises while the port is open, unless the application
+    /// binds its own socket.
+    ///
+    /// A socket counts when UDP input will accept it for a datagram that
+    /// arrives on the attachment's interface: one bound to that interface,
+    /// or one bound to no device. If the interface is enslaved to a VRF, a
+    /// socket bound to no device counts only with `udp_l3mdev_accept`.
+    /// Before Linux 6.5 tc cannot tell whether the interface is enslaved; a
+    /// datagram for such a socket is then left to the stack's own socket
+    /// lookup, in a frame that the host does not answer, and a datagram that
+    /// the stack discards there counts in the host's UDP `NoPorts` and not
+    /// here. See the control-port guide.
+    ///
+    /// A hand-off that arrives in a frame with a VLAN ID is counted here
+    /// whatever is bound. A VLAN device above the interface receives such a
+    /// frame, or nothing does, so tc gives its hand-off to no socket. A
+    /// value that rises while the control port is open and drained can
+    /// therefore mean that the peer sends in a VLAN above the attachment's
+    /// interface.
+    ///
+    /// A G-PDU for no tunnel is counted in [`Self::downlink_unknown_teid`]
+    /// first, so one such datagram can raise both counters.
+    pub downlink_missing_consumer: u64,
 }
 
 /// Identity-bound diagnostic snapshot for one live eBPF GTP-U datapath.
@@ -1493,6 +1624,33 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Resolve an interface index by name in the current netns.
     fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError>;
+
+    /// Require that IP input receives on interface `ifindex` the frames that
+    /// arrive on it: that it has no master other than a VRF, that no device
+    /// of the namespace is stacked on it that can take its frames, and that
+    /// the namespace holds no HSR or PRP device.
+    ///
+    /// tc decides a hand-off on the device it is attached to: it looks for
+    /// the consumer socket there, and where it cannot settle the consumer it
+    /// relies on the frame's type reaching UDP input. Neither holds when
+    /// another device takes the frame after tc ran: the master of an enslaved
+    /// interface (a bridge, a bond, a team, a virtual switch), or a device
+    /// stacked on it with a receive handler of its own (a macvlan, an ipvlan,
+    /// a MACsec device, an HSR or PRP device). The VRF and the socket
+    /// bindings of the device that finally receives then decide the
+    /// delivery, and a bridge and a macvlan reset the frame's type. A VRF is
+    /// the one master that is accepted: the consumer check accounts for it.
+    ///
+    /// Refuses every other master with [`ATTACHMENT_ON_ENSLAVED_INTERFACE`],
+    /// whether or not its receive path takes the frame, and a device stacked
+    /// on the interface with [`ATTACHMENT_BELOW_STACKED_DEVICE`], unless its
+    /// kind is known to leave the frames of the interface alone. The kernel
+    /// does not always report the interlink port of an HSR device, so every
+    /// interface of a namespace that holds an HSR or PRP device is refused,
+    /// with [`ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`]. An interface for
+    /// which one of these cannot be established is refused with the query's
+    /// error. A device in another network namespace is not seen here.
+    fn require_ip_receive_interface(&self, ifindex: u32) -> Result<(), GtpuError>;
 
     /// Load the datapath object, create-or-reuse pinned maps under `pin_dir`,
     /// write the local S2b-U IPv4 into the config map, ensure a clsact qdisc,
@@ -4148,7 +4306,14 @@ impl EbpfGtpuDataplaneBackend {
     /// or when another operation holds its graph's operation lock; the device
     /// is then unchanged, and in the second case a later retry can succeed.
     /// Returns [`GtpuError::StateIndeterminate`] when the attached graph or
-    /// the rollback cannot be proven. After any error the device is still
+    /// the rollback cannot be proven. Returns
+    /// [`GtpuError::UnsupportedFeature`] with
+    /// [`ATTACHMENT_ON_ENSLAVED_INTERFACE`] when the cleanup-only device's
+    /// interface is enslaved to a master other than a VRF, with
+    /// [`ATTACHMENT_BELOW_STACKED_DEVICE`] when a device is stacked on it
+    /// that can take its frames, and with
+    /// [`ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`] when its namespace holds
+    /// an HSR or PRP device. After any error the device is still
     /// cleanup-only unless it was already active.
     #[cfg(any(target_os = "linux", test))]
     pub async fn activate_cleanup_recovery(
@@ -4403,7 +4568,7 @@ impl EbpfGtpuDataplaneBackend {
                         "successor target requires a concrete S2b-U IPv4 address",
                     ));
                 }
-                let ifindex = self.inner.runtime.ifindex_by_name(&request.name)?;
+                let ifindex = self.attachment_ifindex(&request.name)?;
                 ResolvedCurrentSuccessorTarget {
                     pin_dir: self.pin_dir(&request.name),
                     name: request.name,
@@ -4426,7 +4591,7 @@ impl EbpfGtpuDataplaneBackend {
                         "grouped successor requires unspecified legacy bind authority",
                     ));
                 }
-                let ifindex = self.inner.runtime.ifindex_by_name(&request.name)?;
+                let ifindex = self.attachment_ifindex(&request.name)?;
                 let config = grouped_device_config(device_id, ifindex, local_endpoints)
                     .ok_or_else(|| {
                         GtpuError::invalid_config(
@@ -8816,7 +8981,7 @@ impl EbpfGtpuDataplaneBackend {
                 "eBPF backend needs the concrete S2b-U IPv4 as the outer encapsulation source",
             ));
         }
-        let ifindex = self.inner.runtime.ifindex_by_name(&request.name)?;
+        let ifindex = self.attachment_ifindex(&request.name)?;
         // Hold the registration guard across runtime publication so a second
         // poisoned-lock acquisition cannot strand an attached runtime device
         // outside the backend's managed-device index.
@@ -9025,7 +9190,7 @@ impl EbpfGtpuDataplaneBackend {
                 "explicit endpoint-set authority requires an unspecified legacy bind address",
             ));
         }
-        let ifindex = self.inner.runtime.ifindex_by_name(&request.name)?;
+        let ifindex = self.attachment_ifindex(&request.name)?;
         let config =
             grouped_device_config(device_id, ifindex, local_endpoints).ok_or_else(|| {
                 GtpuError::invalid_config(
@@ -9215,10 +9380,27 @@ impl EbpfGtpuDataplaneBackend {
         })
     }
 
+    /// Resolve the interface that an attachment is made on or adopted on, and
+    /// require that IP input receives its frames on it; see
+    /// [`ATTACHMENT_ON_ENSLAVED_INTERFACE`],
+    /// [`ATTACHMENT_BELOW_STACKED_DEVICE`] and
+    /// [`ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`].
+    ///
+    /// Removal resolves the interface without this requirement, so that the
+    /// process that manages an attachment can still remove it after its
+    /// interface was enslaved, a device was stacked on it or an HSR or PRP
+    /// device was added to its namespace. A process that would first have to
+    /// adopt the attachment cannot.
+    fn attachment_ifindex(&self, name: &str) -> Result<u32, GtpuError> {
+        let ifindex = self.inner.runtime.ifindex_by_name(name)?;
+        self.inner.runtime.require_ip_receive_interface(ifindex)?;
+        Ok(ifindex)
+    }
+
     fn resolve_device_sync(&self, name: String) -> Result<GtpDevice, GtpuError> {
         let _operation = self.operation_guard()?;
         validate_interface_name(&name)?;
-        let ifindex = self.inner.runtime.ifindex_by_name(&name)?;
+        let ifindex = self.attachment_ifindex(&name)?;
         let devices = self.devices()?;
         if let Some(device) = devices.get(&ifindex) {
             if device.successor_pending {
@@ -10668,6 +10850,11 @@ impl EbpfGtpuDataplaneBackend {
         if !managed.cleanup_only {
             return Err(GtpuError::AlreadyExists);
         }
+        // IP input must still receive on that interface. This comes after
+        // the two answers above, which a retry relies on.
+        self.inner
+            .runtime
+            .require_ip_receive_interface(device.ifindex)?;
         // The runtime either commits the whole activation or leaves the
         // device cleanup-only and fenced, and every fallible host step runs
         // before it, so this flag and the runtime change together or not at
@@ -16011,9 +16198,10 @@ mod aya_runtime {
         UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
         COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
-        COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
-        COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
-        COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+        COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED,
+        COUNTER_DL_MISSING_CONSUMER, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_UL_ENCAP,
+        COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+        COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
         GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
         GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
@@ -16060,7 +16248,8 @@ mod aya_runtime {
         EbpfTrafficObservationDrain, HistoricalEbpfGraphRecoveryCurrentnessProbe,
         OrdinaryFamilyAuthority, SelectorNamespaceCurrentnessGate, SelectorNamespaceEffectGuard,
         SelectorOperationStampRecord, TftClassifierFilter, TftClassifierFilterKey,
-        TftClassifierKey, TftClassifierMeta,
+        TftClassifierKey, TftClassifierMeta, ATTACHMENT_BELOW_STACKED_DEVICE,
+        ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE, ATTACHMENT_ON_ENSLAVED_INTERFACE,
     };
     use crate::{
         CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryProgress,
@@ -16264,6 +16453,15 @@ mod aya_runtime {
     /// redirect-outcome counter. The current build indexes `COUNTER_SLOTS`
     /// slots, so a retained map of this width silently drops the highest slot.
     const PRE_REDIRECT_COUNTER_SLOTS: u32 = 6;
+    /// Counter slot count of every generation from the uplink
+    /// redirect-outcome counter up to, and not including, the
+    /// missing-consumer counter. The frozen shipped-25 graph has this width.
+    ///
+    /// The current map is wider (`COUNTER_SLOTS`), so a retained map of this
+    /// width would silently discard the missing-consumer counter. The pin
+    /// capacity guard refuses such a graph before anything is read or
+    /// changed, and it then needs a drained reprovision.
+    const PRE_MISSING_CONSUMER_COUNTER_SLOTS: u32 = 7;
 
     /// Parse-only authority for the frozen endpoint-unbound bearer-v2 object.
     ///
@@ -16805,7 +17003,8 @@ mod aya_runtime {
             map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
             key_size: 4,
             value_size: 8,
-            max_entries: COUNTER_SLOTS,
+            // The width the shipped object declared, not the current one.
+            max_entries: PRE_MISSING_CONSUMER_COUNTER_SLOTS,
         },
         FrozenMapSpec {
             name: MAP_DOWNLINK_BINDING_COUNTERS,
@@ -38597,6 +38796,556 @@ mod aya_runtime {
         })
     }
 
+    // Link UAPI values not otherwise exposed by the narrow sys crate.
+    const IFLA_LINK: u16 = 5;
+    const IFLA_MASTER: u16 = 10;
+    const IFLA_EXT_MASK: u16 = 29;
+    const IFLA_LINK_NETNSID: u16 = 37;
+    const IFLA_INFO_SLAVE_KIND: u16 = 4;
+    const IFLA_VLAN_ID: u16 = 1;
+    /// `RTEXT_FILTER_SKIP_STATS`: leave the per-protocol statistics of each
+    /// link out of a dump, which shortens it. The link's own counters stay.
+    const LINK_DUMP_SKIP_STATISTICS: u32 = 1 << 3;
+    const LINK_DUMP_SEQUENCE: u32 = 2;
+    /// How often a dump is asked for again when the links of the namespace
+    /// changed while the kernel wrote it.
+    const LINK_DUMP_ATTEMPTS: usize = 4;
+    const NLA_TYPE_MASK: u16 = 0x3fff;
+    const INTERFACE_INFO_MESSAGE_LEN: usize = 16;
+    const ROUTE_ATTRIBUTE_HEADER_LEN: usize = 4;
+    const LINK_NETLINK_SEQUENCE: u32 = 1;
+    const ENODEV: i32 = 19;
+    /// The link kind of a VRF device.
+    const VRF_LINK_KIND: &[u8] = b"vrf";
+    const VLAN_LINK_KIND: &[u8] = b"vlan";
+    /// The link kind of an HSR device and of a PRP device.
+    const HSR_LINK_KIND: &[u8] = b"hsr";
+    /// The kinds of device that name another interface as their link and
+    /// leave the frames that it receives alone: the other end of a pair, and
+    /// a tunnel or XFRM interface that is bound to the interface, which
+    /// receives only what IP input on the interface hands to its protocol.
+    ///
+    /// This is every kind that reports a link in Linux 5.14 and 6.8
+    /// (`ndo_get_iflink`), without the VLAN device, which is judged by its
+    /// ID, and without the kinds that take frames from the link: `macvlan`,
+    /// `macvtap`, `ipvlan`, `ipvtap`, `macsec`, `rmnet` and `virt_wifi`
+    /// through a receive handler, and a `dsa` port through the switch tag's
+    /// protocol handler. `ipoib` and `lowpan` are not links of an Ethernet
+    /// interface. A kind that is not listed here is taken to take frames.
+    const LINK_KINDS_THAT_LEAVE_FRAMES: &[&[u8]] = &[
+        b"veth",
+        b"vxcan",
+        b"netkit",
+        b"ipip",
+        b"gre",
+        b"gretap",
+        b"erspan",
+        b"ip6gre",
+        b"ip6gretap",
+        b"ip6erspan",
+        b"sit",
+        b"ip6tnl",
+        b"vti",
+        b"vti6",
+        b"xfrm",
+    ];
+
+    /// What an interface's master means for the frames that arrive on it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReceivePath {
+        /// The interface has no master, or its master is a VRF. A VRF takes
+        /// the packet only at IP input, with the interface as its enslaved
+        /// device, which the consumer check accounts for.
+        Interface,
+        /// The interface has another master. A bridge, a bond, a team or a
+        /// virtual switch takes the frame after tc ran on the interface; any
+        /// other master is treated the same.
+        Master,
+    }
+
+    /// Ask the kernel which master interface `ifindex` is enslaved to.
+    fn interface_master(ifindex: u32) -> io::Result<ReceivePath> {
+        let socket = sys::open_route_netlink_socket()?;
+        let ifindex = tc_ifindex(ifindex)?;
+        let request = build_link_query(ifindex, LINK_NETLINK_SEQUENCE, socket.port_id());
+        let sent = sys::send_message(&socket, &request)?;
+        if sent != request.len() {
+            return Err(invalid_data("short link netlink send"));
+        }
+        let mut buffer = vec![0_u8; 65_536];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "link netlink query timeout",
+                ));
+            }
+            let length = match sys::receive_kernel_message(&socket, &mut buffer) {
+                Ok(0) => continue,
+                Ok(length) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(path) = parse_link_receive_path(
+                &buffer[..length],
+                ifindex,
+                LINK_NETLINK_SEQUENCE,
+                socket.port_id(),
+            )? {
+                return Ok(path);
+            }
+        }
+    }
+
+    /// An `RTM_GETLINK` request for one interface, in native byte order.
+    fn build_link_query(ifindex: i32, sequence: u32, port_id: u32) -> Vec<u8> {
+        let length = NETLINK_HEADER_LEN + INTERFACE_INFO_MESSAGE_LEN;
+        let mut request = Vec::with_capacity(length);
+        request.extend_from_slice(&(length as u32).to_ne_bytes());
+        request.extend_from_slice(&sys::RTM_GETLINK.to_ne_bytes());
+        request.extend_from_slice(&sys::NLM_F_REQUEST.to_ne_bytes());
+        request.extend_from_slice(&sequence.to_ne_bytes());
+        request.extend_from_slice(&port_id.to_ne_bytes());
+        // struct ifinfomsg: family, padding, device type, index, flags and
+        // change mask. Only the index selects.
+        request.extend_from_slice(&[sys::AF_UNSPEC, 0, 0, 0]);
+        request.extend_from_slice(&ifindex.to_ne_bytes());
+        request.extend_from_slice(&[0; 8]);
+        request
+    }
+
+    /// Read the receive path of interface `ifindex` from the kernel's reply
+    /// to [`build_link_query`]. `None` means the datagram held no answer yet.
+    ///
+    /// An interface without `IFLA_MASTER` has no master. With a master it is
+    /// still accepted when the master is a VRF, which the kernel names in
+    /// `IFLA_INFO_SLAVE_KIND`. Every other master, and a master whose kind
+    /// the kernel does not name, is not.
+    fn parse_link_receive_path(
+        datagram: &[u8],
+        ifindex: i32,
+        sequence: u32,
+        port_id: u32,
+    ) -> io::Result<Option<ReceivePath>> {
+        let malformed = || invalid_data("malformed link query response");
+        let mut answer = None;
+        let mut offset = 0;
+        while offset < datagram.len() {
+            let header = datagram
+                .get(offset..offset + NETLINK_HEADER_LEN)
+                .ok_or_else(malformed)?;
+            let length = usize::try_from(u32::from_ne_bytes([
+                header[0], header[1], header[2], header[3],
+            ]))
+            .map_err(|_| malformed())?;
+            let end = offset.checked_add(length).ok_or_else(malformed)?;
+            if length < NETLINK_HEADER_LEN || end > datagram.len() {
+                return Err(malformed());
+            }
+            let message_type = u16::from_ne_bytes([header[4], header[5]]);
+            let flags = u16::from_ne_bytes([header[6], header[7]]);
+            if u32::from_ne_bytes([header[8], header[9], header[10], header[11]]) != sequence
+                || u32::from_ne_bytes([header[12], header[13], header[14], header[15]]) != port_id
+                || flags & sys::NLM_F_DUMP_INTR != 0
+            {
+                return Err(malformed());
+            }
+            let body = &datagram[offset + NETLINK_HEADER_LEN..end];
+            match message_type {
+                sys::NLMSG_ERROR => {
+                    let status = body.get(..4).ok_or_else(malformed)?;
+                    let status = i32::from_ne_bytes([status[0], status[1], status[2], status[3]]);
+                    let errno = status
+                        .checked_neg()
+                        .filter(|errno| *errno > 0)
+                        .ok_or_else(malformed)?;
+                    return Err(io::Error::from_raw_os_error(errno));
+                }
+                sys::NLMSG_NOOP => {}
+                sys::RTM_NEWLINK => {
+                    if answer.is_some() || body.len() < INTERFACE_INFO_MESSAGE_LEN {
+                        return Err(malformed());
+                    }
+                    if i32::from_ne_bytes([body[4], body[5], body[6], body[7]]) != ifindex {
+                        return Err(malformed());
+                    }
+                    answer = Some(link_receive_path(&body[INTERFACE_INFO_MESSAGE_LEN..])?);
+                }
+                _ => return Err(malformed()),
+            }
+            let aligned = sys::align_to_netlink(length).ok_or_else(malformed)?;
+            offset = offset.checked_add(aligned).ok_or_else(malformed)?;
+        }
+        Ok(answer)
+    }
+
+    /// Classify the attributes of one `RTM_NEWLINK` message.
+    fn link_receive_path(attributes: &[u8]) -> io::Result<ReceivePath> {
+        let mut master = 0_u32;
+        let mut slave_kind: Option<&[u8]> = None;
+        for attribute in route_attributes(attributes) {
+            let (kind, value) = attribute?;
+            match kind {
+                IFLA_MASTER => {
+                    let value: [u8; 4] = value
+                        .try_into()
+                        .map_err(|_| invalid_data("malformed link master attribute"))?;
+                    master = u32::from_ne_bytes(value);
+                }
+                sys::IFLA_LINKINFO => {
+                    for nested in route_attributes(value) {
+                        let (kind, value) = nested?;
+                        if kind == IFLA_INFO_SLAVE_KIND {
+                            // A NUL-terminated string.
+                            let end = value
+                                .iter()
+                                .position(|octet| *octet == 0)
+                                .unwrap_or(value.len());
+                            slave_kind = Some(&value[..end]);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(if master == 0 || slave_kind == Some(VRF_LINK_KIND) {
+            ReceivePath::Interface
+        } else {
+            ReceivePath::Master
+        })
+    }
+
+    /// Iterate the route attributes in `bytes`: each yields its type, without
+    /// the nesting and byte-order flags, and its payload.
+    fn route_attributes(mut bytes: &[u8]) -> impl Iterator<Item = io::Result<(u16, &[u8])>> + '_ {
+        std::iter::from_fn(move || {
+            if bytes.is_empty() {
+                return None;
+            }
+            let malformed = || invalid_data("malformed link attribute");
+            if bytes.len() < ROUTE_ATTRIBUTE_HEADER_LEN {
+                bytes = &[];
+                return Some(Err(malformed()));
+            }
+            let length = usize::from(u16::from_ne_bytes([bytes[0], bytes[1]]));
+            let kind = u16::from_ne_bytes([bytes[2], bytes[3]]) & NLA_TYPE_MASK;
+            if length < ROUTE_ATTRIBUTE_HEADER_LEN || length > bytes.len() {
+                bytes = &[];
+                return Some(Err(malformed()));
+            }
+            let value = &bytes[ROUTE_ATTRIBUTE_HEADER_LEN..length];
+            // The last attribute may end without padding.
+            let aligned = sys::align_to_netlink(length)
+                .map_or(bytes.len(), |aligned| aligned.min(bytes.len()));
+            bytes = &bytes[aligned..];
+            Some(Ok((kind, value)))
+        })
+    }
+
+    /// What the links of a namespace mean for the frames that an interface
+    /// of it receives. A later variant outweighs an earlier one when the
+    /// links of one dump give more than one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum UpperDevices {
+        /// No device of the namespace names the interface as its lower link,
+        /// or each that does is of a kind that leaves the frames of the
+        /// interface alone, and the namespace holds no HSR or PRP device.
+        LeaveFrames,
+        /// The namespace holds an HSR or PRP device, a link of the kind
+        /// `hsr`. The kernel does not always name the interlink port of an
+        /// HSR device, so such a device may take frames from any interface
+        /// of the namespace.
+        HsrDevice,
+        /// A device of the namespace is stacked on the interface and can
+        /// take frames from it after tc ran.
+        TakeFrames,
+    }
+
+    /// The refusal that the links of the namespace demand, if any.
+    fn stacking_refusal(devices: UpperDevices) -> Result<(), GtpuError> {
+        match devices {
+            UpperDevices::LeaveFrames => Ok(()),
+            UpperDevices::HsrDevice => Err(GtpuError::UnsupportedFeature {
+                feature: ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+            }),
+            UpperDevices::TakeFrames => Err(GtpuError::UnsupportedFeature {
+                feature: ATTACHMENT_BELOW_STACKED_DEVICE,
+            }),
+        }
+    }
+
+    /// Ask the kernel for the links of the namespace, and whether one of
+    /// them is stacked on interface `ifindex` and can take its frames, or is
+    /// an HSR or PRP device.
+    ///
+    /// The kernel names a stacked device only from above: the device reports
+    /// the interface as its lower link, and the interface reports nothing.
+    /// So every link of the namespace is read. A device that was moved to
+    /// another namespace is not among them.
+    fn devices_above(ifindex: u32) -> io::Result<UpperDevices> {
+        let ifindex = tc_ifindex(ifindex)?;
+        for _ in 0..LINK_DUMP_ATTEMPTS {
+            if let Some(devices) = link_dump(ifindex)? {
+                return Ok(devices);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the links changed during every link dump",
+        ))
+    }
+
+    /// One dump of the links. `None` means that the links changed while the
+    /// kernel wrote it, so that it may have left one out.
+    fn link_dump(ifindex: i32) -> io::Result<Option<UpperDevices>> {
+        let socket = sys::open_route_netlink_socket()?;
+        let request = build_link_dump(LINK_DUMP_SEQUENCE, socket.port_id());
+        let sent = sys::send_message(&socket, &request)?;
+        if sent != request.len() {
+            return Err(invalid_data("short link netlink send"));
+        }
+        let mut buffer = vec![0_u8; 65_536];
+        let mut devices = UpperDevices::LeaveFrames;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "link netlink dump timeout",
+                ));
+            }
+            let length = match sys::receive_kernel_message(&socket, &mut buffer) {
+                Ok(0) => continue,
+                Ok(length) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match parse_link_dump(
+                &buffer[..length],
+                ifindex,
+                LINK_DUMP_SEQUENCE,
+                socket.port_id(),
+                &mut devices,
+            )? {
+                LinkDump::More => {}
+                LinkDump::Done => return Ok(Some(devices)),
+                LinkDump::Interrupted => return Ok(None),
+            }
+        }
+    }
+
+    /// An `RTM_GETLINK` dump request for every link of the namespace, in
+    /// native byte order, with the mask that shortens each link's answer.
+    fn build_link_dump(sequence: u32, port_id: u32) -> Vec<u8> {
+        let length =
+            NETLINK_HEADER_LEN + INTERFACE_INFO_MESSAGE_LEN + ROUTE_ATTRIBUTE_HEADER_LEN + 4;
+        let mut request = Vec::with_capacity(length);
+        request.extend_from_slice(&(length as u32).to_ne_bytes());
+        request.extend_from_slice(&sys::RTM_GETLINK.to_ne_bytes());
+        request.extend_from_slice(&(sys::NLM_F_REQUEST | sys::NLM_F_DUMP).to_ne_bytes());
+        request.extend_from_slice(&sequence.to_ne_bytes());
+        request.extend_from_slice(&port_id.to_ne_bytes());
+        // struct ifinfomsg: nothing selects.
+        request.extend_from_slice(&[sys::AF_UNSPEC, 0, 0, 0]);
+        request.extend_from_slice(&[0; 12]);
+        request.extend_from_slice(&((ROUTE_ATTRIBUTE_HEADER_LEN + 4) as u16).to_ne_bytes());
+        request.extend_from_slice(&IFLA_EXT_MASK.to_ne_bytes());
+        request.extend_from_slice(&LINK_DUMP_SKIP_STATISTICS.to_ne_bytes());
+        request
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LinkDump {
+        /// The dump continues in the next datagram.
+        More,
+        /// The kernel has written every link.
+        Done,
+        /// The links changed while the kernel wrote the dump.
+        Interrupted,
+    }
+
+    /// Validate one datagram of the kernel's answer to [`build_link_dump`]
+    /// and note in `devices` what its links mean for interface `ifindex`.
+    /// What was noted holds only once the dump is [`LinkDump::Done`].
+    fn parse_link_dump(
+        datagram: &[u8],
+        ifindex: i32,
+        sequence: u32,
+        port_id: u32,
+        devices: &mut UpperDevices,
+    ) -> io::Result<LinkDump> {
+        let malformed = || invalid_data("malformed link dump response");
+        let mut done = false;
+        let mut offset = 0;
+        while offset < datagram.len() {
+            let header = datagram
+                .get(offset..offset + NETLINK_HEADER_LEN)
+                .ok_or_else(malformed)?;
+            let length = usize::try_from(u32::from_ne_bytes([
+                header[0], header[1], header[2], header[3],
+            ]))
+            .map_err(|_| malformed())?;
+            let end = offset.checked_add(length).ok_or_else(malformed)?;
+            if length < NETLINK_HEADER_LEN || end > datagram.len() {
+                return Err(malformed());
+            }
+            let message_type = u16::from_ne_bytes([header[4], header[5]]);
+            let flags = u16::from_ne_bytes([header[6], header[7]]);
+            if u32::from_ne_bytes([header[8], header[9], header[10], header[11]]) != sequence
+                || u32::from_ne_bytes([header[12], header[13], header[14], header[15]]) != port_id
+            {
+                return Err(malformed());
+            }
+            if flags & sys::NLM_F_DUMP_INTR != 0 {
+                return Ok(LinkDump::Interrupted);
+            }
+            if done && message_type != sys::NLMSG_NOOP {
+                return Err(malformed());
+            }
+            let body = &datagram[offset + NETLINK_HEADER_LEN..end];
+            match message_type {
+                sys::NLMSG_DONE | sys::NLMSG_ERROR => {
+                    // Both carry the kernel's status; a dump that the kernel
+                    // refuses ends in an error message instead.
+                    let status = body.get(..4).ok_or_else(malformed)?;
+                    let status = i32::from_ne_bytes([status[0], status[1], status[2], status[3]]);
+                    if status != 0 || message_type == sys::NLMSG_ERROR {
+                        let errno = status
+                            .checked_neg()
+                            .filter(|errno| *errno > 0)
+                            .ok_or_else(malformed)?;
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
+                    if flags & sys::NLM_F_MULTI == 0 {
+                        return Err(malformed());
+                    }
+                    done = true;
+                }
+                sys::NLMSG_NOOP => {}
+                sys::RTM_NEWLINK => {
+                    if flags & sys::NLM_F_MULTI == 0 || body.len() < INTERFACE_INFO_MESSAGE_LEN {
+                        return Err(malformed());
+                    }
+                    let link = i32::from_ne_bytes([body[4], body[5], body[6], body[7]]);
+                    let found = judge_link(&body[INTERFACE_INFO_MESSAGE_LEN..], link, ifindex)?;
+                    *devices = (*devices).max(found);
+                }
+                _ => return Err(malformed()),
+            }
+            let aligned = sys::align_to_netlink(length).ok_or_else(malformed)?;
+            offset = offset.checked_add(aligned).ok_or_else(malformed)?;
+        }
+        Ok(if done { LinkDump::Done } else { LinkDump::More })
+    }
+
+    /// What the link with the index `link` and these attributes means for
+    /// the frames that interface `ifindex` of its namespace receives.
+    ///
+    /// An HSR or PRP device, a link of the kind `hsr`, has no lower link and
+    /// names its two ring ports in its own attributes. An HSR device can
+    /// have a third port, the interlink. A kernel from Linux 6.10 to 6.17
+    /// does not name it there, and the port names no master. So the answer
+    /// does not say which interfaces such a device takes frames from, and
+    /// its presence alone decides, for every interface of the namespace and
+    /// for the device itself.
+    ///
+    /// Any other device counts only when it is stacked on the interface: it
+    /// names the interface as its lower link (`IFLA_LINK`). With
+    /// `IFLA_LINK_NETNSID` that index belongs to another namespace and is
+    /// not this interface. Every kind that is accepted reports the namespace
+    /// of its link. Some kinds that are refused do not, so an index of
+    /// theirs that only looks like this interface refuses it too. What the
+    /// interface says about its own link is not judged.
+    fn judge_link(attributes: &[u8], link: i32, ifindex: i32) -> io::Result<UpperDevices> {
+        let index = |value: &[u8]| -> io::Result<i64> {
+            let value: [u8; 4] = value
+                .try_into()
+                .map_err(|_| invalid_data("malformed link index attribute"))?;
+            Ok(i64::from(u32::from_ne_bytes(value)))
+        };
+        let own = link == ifindex;
+        let ifindex = i64::from(ifindex);
+        let mut lower = None;
+        let mut lower_is_elsewhere = false;
+        let mut kind: Option<&[u8]> = None;
+        let mut data: Option<&[u8]> = None;
+        for attribute in route_attributes(attributes) {
+            let (attribute, value) = attribute?;
+            match attribute {
+                IFLA_LINK => lower = Some(index(value)?),
+                IFLA_LINK_NETNSID => lower_is_elsewhere = true,
+                sys::IFLA_LINKINFO => {
+                    for nested in route_attributes(value) {
+                        let (attribute, value) = nested?;
+                        match attribute {
+                            sys::IFLA_INFO_KIND => {
+                                // A NUL-terminated string.
+                                let end = value
+                                    .iter()
+                                    .position(|octet| *octet == 0)
+                                    .unwrap_or(value.len());
+                                kind = Some(&value[..end]);
+                            }
+                            sys::IFLA_INFO_DATA => data = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if kind == Some(HSR_LINK_KIND) {
+            return Ok(UpperDevices::HsrDevice);
+        }
+        if own || lower != Some(ifindex) || lower_is_elsewhere {
+            return Ok(UpperDevices::LeaveFrames);
+        }
+        let takes_frames = match kind {
+            Some(VLAN_LINK_KIND) => {
+                // A VLAN device takes the frames of its VLAN, and tc gives a
+                // hand-off in one of them to no socket. With the ID 0 it
+                // takes the frames that carry a priority tag, which are the
+                // interface's own.
+                let mut id = None;
+                for attribute in route_attributes(data.unwrap_or_default()) {
+                    let (attribute, value) = attribute?;
+                    if attribute == IFLA_VLAN_ID {
+                        let value: [u8; 2] = value
+                            .try_into()
+                            .map_err(|_| invalid_data("malformed VLAN ID attribute"))?;
+                        id = Some(u16::from_ne_bytes(value));
+                        break;
+                    }
+                }
+                id.ok_or_else(|| invalid_data("a VLAN link without its VLAN ID"))? == 0
+            }
+            Some(kind) => !LINK_KINDS_THAT_LEAVE_FRAMES.contains(&kind),
+            None => true,
+        };
+        Ok(if takes_frames {
+            UpperDevices::TakeFrames
+        } else {
+            UpperDevices::LeaveFrames
+        })
+    }
+
     const fn tc_filter_info(priority: u16) -> u32 {
         (priority as u32) << 16 | TC_PROTOCOL_ALL as u32
     }
@@ -39888,6 +40637,25 @@ mod aya_runtime {
                 io::ErrorKind::NotFound => GtpuError::NotFound,
                 _ => GtpuError::io("ifindex_lookup", error),
             })
+        }
+
+        fn require_ip_receive_interface(&self, ifindex: u32) -> Result<(), GtpuError> {
+            match interface_master(ifindex) {
+                Ok(ReceivePath::Interface) => {}
+                Ok(ReceivePath::Master) => {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: ATTACHMENT_ON_ENSLAVED_INTERFACE,
+                    })
+                }
+                Err(error) if error.raw_os_error() == Some(ENODEV) => {
+                    return Err(GtpuError::NotFound)
+                }
+                Err(error) => return Err(GtpuError::io("ebpf_interface_master", error)),
+            }
+            match devices_above(ifindex) {
+                Ok(devices) => stacking_refusal(devices),
+                Err(error) => Err(GtpuError::io("ebpf_interface_stack", error)),
+            }
         }
 
         fn attach(
@@ -48450,6 +49218,7 @@ mod aya_runtime {
                     uplink_mtu_rejected: aggregate_pmtu(COUNTER_UL_MTU_REJECT)?,
                     uplink_mtu_policy_corrupt: aggregate_pmtu(COUNTER_UL_PMTU_CORRUPT)?,
                     uplink_redirects_resolved: aggregate(COUNTER_UL_REDIRECT_RESOLVED)?,
+                    downlink_missing_consumer: aggregate(COUNTER_DL_MISSING_CONSUMER)?,
                 },
             };
             // Repeat the complete proof after the reads so any hook or pin
@@ -48648,6 +49417,1040 @@ mod aya_runtime {
 
     fn invalid_data(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+
+    #[cfg(test)]
+    mod receive_path_tests {
+        use super::*;
+
+        const IFINDEX: i32 = 7;
+        const SEQUENCE: u32 = LINK_NETLINK_SEQUENCE;
+        const PORT_ID: u32 = 4242;
+
+        fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
+            let length = ROUTE_ATTRIBUTE_HEADER_LEN + value.len();
+            let mut out = Vec::new();
+            out.extend_from_slice(&(length as u16).to_ne_bytes());
+            out.extend_from_slice(&kind.to_ne_bytes());
+            out.extend_from_slice(value);
+            out.resize(sys::align_to_netlink(length).unwrap(), 0);
+            out
+        }
+
+        fn message(kind: u16, sequence: u32, port_id: u32, body: &[u8]) -> Vec<u8> {
+            flagged_message(kind, 0, sequence, port_id, body)
+        }
+
+        fn flagged_message(
+            kind: u16,
+            flags: u16,
+            sequence: u32,
+            port_id: u32,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let length = NETLINK_HEADER_LEN + body.len();
+            let mut out = Vec::new();
+            out.extend_from_slice(&(length as u32).to_ne_bytes());
+            out.extend_from_slice(&kind.to_ne_bytes());
+            out.extend_from_slice(&flags.to_ne_bytes());
+            out.extend_from_slice(&sequence.to_ne_bytes());
+            out.extend_from_slice(&port_id.to_ne_bytes());
+            out.extend_from_slice(body);
+            out.resize(sys::align_to_netlink(length).unwrap(), 0);
+            out
+        }
+
+        /// The kernel's answer for one link: `struct ifinfomsg`, then the
+        /// attributes a real reply carries around the two that matter.
+        fn link(ifindex: i32, master: Option<u32>, slave_kind: Option<&str>) -> Vec<u8> {
+            let mut body = vec![sys::AF_UNSPEC, 0, 1, 0];
+            body.extend_from_slice(&ifindex.to_ne_bytes());
+            body.extend_from_slice(&[0; 8]);
+            body.extend(attribute(sys::IFLA_IFNAME, b"s2bu\0"));
+            if let Some(master) = master {
+                body.extend(attribute(IFLA_MASTER, &master.to_ne_bytes()));
+            }
+            let mut info = attribute(sys::IFLA_INFO_KIND, b"veth\0");
+            if let Some(kind) = slave_kind {
+                let mut value = kind.as_bytes().to_vec();
+                value.push(0);
+                info.extend(attribute(IFLA_INFO_SLAVE_KIND, &value));
+            }
+            // The nest carries the nested flag, which the kernel does not set
+            // here; a parser must not take the flag for part of the type.
+            body.extend(attribute(sys::IFLA_LINKINFO | NLA_F_NESTED, &info));
+            body.extend(attribute(sys::IFLA_IFALIAS, b"x\0"));
+            message(sys::RTM_NEWLINK, SEQUENCE, PORT_ID, &body)
+        }
+
+        fn parse(datagram: &[u8]) -> io::Result<Option<ReceivePath>> {
+            parse_link_receive_path(datagram, IFINDEX, SEQUENCE, PORT_ID)
+        }
+
+        #[test]
+        fn the_query_selects_one_interface_by_index() {
+            let request = build_link_query(IFINDEX, SEQUENCE, PORT_ID);
+            assert_eq!(request.len(), 32);
+            assert_eq!(u32::from_ne_bytes(request[0..4].try_into().unwrap()), 32);
+            assert_eq!(
+                u16::from_ne_bytes(request[4..6].try_into().unwrap()),
+                sys::RTM_GETLINK
+            );
+            // A plain request: no dump, so the kernel answers with this one
+            // link or with an error.
+            assert_eq!(
+                u16::from_ne_bytes(request[6..8].try_into().unwrap()),
+                sys::NLM_F_REQUEST
+            );
+            assert_eq!(
+                u32::from_ne_bytes(request[8..12].try_into().unwrap()),
+                SEQUENCE
+            );
+            assert_eq!(
+                u32::from_ne_bytes(request[12..16].try_into().unwrap()),
+                PORT_ID
+            );
+            assert_eq!(request[16], sys::AF_UNSPEC);
+            assert_eq!(
+                i32::from_ne_bytes(request[20..24].try_into().unwrap()),
+                IFINDEX
+            );
+            assert_eq!(request[24..32], [0; 8]);
+        }
+
+        #[test]
+        fn an_interface_without_a_master_receives_its_own_frames() {
+            assert_eq!(
+                parse(&link(IFINDEX, None, None)).unwrap(),
+                Some(ReceivePath::Interface)
+            );
+            // A zero master index is no master either.
+            assert_eq!(
+                parse(&link(IFINDEX, Some(0), None)).unwrap(),
+                Some(ReceivePath::Interface)
+            );
+        }
+
+        #[test]
+        fn a_vrf_is_the_only_master_that_is_accepted() {
+            assert_eq!(
+                parse(&link(IFINDEX, Some(12), Some("vrf"))).unwrap(),
+                Some(ReceivePath::Interface)
+            );
+            // The masters whose receive handler takes the frame, one whose
+            // receive path does not (batadv), and two near misses of "vrf".
+            for kind in [
+                "bridge",
+                "bond",
+                "team",
+                "openvswitch",
+                "batadv",
+                "vrfx",
+                "vr",
+            ] {
+                assert_eq!(
+                    parse(&link(IFINDEX, Some(12), Some(kind))).unwrap(),
+                    Some(ReceivePath::Master),
+                    "master kind {kind}"
+                );
+            }
+            // A master whose kind the kernel does not name is not known to
+            // be a VRF.
+            assert_eq!(
+                parse(&link(IFINDEX, Some(12), None)).unwrap(),
+                Some(ReceivePath::Master)
+            );
+        }
+
+        #[test]
+        fn a_kernel_error_is_reported_with_its_errno() {
+            // struct nlmsgerr: the negative errno, then the request header.
+            let mut body = (-ENODEV).to_ne_bytes().to_vec();
+            body.extend_from_slice(&build_link_query(IFINDEX, SEQUENCE, PORT_ID)[..16]);
+            let error = parse(&message(sys::NLMSG_ERROR, SEQUENCE, PORT_ID, &body)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(ENODEV));
+            // A zero status is an acknowledgement, which this request never
+            // asks for.
+            let mut body = 0_i32.to_ne_bytes().to_vec();
+            body.extend_from_slice(&[0; 16]);
+            assert_eq!(
+                parse(&message(sys::NLMSG_ERROR, SEQUENCE, PORT_ID, &body))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        #[test]
+        fn a_reply_that_is_not_the_answer_is_refused() {
+            let invalid = |datagram: &[u8]| {
+                assert_eq!(
+                    parse(datagram).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            };
+            // Another interface, another request, another socket.
+            invalid(&link(IFINDEX + 1, None, None));
+            let answer = link(IFINDEX, Some(12), Some("bridge"));
+            let mut other_sequence = answer.clone();
+            other_sequence[8..12].copy_from_slice(&(SEQUENCE + 1).to_ne_bytes());
+            invalid(&other_sequence);
+            let mut other_port = answer.clone();
+            other_port[12..16].copy_from_slice(&(PORT_ID + 1).to_ne_bytes());
+            invalid(&other_port);
+            // Two answers in one datagram, an unexpected message type, a
+            // truncated header, a truncated link message.
+            invalid(&[answer.clone(), answer.clone()].concat());
+            invalid(&message(sys::RTM_DELLINK, SEQUENCE, PORT_ID, &[0; 16]));
+            invalid(&answer[..10]);
+            invalid(&message(sys::RTM_NEWLINK, SEQUENCE, PORT_ID, &[0; 12]));
+            let mut longer_than_datagram = answer.clone();
+            let claimed = (answer.len() as u32 + 4).to_ne_bytes();
+            longer_than_datagram[0..4].copy_from_slice(&claimed);
+            invalid(&longer_than_datagram);
+            // A datagram without an answer leaves the caller waiting.
+            assert_eq!(parse(&[]).unwrap(), None);
+            assert_eq!(
+                parse(&message(sys::NLMSG_NOOP, SEQUENCE, PORT_ID, &[])).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn malformed_attributes_are_refused() {
+            let invalid = |attributes: &[u8]| {
+                let mut body = vec![sys::AF_UNSPEC, 0, 1, 0];
+                body.extend_from_slice(&IFINDEX.to_ne_bytes());
+                body.extend_from_slice(&[0; 8]);
+                body.extend_from_slice(attributes);
+                assert_eq!(
+                    parse(&message(sys::RTM_NEWLINK, SEQUENCE, PORT_ID, &body))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+            };
+            // A master index of the wrong width.
+            invalid(&attribute(IFLA_MASTER, &[1, 0]));
+            // An attribute shorter than its header, and one longer than what
+            // is left.
+            invalid(&[2, 0, 10, 0]);
+            let mut overlong = attribute(IFLA_MASTER, &12_u32.to_ne_bytes());
+            overlong[0..2].copy_from_slice(&64_u16.to_ne_bytes());
+            invalid(&overlong);
+            // The same inside the link-info nest.
+            invalid(&attribute(sys::IFLA_LINKINFO, &[3, 0, 4, 0]));
+            // Trailing octets that are no attribute.
+            let mut trailing = attribute(IFLA_MASTER, &12_u32.to_ne_bytes());
+            trailing.extend_from_slice(&[0, 0]);
+            invalid(&trailing);
+        }
+
+        const DUMP_SEQUENCE: u32 = LINK_DUMP_SEQUENCE;
+        /// Another interface of the namespace.
+        const OTHER: i32 = IFINDEX + 20;
+
+        /// What a link of a dump says about itself.
+        #[derive(Clone, Copy, Default)]
+        struct Dumped<'a> {
+            /// `IFLA_LINK`.
+            lower: Option<i32>,
+            /// `IFLA_LINK_NETNSID`: the lower link is in another namespace.
+            lower_namespace: Option<i32>,
+            kind: Option<&'a str>,
+            /// The attributes of its `IFLA_INFO_DATA`.
+            data: &'a [u8],
+        }
+
+        /// The body of one link of a dump, without its message header. The
+        /// two nests carry the nested flag, which the kernel does not set
+        /// here and a parser must not take for part of the type.
+        fn dumped_body(index: i32, link: Dumped<'_>) -> Vec<u8> {
+            let mut body = vec![sys::AF_UNSPEC, 0, 1, 0];
+            body.extend_from_slice(&index.to_ne_bytes());
+            body.extend_from_slice(&[0; 8]);
+            body.extend(attribute(sys::IFLA_IFNAME, b"upper0\0"));
+            if let Some(lower) = link.lower {
+                body.extend(attribute(IFLA_LINK, &lower.to_ne_bytes()));
+            }
+            if let Some(namespace) = link.lower_namespace {
+                body.extend(attribute(IFLA_LINK_NETNSID, &namespace.to_ne_bytes()));
+            }
+            if let Some(kind) = link.kind {
+                let mut value = kind.as_bytes().to_vec();
+                value.push(0);
+                let mut info = attribute(sys::IFLA_INFO_KIND, &value);
+                if !link.data.is_empty() {
+                    info.extend(attribute(sys::IFLA_INFO_DATA | NLA_F_NESTED, link.data));
+                }
+                body.extend(attribute(sys::IFLA_LINKINFO | NLA_F_NESTED, &info));
+            }
+            body.extend(attribute(sys::IFLA_IFALIAS, b"x\0"));
+            body
+        }
+
+        fn dumped(index: i32, link: Dumped<'_>) -> Vec<u8> {
+            flagged_message(
+                sys::RTM_NEWLINK,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &dumped_body(index, link),
+            )
+        }
+
+        /// A device of `kind` above the interface.
+        fn above(kind: &str) -> Vec<u8> {
+            dumped(
+                OTHER,
+                Dumped {
+                    lower: Some(IFINDEX),
+                    kind: Some(kind),
+                    ..Dumped::default()
+                },
+            )
+        }
+
+        fn vlan(id: u16) -> Vec<u8> {
+            dumped(
+                OTHER,
+                Dumped {
+                    lower: Some(IFINDEX),
+                    kind: Some("vlan"),
+                    data: &attribute(IFLA_VLAN_ID, &id.to_ne_bytes()),
+                    ..Dumped::default()
+                },
+            )
+        }
+
+        fn done(status: i32) -> Vec<u8> {
+            flagged_message(
+                sys::NLMSG_DONE,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &status.to_ne_bytes(),
+            )
+        }
+
+        /// Read the datagrams of one dump in their order.
+        fn dump(datagrams: &[&[u8]]) -> io::Result<(LinkDump, UpperDevices)> {
+            let mut devices = UpperDevices::LeaveFrames;
+            let mut outcome = LinkDump::More;
+            for datagram in datagrams {
+                outcome = parse_link_dump(datagram, IFINDEX, DUMP_SEQUENCE, PORT_ID, &mut devices)?;
+                if outcome != LinkDump::More {
+                    break;
+                }
+            }
+            Ok((outcome, devices))
+        }
+
+        /// The outcome of the datagrams of one dump, which must be valid.
+        fn dump_of(datagrams: &[&[u8]]) -> (LinkDump, UpperDevices) {
+            dump(datagrams).expect("a valid dump")
+        }
+
+        /// What a complete dump of the interface itself and `links` says.
+        fn complete(links: &[Vec<u8>]) -> io::Result<UpperDevices> {
+            let own = dumped(
+                IFINDEX,
+                Dumped {
+                    kind: Some("veth"),
+                    ..Dumped::default()
+                },
+            );
+            let datagram = [own, links.concat(), done(0)].concat();
+            let (outcome, devices) = dump(&[&datagram])?;
+            assert_eq!(outcome, LinkDump::Done);
+            Ok(devices)
+        }
+
+        #[test]
+        fn the_dump_asks_for_every_link_of_the_namespace() {
+            let request = build_link_dump(DUMP_SEQUENCE, PORT_ID);
+            assert_eq!(request.len(), 40);
+            assert_eq!(u32::from_ne_bytes(request[0..4].try_into().unwrap()), 40);
+            assert_eq!(
+                u16::from_ne_bytes(request[4..6].try_into().unwrap()),
+                sys::RTM_GETLINK
+            );
+            assert_eq!(
+                u16::from_ne_bytes(request[6..8].try_into().unwrap()),
+                sys::NLM_F_REQUEST | sys::NLM_F_DUMP
+            );
+            assert_eq!(
+                u32::from_ne_bytes(request[8..12].try_into().unwrap()),
+                DUMP_SEQUENCE
+            );
+            assert_eq!(
+                u32::from_ne_bytes(request[12..16].try_into().unwrap()),
+                PORT_ID
+            );
+            // No interface is selected.
+            assert_eq!(request[16], sys::AF_UNSPEC);
+            assert_eq!(request[17..32], [0; 15]);
+            // One attribute: the extended mask that shortens each answer.
+            assert_eq!(u16::from_ne_bytes(request[32..34].try_into().unwrap()), 8);
+            assert_eq!(u16::from_ne_bytes(request[34..36].try_into().unwrap()), 29);
+            assert_eq!(u32::from_ne_bytes(request[36..40].try_into().unwrap()), 8);
+        }
+
+        #[test]
+        fn a_device_stacked_on_the_interface_takes_its_frames() {
+            // The kinds that take frames from their lower link through a
+            // receive handler, a switch port, a kind that no kernel names
+            // yet, and two near misses of kinds that are accepted.
+            for kind in [
+                "macvlan",
+                "macvtap",
+                "ipvlan",
+                "ipvtap",
+                "macsec",
+                "rmnet",
+                "virt_wifi",
+                "dsa",
+                "newkind",
+                "vethx",
+                "gr",
+            ] {
+                assert_eq!(
+                    complete(&[above(kind)]).unwrap(),
+                    UpperDevices::TakeFrames,
+                    "kind {kind}"
+                );
+            }
+            // A device that names the interface as its lower link without
+            // naming its own kind.
+            let unnamed = dumped(
+                OTHER,
+                Dumped {
+                    lower: Some(IFINDEX),
+                    ..Dumped::default()
+                },
+            );
+            assert_eq!(complete(&[unnamed]).unwrap(), UpperDevices::TakeFrames);
+            // One such device among others is enough, wherever it stands.
+            assert_eq!(
+                complete(&[above("gre"), above("macvlan"), vlan(100)]).unwrap(),
+                UpperDevices::TakeFrames
+            );
+        }
+
+        #[test]
+        fn a_device_that_leaves_the_frames_of_its_link_alone_is_accepted() {
+            for kind in LINK_KINDS_THAT_LEAVE_FRAMES {
+                let kind = std::str::from_utf8(kind).unwrap();
+                assert_eq!(
+                    complete(&[above(kind)]).unwrap(),
+                    UpperDevices::LeaveFrames,
+                    "kind {kind}"
+                );
+            }
+            assert_eq!(
+                LINK_KINDS_THAT_LEAVE_FRAMES
+                    .iter()
+                    .map(|kind| std::str::from_utf8(kind).unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "veth",
+                    "vxcan",
+                    "netkit",
+                    "ipip",
+                    "gre",
+                    "gretap",
+                    "erspan",
+                    "ip6gre",
+                    "ip6gretap",
+                    "ip6erspan",
+                    "sit",
+                    "ip6tnl",
+                    "vti",
+                    "vti6",
+                    "xfrm"
+                ]
+            );
+            // No device at all, and only the interface itself, whatever it
+            // names as its own link.
+            assert_eq!(complete(&[]).unwrap(), UpperDevices::LeaveFrames);
+            let own_link = dumped(
+                IFINDEX,
+                Dumped {
+                    lower: Some(IFINDEX),
+                    kind: Some("macvlan"),
+                    ..Dumped::default()
+                },
+            );
+            assert_eq!(complete(&[own_link]).unwrap(), UpperDevices::LeaveFrames);
+        }
+
+        #[test]
+        fn a_vlan_device_is_judged_by_its_id() {
+            // tc gives a hand-off in a VLAN to no socket, so its device is
+            // accepted.
+            for id in [1, 100, 4094] {
+                assert_eq!(
+                    complete(&[vlan(id)]).unwrap(),
+                    UpperDevices::LeaveFrames,
+                    "VLAN {id}"
+                );
+            }
+            // The ID 0 takes the frames that carry a priority tag.
+            assert_eq!(complete(&[vlan(0)]).unwrap(), UpperDevices::TakeFrames);
+            // A VLAN device that does not name its ID, or names it in the
+            // wrong width, is not judged.
+            for data in [
+                Vec::new(),
+                attribute(IFLA_VLAN_ID + 1, &100_u16.to_ne_bytes()),
+                attribute(IFLA_VLAN_ID, &100_u32.to_ne_bytes()),
+            ] {
+                let unreadable = dumped(
+                    OTHER,
+                    Dumped {
+                        lower: Some(IFINDEX),
+                        kind: Some("vlan"),
+                        data: &data,
+                        ..Dumped::default()
+                    },
+                );
+                assert_eq!(
+                    complete(&[unreadable]).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        }
+
+        #[test]
+        fn a_device_above_another_interface_is_not_above_this_one() {
+            // The lower link of another interface.
+            let elsewhere = dumped(
+                OTHER,
+                Dumped {
+                    lower: Some(IFINDEX + 1),
+                    kind: Some("macvlan"),
+                    ..Dumped::default()
+                },
+            );
+            assert_eq!(complete(&[elsewhere]).unwrap(), UpperDevices::LeaveFrames);
+            // The same index in another namespace, whatever ID the kernel
+            // has for that namespace.
+            for namespace in [0, 3, -1] {
+                let other_namespace = dumped(
+                    OTHER,
+                    Dumped {
+                        lower: Some(IFINDEX),
+                        lower_namespace: Some(namespace),
+                        kind: Some("macvlan"),
+                        ..Dumped::default()
+                    },
+                );
+                assert_eq!(
+                    complete(&[other_namespace]).unwrap(),
+                    UpperDevices::LeaveFrames,
+                    "namespace {namespace}"
+                );
+            }
+            // A device without a lower link, and a master's own entry.
+            let plain = dumped(
+                OTHER,
+                Dumped {
+                    kind: Some("bridge"),
+                    ..Dumped::default()
+                },
+            );
+            assert_eq!(complete(&[plain]).unwrap(), UpperDevices::LeaveFrames);
+            // A lower link of the wrong width is not read past.
+            let mut body = dumped_body(OTHER, Dumped::default());
+            body.extend(attribute(IFLA_LINK, &[7, 0]));
+            let malformed = flagged_message(
+                sys::RTM_NEWLINK,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &body,
+            );
+            assert_eq!(
+                complete(&[malformed]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        /// The attributes of an HSR or PRP device (`IFLA_HSR_*`): its two
+        /// ring ports, its supervision address, its sequence number, its
+        /// protocol and its interlink port.
+        const IFLA_HSR_SLAVE1: u16 = 1;
+        const IFLA_HSR_SLAVE2: u16 = 2;
+        const IFLA_HSR_SUPERVISION_ADDR: u16 = 4;
+        const IFLA_HSR_SEQ_NR: u16 = 5;
+        const IFLA_HSR_PROTOCOL: u16 = 7;
+        const IFLA_HSR_INTERLINK: u16 = 8;
+        /// `IFLA_HSR_PROTOCOL` of an HSR device and of a PRP device. Both are
+        /// links of the kind `hsr`.
+        const HSR: u8 = 0;
+        const PRP: u8 = 1;
+        /// The two interfaces of the ring.
+        const RING: [i32; 2] = [IFINDEX + 1, IFINDEX + 2];
+
+        /// An HSR or PRP device above the ring, as the kernel dumps it: the
+        /// two ring ports, the supervision address, the sequence number and
+        /// the protocol. A kernel before Linux 6.19 writes nothing about an
+        /// interlink port. A later one names it, as `interlink` does here.
+        fn redundancy_device(index: i32, protocol: u8, interlink: Option<i32>) -> Vec<u8> {
+            let mut data = attribute(IFLA_HSR_SLAVE1, &RING[0].to_ne_bytes());
+            data.extend(attribute(IFLA_HSR_SLAVE2, &RING[1].to_ne_bytes()));
+            if let Some(interlink) = interlink {
+                data.extend(attribute(IFLA_HSR_INTERLINK, &interlink.to_ne_bytes()));
+            }
+            data.extend(attribute(
+                IFLA_HSR_SUPERVISION_ADDR,
+                &[0x01, 0x15, 0x4e, 0x00, 0x01, 0x00],
+            ));
+            data.extend(attribute(IFLA_HSR_SEQ_NR, &0_u16.to_ne_bytes()));
+            data.extend(attribute(IFLA_HSR_PROTOCOL, &[protocol]));
+            dumped(
+                index,
+                Dumped {
+                    kind: Some("hsr"),
+                    data: &data,
+                    ..Dumped::default()
+                },
+            )
+        }
+
+        /// A ring port, as a kernel before Linux 6.18 dumps it: it names
+        /// neither a master nor a lower link.
+        fn ring_port(index: i32) -> Vec<u8> {
+            dumped(
+                index,
+                Dumped {
+                    kind: Some("dummy"),
+                    ..Dumped::default()
+                },
+            )
+        }
+
+        /// The feature that a complete dump of the interface itself and
+        /// `links` refuses the interface with, if it does.
+        fn refusal(links: &[Vec<u8>]) -> Option<&'static str> {
+            match stacking_refusal(complete(links).unwrap()) {
+                Ok(()) => None,
+                Err(GtpuError::UnsupportedFeature { feature }) => Some(feature),
+                Err(other) => panic!("not a refusal of the interface: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_interlink_that_the_dump_omits_is_refused() {
+            // The interface is the interlink port of an HSR device of its
+            // namespace. HSR takes the frames that arrive on it. A kernel
+            // from Linux 6.10 to 6.17 names only the two ring ports: the
+            // device has no lower link, the interface has no master, and
+            // nothing in the dump ties the two together. The device is in
+            // the dump all the same, and that is enough.
+            let dump = [
+                ring_port(RING[0]),
+                ring_port(RING[1]),
+                redundancy_device(OTHER, HSR, None),
+            ];
+            assert_eq!(
+                complete(&dump).unwrap(),
+                UpperDevices::HsrDevice,
+                "the interlink of an HSR device was accepted"
+            );
+            assert_eq!(
+                refusal(&dump),
+                Some(ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE)
+            );
+            // Wherever the device stands in the dump, and in whichever
+            // datagram.
+            let own = dumped(IFINDEX, Dumped::default());
+            let first = [redundancy_device(OTHER, HSR, None), own].concat();
+            let second = [ring_port(RING[0]), ring_port(RING[1]), done(0)].concat();
+            assert_eq!(
+                dump_of(&[&first, &second]),
+                (LinkDump::Done, UpperDevices::HsrDevice)
+            );
+            let first = [dumped(IFINDEX, Dumped::default()), ring_port(RING[0])].concat();
+            let second = [redundancy_device(OTHER, HSR, None), done(0)].concat();
+            assert_eq!(
+                dump_of(&[&first, &second]),
+                (LinkDump::Done, UpperDevices::HsrDevice)
+            );
+        }
+
+        #[test]
+        fn a_prp_device_refuses_the_interfaces_of_its_namespace_too() {
+            // A PRP device is a link of the same kind, and the rule follows
+            // the kind: the interfaces of its namespace are refused as well.
+            let dump = [
+                ring_port(RING[0]),
+                ring_port(RING[1]),
+                redundancy_device(OTHER, PRP, None),
+            ];
+            assert_eq!(
+                complete(&dump).unwrap(),
+                UpperDevices::HsrDevice,
+                "an interface beside a PRP device was accepted"
+            );
+            assert_eq!(
+                refusal(&dump),
+                Some(ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE)
+            );
+        }
+
+        #[test]
+        fn an_hsr_or_prp_device_refuses_whichever_ports_it_names() {
+            for protocol in [HSR, PRP] {
+                // The interface is a port that the device names: a ring
+                // port, or the interlink port on a kernel that reports it.
+                // The answer is the same as for a port it does not name.
+                for named in [IFLA_HSR_SLAVE1, IFLA_HSR_SLAVE2, IFLA_HSR_INTERLINK] {
+                    let mut data = attribute(named, &IFINDEX.to_ne_bytes());
+                    data.extend(attribute(IFLA_HSR_PROTOCOL, &[protocol]));
+                    let device = dumped(
+                        OTHER,
+                        Dumped {
+                            kind: Some("hsr"),
+                            data: &data,
+                            ..Dumped::default()
+                        },
+                    );
+                    assert_eq!(
+                        complete(&[device]).unwrap(),
+                        UpperDevices::HsrDevice,
+                        "protocol {protocol}, port attribute {named}"
+                    );
+                }
+                // The device names an interlink, and it is another one.
+                assert_eq!(
+                    complete(&[redundancy_device(OTHER, protocol, Some(OTHER + 1))]).unwrap(),
+                    UpperDevices::HsrDevice,
+                    "protocol {protocol}"
+                );
+                // The device names nothing at all, or what it names cannot
+                // be read: its ports are not what decides.
+                for data in [Vec::new(), attribute(IFLA_HSR_SLAVE1, &[7, 0])] {
+                    let silent = dumped(
+                        OTHER,
+                        Dumped {
+                            kind: Some("hsr"),
+                            data: &data,
+                            ..Dumped::default()
+                        },
+                    );
+                    assert_eq!(
+                        complete(&[silent]).unwrap(),
+                        UpperDevices::HsrDevice,
+                        "protocol {protocol}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_hsr_or_prp_device_itself_is_refused() {
+            // The rule is about the namespace, so it holds for the device
+            // itself as well: the interface's own entry is of the kind.
+            for protocol in [HSR, PRP] {
+                let datagram = [redundancy_device(IFINDEX, protocol, None), done(0)].concat();
+                assert_eq!(
+                    dump_of(&[&datagram]),
+                    (LinkDump::Done, UpperDevices::HsrDevice),
+                    "protocol {protocol}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_interface_s_own_entry_is_read_for_its_kind_alone() {
+            // Whatever the interface names as its own link or its own VLAN
+            // ID is not judged.
+            for own in [
+                Dumped {
+                    lower: Some(IFINDEX),
+                    kind: Some("macvlan"),
+                    ..Dumped::default()
+                },
+                Dumped {
+                    lower: Some(IFINDEX),
+                    kind: Some("vlan"),
+                    ..Dumped::default()
+                },
+                Dumped {
+                    lower: Some(IFINDEX),
+                    ..Dumped::default()
+                },
+            ] {
+                let datagram = [dumped(IFINDEX, own), done(0)].concat();
+                assert_eq!(
+                    dump_of(&[&datagram]),
+                    (LinkDump::Done, UpperDevices::LeaveFrames)
+                );
+            }
+            // An entry that cannot be read is no answer, the interface's own
+            // included.
+            let mut body = dumped_body(IFINDEX, Dumped::default());
+            body.extend(attribute(IFLA_LINK, &[7, 0]));
+            let malformed = flagged_message(
+                sys::RTM_NEWLINK,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &body,
+            );
+            assert_eq!(
+                dump(&[&[malformed, done(0)].concat()]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        #[test]
+        fn a_namespace_without_an_hsr_or_prp_device_is_judged_as_before() {
+            // Links that leave the interface's frames alone, a bridge with a
+            // port of its own, and kinds whose names only come close.
+            let bridge = dumped(
+                OTHER + 1,
+                Dumped {
+                    kind: Some("bridge"),
+                    ..Dumped::default()
+                },
+            );
+            let near_misses: Vec<Vec<u8>> = ["hs", "hsrx", "prp", "HSR"]
+                .into_iter()
+                .enumerate()
+                .map(|(offset, kind)| {
+                    dumped(
+                        OTHER + 2 + offset as i32,
+                        Dumped {
+                            kind: Some(kind),
+                            ..Dumped::default()
+                        },
+                    )
+                })
+                .collect();
+            let mut dump = vec![above("veth"), vlan(100), above("gre"), bridge];
+            dump.extend(near_misses);
+            assert_eq!(complete(&dump).unwrap(), UpperDevices::LeaveFrames);
+            assert_eq!(refusal(&dump), None);
+            // A device that takes the interface's frames is still what
+            // refuses it.
+            dump.push(above("macvlan"));
+            assert_eq!(complete(&dump).unwrap(), UpperDevices::TakeFrames);
+            assert_eq!(refusal(&dump), Some(ATTACHMENT_BELOW_STACKED_DEVICE));
+        }
+
+        #[test]
+        fn a_stacked_device_is_named_before_an_hsr_or_prp_device() {
+            // Both refuse the interface. The device that is stacked on it is
+            // the one the refusal names, in whichever order the kernel
+            // writes the two.
+            let stacked = above("macvlan");
+            let redundancy = redundancy_device(OTHER + 1, HSR, None);
+            for dump in [
+                [stacked.clone(), redundancy.clone()],
+                [redundancy.clone(), stacked.clone()],
+            ] {
+                assert_eq!(complete(&dump).unwrap(), UpperDevices::TakeFrames);
+                assert_eq!(refusal(&dump), Some(ATTACHMENT_BELOW_STACKED_DEVICE));
+            }
+            // A device that leaves the interface's frames alone does not
+            // outweigh the HSR device.
+            for dump in [
+                [vlan(100), redundancy.clone()],
+                [redundancy.clone(), above("gre")],
+            ] {
+                assert_eq!(complete(&dump).unwrap(), UpperDevices::HsrDevice);
+            }
+        }
+
+        #[test]
+        fn each_answer_of_the_dump_has_its_own_refusal() {
+            assert!(stacking_refusal(UpperDevices::LeaveFrames).is_ok());
+            assert!(matches!(
+                stacking_refusal(UpperDevices::TakeFrames),
+                Err(GtpuError::UnsupportedFeature {
+                    feature: ATTACHMENT_BELOW_STACKED_DEVICE
+                })
+            ));
+            assert!(matches!(
+                stacking_refusal(UpperDevices::HsrDevice),
+                Err(GtpuError::UnsupportedFeature {
+                    feature: ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE
+                })
+            ));
+            // The three features are three names.
+            assert_eq!(
+                ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+                "attachment_in_namespace_with_hsr_device"
+            );
+            assert_ne!(
+                ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+                ATTACHMENT_BELOW_STACKED_DEVICE
+            );
+            assert_ne!(
+                ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+                ATTACHMENT_ON_ENSLAVED_INTERFACE
+            );
+        }
+
+        #[test]
+        fn a_dump_holds_only_once_it_is_complete() {
+            // The kernel writes a dump into several datagrams and ends it
+            // with a message of its own.
+            let first = [dumped(IFINDEX, Dumped::default()), above("macvlan")].concat();
+            let second = [above("gre"), done(0)].concat();
+            assert_eq!(
+                dump(&[&first]).unwrap(),
+                (LinkDump::More, UpperDevices::TakeFrames)
+            );
+            assert_eq!(
+                dump(&[&first, &second]).unwrap(),
+                (LinkDump::Done, UpperDevices::TakeFrames)
+            );
+            assert_eq!(
+                dump(&[&[]]).unwrap(),
+                (LinkDump::More, UpperDevices::LeaveFrames)
+            );
+            assert_eq!(
+                dump(&[&done(0)]).unwrap(),
+                (LinkDump::Done, UpperDevices::LeaveFrames)
+            );
+            // A dump that the kernel ends or answers with an error.
+            assert_eq!(dump(&[&done(-4)]).unwrap_err().raw_os_error(), Some(4));
+            let mut refusal = (-1_i32).to_ne_bytes().to_vec();
+            refusal.extend_from_slice(&build_link_dump(DUMP_SEQUENCE, PORT_ID)[..16]);
+            let refusal = flagged_message(sys::NLMSG_ERROR, 0, DUMP_SEQUENCE, PORT_ID, &refusal);
+            assert_eq!(dump(&[&refusal]).unwrap_err().raw_os_error(), Some(1));
+            let invalid = |datagram: &[u8]| {
+                assert_eq!(
+                    dump(&[datagram]).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            };
+            // An acknowledgement, which the request never asks for, a
+            // positive status, and an end without its status.
+            let mut acknowledgement = 0_i32.to_ne_bytes().to_vec();
+            acknowledgement.extend_from_slice(&[0; 16]);
+            invalid(&flagged_message(
+                sys::NLMSG_ERROR,
+                0,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &acknowledgement,
+            ));
+            invalid(&done(4));
+            invalid(&flagged_message(
+                sys::NLMSG_DONE,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &[0; 2],
+            ));
+            // An end or a link that is not part of a dump, a link after the
+            // end, another message type, and a truncated link.
+            invalid(&flagged_message(
+                sys::NLMSG_DONE,
+                0,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &0_i32.to_ne_bytes(),
+            ));
+            invalid(&message(
+                sys::RTM_NEWLINK,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &dumped_body(OTHER, Dumped::default()),
+            ));
+            invalid(&[done(0), above("gre")].concat());
+            invalid(&flagged_message(
+                sys::RTM_DELLINK,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &[0; 16],
+            ));
+            invalid(&flagged_message(
+                sys::RTM_NEWLINK,
+                sys::NLM_F_MULTI,
+                DUMP_SEQUENCE,
+                PORT_ID,
+                &[0; 12],
+            ));
+            invalid(&above("gre")[..10]);
+        }
+
+        #[test]
+        fn a_dump_that_the_kernel_interrupted_is_no_answer() {
+            // The links changed while the kernel wrote the dump, so it may
+            // have left one out. Whatever was read is dropped.
+            let interrupted = |kind: u16, body: &[u8]| {
+                flagged_message(
+                    kind,
+                    sys::NLM_F_MULTI | sys::NLM_F_DUMP_INTR,
+                    DUMP_SEQUENCE,
+                    PORT_ID,
+                    body,
+                )
+            };
+            let link = interrupted(sys::RTM_NEWLINK, &dumped_body(OTHER, Dumped::default()));
+            assert_eq!(dump(&[&link]).unwrap().0, LinkDump::Interrupted);
+            let end = interrupted(sys::NLMSG_DONE, &0_i32.to_ne_bytes());
+            assert_eq!(
+                dump(&[&[above("gre"), end].concat()]).unwrap().0,
+                LinkDump::Interrupted
+            );
+        }
+
+        #[test]
+        fn a_dump_datagram_of_another_request_is_refused() {
+            let invalid = |datagram: &[u8]| {
+                assert_eq!(
+                    dump(&[datagram]).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            };
+            let link = above("gre");
+            let mut other_sequence = link.clone();
+            other_sequence[8..12].copy_from_slice(&(DUMP_SEQUENCE + 1).to_ne_bytes());
+            invalid(&other_sequence);
+            let mut other_port = link.clone();
+            other_port[12..16].copy_from_slice(&(PORT_ID + 1).to_ne_bytes());
+            invalid(&other_port);
+            let mut longer_than_datagram = link.clone();
+            let claimed = (link.len() as u32 + 4).to_ne_bytes();
+            longer_than_datagram[0..4].copy_from_slice(&claimed);
+            invalid(&longer_than_datagram);
+        }
+
+        #[test]
+        fn the_last_attribute_may_end_without_padding() {
+            let mut body = vec![sys::AF_UNSPEC, 0, 1, 0];
+            body.extend_from_slice(&IFINDEX.to_ne_bytes());
+            body.extend_from_slice(&[0; 8]);
+            body.extend(attribute(IFLA_MASTER, &12_u32.to_ne_bytes()));
+            // A five-octet kind: the attribute is nine octets long and the
+            // message ends there.
+            let mut info = Vec::new();
+            info.extend_from_slice(&9_u16.to_ne_bytes());
+            info.extend_from_slice(&IFLA_INFO_SLAVE_KIND.to_ne_bytes());
+            info.extend_from_slice(b"bond\0");
+            let mut nest = Vec::new();
+            nest.extend_from_slice(
+                &((ROUTE_ATTRIBUTE_HEADER_LEN + info.len()) as u16).to_ne_bytes(),
+            );
+            nest.extend_from_slice(&sys::IFLA_LINKINFO.to_ne_bytes());
+            nest.extend_from_slice(&info);
+            body.extend(nest);
+            let length = NETLINK_HEADER_LEN + body.len();
+            let mut datagram = Vec::new();
+            datagram.extend_from_slice(&(length as u32).to_ne_bytes());
+            datagram.extend_from_slice(&sys::RTM_NEWLINK.to_ne_bytes());
+            datagram.extend_from_slice(&0_u16.to_ne_bytes());
+            datagram.extend_from_slice(&SEQUENCE.to_ne_bytes());
+            datagram.extend_from_slice(&PORT_ID.to_ne_bytes());
+            datagram.extend_from_slice(&body);
+            assert_eq!(parse(&datagram).unwrap(), Some(ReceivePath::Master));
+        }
     }
 
     #[cfg(test)]
@@ -55577,6 +57380,14 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        /// Interfaces enslaved to a master whose receive handler takes
+        /// their frames.
+        enslaved_interfaces: HashSet<u32>,
+        /// Interfaces below a stacked device that can take their frames.
+        interfaces_below_a_stacked_device: HashSet<u32>,
+        /// The namespace holds an HSR or PRP device, which refuses every
+        /// interface of it.
+        namespace_holds_an_hsr_device: bool,
         grouped_reader_grace_enabled: bool,
         grouped_reader_grace_calls: usize,
         grouped_reader_grace_fault: bool,
@@ -58245,6 +60056,26 @@ mod tests {
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
             self.ifindexes.get(name).copied().ok_or(GtpuError::NotFound)
+        }
+
+        fn require_ip_receive_interface(&self, ifindex: u32) -> Result<(), GtpuError> {
+            let state = self.state();
+            if state.enslaved_interfaces.contains(&ifindex) {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: ATTACHMENT_ON_ENSLAVED_INTERFACE,
+                });
+            }
+            if state.interfaces_below_a_stacked_device.contains(&ifindex) {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: ATTACHMENT_BELOW_STACKED_DEVICE,
+                });
+            }
+            if state.namespace_holds_an_hsr_device {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+                });
+            }
+            Ok(())
         }
 
         fn attach(
@@ -76213,6 +78044,26 @@ mod tests {
             request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
             crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request)
         };
+        // A sealed successor whose interface was enslaved meanwhile, below
+        // which a device was stacked, or whose namespace gained an HSR or
+        // PRP device, is not inspected.
+        for refusal in InterfaceRefusal::EACH {
+            refusal.arm(&runtime, REPLACEMENT_IFINDEX);
+            assert!(
+                refusal.refuses(
+                    backend
+                        .inspect_current_ebpf_graph_successor(
+                            intent().into_successor_inspection_request(
+                                target(),
+                                current_recovery_authority()
+                            ),
+                        )
+                        .await
+                ),
+                "{refusal:?}"
+            );
+            release_interfaces(&runtime);
+        }
         let receipt = match backend
             .inspect_current_ebpf_graph_successor(
                 intent().into_successor_inspection_request(target(), current_recovery_authority()),
@@ -76225,6 +78076,30 @@ mod tests {
             }
             outcome => panic!("unexpected successor inspection: {outcome:?}"),
         };
+        // Nor is it admitted: the admission would finalize the receipt and
+        // open the traffic gate.
+        for refusal in InterfaceRefusal::EACH {
+            refusal.arm(&runtime, REPLACEMENT_IFINDEX);
+            assert!(
+                refusal.refuses(
+                    backend
+                        .admit_current_ebpf_graph_successor(
+                            intent().into_successor_admission_request(
+                                target(),
+                                receipt,
+                                current_recovery_authority_for_successor_receipt(receipt),
+                            )
+                        )
+                        .await
+                ),
+                "{refusal:?}"
+            );
+            assert!(!runtime
+                .state()
+                .current_recovery_finalized_receipts
+                .contains_key(&pin_dir));
+            release_interfaces(&runtime);
+        }
         assert_eq!(
             backend
                 .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
@@ -76543,6 +78418,31 @@ mod tests {
             }
             outcome => panic!("unexpected grouped successor inspection: {outcome:?}"),
         };
+        // With its interface enslaved to a master other than a VRF, below
+        // a stacked device, or in a namespace with an HSR or PRP device, the
+        // successor is not admitted and stays inert.
+        for refusal in InterfaceRefusal::EACH {
+            refusal.arm(&runtime, REPLACEMENT_IFINDEX);
+            assert!(
+                refusal.refuses(
+                    backend
+                        .admit_current_ebpf_graph_successor(
+                            intent().into_successor_admission_request(
+                                target(),
+                                receipt,
+                                current_recovery_authority_for_successor_receipt(receipt),
+                            )
+                        )
+                        .await
+                ),
+                "{refusal:?}"
+            );
+            assert!(runtime
+                .state()
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX));
+            release_interfaces(&runtime);
+        }
         assert_eq!(
             backend
                 .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
@@ -77852,6 +79752,7 @@ mod tests {
                 uplink_mtu_rejected: 23,
                 uplink_mtu_policy_corrupt: 24,
                 uplink_redirects_resolved: 25,
+                downlink_missing_consumer: 26,
             },
         };
         runtime.state().datapath_snapshot = expected;
@@ -78104,6 +80005,169 @@ mod tests {
             backend.create_device(create_request()).await.unwrap_err(),
             GtpuError::AlreadyExists
         ));
+    }
+
+    /// Why IP input does not receive on an interface the frames that arrive
+    /// on it.
+    #[derive(Clone, Copy, Debug)]
+    enum InterfaceRefusal {
+        /// A master other than a VRF.
+        Enslaved,
+        /// A stacked device that can take its frames.
+        BelowAStackedDevice,
+        /// An HSR or PRP device in its namespace, which may take its frames.
+        /// This one holds for every interface of the namespace.
+        BesideAnHsrDevice,
+    }
+
+    impl InterfaceRefusal {
+        const EACH: [Self; 3] = [
+            Self::Enslaved,
+            Self::BelowAStackedDevice,
+            Self::BesideAnHsrDevice,
+        ];
+
+        /// Put interface `ifindex` into this state.
+        fn arm(self, runtime: &FakeRuntime, ifindex: u32) {
+            let mut state = runtime.state();
+            match self {
+                Self::Enslaved => {
+                    state.enslaved_interfaces.insert(ifindex);
+                }
+                Self::BelowAStackedDevice => {
+                    state.interfaces_below_a_stacked_device.insert(ifindex);
+                }
+                Self::BesideAnHsrDevice => state.namespace_holds_an_hsr_device = true,
+            }
+        }
+
+        /// Whether this state refuses the other interfaces of the namespace
+        /// as well.
+        fn holds_for_the_namespace(self) -> bool {
+            matches!(self, Self::BesideAnHsrDevice)
+        }
+
+        /// Whether `result` is the refusal that names this state.
+        fn refuses<T>(self, result: Result<T, GtpuError>) -> bool {
+            let expected = match self {
+                Self::Enslaved => ATTACHMENT_ON_ENSLAVED_INTERFACE,
+                Self::BelowAStackedDevice => ATTACHMENT_BELOW_STACKED_DEVICE,
+                Self::BesideAnHsrDevice => ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+            };
+            matches!(
+                result,
+                Err(GtpuError::UnsupportedFeature { feature }) if feature == expected
+            )
+        }
+    }
+
+    /// Every interface receives its own frames again.
+    fn release_interfaces(runtime: &FakeRuntime) {
+        let mut state = runtime.state();
+        state.enslaved_interfaces.clear();
+        state.interfaces_below_a_stacked_device.clear();
+        state.namespace_holds_an_hsr_device = false;
+    }
+
+    #[tokio::test]
+    async fn an_interface_that_does_not_receive_its_frames_is_refused_before_anything_is_attached()
+    {
+        for refusal in InterfaceRefusal::EACH {
+            let (backend, runtime) = backend_with_fake();
+            refusal.arm(&runtime, S2BU_IFINDEX);
+            let before = runtime.state().attached.len();
+
+            assert!(
+                refusal.refuses(backend.create_device(create_request()).await),
+                "{refusal:?}"
+            );
+            let endpoints =
+                GtpuLocalEndpointSet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap();
+            assert!(
+                refusal.refuses(
+                    backend
+                        .create_device_with_endpoints(grouped_device_request(
+                            "s2bu",
+                            grouped_device_id(0x75),
+                            endpoints,
+                        ))
+                        .await
+                ),
+                "{refusal:?}"
+            );
+            assert!(
+                refusal.refuses(backend.resolve_device("s2bu").await),
+                "{refusal:?}"
+            );
+            {
+                let state = runtime.state();
+                assert_eq!(state.attached.len(), before);
+                assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+                assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+            }
+            // A missing interface is still reported as missing. A master and
+            // a stacked device refuse their own interface only; an HSR or
+            // PRP device refuses every interface of the namespace.
+            let mut missing = create_request();
+            missing.name = "nope0".to_string();
+            assert!(matches!(
+                backend.create_device(missing).await.unwrap_err(),
+                GtpuError::NotFound
+            ));
+            let mut other = create_request();
+            other.name = "s2bu-new".to_string();
+            let other = backend.create_device(other).await;
+            if refusal.holds_for_the_namespace() {
+                assert!(refusal.refuses(other), "{refusal:?}");
+            } else {
+                assert_eq!(other.unwrap().ifindex, REPLACEMENT_IFINDEX);
+            }
+            // Once the interface receives its frames again, it is accepted.
+            release_interfaces(&runtime);
+            backend.create_device(create_request()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_whose_interface_stops_receiving_is_refused_and_still_removed() {
+        for refusal in InterfaceRefusal::EACH {
+            let (backend, runtime) = backend_with_fake();
+            let device = backend.create_device(create_request()).await.unwrap();
+            refusal.arm(&runtime, S2BU_IFINDEX);
+
+            // The consumer of its hand-offs is not opened, and the attachment
+            // is not handed out again.
+            let control_port = backend.open_gtpu_control_port(&device).await;
+            #[cfg(target_os = "linux")]
+            assert!(refusal.refuses(control_port), "{refusal:?}");
+            // Off Linux the trait default refuses the control-port feature
+            // before any interface-specific validation can run.
+            #[cfg(not(target_os = "linux"))]
+            assert!(matches!(
+                control_port,
+                Err(GtpuError::UnsupportedFeature {
+                    feature: "gtpu_control_port"
+                })
+            ));
+            assert!(
+                refusal.refuses(backend.resolve_device("s2bu").await),
+                "{refusal:?}"
+            );
+            assert!(runtime.state().attached.contains_key(&S2BU_IFINDEX));
+
+            // A restarted process does not adopt the retained attachment.
+            let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            assert!(
+                refusal.refuses(restarted.resolve_device("s2bu").await),
+                "{refusal:?}"
+            );
+            assert!(runtime.state().attached.contains_key(&S2BU_IFINDEX));
+            drop(restarted);
+
+            // Removal does not ask where IP input receives.
+            backend.remove_device(&device).await.unwrap();
+            assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+        }
     }
 
     #[tokio::test]
@@ -80906,6 +82970,66 @@ mod tests {
                 GtpuError::UnsupportedFeature {
                     feature: "cleanup_only_uplink_mtu_policy_update"
                 }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_activation_is_refused_while_the_interface_does_not_receive_its_frames() {
+        for refusal in InterfaceRefusal::EACH {
+            let (backend, runtime) = backend_with_fake();
+            create_device_with_context(&backend).await;
+            simulate_process_loss(&runtime, false);
+
+            // Cleanup of the retained graph does not ask where IP input
+            // receives: it must stay possible on an interface that was
+            // enslaved, below which a device was stacked, or whose namespace
+            // gained an HSR or PRP device, meanwhile.
+            refusal.arm(&runtime, S2BU_IFINDEX);
+            let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            assert_eq!(
+                recovered
+                    .acquire_cleanup_only_recovery(cleanup_request(
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        S2BU_IFINDEX,
+                    ))
+                    .await
+                    .unwrap(),
+                RetainedGraphCleanupClassification::Acquired
+            );
+
+            // Activation re-enables forwarding, and with it the hand-offs.
+            let device = GtpDevice {
+                name: "s2bu".to_string(),
+                ifindex: S2BU_IFINDEX,
+            };
+            assert!(
+                refusal.refuses(recovered.activate_cleanup_recovery(&device).await),
+                "{refusal:?}"
+            );
+            assert!(!runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+            // A device that this backend does not manage is still reported
+            // as such, whatever state its interface is in.
+            refusal.arm(&runtime, REPLACEMENT_IFINDEX);
+            assert!(matches!(
+                recovered
+                    .activate_cleanup_recovery(&GtpDevice {
+                        name: "s2bu-new".to_string(),
+                        ifindex: REPLACEMENT_IFINDEX,
+                    })
+                    .await,
+                Err(GtpuError::NotFound)
+            ));
+
+            release_interfaces(&runtime);
+            recovered.activate_cleanup_recovery(&device).await.unwrap();
+            assert!(runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+            // And an active device answers a retry as before, whatever state
+            // its interface is in.
+            refusal.arm(&runtime, S2BU_IFINDEX);
+            assert!(matches!(
+                recovered.activate_cleanup_recovery(&device).await,
+                Err(GtpuError::AlreadyExists)
             ));
         }
     }

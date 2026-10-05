@@ -520,6 +520,13 @@ impl EbpfGtpuDataplaneBackend {
             return Err(unavailable());
         }
         if state.socket.is_none() {
+            // This socket is bound on UDP/2152 of the attachment's interface,
+            // where tc then finds it as the consumer of hand-offs. Like the
+            // control port, it is not opened on an interface that was
+            // enslaved since the attachment was made.
+            self.inner
+                .runtime
+                .require_ip_receive_interface(device.ifindex)?;
             state.socket = Some(
                 crate::GtpuReassemblySocket::bind(local, &device.name)
                     .map_err(|_| unavailable())?,
@@ -577,6 +584,13 @@ impl EbpfGtpuDataplaneBackend {
                 .retire();
             return Err(unavailable());
         }
+        // The port is the consumer of this attachment's hand-offs. tc looks
+        // for it on the attachment's interface, so IP input must receive
+        // there: an interface that was enslaved since the attachment was made
+        // is refused, and the attachment is left as it is.
+        self.inner
+            .runtime
+            .require_ip_receive_interface(device.ifindex)?;
         let mut socket = slot
             .lock()
             .map_err(|_| GtpuError::io("ebpf_control_port_state", poisoned_lock()))?;
@@ -592,8 +606,8 @@ impl EbpfGtpuDataplaneBackend {
             );
         }
         if socket.too_big_socket.is_none() {
-            // Without this queue, tc-steered over-MTU G-PDUs would be
-            // answered by the kernel with port unreachable; refuse instead.
+            // Without this queue tc would drop every over-MTU G-PDU for
+            // want of a consumer; refuse instead.
             socket.too_big_socket = Some(
                 crate::GtpuReassemblySocket::bind_packet_too_big_queue(local_ip, &device.name)
                     .map_err(|error| {

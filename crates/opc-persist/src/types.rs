@@ -240,6 +240,25 @@ impl AttestedConfigCommit {
         (self.record, self.audit, self.confirmed_resolution)
     }
 
+    #[allow(dead_code)] // Consumed only by the closed bounded representation path.
+    pub(crate) fn into_capacity_parts(
+        self,
+    ) -> (
+        CommitRecord,
+        Vec<AuditRecord>,
+        Option<ConfirmedCommitResolution>,
+        Option<opc_crypto::ConfigCapacityEvidence>,
+        Option<opc_crypto::ConfigPreparationReservation>,
+    ) {
+        (
+            self.record,
+            self.audit,
+            self.confirmed_resolution,
+            self.capacity_evidence,
+            self.preparation,
+        )
+    }
+
     pub fn record(&self) -> &CommitRecord {
         &self.record
     }

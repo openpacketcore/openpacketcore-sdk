@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use opc_consensus::{ConsensusEntryDigest, ConsensusIdentity};
-use opc_crypto::CryptoEnvelopeV1;
+use opc_crypto::CryptoEnvelopeRef;
 use opc_types::{Timestamp, TxId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,6 +62,11 @@ const AUDIT_PATH_TOKEN_PREFIX: &str = "hmac-sha256:";
 pub(crate) const CONFIG_PRINCIPAL_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const CONFIG_AUDIT_RECORDS_MAX: usize = 16_384;
 pub(crate) const CONFIG_AUDIT_PATH_MAX_BYTES: usize = 8 * 1024;
+/// Complete binary command less the single envelope's byte content. All length
+/// prefixes, proof bytes, audit handles and other metadata remain charged.
+pub(super) const CONFIG_CAPACITY_V1_METADATA_BYTES: usize = 192 * 1024;
+
+pub(super) mod record_encoding;
 
 /// Immutable scope and exact voter set for one config consensus node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +354,15 @@ pub(crate) enum ConfigMutationIntent {
     ManagementAudit(super::audit::AuditCommand),
     /// Exact configuration effect and recoverable audit outcome, applied atomically.
     AuditedMutation(super::PreparedAuditedMutation),
+    /// Reserved index 8. Legacy receivers must still report an unknown variant;
+    /// representation support alone does not enable profile admission.
+    #[serde(skip_deserializing)]
+    BoundedAppend {
+        #[serde(serialize_with = "record_encoding::serialize_commit")]
+        commit: Box<PreparedConfigCommit>,
+        binding: super::capacity_record::CapacityRecordBinding,
+        resolution: Option<ConfirmedCommitResolution>,
+    },
 }
 
 impl ConfigMutationIntent {
@@ -361,7 +375,8 @@ impl ConfigMutationIntent {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
             Self::RetainHistory(_) => 4,
-            Self::AuditedMutation(_) => 5,
+            Self::AuditedMutation(prepared) => prepared.effect.minimum_command_version(),
+            Self::BoundedAppend { .. } => 8,
             Self::ManagementAudit(command) => match command {
                 super::audit::AuditCommand::Initialize { .. }
                 | super::audit::AuditCommand::Intent(_)
@@ -375,7 +390,9 @@ impl ConfigMutationIntent {
 
     fn inline_rollback_label(&self) -> Result<Option<String>, PersistError> {
         match self {
-            Self::AppendCommit(commit) | Self::ResolveConfirmedAndAppend { commit, .. } => {
+            Self::AppendCommit(commit)
+            | Self::ResolveConfirmedAndAppend { commit, .. }
+            | Self::BoundedAppend { commit, .. } => {
                 crate::types::config_rollback_label(&commit.record.principal)
             }
             Self::MarkConfirmed { .. }
@@ -426,11 +443,13 @@ impl ConfigConsensusCommand {
         // resubmit the same durable request ID through a newer binary and
         // receive the stored outcome instead of a false collision.
         let semantic_revision = self.intent.minimum_command_version();
-        let bytes = serde_json::to_vec(&(semantic_revision, self.identity, &self.intent))
-            .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(OUTCOME_DIGEST_DOMAIN);
-        hasher.update(bytes);
+        super::encoding::digest_json(
+            &mut hasher,
+            &(semantic_revision, self.identity, &self.intent),
+        )
+        .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         Ok(hasher.finalize().into())
     }
 
@@ -441,11 +460,10 @@ impl ConfigConsensusCommand {
         previous: ConfigConsensusEntryDigest,
         effective_time: Timestamp,
     ) -> Result<ConfigConsensusEntryDigest, PersistError> {
-        let bytes = serde_json::to_vec(&(sequence, previous, effective_time, self))
-            .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(COMMAND_DIGEST_DOMAIN);
-        hasher.update(bytes);
+        super::encoding::digest_json(&mut hasher, &(sequence, previous, effective_time, self))
+            .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
         Ok(ConsensusEntryDigest::from_bytes(hasher.finalize().into()))
     }
 
@@ -465,7 +483,9 @@ impl ConfigConsensusCommand {
             4 => self.intent.minimum_command_version() <= 4,
             5 => self.intent.minimum_command_version() <= 5,
             6 => self.intent.minimum_command_version() <= 6,
-            CONFIG_CONSENSUS_COMMAND_VERSION => true,
+            CONFIG_CONSENSUS_COMMAND_VERSION => {
+                self.intent.minimum_command_version() <= CONFIG_CONSENSUS_COMMAND_VERSION
+            }
             _ => false,
         };
         if !supported_revision || self.identity != identity {
@@ -474,6 +494,11 @@ impl ConfigConsensusCommand {
             ));
         }
         match &self.intent {
+            ConfigMutationIntent::BoundedAppend { .. } => {
+                return Err(PersistError::inconsistent_state(
+                    "config consensus command scope or revision mismatch",
+                ));
+            }
             ConfigMutationIntent::AppendCommit(commit) => commit.validate()?,
             ConfigMutationIntent::ResolveConfirmedAndAppend { commit, resolution } => {
                 commit.validate()?;
@@ -500,6 +525,68 @@ impl ConfigConsensusCommand {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Private representation validation. This is never the store/apply gate:
+    /// `validate` continues to reject revision 8, including in-memory commands.
+    #[allow(dead_code)]
+    pub(super) fn validate_bounded_representation(
+        &self,
+        identity: ConfigConsensusIdentity,
+        key: &crate::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<(), PersistError> {
+        if self.schema_version != 8
+            || self.identity != identity
+            || profile != opc_crypto::ConfigCapacityProfile::BoundedV1
+        {
+            return Err(PersistError::corrupt_blob());
+        }
+        let (commit, binding, resolution) = match &self.intent {
+            ConfigMutationIntent::BoundedAppend {
+                commit,
+                binding,
+                resolution,
+            } => (commit, binding, resolution),
+            ConfigMutationIntent::AuditedMutation(prepared) => {
+                let super::audit_mutation::AuditedConfigEffect::BoundedAppend {
+                    commit,
+                    binding,
+                    resolution,
+                } = &prepared.effect
+                else {
+                    return Err(PersistError::corrupt_blob());
+                };
+                prepared
+                    .handle
+                    .verify(key, identity, prepared.handle.body.binding.caller)
+                    .map_err(|_| PersistError::corrupt_blob())?;
+                prepared
+                    .verify_effect(key)
+                    .map_err(|_| PersistError::corrupt_blob())?;
+                (commit, binding, resolution)
+            }
+            _ => return Err(PersistError::corrupt_blob()),
+        };
+        binding.verify(&commit.record, identity, key, profile)?;
+        commit.validate()?;
+        if let Some(resolution) = resolution {
+            validate_confirmed_resolution(&commit.record, *resolution)?;
+        }
+        let mut counter = opc_consensus::AppendEntriesBatchAccumulator::new();
+        counter
+            .consider(self)
+            .map_err(|_| PersistError::corrupt_blob())?;
+        if !counter
+            .serialized_entry_bytes()
+            .checked_sub(commit.record.encrypted_blob.len())
+            .is_some_and(|bytes| bytes <= CONFIG_CAPACITY_V1_METADATA_BYTES)
+        {
+            return Err(PersistError::constraint_violation(
+                "config command metadata exceeds byte limit",
+            ));
         }
         Ok(())
     }
@@ -597,7 +684,7 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
     if record.plaintext_digest.len() != 32 || record.encrypted_blob.is_empty() {
         return Err(PersistError::corrupt_blob());
     }
-    let envelope = CryptoEnvelopeV1::decode(&record.encrypted_blob)
+    let envelope = CryptoEnvelopeRef::decode(&record.encrypted_blob)
         .map_err(|_| PersistError::corrupt_blob())?;
     if envelope.nonce.len() != envelope.algorithm.nonce_len()
         || envelope.aad.is_empty()
@@ -606,7 +693,7 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
         return Err(PersistError::corrupt_blob());
     }
     let (aad, bound_key_id) =
-        opc_key::decode_bound_aad(&envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
+        opc_key::decode_bound_aad(envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
     let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
         return Err(PersistError::corrupt_blob());
     };
@@ -625,7 +712,7 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
     Ok(())
 }
 
-fn validate_record_representability(record: &CommitRecord) -> Result<(), PersistError> {
+pub(super) fn validate_record_representability(record: &CommitRecord) -> Result<(), PersistError> {
     if record.version.get() > i64::MAX as u64
         || record.principal.is_empty()
         || record.principal.len() > CONFIG_PRINCIPAL_MAX_BYTES
@@ -775,6 +862,28 @@ pub type SharedConfigConsensusClock = Arc<dyn ConfigConsensusClock>;
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn bounded_append_retains_its_inline_rollback_label() {
+        use crate::consensus::capacity_tests::support::*;
+        let mut command = bounded_command(false, None);
+        let ConfigMutationIntent::BoundedAppend { commit, .. } = &mut command.intent else {
+            unreachable!()
+        };
+        commit.record.principal = r#"{"principal":"writer","replay_lookup_digest":null,"recovery_required":false,"rollback_label":"synthetic-point"}"#.into();
+        command
+            .validate_bounded_representation(
+                identity(),
+                &key(),
+                opc_crypto::ConfigCapacityProfile::BoundedV1,
+            )
+            .unwrap();
+        assert_eq!(
+            command.intent.inline_rollback_label().unwrap(),
+            Some("synthetic-point".into())
+        );
+        assert!(command.validate(identity()).is_err());
+    }
 
     #[derive(Serialize)]
     enum LegacyConfigMutationIntent<'a> {

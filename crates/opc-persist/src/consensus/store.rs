@@ -3,6 +3,9 @@
 mod audit;
 mod audit_continuity;
 
+#[cfg(test)]
+mod capacity_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;

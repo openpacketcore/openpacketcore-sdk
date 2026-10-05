@@ -18,6 +18,7 @@ fn existing_public_types_preserve_all_auto_traits() {
     assert_traits::<opc_crypto::AuthenticatedEnvelope>();
     assert_traits::<opc_crypto::AuthenticatedEnvelopeClaim>();
     assert_traits::<AttestedConfigCommit>();
+    assert_traits::<opc_persist::audit_authority::PreparedAuditedMutation>();
 }
 
 #[tokio::test]

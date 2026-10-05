@@ -150,3 +150,31 @@ async fn end_marker_requires_available_successful_grace_and_exact_post_grace_ret
     assert_eq!(runtime.state().grouped_reader_grace_calls, 2);
     drop(authority.recover_retired(backend, desired).await.unwrap());
 }
+
+/// The socket that sends End Markers is bound on UDP/2152 of the attachment's
+/// interface, where tc then finds it as the consumer of hand-offs. It is not
+/// bound on an interface that does not receive its own frames, and no marker
+/// is sent.
+#[tokio::test]
+async fn end_marker_socket_is_not_bound_on_an_interface_that_does_not_receive_its_frames() {
+    for refusal in InterfaceRefusal::EACH {
+        let (runtime, backend, authority, desired, retired) = fixture(None).await;
+        runtime.state().grouped_reader_grace_enabled = true;
+        refusal.arm(&runtime, S2BU_IFINDEX);
+        assert!(
+            matches!(
+                authority
+                    .send_n3_end_markers(backend.clone(), retired)
+                    .await,
+                Err(GtpuN3EndMarkerError::Unsupported)
+            ),
+            "{refusal:?}"
+        );
+        // The refusal is the socket's: the retirement was validated and the
+        // readers' grace period was waited for before it.
+        assert_eq!(runtime.state().grouped_reader_grace_calls, 1);
+        assert!(control_socket_is_unopened(&backend));
+        release_interfaces(&runtime);
+        drop(authority.recover_retired(backend, desired).await.unwrap());
+    }
+}

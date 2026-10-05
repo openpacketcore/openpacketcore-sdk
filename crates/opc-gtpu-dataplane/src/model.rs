@@ -6879,9 +6879,9 @@ pub struct GtpuProbe {
     /// explicit unsupported statement. The handoff contract is
     /// handoff-capable only: it is complete only while the operator runs an
     /// SDK consumer bound on the concrete local S2b-U address (never
-    /// `0.0.0.0`); without one, reassembled sets are answered with ICMP
-    /// port unreachable and dropped. A backend must never leave this
-    /// implicit.
+    /// `0.0.0.0`); without one, tc counts each set at its first fragment and
+    /// marks it, so that the host discards the reassembled datagram and
+    /// answers nothing. A backend must never leave this implicit.
     pub downlink_outer_fragment_handling: GtpuDownlinkFragmentContract,
     /// Per-session downlink inner MTU enforcement: inner fragmentation by
     /// default, or an in-tunnel RFC 1191 Fragmentation Needed error when
@@ -6899,12 +6899,12 @@ pub struct GtpuProbe {
     /// The backend binds those queues when the control port is first opened for
     /// the attachment and keeps them until the attachment is removed or the
     /// queue is retired. Nothing is bound before that first open, while the
-    /// process is down across a restart (tc keeps steering from the pinned
-    /// graph), or after a retirement. In those windows the kernel may answer
-    /// steered packets with rate-limited ICMP Port Unreachable toward the
-    /// peer, quoting up to about 512 octets of the inner packet, as it
-    /// answers the UDP/2152 hand-offs. Open the control port before installing any context with a
-    /// downlink inner MTU. Enforcement is tracked in #1019.
+    /// process is down across a restart (tc keeps running from the pinned
+    /// graph), or after a retirement. In those windows tc drops the steered
+    /// packets and counts them
+    /// (`EbpfGtpuDatapathCounters::downlink_missing_consumer`), so the host
+    /// answers none of them with an ICMP error toward the peer. Open the
+    /// control port right after creating or adopting the attachment.
     pub downlink_inner_mtu_enforcement: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
