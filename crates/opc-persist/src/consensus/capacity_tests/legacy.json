@@ -279,5 +279,2855 @@
     "json": "[{\"tx_id\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":0,\"yang_path\":\"/fixture:items/item[name='synthetic']/value\",\"op_type\":\"CREATE\",\"previous_value\":null,\"new_value\":\"456\",\"redaction_applied\":false,\"previous_hash\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"entry_hmac\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},{\"tx_id\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":1,\"yang_path\":\"/fixture:items/item[name='synthetic']/value\",\"op_type\":\"UPDATE\",\"previous_value\":\"123\",\"new_value\":\"456\",\"redaction_applied\":false,\"previous_hash\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"entry_hmac\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},{\"tx_id\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":2,\"yang_path\":\"/fixture:items/item[name='synthetic']/value\",\"op_type\":\"DELETE\",\"previous_value\":\"123\",\"new_value\":null,\"redaction_applied\":false,\"previous_hash\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"entry_hmac\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},{\"tx_id\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":3,\"yang_path\":\"/fixture:items/item[name='synthetic']/value\",\"op_type\":\"REPLACE\",\"previous_value\":null,\"new_value\":null,\"redaction_applied\":false,\"previous_hash\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"entry_hmac\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}]",
     "name": "audit-multiple",
     "postcard": "041011111111111141118111111111111111002b2f666978747572653a6974656d732f6974656d5b6e616d653d2773796e746865746963275d2f76616c75650000010334353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001011111111111141118111111111111111012b2f666978747572653a6974656d732f6974656d5b6e616d653d2773796e746865746963275d2f76616c7565010103313233010334353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001011111111111141118111111111111111022b2f666978747572653a6974656d732f6974656d5b6e616d653d2773796e746865746963275d2f76616c75650301033132330000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001011111111111141118111111111111111032b2f666978747572653a6974656d732f6974656d5b6e616d653d2773796e746865746963275d2f76616c75650200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": true
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "writer",
+    "name": "principal-plain",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "writer",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "spiffe://example.test/tenant/t1/sa/admin",
+    "name": "principal-spiffe",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: path must follow canonical OpenPacketCore layout /tenant/<tenant-id>/ns/<namespace>/sa/<service-account>/nf/<nf-kind>/instance/<instance-id>\"))",
+    "recovery": "Ok(false)",
+    "redacted": "spiffe://example.test/tenant/t1/sa/admin",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": true,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\"}",
+    "name": "principal-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"identity\":{\"Internal\":\"spiffe://example.test/tenant/t1/sa/admin\"},\"roles\":[\"reader\",null,4],\"groups\":[\"operators\",false]}",
+    "name": "principal-nested",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: path must follow canonical OpenPacketCore layout /tenant/<tenant-id>/ns/<namespace>/sa/<service-account>/nf/<nf-kind>/instance/<instance-id>\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"identity\":{\"Internal\":\"spiffe://example.test/tenant/t1/sa/admin\"},\"roles\":[\"reader\",null,4],\"groups\":[\"operators\",false]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": true,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Ok(None)",
+    "input": "{\"principal\":\"{\\\"tenant\\\":\\\"t1\\\"}\",\"recovery_required\":false}",
+    "name": "principal-wrapped",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":\"{\\\"tenant\\\":\\\"t1\\\"}\",\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"identity\":{\"Spiffe\":\"spiffe://example.test/tenant/t1/sa/user\"},\"roles\":[\"reader\"],\"groups\":[\"operators\"]}}",
+    "name": "principal-wrapped-policy",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: path must follow canonical OpenPacketCore layout /tenant/<tenant-id>/ns/<namespace>/sa/<service-account>/nf/<nf-kind>/instance/<instance-id>\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":{\"identity\":{\"Spiffe\":\"spiffe://example.test/tenant/t1/sa/user\"},\"roles\":[\"reader\"],\"groups\":[\"operators\"]}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"unknown\":0}",
+    "name": "principal-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"unknown\":0}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"unknown\":1e999}",
+    "name": "principal-unknown-overflow",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"unknown\":1e999}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"one\",\"principal\":\"two\",\"recovery_required\":false}",
+    "name": "principal-duplicate-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"one\",\"principal\":\"two\",\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"one\",\"tenant\":\"two\"}",
+    "name": "principal-duplicate-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"one\",\"tenant\":\"two\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "two",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"one\",\"tenant\":null}",
+    "name": "principal-duplicate-tenant-nonstring",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"one\",\"tenant\":null}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"x\":{\"a\":1,\"a\":2}}",
+    "name": "principal-duplicate-nested",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"x\":{\"a\":1,\"a\":2}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "",
+    "name": "principal-empty",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\"} false",
+    "name": "principal-trailing",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\"} false",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "\"\\u0073\\u0075\\u0070\\u0069-x\"",
+    "name": "principal-unicode",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"$serde_json::private::RawValue\":\"\\\"writer\\\"\"},\"recovery_required\":false}",
+    "name": "principal-raw-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"$serde_json::private::RawValue\":\"{\\\"tenant\\\":\\\"t1\\\"}\"}",
+    "name": "principal-raw-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"$serde_json::private::RawValue\":\"\\\"\\\\u0073\\\\u0075\\\\u0070\\\\u0069-x\\\"\"}",
+    "name": "principal-raw-redaction",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"$serde_json::private::RawValue\":\"{\\\"spiffe_id\\\":\\\"spiffe://example.test/tenant/t1/sa/admin\\\"}\"}",
+    "name": "principal-raw-policy",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"$serde_json::private::RawValue\":\"{\\\"tenant\\\":\\\"other\\\"}\"}",
+    "name": "principal-raw-after-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"$serde_json::private::RawValue\":\"not json\",\"tenant\":\"t1\"}",
+    "name": "principal-raw-invalid",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"recovery_required\":{\"$serde_json::private::RawValue\":\"false\"},\"principal\":\"writer\"}",
+    "name": "principal-raw-bool",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"$serde_json::private::Number\":\"0\"},\"recovery_required\":false}",
+    "name": "principal-number-principal-marker",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":{\"$serde_json::private::Number\":\"1e999\"}}",
+    "name": "principal-number-marker",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":01}",
+    "name": "principal-invalid-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":01}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":\"\\uD800\"}",
+    "name": "principal-invalid-escape",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":\"\\uD800\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":1e999,\"tenant\":\"t1\"}",
+    "name": "principal-invalid-duplicate-value",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":1e999,\"tenant\":\"t1\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"z\":0,\"tenant\":\"t1\",\"a\":false}",
+    "name": "principal-sorted-fields",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"z\":0,\"tenant\":\"t1\",\"a\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0",
+    "name": "principal-canonical-spiffe",
+    "policy": "Ok((\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\", [\"security-admin\"], []))",
+    "recovery": "Ok(false)",
+    "redacted": "spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"identity\":{\"Internal\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"},\"roles\":[\"reader\",null],\"groups\":[\"operators\",4]}",
+    "name": "principal-canonical-policy",
+    "policy": "Ok((\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\", [\"reader\"], [\"operators\"]))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"identity\":{\"Internal\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"},\"roles\":[\"reader\",null],\"groups\":[\"operators\",4]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"identity\":{\"Spiffe\":\"spiffe://example.test/tenant/t1/ns/default/sa/user/nf/amf/instance/0\"},\"roles\":[\"reader\"],\"groups\":[\"operators\"]}}",
+    "name": "principal-canonical-wrapped-policy",
+    "policy": "Ok((\"spiffe://example.test/tenant/t1/ns/default/sa/user/nf/amf/instance/0\", [\"reader\"], [\"operators\"]))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":{\"identity\":{\"Spiffe\":\"spiffe://example.test/tenant/t1/ns/default/sa/user/nf/amf/instance/0\"},\"roles\":[\"reader\"],\"groups\":[\"operators\"]}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"$serde_json::private::RawValue\":\"{\\\"spiffe_id\\\":\\\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\\\"}\"}",
+    "name": "principal-canonical-raw-policy",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "0",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "0",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":0,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":0,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":0}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":0}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "-0",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "-0",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":-0,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":-0,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":-0}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":-0}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "9223372036854775807",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":9223372036854775807,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":9223372036854775807}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "9223372036854775808",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":9223372036854775808,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":9223372036854775808}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "-9223372036854775808",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":-9223372036854775808,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":-9223372036854775808}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "-9223372036854775809",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":-9223372036854775809,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":-9223372036854775809}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "18446744073709551615",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":18446744073709551615,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":18446744073709551615}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "18446744073709551616",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":18446744073709551616,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":18446744073709551616}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "0.1",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "0.1",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":0.1,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":0.1,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":0.1}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":0.1}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1.000000000000000111022302462515654",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1.000000000000000111022302462515654,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1.000000000000000111022302462515654}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1.7976931348623157e308",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1.7976931348623157e308,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1.7976931348623157e308}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1.7976931348623159e308",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1.7976931348623159e308,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1.7976931348623159e308}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1e309",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "1e309",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1e309,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":1e309,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1e309}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":1e309}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1e-999",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "1e-999",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1e-999,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":1e-999,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1e-999}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":1e-999}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "0e999999999999",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "0e999999999999",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":0e999999999999,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":0e999999999999,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":0e999999999999}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":0e999999999999}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1e999999999999",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1e999999999999,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1e999999999999}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "1e-999999999999",
+    "name": "principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "1e-999999999999",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":1e-999999999999,\"recovery_required\":false}",
+    "name": "principal-principal-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":1e-999999999999,\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":1e-999999999999}",
+    "name": "principal-tenant-number",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":1e-999999999999}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "name": "principal-deep-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "name": "principal-deep-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "name": "principal-deep-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "name": "principal-deep-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "name": "principal-deep-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "name": "principal-deep-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(Some(\"{\\\"principal\\\":\\\"writer\\\",\\\"recovery_required\\\":false}\"))",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":true}",
+    "name": "principal-recovery-true",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(true)",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":true}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"recovery_required\":true}",
+    "name": "principal-duplicate-recovery",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"recovery_required\":true}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":null,\"replay_lookup_digest\":null}",
+    "name": "principal-duplicate-digest",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":null,\"replay_lookup_digest\":null}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"one\",\"rollback_label\":\"two\"}",
+    "name": "principal-duplicate-label",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"one\",\"rollback_label\":\"two\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(None)",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":null}",
+    "name": "principal-digest-null",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":null}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":0}",
+    "name": "principal-digest-wrong-type",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":0}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(Some(\"{\\\"principal\\\":\\\"writer\\\",\\\"recovery_required\\\":false,\\\"rollback_label\\\":\\\"release-1\\\"}\"))",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":true,\"rollback_label\":\"release-1\"}",
+    "name": "principal-label-valid",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(true)",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":true,\"rollback_label\":\"release-1\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(Some(\"release-1\"))",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(None)",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":null}",
+    "name": "principal-label-null",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":null}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":false}",
+    "name": "principal-label-wrong-type",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"\"}",
+    "name": "principal-label-empty",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\" release-1\"}",
+    "name": "principal-label-whitespace",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\" release-1\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"release\\u0000\"}",
+    "name": "principal-label-control",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"release\\u0000\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":{\"$serde_json::private::RawValue\":\"\\\"release-1\\\"\"}}",
+    "name": "principal-raw-label",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(Some(\"{\\\"principal\\\":\\\"writer\\\",\\\"recovery_required\\\":false}\"))",
+    "input": " \t\r\n { \"principal\" : \"writer\" , \"recovery_required\" : true } \n\r \t",
+    "name": "principal-whitespace",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must not contain leading or trailing whitespace\"))",
+    "recovery": "Ok(true)",
+    "redacted": " \t\r\n { \"principal\" : \"writer\" , \"recovery_required\" : true } \n\r \t",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"te\\u006eant\":\"t1\"}",
+    "name": "principal-escaped-tenant-key",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"te\\u006eant\":\"t1\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(Some(\"{\\\"principal\\\":\\\"writer\\\",\\\"recovery_required\\\":false}\"))",
+    "input": "{\"princ\\u0069pal\":\"writer\",\"recovery_re\\u0071uired\":true}",
+    "name": "principal-escaped-metadata-keys",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(true)",
+    "redacted": "{\"princ\\u0069pal\":\"writer\",\"recovery_re\\u0071uired\":true}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "\"\\ud83d\\ude00\"",
+    "name": "principal-surrogate-pair",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"\\ud83d\\ude00\"",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Ok(Some(\"{\\\"principal\\\":\\\"😀\\\",\\\"recovery_required\\\":false}\"))",
+    "input": "{\"principal\":\"\\ud83d\\ude00\",\"recovery_required\":true}",
+    "name": "principal-wrapped-surrogate-pair",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(true)",
+    "redacted": "{\"principal\":\"\\ud83d\\ude00\",\"recovery_required\":true}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":\"\\u0000\"}",
+    "name": "principal-escaped-nul",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":\"\\u0000\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "\"\u0000\"",
+    "name": "principal-raw-nul",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "\"\u0000\"",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "﻿{\"tenant\":\"t1\"}",
+    "name": "principal-byte-order-mark",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "﻿{\"tenant\":\"t1\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "[{\"tenant\":\"t1\"}]",
+    "name": "principal-array",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "[{\"tenant\":\"t1\"}]",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "null",
+    "name": "principal-null",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "null",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "true",
+    "name": "principal-true",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "true",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "false",
+    "name": "principal-false",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "false",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":5}",
+    "name": "principal-tenant-wrong-type",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":5}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"identity\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"}",
+    "name": "principal-policy-identity-string",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"identity\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"spiffe_id\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\",\"roles\":{\"reader\":true}}",
+    "name": "principal-policy-roles-object",
+    "policy": "Ok((\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\", [\"security-admin\"], []))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"spiffe_id\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\",\"roles\":{\"reader\":true}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"spiffe_id\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\",\"groups\":\"operators\"}",
+    "name": "principal-policy-groups-string",
+    "policy": "Ok((\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\", [\"security-admin\"], []))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"spiffe_id\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\",\"groups\":\"operators\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"}",
+    "name": "principal-policy-principal-string",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":null,\"spiffe_id\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"}",
+    "name": "principal-policy-principal-null",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":null,\"spiffe_id\":\"spiffe://example.test/tenant/t1/ns/default/sa/admin/nf/amf/instance/0\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(Some(\"{\\\"principal\\\":\\\"writer\\\",\\\"replay_lookup_digest\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"recovery_required\\\":false}\"))",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":true,\"replay_lookup_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "name": "principal-digest-valid",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(true)",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":true,\"replay_lookup_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "redaction_applied": false,
+    "replay": "Ok(Some(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"))",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":true,\"replay_lookup_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "name": "principal-digest-short",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":true,\"replay_lookup_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":true,\"replay_lookup_digest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}",
+    "name": "principal-digest-uppercase",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":true,\"replay_lookup_digest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"replay_lookup_digest\":{\"$serde_json::private::RawValue\":\"\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\"\"}}",
+    "name": "principal-raw-digest",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "\"<redacted>\"",
+    "redaction_applied": true,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": true
+    },
+    "clear_recovery": "Ok(None)",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+    "name": "principal-label-boundary",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(Some(\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"))",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+    "name": "principal-label-boundary",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"rollback_label\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "name": "principal-deep-object-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "t1",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "name": "principal-deep-object-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "name": "principal-deep-object-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "name": "principal-deep-object-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-tenant",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"tenant\":\"t1\",\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": true,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "name": "principal-deep-object-principal",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Ok(false)",
+    "redacted": "{\"principal\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"recovery_required\":false}",
+    "redaction_applied": false,
+    "replay": "Ok(None)",
+    "rollback": "Ok(None)",
+    "tenant": "default",
+    "valid": true
+  },
+  {
+    "aad_matches": {
+      "nested_tenant": false,
+      "other": false,
+      "same_input": false,
+      "writer": false
+    },
+    "clear_recovery": "Err(PersistError { kind: CorruptBlob })",
+    "input": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "name": "principal-deep-object-unknown",
+    "policy": "Err(Unauthorized(\"Invalid SPIFFE ID: must start with 'spiffe://'\"))",
+    "recovery": "Err(PersistError { kind: CorruptBlob })",
+    "redacted": "{\"principal\":\"writer\",\"recovery_required\":false,\"extra\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "redaction_applied": false,
+    "replay": "Err(PersistError { kind: CorruptBlob })",
+    "rollback": "Err(PersistError { kind: CorruptBlob })",
+    "tenant": "default",
+    "valid": false
   }
 ]

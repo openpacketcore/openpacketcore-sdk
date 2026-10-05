@@ -163,3 +163,39 @@ fn timestamp_outside_rfc3339_range_returns_a_serialization_error() {
     assert!(write!(&mut String::new(), "{timestamp}").is_err());
     assert!(serde_json::to_vec(&timestamp).is_err());
 }
+
+#[test]
+fn timestamp_parse_rejects_out_of_range_utc_without_panicking() {
+    for input in ["9999-12-31T23:59:59-01:00", "-9999-01-01T00:00:00+01:00"] {
+        assert!(input.parse::<Timestamp>().is_err());
+        let json = serde_json::to_vec(input).unwrap();
+        assert!(serde_json::from_slice::<Timestamp>(&json).is_err());
+    }
+    for input in ["0000-01-01T00:00:00Z", "9999-12-31T23:59:59.999999999Z"] {
+        assert_eq!(input.parse::<Timestamp>().unwrap().to_string(), input);
+    }
+}
+
+#[test]
+fn timestamp_infallible_conversion_saturates_at_both_utc_bounds() {
+    use time::PrimitiveDateTime;
+    for (local, offset) in [
+        (
+            PrimitiveDateTime::MIN,
+            UtcOffset::from_hms(1, 0, 0).unwrap(),
+        ),
+        (
+            PrimitiveDateTime::MAX,
+            UtcOffset::from_hms(-1, 0, 0).unwrap(),
+        ),
+    ] {
+        let input = local.assume_offset(offset);
+        assert!(input.checked_to_offset(UtcOffset::UTC).is_none());
+        let expected = local.assume_utc();
+        assert_eq!(
+            *Timestamp::from_offset_datetime(input).as_offset_datetime(),
+            expected
+        );
+        assert_eq!(*Timestamp::from(input).as_offset_datetime(), expected);
+    }
+}

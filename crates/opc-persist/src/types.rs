@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use hmac::{Hmac, KeyInit, Mac};
 use opc_data_governance::DataClass;
 use opc_redaction::{redact, RedactionLevel};
-use serde::de::{IgnoredAny, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::net::Ipv6Addr;
 use std::{fmt, fmt::Debug};
@@ -785,99 +784,82 @@ struct ConfigPrincipalMetadataProbe {
     invalid_field_type: bool,
 }
 
-impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ProbeVisitor;
-
-        impl<'de> Visitor<'de> for ProbeVisitor {
-            type Value = ConfigPrincipalMetadataProbe;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a JSON object")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut probe = ConfigPrincipalMetadataProbe {
-                    is_object: true,
-                    ..ConfigPrincipalMetadataProbe::default()
-                };
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
-                        "principal" => {
-                            probe.saw_reserved_field = true;
-                            if probe.saw_principal {
-                                probe.duplicate_reserved_field = true;
-                            }
-                            probe.saw_principal = true;
-                            let value = map.next_value::<serde_json::Value>()?;
-                            match value {
-                                serde_json::Value::String(principal) => {
-                                    probe.principal = Some(principal);
-                                }
-                                _ => probe.invalid_field_type = true,
-                            }
+impl ConfigPrincipalMetadataProbe {
+    fn parse(input: &str) -> Result<Self, ()> {
+        let mut parser = crate::json_text::Parser::new(input);
+        let mut probe = Self {
+            is_object: true,
+            ..Self::default()
+        };
+        parser.object(0, |parser, field| {
+            match field.as_str() {
+                "principal" => {
+                    probe.saw_reserved_field = true;
+                    if probe.saw_principal {
+                        probe.duplicate_reserved_field = true;
+                    }
+                    probe.saw_principal = true;
+                    let value = parser.value(1)?;
+                    match value {
+                        crate::json_text::Json::String(principal) => {
+                            probe.principal = Some(principal);
                         }
-                        "replay_lookup_digest" => {
-                            probe.saw_reserved_field = true;
-                            if probe.saw_replay_lookup_digest {
-                                probe.duplicate_reserved_field = true;
-                            }
-                            probe.saw_replay_lookup_digest = true;
-                            let value = map.next_value::<serde_json::Value>()?;
-                            match value {
-                                serde_json::Value::Null => probe.replay_lookup_digest = None,
-                                serde_json::Value::String(digest) => {
-                                    probe.replay_lookup_digest = Some(digest);
-                                }
-                                _ => probe.invalid_field_type = true,
-                            }
-                        }
-                        "recovery_required" => {
-                            probe.saw_reserved_field = true;
-                            if probe.saw_recovery_required {
-                                probe.duplicate_reserved_field = true;
-                            }
-                            probe.saw_recovery_required = true;
-                            let value = map.next_value::<serde_json::Value>()?;
-                            match value {
-                                serde_json::Value::Bool(required) => {
-                                    probe.recovery_required = Some(required);
-                                }
-                                _ => probe.invalid_field_type = true,
-                            }
-                        }
-                        "rollback_label" => {
-                            probe.saw_reserved_field = true;
-                            if probe.saw_rollback_label {
-                                probe.duplicate_reserved_field = true;
-                            }
-                            probe.saw_rollback_label = true;
-                            let value = map.next_value::<serde_json::Value>()?;
-                            match value {
-                                serde_json::Value::Null => probe.rollback_label = None,
-                                serde_json::Value::String(label) => {
-                                    probe.rollback_label = Some(label);
-                                }
-                                _ => probe.invalid_field_type = true,
-                            }
-                        }
-                        _ => {
-                            probe.unknown_field = true;
-                            map.next_value::<IgnoredAny>()?;
-                        }
+                        _ => probe.invalid_field_type = true,
                     }
                 }
-                Ok(probe)
+                "replay_lookup_digest" => {
+                    probe.saw_reserved_field = true;
+                    if probe.saw_replay_lookup_digest {
+                        probe.duplicate_reserved_field = true;
+                    }
+                    probe.saw_replay_lookup_digest = true;
+                    let value = parser.value(1)?;
+                    match value {
+                        crate::json_text::Json::Null => probe.replay_lookup_digest = None,
+                        crate::json_text::Json::String(digest) => {
+                            probe.replay_lookup_digest = Some(digest);
+                        }
+                        _ => probe.invalid_field_type = true,
+                    }
+                }
+                "recovery_required" => {
+                    probe.saw_reserved_field = true;
+                    if probe.saw_recovery_required {
+                        probe.duplicate_reserved_field = true;
+                    }
+                    probe.saw_recovery_required = true;
+                    let value = parser.value(1)?;
+                    match value {
+                        crate::json_text::Json::Bool(required) => {
+                            probe.recovery_required = Some(required);
+                        }
+                        _ => probe.invalid_field_type = true,
+                    }
+                }
+                "rollback_label" => {
+                    probe.saw_reserved_field = true;
+                    if probe.saw_rollback_label {
+                        probe.duplicate_reserved_field = true;
+                    }
+                    probe.saw_rollback_label = true;
+                    let value = parser.value(1)?;
+                    match value {
+                        crate::json_text::Json::Null => probe.rollback_label = None,
+                        crate::json_text::Json::String(label) => {
+                            probe.rollback_label = Some(label);
+                        }
+                        _ => probe.invalid_field_type = true,
+                    }
+                }
+                _ => {
+                    probe.unknown_field = true;
+                    parser.skip()?;
+                }
             }
-        }
-
-        deserializer.deserialize_any(ProbeVisitor)
+            Ok(())
+        })?;
+        parser.end()?;
+        Ok(probe)
     }
 }
 
@@ -888,7 +870,7 @@ enum ParsedConfigPrincipal {
 }
 
 fn parse_config_principal(stored: &str) -> ParsedConfigPrincipal {
-    let Ok(probe) = serde_json::from_str::<ConfigPrincipalMetadataProbe>(stored) else {
+    let Ok(probe) = ConfigPrincipalMetadataProbe::parse(stored) else {
         return ParsedConfigPrincipal::Legacy;
     };
     if !probe.is_object || !probe.saw_reserved_field {
@@ -1027,10 +1009,13 @@ pub(crate) fn validate_rollback_label(label: &str) -> Result<(), PersistError> {
     Ok(())
 }
 
+/// Extract a string tenant from principal JSON or a SPIFFE path, defaulting to
+/// `"default"` otherwise. JSON object keys, including dependency-private marker
+/// names, are ordinary keys in every build; they never unwrap another value.
 pub fn extract_tenant(principal: &str) -> String {
     let wrapped = wrapped_config_principal(principal);
     let principal = wrapped.as_deref().unwrap_or(principal);
-    if let Some(tenant) = serde_json::from_str::<serde_json::Value>(principal)
+    if let Some(tenant) = crate::json_text::parse(principal)
         .ok()
         .and_then(|principal| {
             principal
@@ -1118,15 +1103,18 @@ pub fn is_sensitive(path: &str, raw_val: &str) -> bool {
     false
 }
 
+/// Mask sensitive audit values after interpreting valid JSON with the stored
+/// format's integer/finite-float rules. Object keys are ordinary keys, including
+/// dependency-private marker names; dependency features cannot unwrap them.
 pub fn redact_entry(path: &str, value_opt: &mut Option<String>, redaction_applied: &mut bool) {
     if let Some(val) = value_opt {
         if val == "\"<redacted>\"" || val == "<redacted>" {
             return;
         }
 
-        let raw_val = match serde_json::from_str::<serde_json::Value>(val) {
-            Ok(serde_json::Value::String(s)) => s,
-            Ok(json_value) => json_value.to_string(),
+        let raw_val = match crate::json_text::parse(val) {
+            Ok(crate::json_text::Json::String(s)) => s,
+            Ok(json_value) => serde_json::to_string(&json_value).unwrap_or_else(|_| val.clone()),
             Err(_) => val.clone(),
         };
 

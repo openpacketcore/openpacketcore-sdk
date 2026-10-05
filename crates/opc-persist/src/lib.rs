@@ -110,6 +110,7 @@ pub mod break_glass;
 mod consensus;
 mod consumer_checkpoint;
 mod error;
+mod json_text;
 mod local_sqlite;
 pub use consumer_checkpoint::{
     ConsumerCheckpointBinding, ConsumerCheckpointError, ConsumerCheckpointOptions,

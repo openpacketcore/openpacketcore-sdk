@@ -174,8 +174,17 @@ impl Timestamp {
     }
 
     /// Convert an `OffsetDateTime` to UTC and wrap it.
+    ///
+    /// An instant outside the supported UTC range saturates to its nearest
+    /// bound. Parsing text instead returns an error for an out-of-range instant.
     pub fn from_offset_datetime(value: OffsetDateTime) -> Self {
-        Self(value.to_offset(UtcOffset::UTC))
+        Self(value.checked_to_offset(UtcOffset::UTC).unwrap_or_else(|| {
+            if value.offset().is_positive() {
+                time::PrimitiveDateTime::MIN.assume_utc()
+            } else {
+                time::PrimitiveDateTime::MAX.assume_utc()
+            }
+        }))
     }
 
     /// Access the inner `OffsetDateTime`.
@@ -223,7 +232,12 @@ impl FromStr for Timestamp {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let parsed = OffsetDateTime::parse(value, &Rfc3339)
             .map_err(|err| ParseError::new("timestamp", err.to_string()))?;
-        Ok(Self::from_offset_datetime(parsed))
+        parsed
+            .checked_to_offset(UtcOffset::UTC)
+            .map(Self)
+            .ok_or_else(|| {
+                ParseError::new("timestamp", "UTC instant is outside the supported range")
+            })
     }
 }
 
