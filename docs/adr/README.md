@@ -39,3 +39,4 @@ accepted.
 | [0024](0024-route-operation-conflict-exclusion.md) | Route operations exclude intersecting kernel keys while independent operations use bounded concurrent workers; dispatched inverses retain exclusion after cancellation. |
 | [0025](0025-management-audit-continuity.md) | Management signing transitions, complete frozen exports and acknowledged pruning share the configuration authority and verify an independently stored monotonic checkpoint. |
 | [0026](0026-exclusive-xfrm-namespace-reset.md) | An exclusive writer retaining no predecessor state can reset namespace XFRM tables and bound stores before ordinary actor commands, with ordered empty readback and monotonic writer epochs. |
+| [0027](0027-exclusive-workload-scope-reset.md) | An explicit exclusive workload reset removes incompatible eBPF leftovers across its declared interfaces while preserving writer locks, selector history and loaded-map reference guards. |

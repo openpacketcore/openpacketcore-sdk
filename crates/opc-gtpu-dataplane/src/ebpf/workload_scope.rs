@@ -87,6 +87,104 @@ impl EbpfGtpuDataplaneBackend {
         scope: EbpfWorkloadScope,
         interface: &str,
     ) -> Result<(), GtpuError> {
+        self.reset_workload(scope, interface, false).await
+    }
+
+    /// Reconcile an exclusively owned workload scope to absence.
+    ///
+    /// # Ownership contract
+    /// The caller owns the entire root, its pinned programs and links, and the
+    /// named interface plus every root leaf naming an interface in the current
+    /// network namespace. Stop the old writer, invalidate its forwarding
+    /// generation and isolate ingress on all those interfaces first. Never
+    /// combine this operation with externally authorized retained-graph recovery.
+    /// A scope that was ever bound to a selector namespace cannot use this reset.
+    ///
+    /// With several interfaces, reset every intended interface before the first
+    /// [`crate::GtpuDataplaneBackend::create_device`]. Missing pins cannot identify
+    /// unnamed interfaces. Once this backend manages any device, it refuses all
+    /// resets until its managed devices are removed.
+    ///
+    /// On those interfaces reset detaches the configured clsact ingress/egress
+    /// slots (chain zero, `ETH_P_ALL`, configured priority, handle `0:1`), every
+    /// SDK filter matched by the ordinary attach predicate, and every filter
+    /// whose program references a scope map, regardless of priority or handle.
+    /// Map references also find renamed interfaces in this namespace; only the
+    /// referencing filters on those devices are detached. Other filters remain.
+    /// Declared names resolve to kernel indices, including alternative names.
+    /// Failed, oversized or unparseable dumps on other interfaces and non-UTF-8
+    /// names are skipped during discovery; unresolved map references still refuse.
+    /// Direct tc deletion stays in the calling network namespace. Unlinking a
+    /// scope's pinned link detaches its attachment wherever it is, including
+    /// another interface, namespace or hook type, when the final reference ends.
+    /// The declaration that every pinned object belongs to the workload covers
+    /// that effect.
+    ///
+    /// Unlike [`Self::reset_workload_graph`], unknown map names/shapes, retained
+    /// records, partial layouts and pinned links/programs do not restrict cleanup.
+    /// All interface hooks and object pins retire before map pins. The reset
+    /// waits up to **250 ms** for retired program IDs and scope-map references,
+    /// including references left by a previous call, then scans references before
+    /// each map unpin. Empty writer-lock directories and existing exclusion
+    /// markers retain their inodes. Success permits ordinary attachment on this
+    /// backend; no sessions survive. Repetition on an absent scope succeeds.
+    /// Two foreign-only layouts can survive successful reset and still block
+    /// ordinary attach: a non-SDK `ETH_P_ALL` filter at the configured priority
+    /// and handle `0:1` in a nonzero chain, or a directory named
+    /// `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside a retained writer or
+    /// operation-lock directory. Existing SDK generations create neither layout;
+    /// the writer responsible must correct it.
+    ///
+    /// # Environment and interruption
+    /// Requires `CAP_NET_ADMIN` for tc and `CAP_SYS_ADMIN` for global program
+    /// enumeration whenever a map or retired program is inspected; `CAP_BPF`
+    /// alone is insufficient. bpffs, procfs, netlink, `bpf`, `openat2` and filesystem
+    /// operations must be accessible, with enough file descriptors to hold the
+    /// inventory. The root and retained lock directories require the effective
+    /// uid/gid and mode `0700`.
+    ///
+    /// Root/lock directories may be created before inspection. After interruption,
+    /// complete the next **exclusive** reset: conservative reset and ordinary
+    /// attach may refuse an unfinished exclusion marker until it succeeds.
+    ///
+    /// # Errors
+    /// - A busy writer/operation lock returns `RetryRequired` with
+    ///   `ebpf_workload_cleanup_writer_busy`; it ends when the holder releases
+    ///   the lock or exits.
+    /// - `StateIndeterminate` with `ebpf_exclusive_workload_external_program_reference`
+    ///   means a program this reset did not detach still references a scope map
+    ///   after the bounded wait. Both reference errors may be retried with
+    ///   back-off: delayed kernel teardown from an earlier call can settle, but
+    ///   a live external namespace, program/link pin or descriptor must retire.
+    ///   Repeated reset does not force that holder away. Referenced maps stay pinned.
+    /// - `StateIndeterminate` with `ebpf_exclusive_workload_detached_program_reference`
+    ///   means a retired program still references a map after the 250 ms wait.
+    ///   Delayed kernel release may settle by itself; an external holder must
+    ///   release its reference. Retrying has no guarantee of convergence.
+    /// - Selector-authority, decommission and legacy selector-terminal markers,
+    ///   or a pending terminal admission on this backend, return `UnsupportedFeature`.
+    ///   They require their separate lifecycle and never end through repeated reset.
+    /// - Wrong root/invalid interface and locally managed devices require caller
+    ///   correction. Identity changes may settle after a concurrent operation ends.
+    ///   Inspection failures never grant deletion authority; denied permissions,
+    ///   symlinks, nested mounts, invalid lock metadata or unavailable kernel
+    ///   facilities require fixing the environment, not unbounded retries.
+    ///
+    /// Keep ingress isolated and do not attach or serve after any error.
+    pub async fn reset_exclusive_workload_graph(
+        &self,
+        scope: EbpfWorkloadScope,
+        interface: &str,
+    ) -> Result<(), GtpuError> {
+        self.reset_workload(scope, interface, true).await
+    }
+
+    async fn reset_workload(
+        &self,
+        scope: EbpfWorkloadScope,
+        interface: &str,
+        exclusive: bool,
+    ) -> Result<(), GtpuError> {
         if self.inner.config.bpffs_pin_root != scope.bpffs_pin_root() {
             return Err(GtpuError::invalid_config(
                 "ebpf.workload_scope",
@@ -105,11 +203,28 @@ impl EbpfGtpuDataplaneBackend {
                 Err(GtpuError::NotFound) => None,
                 Err(error) => return Err(error),
             };
-            backend.inner.runtime.reset_workload_graph(
-                ifindex,
-                &backend.pin_dir(&interface),
-                backend.inner.config.tc_priority,
-            )
+            if exclusive {
+                if backend
+                    .terminal_admissions()?
+                    .keys()
+                    .any(|path| path.starts_with(scope.bpffs_pin_root()))
+                {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "exclusive_workload_cleanup_pending_terminal_admission",
+                    });
+                }
+                backend.inner.runtime.reset_exclusive_workload_graph(
+                    ifindex,
+                    &backend.pin_dir(&interface),
+                    backend.inner.config.tc_priority,
+                )
+            } else {
+                backend.inner.runtime.reset_workload_graph(
+                    ifindex,
+                    &backend.pin_dir(&interface),
+                    backend.inner.config.tc_priority,
+                )
+            }
         })
         .await
     }
@@ -143,6 +258,46 @@ pub(super) fn cleanup(port: &mut impl WorkloadCleanup) -> Result<(), GtpuError> 
     port.detach_owned_hooks()?;
     for index in inventory.pins {
         port.unpin(index)?;
+    }
+    port.finish()
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) struct ExclusiveCleanupInventory {
+    pub(super) interfaces: Vec<usize>,
+    pub(super) object_pins: Vec<usize>,
+    pub(super) pins: Vec<usize>,
+    pub(super) selector_bound: bool,
+}
+
+/// The exclusive adapter inventories every leaf before effects. Program and
+/// link pins must retire before the bounded release wait and map-reference scan.
+#[cfg(any(target_os = "linux", test))]
+pub(super) trait ExclusiveWorkloadCleanup {
+    fn inventory(&mut self) -> Result<ExclusiveCleanupInventory, GtpuError>;
+    fn detach_interface(&mut self, interface: usize) -> Result<(), GtpuError>;
+    fn unpin(&mut self, index: usize) -> Result<(), GtpuError>;
+    fn wait_for_detached_programs(&mut self) -> Result<(), GtpuError>;
+    fn finish(&mut self) -> Result<(), GtpuError>;
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn cleanup_exclusive(port: &mut impl ExclusiveWorkloadCleanup) -> Result<(), GtpuError> {
+    let inventory = port.inventory()?;
+    if inventory.selector_bound {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "workload_cleanup_bound_selector_namespace",
+        });
+    }
+    for interface in inventory.interfaces {
+        port.detach_interface(interface)?;
+    }
+    for pin in inventory.object_pins {
+        port.unpin(pin)?;
+    }
+    port.wait_for_detached_programs()?;
+    for pin in inventory.pins {
+        port.unpin(pin)?;
     }
     port.finish()
 }
@@ -274,5 +429,94 @@ mod tests {
         assert!(port.selector_bound && port.hooks);
         assert_eq!(port.effects, 0);
         assert_eq!(port.pins.len(), super::super::CURRENT_EBPF_GRAPH_PIN_COUNT);
+    }
+
+    #[test]
+    fn exclusive_cleanup_orders_every_interface_and_object_before_map_removal() {
+        struct Scope {
+            hooks: [[bool; 2]; 3],
+            object_pins: BTreeSet<usize>,
+            map_pins: BTreeSet<usize>,
+            released: bool,
+            cut: Option<usize>,
+            effects: usize,
+        }
+        impl Scope {
+            fn effect(&mut self) -> Result<(), GtpuError> {
+                self.effects += 1;
+                if self.cut == Some(self.effects) {
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "injected_cut",
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl ExclusiveWorkloadCleanup for Scope {
+            fn inventory(&mut self) -> Result<ExclusiveCleanupInventory, GtpuError> {
+                self.released = false;
+                self.effect()?;
+                Ok(ExclusiveCleanupInventory {
+                    interfaces: vec![0, 1, 2],
+                    object_pins: self.object_pins.iter().copied().collect(),
+                    pins: self.map_pins.iter().copied().collect(),
+                    selector_bound: false,
+                })
+            }
+            fn detach_interface(&mut self, interface: usize) -> Result<(), GtpuError> {
+                for direction in 0..2 {
+                    self.hooks[interface][direction] = false;
+                    self.effect()?;
+                }
+                Ok(())
+            }
+            fn unpin(&mut self, pin: usize) -> Result<(), GtpuError> {
+                assert_eq!(self.hooks, [[false; 2]; 3], "all leaves must detach first");
+                if !self.object_pins.remove(&pin) {
+                    assert!(
+                        self.object_pins.is_empty(),
+                        "links and programs retire first"
+                    );
+                    assert!(
+                        self.released,
+                        "wait for detached programs before map removal"
+                    );
+                    assert!(self.map_pins.remove(&pin));
+                }
+                self.effect()
+            }
+            fn wait_for_detached_programs(&mut self) -> Result<(), GtpuError> {
+                assert_eq!(self.hooks, [[false; 2]; 3]);
+                assert!(self.object_pins.is_empty());
+                self.released = true;
+                self.effect()
+            }
+            fn finish(&mut self) -> Result<(), GtpuError> {
+                assert!(self.map_pins.is_empty());
+                assert!(self.released);
+                self.effect()
+            }
+        }
+        // 1 complete inventory, 6 hook detaches across 3 interfaces, 2 object
+        // pins, 1 wait, 5 map/directory removals, 1 finish. Include a cut inside
+        // each interface's detach, between directions, as well as driver steps.
+        for cut in 1..=16 {
+            let mut port = Scope {
+                hooks: [[true; 2]; 3],
+                object_pins: [0, 1].into_iter().collect(),
+                map_pins: (2..7).collect(),
+                released: false,
+                cut: Some(cut),
+                effects: 0,
+            };
+            assert!(cleanup_exclusive(&mut port).is_err(), "cut {cut}");
+            assert_eq!(port.effects, cut);
+            port.cut = None;
+            cleanup_exclusive(&mut port).unwrap();
+            cleanup_exclusive(&mut port).unwrap();
+            assert!(port.map_pins.is_empty());
+            assert!(port.object_pins.is_empty());
+        }
     }
 }

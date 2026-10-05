@@ -1783,10 +1783,12 @@ record.
 
 The optional `EbpfWorkloadScope` lifecycle applies only to unbound IPv4
 interface graphs outside this RFC's grouped selector namespace protocol.
-`reset_workload_graph` MUST refuse a namespace containing selector-authority
-or decommission markers, including an otherwise empty graph. It MUST NOT
-remove either marker or infer a fresh durable selector history from graph
-absence. Its local writer lock and repeatable pin inventory are not substitutes
+Both `reset_workload_graph` and `reset_exclusive_workload_graph` MUST refuse a
+namespace containing selector-authority, decommission or legacy selector-terminal
+markers, including an otherwise empty graph. A scope that was ever bound to a
+selector namespace cannot use the exclusive reset. Neither method may remove
+these markers or infer a fresh durable selector history from graph absence.
+Their local writer locks and repeatable pin inventories are not substitutes
 for this RFC's permanent protected record or authority-bearing migration.
 
 | Threat | Required mitigation |

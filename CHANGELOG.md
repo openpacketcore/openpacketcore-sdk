@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encryption claims and envelope aliases. Existing encryption and storage
   profiles keep their limits and byte formats.
 
+- `opc-gtpu-dataplane`: add `reset_exclusive_workload_graph` for callers that
+  exclusively own a workload scope. Reconcile all of its interfaces, including
+  renamed devices and predecessor priorities, and remove unknown pins, link and
+  program pins, incompatible maps and retained records before ordinary attach.
+  Retain writer, selector and program-reference guards with distinct refusals. The conservative `reset_workload_graph` is unchanged. Refs #1100.
+
 - `opc-session-net`: add opt-in V2 publication authority reads across the
   complete authenticated fixed voter set and per-reader shared-pool diagnostics.
   `into_fenced_mutation_roster_v2_provider_adapter_with_publication_voters`
