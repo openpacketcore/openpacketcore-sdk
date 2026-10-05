@@ -129,6 +129,40 @@ async fn workload_strict_reset_owned_restart_reports_zero() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_predecessor_priority_with_and_without_pins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::predecessor_priority_with_and_without_pins().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_alternative_name_without_pins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::alternative_name_without_pins().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_interrupted_exclusion_publication(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::interrupted_exclusion_publication().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_map_reference_authority() -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::map_reference_authority().await
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_SYS_ADMIN/CAP_NET_ADMIN, a fresh netns, and bpffs"]
+async fn workload_strict_reset_foreign_pinned_link_releases_other_interface(
+) -> Result<(), Box<dyn std::error::Error>> {
+    strict_workload_reset::foreign_pinned_link_releases_other_interface().await
+}
+
+#[tokio::test]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_tft_fragmented_esp_pair() -> Result<(), Box<dyn std::error::Error>> {
     tft_fragment_affinity::qualify_pair().await?;

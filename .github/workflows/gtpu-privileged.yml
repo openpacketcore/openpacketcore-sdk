@@ -565,8 +565,9 @@ jobs:
           # in a VRF are not in this subset: the pinned image does not ship
           # the vrf driver, and the guest is offline. They run in the runner
           # job and in the el9 job.
-          grep -Fq 'test result: ok. 39 passed; 0 failed;' <<< "${live_output}"
+          grep -Fq 'test result: ok. 44 passed; 0 failed;' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_EXCLUSIVE_PINNED_LINK_EXERCISED' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_STRICT_PINNED_LINK_EXERCISED' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_DOWNLINK_HAND_OFF_CONSUMER_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_ATTACHMENT_RECEIVE_INTERFACE_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_ATTACHMENT_BELOW_STACKED_DEVICE_PROVEN:' <<< "${live_output}"

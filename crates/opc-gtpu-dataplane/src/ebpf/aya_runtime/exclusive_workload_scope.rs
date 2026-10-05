@@ -333,13 +333,90 @@ struct Node {
     identity: (u64, u64),
     directory: Option<File>,
     // Holding maps prevents map-ID reuse across reference scans and unlink.
-    map: Option<(MapData, u32)>,
+    map: Option<ScopeMap>,
     program_id: Option<u32>,
     object_pin: bool,
     // Keep the pin inode alive as well as its object, preventing inode reuse.
     _pin: Option<File>,
     keep: bool,
     removed: bool,
+}
+
+struct ScopeMap {
+    _data: MapData,
+    id: u32,
+    sdk: bool,
+}
+
+fn sdk_map(name: &OsStr, data: &MapData) -> Result<bool, GtpuError> {
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    let info = data.info().map_err(|_| state_indeterminate(OPERATION))?;
+    if info.map_flags() != 0 {
+        return Ok(false);
+    }
+    let Ok(map_type) = info.map_type() else {
+        // An unknown kernel type cannot match a known SDK definition.
+        return Ok(false);
+    };
+    let map_type = map_type as u32;
+    let definition = |kind, key, value, capacity| {
+        (
+            map_type,
+            info.key_size(),
+            info.value_size(),
+            info.max_entries(),
+        ) == (kind, key, value, capacity)
+    };
+    if info.name() == kernel_program_name(name)
+        && (CURRENT_MAP_SPECS.iter().any(|spec| {
+            spec.name == name
+                && (definition(
+                    spec.map_type,
+                    spec.key_size,
+                    spec.value_size,
+                    spec.max_entries,
+                ) || name == MAP_COUNTERS
+                    && definition(
+                        spec.map_type,
+                        spec.key_size,
+                        spec.value_size,
+                        PRE_REDIRECT_COUNTER_SLOTS,
+                    ))
+        }) || LEGACY_V1_MAP_SPECS
+            .iter()
+            .chain(&LEGACY_V2_MAP_SPECS)
+            .chain(&PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS)
+            .any(|spec| {
+                spec.name == name
+                    && definition(
+                        spec.map_type,
+                        spec.key_size,
+                        spec.value_size,
+                        spec.max_entries,
+                    )
+            }))
+    {
+        return Ok(true);
+    }
+    // Recovery records are standalone arrays, including the second pins of
+    // the same immutable proof. Their contents are not cleanup authority.
+    let proof_sizes: &[usize] = match name {
+        LEGACY_V2_TEARDOWN_PROOF_MAP => &[LEGACY_V2_TEARDOWN_PROOF_LEN, CURRENT_RECOVERY_PROOF_LEN],
+        CURRENT_RECOVERY_TERMINAL_PROOF_MAP | CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP => {
+            &[CURRENT_RECOVERY_PROOF_LEN]
+        }
+        HISTORICAL_25_RECOVERY_PROOF_MAP | HISTORICAL_25_ROOT_HANDOFF_MARKER => &[
+            HISTORICAL_25_RECOVERY_PROOF_LEN,
+            HISTORICAL_25_R4_RECOVERY_PROOF_LEN,
+        ],
+        _ => &[],
+    };
+    Ok(info.name() == kernel_program_name("standalone_array")
+        && proof_sizes
+            .iter()
+            .any(|size| definition(bpf_map_type::BPF_MAP_TYPE_ARRAY as u32, 4, *size as u32, 1)))
 }
 
 struct ExclusiveCleanup {
@@ -367,7 +444,7 @@ impl Interface {
     fn owns_filter_by_name(&self, filter: &Filter, priority: u16, strict: bool) -> bool {
         self.by_name
             && if self.exclusive_priority {
-                filter.priority == priority
+                filter.priority == priority || filter.sdk
             } else {
                 filter.sdk || !strict && filter.exact_slot(priority)
             }
@@ -445,7 +522,15 @@ impl ExclusiveCleanup {
                 if field("link_id:\t").is_some() {
                     (None, field("prog_id:\t"))
                 } else if let Some(id) = field("map_id:\t") {
-                    (Some((data, id)), None)
+                    let sdk = !self.strict || sdk_map(&name, &data)?;
+                    (
+                        Some(ScopeMap {
+                            _data: data,
+                            id,
+                            sdk,
+                        }),
+                        None,
+                    )
                 } else {
                     // Program and link pins belong to the declared root.
                     // Removing a link pin releases its attachment when it is
@@ -600,6 +685,14 @@ impl ExclusiveCleanup {
             .first()
             .and_then(|interface| interface.ifindex);
         let mut referenced = self.referencing_programs()?;
+        // A map of any shape can identify the SDK's own hook after a rename.
+        // Only SDK maps confer reference authority on the named interface or
+        // participate in the strict external-reference guard.
+        let mut discovery_references = if self.strict {
+            self.programs_referencing_maps(false)?
+        } else {
+            referenced.clone()
+        };
         let declared = self.leaves.clone();
         let mut interfaces = declared
             .iter()
@@ -629,20 +722,22 @@ impl ExclusiveCleanup {
                     .into_iter()
                     .filter(|filter| {
                         interface.owns_filter_by_name(filter, self.priority, self.strict)
-                            || !interface.exclusive_priority
+                            || (!self.strict || interface.exclusive_priority)
                                 && filter.program_id.is_some_and(|id| referenced.contains(&id))
                     })
                     .collect();
                 for hook in &interface.hooks {
                     if let Some(id) = hook.program_id {
                         referenced.remove(&id);
+                        discovery_references.remove(&id);
                     }
                 }
             }
         }
         // Map references recover the identity of a renamed interface even
         // when no pin leaf has its new name. On unrelated devices, only that
-        // reference grants authority; names or slot placement alone do not.
+        // reference grants ordinary authority; strict also requires the SDK
+        // attach predicate so a foreign program stays an external reference.
         for interface in nix::net::if_::if_nameindex().map_err(io_error)?.iter() {
             let Ok(name) = interface.name().to_str() else {
                 continue;
@@ -660,7 +755,7 @@ impl ExclusiveCleanup {
             {
                 self.leaves.insert(name.to_owned());
             }
-            if declared_indices.contains(&interface.index()) || referenced.is_empty() {
+            if declared_indices.contains(&interface.index()) || discovery_references.is_empty() {
                 continue;
             }
             // Discovery cannot make an unrelated device a prerequisite. Its
@@ -672,12 +767,17 @@ impl ExclusiveCleanup {
             };
             let hooks = filters
                 .into_iter()
-                .filter(|filter| filter.program_id.is_some_and(|id| referenced.contains(&id)))
+                .filter(|filter| {
+                    (!self.strict || filter.sdk)
+                        && filter
+                            .program_id
+                            .is_some_and(|id| discovery_references.contains(&id))
+                })
                 .collect::<Vec<_>>();
             if !hooks.is_empty() {
                 for hook in &hooks {
                     if let Some(id) = hook.program_id {
-                        referenced.remove(&id);
+                        discovery_references.remove(&id);
                     }
                 }
                 self.leaves.insert(name.to_owned());
@@ -755,10 +855,16 @@ impl ExclusiveCleanup {
     }
 
     fn referencing_programs(&self) -> Result<HashSet<u32>, GtpuError> {
+        self.programs_referencing_maps(self.strict)
+    }
+
+    fn programs_referencing_maps(&self, sdk_only: bool) -> Result<HashSet<u32>, GtpuError> {
         let maps = self
             .nodes
             .iter()
-            .filter_map(|node| node.map.as_ref().map(|(_, id)| *id))
+            .filter_map(|node| node.map.as_ref())
+            .filter(|map| !sdk_only || map.sdk)
+            .map(|map| map.id)
             .collect::<HashSet<_>>();
         let mut references = HashSet::new();
         if maps.is_empty() {
@@ -889,10 +995,11 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
 
     fn detach_interface(&mut self, index: usize) -> Result<(), GtpuError> {
         let hooks = self.interfaces[index].hooks.clone();
-        let entire_priority = self.interfaces[index].exclusive_priority;
         if let Some(ifindex) = self.interfaces[index].ifindex {
             let mut detached_classifiers = HashSet::new();
             for hook in &hooks {
+                let entire_priority =
+                    self.interfaces[index].exclusive_priority && hook.priority == self.priority;
                 if entire_priority && !detached_classifiers.insert(hook.classifier()) {
                     continue;
                 }
@@ -954,7 +1061,17 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
         if selector_marker(name) {
             self.report.selector_markers += 1;
         }
-        if node.directory.is_some() && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER {
+        let sdk_staging = self.nodes[node.parent]
+            .path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(
+                AyaGtpuRuntime::historical_25_ordinary_exclusion_staging_name_is_globally_reserved,
+            );
+        if node.directory.is_some()
+            && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER
+            && !sdk_staging
+        {
             self.report.exclusion_marker_directories += 1;
         }
         if let Some(id) = node.program_id {
@@ -1109,7 +1226,7 @@ mod tests {
         }
         filter.sdk = true;
         assert!(discovered.owns_filter_by_name(&filter, 50, true));
-        assert!(!named.owns_filter_by_name(&filter, 51, true));
+        assert!(named.owns_filter_by_name(&filter, 51, true));
     }
 
     #[test]

@@ -25,9 +25,12 @@ Three removals are safe only with an additional caller assertion:
    call, in every clsact ingress/egress chain. Every classifier kind, protocol
    and handle at that priority belongs to the discarded workload. Removing it
    cannot disrupt another owner under the assertion. A false assertion can
-   detach another owner's forwarding or security policy. Other priorities on
-   the named interface are never touched. A scope entry or map reference does
-   not grant this foreign-filter authority on another interface.
+   detach another owner's forwarding or security policy. At other priorities
+   on the named interface, SDK hooks and filters referencing the product's own
+   scope maps are removed individually, preserving foreign filters sharing a
+   classifier. This retains ordinary reset's ability to clear an old priority,
+   even when the predecessor's pins are gone. A scope entry or map reference
+   does not grant foreign-filter authority on another interface.
 3. The caller owns every object in the scope and abandons predecessor recovery.
    Misplaced exclusion-marker directories can be removed with their contents,
    including within operation locks and writer locks of known interfaces.
@@ -48,20 +51,27 @@ without a boolean at existing call sites.
 Declared interfaces are the explicitly named interface and interface-shaped
 scope-root entry names. Only the named interface, resolved to its kernel index
 including alternative names, receives whole-priority cleanup. Other declared
-interfaces receive SDK-hook and scope-map-reference cleanup; discovery solely
-by map reference authorizes only referencing filters. Direct tc operations stay
-in the calling network namespace. Scope-wide pin cleanup and the pinned-link
-release contract of ADR 0027 remain unchanged.
+interfaces receive SDK-hook cleanup; discovery by scope-map reference also
+requires the SDK attach predicate. Product maps are recognized by known pin
+names and map definitions. A foreign map is unpinned, and its references grant
+no detach authority or refusal. A foreign program on another interface that
+references a product map remains an external-reference refusal. Direct tc
+operations stay in the calling network namespace. A link pinned in the scope
+is released when the reset removes its pin, wherever it is attached, regardless
+of its creator. This is the pinned-link lifetime contract of ADR 0027.
 
 `EbpfStrictWorkloadResetReport` is non-exhaustive. Its identifier-free counts
 cover selector entries, kernel filter entries that do not match the SDK attach
-predicate, and misplaced exclusion directories. SDK hooks and valid exclusions
-do not contribute: a clean repeat and a restart containing only SDK leftovers
-report zeros. Ordinary pins and other directories are not counted.
+predicate, and misplaced exclusion directories. SDK hooks, valid exclusions
+and interrupted SDK exclusion-publication staging directories do not contribute:
+a clean repeat and a restart containing only SDK leftovers report zeros.
+Ordinary pins and other directories are not counted. Released pinned links are
+uncounted because the SDK has no catalog to classify their ownership.
 
 `GtpuError` is already non-exhaustive, so adding
 `StrictWorkloadResetIncomplete { report, source }` preserves the public method's
-signature and existing error variants. A failed attempt with confirmed foreign
+signature and existing error variants. The variant itself is non-exhaustive;
+external matches include `..`. A failed attempt with confirmed foreign
 removals carries its partial report and the original failure as its source.
 Other failures retain their original variant. Callers retain reports across
 retries because a successful retry cannot recount removed objects. Failed
@@ -98,7 +108,12 @@ selector marker shapes, whole-priority classifier conflicts, forwarding after
 strict reset, absent-interface startup orders, interrupted cleanup, writer and
 live-reference guards with residue, counts across a failed attempt and retry,
 and preservation of other interfaces, priorities, scopes and namespaces. A
-scope-root entry does not widen foreign-filter authority. Unit coverage checks
+scope-root entry or foreign map does not widen foreign-filter authority. The
+map fixtures check unknown names, mismatched definitions and external references
+to product maps; a foreign pinned link is released on another interface without
+contributing to the report. Old-priority fixtures cover pins present or absent,
+selector residue, alternative interface names and a foreign filter sharing the
+old classifier. Unit coverage checks
 dispatch, partial-error classification and filter-selection boundaries. Both
 kernel guest lanes run all reset tests; Linux 6.8 also requires the TCX-link
 proof. The existing eight exclusive-reset fixtures remain unchanged.

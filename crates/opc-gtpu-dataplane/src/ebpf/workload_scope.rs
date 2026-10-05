@@ -16,8 +16,10 @@ pub struct EbpfWorkloadScope([u8; 32]);
 /// Identifier-free counts of foreign objects removed by a strict workload reset.
 ///
 /// Zero counts on a completed attempt mean no foreign objects of these classes
-/// were found. SDK hooks, valid ordinary exclusions, ordinary pins and other
-/// directories are not counted. Failed attempts with confirmed removals return
+/// were found. SDK hooks, valid ordinary exclusions, SDK exclusion-publication
+/// staging directories, ordinary pins and other directories are not counted.
+/// Released pinned links are uncounted because the SDK has no ownership catalog
+/// to classify them as foreign. Failed attempts with confirmed removals return
 /// these counts in [`GtpuError::StrictWorkloadResetIncomplete`]; accumulate them
 /// across retries. Uncertain effects of a failed mutation remain unknown.
 #[non_exhaustive]
@@ -28,7 +30,8 @@ pub struct EbpfStrictWorkloadResetReport {
     /// Detached kernel filter entries that do not match the SDK attach predicate.
     /// Includes u32 table entries, but excludes classifier summaries.
     pub tc_filters: usize,
-    /// Removed exclusion-marker directories outside valid ordinary exclusions.
+    /// Removed exclusion-marker directories outside valid ordinary exclusions
+    /// and SDK exclusion-publication staging directories.
     pub exclusion_marker_directories: usize,
 }
 
@@ -156,13 +159,15 @@ impl EbpfGtpuDataplaneBackend {
     /// each map unpin. Empty writer-lock directories and existing exclusion
     /// markers retain their inodes. Success permits ordinary attachment on this
     /// backend; no sessions survive. Repetition on an absent scope succeeds.
-    /// Two foreign-only layouts can survive successful reset and still block
-    /// ordinary attach: a non-SDK `ETH_P_ALL` filter at the configured priority
-    /// and handle `0:1` in a nonzero chain, or a directory named
-    /// `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside a retained writer or
-    /// operation-lock directory. Existing SDK generations create neither layout;
-    /// [`Self::reset_strict_exclusive_workload_graph`] also removes these
-    /// layouts when the caller can make its additional ownership assertions.
+    /// Foreign filters outside the ordinary owned slot can survive successful
+    /// reset and still block ordinary attach: another handle or protocol at the
+    /// configured priority in chain zero (including other classifier kinds,
+    /// such as u32), or a non-SDK `ETH_P_ALL` filter at handle `0:1` in another
+    /// chain. A directory named `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside
+    /// a retained writer or operation-lock directory also survives. Existing
+    /// SDK generations create none of these layouts;
+    /// [`Self::reset_strict_exclusive_workload_graph`] also removes them when
+    /// the caller can make its additional ownership assertions.
     ///
     /// # Environment and interruption
     /// Requires `CAP_NET_ADMIN` for tc and `CAP_SYS_ADMIN` for global program
@@ -221,16 +226,23 @@ impl EbpfGtpuDataplaneBackend {
     /// - **The configured tc priority on the named interface belongs to the
     ///   caller in every chain.** Every clsact ingress/egress filter at that
     ///   priority may be detached, of any origin, classifier kind, protocol or
-    ///   handle. Other priorities on the named interface are not touched.
+    ///   handle. At every other priority on that interface, SDK hooks and filters
+    ///   whose programs reference the product's own scope maps are removed
+    ///   individually, preserving foreign filters sharing their classifier.
+    ///   An old priority therefore cannot strand the next ordinary attach,
+    ///   including when the predecessor's map pins are already gone.
     ///
     /// Declared interfaces are the name passed to this call and interface-shaped
-    /// scope-root entry names. Only the interface named in the call receives
-    /// foreign-filter removal authority, including when named by an alternative
-    /// name. On other declared interfaces, SDK hooks and filters referencing scope
-    /// maps are removed. Discovery by map reference authorizes only referencing
-    /// filters. No foreign-filter authority follows a scope entry or map reference.
-    /// All direct tc operations stay in the calling network namespace; scope-wide
-    /// pin cleanup, including pinned-link release, follows the ordinary contract.
+    /// scope-root entry names. Alternative names resolve to the same kernel
+    /// index. On other interfaces, only SDK hooks found through those entries
+    /// or scope-map references are removed. Product maps are recognized by known
+    /// pin names and map definitions. Foreign maps are unpinned; their references
+    /// confer no detach authority and do not block reset. A foreign program on
+    /// another interface referencing a product map remains an external-reference
+    /// refusal. All direct tc operations stay in the calling network namespace.
+    /// A link pinned in the scope is released when the reset removes its pin,
+    /// wherever it is attached, regardless of who created it. Scope-wide pin
+    /// cleanup otherwise follows the ordinary exclusive reset contract.
     ///
     /// Misplaced exclusion-marker directories are removed throughout the root.
     /// Inside retained lock directories the ordinary preservation rule remains,
@@ -238,9 +250,9 @@ impl EbpfGtpuDataplaneBackend {
     /// call. Valid ordinary exclusions therefore retain their inodes, including
     /// those of absent interfaces; unfinished exclusions of known interfaces are
     /// completed before success. Lock inodes stay held and unchanged.
-    /// Reference guards and interruption rules remain those of the ordinary
-    /// exclusive reset. Repeat this strict reset after an
-    /// interrupted call, before ordinary attachment. No sessions survive;
+    /// The ordinary reference guards apply to product maps; interruption rules
+    /// remain those of the ordinary exclusive reset. Repeat this strict reset
+    /// after an interrupted call, before ordinary attachment. No sessions survive;
     /// callers must drain or transfer emergency sessions before voluntary teardown.
     ///
     /// A false assertion can erase permanent selector fencing/retirement history,

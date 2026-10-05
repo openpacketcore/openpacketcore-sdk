@@ -174,6 +174,7 @@ pub enum GtpuError {
     /// already removed. The source preserves the underlying error classification
     /// and stable operation label. Counts exclude ACK-uncertain removals.
     #[error("GTP-U strict workload reset failed after foreign cleanup: {source}")]
+    #[non_exhaustive]
     StrictWorkloadResetIncomplete {
         /// Confirmed removals during the failed attempt, without identifiers.
         report: EbpfStrictWorkloadResetReport,
@@ -470,7 +471,7 @@ mod tests {
                 operation: "ebpf_exclusive_workload_detached_program_reference",
             }),
         };
-        let GtpuError::StrictWorkloadResetIncomplete { report, source } = &error else {
+        let GtpuError::StrictWorkloadResetIncomplete { report, source, .. } = &error else {
             panic!("strict reset must retain its partial report");
         };
         assert_eq!(report.selector_markers, 0);
