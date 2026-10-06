@@ -139,7 +139,7 @@ impl ConfigRaftNetwork {
             ConsensusWireRequest::try_new(self.identity, self.local_node_id, family, payload)
                 .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let ttl = option.hard_ttl();
-        let response = match tokio::time::timeout(ttl, peer.call(wire)).await {
+        let response = match tokio::time::timeout(ttl, peer.call_with_timeout(wire, ttl)).await {
             Err(_) => {
                 return Err(EngineRpcError::Timeout(Timeout {
                     action,

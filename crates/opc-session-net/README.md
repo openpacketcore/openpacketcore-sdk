@@ -79,11 +79,51 @@ orchestrator behavior.
 ## Consensus production profile
 
 Issue #127 introduces a separate least-authority transport for the shared
-Openraft engine. `SessionConsensusServer` advertises only
+Openraft engine. `SessionConsensusServer` advertises
 `opc-session-consensus/2` and owns only an
 `Arc<dyn SessionConsensusRpcHandler>`; it cannot dispatch `SessionBackend`,
 lease, raw replication-log append, or rebuild operations.
 `RemoteSessionConsensusPeer` implements only `SessionConsensusPeer`.
+
+Consumers may opt into exact connection compatibility through the shared
+`ConsensusPeer::with_compatibility` and `ConsensusRpcHandler::compatibility`
+ports. Both endpoints then also offer
+`opc-session-consensus/2+compatibility/1`. Selecting it adds a purpose-separated
+profile digest to Hello/Ack and requires equality before dispatch. Only the
+connection that completed that exchange carries verification evidence; a new
+pool, reconnect or replacement must negotiate again. Calls requiring a digest
+are rejected before application bytes are sent unless that actual connection
+proved it. Configuration consensus uses this to gate engine participation and
+returning-voter admission.
+
+If either endpoint does not offer the extension, the original ALPN and
+Hello/Ack encoding remain usable, and the handler/caller receives no connection
+proof. Legacy configuration peers still require explicit compatibility probes
+and cannot count toward the new verified admission quorum. This additive
+extension supports one-at-a-time upgrades and rollbacks with the same
+compatibility profile; it does not relax the exact revision rules below.
+
+Configuration quorum admission needs this mTLS extension at both endpoints.
+The plaintext transport always returns legacy evidence and uses the all-peer
+admission fallback. A wrapper must forward
+`ConsensusPeer::{with_compatibility, call_with_compatibility}` and
+`ConsensusRpcHandler::{compatibility, handle_with_compatibility}` together,
+including the configured peer returned by `with_compatibility` and the proof
+from the connection that carries the call. Forwarding none selects legacy
+all-peer admission. Partial forwarding can cause total engine refusal: an
+unproved incoming call is rejected if a reverse probe proves that its sender
+supports the extension.
+
+Configuration consensus currently sends an explicit compatibility
+`ReadBarrier` probe before every Vote, AppendEntries and InstallSnapshot,
+including heartbeats, even after modern connection negotiation. A receiver
+running the compatibility gate also reverse-probes calls without connection
+proof before engine dispatch. Between updated endpoints this adds one round
+trip on modern links and two on legacy links; old binaries retain their
+previous request path. These probes share the existing complete engine-call
+deadline. A compatibility probe only compares the profile; it does not perform
+a linearizable read. Connection pooling avoids new handshakes on a healthy
+lane but does not remove these per-call probes.
 
 The legacy `RemoteSessionBackend`, `SessionReplicationServer`, and protocol-v5
 `Request`/`Response` surface compile only with the non-default

@@ -11,7 +11,7 @@ use opc_config_bus::{
     CommitWrite, EncryptingManagedDatastore, ManagedDatastore, StoreErrorCode, StoredConfig,
     StoredRequestFingerprint, StoredRequestMode,
 };
-use opc_config_bus_consensus::RaftManagedDatastore;
+use opc_config_bus_consensus::{PersistManagedDatastore, RaftManagedDatastore};
 use opc_config_model::{
     ApplyPlan, AuthStrength, ConfigOperation, IdempotencyKey, RequestId, RequestSource,
     RollbackTarget, TransportType, TrustedPrincipal, WorkloadIdentity, YangPath,
@@ -80,6 +80,31 @@ fn encrypted_store(
         cluster.stores[index].clone(),
     )));
     EncryptingManagedDatastore::new(raw, Arc::clone(provider))
+}
+
+async fn disconnected_history(
+    cluster: &ConfigCluster,
+    index: usize,
+    provider: &Arc<MemoryKeyProvider>,
+) -> Vec<StoredConfig<AmfConfig>> {
+    let error = encrypted_store(cluster, index, provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .err()
+        .expect("unadmitted store must not serve retained history");
+    assert_eq!(StoreErrorCode::Unavailable, error.code);
+    // Inspect the same reopened disk through the fixture's backend, while
+    // its transport is disconnected. Serving remains gated on admission.
+    let backend = cluster
+        .disconnected_backend(index)
+        .expect("disconnected reopened backend");
+    let raw = Arc::new(PersistManagedDatastore::<AmfConfig, _>::new(Arc::new(
+        backend,
+    )));
+    EncryptingManagedDatastore::new(raw, Arc::clone(provider))
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("inspect disconnected same-disk history")
 }
 
 fn config(hostname: &str, capacity: u32) -> AmfConfig {
@@ -963,10 +988,7 @@ async fn stopped_follower_reopens_same_disk_and_rejoins_live_encrypted_lineage()
     );
     assert!(!disconnected_status.admitted);
     assert_eq!(stopped_database, cluster.database_path(stopped_follower));
-    let disconnected_history = encrypted_store(&cluster, stopped_follower, &provider)
-        .load_since(ConfigVersion::INITIAL, 8)
-        .await
-        .expect("load disconnected same-disk history");
+    let disconnected_history = disconnected_history(&cluster, stopped_follower, &provider).await;
     verify_nonempty_exact_reopened_history(&pre_stop_history, &disconnected_history)
         .expect("same-disk state must exist before network catch-up");
     assert!(disconnected_history
@@ -1347,10 +1369,7 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
     assert_eq!(stopped_identity, disconnected_status.node_id);
     assert!(!disconnected_status.admitted);
     assert_eq!(stopped_database, cluster.database_path(stopped_leader));
-    let disconnected_history = encrypted_store(&cluster, stopped_leader, &provider)
-        .load_since(ConfigVersion::INITIAL, 8)
-        .await
-        .expect("load disconnected stopped-leader history");
+    let disconnected_history = disconnected_history(&cluster, stopped_leader, &provider).await;
     verify_nonempty_exact_reopened_history(&pre_stop_history, &disconnected_history)
         .expect("stopped leader must reopen its exact non-empty pre-stop history");
     assert!(disconnected_history

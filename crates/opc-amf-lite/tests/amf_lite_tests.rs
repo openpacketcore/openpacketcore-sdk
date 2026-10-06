@@ -25,6 +25,35 @@ fn test_audit_key() -> AuditKey {
     AuditKey::new(TEST_AUDIT_KEY_BYTES).unwrap()
 }
 
+fn log_config_rpc_counts(cluster: &ConfigCluster, phase: &str) {
+    use opc_consensus::{decode_bounded, ConsensusRpcFamily, ConsensusWireRequest};
+
+    // The existing configuration ReadBarrier envelope is revision, profile,
+    // probe flag and remaining budget. Inspect already-captured frames only;
+    // diagnostic counting adds no work to the loopback request path.
+    type ReadBarrierEnvelope = (u16, (u16, u16, u64, [u8; 32]), bool, u64);
+    let (mut engine, mut barriers, mut probes) = (0, 0, 0);
+    for frame in cluster.captured_frames() {
+        let request: ConsensusWireRequest = decode_bounded(&frame).expect("captured config RPC");
+        match request.family {
+            ConsensusRpcFamily::Vote
+            | ConsensusRpcFamily::AppendEntries
+            | ConsensusRpcFamily::InstallSnapshot => engine += 1,
+            ConsensusRpcFamily::ReadBarrier => {
+                barriers += 1;
+                if let Ok((_, _, true, _)) = decode_bounded::<ReadBarrierEnvelope>(&request.payload)
+                {
+                    probes += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    eprintln!(
+        "HA_RPC phase={phase} engine={engine} read_barrier={barriers} compatibility_probe={probes}"
+    );
+}
+
 fn get_free_ports(count: usize) -> Vec<u16> {
     let listeners: Vec<_> = (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -407,6 +436,13 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
     .unwrap();
 
     // Commit a config to leader node 0
+    // Runtime startup installs a tracing panic hook. Preserve it while also
+    // printing this fixture's failures when no tracing subscriber is active.
+    let runtime_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        eprintln!("[HA] {panic}");
+        runtime_panic_hook(panic);
+    }));
     println!("[HA] Submitting commit-confirmed config to leader node 0");
     let candidate = AmfConfig {
         hostname: "amf-ha-node0".to_string(),
@@ -465,20 +501,30 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
     // 8. Simulate AMF Node 0 crash & Consensus leader failover
     println!("[HA] Shutting down AMF node 0 and isolating its config leader");
     wait_for_shutdown(&amf_0).await;
+    log_config_rpc_counts(&config_cluster, "before_failover");
     config_cluster.isolate(original_leader);
+    let failover_started = std::time::Instant::now();
     let survivor_leader = config_cluster
         .wait_for_survivor_leader(original_leader)
         .await;
+    eprintln!(
+        "HA_TIMING phase=failover elapsed_us={}",
+        failover_started.elapsed().as_micros()
+    );
 
     // Start a new AMF-lite instance targeting the new consensus leader
     let admin_ports_new = get_free_ports(1);
     let admin_addr_new: SocketAddr = format!("127.0.0.1:{}", admin_ports_new[0]).parse().unwrap();
 
-    assert!(config_cluster.stores[survivor_leader]
-        .load_latest()
-        .await
-        .expect("survivor config read")
-        .is_some());
+    let read_started = std::time::Instant::now();
+    let survivor_read = config_cluster.stores[survivor_leader].load_latest().await;
+    eprintln!(
+        "HA_TIMING phase=survivor_read elapsed_us={} result={:?}",
+        read_started.elapsed().as_micros(),
+        survivor_read.as_ref().map(|value| value.is_some())
+    );
+    log_config_rpc_counts(&config_cluster, "after_failover");
+    assert!(survivor_read.expect("survivor config read").is_some());
     println!("[HA] Launching new AMF node 1 on the survivor config leader");
     let recovered_session_store = session_cluster.store(1);
     let amf_1 = AmfLite::start(
@@ -582,6 +628,7 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
         .shutdown()
         .await
         .expect("shutdown config cluster");
+    log_config_rpc_counts(&config_cluster, "complete");
     println!(
         "[HA] Test test_amf_lite_config_ha_failover_and_session_recovery passed successfully!"
     );

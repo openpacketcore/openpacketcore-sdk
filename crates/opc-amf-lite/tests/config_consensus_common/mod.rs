@@ -133,6 +133,7 @@ pub struct ConfigCluster {
     identity: ConfigConsensusIdentity,
     nodes: [ConfigConsensusNodeId; 3],
     lifecycle: [ConfigNodeLifecycle; 3],
+    disconnected_backends: [Option<SqliteBackend>; 3],
     paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
     captured_frames: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
@@ -209,6 +210,7 @@ impl ConfigCluster {
             identity,
             nodes,
             lifecycle: [ConfigNodeLifecycle::Running; 3],
+            disconnected_backends: [None, None, None],
             paths,
             captured_frames,
         };
@@ -256,6 +258,16 @@ impl ConfigCluster {
 
     pub fn database_path(&self, node: usize) -> PathBuf {
         self.root.join(format!("config-{node}.sqlite"))
+    }
+
+    pub fn disconnected_backend(
+        &self,
+        node: usize,
+    ) -> Result<SqliteBackend, ConfigClusterLifecycleError> {
+        self.require_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)?;
+        self.disconnected_backends[node].clone().ok_or(
+            ConfigClusterLifecycleError::OperationFailed("missing disconnected backend"),
+        )
     }
 
     pub fn node_lifecycle(
@@ -419,7 +431,8 @@ impl ConfigCluster {
             )
             .await
             .map_err(|_| ConfigClusterLifecycleError::OperationFailed("reopened config backend"))?;
-            ConsensusConfigStore::open_with_operation_timeout(
+            let retained_backend = backend.clone();
+            let store = ConsensusConfigStore::open_with_operation_timeout(
                 topology,
                 backend,
                 snapshots,
@@ -427,10 +440,13 @@ impl ConfigCluster {
                 Duration::from_secs(5),
             )
             .await
-            .map_err(|_| ConfigClusterLifecycleError::OperationFailed("reopened consensus store"))
+            .map_err(|_| {
+                ConfigClusterLifecycleError::OperationFailed("reopened consensus store")
+            })?;
+            Ok((store, retained_backend))
         })
         .await;
-        let reopened = match reopened {
+        let (reopened, retained_backend) = match reopened {
             Ok(Ok(store)) => store,
             Ok(Err(error)) => {
                 self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
@@ -501,6 +517,7 @@ impl ConfigCluster {
             }
         }
         self.stores[node] = reopened;
+        self.disconnected_backends[node] = Some(retained_backend);
         self.set_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)
     }
 
@@ -550,7 +567,10 @@ impl ConfigCluster {
         })
         .await;
         match result {
-            Ok(Ok(())) => self.set_node_lifecycle(node, ConfigNodeLifecycle::Running),
+            Ok(Ok(())) => {
+                self.disconnected_backends[node] = None;
+                self.set_node_lifecycle(node, ConfigNodeLifecycle::Running)
+            }
             Ok(Err(error)) => {
                 if tokio::time::timeout(
                     cluster_transition_timeout(),

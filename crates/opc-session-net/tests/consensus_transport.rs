@@ -42,6 +42,9 @@ use opc_types::{NetworkFunctionKind, TenantId};
 #[path = "consensus_transport/majority_recovery.rs"]
 mod majority_recovery;
 
+#[path = "consensus_transport/compatibility.rs"]
+mod compatibility;
+
 const SERVER_REPLICA: u16 = 2;
 const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE

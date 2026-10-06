@@ -91,6 +91,9 @@ pub const SESSION_NET_CAS_REQUEST_ID_BYTES: usize = 36;
 pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 /// Dedicated ALPN for the least-authority consensus-only transport.
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
+// Offer alongside the existing ALPN. Only selecting this extension authorizes
+// additive handshake fields; the frozen legacy decoder rejects unknown fields.
+pub(crate) const CONSENSUS_COMPATIBILITY_ALPN: &[u8] = b"opc-session-consensus/2+compatibility/1";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
 ///
 /// Revision 5 adds an exact application-semantics gate for outcome-digest v2.
@@ -465,6 +468,8 @@ pub(crate) enum BootstrapResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionConsensusBootstrapHello {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<opc_consensus::ConsensusCompatibility>,
     pub transport_revision: u16,
     pub contract_profile: SessionConsensusContractProfile,
     pub sender_replica_id: String,
@@ -480,6 +485,8 @@ pub(crate) struct SessionConsensusBootstrapHello {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionConsensusBootstrapAck {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<opc_consensus::ConsensusCompatibility>,
     pub transport_revision: u16,
     pub contract_profile: SessionConsensusContractProfile,
     pub identity: SessionConsensusIdentity,
@@ -4921,6 +4928,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use bytes::Bytes;
     use opc_session_store::{
         CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation,
@@ -7512,5 +7520,86 @@ mod tests {
 
         let result = read_frame::<_, Response>(&mut reader, 128).await;
         assert!(matches!(result, Err(ProtocolError::FrameTooLarge(1024))));
+    }
+    #[test]
+    fn optional_consensus_compatibility_preserves_the_frozen_legacy_handshake() {
+        // These are the pre-extension field sets. Their strict decoders must
+        // accept an unextended exchange, and reject an extended exchange.
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyHello {
+            transport_revision: u16,
+            contract_profile: SessionConsensusContractProfile,
+            sender_replica_id: String,
+            expected_server_replica_id: String,
+            identity: SessionConsensusIdentity,
+            sender_node_id: SessionConsensusNodeId,
+            expected_server_node_id: SessionConsensusNodeId,
+            handshake_nonce: uuid::Uuid,
+            requested_response_frame_size: u32,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyAck {
+            transport_revision: u16,
+            contract_profile: SessionConsensusContractProfile,
+            identity: SessionConsensusIdentity,
+            server_node_id: SessionConsensusNodeId,
+            accepted_sender_node_id: SessionConsensusNodeId,
+            handshake_nonce: uuid::Uuid,
+            accepted_response_frame_size: u32,
+            server_request_frame_size: u32,
+        }
+        let cluster = opc_consensus::ConsensusClusterId::new("legacy-handshake").unwrap();
+        let epoch = opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap();
+        let identity = SessionConsensusIdentity::new(
+            cluster,
+            opc_consensus::derive_configuration_id(cluster, epoch, &[[7; 32]]),
+            epoch,
+        );
+        let mut hello = SessionConsensusBootstrapHello {
+            compatibility: None,
+            transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+            contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+            sender_replica_id: "one".into(),
+            expected_server_replica_id: "two".into(),
+            identity,
+            sender_node_id: SessionConsensusNodeId::new(1).unwrap(),
+            expected_server_node_id: SessionConsensusNodeId::new(2).unwrap(),
+            handshake_nonce: uuid::Uuid::nil(),
+            requested_response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
+        };
+        let bytes = serde_json::to_vec(&hello).unwrap();
+        let legacy: LegacyHello = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
+        assert_eq!(
+            serde_json::from_slice::<SessionConsensusBootstrapHello>(&bytes).unwrap(),
+            hello
+        );
+        hello.compatibility = Some([0x41; 32]);
+        assert!(
+            serde_json::from_slice::<LegacyHello>(&serde_json::to_vec(&hello).unwrap()).is_err()
+        );
+
+        let mut ack = SessionConsensusBootstrapAck {
+            compatibility: None,
+            transport_revision: hello.transport_revision,
+            contract_profile: hello.contract_profile,
+            identity,
+            server_node_id: hello.expected_server_node_id,
+            accepted_sender_node_id: hello.sender_node_id,
+            handshake_nonce: hello.handshake_nonce,
+            accepted_response_frame_size: hello.requested_response_frame_size,
+            server_request_frame_size: hello.requested_response_frame_size,
+        };
+        let bytes = serde_json::to_vec(&ack).unwrap();
+        let legacy: LegacyAck = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
+        assert_eq!(
+            serde_json::from_slice::<SessionConsensusBootstrapAck>(&bytes).unwrap(),
+            ack
+        );
+        ack.compatibility = Some([0x41; 32]);
+        assert!(serde_json::from_slice::<LegacyAck>(&serde_json::to_vec(&ack).unwrap()).is_err());
     }
 }

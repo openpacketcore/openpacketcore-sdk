@@ -308,7 +308,9 @@ pub trait ConfigStore: Send + Sync {
     /// Standalone stores use the same durable head as `load_latest`.
     /// Consensus stores override this method to avoid a leader/read-index
     /// round while still returning only locally applied state through the
-    /// first uncleared `recovery_required` publication fence.
+    /// first uncleared `recovery_required` publication fence. Configuration
+    /// consensus still requires local compatibility/membership admission;
+    /// this method cannot serve from an unadmitted retained store.
     async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
         self.load_latest()
             .await?
@@ -326,6 +328,7 @@ pub trait ConfigStore: Send + Sync {
     /// Implementations supporting follower-served config watches must return
     /// only the contiguous locally committed/applied, recovery-cleared prefix
     /// and must never start after the exact successor or skip a fenced row.
+    /// Configuration consensus requires local admission before serving it.
     /// The default fails closed for legacy adapters.
     async fn load_since(
         &self,
@@ -341,7 +344,8 @@ pub trait ConfigStore: Send + Sync {
     /// `None` means this adapter does not prune application history; `Some(0)`
     /// activates the retention replay contract before the first pruning step.
     /// A cursor equal to the floor retains its exact successor. This is neither
-    /// worker application nor a serving permit.
+    /// worker application nor a serving permit. Configuration consensus rejects
+    /// this operation until local admission succeeds.
     async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, PersistError> {
         Ok(None)
     }

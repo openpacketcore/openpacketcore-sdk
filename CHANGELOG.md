@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-consensus`: add optional connection compatibility through
+  `ConsensusCompatibility`, `ConsensusCallResponse`,
+  `ConsensusPeer::{with_compatibility, call_with_compatibility}` and
+  `ConsensusRpcHandler::{compatibility, handle_with_compatibility}`.
+  `opc-persist` adds `ConfigConsensusOpenError::CompatibleQuorumUnavailable`
+  for retained-voter admission without a compatible quorum. Refs #1115.
+
 - `opc-session-store`: expose a latched terminal storage-failure future shared
   by every store clone. The reference quorum voter exits with code 74 on a fatal
   fence in either control mode, allowing its supervisor to restart and replay
@@ -75,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `opc-persist`: retained-voter admission without a compatible quorum now
+  returns `CompatibleQuorumUnavailable` when no peer has proved incompatible;
+  a known mismatch retains `ClusterFormationRejected`. Unadmitted stores also
+  refuse local committed latest/history/floor/watch reads. Every configuration
+  Vote, AppendEntries and InstallSnapshot, including heartbeats, now shares
+  its existing deadline with an outbound compatibility probe; updated receivers
+  also reverse-probe calls without connection proof. Quorum admission requires the
+  negotiated mTLS extension at both endpoints; plaintext and legacy peers use
+  complete-fleet explicit-probe admission. Refs #1115.
+
 - `opc-session-store`: `maintain_fenced_transition_v2_history` may now poll
   memory admission until the operation timeout and return `BackendUnavailable`
   after waiting. Committed retirement pressure fails closed after ten seconds
@@ -124,6 +141,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-persist`: admit returning configuration voters with a majority whose
+  compatibility is proved on authenticated connections, including the local
+  voter. Reverify reconnects and reject incompatible engine traffic before
+  voting, replication or snapshot installation. An additive negotiated
+  `opc-session-net` handshake preserves legacy peers' explicit-probe admission
+  and one-at-a-time rolling restarts; stored formats are unchanged. Fixes #1115.
 
 - `opc-session-store`: bound native durable V2 history-retirement preparation
   within the existing 128 MiB verification cap, checkpoint and throttle by
