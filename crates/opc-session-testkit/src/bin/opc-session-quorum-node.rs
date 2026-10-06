@@ -396,6 +396,8 @@ impl SessionConsensusRpcHandler for QualificationProbeDispatchCountingHandler {
 
 struct QualificationNode {
     store: Arc<ConsensusSessionStore>,
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    storage_fence_armed_for_test: bool,
     protected: ProtectedStore,
     server: Option<SessionConsensusServerHandle>,
     consumer_server: Option<SessionQuorumConsumerServerHandle>,
@@ -1634,6 +1636,8 @@ impl QualificationNode {
             isolated_scale: config.isolated_scale,
             isolated_scale_clock,
             store,
+            #[cfg(all(target_os = "linux", feature = "test-control"))]
+            storage_fence_armed_for_test: false,
             protected,
             server: Some(server),
             consumer_server: None,
@@ -1660,8 +1664,39 @@ impl QualificationNode {
         })
     }
 
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    fn release_storage_fence_for_test(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        reader: &mut impl Read,
+        writer: &mut impl Write,
+    ) -> Result<(), NodeFailure> {
+        if !std::mem::take(&mut self.storage_fence_armed_for_test) {
+            return Ok(());
+        }
+        // The client must already be accepted and receive this handshake
+        // before it can release the fault. No scheduling delay is involved.
+        write_json_line(writer, &QualificationNodeReply::StorageFenceReady)
+            .map_err(|_| NodeFailure)?;
+        let mut trigger = [0_u8];
+        reader.read_exact(&mut trigger).map_err(|_| NodeFailure)?;
+        if trigger != *b" " {
+            return Err(NodeFailure);
+        }
+        let store = Arc::clone(&self.store);
+        runtime.spawn(async move {
+            let _ = opc_session_store::test_support::fence_consensus_storage_for_test(&store);
+        });
+        Ok(())
+    }
+
     async fn handle(&mut self, command: QualificationNodeCommand) -> QualificationNodeReply {
         match command {
+            #[cfg(all(target_os = "linux", feature = "test-control"))]
+            QualificationNodeCommand::FenceStorageForTest => {
+                self.storage_fence_armed_for_test = true;
+                QualificationNodeReply::StorageFenceArmed
+            }
             QualificationNodeCommand::Configure => QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::InvalidRequest,
             },
@@ -6309,6 +6344,31 @@ fn run_server(arguments: NodeArguments) -> Result<(), NodeFailure> {
     }
 }
 
+/// The synchronous control loop may be blocked in client I/O. Observe the
+/// storage latch on an independent runtime task and terminate the incarnation
+/// without waiting for that I/O or a failed storage drain. Process exit closes
+/// every listener/connection and releases durable locks; startup owns replay
+/// and stale control-socket cleanup. No blocking diagnostic precedes the exit.
+struct TerminalFailureExit(JoinHandle<()>);
+
+// Distinguish terminal storage fences from main's generic failure code 1.
+const TERMINAL_STORAGE_EXIT_CODE: i32 = 74;
+
+impl TerminalFailureExit {
+    fn start(runtime: &tokio::runtime::Runtime, store: Arc<ConsensusSessionStore>) -> Self {
+        Self(runtime.spawn(async move {
+            let _reason = store.terminal_failure().await;
+            std::process::exit(TERMINAL_STORAGE_EXIT_CODE);
+        }))
+    }
+}
+
+impl Drop for TerminalFailureExit {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn run_stdio_server(arguments: NodeArguments) -> Result<(), NodeFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -6343,6 +6403,7 @@ fn run_stdio_server(arguments: NodeArguments) -> Result<(), NodeFailure> {
         return Err(NodeFailure);
     }
     let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
+    let _terminal_exit = TerminalFailureExit::start(&runtime, Arc::clone(&node.store));
     write_json_line(
         &mut writer,
         &QualificationNodeReply::Started {
@@ -6352,6 +6413,8 @@ fn run_stdio_server(arguments: NodeArguments) -> Result<(), NodeFailure> {
     .map_err(|_| NodeFailure)?;
 
     loop {
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        node.release_storage_fence_for_test(&runtime, &mut reader, &mut writer)?;
         let command = match read_bounded_json_line::<_, QualificationNodeCommand>(&mut reader) {
             Ok(Some(command)) => command,
             Ok(None) => break,
@@ -6690,6 +6753,13 @@ fn serve_control_connection(
     };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = BufWriter::new(stream);
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    if node
+        .release_storage_fence_for_test(runtime, &mut reader, &mut writer)
+        .is_err()
+    {
+        return false;
+    }
     let command = match read_single_control_command(&mut reader) {
         Ok(command) => command,
         _ => {
@@ -6718,6 +6788,30 @@ fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result
         .block_on(TcpListener::bind(arguments.bind_addr))
         .map_err(|_| NodeFailure)?;
     let bind_addr = listener.local_addr().map_err(|_| NodeFailure)?;
+    // Test-only port-zero startup retains the child listener while the
+    // harness writes membership from Bound, just like the stdio harness.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    let startup_writer = if arguments.bind_addr.port() == 0 {
+        let mut writer = BufWriter::new(io::stdout());
+        write_json_line(
+            &mut writer,
+            &QualificationNodeReply::Bound {
+                node_index: arguments.node_index,
+                bind_addr,
+            },
+        )
+        .map_err(|_| NodeFailure)?;
+        let configure = read_bounded_json_line::<_, QualificationNodeCommand>(&mut BufReader::new(
+            io::stdin().lock(),
+        ))
+        .map_err(|_| NodeFailure)?;
+        if !matches!(configure, Some(QualificationNodeCommand::Configure)) {
+            return Err(NodeFailure);
+        }
+        Some(writer)
+    } else {
+        None
+    };
     let config = load_config(&arguments.config_path)?;
     if config.node_index != arguments.node_index || config.validate_bind_addr(bind_addr).is_err() {
         return Err(NodeFailure);
@@ -6725,6 +6819,17 @@ fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result
     let (control_listener, _control_guard) =
         bind_control_socket(&config.workspace_directory, control_socket)?;
     let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
+    let _terminal_exit = TerminalFailureExit::start(&runtime, Arc::clone(&node.store));
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    if let Some(mut writer) = startup_writer {
+        write_json_line(
+            &mut writer,
+            &QualificationNodeReply::Started {
+                node_index: config.node_index,
+            },
+        )
+        .map_err(|_| NodeFailure)?;
+    }
     loop {
         let (stream, _) = control_listener.accept().map_err(|_| NodeFailure)?;
         if serve_control_connection(&runtime, &mut node, stream, config.node_index) {

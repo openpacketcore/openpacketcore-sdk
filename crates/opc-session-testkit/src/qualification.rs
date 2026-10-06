@@ -5272,6 +5272,9 @@ impl fmt::Debug for QualificationConcurrentBatchSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationNodeCommandKind {
+    /// Arm a terminal native-storage fence in a test-only process.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    FenceStorageForTest,
     /// Validate and open the configured node runtime.
     Configure,
     /// Initialize the configured consensus cluster.
@@ -5372,6 +5375,8 @@ pub enum QualificationNodeCommandKind {
 impl QualificationNodeCommandKind {
     /// Complete command inventory in stable protocol order.
     pub const ALL: &'static [Self] = &[
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        Self::FenceStorageForTest,
         Self::Configure,
         Self::Initialize,
         Self::Probe,
@@ -5425,6 +5430,11 @@ impl QualificationNodeCommandKind {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QualificationNodeCommand {
+    /// Arm a native-storage fence. Before its next command read, the server
+    /// emits a readiness reply and requires one space byte to release the
+    /// fence. Never available without the test-control feature.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    FenceStorageForTest,
     Configure,
     Initialize,
     Probe,
@@ -5582,6 +5592,10 @@ pub enum QualificationNodeCommand {
 impl fmt::Debug for QualificationNodeCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(all(target_os = "linux", feature = "test-control"))]
+            Self::FenceStorageForTest => {
+                formatter.write_str("QualificationNodeCommand::FenceStorageForTest")
+            }
             Self::Configure => formatter.write_str("QualificationNodeCommand::Configure"),
             Self::Initialize => formatter.write_str("QualificationNodeCommand::Initialize"),
             Self::Probe => formatter.write_str("QualificationNodeCommand::Probe"),
@@ -5731,6 +5745,8 @@ impl QualificationNodeCommand {
     /// Return the exhaustive fixed kind used by timeout/error diagnostics.
     pub const fn kind(&self) -> QualificationNodeCommandKind {
         match self {
+            #[cfg(all(target_os = "linux", feature = "test-control"))]
+            Self::FenceStorageForTest => QualificationNodeCommandKind::FenceStorageForTest,
             Self::Configure => QualificationNodeCommandKind::Configure,
             Self::Initialize => QualificationNodeCommandKind::Initialize,
             Self::Probe => QualificationNodeCommandKind::Probe,
@@ -5818,6 +5834,8 @@ impl QualificationNodeCommand {
     /// consulted by the child process.
     pub fn validate(&self) -> Result<(), QualificationCommandError> {
         match self {
+            #[cfg(all(target_os = "linux", feature = "test-control"))]
+            Self::FenceStorageForTest => Ok(()),
             Self::Configure
             | Self::Initialize
             | Self::Probe
@@ -6171,6 +6189,12 @@ pub struct QualificationConcurrentWatchEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QualificationNodeReply {
+    /// The test-only native-storage fence awaits its input readiness handshake.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    StorageFenceArmed,
+    /// Input is connected; one space byte releases the armed test-only fence.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    StorageFenceReady,
     /// Explicit scale-mode proof and passive persistence progress.
     IsolatedScaleReadiness {
         status: QualificationIsolatedScaleReadiness,
@@ -8462,6 +8486,8 @@ mod tests {
     #[test]
     fn concurrent_command_inventory_is_complete_and_unique() {
         let commands = vec![
+            #[cfg(all(target_os = "linux", feature = "test-control"))]
+            QualificationNodeCommand::FenceStorageForTest,
             QualificationNodeCommand::Configure,
             QualificationNodeCommand::Initialize,
             QualificationNodeCommand::Probe,

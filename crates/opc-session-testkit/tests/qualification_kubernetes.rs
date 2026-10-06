@@ -48,6 +48,14 @@ fn renderer_emits_strict_three_and_five_member_lists() {
         assert_eq!(stateful_sets.len(), member_count);
         for (node_index, stateful_set) in stateful_sets.into_iter().enumerate() {
             let container = &stateful_set["spec"]["template"]["spec"]["containers"][0];
+            assert_eq!(
+                stateful_set["spec"]["template"]["spec"]["restartPolicy"],
+                "Always"
+            );
+            assert!(
+                container.get("livenessProbe").is_none(),
+                "terminal fences restart through process exit"
+            );
             assert_eq!(container["image"], digest_image());
             assert_eq!(
                 container["args"],

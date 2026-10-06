@@ -26,6 +26,7 @@ pub use persistence::{
     SessionAsyncPersistenceProgress, SessionAsyncRecoveryState, SessionPersistenceDrainError,
     SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
     SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
+    SessionStoreTerminalFailure,
 };
 pub use snapshot_directory::SnapshotDirectory;
 pub use snapshot_integrity::SnapshotIntegrityPolicy;

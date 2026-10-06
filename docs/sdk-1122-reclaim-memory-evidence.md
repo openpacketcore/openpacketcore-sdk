@@ -377,17 +377,15 @@ checkpoint or relocation drain longer than ten seconds without observable
 relief can still fence a healthy voter on very slow storage. A successful
 reservation resets the wait; shutdown and planner errors do not fence.
 
-A storage fence is terminal for the embedding process. Its recovery owner is
-the process supervisor: the embedding voter must exit non-zero, then kubelet or
-systemd restarts it to re-audit and replay the unchanged durable state. The SDK
-currently reports terminal storage/engine failure but does not itself guarantee
-that exit, and the test voter keeps its command loop running. That pre-existing
-fatal-error supervision gap is tracked separately in
-[issue #1127](https://github.com/openpacketcore/openpacketcore-sdk/issues/1127).
-This change implements neither a supervisor nor in-process reopen. The crash
-proof explicitly respawns each killed voter; it proves recovery after restart,
-not automatic restart of a still-running fenced process. No manual cleanup or
-operator replacement is part of the required recovery contract.
+A storage fence is terminal for the embedding process. The reference voter
+observes `ConsensusSessionStore::terminal_failure()` independently of command
+input and exits with code `74` on a terminal storage fence. Its process supervisor,
+such as kubelet or systemd, restarts it to re-audit and replay the unchanged
+durable state. There is no in-process reopen. This retirement crash proof
+explicitly respawns each killed voter to verify recovery after restart; the
+fenced-voter tests additionally cover bounded self-exit and same-path recovery.
+No manual cleanup or operator replacement is part of the required recovery
+contract.
 
 The implementation adds no voluntary restart or emergency-session termination.
 Existing session and emergency-session continuity protections continue to apply;

@@ -573,6 +573,7 @@ struct State {
     checkpoint_epoch: u64,
     snapshot: Option<snapshot::Handoff>,
     status: Status,
+    terminal_failure: tokio::sync::watch::Sender<bool>,
     failure: Option<SessionStorageFailure>,
     observations: VecDeque<FlushObservation>,
     observation_requests: usize,
@@ -598,6 +599,8 @@ pub(crate) struct Wal {
     directory: PathBuf,
     limits: Limits,
     shared: Arc<Shared>,
+    // Subscribe without taking State: a failed owner may have poisoned it.
+    terminal_failure: tokio::sync::watch::Sender<bool>,
     writer: Mutex<Option<JoinHandle<io::Result<()>>>>,
     control: IoControl,
     #[cfg(test)]
@@ -608,6 +611,20 @@ pub(crate) struct Wal {
 }
 
 impl State {
+    fn fence(&mut self) {
+        self.status = Status::Failed;
+        self.applied_prefix = None;
+        self.queue.clear();
+        self.terminal_failure.send_if_modified(|failed| {
+            if *failed {
+                false
+            } else {
+                *failed = true;
+                true
+            }
+        });
+    }
+
     fn volatile_mode(&self) -> bool {
         if self.asynchronous.is_some() {
             return true;
@@ -677,6 +694,7 @@ impl State {
             checkpoint_epoch: anchor.map_or(0, |anchor| anchor.epoch),
             snapshot: None,
             status: Status::Running,
+            terminal_failure: tokio::sync::watch::channel(false).0,
             failure: None,
             observations: VecDeque::new(),
             observation_requests: 0,
@@ -935,6 +953,7 @@ impl Wal {
             .native
             .as_ref()
             .and_then(|native| native.business.roster_root().cloned());
+        let terminal_failure = state.terminal_failure.clone();
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             ready: Condvar::new(),
@@ -953,6 +972,7 @@ impl Wal {
             directory,
             limits,
             shared,
+            terminal_failure,
             writer: Mutex::new(Some(writer)),
             control: caller_control,
             #[cfg(test)]
@@ -991,6 +1011,23 @@ impl Wal {
                 .as_ref()
                 .map(|progress| progress.observe(state.sequence)),
         )
+    }
+
+    pub(crate) async fn terminal_failure(&self) {
+        let mut receiver = self.terminal_failure.subscribe();
+        // Retaining &self also retains a sender, so closure is impossible.
+        // Never interpret ordinary channel closure as a storage fence.
+        if receiver.wait_for(|failed| *failed).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn fence_for_test(&self) -> io::Result<()> {
+        let mut state = lock_state(&self.shared)?;
+        application::fence(&mut state);
+        self.shared.ready.notify_all();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1357,8 +1394,7 @@ impl Drop for WriterExit {
             Err(poison) => poison.into_inner(),
         };
         if state.status != Status::Closed {
-            state.status = Status::Failed;
-            state.queue.clear(); // Request::drop owns each failure completion.
+            state.fence(); // Request::drop owns each failure completion.
         }
         self.0.ready.notify_all();
     }
@@ -1379,8 +1415,7 @@ impl Drop for Group {
             };
             // Fence pending reads/admission before either queued or in-flight
             // failure completion becomes observable, including unwind.
-            state.status = Status::Failed;
-            state.queue.clear();
+            state.fence();
         }
     }
 }

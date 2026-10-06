@@ -598,6 +598,20 @@ the owner. Monitor both `storage_failure` and `asynchronous.background_failure`;
 writer does not retry indefinitely or erase an already returned operation
 result.
 
+Await `ConsensusSessionStore::terminal_failure()` alongside the process's main
+work. A fatal owner fence resolves every waiter with the closed, value-free
+`SessionStoreTerminalFailure::StorageFenced` reason, including waiters started
+after the fence. Cancellation does not consume the signal. The incarnation
+never reopens itself: the embedder must exit for supervisor restart, or remove
+all users and fully drain and replace the store. Successful shutdown, quorum
+loss, and an Async background error that leaves resident storage usable do not
+resolve this signal. A failed final shutdown drain, including one after a
+retained Async background error, fences the owner and resolves the signal.
+Startup audits and replays the same durable files before readmission; no node
+cleanup is needed. Committed durable outcomes survive,
+while callers whose replies were interrupted use the existing request/outcome
+resolution contract.
+
 `drain_async_persistence().await` explicitly requests local persistence through
 the resident cut captured by that call, within the configured operation
 deadline. Later concurrent mutations need not be included. A timeout or caller
@@ -1404,11 +1418,11 @@ alone does not renew it. A successful reservation resets the wait, so a later
 retry gets a fresh budget. A single checkpoint or relocation drain exceeding
 ten seconds without observable relief can still fence a healthy voter on very
 slow storage. Shutdown cancels the wait promptly without fencing the WAL,
-preserving its accepted-work drain. A fence is terminal for the embedding
-process: it must exit non-zero, and its supervisor restarts it to re-audit and
-replay. Automatic fatal-error exit is a separate existing gap tracked in
-[issue #1127](https://github.com/openpacketcore/openpacketcore-sdk/issues/1127);
-this change does not implement a supervisor or in-process reopen.
+preserving its accepted-work drain. A fence is terminal for the store
+incarnation. The reference voter observes
+`ConsensusSessionStore::terminal_failure()` and exits with code 74; its
+supervisor restarts it to re-audit and replay the durable state. The fenced
+store never reopens in process.
 For `V2WithVoid`, an unavailable voter can withhold readiness and first activation
 until its supervisor restarts it if an exact-scope profile proof has not already
 been cached or activated. Each call retains its existing deadline. A running

@@ -12,6 +12,9 @@ use super::*;
 #[path = "sequential_wal/cancelled_reads.rs"]
 mod cancelled_reads;
 
+#[path = "sequential_wal/terminal_failure.rs"]
+mod terminal_failure;
+
 struct Pause {
     point: Point,
     state: Mutex<(bool, bool)>,

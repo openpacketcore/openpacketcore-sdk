@@ -32,6 +32,10 @@ const FLEET_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_DIRECTORY_MODE: u32 = 0o700;
 const CONTROL_SOCKET_MODE: u32 = 0o600;
 
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[path = "qualification_control_socket/fenced_exit.rs"]
+mod fenced_exit;
+
 struct TestServer {
     child: Child,
 }
