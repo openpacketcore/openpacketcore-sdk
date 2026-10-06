@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "linux", test))]
 use std::task::{Context, Poll};
-pub use workload_scope::EbpfWorkloadScope;
+pub use workload_scope::{EbpfStrictWorkloadResetReport, EbpfWorkloadScope};
 
 use async_trait::async_trait;
 use opc_dataplane_observation::{
@@ -1619,6 +1619,18 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     ) -> Result<(), GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "exclusive_workload_cleanup",
+        })
+    }
+
+    /// Reset with the caller's unbound-selector and every-chain slot assertion.
+    fn reset_strict_exclusive_workload_graph(
+        &self,
+        _ifindex: Option<u32>,
+        _pin_dir: &Path,
+        _tc_priority: u16,
+    ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "strict_exclusive_workload_cleanup",
         })
     }
 
@@ -40629,7 +40641,16 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<(), GtpuError> {
-            exclusive_workload_scope::reset(self, ifindex, pin_dir, tc_priority)
+            exclusive_workload_scope::reset(self, ifindex, pin_dir, tc_priority, false).map(|_| ())
+        }
+
+        fn reset_strict_exclusive_workload_graph(
+            &self,
+            ifindex: Option<u32>,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<super::EbpfStrictWorkloadResetReport, GtpuError> {
+            exclusive_workload_scope::reset(self, ifindex, pin_dir, tc_priority, true)
         }
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
@@ -57380,6 +57401,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        strict_workload_resets: Vec<(Option<u32>, PathBuf, u16)>,
+        strict_workload_reset_report: EbpfStrictWorkloadResetReport,
         /// Interfaces enslaved to a master whose receive handler takes
         /// their frames.
         enslaved_interfaces: HashSet<u32>,
@@ -60002,6 +60025,19 @@ mod tests {
     }
 
     impl EbpfGtpuRuntime for FakeRuntime {
+        fn reset_strict_exclusive_workload_graph(
+            &self,
+            ifindex: Option<u32>,
+            pin_dir: &Path,
+            priority: u16,
+        ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
+            let mut state = self.state();
+            state
+                .strict_workload_resets
+                .push((ifindex, pin_dir.to_owned(), priority));
+            Ok(state.strict_workload_reset_report)
+        }
+
         fn synchronize_grouped_readers(&self) -> Result<(), GtpuError> {
             assert!(self.selector_namespace_effect_held.load(Ordering::Acquire));
             let mut state = self.state();
@@ -73080,6 +73116,121 @@ mod tests {
 
     fn current_recovery_authority() -> crate::CurrentEbpfGraphRecoveryAuthority {
         current_recovery_authority_with_values(0x91, 0x92, 1, 0x93)
+    }
+
+    #[tokio::test]
+    async fn strict_workload_reset_dispatches_only_explicit_assertion_and_returns_counts() {
+        let scope = EbpfWorkloadScope::new([0x53; 32]).unwrap();
+        let runtime = Arc::new(FakeRuntime::new());
+        let report = {
+            let mut state = runtime.state();
+            state.strict_workload_reset_report.selector_markers = 3;
+            state.strict_workload_reset_report.tc_filters = 5;
+            state
+                .strict_workload_reset_report
+                .exclusion_marker_directories = 7;
+            state.strict_workload_reset_report
+        };
+        let backend = EbpfGtpuDataplaneBackend::with_runtime_and_config(
+            runtime.clone(),
+            EbpfGtpuDataplaneBackendConfig {
+                bpffs_pin_root: scope.bpffs_pin_root(),
+                tc_priority: 73,
+            },
+        );
+        assert!(matches!(
+            backend.reset_workload_graph(scope, "s2bu").await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "workload_cleanup"
+            })
+        ));
+        assert!(matches!(
+            backend.reset_exclusive_workload_graph(scope, "s2bu").await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "exclusive_workload_cleanup"
+            })
+        ));
+        assert!(runtime.state().strict_workload_resets.is_empty());
+        for interface in ["s2bu", "missing"] {
+            let actual = backend
+                .reset_strict_exclusive_workload_graph(scope, interface)
+                .await
+                .unwrap();
+            assert_eq!(actual.selector_markers, 3);
+            assert_eq!(actual.tc_filters, 5);
+            assert_eq!(actual.exclusion_marker_directories, 7);
+        }
+        assert_eq!(
+            runtime.state().strict_workload_resets,
+            vec![
+                (Some(S2BU_IFINDEX), scope.bpffs_pin_root().join("s2bu"), 73),
+                (None, scope.bpffs_pin_root().join("missing"), 73),
+            ]
+        );
+        assert!(backend
+            .reset_strict_exclusive_workload_graph(
+                EbpfWorkloadScope::new([0x54; 32]).unwrap(),
+                "s2bu"
+            )
+            .await
+            .is_err());
+        assert!(backend
+            .reset_strict_exclusive_workload_graph(scope, "../s2bu")
+            .await
+            .is_err());
+        assert_eq!(runtime.state().strict_workload_resets.len(), 2);
+        assert_eq!(format!("{report:?}"), "EbpfStrictWorkloadResetReport { selector_markers: 3, tc_filters: 5, exclusion_marker_directories: 7 }");
+    }
+
+    #[tokio::test]
+    async fn strict_workload_reset_preserves_pending_terminal_admission() {
+        let scope = EbpfWorkloadScope::new([0x55; 32]).unwrap();
+        let runtime = Arc::new(FakeRuntime::new());
+        let backend = EbpfGtpuDataplaneBackend::with_runtime_and_config(
+            runtime.clone(),
+            EbpfGtpuDataplaneBackendConfig {
+                bpffs_pin_root: scope.bpffs_pin_root(),
+                ..EbpfGtpuDataplaneBackendConfig::default()
+            },
+        );
+        let pin_dir = scope.bpffs_pin_root().join("s2bu");
+        let authority = current_recovery_authority();
+        let receipt = crate::CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            authority.binding(),
+            crate::CurrentEbpfGraphRecoveryOutcome::Removed,
+            crate::CurrentEbpfGraphRecoveryCommitment::new([0x56; 32]).unwrap(),
+            crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            None,
+        );
+        backend.terminal_admissions().unwrap().insert(
+            pin_dir.clone(),
+            PendingCurrentTerminalAdmission {
+                intent: crate::CurrentEbpfGraphRecoveryIntent::new(
+                    "s2bu",
+                    crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+                ),
+                receipt,
+                authority,
+            },
+        );
+        assert!(matches!(
+            backend
+                .reset_strict_exclusive_workload_graph(scope, "s2bu")
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "exclusive_workload_cleanup_pending_terminal_admission"
+            })
+        ));
+        assert!(runtime.state().strict_workload_resets.is_empty());
+        assert_eq!(
+            backend
+                .terminal_admissions()
+                .unwrap()
+                .get(&pin_dir)
+                .unwrap()
+                .receipt,
+            receipt
+        );
     }
 
     #[tokio::test]

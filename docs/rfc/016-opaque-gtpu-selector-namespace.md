@@ -1321,8 +1321,10 @@ case, length, or extra matching entry is invalid. The protected
 precommitted coordinates, and canonical capsule before marker creation.
 
 The terminal marker is created only by the stopped decommission workflow, is
-never removed, and makes the transition one-way independently of the protected
-store. Ordinary `Bound` requires its proved absence. `Decommissioning` may have
+never removed within this lifecycle, and makes the transition one-way independently
+of the protected store. The distinct reset for a never-provisioned scope is outside
+this lifecycle; see [ADR 0028](../adr/0028-strict-exclusive-workload-reset.md).
+Ordinary `Bound` requires its proved absence. `Decommissioning` may have
 it absent or exact depending on recorded progress and, when present, requires
 the decoded capsule to equal its stored predecessor and coordinate fields.
 `Decommissioned` requires that same exact marker. If protected storage rolls
@@ -1553,12 +1555,16 @@ reboot leaves the protected ledger `Bound` and therefore fails closed rather
 than recreating authority. Any other unsupported durability result, I/O, sync,
 close, ACK, enumeration, ownership, mode, link-count, or identity failure is
 ambiguous and fails closed. The marker is never renamed,
-modified, or silently recreated after deletion. A separately authorized
+modified, or silently recreated after deletion within this lifecycle; see
+[ADR 0028](../adr/0028-strict-exclusive-workload-reset.md) for the separate
+never-provisioned-scope reset. A separately authorized
 decommission procedure may remove mutable programs, selector maps, journals,
 and non-authority pins only after the protected namespace record is permanently
 `Decommissioned`; it MUST retain the authority marker, terminal decommission
 fence, complete operation-stamp authority map, and protected record. Normal
-cleanup and decommission never erase any of those authority fences.
+cleanup and decommission never erase any of those authority fences. The strict
+reset in [ADR 0028](../adr/0028-strict-exclusive-workload-reset.md) is outside
+this lifecycle and cannot be used in a selector-provisioned scope.
 
 ## 9. Backend Contract
 
@@ -1768,7 +1774,9 @@ the authenticated phase/terminal coordinates from that marker as specified in
 §8.1; any other rollback remains indeterminate rather than inventing a
 generation or nonce. A crash after step 4 leaves `Decommissioned`, forbids
 traffic and claims, and may only resume the same bounded steps 5–6 cleanup and
-verification. Neither marker nor the protected record is ever removed.
+verification. Neither marker nor the protected record is ever removed by this
+lifecycle; the never-provisioned-scope reset in
+[ADR 0028](../adr/0028-strict-exclusive-workload-reset.md) is outside its contract.
 `Decommissioned` can be restored or moved only by a future separately
 authorized, versioned migration that preserves both terminal fences; it can
 never become an ordinary fresh namespace.
@@ -1791,6 +1799,18 @@ these markers or infer a fresh durable selector history from graph absence.
 Their local writer locks and repeatable pin inventories are not substitutes
 for this RFC's permanent protected record or authority-bearing migration.
 
+`reset_strict_exclusive_workload_graph` is the only workload-scope operation
+that removes selector-authority, decommission and legacy selector-terminal
+markers, as specified in [ADR 0028](../adr/0028-strict-exclusive-workload-reset.md).
+It is outside this RFC's lifecycle and is valid only for an exclusively owned
+scope in which no selector namespace was ever provisioned. Its additional
+ownership assertion covers the configured tc priority on the named interface.
+Using it in any selector-provisioned scope, including after decommission, erases
+permanent authority and retirement fences and can permit retired namespace reuse
+or conflict with another owner. Writer locks and program-reference checks cannot
+prove the absence of selector history. It is not a replacement for this RFC's
+history-preserving decommission or migration protocol.
+
 | Threat | Required mitigation |
 | :--- | :--- |
 | Split brain or concurrent claimant | One complete ledger CAS, monotonic generation, host-global control lock, and exact readback; disagreement poisons or fails closed. |
@@ -1799,7 +1819,7 @@ for this RFC's permanent protected record or authority-bearing migration.
 | Partial selector claim/removal | Canonical whole-group transaction and exact whole-group readback; mixed provenance is unsupported. |
 | Ordinary caller or non-selected mock forges evidence | Opaque affine requests and private receipt coordinates are not independently constructible; the SDK validates the exact request kind, binding, complete set, phase generations/nonces, durable selector-backend epoch, receipt class, and closed coordinator outcome. Structural or semantic equality alone cannot supply the missing request. A backend deliberately passed to the production lifecycle is selected into the TCB and is not in this attacker class. |
 | ACK loss, cancellation, or process death | Durable progress states, operation nonce, exact recovery outcomes, bounded supervision, and poison on ambiguity. |
-| Map/program loss or ordinary cleanup | Immutable persistent control marker plus durable ledger; absence does not prove historical absence. |
+| Map/program loss or ordinary cleanup | Persistent control marker plus durable ledger; both ordinary workload resets refuse selector markers. Strict reset ([ADR 0028](../adr/0028-strict-exclusive-workload-reset.md)) is outside this lifecycle and valid only in a never-provisioned scope. Absence does not prove historical absence. |
 | Control-marker tampering | Trusted descriptor traversal, no-follow/no-replace, owner/mode/link/inode checks, exact enumeration/digest binding, directory sync, and host-global lock. |
 | Symlink, hardlink, or replacement race | Descriptor-relative no-follow traversal; reject links, unexpected metadata, changed inode, and non-bpffs objects before mutation. |
 | Durable rollback or cloned database | Protected AAD plus permanent backend-owned group stamp keys and exact current lifecycle values; every effect revalidates the exact ledger/stamp bijection while holding the backend-global gate. Extra/missing/mismatched history fails closed. |

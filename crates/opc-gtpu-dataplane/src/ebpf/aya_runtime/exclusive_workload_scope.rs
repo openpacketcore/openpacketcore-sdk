@@ -5,6 +5,7 @@ use crate::ebpf::validate_interface_name;
 use crate::ebpf::workload_scope::{
     cleanup_exclusive, ExclusiveCleanupInventory, ExclusiveWorkloadCleanup,
 };
+use crate::ebpf::EbpfStrictWorkloadResetReport;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStringExt;
@@ -66,9 +67,14 @@ impl Filter {
             && self.handle == u32::from(TC_HANDLE)
     }
 
-    fn detach(&self, ifindex: u32) -> Result<(), GtpuError> {
-        // Zero would delete the whole priority rather than one filter.
-        if self.handle == 0 {
+    fn classifier(&self) -> (u32, u32, u16, u16) {
+        (self.parent, self.chain, self.protocol, self.priority)
+    }
+
+    fn detach(&self, ifindex: u32, entire_priority: bool) -> Result<(), GtpuError> {
+        // Only the strict assertion on the named interface authorizes deleting
+        // a complete classifier, including u32 tables and all their rules.
+        if self.handle == 0 && !entire_priority {
             return Err(state_indeterminate(OPERATION));
         }
         let socket = sys::open_route_netlink_socket().map_err(io_error)?;
@@ -81,7 +87,7 @@ impl Filter {
             TC_NETLINK_SEQUENCE,
             socket.port_id(),
             tc_ifindex(ifindex).map_err(io_error)?,
-            self.handle,
+            if entire_priority { 0 } else { self.handle },
             self.parent,
             (u32::from(self.priority) << 16) | u32::from(self.protocol),
             &attributes,
@@ -106,7 +112,8 @@ pub(super) fn reset(
     ifindex: Option<u32>,
     pin_dir: &Path,
     priority: u16,
-) -> Result<(), GtpuError> {
+    strict: bool,
+) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
     if !runtime
         .devices
         .lock()
@@ -170,12 +177,24 @@ pub(super) fn reset(
                 .to_owned(),
             ifindex,
             by_name: true,
+            exclusive_priority: strict,
             hooks: Vec::new(),
         }],
         priority,
+        strict,
+        report: EbpfStrictWorkloadResetReport::default(),
         retired_programs: HashSet::new(),
     };
-    cleanup_exclusive(&mut port)
+    if let Err(source) = cleanup_exclusive(&mut port) {
+        if strict && port.report != EbpfStrictWorkloadResetReport::default() {
+            return Err(GtpuError::StrictWorkloadResetIncomplete {
+                report: port.report,
+                source: Box::new(source),
+            });
+        }
+        return Err(source);
+    }
+    Ok(port.report)
 }
 
 fn io_error(error: impl Into<io::Error>) -> GtpuError {
@@ -298,19 +317,106 @@ fn entries(directory: &File) -> Result<Vec<OsString>, GtpuError> {
     Ok(names)
 }
 
+fn selector_marker(name: &OsStr) -> bool {
+    [
+        b"SELECTOR_AUTHORITY_".as_slice(),
+        b"SELECTOR_DECOMMISSIONED_",
+        b"SELECTOR_TERMINAL_FENCE_",
+    ]
+    .iter()
+    .any(|prefix| name.as_bytes().starts_with(prefix))
+}
+
 struct Node {
     path: PathBuf,
     parent: usize,
     identity: (u64, u64),
     directory: Option<File>,
     // Holding maps prevents map-ID reuse across reference scans and unlink.
-    map: Option<(MapData, u32)>,
+    map: Option<ScopeMap>,
     program_id: Option<u32>,
     object_pin: bool,
     // Keep the pin inode alive as well as its object, preventing inode reuse.
     _pin: Option<File>,
     keep: bool,
     removed: bool,
+}
+
+struct ScopeMap {
+    _data: MapData,
+    id: u32,
+    sdk: bool,
+}
+
+fn sdk_map(name: &OsStr, data: &MapData) -> Result<bool, GtpuError> {
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    let info = data.info().map_err(|_| state_indeterminate(OPERATION))?;
+    if info.map_flags() != 0 {
+        return Ok(false);
+    }
+    let Ok(map_type) = info.map_type() else {
+        // An unknown kernel type cannot match a known SDK definition.
+        return Ok(false);
+    };
+    let map_type = map_type as u32;
+    let definition = |kind, key, value, capacity| {
+        (
+            map_type,
+            info.key_size(),
+            info.value_size(),
+            info.max_entries(),
+        ) == (kind, key, value, capacity)
+    };
+    if info.name() == kernel_program_name(name)
+        && (CURRENT_MAP_SPECS.iter().any(|spec| {
+            spec.name == name
+                && (definition(
+                    spec.map_type,
+                    spec.key_size,
+                    spec.value_size,
+                    spec.max_entries,
+                ) || name == MAP_COUNTERS
+                    && definition(
+                        spec.map_type,
+                        spec.key_size,
+                        spec.value_size,
+                        PRE_REDIRECT_COUNTER_SLOTS,
+                    ))
+        }) || LEGACY_V1_MAP_SPECS
+            .iter()
+            .chain(&LEGACY_V2_MAP_SPECS)
+            .chain(&PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS)
+            .any(|spec| {
+                spec.name == name
+                    && definition(
+                        spec.map_type,
+                        spec.key_size,
+                        spec.value_size,
+                        spec.max_entries,
+                    )
+            }))
+    {
+        return Ok(true);
+    }
+    // Recovery records are standalone arrays, including the second pins of
+    // the same immutable proof. Their contents are not cleanup authority.
+    let proof_sizes: &[usize] = match name {
+        LEGACY_V2_TEARDOWN_PROOF_MAP => &[LEGACY_V2_TEARDOWN_PROOF_LEN, CURRENT_RECOVERY_PROOF_LEN],
+        CURRENT_RECOVERY_TERMINAL_PROOF_MAP | CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP => {
+            &[CURRENT_RECOVERY_PROOF_LEN]
+        }
+        HISTORICAL_25_RECOVERY_PROOF_MAP | HISTORICAL_25_ROOT_HANDOFF_MARKER => &[
+            HISTORICAL_25_RECOVERY_PROOF_LEN,
+            HISTORICAL_25_R4_RECOVERY_PROOF_LEN,
+        ],
+        _ => &[],
+    };
+    Ok(info.name() == kernel_program_name("standalone_array")
+        && proof_sizes
+            .iter()
+            .any(|size| definition(bpf_map_type::BPF_MAP_TYPE_ARRAY as u32, 4, *size as u32, 1)))
 }
 
 struct ExclusiveCleanup {
@@ -321,6 +427,8 @@ struct ExclusiveCleanup {
     leaves: BTreeSet<String>,
     interfaces: Vec<Interface>,
     priority: u16,
+    strict: bool,
+    report: EbpfStrictWorkloadResetReport,
     retired_programs: HashSet<u32>,
 }
 
@@ -328,7 +436,19 @@ struct Interface {
     name: String,
     ifindex: Option<u32>,
     by_name: bool,
+    exclusive_priority: bool,
     hooks: Vec<Filter>,
+}
+
+impl Interface {
+    fn owns_filter_by_name(&self, filter: &Filter, priority: u16, strict: bool) -> bool {
+        self.by_name
+            && if self.exclusive_priority {
+                filter.priority == priority || filter.sdk
+            } else {
+                filter.sdk || !strict && filter.exact_slot(priority)
+            }
+    }
 }
 
 impl ExclusiveCleanup {
@@ -341,16 +461,9 @@ impl ExclusiveCleanup {
 
     fn inventory_directory(&mut self, parent: usize) -> Result<bool, GtpuError> {
         for name in entries(self.directory(parent)?)? {
-            // Permanent selector history cannot be erased by a declaration
-            // about the ordinary workload graph, even if the marker is torn.
-            if [
-                b"SELECTOR_AUTHORITY_".as_slice(),
-                b"SELECTOR_DECOMMISSIONED_",
-                b"SELECTOR_TERMINAL_FENCE_",
-            ]
-            .iter()
-            .any(|prefix| name.as_bytes().starts_with(prefix))
-            {
+            // Only the strict assertion says these cannot protect a bound
+            // selector's permanent history, including torn marker layouts.
+            if !self.strict && selector_marker(&name) {
                 return Ok(true);
             }
             let path = self.nodes[parent].path.join(&name);
@@ -409,7 +522,15 @@ impl ExclusiveCleanup {
                 if field("link_id:\t").is_some() {
                     (None, field("prog_id:\t"))
                 } else if let Some(id) = field("map_id:\t") {
-                    (Some((data, id)), None)
+                    let sdk = !self.strict || sdk_map(&name, &data)?;
+                    (
+                        Some(ScopeMap {
+                            _data: data,
+                            id,
+                            sdk,
+                        }),
+                        None,
+                    )
                 } else {
                     // Program and link pins belong to the declared root.
                     // Removing a link pin releases its attachment when it is
@@ -430,15 +551,20 @@ impl ExclusiveCleanup {
                 && stem
                     .iter()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+            let retained_exclusion = directory.is_some()
+                && self.nodes[parent].keep
+                && self.nodes[parent].parent != 0
+                && self.nodes[self.nodes[parent].parent].path
+                    == Path::new(RECONCILER_CONTROL_DIRECTORY)
+                && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER;
             let keep = directory.is_some()
                 && (path == Path::new(RECONCILER_CONTROL_DIRECTORY)
                     || direct_control_child && lock_name
-                    || self.nodes[parent].keep
-                        && self.nodes[parent].parent != 0
-                        && self.nodes[self.nodes[parent].parent].path
-                            == Path::new(RECONCILER_CONTROL_DIRECTORY)
-                        && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER);
-            if keep {
+                    || retained_exclusion);
+            // Strict marker classification waits until every known interface
+            // has been discovered. A foreign marker in a writer/operation lock
+            // is removable; an absent interface's valid exclusion is not.
+            if keep && !(self.strict && retained_exclusion) {
                 AyaGtpuRuntime::verify_control_directory(
                     directory
                         .as_ref()
@@ -554,15 +680,31 @@ impl ExclusiveCleanup {
 
     fn inventory_interfaces(&mut self) -> Result<(), GtpuError> {
         self.revalidate_interface()?;
+        let named_ifindex = self
+            .interfaces
+            .first()
+            .and_then(|interface| interface.ifindex);
         let mut referenced = self.referencing_programs()?;
+        // A map of any shape can identify the SDK's own hook after a rename.
+        // Only recognized SDK maps confer authority independent of the SDK
+        // attach predicate or participate in the strict reference guard.
+        let mut discovery_references = if self.strict {
+            self.programs_referencing_maps(false)?
+        } else {
+            referenced.clone()
+        };
         let declared = self.leaves.clone();
         let mut interfaces = declared
             .iter()
             .map(|name| {
+                let ifindex = interface_index(name)?;
                 Ok(Interface {
                     name: name.clone(),
-                    ifindex: interface_index(name)?,
+                    ifindex,
                     by_name: true,
+                    exclusive_priority: self.strict
+                        && ifindex.is_some()
+                        && ifindex == named_ifindex,
                     hooks: Vec::new(),
                 })
             })
@@ -579,21 +721,21 @@ impl ExclusiveCleanup {
                     .filters(ifindex)?
                     .into_iter()
                     .filter(|filter| {
-                        filter.sdk
-                            || filter.exact_slot(self.priority)
+                        interface.owns_filter_by_name(filter, self.priority, self.strict)
                             || filter.program_id.is_some_and(|id| referenced.contains(&id))
                     })
                     .collect();
                 for hook in &interface.hooks {
                     if let Some(id) = hook.program_id {
                         referenced.remove(&id);
+                        discovery_references.remove(&id);
                     }
                 }
             }
         }
         // Map references recover the identity of a renamed interface even
-        // when no pin leaf has its new name. On unrelated devices, only that
-        // reference grants authority; names or slot placement alone do not.
+        // when no pin leaf has its new name. Ordinary cleanup follows every
+        // scope-map reference; strict requires a recognized map or an SDK hook.
         for interface in nix::net::if_::if_nameindex().map_err(io_error)?.iter() {
             let Ok(name) = interface.name().to_str() else {
                 continue;
@@ -611,7 +753,7 @@ impl ExclusiveCleanup {
             {
                 self.leaves.insert(name.to_owned());
             }
-            if declared_indices.contains(&interface.index()) || referenced.is_empty() {
+            if declared_indices.contains(&interface.index()) || discovery_references.is_empty() {
                 continue;
             }
             // Discovery cannot make an unrelated device a prerequisite. Its
@@ -623,12 +765,17 @@ impl ExclusiveCleanup {
             };
             let hooks = filters
                 .into_iter()
-                .filter(|filter| filter.program_id.is_some_and(|id| referenced.contains(&id)))
+                .filter(|filter| {
+                    filter.program_id.is_some_and(|id| {
+                        discovery_references.contains(&id)
+                            && (!self.strict || filter.sdk || referenced.contains(&id))
+                    })
+                })
                 .collect::<Vec<_>>();
             if !hooks.is_empty() {
                 for hook in &hooks {
                     if let Some(id) = hook.program_id {
-                        referenced.remove(&id);
+                        discovery_references.remove(&id);
                     }
                 }
                 self.leaves.insert(name.to_owned());
@@ -636,12 +783,62 @@ impl ExclusiveCleanup {
                     name: name.to_owned(),
                     ifindex: Some(interface.index()),
                     by_name: false,
+                    exclusive_priority: false,
                     hooks,
                 });
             }
         }
         self.interfaces = interfaces;
         self.revalidate_interface()
+    }
+
+    fn retain_ordinary_exclusions(&mut self) -> Result<(), GtpuError> {
+        if !self.strict {
+            return Ok(());
+        }
+        let control = self
+            .nodes
+            .iter()
+            .find(|node| node.path == Path::new(RECONCILER_CONTROL_DIRECTORY))
+            .ok_or_else(|| state_indeterminate(OPERATION))?;
+        let writer_names = self
+            .leaves
+            .iter()
+            .map(|leaf| {
+                AyaGtpuRuntime::selector_namespace_pin_commitment(
+                    control.identity.0,
+                    control.identity.1,
+                    OsStr::new(leaf),
+                )
+                .map(|namespace| AyaGtpuRuntime::lower_hex(&namespace))
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        for index in 1..self.nodes.len() {
+            let node = &self.nodes[index];
+            if !node.keep
+                || node.path.file_name()
+                    != Some(OsStr::new(HISTORICAL_25_ORDINARY_EXCLUSION_MARKER))
+            {
+                continue;
+            }
+            let parent = self.nodes[node.parent]
+                .path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            if parent.ends_with(RECONCILER_OPERATION_LOCK_SUFFIX) || writer_names.contains(parent) {
+                self.nodes[index].keep = false;
+            } else {
+                // An unknown 64-hex lock can be an absent interface's legacy
+                // exclusion. Preserve its marker exactly as ordinary reset does.
+                AyaGtpuRuntime::verify_control_directory(
+                    self.directory(index)?,
+                    Some(node.identity),
+                    OPERATION,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn revalidate_interface(&self) -> Result<(), GtpuError> {
@@ -656,10 +853,16 @@ impl ExclusiveCleanup {
     }
 
     fn referencing_programs(&self) -> Result<HashSet<u32>, GtpuError> {
+        self.programs_referencing_maps(self.strict)
+    }
+
+    fn programs_referencing_maps(&self, sdk_only: bool) -> Result<HashSet<u32>, GtpuError> {
         let maps = self
             .nodes
             .iter()
-            .filter_map(|node| node.map.as_ref().map(|(_, id)| *id))
+            .filter_map(|node| node.map.as_ref())
+            .filter(|map| !sdk_only || map.sdk)
+            .map(|map| map.id)
             .collect::<HashSet<_>>();
         let mut references = HashSet::new();
         if maps.is_empty() {
@@ -704,7 +907,7 @@ impl ExclusiveCleanup {
         for interface in &self.interfaces {
             if let Some(ifindex) = interface.ifindex {
                 if self.filters(ifindex)?.iter().any(|filter| {
-                    interface.by_name && (filter.sdk || filter.exact_slot(self.priority))
+                    interface.owns_filter_by_name(filter, self.priority, self.strict)
                         || interface.hooks.iter().any(|old| {
                             (
                                 old.parent,
@@ -774,6 +977,7 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
             );
         }
         self.inventory_interfaces()?;
+        self.retain_ordinary_exclusions()?;
         self.revalidate()?;
         let (object_pins, pins) = (1..self.nodes.len())
             .rev()
@@ -790,14 +994,42 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
     fn detach_interface(&mut self, index: usize) -> Result<(), GtpuError> {
         let hooks = self.interfaces[index].hooks.clone();
         if let Some(ifindex) = self.interfaces[index].ifindex {
-            for hook in hooks {
+            let mut detached_classifiers = HashSet::new();
+            for hook in &hooks {
+                let entire_priority =
+                    self.interfaces[index].exclusive_priority && hook.priority == self.priority;
+                if entire_priority && !detached_classifiers.insert(hook.classifier()) {
+                    continue;
+                }
                 self.revalidate()?;
-                if !self.filters(ifindex)?.contains(&hook) {
+                let current = self.filters(ifindex)?;
+                let removing = if entire_priority {
+                    hooks
+                        .iter()
+                        .filter(|other| other.classifier() == hook.classifier())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![hook]
+                };
+                if removing.iter().any(|filter| !current.contains(filter))
+                    || entire_priority
+                        && current
+                            .iter()
+                            .filter(|filter| filter.classifier() == hook.classifier())
+                            .count()
+                            != removing.len()
+                {
                     return Err(state_indeterminate(OPERATION));
                 }
-                hook.detach(ifindex)?;
-                if let Some(id) = hook.program_id {
-                    self.retired_programs.insert(id);
+                hook.detach(ifindex, entire_priority)?;
+                for filter in removing {
+                    // Handle zero is the dump's classifier summary, not a
+                    // filter. Counting it would report foreign residue even
+                    // for a classifier containing only the SDK's own hooks.
+                    self.report.tc_filters += usize::from(filter.handle != 0 && !filter.sdk);
+                    if let Some(id) = filter.program_id {
+                        self.retired_programs.insert(id);
+                    }
                 }
             }
         }
@@ -824,6 +1056,20 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
             },
         )
         .map_err(io_error)?;
+        if selector_marker(name) {
+            self.report.selector_markers += 1;
+        }
+        let parent_path = &self.nodes[node.parent].path;
+        let sdk_staging = parent_path.parent() == Some(Path::new(RECONCILER_CONTROL_DIRECTORY))
+            && parent_path.file_name().and_then(OsStr::to_str).is_some_and(
+                AyaGtpuRuntime::historical_25_ordinary_exclusion_staging_name_is_globally_reserved,
+            );
+        if node.directory.is_some()
+            && name == HISTORICAL_25_ORDINARY_EXCLUSION_MARKER
+            && !sdk_staging
+        {
+            self.report.exclusion_marker_directories += 1;
+        }
         if let Some(id) = node.program_id {
             self.retired_programs.insert(id);
         }
@@ -859,9 +1105,9 @@ impl ExclusiveWorkloadCleanup for ExclusiveCleanup {
         self.revalidate()?;
         self.require_unreferenced()?;
         self.verify_detached_hooks()?;
-        // Preserve all earlier exclusions and finish every inventoried leaf,
-        // including names from before a rename. A later reset of another
-        // interface must not make ordinary attachment bounce between markers.
+        // Finish every inventoried leaf, including names from before a rename.
+        // Both forms preserve earlier ordinary exclusions, including those of
+        // absent interfaces whose hashed lock names this call cannot recover.
         let control = self
             .nodes
             .iter()
@@ -930,6 +1176,53 @@ mod tests {
             },
             state,
         )
+    }
+
+    #[test]
+    fn strict_priority_authority_requires_the_named_interface() {
+        let mut filter = Filter {
+            parent: sys::TC_H_CLSACT_INGRESS,
+            chain: 0,
+            protocol: TC_PROTOCOL_ALL,
+            priority: 50,
+            handle: u32::from(TC_HANDLE),
+            kind: b"matchall\0".to_vec(),
+            sdk: false,
+            program_id: None,
+        };
+        let named = Interface {
+            name: "named0".into(),
+            ifindex: Some(17),
+            by_name: true,
+            exclusive_priority: true,
+            hooks: Vec::new(),
+        };
+        let discovered = Interface {
+            name: "scope0".into(),
+            ifindex: Some(19),
+            by_name: true,
+            exclusive_priority: false,
+            hooks: Vec::new(),
+        };
+        for chain in [0, 7, u32::MAX] {
+            for protocol in [TC_PROTOCOL_ALL, 0x0800_u16.to_be(), 0x86dd_u16.to_be()] {
+                for handle in [0, u32::from(TC_HANDLE), 2, 0x8000_0800] {
+                    filter.chain = chain;
+                    filter.protocol = protocol;
+                    filter.handle = handle;
+                    assert!(named.owns_filter_by_name(&filter, 50, true));
+                    assert!(!named.owns_filter_by_name(&filter, 51, true));
+                    assert!(!discovered.owns_filter_by_name(&filter, 50, true));
+                    assert_eq!(
+                        discovered.owns_filter_by_name(&filter, 50, false),
+                        chain == 0 && protocol == TC_PROTOCOL_ALL && handle == u32::from(TC_HANDLE)
+                    );
+                }
+            }
+        }
+        filter.sdk = true;
+        assert!(discovered.owns_filter_by_name(&filter, 50, true));
+        assert!(named.owns_filter_by_name(&filter, 51, true));
     }
 
     #[test]
