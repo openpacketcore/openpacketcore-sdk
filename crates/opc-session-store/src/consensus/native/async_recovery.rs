@@ -461,14 +461,15 @@ impl NativeDelta<'_> {
                 .map_err(|_| invalid("native asynchronous history state invalid"))?,
             );
         }
-        for id in self
-            .base
-            .receipts
-            .iter()
-            .map(|(id, _)| id)
-            .chain(self.receipts.keys())
-        {
-            self.receipt_removals.insert(*id);
+        for (epoch, first, count) in self.receipt_order.ranges() {
+            for ordinal in first..first + count as u64 {
+                let indexed = self
+                    .receipt_order
+                    .get(epoch, ordinal)
+                    .ok_or_else(|| invalid("native recovery removal index has a hole"))?;
+                self.receipt_removals
+                    .insert(indexed.id, ordinal, &self.receipt_order)?;
+            }
         }
         self.receipts.clear();
         self.receipt_order = history_order::ReceiptOrder::default();

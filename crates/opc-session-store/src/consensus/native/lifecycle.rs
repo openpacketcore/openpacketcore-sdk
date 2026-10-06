@@ -250,6 +250,112 @@ pub(super) fn conservation(
     Ok(())
 }
 
+// One scalar lifecycle plan shared by admission and application. No receipt
+// allocation or mutation occurs here; application still verifies every row.
+fn planned_history(
+    history: Option<FencedTransitionV2HistoryState>,
+    sequence: u64,
+    command: &SessionConsensusCommand,
+    now: Timestamp,
+    last: impl Fn(u64) -> Option<Timestamp>,
+) -> io::Result<Result<Option<FencedTransitionV2HistoryState>, StoreError>> {
+    let SessionMutationIntent::MaintainFencedTransitionV2History {
+        expected_generation,
+        expected_active_epoch,
+        expected_retired_through,
+        expected_bound_entries,
+    } = &command.intent
+    else {
+        return Err(invalid(
+            "native history maintenance must be a raw internal command",
+        ));
+    };
+    if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
+        return Err(invalid("native history maintenance time outside profile"));
+    }
+    let Some(history) = history else {
+        return Ok(Err(StoreError::FencedTransitionHistoryEpochNotActive));
+    };
+    if history.generation() != *expected_generation
+        || history.active_epoch() != *expected_active_epoch
+        || floor(Some(history)) != *expected_retired_through
+        || history.bound_entries() as u64 != *expected_bound_entries
+    {
+        return Ok(Err(StoreError::FencedTransitionHistoryEpochNotActive));
+    }
+    if sequence >= COUNTER_MAX
+        || history.generation() >= COUNTER_MAX
+        || history
+            .active_epoch()
+            .is_some_and(|epoch| epoch.get() >= COUNTER_MAX)
+        || history
+            .reclaim_epoch()
+            .is_some_and(|epoch| epoch.get() >= COUNTER_MAX)
+    {
+        return Ok(Err(StoreError::FencedTransitionStorageExhausted));
+    }
+    let active = history
+        .active_epoch()
+        .ok_or_else(|| invalid("native maintenance active epoch absent"))?;
+    let generation = history.generation() + 1;
+    let updated = if history.reclaim_epoch().is_none()
+        && active.get() - floor(Some(history)) < (FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1) as u64
+    {
+        if history.bound_entries() < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+            None
+        } else {
+            Some(
+                FencedTransitionV2HistoryState::new(
+                    Some(
+                        FencedTransitionV2HistoryEpoch::new(active.get() + 1)
+                            .map_err(|_| invalid("native successor epoch invalid"))?,
+                    ),
+                    history.retired_through(),
+                    None,
+                    0,
+                    generation,
+                    0,
+                    history.reclaimed_entries(),
+                )
+                .map_err(|_| invalid("native rotated history invalid"))?,
+            )
+        }
+    } else {
+        let epoch = history
+            .reclaim_epoch()
+            .map_or(floor(Some(history)) + 1, |epoch| epoch.get());
+        let remaining = if history.reclaim_epoch().is_some() {
+            history.reclaim_remaining()
+        } else {
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+        };
+        let last = last(epoch).ok_or_else(|| invalid("native retiring epoch is missing"))?;
+        if history.reclaim_epoch().is_none() && last > now {
+            None
+        } else {
+            let count = remaining.min(FENCED_TRANSITION_V2_RECLAIM_BATCH);
+            if history.reclaimed_entries() > COUNTER_MAX - count as u64 {
+                return Ok(Err(StoreError::FencedTransitionStorageExhausted));
+            }
+            let retired = FencedTransitionV2HistoryEpoch::new(epoch)
+                .map_err(|_| invalid("native retired epoch invalid"))?;
+            Some(
+                FencedTransitionV2HistoryState::new(
+                    Some(active),
+                    Some(retired),
+                    (remaining > count).then_some(retired),
+                    remaining - count,
+                    generation,
+                    history.bound_entries(),
+                    history.reclaimed_entries() + count as u64,
+                )
+                .map_err(|_| invalid("native reclaimed history invalid"))?,
+            )
+        }
+    };
+    Ok(Ok(updated))
+}
+
 impl NativeDelta<'_> {
     pub(super) fn maintain_history(
         &mut self,
@@ -257,104 +363,29 @@ impl NativeDelta<'_> {
         now: Timestamp,
         index: u64,
     ) -> io::Result<SessionConsensusResponse> {
-        let SessionMutationIntent::MaintainFencedTransitionV2History {
-            expected_generation,
-            expected_active_epoch,
-            expected_retired_through,
-            expected_bound_entries,
-        } = &command.intent
-        else {
-            return Err(invalid(
-                "native history maintenance must be a raw internal command",
-            ));
+        let updated = match planned_history(
+            self.frontiers.history,
+            self.frontiers.sequence,
+            command,
+            now,
+            |epoch| self.receipt_order.last(epoch).map(|row| row.retained_until),
+        )? {
+            Ok(updated) => updated,
+            Err(error) => return Ok(self.clock_response(now, index, error)),
         };
-        if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
-            return Err(invalid("native history maintenance time outside profile"));
-        }
-        let Some(history) = self.frontiers.history else {
-            return Ok(self.clock_response(
-                now,
-                index,
-                StoreError::FencedTransitionHistoryEpochNotActive,
-            ));
-        };
-        if history.generation() != *expected_generation
-            || history.active_epoch() != *expected_active_epoch
-            || floor(Some(history)) != *expected_retired_through
-            || history.bound_entries() as u64 != *expected_bound_entries
-        {
-            return Ok(self.clock_response(
-                now,
-                index,
-                StoreError::FencedTransitionHistoryEpochNotActive,
-            ));
-        }
-        if self.frontiers.sequence >= COUNTER_MAX
-            || history.generation() >= COUNTER_MAX
-            || history
-                .active_epoch()
-                .is_some_and(|epoch| epoch.get() >= COUNTER_MAX)
-            || history
-                .reclaim_epoch()
-                .is_some_and(|epoch| epoch.get() >= COUNTER_MAX)
-        {
-            return Ok(self.clock_response(
-                now,
-                index,
-                StoreError::FencedTransitionStorageExhausted,
-            ));
-        }
-        let active = history
-            .active_epoch()
-            .ok_or_else(|| invalid("native maintenance active epoch absent"))?;
-        let generation = history.generation() + 1;
-        let updated = if history.reclaim_epoch().is_none()
-            && active.get() - floor(Some(history))
-                < (FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1) as u64
-        {
-            if history.bound_entries() < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
-                None
-            } else {
-                Some(
-                    FencedTransitionV2HistoryState::new(
-                        Some(
-                            FencedTransitionV2HistoryEpoch::new(active.get() + 1)
-                                .map_err(|_| invalid("native successor epoch invalid"))?,
-                        ),
-                        history.retired_through(),
-                        None,
-                        0,
-                        generation,
-                        0,
-                        history.reclaimed_entries(),
-                    )
-                    .map_err(|_| invalid("native rotated history invalid"))?,
-                )
-            }
-        } else {
-            let epoch = history
-                .reclaim_epoch()
-                .map_or(floor(Some(history)) + 1, |epoch| epoch.get());
-            let remaining = if history.reclaim_epoch().is_some() {
-                history.reclaim_remaining()
-            } else {
-                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
-            };
-            let last = self
-                .receipt_order
-                .last(epoch)
-                .ok_or_else(|| invalid("native retiring epoch is missing"))?;
-            if history.reclaim_epoch().is_none() && last.retained_until > now {
-                None
-            } else {
-                let count = remaining.min(FENCED_TRANSITION_V2_RECLAIM_BATCH);
-                if history.reclaimed_entries() > COUNTER_MAX - count as u64 {
-                    return Ok(self.clock_response(
-                        now,
-                        index,
-                        StoreError::FencedTransitionStorageExhausted,
-                    ));
-                }
+        if let Some(updated) = updated {
+            let history = self
+                .frontiers
+                .history
+                .ok_or_else(|| invalid("native history absent"))?;
+            let count = (updated.reclaimed_entries() - history.reclaimed_entries()) as usize;
+            if count != 0 {
+                let epoch = updated.retired_through().unwrap().get();
+                let remaining = if history.reclaim_epoch().is_some() {
+                    history.reclaim_remaining()
+                } else {
+                    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+                };
                 let first = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64 - remaining as u64 + 1;
                 // Exactly the fixed original batch. No map scan, payload
                 // decoding or cold-file access is needed for reclamation.
@@ -369,26 +400,13 @@ impl NativeDelta<'_> {
                     if row.ordinal != ordinal || row.retained_until != indexed.retained_until {
                         return Err(invalid("native reclaim row differs from admitted order"));
                     }
+                    self.receipt_removals
+                        .insert(indexed.id, ordinal, &self.receipt_order)?;
                     self.receipt_order.remove_prefix(indexed.id, ordinal)?;
                     self.receipts.remove(&indexed.id);
-                    self.receipt_removals.insert(indexed.id);
                 }
-                let retired = FencedTransitionV2HistoryEpoch::new(epoch)
-                    .map_err(|_| invalid("native retired epoch invalid"))?;
-                Some(
-                    FencedTransitionV2HistoryState::new(
-                        Some(active),
-                        Some(retired),
-                        (remaining > count).then_some(retired),
-                        remaining - count,
-                        generation,
-                        history.bound_entries(),
-                        history.reclaimed_entries() + count as u64,
-                    )
-                    .map_err(|_| invalid("native reclaimed history invalid"))?,
-                )
             }
-        };
+        }
         if let Some(updated) = updated {
             self.frontiers.history = Some(updated);
         }
@@ -401,5 +419,74 @@ impl NativeDelta<'_> {
         self.frontiers.digest = digest;
         self.frontiers.logical_time = Some(now);
         Ok(self.response(index, Ok(SessionMutationOutcome::Unit)))
+    }
+}
+
+impl NativeState {
+    /// Exact deletion count for a maintenance-only delivery. This scalar hint
+    /// does not evaluate receipt bindings from other commands in a mixed
+    /// delivery, so it can underestimate or skip admission on a follower.
+    /// Authoritative evaluation still reserves any shortfall fail-closed before
+    /// allocating the exact before-row vector; it does not bypass the cap.
+    pub(crate) fn reclaim_candidate_bytes(
+        &self,
+        entries: &[Entry<SessionRaftTypeConfig>],
+    ) -> io::Result<usize> {
+        // Scalar copies only: admission must not allocate a candidate before
+        // it obtains its reservation, even for a very large delivery.
+        let mut history = self.frontiers.history;
+        let mut sequence = self.frontiers.sequence;
+        let mut logical_time = self.frontiers.logical_time;
+        let order = &self.require_business_proof()?.receipt_order;
+        let mut count = 0usize;
+        for entry in entries {
+            let EntryPayload::Normal(command) = &entry.payload else {
+                continue;
+            };
+            let now =
+                logical_time.map_or(command.logical_time, |time| time.max(command.logical_time));
+            if matches!(
+                command.intent,
+                SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            ) {
+                if let Ok(updated) = planned_history(history, sequence, command, now, |epoch| {
+                    order.last(epoch).map(|row| row.retained_until)
+                })? {
+                    if let Some(updated) = updated {
+                        count += (updated.reclaimed_entries()
+                            - history.unwrap().reclaimed_entries())
+                            as usize;
+                        history = Some(updated);
+                    }
+                    sequence += 1;
+                }
+            }
+            logical_time = Some(now);
+        }
+        Self::reclaim_rows_bytes(count)
+    }
+
+    // Before ordering, time and expectations are not committed yet. Reserve
+    // only a possible reclaim step; rotation-only epochs need no deletion headroom.
+    pub(crate) fn next_reclaim_candidate_bytes(&self) -> usize {
+        self.frontiers
+            .history
+            .filter(|history| {
+                history.reclaim_epoch().is_some()
+                    || history.active_epoch().is_some_and(|active| {
+                        active.get() - floor(Some(*history))
+                            >= (FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1) as u64
+                    })
+            })
+            .map_or(0, |history| {
+                history
+                    .reclaim_epoch()
+                    .map_or(FENCED_TRANSITION_V2_RECLAIM_BATCH, |_| {
+                        history
+                            .reclaim_remaining()
+                            .min(FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                    })
+            })
+            * Self::reclaim_rows_bytes(1).expect("one deletion size")
     }
 }

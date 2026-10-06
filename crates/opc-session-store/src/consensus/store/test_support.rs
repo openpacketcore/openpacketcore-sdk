@@ -497,6 +497,38 @@ pub fn consensus_local_wal_costs_for_test(
         .transpose()
 }
 
+/// Observe the actual shared reservation counter, its process lifetime peak,
+/// and the unchanged cap. This neither resets nor changes admission.
+#[cfg(target_os = "linux")]
+pub fn native_verification_memory_for_test() -> [usize; 3] {
+    crate::consensus::verified_snapshot::VerificationMemory::usage_for_test()
+}
+
+/// Opt in to reservation peak diagnostics for an explicit scale fixture.
+/// This changes only diagnostic output, not accounting or admission.
+#[cfg(target_os = "linux")]
+pub fn enable_native_verification_peak_diagnostics_for_test() {
+    crate::consensus::verified_snapshot::VerificationMemory::enable_peak_diagnostics_for_test();
+}
+
+/// Begin a separate retirement maximum without changing the real counter or cap.
+#[cfg(target_os = "linux")]
+pub fn begin_native_retirement_phase_for_test() {
+    crate::consensus::verified_snapshot::VerificationMemory::begin_retirement_phase_for_test();
+}
+
+/// Request and join one ordinary checkpoint for a native crash-cut witness.
+#[cfg(target_os = "linux")]
+pub fn checkpoint_native_for_test(store: &ConsensusSessionStore) -> std::io::Result<()> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("native checkpoint owner absent"))?
+        .checkpoint()
+        .map(|_| ())
+}
+
 /// Release native Rust roots after this store has shut down and joined its
 /// writers. The observer must invoke each supplied release once, synchronously.
 /// This consumes the closed in-memory state and must follow every witness read.

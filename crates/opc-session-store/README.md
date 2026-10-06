@@ -1390,6 +1390,45 @@ completed validation scratch no longer occupies that allowance. Retained
 terminal and tombstone rows keep their original validation reservation.
 Neither the initial validation allowance nor the process cap is reduced.
 
+Native durable V2 retirement shares that same 128 MiB cap. Its live and captured
+change journals retain their reservations until the last owner releases them;
+publication scratch is released when its temporary allocations die. Deleted
+receipts retain their complete identity and predecessor fingerprints but do not
+reserve relocation slots, because they produce no replacement rows. A memory
+trigger requests checkpoints before optional maintenance consumes the remaining
+allowance. Admission leaves space for consumer reads and checkpoint preparation,
+and waits without holding the state lock, operation permit, or candidate roots.
+Committed pressure waits renew their ten-second inactivity bound only when the
+admission shortfall or live journal reaches a new low; checkpoint completion
+alone does not renew it. A successful reservation resets the wait, so a later
+retry gets a fresh budget. A single checkpoint or relocation drain exceeding
+ten seconds without observable relief can still fence a healthy voter on very
+slow storage. Shutdown cancels the wait promptly without fencing the WAL,
+preserving its accepted-work drain. A fence is terminal for the embedding
+process: it must exit non-zero, and its supervisor restarts it to re-audit and
+replay. Automatic fatal-error exit is a separate existing gap tracked in
+[issue #1127](https://github.com/openpacketcore/openpacketcore-sdk/issues/1127);
+this change does not implement a supervisor or in-process reopen.
+For `V2WithVoid`, an unavailable voter can withhold readiness and first activation
+until its supervisor restarts it if an exact-scope profile proof has not already
+been cached or activated. Each call retains its existing deadline. A running
+fenced peer can still prove its immutable created profile, and a cached proof
+lets the healthy quorum activate; the fenced peer's own readiness still fails
+its local recovery/barrier gate. Void receipts retain the same journal and
+retirement reservations, preserve first-binding-wins through process exit and
+replay, and create no business effect.
+Public maintenance may poll until its operation deadline and return
+`BackendUnavailable`. Cold replay uses bounded preparation cohorts independently
+of transport batches; it retains the complete suffix until the writer starts.
+The maximum retirement-only suffix is tested below half the cap; arbitrary mixed
+consumer/roster traffic retains the existing verification-exhaustion exposure.
+The scalar maintenance planner does not model new receipt bindings in mixed
+deliveries; exact evaluation reserves any underestimated deletion inventory
+against the hard cap. Planner errors fall back to that evaluation and increment
+the value-free `application.retirement_plan_fallbacks` diagnostic counter.
+Live delivery still publishes atomically. See the
+[retirement memory proof](../../docs/sdk-1122-reclaim-memory-evidence.md).
+
 Explicit portable selection can read existing sealed images, but an old strict
 reader cannot reopen newly written unsealed snapshots. A rollout or rollback
 must retain compatible readers or use a separately reviewed offline conversion
@@ -1922,6 +1961,12 @@ after its exact-result window and reclaim it in ordered 1,024-entry batches.
 During that reclamation the active epoch remains writable, but no ninth epoch
 is allocated. This is generic bounded SDK lifecycle state, not subscriber or
 network-function policy.
+
+Memory pressure may defer local maintenance admission and request an ordinary
+checkpoint; it never authorizes retirement from a local clock or compaction.
+The 1,024-entry reclaim command, immutable profile digest, receipt outcomes,
+journal records and stored formats are unchanged. A restarted durable voter
+audits and replays its existing storage and rejoins without manual cleanup.
 
 ## Fenced ownership
 

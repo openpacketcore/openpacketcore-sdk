@@ -851,3 +851,168 @@ async fn native_three_voter_void_uses_quorum_after_exact_profile_activation() {
     fleet.close().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_reclaim_memory_void_fenced_voter_keeps_readiness_and_activation_bounded() {
+    use crate::sqlite::consensus::wal::Point;
+
+    let mut fleet = Fleet::new_native("void-fenced-voter-before-activation");
+    let armed = Arc::new(AtomicUsize::new(usize::MAX));
+    for (index, test) in fleet.tests.iter_mut().enumerate() {
+        let armed = Arc::clone(&armed);
+        *test = Arc::new(PrivateWalTest::new_native_with_hook(
+            fleet.directory.path().join(format!("wal-{index}")),
+            [index as u8 + 1; 32],
+            Arc::new(move |point| {
+                if point == Point::BeforeNativeApplyPrepare && armed.load(Ordering::SeqCst) == index
+                {
+                    // A terminal apply error takes the same native owner fence
+                    // as retirement's no-progress timeout. The separate WAL
+                    // test exercises that timeout under actual memory pressure.
+                    Err(std::io::Error::other("test terminal native apply failure"))
+                } else {
+                    Ok(())
+                }
+            }),
+        ));
+    }
+    fleet
+        .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
+        .await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet
+            .stores
+            .iter()
+            .position(|store| store.status().leader_id == Some(store.status().node_id))
+            .unwrap();
+        let failed = (leader + 1) % 3;
+        let store = &fleet.stores[leader];
+        let (identity, voters) = store.current_scope().unwrap();
+        assert!(!store
+            .inner
+            .backend
+            .consensus_fenced_transition_v2_activation_matches_scope(
+                store.inner.storage_identity,
+                identity,
+                voters,
+                FencedTransitionV2Profile::V2WithVoid.digest(),
+            )
+            .await
+            .unwrap());
+        armed.store(failed, Ordering::SeqCst);
+        let encrypted = EncryptingSessionBackend::new(
+            Arc::new(store.clone()),
+            provider(),
+            "void-fenced-readiness",
+        );
+        encrypted
+            .acquire(
+                &key(401),
+                OwnerId::new("void-fenced-readiness").unwrap(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("the two healthy voters can commit an ordinary lease");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fleet.stores[failed]
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .running_state
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failed apply fences the local consensus owner");
+        let report = tokio::time::timeout(
+            Duration::from_secs(3),
+            fleet.stores[failed].probe_fixed_quorum_readiness_before(
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("local fenced readiness is bounded even with a cached proof");
+        assert_ne!(report.state(), crate::DurableReadinessState::Ready);
+
+        *store
+            .inner
+            .fenced_transition_profile_admission
+            .lock()
+            .unwrap() = None;
+        // Capability describes the immutable profile, not liveness. The
+        // fenced process can still answer it while its handler is installed.
+        let report = tokio::time::timeout(
+            Duration::from_secs(3),
+            store.probe_fixed_quorum_readiness_before(
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state(), crate::DurableReadinessState::Ready);
+        let proof = store
+            .inner
+            .fenced_transition_profile_admission
+            .lock()
+            .unwrap()
+            .take();
+        assert!(proof.is_some());
+        *fleet.peers[failed].handler.write().await = None;
+        for _ in 0..2 {
+            let report = tokio::time::timeout(
+                Duration::from_millis(750),
+                store.probe_fixed_quorum_readiness_before(
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                ),
+            )
+            .await
+            .expect("an absent pre-activation proof never leaves a call waiting");
+            assert_eq!(report.state(), crate::DurableReadinessState::NoQuorum);
+        }
+        let request = v2_create_request(
+            402,
+            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+            FenceToken::new(0),
+            &provider(),
+        )
+        .await;
+        let unavailable = tokio::time::timeout(
+            crate::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT + Duration::from_secs(2),
+            store.fenced_transition_v2_void(&request),
+        )
+        .await
+        .expect("first activation without every proof returns within its operation budget");
+        assert!(matches!(
+            unavailable,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        *store
+            .inner
+            .fenced_transition_profile_admission
+            .lock()
+            .unwrap() = proof;
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                store.fenced_transition_v2_void(&request),
+            )
+            .await
+            .expect("the exact-scope proof permits activation on the healthy quorum")
+            .unwrap(),
+            FencedTransitionV2Status::Recorded(Box::new(Err(StoreError::FencedTransitionVoided)))
+        );
+        assert!(store.get(request.lease().key()).await.unwrap().is_none());
+    })
+    .catch_unwind()
+    .await;
+    let shutdowns = join_all(fleet.stores.iter().map(ConsensusSessionStore::shutdown)).await;
+    for peer in &fleet.peers {
+        *peer.handler.write().await = None;
+    }
+    fleet.stores.clear();
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert_eq!(shutdowns.iter().filter(|result| result.is_err()).count(), 1);
+}

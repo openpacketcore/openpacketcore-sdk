@@ -1107,6 +1107,68 @@ impl Wal {
     }
 
     #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn open_replay_observation_for_test(
+        directory: &Path,
+        binding: Binding,
+    ) -> io::Result<(Self, [usize; 3])> {
+        use crate::consensus::verified_snapshot::VerificationMemory;
+        VerificationMemory::begin_retirement_phase_for_test();
+        let opening = Opening::new(
+            directory,
+            binding,
+            None,
+            Limits::default(),
+            IoControl::default(),
+        )?;
+        let observation = [
+            opening.native.business.changed_verification_bytes(),
+            VerificationMemory::used_bytes(),
+            VerificationMemory::retirement_peak_for_test(),
+        ];
+        Ok((opening.finish(|| Ok(()))?, observation))
+    }
+
+    /// Build an admitted partial-retirement basis for component tests. The
+    /// public fleet proof independently constructs history through consumers.
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn open_reclaim_fixture_for_test(
+        directory: &Path,
+        binding: Binding,
+        history: crate::FencedTransitionV2HistoryState,
+        now: opc_types::Timestamp,
+        control: IoControl,
+    ) -> io::Result<Self> {
+        Self::open_reclaim_fixture_with_receipts_for_test(
+            directory, binding, history, now, control, None, false,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn open_reclaim_fixture_with_receipts_for_test(
+        directory: &Path,
+        binding: Binding,
+        history: crate::FencedTransitionV2HistoryState,
+        now: opc_types::Timestamp,
+        control: IoControl,
+        response: Option<crate::consensus::SessionConsensusResponse>,
+        keep_first: bool,
+    ) -> io::Result<Self> {
+        let mut opening = Opening::new(directory, binding, None, Limits::default(), control)?;
+        opening.native = opening.native.clone();
+        crate::consensus::native::lifecycle_tests::seed(
+            &mut opening.native,
+            history,
+            now,
+            response,
+            keep_first,
+        );
+        // Seed is audited in full and goes through the ordinary base writer,
+        // readback and CURRENT selection before any tested command is applied.
+        opening.selected = None;
+        opening.finish(|| Ok(()))
+    }
+
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn create_native_with_root(
         directory: &Path,
         basis: &Connection,
@@ -1961,20 +2023,214 @@ impl Wal {
         Ok(result)
     }
 
+    /// Check before ordering optional maintenance. Returning false requests a
+    /// checkpoint only when it can help, without holding an operation permit,
+    /// captured roots, a reservation, or State while the caller yields.
+    pub(crate) fn native_retirement_ready(&self) -> io::Result<bool> {
+        let mut state = lock_state(&self.shared)?;
+        ensure_native_public_owner(&state)?;
+        if state.snapshot.is_some() || state.native_install_pending || state.retirement_stopped {
+            return Ok(false);
+        }
+        let bytes = state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("native retirement owner missing"))?
+            .business
+            .next_reclaim_candidate_bytes();
+        if native_basis::retirement_ready(&state, bytes) {
+            return Ok(true);
+        }
+        state.application_costs.retirement_deferrals += 1;
+        if native_basis::request_retirement_checkpoint(&mut state, bytes) {
+            self.shared.ready.notify_all();
+        }
+        Ok(false)
+    }
+
+    /// Interrupt pressure waits before joining the consensus state-machine.
+    pub(crate) fn stop_retirement_waits(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.retirement_stopped = true;
+            self.shared.ready.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn retirement_wait_state_for_test(
+        &self,
+    ) -> io::Result<(u64, usize, bool)> {
+        let state = lock_state(&self.shared)?;
+        Ok((
+            state.application_costs.retirement_waits,
+            state.native_operations,
+            state.checkpoint_requested,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn retirement_install_for_test(
+        &self,
+        pending: bool,
+    ) -> io::Result<()> {
+        lock_state(&self.shared)?.native_install_pending = pending;
+        self.shared.ready.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn retirement_journal_bytes_for_test(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .native
+            .as_ref()
+            .unwrap()
+            .business
+            .changed_verification_bytes()
+    }
+
     pub(crate) fn native_apply_committed(
         &self,
         entries: &[Entry<SessionRaftTypeConfig>],
     ) -> io::Result<super::super::AppliedBatch> {
         let started = Instant::now();
-        let _permit = self.native_operation()?;
+        let has_retirement = entries.iter().any(|entry| {
+            matches!(&entry.payload,
+            opc_consensus::engine::EntryPayload::Normal(command) if matches!(command.intent,
+                crate::SessionMutationIntent::MaintainFencedTransitionV2History { .. }))
+        });
+        let mut pressure_progress = None;
         let mut lock_wait = Duration::ZERO;
         let mut preflight = Duration::ZERO;
         let mut apply = Duration::ZERO;
         loop {
+            let permit = self.native_operation()?;
             let waiting = Instant::now();
             let mut state = lock_state(&self.shared)?;
             lock_wait += waiting.elapsed();
             ensure_native_application_owner(&state)?;
+            let mut reclaim_memory = None;
+            if has_retirement && native_basis::manages_retirement(&state) {
+                // This scalar planner is only a scheduling hint. Evaluation
+                // owns business validation and the exact allocation reserve,
+                // including mixed deliveries the hint cannot model.
+                let bytes = match state
+                    .native
+                    .as_ref()
+                    .ok_or_else(|| invalid_data("native retirement owner missing"))
+                    .and_then(|native| {
+                        #[cfg(test)]
+                        (self.control.hook)(Point::BeforeNativeRetirementPlan)?;
+                        native.business.reclaim_candidate_bytes(entries)
+                    }) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        state.application_costs.retirement_plan_fallbacks = state
+                            .application_costs
+                            .retirement_plan_fallbacks
+                            .saturating_add(1);
+                        0
+                    }
+                };
+                if bytes != 0 {
+                    if native_basis::retirement_ready(&state, bytes) {
+                        reclaim_memory = native_basis::reserve_retirement(bytes);
+                    }
+                    if reclaim_memory.is_none() {
+                        // Neither State, a captured root, nor an operation
+                        // permit survives the wait. Installs and the writer
+                        // can progress independently of this applied entry.
+                        drop(state);
+                        drop(permit);
+                        let mut waiting = lock_state(&self.shared)?;
+                        let (last_progress, lowest_shortfall, lowest_journal) = pressure_progress
+                            .get_or_insert_with(|| {
+                                waiting.application_costs.retirement_waits += 1;
+                                #[cfg(feature = "test-control")]
+                                eprintln!("native_retirement_admission_wait");
+                                (
+                                    Instant::now(),
+                                    native_basis::retirement_shortfall(bytes),
+                                    waiting.native.as_ref().map_or(0, |native| {
+                                        native.business.changed_verification_bytes()
+                                    }),
+                                )
+                            });
+                        let mut just_failed_admission = true;
+                        loop {
+                            ensure_native_application_owner(&waiting)?;
+                            if waiting.retirement_stopped || waiting.status != Status::Running {
+                                // Cancellation precedes the normal WAL drain.
+                                // Do not fence and discard already accepted work.
+                                return Err(io::Error::other(
+                                    "native retirement admission stopped",
+                                ));
+                            }
+                            let current_journal = waiting
+                                .native
+                                .as_ref()
+                                .map_or(0, |native| native.business.changed_verification_bytes());
+                            let current_shortfall = native_basis::retirement_shortfall(bytes);
+                            if current_shortfall < *lowest_shortfall
+                                || current_journal < *lowest_journal
+                            {
+                                *last_progress = Instant::now();
+                            }
+                            // Only new lows demonstrate relief. A temporary
+                            // checkpoint allocation growing and then shrinking
+                            // must not keep an otherwise stalled wait alive.
+                            *lowest_shortfall = (*lowest_shortfall).min(current_shortfall);
+                            *lowest_journal = (*lowest_journal).min(current_journal);
+                            let ready = native_basis::retirement_ready(&waiting, bytes);
+                            // Newly observed relief gets a fresh atomic
+                            // reservation attempt even at the deadline. If
+                            // that attempt loses a counter race, it cannot
+                            // keep renewing the wait without further relief.
+                            if last_progress.elapsed() >= native_basis::RETIREMENT_WAIT_TIMEOUT
+                                && (!ready || just_failed_admission)
+                            {
+                                waiting.application_costs.retirement_timeouts += 1;
+                                application::fence(&mut waiting);
+                                self.shared.ready.notify_all();
+                                return Err(io::Error::other(
+                                    "native retirement admission timed out",
+                                ));
+                            }
+                            if ready {
+                                break; // Recapture and atomically reserve against fresh State.
+                            }
+                            just_failed_admission = false;
+                            if native_basis::request_retirement_checkpoint(&mut waiting, bytes) {
+                                self.shared.ready.notify_all();
+                            }
+                            // Other stores share the process counter but not
+                            // this condition variable. Poll without repeatedly
+                            // acquiring/releasing an operation permit or waking
+                            // every waiter ourselves.
+                            (waiting, _) = self
+                                .shared
+                                .ready
+                                .wait_timeout(
+                                    waiting,
+                                    Duration::from_millis(20).min(
+                                        native_basis::RETIREMENT_WAIT_TIMEOUT
+                                            .saturating_sub(last_progress.elapsed()),
+                                    ),
+                                )
+                                .map_err(|_| {
+                                    io::Error::other("native reclaim admission poisoned")
+                                })?;
+                        }
+                        drop(waiting);
+                        continue;
+                    }
+                    // A later stale-predecessor retry starts a new episode;
+                    // it must not inherit time spent preparing this apply.
+                    pressure_progress = None;
+                }
+            }
             let checking = Instant::now();
             let captured: io::Result<ApplicationCapture> = (|| {
                 let native = state
@@ -1986,7 +2242,10 @@ impl Wal {
                     state.committed_for_application(),
                     entries,
                 )?;
-                native.business.capture_application()
+                native
+                    .business
+                    .capture_application()
+                    .map(|capture| capture.with_reclaim_memory(reclaim_memory))
             })();
             preflight += checking.elapsed();
             let captured = match captured {
@@ -2082,6 +2341,9 @@ impl Wal {
                 async_persistence::dirty(&mut state);
                 self.shared.ready.notify_all();
             }
+            // Application itself can cross the memory trigger without adding
+            // another WAL record. Wake the writer at this publication cut.
+            self.shared.ready.notify_all();
             state.application_costs.lock_wait += lock_wait;
             state.application_costs.preflight += preflight;
             state.application_costs.native_apply += apply;

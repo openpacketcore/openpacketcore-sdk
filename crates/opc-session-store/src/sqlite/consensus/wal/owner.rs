@@ -26,7 +26,7 @@ const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA003";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[cfg(any(test, feature = "test-control"))]
-type GenerationHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+type GenerationHookForTest = Arc<dyn Fn(&'static str) -> io::Result<()> + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) type IoHookForTest = Arc<dyn Fn(super::Point) -> io::Result<()> + Send + Sync>;
@@ -158,6 +158,20 @@ impl NativeOwner {
     #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn set_generation_hook_for_test(
         &self,
+        hook: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+    ) -> io::Result<()> {
+        self.set_checkpoint_hook_for_test(Arc::new(move |cut| {
+            if cut == "before_append" {
+                hook()
+            } else {
+                Ok(())
+            }
+        }))
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn set_checkpoint_hook_for_test(
+        &self,
         hook: GenerationHookForTest,
     ) -> io::Result<()> {
         if self
@@ -219,8 +233,16 @@ impl NativeOwner {
             if let Some(hook) = hook {
                 return IoControl {
                     hook: Arc::new(move |point| {
-                        if point == super::Point::BeforeNativeGenerationAppend {
-                            hook()?;
+                        let cut = match point {
+                            super::Point::AfterNativeGenerationCapture => Some("capture"),
+                            super::Point::BeforeNativeGenerationAppend => Some("before_append"),
+                            super::Point::AfterNativeGenerationAppend => Some("append"),
+                            super::Point::AfterBasisSelectorRename => Some("selection"),
+                            super::Point::AfterBasisReclaimFile => Some("reclaim_covered"),
+                            _ => None,
+                        };
+                        if let Some(cut) = cut {
+                            hook(cut)?;
                         }
                         Ok(())
                     }),

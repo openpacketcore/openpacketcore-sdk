@@ -65,6 +65,13 @@ pub(crate) struct Relocations {
     _memory: VerificationMemory,
 }
 
+#[cfg(test)]
+impl Relocations {
+    pub(super) fn reserved_bytes_for_test(&self) -> usize {
+        self._memory.reserved_bytes_for_test()
+    }
+}
+
 /// One owner work unit performs at most 64 persistent-container mutations.
 /// The writer releases State and services its WAL queue between units.
 pub(crate) const RELOCATION_STEP_ROWS: usize = 64;

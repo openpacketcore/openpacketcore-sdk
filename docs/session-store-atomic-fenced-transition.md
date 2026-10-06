@@ -539,6 +539,17 @@ advances only the retired floor and removes the oldest closed replay epoch in
 fixed batches after that epoch's final retention deadline; the active epoch
 remains writable throughout reclamation.
 
+Native durable retirement prepares each command under the existing process-wide
+128 MiB verification cap. Memory pressure requests a checkpoint and can defer
+maintenance admission, without changing the replicated 1,024-row step or its
+deterministic result. Captured deletion identities and predecessor fingerprints
+remain fully verified; deletion-only rows need no relocation output slots.
+Replay preparation cohorts are local implementation bounds, independent of the
+transport batch, and coalesced live application retains one atomic publication.
+These changes do not alter the profile digest, journal records or stored format.
+The [full retirement proof](sdk-1122-reclaim-memory-evidence.md) covers all 128
+steps and voter recovery at checkpoint cuts.
+
 The first V2 transition for a scope is one replicated activating command. It
 atomically installs the V2 database format (format 3), the exact-scope
 activation certificate and immutable profile, its V2 receipt, and its lease

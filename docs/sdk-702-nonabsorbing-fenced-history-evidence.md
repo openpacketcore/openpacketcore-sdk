@@ -83,6 +83,12 @@ does it use historical output as current acceptance evidence. The broader
 before/during/after exact-retry, changed-body-conflict, and Retired
 classification is covered by the focused SQLite cases above.
 
+The separate [SDK-1122 memory proof](sdk-1122-reclaim-memory-evidence.md)
+fills the complete retained envelope and retires one full epoch through all 128
+batches, with one-voter crash and reopen cuts. It supplements this two-batch
+gate; it does not qualify the successor-scale workload's offered rate, latency
+or resource profile.
+
 ## Successor-scale release gate
 
 The release qualification target is

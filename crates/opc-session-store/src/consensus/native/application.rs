@@ -11,6 +11,7 @@ pub(crate) struct ApplicationCapture {
     // Covers the bounded frontiers/membership copy and persistent map roots.
     // Historical row bodies remain shared with their original reservations.
     _memory: VerificationMemory,
+    reclaim_memory: Option<VerificationMemory>,
 }
 
 pub(crate) struct ApplicationPublication(changes::Publication);
@@ -23,11 +24,17 @@ impl NativeState {
         Ok(ApplicationCapture {
             state,
             _memory: memory,
+            reclaim_memory: None,
         })
     }
 }
 
 impl ApplicationCapture {
+    pub(crate) fn with_reclaim_memory(mut self, memory: Option<VerificationMemory>) -> Self {
+        self.reclaim_memory = memory;
+        self
+    }
+
     pub(crate) fn prepare(
         self,
         entries: &[Entry<SessionRaftTypeConfig>],
@@ -70,9 +77,10 @@ impl ApplicationCapture {
             before_receipt_read()?;
             Some(reads.resolve(check)?.copy_current(&self.state)?)
         };
-        let delta = self
+        let mut delta = self
             .state
             .prepare_using_checked(entries, copies.as_ref(), check)?;
+        delta.reclaim_memory = self.reclaim_memory;
         #[cfg(feature = "test-control")]
         let evaluated = std::time::Instant::now();
         // Store::finish_with_changes has destroyed evaluator hydrations.

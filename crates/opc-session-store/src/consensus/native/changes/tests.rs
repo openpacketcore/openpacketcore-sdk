@@ -16,6 +16,9 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use std::str::FromStr;
 use std::time::Duration;
 
+#[path = "reclaim_memory.rs"]
+mod reclaim_memory;
+
 #[test]
 fn native_frontier_captures_preserve_nested_authority_without_allocating() {
     let (mut storage, _, _) = fixture();
@@ -409,17 +412,62 @@ pub(in crate::consensus::native) fn fixture() -> (
     FencedTransitionV2Request,
     FencedTransitionOutcome,
 ) {
-    let mut storage = NativeStorage::empty(identity(), members()).unwrap();
+    fixture_with_profile(crate::FencedTransitionV2Profile::V2)
+}
+
+pub(in crate::consensus::native) fn fixture_with_profile(
+    profile: crate::FencedTransitionV2Profile,
+) -> (
+    NativeStorage,
+    FencedTransitionV2Request,
+    FencedTransitionOutcome,
+) {
+    let mut storage =
+        NativeStorage::empty_with_roster_root_and_profile(identity(), members(), None, profile)
+            .unwrap();
     let first = request(1, None);
-    let result = apply(
-        &mut storage,
-        &[formation(), command(1, &first, time(1), true)],
-    );
+    let mut activation = command(1, &first, time(1), true);
+    let EntryPayload::Normal(value) = &mut activation.payload else {
+        unreachable!()
+    };
+    let SessionMutationIntent::ActivateFencedTransitionV2 { profile_digest, .. } =
+        &mut value.intent
+    else {
+        unreachable!()
+    };
+    *profile_digest = profile.digest();
+    let result = apply(&mut storage, &[formation(), activation]);
     let Ok(SessionMutationOutcome::FencedTransition(outcome)) = &result.responses[1].result else {
         panic!("successful activation")
     };
     let outcome = outcome.clone();
     (storage, first, outcome)
+}
+
+pub(in crate::consensus::native) fn void_command(
+    index: u64,
+    request: &FencedTransitionV2Request,
+    now: Timestamp,
+    activate: bool,
+) -> Entry<SessionRaftTypeConfig> {
+    let mut entry = command(index, request, now, false);
+    let EntryPayload::Normal(value) = &mut entry.payload else {
+        unreachable!()
+    };
+    value.request_id = SessionConsensusRequestId::from_bytes(
+        crate::fenced_transition::fenced_transition_v2_void_outer_request_id(request.request_id()),
+    );
+    value.intent = if activate {
+        SessionMutationIntent::ActivateVoidFencedTransitionV2 {
+            request: Box::new(request.clone()),
+            scope_identity: identity(),
+            voter_set_digest: fenced_transition_voter_set_digest(identity(), &members()),
+            profile_digest: crate::FencedTransitionV2Profile::V2WithVoid.digest(),
+        }
+    } else {
+        SessionMutationIntent::VoidFencedTransitionV2(Box::new(request.clone()))
+    };
+    entry
 }
 
 #[test]
@@ -1013,7 +1061,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         },
     };
     validate_staged(std::slice::from_ref(&removal), &current, Some(&dirty)).unwrap();
-    publish_rows(vec![removal], &mut current, Some(&mut dirty));
+    publish_rows(vec![removal].into(), &mut current, Some(&mut dirty));
     let replacement = SharedRow::new((*original).clone()).unwrap();
     let reinsert = StagedRow {
         key: 1,
@@ -1026,7 +1074,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         },
     };
     validate_staged(std::slice::from_ref(&reinsert), &current, Some(&dirty)).unwrap();
-    publish_rows(vec![reinsert], &mut current, Some(&mut dirty));
+    publish_rows(vec![reinsert].into(), &mut current, Some(&mut dirty));
     assert_eq!(dirty.len(), 1);
     assert!(dirty[&1].before.as_ref().unwrap().ptr_eq(&original));
     assert!(dirty[&1].after.as_ref().unwrap().ptr_eq(&replacement));

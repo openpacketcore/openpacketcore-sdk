@@ -13,6 +13,7 @@ mod asynchronous;
 mod cold_reads;
 mod export;
 mod public_reads;
+mod reclaim_memory;
 
 struct Gate {
     point: Point,
