@@ -121,6 +121,12 @@ impl NativeLog {
         entry: &Entry<SessionRaftTypeConfig>,
         state: &NativeState,
     ) -> io::Result<()> {
+        if matches!(&entry.payload, EntryPayload::Normal(command)
+            if command.intent.contains_fenced_transition_v2_void())
+            && state.frontiers.fenced_transition_profile != FencedTransitionV2Profile::V2WithVoid
+        {
+            return Err(invalid("native store profile does not permit void"));
+        }
         Self::validate_entry_context(entry, state.identity, &state.members)
     }
 
@@ -172,6 +178,8 @@ impl NativeLog {
                 intent,
                 SessionMutationIntent::AdvanceLogicalTime
                     | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+                    | SessionMutationIntent::VoidFencedTransitionV2(_)
+                    | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
                     | SessionMutationIntent::FencedTransitionV2(_)
                     | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
                     | SessionMutationIntent::FencedTransitionV2Batch(_)

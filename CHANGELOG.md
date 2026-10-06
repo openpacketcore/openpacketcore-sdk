@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including partial counts in `GtpuError::StrictWorkloadResetIncomplete` on
   failure. Refs #1118.
 
+- `opc-session-store`: add an independently negotiated V2 void profile for
+  stores created with `FencedTransitionV2Profile::V2WithVoid`. A quorum void
+  binds a terminal no-effect receipt for the exact original request ID, or
+  returns the original receipt if it already bound. Exact-scope admission
+  establishes the immutable voter profile; later voids require a quorum.
+  Original V2 stores and byte vectors retain their contract; stores are created
+  under one profile and are not converted. Void-profile stores alone can report
+  the new `fenced_transition_profile_mismatch` readiness state. Before first
+  activation, readiness requires every voter's exact-scope proof; a cached proof
+  or activation certificate permits subsequent quorum-only readiness. Baseline
+  readiness performs no new profile probes, lookups, or RPCs.
+  Refs #1102.
+
 - `opc-crypto` and `opc-persist`: add opt-in exact configuration byte evidence
   and eight-slot, destination-specific preparation leases retained through
   encryption claims and envelope aliases. Existing encryption and storage
@@ -76,10 +89,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lane checked GTP-U targets, not the test-kit targets. Linux behavior is
   unchanged.
 
+- `opc-session-store` (breaking for exhaustive matches): append
+  `StoreError::FencedTransitionVoided` to the exhaustive public `StoreError`
+  enum; downstream exhaustive matches must handle the new variant. Refs #1102.
+
+- `opc-session-net`: explicitly opted-in void clients offer
+  `opc-session-consumer/2-void` followed by the frozen `/2` token. Only
+  void-profile stores advertise the marker. An authenticated `/2` selection
+  caches unsupported for that connection without sending an unknown operation;
+  original operations keep using the lane. A `/2-void` selection does not grant
+  activation. Definite capability answers are cached per physical lane;
+  transport/TLS failures stay unavailable. Baseline offers, selections, and
+  revision-five bytes are unchanged. Refs #1102.
+
 - `opc-persist`: add inert internal bounded record and command representations
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-session-net`: bounded protected V2 reclamation can void an exact
+  unbound request after a known return, cancellation, drop, or its original
+  in-memory deadline. An unregistered trait caller supplies no deadline, so
+  its current-process row stays retained until status or retirement resolves it.
+  Only owned schema-two journals use directory locking, staging cleanup and
+  publication syncs to publish creation atomically; schema-one creation/open
+  and error texts remain unchanged. Owned journals exclude concurrent
+  processes, release ownership on crash, and allow immediate
+  reclamation of inherited rows. Exact terminal receipts drain rows and resolve
+  retained handles; unknown replies and older
+  voters keep rows for retry and report the reason. Unsupported counts every
+  eligible retained row covered by the cached answer. An unavailable void advances
+  the sweep cursor so status-resolvable rows can still drain. The owned journal
+  has a distinct authenticated format; crossing the format boundary requires a
+  fresh install. No durable deadlines or new scheduling timers are added.
+  Refs #1102.
 
 - `opc-persist`: make stored-principal validation, tenant attribution, policy
   identity parsing and audit redaction independent of JSON dependency features.

@@ -31,6 +31,8 @@ mod shared;
 use row_map::RowMap;
 mod v1;
 mod validation;
+#[cfg(test)]
+mod void_tests;
 pub(crate) use application::ApplicationCapture;
 mod capture;
 mod cold;
@@ -71,17 +73,19 @@ use super::{
 };
 use crate::backend::{ReplicationEntry, ReplicationTxId};
 use crate::fenced_transition::{
-    fenced_transition_v2_outer_request_id, fenced_transition_v2_profile_digest,
-    fenced_transition_v2_timestamp_is_in_range, FencedTransitionOutcome,
-    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
-    FencedTransitionV2Status, FENCED_TRANSITION_OUTCOME_RETENTION,
-    FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    fenced_transition_v2_outer_request_id, fenced_transition_v2_timestamp_is_in_range,
+    FencedTransitionOutcome, FencedTransitionV2HistoryState, FencedTransitionV2Profile,
+    FencedTransitionV2Request, FencedTransitionV2RequestId, FencedTransitionV2Status,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
 };
 use crate::lease::LeaseGuard;
 use crate::model::SessionKey;
 use crate::{StoreError, StoredSessionRecord};
 
 const COUNTER_MAX: u64 = i64::MAX as u64;
+#[cfg(test)]
+use crate::fenced_transition::fenced_transition_v2_profile_digest;
 const LOG_RPC_ENTRIES: usize = opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -282,6 +286,7 @@ impl<'de> Deserialize<'de> for NativeFrontiers {
             roster_v2_activation: value.roster_v2_activation,
             current_snapshot: value.current_snapshot,
             async_recovery: None,
+            fenced_transition_profile: FencedTransitionV2Profile::V2,
         })))
     }
 }
@@ -303,6 +308,8 @@ impl std::ops::DerefMut for NativeFrontiers {
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename = "NativeFrontiers")]
 struct NativeFrontierValues {
+    #[serde(default)]
+    fenced_transition_profile: FencedTransitionV2Profile,
     applied: Option<LogId<SessionConsensusNodeId>>,
     membership: StoredMembership<SessionConsensusNodeId, EmptyNode>,
     sequence: u64,
@@ -335,18 +342,24 @@ impl Serialize for NativeFrontierValues {
         let include_roster_v1 = !serializer.is_human_readable() || self.roster_v1_namespace;
         let include_roster_v2 =
             !serializer.is_human_readable() || self.roster_v2_activation.is_some();
-        if !serializer.is_human_readable() && self.async_recovery.is_some() {
+        if !serializer.is_human_readable()
+            && (self.async_recovery.is_some()
+                || self.fenced_transition_profile != FencedTransitionV2Profile::V2)
+        {
             return Err(serde::ser::Error::custom(
                 "asynchronous frontier requires a named header",
             ));
         }
         let include_async_recovery = self.async_recovery.is_some();
+        let include_fenced_profile =
+            self.fenced_transition_profile != FencedTransitionV2Profile::V2;
         let mut value = serializer.serialize_struct(
             "NativeFrontiers",
             12 + usize::from(include_v1)
                 + usize::from(include_roster_v1)
                 + usize::from(include_roster_v2)
-                + usize::from(include_async_recovery),
+                + usize::from(include_async_recovery)
+                + usize::from(include_fenced_profile),
         )?;
         value.serialize_field("applied", &self.applied)?;
         value.serialize_field("membership", &self.membership)?;
@@ -370,6 +383,9 @@ impl Serialize for NativeFrontierValues {
         }
         if include_async_recovery {
             value.serialize_field("async_recovery", &self.async_recovery)?;
+        }
+        if include_fenced_profile {
+            value.serialize_field("fenced_transition_profile", &self.fenced_transition_profile)?;
         }
         value.serialize_field("current_snapshot", &self.current_snapshot)?;
         value.end()
@@ -510,7 +526,23 @@ impl NativeStorage {
         members: BTreeSet<SessionConsensusNodeId>,
         roster_root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
     ) -> io::Result<Self> {
-        let business = NativeState::empty_with_roster_root(identity, members, roster_root)?;
+        Self::empty_with_roster_root_and_profile(
+            identity,
+            members,
+            roster_root,
+            FencedTransitionV2Profile::V2,
+        )
+    }
+
+    pub(crate) fn empty_with_roster_root_and_profile(
+        identity: SessionConsensusIdentity,
+        members: BTreeSet<SessionConsensusNodeId>,
+        roster_root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
+        profile: FencedTransitionV2Profile,
+    ) -> io::Result<Self> {
+        let mut business = NativeState::empty_with_roster_root(identity, members, roster_root)?;
+        business.frontiers.fenced_transition_profile = profile;
+        business.admit_business()?;
         let mut log = log::NativeLog::default();
         log.admit(&business)?;
         Ok(Self { business, log })
@@ -662,6 +694,7 @@ impl NativeState {
                 roster_v1_namespace: false,
                 roster_v2_activation: None,
                 async_recovery: None,
+                fenced_transition_profile: FencedTransitionV2Profile::V2,
                 current_snapshot: None,
             })),
             keys: RowMap::new(),
@@ -865,9 +898,9 @@ impl NativeState {
         rows(
             &mut digest,
             self.receipts.len(),
-            self.receipts
-                .iter()
-                .map(|(id, row)| Self::receipt_digest_for_test(*id, row)),
+            self.receipts.iter().map(|(id, row)| {
+                Self::receipt_digest_for_test(*id, row, self.frontiers.fenced_transition_profile)
+            }),
         )?;
         rows(
             &mut digest,
@@ -908,6 +941,7 @@ impl NativeState {
     fn receipt_digest_for_test(
         id: FencedTransitionV2RequestId,
         row: &NativeReceipt,
+        profile: FencedTransitionV2Profile,
     ) -> io::Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
 
@@ -944,9 +978,13 @@ impl NativeState {
                 return Err(invalid("test selected receipt raw facts differ"));
             }
             let response =
-                crate::sqlite::consensus::decode_fenced_transition_v2_response(&bytes[HEADER..])?;
-            if crate::sqlite::consensus::encode_fenced_transition_v2_response(&response)?
-                != bytes[HEADER..]
+                crate::sqlite::consensus::decode_fenced_transition_v2_response_with_profile(
+                    &bytes[HEADER..],
+                    profile,
+                )?;
+            if crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
+                &response, profile,
+            )? != bytes[HEADER..]
             {
                 return Err(invalid("test selected receipt response is not canonical"));
             }
@@ -1032,7 +1070,7 @@ impl NativeState {
     ) -> bool {
         identity == self.identity
             && voters == &self.members
-            && profile == fenced_transition_v2_profile_digest()
+            && profile == self.frontiers.fenced_transition_profile.digest()
             && self.frontiers.history.is_some()
             && self
                 .frontiers
@@ -1174,7 +1212,10 @@ impl NativeState {
                         cold::copy_outcome(outcome).map_err(|_| unavailable())?,
                     ))))
                 }
-                Err(error) if business::deterministic(error) => {
+                Err(error)
+                    if business::deterministic(error)
+                        || matches!(error, StoreError::FencedTransitionVoided) =>
+                {
                     return Ok(FencedTransitionV2Status::Recorded(Box::new(Err(
                         error.clone()
                     ))))
@@ -1433,10 +1474,17 @@ impl NativeDelta<'_> {
                 }
                 self.ordinary(command, intent, authorized, now, index)
             }
-            SessionMutationIntent::FencedTransitionV2(request) => {
+            SessionMutationIntent::FencedTransitionV2(request)
+            | SessionMutationIntent::VoidFencedTransitionV2(request) => {
                 self.singleton(command, request, None, authorized, now, index)
             }
             SessionMutationIntent::ActivateFencedTransitionV2 {
+                request,
+                scope_identity,
+                voter_set_digest,
+                profile_digest,
+            }
+            | SessionMutationIntent::ActivateVoidFencedTransitionV2 {
                 request,
                 scope_identity,
                 voter_set_digest,
@@ -1512,7 +1560,7 @@ impl NativeDelta<'_> {
                             self.base.identity,
                             &self.base.members,
                         )
-                    && activation.profile == fenced_transition_v2_profile_digest()
+                    && activation.profile == self.frontiers.fenced_transition_profile.digest()
             })
     }
 
@@ -1525,6 +1573,11 @@ impl NativeDelta<'_> {
         now: Timestamp,
         index: u64,
     ) -> io::Result<SessionConsensusResponse> {
+        let void = command.intent.contains_fenced_transition_v2_void();
+        if void && self.frontiers.fenced_transition_profile != FencedTransitionV2Profile::V2WithVoid
+        {
+            return Err(invalid("native store profile does not permit void"));
+        }
         if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
             return Err(invalid("native V2 command time outside profile"));
         }
@@ -1555,7 +1608,7 @@ impl NativeDelta<'_> {
             if activation.identity != self.base.identity
                 || activation.voters
                     != fenced_transition_voter_set_digest(self.base.identity, &self.base.members)
-                || activation.profile != fenced_transition_v2_profile_digest()
+                || activation.profile != self.frontiers.fenced_transition_profile.digest()
             {
                 return Err(invalid("native V2 activation differs"));
             }
@@ -1648,7 +1701,16 @@ impl NativeDelta<'_> {
                 StoreError::FencedTransitionRetentionExhausted,
             ));
         };
-        let result = self.effect(request, now, self.frontiers.sequence >= COUNTER_MAX)?;
+        let result = if void {
+            let current = self.key(request.lease().key());
+            match business::transition(request, &current, &self.frontiers, now) {
+                Ok(_) => Err(StoreError::FencedTransitionVoided),
+                Err(error) if business::deterministic(&error) => Err(error),
+                Err(_) => return Err(invalid("native void authority check failed")),
+            }
+        } else {
+            self.effect(request, now, self.frontiers.sequence >= COUNTER_MAX)?
+        };
         if self.frontiers.sequence < COUNTER_MAX {
             self.frontiers.sequence += 1;
             self.frontiers.digest = command
@@ -1852,7 +1914,10 @@ impl NativeDelta<'_> {
         .map_err(|_| invalid("native bound history invalid"))?;
         // Reuse the fixed response codec as an independent schema/error-profile
         // validator before a receipt can become visible or enter a snapshot.
-        crate::sqlite::consensus::encode_fenced_transition_v2_response(&response)?;
+        crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
+            &response,
+            self.frontiers.fenced_transition_profile,
+        )?;
         if self.receipt(&request.request_id()).is_some() {
             return Err(invalid("native duplicate receipt binding"));
         }
@@ -1906,7 +1971,12 @@ fn replay_outcome(
         Ok(SessionMutationOutcome::FencedTransition(outcome)) => {
             Ok(Ok(cold::copy_outcome(outcome)?))
         }
-        Err(error) if business::deterministic(error) => Ok(Err(error.clone())),
+        Err(error)
+            if business::deterministic(error)
+                || matches!(error, StoreError::FencedTransitionVoided) =>
+        {
+            Ok(Err(error.clone()))
+        }
         _ => Err(invalid("native retained response invalid")),
     }
 }

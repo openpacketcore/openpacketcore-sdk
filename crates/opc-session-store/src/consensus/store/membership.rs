@@ -2160,6 +2160,7 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_logical_time_ingress,
             fenced_transition_v2_status_logical_time,
             fenced_transition_v2_status_batch,
+            fenced_transition_profile_admission: Mutex::new(None),
             proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
@@ -2816,21 +2817,17 @@ impl ConsensusSessionStore {
         // membership change merely because every prospective peer happens to
         // reply with the public digest: it could otherwise admit the change
         // and subsequently reject the replicated V2 command it certified.
-        if self.local_fenced_transition_v2_capability()
-            != Some(crate::FencedTransitionV2Capability::V2)
-        {
+        if self.local_fenced_transition_v2_capability().is_none() {
             return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
         }
-        let profile_digest = crate::fenced_transition::fenced_transition_v2_profile_digest();
+        let profile_digest = self.inner.backend.fenced_transition_profile.digest();
         let peers = self.inner.topology_coordinator.staged_peers(request)?;
         for learner in desired_members.difference(current_members).copied() {
             if learner == self.inner.local_node_id {
                 // A current retained leader cannot itself be a prospective
                 // learner. Keep this explicit so a future coordinator shape
                 // cannot accidentally make local capability implicit.
-                if self.local_fenced_transition_v2_capability()
-                    != Some(crate::FencedTransitionV2Capability::V2)
-                {
+                if self.local_fenced_transition_v2_capability().is_none() {
                     return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                 }
                 continue;
@@ -4361,10 +4358,9 @@ impl ConsensusSessionStore {
                     Ok((current_identity, current_members)) => (
                         current_identity,
                         current_members.contains(&authenticated_sender)
-                            && self.local_fenced_transition_v2_capability()
-                                == Some(crate::FencedTransitionV2Capability::V2)
+                            && self.local_fenced_transition_v2_capability().is_some()
                             && profile_digest
-                                == crate::fenced_transition::fenced_transition_v2_profile_digest(),
+                                == self.inner.backend.fenced_transition_profile.digest(),
                     ),
                     Err(_) => return TopologyAdmissionBarrierReply::NotReady,
                 }

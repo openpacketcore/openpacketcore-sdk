@@ -281,6 +281,9 @@ pub struct AuthenticatedPreparedFencedTransitionFixture {
     journal_key: PreparedFencedTransitionJournalKey,
     recovery_journal_path: PathBuf,
     recovery_journal_key: FencedTransitionV2RecoveryJournalKey,
+    owned_recovery_journal: bool,
+    #[cfg(all(test, feature = "test-control"))]
+    recovery_capacity: usize,
 }
 
 /// Copy-only aggregate observation of fixture transport activity.
@@ -1145,14 +1148,35 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         Self::start_with_authority(scopes, true).await
     }
 
+    /// Start three extended-profile voters with an exclusively owned recovery journal.
+    /// The stores and journal are created under their respective void contracts.
+    pub async fn start_fixed_durable_with_void(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_options(scopes, true, true).await
+    }
+
     async fn start_with_authority(
         scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
         fixed: bool,
     ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_options(scopes, fixed, false).await
+    }
+
+    async fn start_with_options(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+        fixed: bool,
+        owned_recovery_journal: bool,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
         let client_identity = SpiffeId::new(FIXTURE_CLIENT_SPIFFE)
             .expect("fixture client SPIFFE is a complete workload identity");
         let grant = SessionConsumerAuthorizationGrant::try_new(client_identity, scopes)?;
-        let cluster = if fixed {
+        let cluster = if owned_recovery_journal {
+            ConsensusTestCluster::start_fixed_durable_with_profile(
+                opc_session_store::FencedTransitionV2Profile::V2WithVoid,
+            )
+            .await
+        } else if fixed {
             ConsensusTestCluster::start_fixed_durable().await
         } else {
             ConsensusTestCluster::start(FIXTURE_VOTER_COUNT).await
@@ -1216,10 +1240,17 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             .path()
             .join("prepared-fenced-v2-recovery.sqlite3");
         let recovery_journal_key = FencedTransitionV2RecoveryJournalKey::from_bytes([0x44; 32]);
-        FencedTransitionV2RecoveryJournal::create_new(
-            &recovery_journal_path,
-            recovery_journal_key.clone(),
-        )?;
+        if owned_recovery_journal {
+            FencedTransitionV2RecoveryJournal::create_new_owned(
+                &recovery_journal_path,
+                recovery_journal_key.clone(),
+            )?;
+        } else {
+            FencedTransitionV2RecoveryJournal::create_new(
+                &recovery_journal_path,
+                recovery_journal_key.clone(),
+            )?;
+        }
 
         Ok(Self {
             cluster,
@@ -1240,6 +1271,9 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             journal_key,
             recovery_journal_path,
             recovery_journal_key,
+            owned_recovery_journal,
+            #[cfg(all(test, feature = "test-control"))]
+            recovery_capacity: opc_session_store::FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
         })
     }
 
@@ -1466,13 +1500,19 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         self.voters
             .iter()
             .map(|voter| {
+                let client = StatelessSessionConsumerClient::new(
+                    voter.address,
+                    rustls_pki_types::ServerName::IpAddress(voter.address.ip().into()),
+                    voter.authority.clone(),
+                    self.client_config.clone(),
+                );
+                let client = if self.owned_recovery_journal {
+                    client.with_fenced_transition_v2_void_transport()
+                } else {
+                    client
+                };
                 PersistentSessionConsumerClient::try_from_stateless(
-                    StatelessSessionConsumerClient::new(
-                        voter.address,
-                        rustls_pki_types::ServerName::IpAddress(voter.address.ip().into()),
-                        voter.authority.clone(),
-                        self.client_config.clone(),
-                    ),
+                    client,
                     PersistentSessionConsumerConfig::default(),
                 )
             })
@@ -1581,10 +1621,20 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         Arc<FencedTransitionV2RecoveryJournal>,
         AuthenticatedPreparedFencedTransitionFixtureError,
     > {
-        Ok(Arc::new(FencedTransitionV2RecoveryJournal::open_existing(
-            &self.recovery_journal_path,
-            self.recovery_journal_key.clone(),
-        )?))
+        let journal = if self.owned_recovery_journal {
+            FencedTransitionV2RecoveryJournal::open_existing_owned(
+                &self.recovery_journal_path,
+                self.recovery_journal_key.clone(),
+            )?
+        } else {
+            FencedTransitionV2RecoveryJournal::open_existing(
+                &self.recovery_journal_path,
+                self.recovery_journal_key.clone(),
+            )?
+        };
+        #[cfg(all(test, feature = "test-control"))]
+        let journal = journal.with_capacity_for_test(self.recovery_capacity)?;
+        Ok(Arc::new(journal))
     }
 
     /// Withhold the next successful epoch-fenced V2 transition response from
@@ -1853,7 +1903,17 @@ struct FixtureConsumer {
     fenced_transition_v2_status_calls: AtomicUsize,
     fenced_transition_v2_history_state_calls: AtomicUsize,
     #[cfg(test)]
+    last_fenced_transition_v2_request: Mutex<Option<opc_session_store::FencedTransitionV2Request>>,
+    #[cfg(test)]
     stall_fenced_transition_v2_status: AtomicBool,
+    #[cfg(test)]
+    stall_fenced_transition_v2_mutation: AtomicBool,
+    #[cfg(test)]
+    legacy_fenced_transition_v2_capability: AtomicBool,
+    #[cfg(test)]
+    unavailable_fenced_transition_v2_capability: AtomicBool,
+    #[cfg(test)]
+    stall_fenced_transition_v2_void_response: AtomicBool,
     ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     voter: usize,
 }
@@ -1879,7 +1939,17 @@ impl FixtureConsumer {
             fenced_transition_v2_status_calls: AtomicUsize::new(0),
             fenced_transition_v2_history_state_calls: AtomicUsize::new(0),
             #[cfg(test)]
+            last_fenced_transition_v2_request: Mutex::new(None),
+            #[cfg(test)]
             stall_fenced_transition_v2_status: AtomicBool::new(false),
+            #[cfg(test)]
+            stall_fenced_transition_v2_mutation: AtomicBool::new(false),
+            #[cfg(test)]
+            legacy_fenced_transition_v2_capability: AtomicBool::new(false),
+            #[cfg(test)]
+            unavailable_fenced_transition_v2_capability: AtomicBool::new(false),
+            #[cfg(test)]
+            stall_fenced_transition_v2_void_response: AtomicBool::new(false),
             ordinary_cas_fault,
             voter,
         }
@@ -1888,6 +1958,10 @@ impl FixtureConsumer {
 
 #[async_trait]
 impl SessionQuorumConsumer for FixtureConsumer {
+    fn fenced_transition_v2_void_transport_enabled(&self) -> bool {
+        self.inner.fenced_transition_v2_void_transport_enabled()
+    }
+
     async fn execute(
         &self,
         authorization: &SessionConsumerAuthorization,
@@ -1976,6 +2050,42 @@ impl SessionQuorumConsumer for FixtureConsumer {
             self.fenced_transition_v2_calls
                 .fetch_add(1, Ordering::SeqCst);
         }
+        #[cfg(test)]
+        {
+            if let SessionConsumerV2Operation::FencedTransitionV2 { request } = request.operation()
+            {
+                *self.last_fenced_transition_v2_request.lock().unwrap() = Some((**request).clone());
+            }
+            if matches!(
+                request.operation(),
+                SessionConsumerV2Operation::FencedTransitionV2VoidCapability
+            ) && self
+                .unavailable_fenced_transition_v2_capability
+                .load(Ordering::Acquire)
+            {
+                return SessionConsumerV2Response::FencedTransitionV2VoidCapability(Err(
+                    opc_session_store::SessionConsumerStoreError::Unavailable,
+                ));
+            }
+            if fenced_transition_v2
+                && self
+                    .stall_fenced_transition_v2_mutation
+                    .load(Ordering::Acquire)
+            {
+                std::future::pending::<()>().await;
+            }
+            if matches!(
+                request.operation(),
+                SessionConsumerV2Operation::FencedTransitionV2VoidCapability
+            ) && self
+                .legacy_fenced_transition_v2_capability
+                .load(Ordering::Acquire)
+            {
+                return SessionConsumerV2Response::FencedTransitionV2VoidCapability(Err(
+                    opc_session_store::SessionConsumerStoreError::CapabilityNotSupported,
+                ));
+            }
+        }
         if matches!(
             request.operation(),
             SessionConsumerV2Operation::FencedTransitionV2Status { .. }
@@ -2000,6 +2110,17 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute_v2(authorization, request).await;
+        #[cfg(test)]
+        if matches!(
+            &response,
+            SessionConsumerV2Response::FencedTransitionV2Void { result: Ok(_), .. }
+        ) && self
+            .stall_fenced_transition_v2_void_response
+            .load(Ordering::Acquire)
+        {
+            std::future::pending::<()>().await;
+        }
+
         if fenced_transition_v2
             && matches!(
                 &response,

@@ -1083,12 +1083,17 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let protected_roster_v2_layout = consensus::protected_roster_v2_recovery_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
+    let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn
         .query_row(
-            "SELECT schema_version, cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
+            "SELECT cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    // Format six retains the independently authenticated lane layout in its
+    // immutable profile marker. Validate that marker before using the layout;
+    // accepting the raw outer format alone would conceal a corrupt lane fence.
+    let schema_version = consensus::persisted_schema_version_in_sync(conn, false)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let expected_schema_version = match protected_roster_v2_layout {
         consensus::ProtectedRosterV2RecoveryLayout::Inactive
@@ -2013,6 +2018,8 @@ fn validate_fenced_transition_v2_recovery_state(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
 ) -> Result<(), RecoveryError> {
+    let profile = consensus::fenced_transition_profile_in_sync(conn, false)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     preflight_fenced_transition_v2_receipt_count(conn)?;
     let storage_epoch = i64::try_from(storage_identity.configuration_epoch().get())
         .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -2034,7 +2041,7 @@ fn validate_fenced_transition_v2_recovery_state(
             storage_identity,
             membership_scope.current_identity,
             &membership_scope.current_members,
-            crate::fenced_transition::fenced_transition_v2_profile_digest(),
+            profile.digest(),
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
         if !scope_matches {
@@ -2080,7 +2087,7 @@ fn validate_fenced_transition_v2_recovery_state(
     let history_profile_digest: [u8; 32] = history_profile_digest
         .try_into()
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    if history_profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest() {
+    if history_profile_digest != profile.digest() {
         return Err(RecoveryError::CorruptReplica);
     }
     let retired_through =
@@ -2199,7 +2206,7 @@ fn validate_fenced_transition_v2_recovery_state(
             return Err(RecoveryError::CorruptReplica);
         }
         if let (Some(response), Some(response_digest)) = (response, response_digest) {
-            consensus::decode_fenced_transition_v2_response(&response)
+            consensus::decode_fenced_transition_v2_response_with_profile(&response, profile)
                 .map_err(|_| RecoveryError::CorruptReplica)?;
             let response_digest: [u8; 32] = response_digest
                 .try_into()
@@ -2670,6 +2677,14 @@ fn hash_current_checkpoint(
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
     hasher.update(schema_version.to_be_bytes());
+    if consensus::fenced_transition_profile_in_sync(conn, false)
+        .map_err(|_| RecoveryError::CorruptReplica)?
+        == crate::FencedTransitionV2Profile::V2WithVoid
+    {
+        hasher.update(b"openpacketcore/session-recovery/fenced-transition-void-profile/v1\0");
+        let query = "SELECT * FROM consensus_fenced_transition_profile ORDER BY singleton";
+        hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
+    }
     if receipt_layout == consensus::FencedTransitionReceiptLedgerLayout::Activated
         && table_exists(conn, "consensus_fenced_transition_activation")?
     {
@@ -3158,6 +3173,8 @@ fn validate_exact_recovery_schema(
     conn: &Connection,
     require_recovery_table: bool,
 ) -> Result<(), RecoveryError> {
+    let profile = consensus::fenced_transition_profile_in_sync(conn, false)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
@@ -3260,6 +3277,13 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let mut observed = recovery_schema_manifest(conn)?;
+    if profile == crate::FencedTransitionV2Profile::V2WithVoid {
+        // The profile reader above checks the exact DDL, singleton, digest and
+        // inner layout. It is the only extra object in an extended store.
+        observed
+            .remove("consensus_fenced_transition_profile")
+            .ok_or(RecoveryError::CorruptReplica)?;
+    }
     observed
         .remove("consensus_identity")
         .ok_or(RecoveryError::CorruptReplica)?;
@@ -3414,6 +3438,8 @@ fn fenced_receipt_commitment_columns(
 }
 
 fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String>, RecoveryError> {
+    let maximum_objects = consensus::consensus_schema_max_objects_in_sync(conn, false)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut statement = conn
         .prepare(
             "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
@@ -3424,7 +3450,7 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut manifest = BTreeMap::new();
     while let Some(row) = rows.next().map_err(|_| RecoveryError::CorruptReplica)? {
-        if manifest.len() == consensus::CONSENSUS_SCHEMA_MAX_OBJECTS {
+        if manifest.len() == maximum_objects {
             return Err(RecoveryError::CorruptReplica);
         }
         let kind = row

@@ -1863,6 +1863,7 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             // unavailable capability, using the existing redaction-safe wire
             // spelling rather than extending the frozen v5 enum.
             StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionVoided
             | StoreError::FencedTransitionHistoryEpochRetired
             | StoreError::FencedTransitionHistoryEpochNotActive
             | StoreError::FencedTransitionRetentionExhausted

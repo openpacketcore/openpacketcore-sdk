@@ -4013,6 +4013,7 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session re-pin journal fenced transition identity was reused",
         ),
         StoreError::FencedTransitionHistoryFull
+        | StoreError::FencedTransitionVoided
         | StoreError::FencedTransitionRetentionExhausted
         | StoreError::FencedTransitionStorageExhausted
         | StoreError::FencedTransitionHistoryEpochRetired

@@ -1158,7 +1158,8 @@ pub(super) fn validate_frontier_transition(
     after: &NativeFrontiers,
     snapshot: bool,
 ) -> io::Result<()> {
-    if before.sequence > after.sequence
+    if before.fenced_transition_profile != after.fenced_transition_profile
+        || before.sequence > after.sequence
         || before.watch_sequence > after.watch_sequence
         || before.next_fence > after.next_fence
         || before.next_credential > after.next_credential

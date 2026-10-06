@@ -42,5 +42,253 @@
     "material_epochs": 46,
     "tls_tcp": 44,
     "app_dictionaries": 43
+  },
+  "quiescent_lib_shards": {
+    "consumer_void_lost_before_bind_drains_the_row_and_resolves_the_live_handle": "heavy-1",
+    "consumer_void_keeps_a_waiting_call_then_drains_after_cancellation": "heavy-1",
+    "consumer_void_drains_after_the_leader_loses_authority_during_the_original_call": "heavy-1",
+    "consumer_void_unknown_response_retains_until_exact_status_confirms_it": "heavy-1",
+    "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps": "heavy-1",
+    "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum": "it-0",
+    "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction": "it-0",
+    "persistent_three_voter_first_transition_has_one_leader_activation_proof": "it-0",
+    "persistent_three_voter_protected_roster_survives_real_os_process_loss": "it-0",
+    "singleton_public_protected_flow_preserves_durable_state": "it-0"
+  },
+  "_lib_groups_comment": [
+    "Exact names keep moved groups disjoint from misc and from isolated timing contracts.",
+    "New unlisted tests still run on misc. Precheck rejects missing or ambiguous names.",
+    "The full-journal opt-in proof stays ignored; do not turn it into a hosted qualification."
+  ],
+  "lib_groups": [
+    {
+      "module": "consumer::tests::void_alpn_tests",
+      "shard": "it-1",
+      "tests": [
+        "void_alpn_baseline_and_opt_in_offers_match_a_frozen_main_server",
+        "void_alpn_baseline_server_and_frozen_main_client_keep_exact_selection",
+        "void_alpn_definite_capability_is_cached_only_for_the_physical_lane",
+        "void_alpn_protocol_rejection_retires_the_lane_before_a_new_answer",
+        "void_alpn_marker_does_not_grant_activation_or_cache_unavailability",
+        "void_alpn_first_positive_proof_retires_a_cancelled_competing_lane",
+        "void_alpn_transport_and_tls_failures_never_seed_unsupported",
+        "void_alpn_stateless_fallback_sends_no_unknown_frame"
+      ]
+    },
+    {
+      "module": "consumer::tests::void_wire_tests",
+      "shard": "it-1",
+      "tests": [
+        "void_wire_requires_the_full_original_identity_for_every_result",
+        "void_wire_terminal_error_is_lossless_without_changing_original_error_classification"
+      ]
+    },
+    {
+      "module": "consensus::native::void_tests",
+      "shard": "it-1",
+      "tests": [
+        "native_void_before_original_binds_one_receipt_without_a_session_or_watch_effect",
+        "native_original_before_void_replays_success_including_within_one_apply_batch",
+        "native_base_profile_never_accepts_void_even_after_original_is_bound",
+        "native_void_command_tags_are_appended_and_digest_domain_is_separate",
+        "native_void_and_original_preserve_first_binding_across_epoch_rotation",
+        "native_void_and_original_cannot_bind_an_unbound_request_after_its_epoch_closes",
+        "native_void_obeys_original_authority_before_binding_and_fence_checks",
+        "native_void_prevents_late_batched_original_under_the_authorized_envelope"
+      ]
+    },
+    {
+      "module": "consensus::store::sequential_wal_sdk_tests::void_tests",
+      "shard": "it-1",
+      "tests": [
+        "baseline_readiness_ignores_a_peer_that_rejects_profile_probes",
+        "baseline_readiness_ignores_a_peer_that_never_answers_profile_probes",
+        "baseline_capability_prefers_unavailable_to_unsupported_before_activation",
+        "void_readiness_reuses_proof_while_activation_lookup_is_blocked",
+        "void_readiness_loads_a_slow_activation_once_outside_the_probe_budget",
+        "void_readiness_bounds_unanswered_probes_and_reuses_the_exact_scope_proof",
+        "void_readiness_before_first_activation_needs_every_voters_proof",
+        "recovery_inspection_accepts_real_void_profile_replicas",
+        "native_three_voter_void_decides_before_original_and_survives_restart",
+        "native_three_voter_original_receipt_wins_over_later_void",
+        "native_three_voter_void_requires_every_voters_created_profile",
+        "sqlite_three_voter_void_replays_the_deciding_receipt_without_a_second_effect",
+        "native_three_voter_void_uses_quorum_after_exact_profile_activation"
+      ]
+    },
+    {
+      "module": "fenced_transition_journal::recovery::void_ownership_tests",
+      "shard": "it-1",
+      "tests": [
+        "baseline_journal_concurrent_creation_ignores_other_directory_owners",
+        "baseline_journal_open_does_not_require_directory_lock_support",
+        "baseline_journal_second_open_keeps_the_original_coarse_error",
+        "owned_journal_void_waits_for_current_call_and_accepts_inherited_rows",
+        "owned_journal_void_deadline_and_cancelled_preparation_are_process_local",
+        "owned_journal_void_serializes_redispatch_with_reclamation",
+        "owned_journal_void_never_converts_a_legacy_journal",
+        "owned_journal_void_late_completion_cannot_recreate_a_removed_call",
+        "owned_journal_creation_child",
+        "owned_journal_creation_is_crash_atomic",
+        "owned_journal_live_owner_and_corruption_have_distinct_reasons",
+        "owned_journal_process_child",
+        "owned_journal_void_lookup_retains_its_notice_across_row_removal",
+        "owned_journal_void_excludes_another_process_and_recovers_after_crash"
+      ]
+    },
+    {
+      "module": "sqlite::consensus::tests::void_profile_matrix",
+      "shard": "it-1",
+      "tests": [
+        "every_fenced_and_roster_profile_combination_snapshots_restores_and_reopens"
+      ]
+    },
+    {
+      "module": "sqlite::consensus::void_profile_tests",
+      "shard": "it-1",
+      "tests": [
+        "void_profile_has_an_independent_fixed_digest",
+        "void_store_profile_is_selected_atomically_at_creation_and_never_converted",
+        "void_profile_marker_and_scope_survive_other_lane_activation",
+        "void_profile_refuses_missing_marker_and_cannot_be_inferred_from_v2_activation",
+        "void_receipt_codec_is_closed_under_the_original_profile",
+        "void_public_open_refuses_the_other_profile_and_tampered_marker",
+        "void_snapshot_cannot_convert_a_stores_profile",
+        "void_profile_with_both_rosters_builds_a_snapshot",
+        "roster_activation_refuses_to_downgrade_either_store_profile"
+      ]
+    },
+    {
+      "module": "authenticated_consumer_fixture::v2_facade_tests::void_tests",
+      "shard": "it-1",
+      "tests": [
+        "consumer_void_sweep_preserves_an_unregistered_trait_callers_receipt",
+        "consumer_void_profile_preserves_the_legacy_capability_decoder_and_operations",
+        "consumer_void_cancelled_preflight_then_redispatch_protects_the_live_call",
+        "consumer_void_older_voter_is_reported_and_the_row_stays_retained",
+        "consumer_void_one_unavailable_capability_does_not_veto_certified_quorum",
+        "consumer_void_inherited_row_is_reclaimed_without_the_previous_call_deadline",
+        "consumer_small_full_journal_void_reclaims_all_inherited_unbound_rows"
+      ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests",
+      "shard": "heavy-0",
+      "tests": [
+        "async_persistence_public_reopen_requires_live_cut_and_local_application",
+        "async_persistence_all_cold_roots_withhold_votes_and_restored_leader_traffic",
+        "async_persistence_public_mode_isolation_precedes_engine_and_control_mutation",
+        "async_persistence_wire_bounds_full_lineage_and_attempt_replacement",
+        "admission::async_persistence_retry_retains_certified_catch_up_across_deadlines",
+        "admission::async_persistence_resumed_catch_up_recertifies_a_new_committed_leader",
+        "admission::async_persistence_real_certificate_binds_request_scope_full_vote_and_membership",
+        "admission::async_persistence_conflicting_suffix_and_cancelled_activation_require_a_fresh_attempt",
+        "authority_reservation::async_authority_promise_is_durable_idempotent_and_monotonic",
+        "authority_reservation::async_authority_interrupted_promise_never_grants_old_owner_new_range",
+        "authority_reservation::async_authority_reservation_is_unchanged_by_ordinary_acknowledgements",
+        "authority_reservation::async_authority_missing_corrupt_or_foreign_record_cannot_consume_close_evidence",
+        "authority_reservation::async_authority_publication_failure_never_starts_an_engine",
+        "authority_reservation::async_authority_replacement_at_sync_cannot_publish_an_owner",
+        "bootstrap::async_persistence_public_root_interruption_never_reseeds_or_admits",
+        "bootstrap::async_persistence_public_reopen_before_first_generation_requires_live_quorum",
+        "closed::async_closed_proof_is_one_use_and_does_not_grant_traffic",
+        "closed::async_closed_shutdown_cannot_certify_a_quarantined_predecessor",
+        "closed::async_closed_publication_failures_preserve_exact_recovery_boundary",
+        "closed::async_closed_consumption_failure_never_starts_an_uncertified_owner",
+        "closed::async_closed_rejects_foreign_corrupt_and_stale_selected_proof",
+        "closed::async_closed_rejects_file_replacement_at_consumption",
+        "closed::async_closed_cancelled_shutdown_retains_lock_until_proof_is_complete",
+        "initialization::active_admission_probe_deadline_is_call_local_and_release_runs_the_real_probe",
+        "initialization::native_scope_rejection_cannot_reuse_a_previous_admission_deadline",
+        "majority_authority::async_lagging_survivor_and_retained_majority_lose_issued_fence_evidence",
+        "majority_authority::async_all_cold_retained_roots_lose_issued_fence_evidence",
+        "majority_authority::async_majority_volatile_tail_recovers_successor_authority",
+        "majority_authority::async_all_cold_volatile_tail_recovers_successor_authority",
+        "majority_authority::protected_async_majority_volatile_tail_and_differing_generations_recover",
+        "majority_authority::protected_async_all_cold_volatile_tail_and_differing_generations_recover",
+        "majority_protocol::protected_async_rejoin_preserves_admitted_survivor_authority",
+        "majority_protocol::async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement",
+        "majority_protocol::protected_async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement",
+        "majority_protocol::async_recovery_five_voters_repeat_boundary_and_sequential_rejoin",
+        "majority_protocol::protected_async_recovery_five_voters_repeat_boundary_and_sequential_rejoin",
+        "majority_protocol::async_recovery_activation_retry_survives_a_new_real_leader",
+        "majority_protocol::protected_async_recovery_activation_retry_survives_a_new_real_leader",
+        "majority_protocol::async_recovery_retries_an_election_interrupted_after_preparation",
+        "majority_protocol::protected_async_recovery_retries_an_election_interrupted_after_preparation",
+        "majority_protocol::async_recovery_old_ready_and_delayed_activation_cannot_admit_a_replacement",
+        "majority_protocol::protected_async_recovery_old_ready_and_delayed_activation_cannot_admit_a_replacement",
+        "majority_protocol::async_recovery_certificates_require_exact_roster_root_boot_vote_and_commit",
+        "majority_protocol::protected_async_recovery_certificates_require_exact_roster_root_boot_vote_and_commit",
+        "majority_protocol::async_recovery_snapshot_requires_complete_install_and_actual_matching_append",
+        "majority_protocol::protected_async_recovery_snapshot_requires_complete_install_and_actual_matching_append",
+        "majority_protocol::async_recovery_protected_trust_root_needs_authority_even_without_retained_activation",
+        "majority_protocol::protected_async_stale_cold_attempt_cannot_replace_committed_recovery",
+        "majority_protocol::protected_async_stale_cold_attempt_cannot_replace_active_recovery",
+        "protected::protected_async_missing_owner_withholds_authority_then_retries_without_reset",
+        "protected::protected_async_delayed_old_provider_receipt_cannot_authorize_next_round",
+        "protected::protected_async_slow_owner_completion_resumes_same_committed_election",
+        "protected::protected_async_maximum_owner_inventory_recovers_and_reopens",
+        "races::async_persistence_old_completion_cannot_certify_a_new_leader",
+        "races::async_persistence_cached_append_success_cannot_commit_a_fresh_cold_barrier",
+        "races::async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campaign",
+        "retirement::planned_native_leader_retirement_preserves_close_proof_and_reopen",
+        "retirement::planned_native_follower_retirement_preserves_close_proof_and_reopen",
+        "retirement::retiring_native_voter_does_not_manufacture_missing_v1_activation",
+        "retirement::planned_native_handoff_preserves_an_accepted_mutations_original_completion",
+        "snapshots::async_persistence_cold_repair_rejects_wrong_authority_and_requires_real_append",
+        "snapshots::async_persistence_compacted_snapshot_cancellation_fences_replacement_and_reopens",
+        "snapshots::async_persistence_failed_final_snapshot_keeps_cold_admission_and_selected_prefix",
+        "writer::async_persistence_public_v2_and_snapshot_work_continue_during_writer_stall",
+        "writer::async_persistence_public_background_error_preserves_results_and_reports_failed_drain",
+        "writer::async_persistence_failed_writer_recovery_survives_a_snapshot_call_deadline",
+        "writer::async_persistence_recovery_survives_post_activation_admission_deadlines",
+        "writer::async_persistence_shutdown_deadline_survives_a_held_writer"
+      ]
+    },
+    {
+      "module": "stateless_quorum_consumer::publication_authority_failover",
+      "shard": "heavy-1",
+      "tests": [
+        "publication_authority_failover_pre_and_post_reads_preserve_provider_calls",
+        "publication_authority_failover_survives_primary_listener_loss",
+        "publication_authority_failover_fresh_postcheck_and_canonical_alternates",
+        "publication_authority_failover_rejection_is_terminal_before_and_after_effect",
+        "publication_authority_failover_all_unavailable_retains_same_capsule",
+        "publication_authority_failover_cancellation_does_not_advance_or_replay",
+        "publication_authority_failover_retains_original_primary_pool",
+        "publication_authority_failover_rejects_invalid_rosters_before_claiming_pool",
+        "publication_authority_failover_existing_constructor_remains_single_pool",
+        "publication_authority_review_stalled_primary_leaves_time_for_alternate",
+        "publication_authority_review_shutdown_alternate_does_not_end_traversal",
+        "publication_authority_review_all_server_rejections_are_terminal",
+        "publication_authority_server_unavailable_preserves_retry_class_and_postcheck_recovery",
+        "publication_authority_hello_rejection_stops_before_healthy_alternate",
+        "publication_authority_review_primary_recovers_during_alternate_read",
+        "publication_authority_review_consensus_member_stopped",
+        "publication_authority_review_retired_member_response_is_terminal",
+        "publication_authority_review_partitioned_alternate_cannot_serve_stale_current",
+        "publication_authority_review_tls_alpn_and_io_alternates_are_retryable",
+        "publication_authority_review_attestation_root_mismatch_is_rejected"
+      ]
+    }
+  ],
+  "_balance_comment": [
+    "2026-10-06 rebalance after #1128 misc exceeded its unchanged 60-minute limit.",
+    "Hosted baseline #1125: https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/37405076185",
+    "Hosted train #1128: https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/37425986614",
+    "The completed train prefix plus the main heavy remainder estimates the old misc job at 3632.5 seconds.",
+    "Moved ordinary groups measured locally with the exact CI workspace selection and Rust 1.99.0: void 168.7s wall / 166.31s harness, async persistence 657.8s / 657.52s, publication failover 230.2s / 229.81s.",
+    "The unchanged exact isolated commands measured in hosted #1128: five void contracts 26.32s; five older contracts 261.66s.",
+    "For misc subtract the moved harness times and hosted isolated command times, then add a 60s reserve. For each destination use the larger baseline/train job time, add moved command time and a 300s compilation reserve.",
+    "These are workload estimates, not job timeouts or a completed hosted rerun; remeasure when the test mix changes."
+  ],
+  "_estimated_hosted_seconds": {
+    "misc": 2351,
+    "quiescent-o1": 1282,
+    "it-0": 1343,
+    "it-1": 843,
+    "it-2": 1452,
+    "heavy-0": 1506,
+    "heavy-1": 950
   }
 }

@@ -43,8 +43,9 @@ mod recovery;
 
 pub(crate) use recovery::{canonical_recovery_request, RecoveryJournalAdmission};
 pub use recovery::{
-    FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey,
-    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
+    FencedTransitionV2RecoveryCall, FencedTransitionV2RecoveryJournal,
+    FencedTransitionV2RecoveryJournalKey, FencedTransitionV2RecoveryNotice,
+    FencedTransitionV2VoidEligibility, FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
     FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
     FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
 };
@@ -576,7 +577,7 @@ impl PreparedFencedTransitionJournal {
         key: PreparedFencedTransitionJournalKey,
         mode: JournalOpenMode,
     ) -> Result<Self, StoreError> {
-        let path = prepare_secure_journal_path(path, mode)?;
+        let path = prepare_secure_journal_path(path, mode).map_err(|_| journal_unavailable())?;
         #[cfg(unix)]
         let key = key.bind_to_checked_path(&path.binding_path)?;
         // SQLite's SQLITE_OPEN_NOFOLLOW rejects the descriptor-directory
@@ -5127,13 +5128,16 @@ impl SecureJournalPathGuard {
 }
 
 #[cfg(unix)]
+const JOURNAL_OWNER_LOCKED: &str = "prepared journal locked by a live owner";
+
+#[cfg(unix)]
 impl SecureJournalOpenLease {
     fn acquire(identity: SecureJournalFileIdentity) -> Result<Self, StoreError> {
         let mut identities = active_secure_journal_identities()
             .lock()
             .map_err(|_| journal_unavailable())?;
         if !identities.insert(identity) {
-            return Err(journal_unavailable());
+            return Err(StoreError::BackendUnavailable(JOURNAL_OWNER_LOCKED.into()));
         }
         Ok(Self { identity })
     }
@@ -5375,18 +5379,23 @@ fn validate_existing_sqlite_header(
 
 #[cfg(unix)]
 fn sqlite_descriptor_path(
-    parent: &std::os::fd::OwnedFd,
+    parent: &impl std::os::fd::AsFd,
     leaf_name: &std::ffi::OsStr,
 ) -> Result<PathBuf, StoreError> {
     use std::os::fd::AsRawFd;
 
     #[cfg(target_os = "linux")]
-    let anchor = PathBuf::from("/proc/self/fd").join(parent.as_raw_fd().to_string());
+    let anchor = PathBuf::from("/proc/self/fd").join(parent.as_fd().as_raw_fd().to_string());
     #[cfg(not(target_os = "linux"))]
-    let anchor = PathBuf::from("/dev/fd").join(parent.as_raw_fd().to_string());
+    let anchor = PathBuf::from("/dev/fd").join(parent.as_fd().as_raw_fd().to_string());
 
     let anchor_metadata = std::fs::metadata(&anchor).map_err(|_| journal_unavailable())?;
-    let held_parent = std::fs::File::from(parent.try_clone().map_err(|_| journal_unavailable())?);
+    let held_parent = std::fs::File::from(
+        parent
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| journal_unavailable())?,
+    );
     if !same_metadata_file(
         &anchor_metadata,
         &held_parent.metadata().map_err(|_| journal_unavailable())?,

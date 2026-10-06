@@ -234,6 +234,10 @@ pub enum StoreError {
     /// fixed error carries no key, tenant, owner, or reservation metadata.
     #[error("session record is reserved by a protected roster")]
     SessionRecordReserved,
+    /// The exact original request is bound to a terminal no-effect receipt
+    /// under the independently negotiated V2 void profile. It can never apply.
+    #[error("fenced transition request was voided")]
+    FencedTransitionVoided,
 }
 
 /// Error type for lease operations.

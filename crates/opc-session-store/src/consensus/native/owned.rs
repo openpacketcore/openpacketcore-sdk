@@ -222,6 +222,20 @@ fn intent(
         SessionMutationIntent::FencedTransitionV2(request) => {
             SessionMutationIntent::FencedTransitionV2(Box::new(request.copy_for_native_read()?))
         }
+        SessionMutationIntent::VoidFencedTransitionV2(request) => {
+            SessionMutationIntent::VoidFencedTransitionV2(Box::new(request.copy_for_native_read()?))
+        }
+        SessionMutationIntent::ActivateVoidFencedTransitionV2 {
+            request,
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
+        } => SessionMutationIntent::ActivateVoidFencedTransitionV2 {
+            request: Box::new(request.copy_for_native_read()?),
+            scope_identity: *scope_identity,
+            voter_set_digest: *voter_set_digest,
+            profile_digest: *profile_digest,
+        },
         SessionMutationIntent::ActivateFencedTransitionV2 {
             request,
             scope_identity,

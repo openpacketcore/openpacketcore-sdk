@@ -1726,6 +1726,21 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Bind a terminal no-effect receipt for one exact unbound V2 request.
+    /// A separately created void profile requires a unanimous proof for its
+    /// exact immutable scope before first activation. Once that proof or the
+    /// durable activation certificate exists, each void requires a quorum.
+    /// A prior original binding returns its real receipt. Unknown outcomes must
+    /// retain the request; repeating this operation is idempotent.
+    async fn fenced_transition_v2_void(
+        &self,
+        _request: &crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2Status, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "fenced_transition_v2_void".into(),
+        ))
+    }
+
     /// Atomically compare the current generation and write the new record if it
     /// matches. Implementations MUST require a current [`LeaseGuard`] and MUST
     /// reject writes whose record owner/fence do not match that lease.

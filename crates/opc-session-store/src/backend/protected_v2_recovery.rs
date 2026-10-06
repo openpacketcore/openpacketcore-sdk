@@ -58,6 +58,13 @@ pub trait ProtectedFencedTransitionV2Backend:
 
     /// Select the active epoch, seal once, and durably bind the caller ID to
     /// the complete sealed V2 request before returning.
+    ///
+    /// This method receives no deadline. On an owned journal, a caller that
+    /// has not registered a call with
+    /// [`FencedTransitionV2RecoveryJournal::begin_call`] retains its row against
+    /// void for this process lifetime; exact status or epoch retirement can
+    /// still resolve it. A caller that needs deadline-based reclamation must
+    /// register its original deadline before preparation, as the facade does.
     async fn prepare_protected_fenced_transition_v2(
         &self,
         request: FencedTransitionRequest,
@@ -68,6 +75,26 @@ pub trait ProtectedFencedTransitionV2Backend:
         &self,
         request_id: FencedTransitionRequestId,
     ) -> Result<PreparedFencedTransitionV2Lookup, StoreError>;
+
+    /// Recover the retained request while pinning its in-memory receipt notice.
+    /// Owned journals capture both under one read permit, so reclamation cannot
+    /// remove the row before the recovered handle acquires its notice.
+    async fn recover_protected_fenced_transition_v2_with_notice(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2Lookup,
+            Option<crate::FencedTransitionV2RecoveryNotice>,
+        ),
+        StoreError,
+    > {
+        Ok((
+            self.recover_protected_fenced_transition_v2(request_id)
+                .await?,
+            None,
+        ))
+    }
 
     /// Locally authenticate that `prepared` is still the exact retained row.
     async fn preflight_protected_fenced_transition_v2(
@@ -87,6 +114,23 @@ pub trait ProtectedFencedTransitionV2Backend:
         &self,
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<FencedTransitionV2Status, StoreError>;
+
+    /// Check the journal ownership and original caller lifetime before a void.
+    fn protected_fenced_transition_v2_void_eligibility(
+        &self,
+        _prepared: &PreparedFencedTransitionV2,
+    ) -> crate::FencedTransitionV2VoidEligibility {
+        crate::FencedTransitionV2VoidEligibility::UnsupportedJournal
+    }
+
+    /// Ask the unanimously capable quorum to bind the exact deciding receipt.
+    /// An unknown outcome must retain the journal row.
+    async fn protected_fenced_transition_v2_void(
+        &self,
+        _prepared: &PreparedFencedTransitionV2,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        Err(unsupported_protected_fenced_transition_v2_recovery())
+    }
 
     /// Remove the retained row only while it still holds `prepared` exactly.
     ///
@@ -297,16 +341,34 @@ where
         &self,
         request_id: FencedTransitionRequestId,
     ) -> Result<PreparedFencedTransitionV2Lookup, StoreError> {
+        self.recover_with_notice(request_id)
+            .await
+            .map(|(lookup, _)| lookup)
+    }
+
+    async fn recover_with_notice(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2Lookup,
+            Option<crate::FencedTransitionV2RecoveryNotice>,
+        ),
+        StoreError,
+    > {
         require_fenced_transition_physical_boundary(self.inner)?;
         let (journal, scope) = self.bound_journal().await?;
-        match journal.lookup(scope, request_id).await? {
-            Some(request) => {
+        match journal.lookup_with_notice(scope, request_id).await? {
+            Some((request, notice)) => {
                 require_fenced_transition_v2_physical_envelope(&request)?;
-                Ok(PreparedFencedTransitionV2Lookup::Found(
-                    PreparedFencedTransitionV2::new(request_id, request),
+                Ok((
+                    PreparedFencedTransitionV2Lookup::Found(PreparedFencedTransitionV2::new(
+                        request_id, request,
+                    )),
+                    notice,
                 ))
             }
-            None => Ok(PreparedFencedTransitionV2Lookup::Absent),
+            None => Ok((PreparedFencedTransitionV2Lookup::Absent, None)),
         }
     }
 
@@ -317,6 +379,15 @@ where
         &self,
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<(), StoreError> {
+        self.require_exact_journal(prepared).await.map(|_| ())
+    }
+
+    /// Keep the authenticated journal for an in-memory receipt notification.
+    /// Releasing a row still performs its own authenticated compare-and-delete.
+    async fn require_exact_journal(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> Result<&'a Arc<FencedTransitionV2RecoveryJournal>, StoreError> {
         require_fenced_transition_physical_boundary(self.inner)?;
         let (journal, scope) = self.bound_journal().await?;
         let Some(stored) = journal.lookup(scope, prepared.request_id()).await? else {
@@ -327,7 +398,8 @@ where
         {
             return Err(StoreError::FencedTransitionRequestConflict);
         }
-        require_fenced_transition_v2_physical_envelope(&stored)
+        require_fenced_transition_v2_physical_envelope(&stored)?;
+        Ok(journal)
     }
 
     pub(super) async fn effect(
@@ -369,15 +441,73 @@ where
         }
     }
 
+    fn void_eligibility(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> crate::FencedTransitionV2VoidEligibility {
+        self.recovery_journal.map_or(
+            crate::FencedTransitionV2VoidEligibility::UnsupportedJournal,
+            |journal| {
+                journal.void_reclamation_eligibility(
+                    prepared.request_id(),
+                    prepared.physical_request().request_id(),
+                )
+            },
+        )
+    }
+
     pub(super) async fn status(
         &self,
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<FencedTransitionV2Status, StoreError> {
-        self.require_exact(prepared).await?;
+        let journal = self.require_exact_journal(prepared).await?;
         self.require_v2_boundary().await?;
-        self.inner
+        let status = self
+            .inner
             .fenced_transition_v2_status(prepared.physical_request())
-            .await
+            .await?;
+        if matches!(&status, FencedTransitionV2Status::Recorded(result) if matches!(result.as_ref(), Err(StoreError::FencedTransitionVoided)))
+        {
+            journal.record_terminal(
+                prepared.request_id(),
+                prepared.physical_request().request_id(),
+                &status,
+            );
+        }
+        Ok(status)
+    }
+
+    pub(super) async fn void(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        let journal = self.require_exact_journal(prepared).await?;
+        match self.void_eligibility(prepared) {
+            crate::FencedTransitionV2VoidEligibility::Ready => {}
+            crate::FencedTransitionV2VoidEligibility::UnsupportedJournal => {
+                return Err(unsupported_protected_fenced_transition_v2_recovery())
+            }
+            crate::FencedTransitionV2VoidEligibility::WaitingCaller => {
+                return Err(recovery_row_unavailable())
+            }
+        }
+        self.require_v2_boundary().await?;
+        if !journal.try_begin_void(
+            prepared.request_id(),
+            prepared.physical_request().request_id(),
+        ) {
+            return Err(recovery_row_unavailable());
+        }
+        let status = self
+            .inner
+            .fenced_transition_v2_void(prepared.physical_request())
+            .await?;
+        journal.record_terminal(
+            prepared.request_id(),
+            prepared.physical_request().request_id(),
+            &status,
+        );
+        Ok(status)
     }
 
     pub(super) async fn discard(
@@ -487,6 +617,21 @@ where
         self.v2_recovery_parts().recover(request_id).await
     }
 
+    async fn recover_protected_fenced_transition_v2_with_notice(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2Lookup,
+            Option<crate::FencedTransitionV2RecoveryNotice>,
+        ),
+        StoreError,
+    > {
+        self.v2_recovery_parts()
+            .recover_with_notice(request_id)
+            .await
+    }
+
     async fn preflight_protected_fenced_transition_v2(
         &self,
         prepared: &PreparedFencedTransitionV2,
@@ -506,6 +651,20 @@ where
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<FencedTransitionV2Status, StoreError> {
         self.v2_recovery_parts().status(prepared).await
+    }
+
+    fn protected_fenced_transition_v2_void_eligibility(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> crate::FencedTransitionV2VoidEligibility {
+        self.v2_recovery_parts().void_eligibility(prepared)
+    }
+
+    async fn protected_fenced_transition_v2_void(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        self.v2_recovery_parts().void(prepared).await
     }
 
     async fn discard_protected_fenced_transition_v2(
@@ -572,6 +731,21 @@ where
         self.v2_recovery_parts().recover(request_id).await
     }
 
+    async fn recover_protected_fenced_transition_v2_with_notice(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2Lookup,
+            Option<crate::FencedTransitionV2RecoveryNotice>,
+        ),
+        StoreError,
+    > {
+        self.v2_recovery_parts()
+            .recover_with_notice(request_id)
+            .await
+    }
+
     async fn preflight_protected_fenced_transition_v2(
         &self,
         prepared: &PreparedFencedTransitionV2,
@@ -591,6 +765,20 @@ where
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<FencedTransitionV2Status, StoreError> {
         self.v2_recovery_parts().status(prepared).await
+    }
+
+    fn protected_fenced_transition_v2_void_eligibility(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> crate::FencedTransitionV2VoidEligibility {
+        self.v2_recovery_parts().void_eligibility(prepared)
+    }
+
+    async fn protected_fenced_transition_v2_void(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        self.v2_recovery_parts().void(prepared).await
     }
 
     async fn discard_protected_fenced_transition_v2(

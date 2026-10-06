@@ -30,6 +30,8 @@ use opc_types::{NetworkFunctionKind, TenantId};
 
 use super::*;
 
+mod void_tests;
+
 const PAYLOAD: &[u8] = b"fixture-v2-facade-payload";
 
 fn tenant() -> TenantId {

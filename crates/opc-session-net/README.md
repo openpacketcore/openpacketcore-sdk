@@ -267,7 +267,7 @@ cutover; there is no general-lane dual mode. Its private JSON DTO bytes are
 canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
 and unknown fields fail closed.
 
-The additive V2 epoch-fenced-transition family uses only
+The original V2 epoch-fenced-transition family uses
 `opc-session-consumer/2` with transport revision 5. A V2 offer never falls back
 to V1, and neither revision reuses the other's authenticated connection, Hello,
 or JSON envelope. A listener may provision both exact ALPNs during a cutover,
@@ -278,10 +278,32 @@ and a V1-only peer fails before V2 dispatch. Deploy listener support and any
 required V2 store/journal provisioning before enabling the explicit V2 API,
 then drain V2 callers before removing it.
 
+
+The optional void extension adds `opc-session-consumer/2-void` at the same
+revision. Opt in with
+`StatelessSessionConsumerClient::with_fenced_transition_v2_void_transport`
+before constructing a persistent pool. Only these clients offer `/2-void`
+followed by `/2`; baseline clients keep their exact original single-token offer.
+Only a service for a separately created void-profile store advertises the
+marker. A baseline store keeps its original ALPN list and selects `/2` even
+when offered the marker. The frozen old decoder cannot answer an unknown
+operation: it closes exactly as transport loss would, so negotiation must
+establish decoding support before any new operation is sent.
+
+After mTLS authentication and the unchanged exact-scope Hello, `/2` means void
+is unsupported for that physical lane. Neither new operation is sent, and the
+lane remains usable for every original operation. `/2-void` establishes only
+decoding support; the existing exact-scope capability and activation proof
+still applies. Each physical lane caches a definite capability answer and
+forgets it on retirement or reconnect. Unavailable replies and transport/TLS
+failures never seed unsupported. Cancelling a competing probe after the first
+positive answer retires its lane. An owned journal alone does not change the
+client's ALPN offer. See [ADR 0029](../../docs/adr/0029-fenced-transition-void.md).
+
 The separately authorized V1 protected-roster family uses only
 `opc-session-consumer/3` with transport revision 5. When roster ingress is
-enabled, the listener advertises `/3` before `/2` and `/1`; a client offers
-exactly one ALPN. `/3` accepts only its roster operation set and exact
+enabled, the listener advertises `/3` before the V2 and general lanes; a
+protected-roster client offers exactly one ALPN. `/3` accepts only its roster operation set and exact
 tenant/scope/fence authority, never shares a lane or fallback path with `/1`
 or `/2`, and is excluded from `/2` capacity accounting and idle reclaim.
 

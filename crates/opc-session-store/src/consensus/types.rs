@@ -55,6 +55,8 @@ pub const SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES: usize =
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v1\0";
 const COMMAND_V2_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v2-fixed\0";
+const COMMAND_V2_VOID_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/command/v2-void/v1\0";
 const COMMAND_V2_DIGEST_MAGIC: &[u8] = b"OPC-SC-V2-APPLIED\0";
 /// Fixed V2 applied-command digest encoding revision.
 ///
@@ -2170,6 +2172,20 @@ pub enum SessionMutationIntent {
         /// Verified complete external retirement for a protected root.
         protected: Option<Box<super::protected_recovery::ProtectedRecoveryProof>>,
     },
+    /// Bind a terminal no-effect receipt for the exact original request.
+    /// Only stores created with the separately negotiated void profile accept it.
+    VoidFencedTransitionV2(Box<FencedTransitionV2Request>),
+    /// First void in an exact unanimously certified authority scope.
+    ActivateVoidFencedTransitionV2 {
+        /// Exact original request, including its self-authenticating ID.
+        request: Box<FencedTransitionV2Request>,
+        /// Authority scope proved by every voter.
+        scope_identity: SessionConsensusIdentity,
+        /// Commitment to every voter in that scope.
+        voter_set_digest: [u8; 32],
+        /// Independently negotiated immutable void profile.
+        profile_digest: [u8; 32],
+    },
 }
 
 /// Exact, self-contained precondition and effect request for the appended
@@ -2267,6 +2283,15 @@ impl SessionConsensusCommand {
                     effective_logical_time,
                 )?,
             )
+        } else if self.intent.contains_fenced_transition_v2_void() {
+            (
+                COMMAND_V2_VOID_DIGEST_DOMAIN,
+                self.encode_v2_applied_digest_input(
+                    sequence,
+                    previous_digest,
+                    effective_logical_time,
+                )?,
+            )
         } else if self.intent.contains_fenced_transition_v2() {
             (
                 COMMAND_V2_DIGEST_DOMAIN,
@@ -2344,6 +2369,13 @@ impl SessionConsensusCommand {
 }
 
 impl SessionMutationIntent {
+    pub(crate) fn contains_fenced_transition_v2_void(&self) -> bool {
+        matches!(
+            self,
+            Self::VoidFencedTransitionV2(_) | Self::ActivateVoidFencedTransitionV2 { .. }
+        ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_transition_v2_void())
+    }
+
     fn contains_roster_command(&self) -> bool {
         matches!(
             self,
@@ -2490,8 +2522,13 @@ fn append_v2_applied_intent(
     intent: &SessionMutationIntent,
 ) -> Result<(), StoreError> {
     match intent {
-        SessionMutationIntent::FencedTransitionV2(request) => {
-            out.push(1);
+        SessionMutationIntent::FencedTransitionV2(request)
+        | SessionMutationIntent::VoidFencedTransitionV2(request) => {
+            out.push(if intent.contains_fenced_transition_v2_void() {
+                6
+            } else {
+                1
+            });
             out.extend_from_slice(&request.request_id().to_bytes());
         }
         SessionMutationIntent::FencedTransitionV2Batch(requests) => {
@@ -2515,8 +2552,18 @@ fn append_v2_applied_intent(
             scope_identity,
             voter_set_digest,
             profile_digest,
+        }
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 {
+            request,
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
         } => {
-            out.push(2);
+            out.push(if intent.contains_fenced_transition_v2_void() {
+                7
+            } else {
+                2
+            });
             out.extend_from_slice(&request.request_id().to_bytes());
             append_v2_applied_identity(out, *scope_identity);
             out.extend_from_slice(voter_set_digest);
@@ -2544,7 +2591,9 @@ fn append_v2_applied_intent(
             origin,
             authority_identity,
             mutation,
-        } if mutation.contains_fenced_transition_v2() => {
+        } if mutation.contains_fenced_transition_v2()
+            || mutation.contains_fenced_transition_v2_void() =>
+        {
             out.push(4);
             out.extend_from_slice(&origin.get().to_be_bytes());
             append_v2_applied_identity(out, *authority_identity);

@@ -72,7 +72,10 @@ pub(super) fn validate_receipt(
         }
     }
     if let Some(response) = &receipt.response {
-        crate::sqlite::consensus::encode_fenced_transition_v2_response(response)?;
+        crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
+            response,
+            frontiers.fenced_transition_profile,
+        )?;
     }
     if receipt.cold.is_some() {
         use resident::RowFingerprint;
@@ -200,7 +203,7 @@ pub(super) fn validate_frontiers(
             .map_err(|_| invalid("native image history invalid"))?;
             if activation.identity != identity
                 || activation.voters != fenced_transition_voter_set_digest(identity, members)
-                || activation.profile != fenced_transition_v2_profile_digest()
+                || activation.profile != frontiers.fenced_transition_profile.digest()
                 || lifecycle::receipt_count(Some(history))? != receipts
             {
                 return Err(invalid("native image activation or receipt count differs"));

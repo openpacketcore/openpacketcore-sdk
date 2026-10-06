@@ -182,6 +182,13 @@ impl NativeStorage {
         check()?;
         let state = &self.business;
         let frontiers = &state.frontiers;
+        if sql::fenced_transition_profile_in_sync(conn, false)?
+            != frontiers.fenced_transition_profile
+        {
+            return Err(invalid(
+                "native export store profile differs from its basis",
+            ));
+        }
         let stored_root = sql::roster_snapshot::read_root(conn)
             .map_err(|_| invalid("native snapshot cold roster root is corrupt"))?;
         if stored_root.as_ref() != state.roster_root.as_deref() {
@@ -368,7 +375,12 @@ impl NativeStorage {
                 let encoded = receipt
                     .response
                     .as_deref()
-                    .map(sql::encode_fenced_transition_v2_response)
+                    .map(|response| {
+                        sql::encode_fenced_transition_v2_response_with_profile(
+                            response,
+                            frontiers.fenced_transition_profile,
+                        )
+                    })
                     .transpose()?;
                 let response_digest = encoded
                     .as_ref()
