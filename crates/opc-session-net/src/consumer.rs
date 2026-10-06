@@ -122,6 +122,14 @@ pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 /// checked.
 pub const SESSION_QUORUM_CONSUMER_V2_ALPN: &[u8] = b"opc-session-consumer/2";
 
+/// Opt-in V2 lane whose peer can decode the separate void extension.
+///
+/// An opted-in client offers this token before the frozen `/2` token. An
+/// authenticated `/2` selection proves void is unsupported on that connection;
+/// `/2-void` still requires the existing exact-scope capability and activation
+/// checks. Neither token changes the revision-5 Hello or original operations.
+pub const SESSION_QUORUM_CONSUMER_V2_VOID_ALPN: &[u8] = b"opc-session-consumer/2-void";
+
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
 pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 6;
 
@@ -2775,6 +2783,10 @@ fn v2_response_matches_operation(
             SessionConsumerV2Response::FencedTransitionV2Capability(_),
         )
         | (
+            SessionConsumerV2Operation::FencedTransitionV2VoidCapability,
+            SessionConsumerV2Response::FencedTransitionV2VoidCapability(_),
+        )
+        | (
             SessionConsumerV2Operation::FencedTransitionV2HistoryState,
             SessionConsumerV2Response::FencedTransitionV2HistoryState(_),
         )
@@ -2789,6 +2801,10 @@ fn v2_response_matches_operation(
         | (
             SessionConsumerV2Operation::FencedTransitionV2Status { .. },
             SessionConsumerV2Response::FencedTransitionV2Status(_),
+        )
+        | (
+            SessionConsumerV2Operation::FencedTransitionV2Void { .. },
+            SessionConsumerV2Response::FencedTransitionV2Void { .. },
         ) => true,
         _ => false,
     }
@@ -2807,6 +2823,21 @@ fn v2_response_matches_request(
         return false;
     }
     match (request.operation(), response) {
+        (
+            SessionConsumerV2Operation::FencedTransitionV2Void { request },
+            SessionConsumerV2Response::FencedTransitionV2Void { request_id, result },
+        ) => {
+            *request_id == request.request_id()
+                && match result {
+                    Ok(opc_session_store::SessionConsumerV2FencedTransitionStatus::Recorded(
+                        result,
+                    )) => match result.as_ref() {
+                        Ok(outcome) => outcome.matches_v2_request(request),
+                        Err(error) => error.is_recorded_deterministic(),
+                    },
+                    _ => true,
+                }
+        }
         (
             SessionConsumerV2Operation::FencedTransitionV2 { request },
             SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)),
@@ -4238,8 +4269,50 @@ fn consumer_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls
     consumer_client_tls_config_for_alpn(config, SESSION_QUORUM_CONSUMER_ALPN)
 }
 
-fn consumer_client_tls_config_v2(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
-    consumer_client_tls_config_for_alpn(config, SESSION_QUORUM_CONSUMER_V2_ALPN)
+fn consumer_client_tls_config_v2(
+    config: Arc<opc_tls::ClientConfig>,
+    void_transport: bool,
+) -> Arc<opc_tls::ClientConfig> {
+    let mut config = consumer_client_tls_config_for_alpn(config, SESSION_QUORUM_CONSUMER_V2_ALPN);
+    if void_transport {
+        Arc::make_mut(&mut config)
+            .alpn_protocols
+            .insert(0, SESSION_QUORUM_CONSUMER_V2_VOID_ALPN.to_vec());
+    }
+    config
+}
+
+fn consumer_v2_void_transport_selected(
+    alpn: Option<&[u8]>,
+    opted_in: bool,
+) -> Result<bool, SessionConsumerClientError> {
+    match alpn {
+        Some(SESSION_QUORUM_CONSUMER_V2_ALPN) => Ok(false),
+        Some(SESSION_QUORUM_CONSUMER_V2_VOID_ALPN) if opted_in => Ok(true),
+        _ => Err(SessionConsumerClientError::Protocol),
+    }
+}
+
+fn consumer_v2_cached_void_response(
+    operation: &SessionConsumerV2Operation,
+    support: Option<bool>,
+) -> Option<SessionConsumerV2Response> {
+    match (operation, support) {
+        (SessionConsumerV2Operation::FencedTransitionV2VoidCapability, Some(supported)) => Some(
+            SessionConsumerV2Response::FencedTransitionV2VoidCapability(if supported {
+                Ok(())
+            } else {
+                Err(SessionConsumerStoreError::CapabilityNotSupported)
+            }),
+        ),
+        (SessionConsumerV2Operation::FencedTransitionV2Void { request }, Some(false)) => {
+            Some(SessionConsumerV2Response::FencedTransitionV2Void {
+                request_id: request.request_id(),
+                result: Err(SessionConsumerStoreError::CapabilityNotSupported),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn consumer_client_tls_config_for_alpn(
@@ -4266,15 +4339,21 @@ fn consumer_client_tls_config_for(
 
 #[cfg(test)]
 fn consumer_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
-    consumer_server_tls_config_for(config, Some(ConsumerTransportCapability::ProtectedRosterV5))
+    consumer_server_tls_config_for(
+        config,
+        Some(ConsumerTransportCapability::ProtectedRosterV5),
+        false,
+    )
 }
 
 fn consumer_server_tls_config_for(
     config: Arc<opc_tls::ServerConfig>,
     roster_transport_capability: Option<ConsumerTransportCapability>,
+    void_transport: bool,
 ) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
-    config.alpn_protocols = consumer_server_alpn_protocols(roster_transport_capability);
+    config.alpn_protocols =
+        consumer_server_alpn_protocols(roster_transport_capability, void_transport);
     config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
     config.ticketer = Arc::new(DisabledConsumerSessionTickets);
     config.send_tls13_tickets = 0;
@@ -4285,14 +4364,18 @@ fn consumer_server_tls_config_for(
 
 fn consumer_server_alpn_protocols(
     roster_transport_capability: Option<ConsumerTransportCapability>,
+    void_transport: bool,
 ) -> Vec<Vec<u8>> {
-    // A client offers exactly one ALPN. Keep the existing general lanes and
+    // A baseline client offers exactly one ALPN. Keep the existing general lanes and
     // advertise exactly one protected roster ALPN only while its separately
     // authorized ingress exists. A V1 and a V2 listener are intentionally
     // disjoint: a peer cannot negotiate one profile and dispatch the other.
     let mut alpn_protocols = Vec::with_capacity(3);
     if let Some(capability) = roster_transport_capability {
         alpn_protocols.push(capability.alpn().to_vec());
+    }
+    if void_transport {
+        alpn_protocols.push(SESSION_QUORUM_CONSUMER_V2_VOID_ALPN.to_vec());
     }
     alpn_protocols.extend([
         SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
@@ -6838,6 +6921,7 @@ pub struct StatelessSessionConsumerClient {
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
     transport_capability: ConsumerTransportCapability,
+    fenced_transition_v2_void_transport: bool,
     physical_admission: StatelessConsumerPhysicalAdmission,
     #[cfg(test)]
     v2_attempt_entropy_test_hook: Option<V2AttemptEntropyTestHook>,
@@ -7026,6 +7110,7 @@ impl StatelessSessionConsumerClient {
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
             transport_capability: ConsumerTransportCapability::GeneralV6,
+            fenced_transition_v2_void_transport: false,
             physical_admission: StatelessConsumerPhysicalAdmission::new(),
             #[cfg(test)]
             v2_attempt_entropy_test_hook: None,
@@ -7079,11 +7164,24 @@ impl StatelessSessionConsumerClient {
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
             transport_capability: ConsumerTransportCapability::GeneralV6,
+            fenced_transition_v2_void_transport: false,
             physical_admission: StatelessConsumerPhysicalAdmission::new(),
             v2_attempt_entropy_test_hook: None,
             v2_request_commitment_test_hook: None,
             final_admission_test_hook: None,
         }
+    }
+
+    /// Opt into negotiation of the separate V2 void transport extension.
+    ///
+    /// Call this before constructing a persistent client. Baseline peers select
+    /// the original `/2` lane; its original operations remain usable and void
+    /// reports unsupported without sending an unknown operation. A `/2-void`
+    /// selection proves decoding support only, not exact-scope activation.
+    #[must_use]
+    pub fn with_fenced_transition_v2_void_transport(mut self) -> Self {
+        self.fenced_transition_v2_void_transport = true;
+        self
     }
 
     #[cfg(test)]
@@ -8031,6 +8129,7 @@ impl StatelessSessionConsumerClient {
         })?;
         let connector = tokio_rustls::TlsConnector::from(consumer_client_tls_config_v2(
             handshake.rustls_config(),
+            self.fenced_transition_v2_void_transport,
         ));
         // The lower TCP wrapper sees a per-Call counter only while the outer
         // TLS Call writer is synchronously polling. Setup, Hello, and reader
@@ -8063,11 +8162,11 @@ impl StatelessSessionConsumerClient {
                 });
             }
         };
-        if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
-            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
-                cause: SessionConsumerClientError::Protocol,
-            });
-        }
+        let void_transport = consumer_v2_void_transport_selected(
+            tls.get_ref().1.alpn_protocol(),
+            self.fenced_transition_v2_void_transport,
+        )
+        .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let peer =
             opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1).map_err(|_| {
                 PersistentSessionConsumerV2ExecuteError::NotTransmitted {
@@ -8227,6 +8326,12 @@ impl StatelessSessionConsumerClient {
         }
         ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
             .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
+        if let Some(response) = consumer_v2_cached_void_response(
+            request.operation(),
+            (!void_transport).then_some(false),
+        ) {
+            return Ok(response);
+        }
         let correlation = NonZeroU32::MIN;
         let attempt_nonce = self.generate_v2_attempt_nonce().map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
@@ -9871,6 +9976,9 @@ struct PersistentV2Connection {
     admitted_generation: u64,
     admitted_material_epoch: opc_tls::TlsMaterialEpoch,
     state: Arc<PersistentV2LaneState>,
+    /// Definite support under this physical lane's authenticated scope.
+    /// A marker selection starts unknown; a frozen `/2` selection starts false.
+    void_capability: Option<bool>,
 }
 
 struct PersistentV2LaneCall {
@@ -11332,6 +11440,7 @@ impl PersistentSessionConsumerV2Pool {
             .map_err(|_| SessionConsumerClientError::Authentication)?;
         let connector = tokio_rustls::TlsConnector::from(consumer_client_tls_config_v2(
             handshake.rustls_config(),
+            self.client.fenced_transition_v2_void_transport,
         ));
         // This counter is per successfully established lane. The actor takes
         // its baseline immediately before a Call, so TLS/Hello setup bytes
@@ -11359,9 +11468,10 @@ impl PersistentSessionConsumerV2Pool {
         .map_err(|_| SessionConsumerClientError::Unavailable)?
         .map_err(classify_tls_io_error)
         .map_err(SessionConsumerClientError::from)?;
-        if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
-            return Err(SessionConsumerClientError::Protocol);
-        }
+        let void_transport = consumer_v2_void_transport_selected(
+            tls.get_ref().1.alpn_protocol(),
+            self.client.fenced_transition_v2_void_transport,
+        )?;
         let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
             .map_err(|_| SessionConsumerClientError::Authentication)?;
         if peer.spiffe_id().as_str() != self.client.voter.tls_identity() {
@@ -11518,6 +11628,7 @@ impl PersistentSessionConsumerV2Pool {
             admitted_generation: generation,
             admitted_material_epoch: admission.epoch(),
             state,
+            void_capability: (!void_transport).then_some(false),
         };
         setup_attempt.succeed();
         Ok(connection)
@@ -11706,6 +11817,26 @@ impl PersistentSessionConsumerV2Pool {
                 cause: SessionConsumerClientError::Deadline,
             });
         }
+        if let Some(response) =
+            consumer_v2_cached_void_response(request.operation(), connection.void_capability)
+        {
+            ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
+                .map_err(
+                    |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
+                )?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Deadline,
+                });
+            }
+            if self.reusable(&mut connection) {
+                self.idle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_back(PersistentV2PoolEntry::Lane(connection));
+            }
+            return Ok(response);
+        }
         let attempt_nonce = self.client.generate_v2_attempt_nonce().map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
@@ -11746,6 +11877,20 @@ impl PersistentSessionConsumerV2Pool {
         }
         let response = match completed {
             Ok(Ok(response)) => response,
+            Ok(Err(SessionConsumerClientError::Protocol))
+                if write_progress.accepted_any()
+                    && matches!(
+                        request.operation(),
+                        SessionConsumerV2Operation::FencedTransitionV2VoidCapability
+                    ) =>
+            {
+                // The authenticated marker lane rejected a known probe with
+                // a protocol error. Its actor is retired; an EOF or TLS/setup
+                // failure never reaches this definite-unsupported branch.
+                return Ok(SessionConsumerV2Response::FencedTransitionV2VoidCapability(
+                    Err(SessionConsumerStoreError::CapabilityNotSupported),
+                ));
+            }
             Ok(Err(cause)) => {
                 return Err(v2_persistent_error(
                     request,
@@ -11761,6 +11906,22 @@ impl PersistentSessionConsumerV2Pool {
                 ));
             }
         };
+        if matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2VoidCapability
+        ) {
+            match &response {
+                SessionConsumerV2Response::FencedTransitionV2VoidCapability(Ok(())) => {
+                    connection.void_capability = Some(true);
+                }
+                SessionConsumerV2Response::FencedTransitionV2VoidCapability(Err(
+                    SessionConsumerStoreError::CapabilityNotSupported,
+                )) => {
+                    connection.void_capability = Some(false);
+                }
+                _ => {}
+            }
+        }
         let service_outcome_unknown = v2_response_is_outcome_unknown(&response);
         if self.reusable(&mut connection) && !v2_response_retires_connection_authority(&response) {
             self.idle
@@ -12211,7 +12372,8 @@ fn v2_outcome_unknown(
     request: &SessionConsumerV2Request,
 ) -> Option<PersistentSessionConsumerV2ExecuteError> {
     match request.operation() {
-        SessionConsumerV2Operation::FencedTransitionV2 { request } => {
+        SessionConsumerV2Operation::FencedTransitionV2 { request }
+        | SessionConsumerV2Operation::FencedTransitionV2Void { request } => {
             Some(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown {
                 request_id: request.request_id(),
             })
@@ -12234,6 +12396,9 @@ fn v2_outcome_unknown(
 fn v2_response_is_outcome_unknown(response: &SessionConsumerV2Response) -> bool {
     matches!(
         response,
+        SessionConsumerV2Response::FencedTransitionV2Void {
+            result: Err(SessionConsumerStoreError::Unavailable | SessionConsumerStoreError::OutcomeUnavailable), ..
+        } |
         SessionConsumerV2Response::FencedTransitionV2(Err(
             opc_session_store::SessionConsumerV2FencedTransitionError::OutcomeUnknown
         )) | SessionConsumerV2Response::FencedTransitionV2Batch(Err(
@@ -19437,6 +19602,8 @@ async fn handle_server_connection_v2(
     tls: tokio_rustls::server::TlsStream<TcpStream>,
     context: ConsumerV2ServerConnectionContext,
 ) -> Result<(), ProtocolError> {
+    let void_transport =
+        tls.get_ref().1.alpn_protocol() == Some(SESSION_QUORUM_CONSUMER_V2_VOID_ALPN);
     let ConsumerV2ServerConnectionContext {
         service,
         authorization,
@@ -19722,6 +19889,11 @@ async fn handle_server_connection_v2(
             ))
         } else if let Err(rejection) = authorization.authorize_v2_operation(request.operation()) {
             Some(SessionConsumerV2Response::Rejected(rejection))
+        } else if let Some(response) = consumer_v2_cached_void_response(
+            request.operation(),
+            (!void_transport).then_some(false),
+        ) {
+            Some(response)
         } else {
             let execute = service.execute_v2(&authorization, request.clone());
             tokio::pin!(execute);
@@ -19873,6 +20045,7 @@ async fn handle_server_connection(
     let acceptor = tokio_rustls::TlsAcceptor::from(consumer_server_tls_config_for(
         handshake.rustls_config(),
         roster_transport_capability,
+        service.fenced_transition_v2_void_transport_enabled(),
     ));
     // TLS has the finite no-byte setup budget and is interruptible by abort.
     // The authenticated active-frame budget starts only after TLS, at the
@@ -19940,7 +20113,10 @@ async fn handle_server_connection(
     // ownership are deliberately established before selecting the DTO lane.
     // ALPN is the sole V1/V2 discriminator: never allow either decoder to
     // receive the other revision's envelope.
-    if tls.get_ref().1.alpn_protocol() == Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
+    if matches!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(SESSION_QUORUM_CONSUMER_V2_ALPN | SESSION_QUORUM_CONSUMER_V2_VOID_ALPN)
+    ) {
         return handle_server_connection_v2(
             tls,
             ConsumerV2ServerConnectionContext {
@@ -21258,6 +21434,10 @@ mod payload_profile;
 
 #[cfg(test)]
 mod tests {
+    #[path = "void_alpn_tests.rs"]
+    mod void_alpn_tests;
+    #[path = "void_wire_tests.rs"]
+    mod void_wire_tests;
     use std::io;
     use std::net::SocketAddr;
     use std::num::NonZeroU32;
@@ -30408,15 +30588,17 @@ mod tests {
             super::ConsumerTransportCapability::ProtectedRosterV6.roster_profile()
         );
 
-        let v1_listener = super::consumer_server_alpn_protocols(Some(
-            super::ConsumerTransportCapability::ProtectedRosterV5,
-        ));
+        let v1_listener = super::consumer_server_alpn_protocols(
+            Some(super::ConsumerTransportCapability::ProtectedRosterV5),
+            false,
+        );
         assert!(v1_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_ALPN.to_vec()));
         assert!(!v1_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN.to_vec()));
 
-        let v2_listener = super::consumer_server_alpn_protocols(Some(
-            super::ConsumerTransportCapability::ProtectedRosterV6,
-        ));
+        let v2_listener = super::consumer_server_alpn_protocols(
+            Some(super::ConsumerTransportCapability::ProtectedRosterV6),
+            false,
+        );
         assert!(v2_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN.to_vec()));
         assert!(!v2_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_ALPN.to_vec()));
     }
@@ -33485,6 +33667,7 @@ mod tests {
             .expect("oversized V2 client handshake snapshot");
         let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
             handshake.rustls_config(),
+            false,
         ));
         let mut tls = connector
             .connect(
@@ -33574,6 +33757,7 @@ mod tests {
             .expect("wrong-profile V2 client handshake snapshot");
         let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
             handshake.rustls_config(),
+            false,
         ));
         let mut tls = connector
             .connect(
@@ -33653,6 +33837,7 @@ mod tests {
             .expect("substituted commitment client handshake snapshot");
         let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
             handshake.rustls_config(),
+            false,
         ));
         let mut tls = connector
             .connect(

@@ -2104,8 +2104,10 @@ impl SessionConsumerAuthorization {
     ) -> Result<(), SessionConsumerRejection> {
         let authorized = match operation {
             SessionConsumerV2Operation::FencedTransitionV2Capability
+            | SessionConsumerV2Operation::FencedTransitionV2VoidCapability
             | SessionConsumerV2Operation::FencedTransitionV2HistoryState => true,
             SessionConsumerV2Operation::FencedTransitionV2 { request }
+            | SessionConsumerV2Operation::FencedTransitionV2Void { request }
             | SessionConsumerV2Operation::FencedTransitionV2Status { request } => {
                 self.permits_fenced_transition_v2(request)
             }
@@ -2187,16 +2189,25 @@ pub enum SessionConsumerV2Operation {
         /// Complete canonical V2 transition body.
         request: Box<FencedTransitionV2Request>,
     },
+    /// Bind an exact terminal no-effect receipt under the unanimous void profile.
+    FencedTransitionV2Void {
+        /// Complete original request whose first consensus binding decides.
+        request: Box<FencedTransitionV2Request>,
+    },
+    /// Prove the separate void extension without changing the original V2 reply.
+    FencedTransitionV2VoidCapability,
 }
 
 impl fmt::Debug for SessionConsumerV2Operation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::FencedTransitionV2Capability => "FencedTransitionV2Capability",
+            Self::FencedTransitionV2VoidCapability => "FencedTransitionV2VoidCapability",
             Self::FencedTransitionV2HistoryState => "FencedTransitionV2HistoryState",
             Self::FencedTransitionV2 { .. } => "FencedTransitionV2",
             Self::FencedTransitionV2Batch { .. } => "FencedTransitionV2Batch",
             Self::FencedTransitionV2Status { .. } => "FencedTransitionV2Status",
+            Self::FencedTransitionV2Void { .. } => "FencedTransitionV2Void",
         };
         formatter.write_str(name)
     }
@@ -2205,10 +2216,11 @@ impl fmt::Debug for SessionConsumerV2Operation {
 impl SessionConsumerV2Operation {
     fn request_id(&self) -> Option<FencedTransitionV2RequestId> {
         match self {
-            Self::FencedTransitionV2 { request } | Self::FencedTransitionV2Status { request } => {
-                Some(request.request_id())
-            }
+            Self::FencedTransitionV2 { request }
+            | Self::FencedTransitionV2Status { request }
+            | Self::FencedTransitionV2Void { request } => Some(request.request_id()),
             Self::FencedTransitionV2Capability
+            | Self::FencedTransitionV2VoidCapability
             | Self::FencedTransitionV2HistoryState
             | Self::FencedTransitionV2Batch { .. } => None,
         }
@@ -2217,7 +2229,9 @@ impl SessionConsumerV2Operation {
     /// Validate the bounded V2 request body before quorum dispatch.
     pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
         match self {
-            Self::FencedTransitionV2 { request } | Self::FencedTransitionV2Status { request } => {
+            Self::FencedTransitionV2 { request }
+            | Self::FencedTransitionV2Status { request }
+            | Self::FencedTransitionV2Void { request } => {
                 // A complete V2 ID commits to its body. A structurally valid
                 // body substituted under a retained full ID is therefore a
                 // typed request conflict, not a malformed wire frame. Admit
@@ -2233,7 +2247,9 @@ impl SessionConsumerV2Operation {
                 validate_fenced_transition_v2_batch(requests)
                     .map_err(|_| SessionConsumerRejection::MalformedRequest)
             }
-            Self::FencedTransitionV2Capability | Self::FencedTransitionV2HistoryState => Ok(()),
+            Self::FencedTransitionV2Capability
+            | Self::FencedTransitionV2VoidCapability
+            | Self::FencedTransitionV2HistoryState => Ok(()),
         }
     }
 
@@ -2242,7 +2258,9 @@ impl SessionConsumerV2Operation {
     pub const fn is_effectful(&self) -> bool {
         matches!(
             self,
-            Self::FencedTransitionV2 { .. } | Self::FencedTransitionV2Batch { .. }
+            Self::FencedTransitionV2 { .. }
+                | Self::FencedTransitionV2Batch { .. }
+                | Self::FencedTransitionV2Void { .. }
         )
     }
 }
@@ -2372,6 +2390,7 @@ impl From<StoreError> for SessionConsumerStoreError {
             // nevertheless leaks one across that boundary; revision 5 maps
             // them with `SessionConsumerV2FencedTransitionError` instead.
             | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionVoided
             | StoreError::FencedTransitionHistoryEpochNotActive => Self::CapabilityNotSupported,
             StoreError::CasIdempotencyOutcomeUnavailable
             | StoreError::FencedTransitionOutcomeUnknown
@@ -2637,6 +2656,8 @@ pub enum SessionConsumerV2FencedTransitionError {
     RetentionExhausted,
     /// The deterministic V2 transition receipt could not be retained.
     StorageExhausted,
+    /// The extended profile bound a terminal no-effect void receipt.
+    Voided,
 }
 
 impl From<StoreError> for SessionConsumerV2FencedTransitionError {
@@ -2659,6 +2680,7 @@ impl From<StoreError> for SessionConsumerV2FencedTransitionError {
             StoreError::FencedTransitionHistoryFull => Self::HistoryFull,
             StoreError::FencedTransitionRetentionExhausted => Self::RetentionExhausted,
             StoreError::FencedTransitionStorageExhausted => Self::StorageExhausted,
+            StoreError::FencedTransitionVoided => Self::Voided,
             error => Self::Store(SessionConsumerStoreError::from(error)),
         }
     }
@@ -2716,6 +2738,7 @@ impl SessionConsumerV2FencedTransitionError {
                 | StoreError::LeaseExpired
                 | StoreError::PayloadTooLarge { .. }
                 | StoreError::FencedTransitionStorageExhausted
+                | StoreError::FencedTransitionVoided
         )
         .then(|| Self::from(error))
         .filter(|error| error.is_recorded_deterministic())
@@ -2738,6 +2761,7 @@ impl SessionConsumerV2FencedTransitionError {
                     | Self::InvalidRecordExpiry
                     | Self::LeaseHeld
                     | Self::LeaseExpired
+                    | Self::Voided
                     | Self::StorageExhausted
             ) || matches!(self, Self::PayloadTooLarge { .. }))
     }
@@ -2769,6 +2793,7 @@ impl SessionConsumerV2FencedTransitionError {
             Self::HistoryFull => StoreError::FencedTransitionHistoryFull,
             Self::RetentionExhausted => StoreError::FencedTransitionRetentionExhausted,
             Self::StorageExhausted => StoreError::FencedTransitionStorageExhausted,
+            Self::Voided => StoreError::FencedTransitionVoided,
         }
     }
 }
@@ -3315,16 +3340,28 @@ pub enum SessionConsumerV2Response {
     ),
     /// The V2 operation was rejected before dispatch.
     Rejected(SessionConsumerRejection),
+    /// Exact, full-ID-correlated result of an extended-profile void.
+    FencedTransitionV2Void {
+        /// Complete original identity, repeated for successes and failures.
+        request_id: FencedTransitionV2RequestId,
+        /// Real deciding receipt, retained status, or refusal. Availability
+        /// errors can follow a binding and leave the outcome unknown.
+        result: Result<SessionConsumerV2FencedTransitionStatus, SessionConsumerStoreError>,
+    },
+    /// Exact proof of the separately activated void profile.
+    FencedTransitionV2VoidCapability(Result<(), SessionConsumerStoreError>),
 }
 
 impl fmt::Debug for SessionConsumerV2Response {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::FencedTransitionV2Capability(_) => "FencedTransitionV2Capability",
+            Self::FencedTransitionV2VoidCapability(_) => "FencedTransitionV2VoidCapability",
             Self::FencedTransitionV2HistoryState(_) => "FencedTransitionV2HistoryState",
             Self::FencedTransitionV2(_) => "FencedTransitionV2",
             Self::FencedTransitionV2Batch(_) => "FencedTransitionV2Batch",
             Self::FencedTransitionV2Status(_) => "FencedTransitionV2Status",
+            Self::FencedTransitionV2Void { .. } => "FencedTransitionV2Void",
             Self::Rejected(_) => "Rejected",
         };
         formatter.write_str(name)
@@ -3377,6 +3414,15 @@ impl fmt::Debug for SessionConsumerResponse {
 /// replication append/rebuild request.
 #[async_trait]
 pub trait SessionQuorumConsumer: Send + Sync {
+    /// Whether this ingress serves an immutable, separately selected void profile.
+    ///
+    /// Transports use this only to advertise decoding support. It must remain
+    /// false for baseline stores, and does not replace authentication, scope
+    /// checks, or the exact voter profile proof inside [`Self::execute_v2`].
+    fn fenced_transition_v2_void_transport_enabled(&self) -> bool {
+        false
+    }
+
     /// Execute one authenticated, scope-bound consumer request.
     async fn execute(
         &self,

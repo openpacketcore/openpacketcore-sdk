@@ -1,12 +1,16 @@
 //! Real fixed-quorum SDK calls through the private WAL opt-in. The peer
 //! transport is in-process; this does not qualify remote TLS or snapshots.
 
+#[path = "sequential_wal_sdk_tests/void_tests.rs"]
+mod void_tests;
+
 #[path = "sequential_wal_sdk_tests/scoped_reads.rs"]
 mod scoped_reads;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +53,8 @@ struct Peer {
     node: SessionConsensusNodeId,
     identity: SessionConsensusIdentity,
     handler: tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>,
+    profile_probe_behavior: AtomicU8,
+    profile_probes: AtomicUsize,
 }
 
 impl fmt::Debug for Peer {
@@ -73,6 +79,21 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if request.family == crate::consensus::SessionConsensusRpcFamily::ReadBarrier
+            && super::decode_bounded::<super::FencedTransitionV2CapabilityProbe>(&request.payload)
+                .is_ok()
+        {
+            self.profile_probes.fetch_add(1, Ordering::SeqCst);
+            match self.profile_probe_behavior.load(Ordering::SeqCst) {
+                1 => {
+                    return Ok(SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::Protocol),
+                    });
+                }
+                2 => return std::future::pending().await,
+                _ => {}
+            }
+        }
         let handler = self
             .handler
             .read()
@@ -150,6 +171,8 @@ impl Fleet {
                     node: topology.local_consensus_node_id().expect("node"),
                     identity,
                     handler: tokio::sync::RwLock::new(None),
+                    profile_probe_behavior: AtomicU8::new(0),
+                    profile_probes: AtomicUsize::new(0),
                 })
             })
             .collect();

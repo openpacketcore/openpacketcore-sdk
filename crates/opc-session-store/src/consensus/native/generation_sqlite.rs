@@ -287,6 +287,7 @@ impl<'a> SqlitePreparedBase<'a> {
                 identity,
                 members: members.clone(),
                 frontiers: NativeFrontiers(Arc::new(NativeFrontierValues {
+                    fenced_transition_profile: sql::fenced_transition_profile_in_sync(&tx, false)?,
                     applied: sql::read_applied_sync(&tx, identity)?,
                     membership: sql::read_membership_sync(&tx, identity)?,
                     sequence,
@@ -628,7 +629,12 @@ impl<'a> SqlitePreparedBase<'a> {
                     payload_digest: scalar(row, 2)?,
                     retained_until: timestamp(row.get(3).map_err(db)?)?,
                     response: encoded
-                        .map(sql::decode_fenced_transition_v2_response)
+                        .map(|bytes| {
+                            sql::decode_fenced_transition_v2_response_with_profile(
+                                bytes,
+                                context.business.frontiers.fenced_transition_profile,
+                            )
+                        })
                         .transpose()?
                         .map(Arc::new),
                     cold: None,

@@ -1027,6 +1027,17 @@ impl DynamicFleet {
     async fn start_three_with_roster_attestation_trust_root(
         roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     ) -> Self {
+        Self::start_three_with_profiles(
+            roster_attestation_trust_root,
+            opc_session_store::FencedTransitionV2Profile::V2,
+        )
+        .await
+    }
+
+    async fn start_three_with_profiles(
+        roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+        fenced_profile: opc_session_store::FencedTransitionV2Profile,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("create dynamic-membership directory");
         let clock = Arc::new(MutableClock::new(Timestamp::now_utc()));
         let members = (0..EXPANDED_MEMBER_COUNT).map(member).collect::<Vec<_>>();
@@ -1069,8 +1080,11 @@ impl DynamicFleet {
         let network = LoopbackNetwork::new(node_ids);
         let backends = (0..EXPANDED_MEMBER_COUNT)
             .map(|index| {
-                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
-                    .expect("open SQLite node")
+                SqliteSessionBackend::open_with_fenced_transition_v2_profile(
+                    directory.path().join(format!("node-{index}.sqlite")),
+                    fenced_profile,
+                )
+                .expect("open SQLite node")
             })
             .collect::<Vec<_>>();
 
@@ -1157,6 +1171,12 @@ impl DynamicFleet {
     ) {
         let storage_anchor: SessionConsensusStorageAnchor = self.stores[0].storage_anchor();
         for index in INITIAL_MEMBER_COUNT..EXPANDED_MEMBER_COUNT {
+            if !request
+                .desired_consensus_node_ids()
+                .contains(&self.network.node_ids[index])
+            {
+                continue;
+            }
             let bootstrap =
                 SessionTopologyCandidateBootstrap::try_new_from_validated_current_topology(
                     storage_anchor,
@@ -1550,6 +1570,84 @@ impl DynamicFleet {
         })
         .await
         .expect("active membership elects one highest-term leader")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn void_history_survives_staged_voter_addition_removal_and_replacement() {
+    use opc_session_store::{FencedTransitionV2Profile, FencedTransitionV2Status};
+
+    // Expansion/removal and a same-size replacement each begin with real
+    // terminal void receipts, so every learner must admit their exact codec.
+    for replacement in [false, true] {
+        let mut fleet =
+            DynamicFleet::start_three_with_profiles(None, FencedTransitionV2Profile::V2WithVoid)
+                .await;
+        let request = v2_transition_request(b"void-before-membership", 0x71);
+        let expected =
+            FencedTransitionV2Status::Recorded(Box::new(Err(StoreError::FencedTransitionVoided)));
+        assert_eq!(
+            fleet.stores[0]
+                .fenced_transition_v2_void(&request)
+                .await
+                .unwrap(),
+            expected,
+        );
+        let leader = fleet.wait_transition_caller(&[0, 1, 2]).await;
+        let desired_members = if replacement {
+            vec![0, if leader == 0 { 1 } else { leader }, 3]
+        } else {
+            vec![0, 1, 2, 3, 4]
+        };
+        let desired = desired_members.as_slice();
+        let change = fleet.transition_request(1, desired, 0x72);
+        fleet.provision_expansion(&change).await;
+        let proof = fleet.prepare(&change, desired).await;
+        fleet.commit(&change, &proof, desired).await;
+        let removed = (0..3)
+            .filter(|index| !desired.contains(index))
+            .collect::<Vec<_>>();
+        wait_completed_and_admitted(&fleet.stores, &change, desired, &removed).await;
+        for &index in desired {
+            assert_eq!(
+                fleet.stores[index]
+                    .fenced_transition_v2_status(&request)
+                    .await
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                fleet.stores[index]
+                    .fenced_transition_v2(request.clone())
+                    .await,
+                Err(StoreError::FencedTransitionVoided),
+            );
+        }
+        prove_read_write_on_every_active_store(&fleet.stores, desired, "void-successor").await;
+        if !replacement {
+            let leader = fleet.wait_transition_caller(&[0, 1, 2, 3, 4]).await;
+            let retained = [0, 1, if leader < 2 { 2 } else { leader }];
+            let removed = (0..5)
+                .filter(|index| !retained.contains(index))
+                .collect::<Vec<_>>();
+            let remove = fleet.transition_request(2, &retained, 0x73);
+            fleet.stage_on_all(&remove);
+            let proof = fleet.prepare(&remove, &retained).await;
+            fleet.commit(&remove, &proof, &retained).await;
+            wait_completed_and_admitted(&fleet.stores, &remove, &retained, &removed).await;
+            for index in retained {
+                assert_eq!(
+                    fleet.stores[index]
+                        .fenced_transition_v2_status(&request)
+                        .await
+                        .unwrap(),
+                    expected,
+                );
+            }
+        }
+        for store in &fleet.stores {
+            store.shutdown().await.unwrap();
+        }
     }
 }
 

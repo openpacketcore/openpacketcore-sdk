@@ -43,10 +43,12 @@ fn prepared_fenced_v2_readiness_unavailable() -> StoreError {
 pub struct SessionConsumerPreparedFencedTransitionV2BackendError;
 
 /// Opaque exact voter set produced only after every persistent voter proved
-/// `FencedTransitionV2Capability::V2` over a prewarmed `/2` lane.
+/// a V2 capability over a prewarmed `/2` lane. Void support is negotiated
+/// separately without changing the original capability reply.
 pub struct ActivatedSessionConsumerFencedTransitionV2Voters {
     router: Arc<PreparedConsumerRouter>,
     history: Option<FencedTransitionV2HistoryState>,
+    capability: FencedTransitionV2Capability,
 }
 
 impl fmt::Debug for ActivatedSessionConsumerFencedTransitionV2Voters {
@@ -76,6 +78,9 @@ pub struct SessionConsumerFencedTransitionV2ReclaimReport {
     reclaimed: usize,
     retained: usize,
     interrupted: bool,
+    voided: usize,
+    unsupported: usize,
+    waiting_callers: usize,
 }
 
 impl SessionConsumerFencedTransitionV2ReclaimReport {
@@ -91,16 +96,31 @@ impl SessionConsumerFencedTransitionV2ReclaimReport {
         self.reclaimed
     }
 
-    /// Examined rows retained because their status is `Recorded`,
-    /// `NotFound`, `RequestConflict`, or otherwise not reclaimable.
+    /// Examined rows retained for an original receipt, a waiting caller,
+    /// unsupported void, `RequestConflict`, or another unresolved status.
     pub const fn retained(&self) -> usize {
         self.retained
     }
 
     /// Whether the sweep stopped early at an unavailable status or at the
     /// caller's deadline. A later sweep resumes from the same position.
+    /// Unavailable and unknown voids retain their rows but advance the cursor.
     pub const fn interrupted(&self) -> bool {
         self.interrupted
+    }
+    /// Rows with an exact terminal void receipt observed by this sweep.
+    pub const fn voided(&self) -> usize {
+        self.voided
+    }
+
+    /// NotFound rows retained because the journal or a voter lacks void support.
+    pub const fn unsupported(&self) -> usize {
+        self.unsupported
+    }
+
+    /// NotFound rows retained for a current caller within its original deadline.
+    pub const fn waiting_callers(&self) -> usize {
+        self.waiting_callers
     }
 }
 
@@ -131,6 +151,8 @@ impl fmt::Debug for SessionConsumerRecoveredFencedTransition {
 /// Private construction boundary for an erased SDK protection wrapper that
 /// implements the sealed protected V2 port.
 trait PreparedFencedTransitionV2WrapperFactory: Send + Sync {
+    fn journal(&self) -> Arc<FencedTransitionV2RecoveryJournal>;
+
     fn wrap(
         &self,
         physical: Arc<dyn SessionBackend>,
@@ -154,6 +176,10 @@ impl<P> PreparedFencedTransitionV2WrapperFactory for LocalAeadPreparedFencedTran
 where
     P: KeyProvider + Send + Sync + 'static + ?Sized,
 {
+    fn journal(&self) -> Arc<FencedTransitionV2RecoveryJournal> {
+        Arc::clone(&self.journal)
+    }
+
     fn wrap(
         &self,
         physical: Arc<dyn SessionBackend>,
@@ -197,6 +223,10 @@ impl<S> PreparedFencedTransitionV2WrapperFactory for RemoteSealPreparedFencedTra
 where
     S: RemoteSealProvider + Send + Sync + 'static + ?Sized,
 {
+    fn journal(&self) -> Arc<FencedTransitionV2RecoveryJournal> {
+        Arc::clone(&self.journal)
+    }
+
     fn wrap(
         &self,
         physical: Arc<dyn SessionBackend>,
@@ -437,6 +467,7 @@ enum V2HistoryRead {
 /// facade operation. It owns the activated roster but no global cursor map,
 /// serves only the V2 subset, and fails every other operation locally.
 struct ActivatedFencedTransitionV2Backend {
+    capability: FencedTransitionV2Capability,
     router: Arc<PreparedConsumerRouter>,
     route: Arc<PreparedFencedTransitionV2Route>,
     history: Arc<PreparedFencedV2HistoryCache>,
@@ -657,7 +688,7 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
     ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
         // Activation proved the exact V2 profile on every voter before this
         // adapter could exist; each physical call is still authorized anew.
-        Ok(Some(FencedTransitionV2Capability::V2))
+        Ok(Some(self.capability))
     }
 
     async fn fenced_transition_v2_history_state(
@@ -745,6 +776,84 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         }
     }
 
+    async fn fenced_transition_v2_void(
+        &self,
+        request: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        let deadline = self
+            .attempt_deadline()
+            .ok_or_else(prepared_fenced_v2_deadline)?;
+        // The store proves the exact immutable voter profile at activation.
+        // Any reachable voter can expose that proof; an unavailable lane does
+        // not veto an already certified quorum.
+        use futures_util::StreamExt as _;
+        let mut probes = self
+            .router
+            .clients
+            .iter()
+            .enumerate()
+            .map(|(index, client)| async move {
+                let probe = SessionConsumerV2Request::new(
+                    self.router.scope,
+                    SessionConsumerV2Operation::FencedTransitionV2VoidCapability,
+                );
+                (index, client.execute_v2_before(&probe, deadline).await)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        let mut voter = None;
+        let mut unsupported = 0;
+        while let Some((index, response)) = probes.next().await {
+            if v2_authority_revoked(&response) {
+                return Err(StoreError::TopologyAuthorityRevoked);
+            }
+            match response {
+                Ok(SessionConsumerV2Response::FencedTransitionV2VoidCapability(Ok(()))) => {
+                    voter = Some(index);
+                    break;
+                }
+                Ok(SessionConsumerV2Response::FencedTransitionV2VoidCapability(Err(
+                    SessionConsumerStoreError::CapabilityNotSupported,
+                )))
+                | Ok(SessionConsumerV2Response::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                )) => unsupported += 1,
+                _ => {}
+            }
+        }
+        drop(probes);
+        let Some(voter) = voter else {
+            return Err(if unsupported == self.voter_count() {
+                StoreError::CapabilityNotSupported("fenced_transition_v2_void".into())
+            } else {
+                StoreError::BackendUnavailable(
+                    "fenced transition V2 void capability unavailable".into(),
+                )
+            });
+        };
+        let wire = SessionConsumerV2Request::new(
+            self.router.scope,
+            SessionConsumerV2Operation::FencedTransitionV2Void {
+                request: Box::new(request.clone()),
+            },
+        );
+        let response = self.router.clients[voter]
+            .execute_v2_before(&wire, deadline)
+            .await;
+        if v2_authority_revoked(&response) {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        match response {
+            Ok(SessionConsumerV2Response::FencedTransitionV2Void { request_id, result })
+                if request_id == request.request_id() =>
+            {
+                result
+                    .map_err(SessionConsumerStoreError::into_store_error)
+                    .and_then(consumer_v2_status_into_store)
+            }
+            _ => Err(StoreError::FencedTransitionOutcomeUnknown),
+        }
+    }
+
     async fn fenced_transition_v2_status(
         &self,
         request: &FencedTransitionV2Request,
@@ -815,6 +924,7 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
 /// }
 /// ```
 pub struct SessionConsumerPreparedFencedTransitionV2Backend {
+    capability: FencedTransitionV2Capability,
     router: Arc<PreparedConsumerRouter>,
     wrapper_factory: Arc<dyn PreparedFencedTransitionV2WrapperFactory>,
     legacy_v1: Option<SessionConsumerPreparedFencedTransitionBackend>,
@@ -835,8 +945,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// same local authenticated identity, one roster commitment, and distinct
     /// node IDs and voter TLS identities. Every voter's `/2` lane is
     /// prewarmed and must return `FencedTransitionV2Capability::V2`; any
-    /// other result refuses construction. The returned roster is opaque and
-    /// canonicalized by node ordinal.
+    /// other result refuses construction. Void is negotiated separately. The
+    /// returned roster is opaque and canonicalized by node ordinal.
     ///
     /// Activation also reads the linearized V2 history state once to seed
     /// the facade's active-epoch cache. A revoked topology authority refuses
@@ -900,8 +1010,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             }
             match response {
                 Ok(SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
-                    FencedTransitionV2Capability::V2,
-                ))) => Ok(()),
+                    capability @ FencedTransitionV2Capability::V2,
+                ))) => Ok(capability),
                 Ok(SessionConsumerV2Response::FencedTransitionV2Capability(_)) => {
                     Err(StoreError::CapabilityNotSupported(
                         "atomic_fenced_transition_epoch_history_v2".into(),
@@ -911,9 +1021,10 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             }
         }))
         .await;
-        for capability in capabilities {
-            capability?;
+        for proof in capabilities {
+            proof?;
         }
+        let capability = FencedTransitionV2Capability::V2;
 
         // The client configuration is immutable, but read it again after the
         // fan-out so a semantic authority change cannot race activation.
@@ -948,6 +1059,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             Err(_) => None,
         };
         Ok(ActivatedSessionConsumerFencedTransitionV2Voters {
+            capability,
             router: Arc::new(router),
             history,
         })
@@ -966,6 +1078,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     {
         let scope = prepared_fenced_v2_recovery_scope(&voters.router)?;
         Ok(Self {
+            capability: voters.capability,
             router: voters.router,
             wrapper_factory: Arc::new(LocalAeadPreparedFencedTransitionV2Wrapper {
                 provider,
@@ -993,6 +1106,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     {
         let scope = prepared_fenced_v2_recovery_scope(&voters.router)?;
         Ok(Self {
+            capability: voters.capability,
             router: voters.router,
             wrapper_factory: Arc::new(RemoteSealPreparedFencedTransitionV2Wrapper {
                 provider,
@@ -1047,6 +1161,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     ) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
         self.wrapper_factory
             .wrap(Arc::new(ActivatedFencedTransitionV2Backend {
+                capability: self.capability,
                 router: Arc::clone(&self.router),
                 route,
                 history: Arc::clone(&self.history),
@@ -1064,6 +1179,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             .unwrap_or_else(tokio::time::Instant::now);
         self.wrapper_factory
             .wrap(Arc::new(ActivatedFencedTransitionV2Backend {
+                capability: self.capability,
                 router: Arc::clone(&self.router),
                 route: Arc::new(PreparedFencedTransitionV2Route::new(0)),
                 history: Arc::clone(&self.history),
@@ -1105,6 +1221,14 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         if tokio::time::Instant::now() >= deadline {
             return Err(prepared_fenced_v2_deadline());
         }
+        let call = tokio::time::timeout_at(
+            deadline,
+            self.wrapper_factory
+                .journal()
+                .begin_call(request.request_id(), deadline),
+        )
+        .await
+        .map_err(|_| prepared_fenced_v2_deadline())??;
         let route = Arc::new(PreparedFencedTransitionV2Route::new(
             prepared_fenced_v2_origin(&self.router, request.request_id()),
         ));
@@ -1123,7 +1247,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 self.handle_routing(route),
                 PreparedRequestState::new(0),
                 true,
-            ),
+            )
+            .with_call(call),
         })
     }
 
@@ -1149,8 +1274,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         ));
         let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Cached);
         tokio::time::timeout_at(deadline, async {
-            let retained = backend
-                .recover_protected_fenced_transition_v2(request_id)
+            let (retained, notice) = backend
+                .recover_protected_fenced_transition_v2_with_notice(request_id)
                 .await?;
             let legacy = match &self.legacy_v1 {
                 Some(legacy) => {
@@ -1173,7 +1298,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                                 self.handle_routing(Arc::clone(&route)),
                                 state,
                                 false,
-                            ),
+                            )
+                            .with_recovery_notice(notice),
                         },
                     )))
                 }
@@ -1200,13 +1326,26 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// exact status of at most `limit` rows in caller-ID order from a
     /// process-local cursor and removes those whose status is `Expired`,
     /// `Retired`, `HistoryFull`, `RetentionExhausted`, or `EpochNotActive`
-    /// for an epoch below the active epoch. It retains `Recorded`,
-    /// `NotFound`, and `RequestConflict` rows. A row's read-only status moves
+    /// for an epoch below the active epoch. A row's read-only status moves
     /// to the next canonical voter when one is unavailable. The sweep stops
     /// as interrupted when every voter failed for one row, when a local
     /// journal read or removal fails, or at the budget's deadline. `limit`
     /// must be in
     /// `1..=FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX`.
+    ///
+    /// For an exclusively owned journal, exact `NotFound` permits one void
+    /// attempt after a known return, cancellation, drop, or the original
+    /// in-memory deadline. An unknown attempt return continues to wait for
+    /// that deadline. Inherited and unregistered rows are immediately eligible.
+    /// A reachable voter proves the separately admitted immutable void profile.
+    /// Waiting callers and unsupported peers retain the row and are counted
+    /// in the report. An unavailable or unknown void advances past the retained
+    /// row and suppresses further void attempts for this pass; status work
+    /// continues and a later pass retries after the cursor wraps.
+    /// An exact terminal void receipt removes the row and remains observable
+    /// by live or recovered handles. An original success remains retained
+    /// for its caller to observe and release. `RequestConflict` stays retained.
+    /// No deadline is persisted, and ordinary journals retain `NotFound` rows.
     ///
     /// The caller owns scheduling. Epoch rotation and retired-floor
     /// advancement remain the state process's replicated maintenance.
@@ -1255,6 +1394,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         let mut next_cursor = cursor;
         let wrapped = page.len() < remaining;
         let voter_count = self.router.clients.len();
+        let mut attempt_void = true;
+        let mut void_unsupported = false;
         for (request_id, history_epoch) in page {
             let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline) else {
                 report.interrupted = true;
@@ -1295,7 +1436,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 .await
                 {
                     Ok(Ok(observed)) => {
-                        status = Some(Ok(observed));
+                        status = Some(observed);
                         break;
                     }
                     Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
@@ -1304,22 +1445,81 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                     Ok(Err(_)) | Err(_) => {}
                 }
             }
-            let reclaimable = match status.unwrap_or(Err(())) {
-                Ok(
-                    FencedTransitionV2Status::Expired
-                    | FencedTransitionV2Status::Retired
-                    | FencedTransitionV2Status::HistoryFull
-                    | FencedTransitionV2Status::RetentionExhausted,
-                ) => true,
-                // A request in an epoch below the active epoch can never bind.
-                Ok(FencedTransitionV2Status::EpochNotActive) => history
-                    .active_epoch()
-                    .is_some_and(|active| history_epoch < active),
-                Ok(_) => false,
-                Err(()) => {
+            let mut observed = match status {
+                Some(status) => status,
+                _ => {
                     report.interrupted = true;
                     break;
                 }
+            };
+            let mut void_result = false;
+            if matches!(observed, FencedTransitionV2Status::NotFound) {
+                match backend.protected_fenced_transition_v2_void_eligibility(&prepared) {
+                    opc_session_store::FencedTransitionV2VoidEligibility::Ready if attempt_void => {
+                        let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline)
+                        else {
+                            report.interrupted = true;
+                            break;
+                        };
+                        route.install_attempt_deadline(attempt_deadline);
+                        match tokio::time::timeout_at(
+                            attempt_deadline,
+                            backend.protected_fenced_transition_v2_void(&prepared),
+                        )
+                        .await
+                        {
+                            Ok(Ok(status)) => {
+                                observed = status;
+                                void_result = true;
+                            }
+                            Ok(Err(StoreError::CapabilityNotSupported(_))) => {
+                                report.unsupported += 1;
+                                attempt_void = false;
+                                void_unsupported = true;
+                            }
+                            Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
+                                return Err(StoreError::TopologyAuthorityRevoked)
+                            }
+                            _ => {
+                                // Neither an unavailable probe nor an unknown
+                                // void is a receipt. Keep this row, but continue
+                                // status work and advance past it for this pass.
+                                attempt_void = false;
+                            }
+                        }
+                    }
+                    opc_session_store::FencedTransitionV2VoidEligibility::Ready => {
+                        if void_unsupported {
+                            report.unsupported += 1;
+                        }
+                    }
+                    opc_session_store::FencedTransitionV2VoidEligibility::WaitingCaller => {
+                        report.waiting_callers += 1
+                    }
+                    _ => report.unsupported += 1,
+                }
+            }
+            let reclaimable = match &observed {
+                FencedTransitionV2Status::Recorded(result)
+                    if matches!(result.as_ref(), Err(StoreError::FencedTransitionVoided)) =>
+                {
+                    report.voided += 1;
+                    true
+                }
+                // A void can also replay a prior deterministic rejection or
+                // bind its own original authority/fence rejection. Either is
+                // an exact no-effect receipt; successful originals stay retained.
+                FencedTransitionV2Status::Recorded(result) if void_result && result.is_err() => {
+                    true
+                }
+                FencedTransitionV2Status::Expired
+                | FencedTransitionV2Status::Retired
+                | FencedTransitionV2Status::HistoryFull
+                | FencedTransitionV2Status::RetentionExhausted => true,
+                FencedTransitionV2Status::EpochNotActive => history
+                    .active_epoch()
+                    .is_some_and(|active| history_epoch < active),
+                _ => false,
             };
             report.examined += 1;
             if reclaimable {
@@ -1521,6 +1721,8 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
 }
 
 struct PersistentPreparedFencedTransitionV2Token {
+    recovery_call: Option<opc_session_store::FencedTransitionV2RecoveryCall>,
+    recovery_notice: Option<opc_session_store::FencedTransitionV2RecoveryNotice>,
     backend: Arc<dyn ProtectedFencedTransitionV2Backend>,
     prepared: PreparedFencedTransitionV2,
     budget: PreparedCheckpointBudget,
@@ -1644,6 +1846,8 @@ impl PersistentPreparedFencedTransitionV2Token {
             history,
         } = routing;
         Self {
+            recovery_call: None,
+            recovery_notice: None,
             backend,
             prepared,
             budget,
@@ -1655,6 +1859,26 @@ impl PersistentPreparedFencedTransitionV2Token {
             terminal_receipt: StdMutex::new(None),
             resolution: StdMutex::new(V2Resolution::Unresolved),
         }
+    }
+
+    fn with_call(mut self, call: opc_session_store::FencedTransitionV2RecoveryCall) -> Self {
+        self.recovery_notice = Some(call.notice());
+        self.recovery_call = Some(call);
+        self
+    }
+
+    fn with_recovery_notice(
+        mut self,
+        notice: Option<opc_session_store::FencedTransitionV2RecoveryNotice>,
+    ) -> Self {
+        self.recovery_notice = notice;
+        self
+    }
+
+    fn reclaimed_receipt(&self) -> Option<FencedTransitionV2Status> {
+        self.recovery_notice
+            .as_ref()
+            .and_then(|notice| notice.terminal_status())
     }
 
     fn set_resolution(&self, resolution: V2Resolution) {
@@ -1692,11 +1916,36 @@ impl PersistentPreparedFencedTransitionV2Token {
     }
 
     async fn execute_once(&self) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        if let Some(FencedTransitionV2Status::Recorded(result)) = self.reclaimed_receipt() {
+            self.terminal_receipt(Ok(FencedTransitionV2Status::Recorded(result.clone())))
+                .ok();
+            return (*result).map_err(FencedTransitionExecuteError::Rejected);
+        }
+
         let Some(mut preparation) =
             PreparedFencedV2PreparationGuard::begin(&self.state, &self.route, self.voter_count)
         else {
             return Err(FencedTransitionExecuteError::NotTransmitted);
         };
+        if self
+            .recovery_call
+            .as_ref()
+            .is_some_and(|call| !call.dispatch_started())
+        {
+            preparation.receipt_only();
+            return Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: self.prepared.request_id(),
+            });
+        }
+        struct Returned<'a>(Option<&'a opc_session_store::FencedTransitionV2RecoveryCall>);
+        impl Drop for Returned<'_> {
+            fn drop(&mut self) {
+                if let Some(call) = self.0 {
+                    call.returned();
+                }
+            }
+        }
+        let mut returned = Returned(self.recovery_call.as_ref());
         // Authenticate the exact retained row before any lane work. The
         // wrapper repeats this immediately before each physical dispatch.
         if !matches!(
@@ -1774,6 +2023,9 @@ impl PersistentPreparedFencedTransitionV2Token {
                 }
                 _ => {
                     preparation.receipt_only();
+                    // An attempt timeout does not end the original caller's
+                    // deadline. Cancellation still drops the guard normally.
+                    returned.0 = None;
                     return Err(FencedTransitionExecuteError::OutcomeUnknown {
                         request_id: self.prepared.request_id(),
                     });
@@ -1793,6 +2045,9 @@ impl PersistentPreparedFencedTransitionV2Token {
         &self,
     ) -> Option<Result<FencedTransitionV2Status, SessionConsumerPreparedFencedTransitionStatusError>>
     {
+        if let Some(status) = self.reclaimed_receipt() {
+            return Some(self.terminal_receipt(Ok(status)));
+        }
         self.terminal_receipt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1848,6 +2103,9 @@ impl PersistentPreparedFencedTransitionV2Token {
         {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
+                if let Some(result) = self.cached_terminal_receipt() {
+                    return result;
+                }
                 return self.terminal_receipt(Err(
                     SessionConsumerPreparedFencedTransitionStatusError::Unavailable,
                 ));
@@ -1940,6 +2198,7 @@ impl PersistentPreparedFencedTransitionV2Token {
     }
 
     async fn release_resolved(&self) -> Result<(), SessionConsumerFencedTransitionV2ReleaseError> {
+        let _ = self.cached_terminal_receipt();
         match self.resolution() {
             V2Resolution::Released => Ok(()),
             V2Resolution::Unresolved => {

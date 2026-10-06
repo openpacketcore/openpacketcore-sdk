@@ -462,6 +462,68 @@ pub enum FencedTransitionV2Capability {
     V2,
 }
 
+/// Immutable fenced-transition contract selected when a store is created.
+///
+/// Stores are created under one profile and are not converted. The default
+/// preserves the original V2 contract and never accepts a void command.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum FencedTransitionV2Profile {
+    /// Original V2 contract and published byte vectors.
+    #[default]
+    V2,
+    /// Original request identities with an independently certified void contract.
+    V2WithVoid,
+}
+
+const FENCED_TRANSITION_V2_VOID_PROFILE_DESCRIPTOR: &str = concat!(
+    "base=original-v2-profile;store-profile=immutable-at-creation;database-format=6;",
+    "store-marker=consensus_fenced_transition_profile(singleton=1|profile_digest=bytes32|layout_version=1..5);",
+    "native-frontiers=named:fenced_transition_profile=V2WithVoid;baseline-omits-field;",
+    "capability=additive:void-capability-operation;baseline-capability=V2;capability-probe=original-v2-schema-and-exact-selected-digest;",
+    "intent-tags=void:33|activate-void:34;void=box(original-v2-request);",
+    "activate-void=box(original-v2-request)|scope:identity|voters:bytes32|profile:bytes32;",
+    "applied-domain=openpacketcore/session-consensus/command/v2-void/v1\\0;",
+    "applied-input=original-v2-fixed-header|intent;intent-tags=void:6|activate-void:7;",
+    "intent-body=original-v2-full-id:bytes56;activation=scope:identity|voters:bytes32|profile:bytes32;",
+    "authorized=original-v2-envelope;response-codec=original-v2-plus-error-tag:26;",
+    "wire-error=append-after-SessionRecordReserved:FencedTransitionVoided;",
+    "receipt-key=original-full-id;commitments=original-v2-payload-and-binding;",
+    "void=original-authority-and-fence-checks|first-binding-wins|no-session-or-lease-or-watch-effect;",
+    "unanimous-exact-scope-profile-at-activation;quorum-after-activation;retention-and-epochs=original-v2;",
+    "outer-id=sha256(openpacketcore/session-consensus/fenced-transition/v2/void/outer-id/v1\\0|id:bytes56)[0..16]"
+);
+
+impl FencedTransitionV2Profile {
+    /// Digest which every voter must prove for this exact store profile.
+    pub fn digest(self) -> [u8; 32] {
+        match self {
+            Self::V2 => fenced_transition_v2_profile_digest(),
+            Self::V2WithVoid => {
+                let mut hash = Sha256::new();
+                hash.update(b"openpacketcore/session-store/fenced-transition/v2/void-profile/v1\0");
+                hash.update(fenced_transition_v2_profile_digest());
+                hash.update(FENCED_TRANSITION_V2_VOID_PROFILE_DESCRIPTOR.as_bytes());
+                hash.finalize().into()
+            }
+        }
+    }
+}
+
+/// Derive the independent consensus identity of a void for one original ID.
+/// The durable receipt remains keyed by the complete original request ID.
+pub(crate) fn fenced_transition_v2_void_outer_request_id(
+    id: FencedTransitionV2RequestId,
+) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"openpacketcore/session-consensus/fenced-transition/v2/void/outer-id/v1\0");
+    hash.update(id.to_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    let mut outer = [0; 16];
+    outer.copy_from_slice(&digest[..16]);
+    outer
+}
+
 /// Exact-result recovery window for a committed fenced transition.
 ///
 /// The durable request/body binding remains for the consensus identity's

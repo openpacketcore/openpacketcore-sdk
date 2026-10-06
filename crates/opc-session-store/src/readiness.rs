@@ -352,6 +352,10 @@ pub enum DurableReadinessState {
     /// topology evidence was absent, non-production, not yet valid, expired, or
     /// bound to another immutable configuration.
     TopologyInvalid,
+    /// A void-profile store found voters that cannot prove its selected
+    /// immutable fenced-transition history profile. Baseline stores do not
+    /// probe this extension or report this state.
+    FencedTransitionProfileMismatch,
     /// Conflicting or unrepairable durable state requires recovery action.
     RecoveryRequired,
     /// The store uses Async acknowledgement and cannot grant durable readiness.
@@ -365,6 +369,7 @@ impl DurableReadinessState {
             Self::Ready => "ready",
             Self::NoQuorum => "no_quorum",
             Self::TopologyInvalid => "topology_invalid",
+            Self::FencedTransitionProfileMismatch => "fenced_transition_profile_mismatch",
             Self::RecoveryRequired => "recovery_required",
             Self::PersistenceNotDurable => "persistence_not_durable",
         }
@@ -528,6 +533,7 @@ impl DurableReadinessReport {
             DurableReadinessState::RecoveryRequired => DurableRecoveryState::RecoveryRequired,
             DurableReadinessState::NoQuorum
             | DurableReadinessState::TopologyInvalid
+            | DurableReadinessState::FencedTransitionProfileMismatch
             | DurableReadinessState::PersistenceNotDurable => DurableRecoveryState::AwaitingQuorum,
         };
         Self {

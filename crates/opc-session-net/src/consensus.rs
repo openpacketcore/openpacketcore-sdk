@@ -7180,6 +7180,96 @@ mod tests {
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
+    #[cfg(feature = "insecure-test")]
+    #[tokio::test]
+    async fn readiness_probe_timeout_preserves_cold_setup_for_the_next_probe() {
+        let (server_binding, client_binding) = bindings();
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let (server, address) =
+            SessionConsensusServer::new_insecure(handler.clone(), server_binding)
+                .listen("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let resolutions = Arc::clone(&resolutions);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(address)
+                })
+            })
+        };
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding.clone(),
+            None,
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::ReadBarrier,
+            b"readiness-profile-probe".to_vec(),
+        )
+        .unwrap();
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        // Store readiness wraps `call`, rather than passing its 250 ms bound
+        // to `call_with_timeout`. Cold setup has a separate, detached owner.
+        let first = crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
+            .scope(Arc::clone(&accounting), async {
+                tokio::time::timeout(Duration::from_millis(250), peer.call(request.clone())).await
+            })
+            .await;
+        assert!(first.is_err());
+        entered.notified().await;
+        assert_eq!(accounting.snapshot(), (1, 0, 0, 0));
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+        let coordinator = &peer.connection_pool.cold_connection;
+        assert!(matches!(
+            coordinator.state.lock().await.phase,
+            ConsensusColdConnectionPhase::Connecting { .. }
+        ));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = coordinator.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if matches!(
+                    coordinator.state.lock().await.phase,
+                    ConsensusColdConnectionPhase::Ready { .. }
+                ) {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("detached cold setup completes after the first probe expires");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), peer.call(request.clone()))
+                .await
+                .expect("the later probe reuses completed setup"),
+            Ok(SessionConsensusWireResponse {
+                result: Ok(request.payload)
+            }),
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.0.load(Ordering::Relaxed), 1);
+        assert_eq!(accounting.snapshot(), (1, 1, 0, 0));
+        drop(peer);
+        server.abort_and_wait().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn consensus_soft_timeout_classifies_pending_connect_without_abandoning() {
         let (_server_binding, client_binding) = bindings();

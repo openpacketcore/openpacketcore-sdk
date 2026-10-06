@@ -34,6 +34,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -72,12 +73,24 @@ QUIESCENT_SELECTOR_LIB_MODULE = "ebpf::tests::remote_selector_regression"
 QUIESCENT_SELECTOR_LIB_TEST = (
     "singleton_public_protected_flow_preserves_durable_state"
 )
+# These call-lifetime assertions use 250 ms physical attempts while another
+# request is deliberately stalled. Like the contracts above, they need a
+# separate process so unrelated TLS/consensus fixtures cannot spend that cap.
+QUIESCENT_VOID_LIB_MODULE = "authenticated_consumer_fixture::v2_facade_tests::void_tests"
+QUIESCENT_VOID_LIB_TESTS = (
+    "consumer_void_lost_before_bind_drains_the_row_and_resolves_the_live_handle",
+    "consumer_void_keeps_a_waiting_call_then_drains_after_cancellation",
+    "consumer_void_drains_after_the_leader_loses_authority_during_the_original_call",
+    "consumer_void_unknown_response_retains_until_exact_status_confirms_it",
+    "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
+)
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     QUIESCENT_SELECTOR_LIB_TEST,
+    *QUIESCENT_VOID_LIB_TESTS,
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -277,6 +290,8 @@ def shard_ids(plan: dict) -> list[str]:
 def qualified_quiescent_lib_test(name: str) -> str:
     if name == QUIESCENT_SELECTOR_LIB_TEST:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
+    if name in QUIESCENT_VOID_LIB_TESTS:
+        return f"{QUIESCENT_VOID_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 
@@ -303,21 +318,45 @@ def quiescent_lib_list_command(name: str) -> list[str]:
     return command
 
 
-def quiescent_lib_tests_for_shard(shard: str) -> tuple[str, ...]:
+def quiescent_lib_tests_for_shard(shard: str, plan: dict) -> tuple[str, ...]:
     """Return the private-lib timing contracts owned by one serial shard."""
-    if shard == "misc":
-        return tuple(
-            name
-            for name in QUIESCENT_LIB_TESTS
-            if name not in OPTIMIZED_QUIESCENT_LIB_TESTS
-        )
-    if shard == OPTIMIZED_QUIESCENT_SHARD:
-        return tuple(
-            name
-            for name in QUIESCENT_LIB_TESTS
+    overrides = plan.get("quiescent_lib_shards", {})
+    return tuple(
+        name
+        for name in QUIESCENT_LIB_TESTS
+        if overrides.get(
+            name,
+            OPTIMIZED_QUIESCENT_SHARD
             if name in OPTIMIZED_QUIESCENT_LIB_TESTS
-        )
-    return ()
+            else "misc",
+        ) == shard
+    )
+
+
+def lib_group_names(group: dict) -> list[str]:
+    """Named tests move together; future unlisted tests still run on misc."""
+    return [f"{group['module']}::{name}" for name in group["tests"]]
+
+
+def moved_lib_names(plan: dict) -> list[str]:
+    return [qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS] + [
+        name for group in plan.get("lib_groups", []) for name in lib_group_names(group)
+    ]
+
+
+def lib_group_command(group: dict) -> list[str]:
+    return SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_group_names(group)]
+
+
+def extra_lib_commands(plan: dict, shard: str) -> list[list[str]]:
+    return [
+        lib_group_command(group)
+        for group in plan.get("lib_groups", [])
+        if group["shard"] == shard
+    ] + [
+        quiescent_lib_command(name)
+        for name in quiescent_lib_tests_for_shard(shard, plan)
+    ]
 
 
 def quiescent_consensus_openraft_command(name: str) -> list[str]:
@@ -347,6 +386,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     """The cargo invocations for one shard."""
     heavy = plan["heavy"]
     named = [name for group in heavy["shards"] for name in group]
+    extra = extra_lib_commands(plan, shard)
 
     if shard == "misc":
         # Unit tests, binary tests, the example compile check, doctests, plus
@@ -361,15 +401,14 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         # its literal timing bounds become a process-concurrency test.
         lib_skips = [
             arg
-            for name in QUIESCENT_LIB_TESTS
-            for arg in ("--skip", qualified_quiescent_lib_test(name))
+            for name in moved_lib_names(plan)
+            for arg in ("--skip", name)
         ]
         return [
-            SELECTION + ["--lib", "--bins", "--", *HARNESS, "--exact", *lib_skips],
-            *[
-                quiescent_lib_command(name)
-                for name in quiescent_lib_tests_for_shard(shard)
-            ],
+            SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_skips],
+            *extra,
+            # Library names must never filter a binary's unrelated tests.
+            SELECTION + ["--bins", "--", *HARNESS],
             list(EXAMPLES),
             SELECTION + ["--doc", "--", *HARNESS],
             SELECTION
@@ -381,10 +420,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         # but compile once on their own runner. Keeping them behind misc's
         # broad lib/bin run exceeded that job's hard 60-minute budget before
         # the first O1 test process could start.
-        return [
-            quiescent_lib_command(name)
-            for name in quiescent_lib_tests_for_shard(shard)
-        ]
+        return extra
 
     if shard.startswith("heavy-"):
         group = heavy["shards"][int(shard.split("-", 1)[1])]
@@ -392,7 +428,8 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         # else, so the groups cannot overlap.
         return [
             SELECTION
-            + ["--test", heavy["target"], "--", *HARNESS, "--exact", *group]
+            + ["--test", heavy["target"], "--", *HARNESS, "--exact", *group],
+            *extra,
         ]
 
 
@@ -408,7 +445,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         if contract[0] in buckets[shard]
     ]
     if not contracts:
-        return [SELECTION + selected + ["--", *HARNESS]]
+        return [SELECTION + selected + ["--", *HARNESS], *extra]
 
     # libtest's skip filter is substring-based unless --exact is present. The
     # ordinary invocation still runs every other test in this target, while a
@@ -429,7 +466,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         for _, names, command in contracts
         for name in names
     ]
-    return [ordinary, *isolated]
+    return [ordinary, *isolated, *extra]
 
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -484,10 +521,12 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     proves the shard actually issues the invocations that cover them, so
     dropping (say) the doctest command cannot pass unnoticed.
     """
+    verify_lib_plan(plan)
     misc_commands = commands(plan, "misc", targets)
     misc = [" ".join(command) for command in misc_commands]
     required = {
-        "unit tests": " --lib --bins ",
+        "unit tests": " --lib ",
+        "binary tests": " --bins ",
         "example compile check": "cargo build ",
         "doctests": " --doc ",
         "heavy remainder": f" --test {plan['heavy']['target']} ",
@@ -499,17 +538,17 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         sys.exit("private-lib isolated timing contracts are duplicated")
     lib_skip = ["--exact"] + [
         arg
-        for name in QUIESCENT_LIB_TESTS
-        for arg in ("--skip", qualified_quiescent_lib_test(name))
+        for name in moved_lib_names(plan)
+        for arg in ("--skip", name)
     ]
     if misc_commands[0][-len(lib_skip) :] != lib_skip:
         sys.exit(
             "the misc ordinary --lib process must skip every private-lib "
-            "timing contract exactly once"
+            "timing contract and moved library test exactly once"
         )
     expected_misc_isolated = [
         quiescent_lib_command(name)
-        for name in quiescent_lib_tests_for_shard("misc")
+        for name in quiescent_lib_tests_for_shard("misc", plan)
     ]
     if misc_commands[1 : 1 + len(expected_misc_isolated)] != expected_misc_isolated:
         sys.exit(
@@ -519,24 +558,21 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     optimized_commands = commands(plan, OPTIMIZED_QUIESCENT_SHARD, targets)
     expected_optimized_isolated = [
         quiescent_lib_command(name)
-        for name in quiescent_lib_tests_for_shard(OPTIMIZED_QUIESCENT_SHARD)
+        for name in quiescent_lib_tests_for_shard(OPTIMIZED_QUIESCENT_SHARD, plan)
     ]
     if optimized_commands != expected_optimized_isolated:
         sys.exit(
             "the optimized private-lib shard must run its timing contracts "
             "once each, in their declared module-qualified name order"
         )
-    expected_all_isolated = [
-        quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS
-    ]
-    if (
-        [*expected_misc_isolated, *expected_optimized_isolated]
-        != expected_all_isolated
-    ):
-        sys.exit(
-            "private-lib timing contracts must be partitioned between the "
-            "ordinary and optimized shards in their declared order"
-        )
+    for shard in shard_ids(plan):
+        actual = commands(plan, shard, targets)
+        library_commands = [
+            command for command in actual
+            if "--lib" in command and command != misc_commands[0]
+        ]
+        if library_commands != extra_lib_commands(plan, shard):
+            sys.exit(f"{shard} must run every assigned library group exactly once")
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
             # `--exact` with no names disables filtering, so an empty group
@@ -579,7 +615,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             for _, contract_names, command in owner_contracts
             for name in contract_names
         ]
-        if owner_commands[1:] != expected_isolated:
+        if owner_commands[1 : 1 + len(expected_isolated)] != expected_isolated:
             sys.exit(
                 f"{owner} must run isolated timing contracts once each, in "
                 "their declared target and name order"
@@ -600,6 +636,32 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         f"misc issues {len(misc)} invocations; "
         f"{OPTIMIZED_QUIESCENT_SHARD} issues {len(optimized_commands)}"
     )
+
+
+def verify_lib_plan(plan: dict) -> None:
+    """Keep exact library filters disjoint and timing profiles unchanged."""
+    ordinary_shards = set(shard_ids(plan)) - {"misc", OPTIMIZED_QUIESCENT_SHARD}
+    overrides = plan.get("quiescent_lib_shards", {})
+    for name, shard in overrides.items():
+        if name not in QUIESCENT_LIB_TESTS or name in OPTIMIZED_QUIESCENT_LIB_TESTS:
+            sys.exit(f"invalid ordinary timing-contract override: {name!r}")
+        if shard not in ordinary_shards:
+            sys.exit(f"invalid ordinary timing-contract shard: {shard!r}")
+    claimed = {qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS}
+    rust_path = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*")
+    for group in plan.get("lib_groups", []):
+        if group["shard"] not in ordinary_shards:
+            sys.exit(f"invalid library-group shard: {group['shard']!r}")
+        if not group["tests"]:
+            sys.exit("library groups must name at least one test")
+        if not rust_path.fullmatch(group["module"]) or any(
+            not rust_path.fullmatch(name) for name in group["tests"]
+        ):
+            sys.exit("library groups require module-qualified Rust test names")
+        for name in lib_group_names(group):
+            if name in claimed:
+                sys.exit(f"library test is claimed more than once: {name!r}")
+            claimed.add(name)
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -709,7 +771,28 @@ def precheck(plan: dict, shard: str) -> None:
     # burn seven runners before the gates job reported it.
     targets = integration_targets()
     verify(plan, targets)
-    isolated_lib_tests = quiescent_lib_tests_for_shard(shard)
+    groups = [group for group in plan.get("lib_groups", []) if group["shard"] == shard]
+    if groups:
+        # Resolve all groups in one Cargo invocation. Keep a multiset: a
+        # duplicate full name in another library must not hide behind a set.
+        names = [name for group in groups for name in lib_group_names(group)]
+        command = SELECTION + ["--lib", "--", "--list", "--exact", *names]
+        output = subprocess.run(
+            command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+        ).stdout
+        selected = Counter(
+            line.rsplit(":", 1)[0]
+            for line in output.splitlines()
+            if line.endswith(": test")
+        )
+        if selected != Counter(names):
+            sys.exit(
+                f"{shard} library groups do not resolve exactly once: "
+                f"missing {dict(Counter(names) - selected)}, "
+                f"unexpected {dict(selected - Counter(names))}"
+            )
+        print(f"{shard} library groups resolve exactly once: {len(names)} tests")
+    isolated_lib_tests = quiescent_lib_tests_for_shard(shard, plan)
     if isolated_lib_tests:
         for name in isolated_lib_tests:
             qualified = qualified_quiescent_lib_test(name)

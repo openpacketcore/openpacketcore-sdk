@@ -516,8 +516,9 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 // The frozen pre-roster layout has 24 objects. The protected roster adds six
 // tables and three indexes, generic V2 adds three tables and two indexes, and
 // protected-roster V2 adds three tables and three indexes. Thus the current
-// full layout has exactly 44 objects. This remains a hard schema
-// manifest bound: an additional object is never admitted.
+// base layout has exactly 44 objects. The independently validated void-profile
+// marker adds exactly one. Every manifest remains bounded by its own profile;
+// an arbitrary forty-fifth object is not admitted to a baseline store.
 pub(crate) const CONSENSUS_SCHEMA_MAX_OBJECTS: usize = 44;
 #[cfg(all(test, target_os = "linux"))]
 const FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS: usize = 33;
@@ -526,6 +527,11 @@ const FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS: usize = 33;
 /// only from its replicated activation command.
 // These are persisted on disk, so unlike the in-memory command/schema wire
 // revision they must never be derived from a future `SESSION_*` bump.
+#[path = "consensus/void_profile.rs"]
+mod void_profile;
+pub(crate) use void_profile::fenced_transition_profile_in_sync;
+pub(crate) use void_profile::schema_max_objects as consensus_schema_max_objects_in_sync;
+
 const FENCED_TRANSITION_V1_DATABASE_FORMAT: i64 = 2;
 const FENCED_TRANSITION_V2_DATABASE_FORMAT: i64 = 3;
 /// Protected-roster activation is independent of both fenced-transition
@@ -6483,17 +6489,19 @@ impl SqliteConsensusCore {
             // schema is the durable witness, including interrupted startup.
             let fresh_native_basis = !super::consensus_identity_exists(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-            let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
-                &conn,
-                required_storage_identity,
-                identity,
-                &expected_members,
-                &expected_bindings,
-                pending,
-                authority_profile,
-                fixed_placement_policy,
-                roster_attestation_trust_root.as_ref(),
-            )?;
+            let storage_identity =
+                initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
+                    &conn,
+                    required_storage_identity,
+                    identity,
+                    &expected_members,
+                    &expected_bindings,
+                    pending,
+                    authority_profile,
+                    fixed_placement_policy,
+                    roster_attestation_trust_root.as_ref(),
+                    backend.fenced_transition_profile,
+                )?;
             let applied = read_applied_sync(&conn, storage_identity)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
             let protected_roster_occupancy =
@@ -6787,6 +6795,7 @@ fn initialize_schema_with_profile(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     conn: &Connection,
@@ -6798,6 +6807,33 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     authority_profile: ConsensusAuthorityProfile,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+) -> Result<SessionConsensusIdentity, SessionConsensusStorageError> {
+    initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
+        conn,
+        required_storage_identity,
+        requested_identity,
+        expected_members,
+        expected_bindings,
+        pending,
+        authority_profile,
+        fixed_placement_policy,
+        roster_attestation_trust_root,
+        crate::FencedTransitionV2Profile::V2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
+    conn: &Connection,
+    required_storage_identity: Option<SessionConsensusIdentity>,
+    requested_identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    pending: Option<PendingMembershipBootstrap<'_>>,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+    fenced_profile: crate::FencedTransitionV2Profile,
 ) -> Result<SessionConsensusIdentity, SessionConsensusStorageError> {
     if matches!(authority_profile, ConsensusAuthorityProfile::FixedImmutable)
         != fixed_placement_policy.is_some()
@@ -6855,6 +6891,17 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
             params![epoch, SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice()],
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    }
+
+    if !identity_table_exists {
+        void_profile::create(&tx, fenced_profile)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    }
+    if fenced_transition_profile_in_sync(&tx, false)
+        .map_err(|_| SessionConsensusStorageError::SchemaVersionMismatch)?
+        != fenced_profile
+    {
+        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
 
     let storage_identity = read_storage_identity_sync(&tx)?;
@@ -7370,9 +7417,12 @@ pub(crate) fn read_storage_identity_sync(
             || value == FENCED_TRANSITION_V2_DATABASE_FORMAT
             || value == PROTECTED_ROSTER_DATABASE_FORMAT
             || value == PROTECTED_ROSTER_V2_DATABASE_FORMAT
+            || value == void_profile::DATABASE_FORMAT
     ) {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
+    fenced_transition_profile_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::SchemaVersionMismatch)?;
     let cluster: [u8; 32] = cluster
         .try_into()
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -10916,18 +10966,12 @@ fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
             Err(invalid_data("protected roster schema is not prepared"))
         }
         ProtectedRosterLayout::Prepared => {
-            let changed = conn
-                .execute(
-                    "UPDATE consensus_identity SET schema_version = ?1 \
-                     WHERE singleton = 1 AND schema_version IN (?2, ?3, ?4)",
-                    params![
-                        PROTECTED_ROSTER_DATABASE_FORMAT,
-                        i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
-                        FENCED_TRANSITION_V1_DATABASE_FORMAT,
-                        FENCED_TRANSITION_V2_DATABASE_FORMAT,
-                    ],
-                )
-                .map_err(db_error)?;
+            let changed = void_profile::set_layout(
+                conn,
+                PROTECTED_ROSTER_DATABASE_FORMAT,
+                None,
+                &[(1, None), (2, None), (3, None)],
+            )?;
             if changed != 1
                 || protected_roster_layout_in_sync(conn, false)? != ProtectedRosterLayout::Activated
             {
@@ -16960,18 +17004,12 @@ fn activate_protected_roster_profile_v2_scope_sync(
     if protected_roster_v2_layout_in_sync(conn, false)? == ProtectedRosterV2Layout::Absent {
         conn.execute_batch(PROTECTED_ROSTER_V2_SCHEMA)
             .map_err(db_error)?;
-        let changed = conn
-            .execute(
-                "UPDATE consensus_identity SET schema_version=?1 WHERE singleton=1 AND schema_version IN (?2, ?3, ?4, ?5)",
-                params![
-                    PROTECTED_ROSTER_V2_DATABASE_FORMAT,
-                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
-                    FENCED_TRANSITION_V1_DATABASE_FORMAT,
-                    FENCED_TRANSITION_V2_DATABASE_FORMAT,
-                    PROTECTED_ROSTER_DATABASE_FORMAT,
-                ],
-            )
-            .map_err(db_error)?;
+        let changed = void_profile::set_layout(
+            conn,
+            PROTECTED_ROSTER_V2_DATABASE_FORMAT,
+            None,
+            &[(1, None), (2, None), (3, None), (4, None)],
+        )?;
         if changed != 1 {
             return Err(invalid_data(
                 "protected roster V2 activation format is invalid",
@@ -17224,15 +17262,12 @@ pub(crate) fn activate_fenced_transition_scope_with_voter_digest_sync(
                     ));
                 }
             };
-            let changed = conn
-                .execute(
-                    "UPDATE consensus_identity SET schema_version = ?1, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1 AND schema_version = ?2 AND fenced_transition_receipt_ledger_activated = 0",
-                    params![
-                        target_format,
-                        current_format,
-                    ],
-                )
-                .map_err(db_error)?;
+            let changed = void_profile::set_layout(
+                conn,
+                target_format,
+                Some(true),
+                &[(current_format, Some(false))],
+            )?;
             if changed != 1 {
                 return Err(invalid_data(
                     "fenced transition activation schema fence is invalid",
@@ -17459,7 +17494,7 @@ fn read_fenced_transition_v2_history_row_in_sync(
     let profile_digest: [u8; 32] = profile_digest
         .try_into()
         .map_err(|_| invalid_data("fenced transition V2 history profile is invalid"))?;
-    if profile_digest != fenced_transition_v2_profile_digest() {
+    if profile_digest != fenced_transition_profile_in_sync(conn, attached)?.digest() {
         return Err(invalid_data(
             "fenced transition V2 history profile is invalid",
         ));
@@ -17591,7 +17626,7 @@ pub(crate) fn fenced_transition_v2_activation_matches_scope_sync(
         || scope_identity.cluster_id() != storage_identity.cluster_id()
         || voters.is_empty()
         || !fenced_transition_v2_payload_cap_matches_local_storage()
-        || profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest()
+        || profile_digest != fenced_transition_profile_in_sync(conn, false)?.digest()
     {
         return Ok(false);
     }
@@ -17619,7 +17654,7 @@ fn fenced_transition_v2_activation_matches_history_sync(
     if scope_identity.cluster_id() != storage_identity.cluster_id()
         || voters.is_empty()
         || !fenced_transition_v2_payload_cap_matches_local_storage()
-        || profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest()
+        || profile_digest != fenced_transition_profile_in_sync(conn, false)?.digest()
     {
         return Ok(false);
     }
@@ -17677,7 +17712,7 @@ fn read_fenced_transition_v2_activation_certificate_in_sync(
     let profile: [u8; 32] = profile
         .try_into()
         .map_err(|_| invalid_data("fenced transition V2 activation profile is invalid"))?;
-    if profile != crate::fenced_transition::fenced_transition_v2_profile_digest() {
+    if profile != fenced_transition_profile_in_sync(conn, attached)?.digest() {
         return Err(invalid_data(
             "fenced transition V2 activation profile is invalid",
         ));
@@ -17711,7 +17746,7 @@ fn validate_fenced_transition_v2_activation_certificate_in_sync(
     if scope_identity != scope.current_identity
         || voters
             != fenced_transition_voter_set_digest(scope.current_identity, &scope.current_members)
-        || profile != crate::fenced_transition::fenced_transition_v2_profile_digest()
+        || profile != fenced_transition_profile_in_sync(conn, attached)?.digest()
         || profile != history.profile_digest
     {
         return Err(invalid_data(
@@ -17737,7 +17772,7 @@ pub(crate) fn activate_fenced_transition_v2_scope_sync(
     if scope_identity.cluster_id() != storage_identity.cluster_id()
         || voters.is_empty()
         || !fenced_transition_v2_payload_cap_matches_local_storage()
-        || profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest()
+        || profile_digest != fenced_transition_profile_in_sync(conn, false)?.digest()
     {
         return Err(invalid_data(
             "fenced transition V2 activation scope is invalid",
@@ -17769,18 +17804,12 @@ pub(crate) fn activate_fenced_transition_v2_scope_sync(
         // state-machine transaction. No writable-open path calls this.
         conn.execute_batch(FENCED_TRANSITION_V2_SCHEMA)
             .map_err(db_error)?;
-        let changed = conn
-            .execute(
-                    "UPDATE consensus_identity SET schema_version = ?1, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1 AND ((schema_version = ?2 AND fenced_transition_receipt_ledger_activated = 0) OR (schema_version = ?3 AND fenced_transition_receipt_ledger_activated = 1) OR (schema_version = ?4 AND fenced_transition_receipt_ledger_activated IN (0, 1)) OR (schema_version = ?5 AND fenced_transition_receipt_ledger_activated IN (0, 1)))",
-                params![
-                    target_format,
-                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
-                    FENCED_TRANSITION_V1_DATABASE_FORMAT,
-                    PROTECTED_ROSTER_DATABASE_FORMAT,
-                    PROTECTED_ROSTER_V2_DATABASE_FORMAT,
-                ],
-            )
-            .map_err(db_error)?;
+        let changed = void_profile::set_layout(
+            conn,
+            target_format,
+            Some(true),
+            &[(1, Some(false)), (2, Some(true)), (4, None), (5, None)],
+        )?;
         if changed != 1
             || fenced_transition_v2_ledger_layout_sync(conn)?
                 != FencedTransitionV2LedgerLayout::Activated
@@ -18229,6 +18258,7 @@ fn schema_manifest_in_sync(
     conn: &Connection,
     attached: bool,
 ) -> io::Result<BTreeMap<(String, String), String>> {
+    let maximum_objects = consensus_schema_max_objects_in_sync(conn, attached)?;
     let master = if attached {
         "consensus_incoming.sqlite_master"
     } else {
@@ -18251,7 +18281,7 @@ fn schema_manifest_in_sync(
         .map_err(db_error)?;
     let mut manifest = BTreeMap::new();
     for row in rows {
-        if manifest.len() == CONSENSUS_SCHEMA_MAX_OBJECTS {
+        if manifest.len() == maximum_objects {
             return Ok(BTreeMap::new());
         }
         let (kind, name, sql) = row.map_err(db_error)?;
@@ -18478,7 +18508,14 @@ fn fenced_transition_activation_table_schema_is_exact_in_sync(
     )
 }
 
-fn persisted_schema_version_in_sync(conn: &Connection, attached: bool) -> io::Result<i64> {
+pub(crate) fn persisted_schema_version_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<i64> {
+    void_profile::layout(conn, attached)
+}
+
+fn raw_persisted_schema_version_in_sync(conn: &Connection, attached: bool) -> io::Result<i64> {
     let source = if attached {
         "consensus_incoming.consensus_identity"
     } else {
@@ -21019,6 +21056,8 @@ fn is_fenced_transition_v2_json_discriminant(key: &str) -> bool {
     matches!(
         key,
         "FencedTransitionV2"
+            | "VoidFencedTransitionV2"
+            | "ActivateVoidFencedTransitionV2"
             | "ActivateFencedTransitionV2"
             | "MaintainFencedTransitionV2History"
             | "FencedTransitionV2Batch"
@@ -21256,7 +21295,9 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
 fn mutation_intent_contains_fenced_transition_v2(intent: &SessionMutationIntent) -> bool {
     matches!(
         intent,
-        SessionMutationIntent::FencedTransitionV2(_)
+        SessionMutationIntent::VoidFencedTransitionV2(_)
+            | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
+            | SessionMutationIntent::FencedTransitionV2(_)
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
             | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
             | SessionMutationIntent::FencedTransitionV2Batch(_)
@@ -22066,11 +22107,14 @@ pub(crate) fn validate_command_for_log(
                 "session fenced transition V2 payload profile is incompatible with local storage",
             ));
         }
-        if command.request_id
-            != SessionConsensusRequestId::from_bytes(fenced_transition_v2_outer_request_id(
+        let outer = if command.intent.contains_fenced_transition_v2_void() {
+            crate::fenced_transition::fenced_transition_v2_void_outer_request_id(
                 request.request_id(),
-            ))
-        {
+            )
+        } else {
+            fenced_transition_v2_outer_request_id(request.request_id())
+        };
+        if command.request_id != SessionConsensusRequestId::from_bytes(outer) {
             return Err(invalid_data(
                 "session fenced transition V2 request identity mismatch",
             ));
@@ -22176,7 +22220,8 @@ pub(crate) fn validate_command_for_log(
     {
         if scope_identity.cluster_id() != command.identity.cluster_id()
             || voters.iter().all(|byte| *byte == 0)
-            || profile != crate::fenced_transition::fenced_transition_v2_profile_digest()
+            || (profile != crate::FencedTransitionV2Profile::V2.digest()
+                && profile != crate::FencedTransitionV2Profile::V2WithVoid.digest())
         {
             return Err(invalid_data(
                 "session fenced transition V2 activation is invalid",
@@ -22354,7 +22399,7 @@ impl MembershipLogProjection {
                         storage_identity,
                         scope.current_identity,
                         &scope.current_members,
-                        crate::fenced_transition::fenced_transition_v2_profile_digest(),
+                        fenced_transition_profile_in_sync(conn, false)?.digest(),
                         &history,
                     )?;
                     (Some(history), activated)
@@ -22449,6 +22494,12 @@ impl MembershipLogProjection {
                 "projected fenced transition V2 logical time is outside the profiled range",
             ));
         }
+        if command.intent.contains_fenced_transition_v2_void()
+            && fenced_transition_profile_in_sync(conn, false)?
+                != crate::FencedTransitionV2Profile::V2WithVoid
+        {
+            return Err(invalid_data("store profile does not permit void"));
+        }
         // The full request self-authenticates before activation, floor, or
         // receipt lookup.  A body substitution is a committed no-effect
         // conflict even after physical reclamation.
@@ -22489,7 +22540,7 @@ impl MembershipLogProjection {
                         self.scope.current_identity,
                         &self.scope.current_members,
                     )
-                || profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest()
+                || profile_digest != fenced_transition_profile_in_sync(conn, false)?.digest()
             {
                 return Err(invalid_data(
                     "projected fenced transition V2 activation scope is stale",
@@ -23542,6 +23593,8 @@ impl MembershipLogProjection {
             | SessionMutationIntent::PreflightProtectedRosterProfileV2
             | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
+            | SessionMutationIntent::VoidFencedTransitionV2(_)
+            | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
             | SessionMutationIntent::FencedTransitionV2(_)
             | SessionMutationIntent::FencedTransitionV2Batch(_)
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
@@ -26291,6 +26344,8 @@ pub(crate) fn payload_digest(
             return fenced_transition_payload_digest(storage_identity, request);
         }
         SessionMutationIntent::FencedTransitionV2(request)
+        | SessionMutationIntent::VoidFencedTransitionV2(request)
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 { request, .. }
         | SessionMutationIntent::ActivateFencedTransitionV2 { request, .. } => {
             return match request.validate() {
                 Ok(()) => fenced_transition_v2_payload_digest(storage_identity, request),
@@ -26648,14 +26703,15 @@ pub(crate) fn protected_roster_command_for_scope<'a>(
 fn fenced_transition_v2_request(
     intent: &SessionMutationIntent,
 ) -> Option<&FencedTransitionV2Request> {
+    let intent = match intent {
+        SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+        intent => intent,
+    };
     match intent {
-        SessionMutationIntent::FencedTransitionV2(request) => Some(request),
-        SessionMutationIntent::ActivateFencedTransitionV2 { request, .. } => Some(request),
-        SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
-            SessionMutationIntent::FencedTransitionV2(request)
-            | SessionMutationIntent::ActivateFencedTransitionV2 { request, .. } => Some(request),
-            _ => None,
-        },
+        SessionMutationIntent::FencedTransitionV2(request)
+        | SessionMutationIntent::VoidFencedTransitionV2(request)
+        | SessionMutationIntent::ActivateFencedTransitionV2 { request, .. }
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 { request, .. } => Some(request),
         _ => None,
     }
 }
@@ -26745,22 +26801,23 @@ fn protected_roster_profile_v2_activation(
 fn fenced_transition_v2_activation(
     intent: &SessionMutationIntent,
 ) -> Option<(SessionConsensusIdentity, [u8; 32], [u8; 32])> {
+    let intent = match intent {
+        SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+        intent => intent,
+    };
     match intent {
         SessionMutationIntent::ActivateFencedTransitionV2 {
             scope_identity,
             voter_set_digest,
             profile_digest,
             ..
+        }
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 {
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
+            ..
         } => Some((*scope_identity, *voter_set_digest, *profile_digest)),
-        SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
-            SessionMutationIntent::ActivateFencedTransitionV2 {
-                scope_identity,
-                voter_set_digest,
-                profile_digest,
-                ..
-            } => Some((*scope_identity, *voter_set_digest, *profile_digest)),
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -27016,8 +27073,19 @@ fn append_fenced_transition_v2_response_mutation(
 /// Encode the only receipt envelope forms V2 permits.  This is intentionally
 /// not a general `SessionConsensusResponse` codec: accepting an unrelated
 /// success or error would make a durable V2 retry result build-dependent.
+#[cfg(test)]
 pub(crate) fn encode_fenced_transition_v2_response(
     response: &SessionConsensusResponse,
+) -> io::Result<Vec<u8>> {
+    encode_fenced_transition_v2_response_with_profile(
+        response,
+        crate::FencedTransitionV2Profile::V2,
+    )
+}
+
+pub(crate) fn encode_fenced_transition_v2_response_with_profile(
+    response: &SessionConsensusResponse,
+    profile: crate::FencedTransitionV2Profile,
 ) -> io::Result<Vec<u8>> {
     if response.sequence == 0
         || response.digest.is_none()
@@ -27053,6 +27121,11 @@ pub(crate) fn encode_fenced_transition_v2_response(
             out.push(FENCED_TRANSITION_V2_RESPONSE_PAYLOAD_TOO_LARGE);
             out.extend_from_slice(&actual.to_be_bytes());
             out.extend_from_slice(&max.to_be_bytes());
+        }
+        Err(StoreError::FencedTransitionVoided)
+            if profile == crate::FencedTransitionV2Profile::V2WithVoid =>
+        {
+            out.push(26)
         }
         Err(error) => out.push(fenced_transition_v2_response_error_tag(error)?),
         _ => return Err(fenced_transition_v2_response_invalid()),
@@ -27297,8 +27370,16 @@ fn decode_fenced_transition_v2_response_error(
 /// Decode and fully frame-check one V2 receipt response.  Unknown tags,
 /// noncanonical timestamps, overflowed lengths and any trailing byte reject
 /// the ledger rather than silently changing an exact retry result.
+#[cfg(test)]
 pub(crate) fn decode_fenced_transition_v2_response(
     encoded: &[u8],
+) -> io::Result<SessionConsensusResponse> {
+    decode_fenced_transition_v2_response_with_profile(encoded, crate::FencedTransitionV2Profile::V2)
+}
+
+pub(crate) fn decode_fenced_transition_v2_response_with_profile(
+    encoded: &[u8],
+    profile: crate::FencedTransitionV2Profile,
 ) -> io::Result<SessionConsensusResponse> {
     if encoded.len() > FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES {
         return Err(fenced_transition_v2_response_invalid());
@@ -27320,6 +27401,8 @@ pub(crate) fn decode_fenced_transition_v2_response(
             FencedTransitionOutcome::new(lease, generation, mutation, recorded_at)
                 .map_err(|_| fenced_transition_v2_response_invalid())?,
         ))
+    } else if result_tag == 26 && profile == crate::FencedTransitionV2Profile::V2WithVoid {
+        Err(StoreError::FencedTransitionVoided)
     } else {
         Err(decode_fenced_transition_v2_response_error(
             result_tag,
@@ -27376,7 +27459,12 @@ fn validate_fenced_transition_v2_response_for_request(
         {
             Ok(())
         }
-        Err(error) if is_persistable_fenced_transition_error(error) => Ok(()),
+        Err(error)
+            if is_persistable_fenced_transition_error(error)
+                || matches!(error, StoreError::FencedTransitionVoided) =>
+        {
+            Ok(())
+        }
         _ => Err(invalid_data(
             "persisted fenced transition V2 receipt does not match its request",
         )),
@@ -27392,7 +27480,11 @@ fn validate_fenced_transition_v2_receipt_metadata(
             "persisted fenced transition V2 retention is invalid",
         ));
     }
-    validate_fenced_transition_receipt(retained_until, response)?;
+    validate_fenced_transition_receipt_with_profile(
+        retained_until,
+        response,
+        crate::FencedTransitionV2Profile::V2WithVoid,
+    )?;
     let logical_time = response.logical_time.ok_or_else(|| {
         invalid_data("persisted fenced transition V2 receipt logical time is invalid")
     })?;
@@ -27508,7 +27600,10 @@ fn read_fenced_transition_v2_receipt_sync(
                     "persisted fenced transition V2 receipt is invalid",
                 ));
             }
-            let response = decode_fenced_transition_v2_response(&encoded)?;
+            let response = decode_fenced_transition_v2_response_with_profile(
+                &encoded,
+                fenced_transition_profile_in_sync(conn, false)?,
+            )?;
             validate_fenced_transition_v2_receipt_metadata(retained_until_timestamp, &response)?;
             validate_fenced_transition_v2_response_for_request(request, &response)?;
             let digest: [u8; 32] = digest
@@ -27547,7 +27642,10 @@ fn store_fenced_transition_v2_receipt_row_sync(
 ) -> io::Result<()> {
     validate_fenced_transition_v2_receipt_metadata(retained_until, response)?;
     validate_fenced_transition_v2_response_for_request(request, response)?;
-    let encoded = encode_fenced_transition_v2_response(response)?;
+    let encoded = encode_fenced_transition_v2_response_with_profile(
+        response,
+        fenced_transition_profile_in_sync(conn, false)?,
+    )?;
     if encoded.len() > FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES {
         return Err(invalid_data("fenced transition V2 receipt is too large"));
     }
@@ -27959,6 +28057,18 @@ pub(crate) fn validate_fenced_transition_receipt(
     retained_until: Timestamp,
     response: &SessionConsensusResponse,
 ) -> io::Result<()> {
+    validate_fenced_transition_receipt_with_profile(
+        retained_until,
+        response,
+        crate::FencedTransitionV2Profile::V2,
+    )
+}
+
+fn validate_fenced_transition_receipt_with_profile(
+    retained_until: Timestamp,
+    response: &SessionConsensusResponse,
+    profile: crate::FencedTransitionV2Profile,
+) -> io::Result<()> {
     if response.sequence == 0 || response.digest.is_none() || response.raft_log_index == 0 {
         return Err(invalid_data(
             "persisted fenced transition receipt metadata is invalid",
@@ -27988,6 +28098,8 @@ pub(crate) fn validate_fenced_transition_receipt(
                 ));
             }
         }
+        Err(StoreError::FencedTransitionVoided)
+            if profile == crate::FencedTransitionV2Profile::V2WithVoid => {}
         Err(error) if is_persistable_fenced_transition_error(error) => {}
         Err(_) => {
             return Err(invalid_data(
@@ -28660,7 +28772,10 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
                         "persisted fenced transition V2 receipt is invalid",
                     ));
                 }
-                let response = decode_fenced_transition_v2_response(&response_json)?;
+                let response = decode_fenced_transition_v2_response_with_profile(
+                    &response_json,
+                    fenced_transition_profile_in_sync(conn, false)?,
+                )?;
                 validate_fenced_transition_v2_receipt_metadata(
                     retained_until_timestamp,
                     &response,
@@ -29442,7 +29557,7 @@ fn apply_fenced_transition_v2_batch_command_sync(
             storage_identity,
             scope.current_identity,
             &scope.current_members,
-            crate::fenced_transition::fenced_transition_v2_profile_digest(),
+            fenced_transition_profile_in_sync(tx, false)?.digest(),
         )?
     {
         return Err(invalid_data(
@@ -29670,6 +29785,12 @@ fn apply_fenced_transition_v2_command_sync(
             "fenced transition V2 logical time is outside the profiled range",
         ));
     }
+    if command.intent.contains_fenced_transition_v2_void()
+        && fenced_transition_profile_in_sync(tx, false)?
+            != crate::FencedTransitionV2Profile::V2WithVoid
+    {
+        return Err(invalid_data("store profile does not permit void"));
+    }
     // Self-authentication is evaluated before any durable row lookup or
     // retired-floor test. A caller-provided ID/body mismatch is terminal even
     // after physical reclamation of the original epoch.
@@ -29739,7 +29860,7 @@ fn apply_fenced_transition_v2_command_sync(
                         scope.current_identity,
                         &scope.current_members,
                     )
-                || profile != crate::fenced_transition::fenced_transition_v2_profile_digest()
+                || profile != fenced_transition_profile_in_sync(tx, false)?.digest()
             {
                 return Err(invalid_data(
                     "fenced transition V2 activation scope is stale",
@@ -29759,7 +29880,7 @@ fn apply_fenced_transition_v2_command_sync(
             storage_identity,
             scope.current_identity,
             &scope.current_members,
-            crate::fenced_transition::fenced_transition_v2_profile_digest(),
+            fenced_transition_profile_in_sync(tx, false)?.digest(),
         )? =>
         {
             return Err(invalid_data(
@@ -30403,6 +30524,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::SessionRecordReserved
         | StoreError::PayloadTooLarge { .. }
         | StoreError::FencedTransitionRequestExpired
+        | StoreError::FencedTransitionVoided
         | StoreError::FencedTransitionStorageExhausted => true,
         StoreError::CapabilityNotSupported(_)
         | StoreError::CasIdempotencyConflict
@@ -30744,6 +30866,22 @@ fn execute_application_intent_sync(
                 Some(replication),
             ))
         }
+        SessionMutationIntent::VoidFencedTransitionV2(request)
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 { request, .. } => {
+            request.validate_at(logical_time)?;
+            let request = fenced_transition_v2_as_v1_request(request)?;
+            conn.execute_batch("SAVEPOINT fenced_transition_void_check")
+                .map_err(|_| StoreError::BackendUnavailable("void validation failed".into()))?;
+            let result = execute_fenced_transition_sync(conn, &request, caps, logical_time);
+            conn.execute_batch(
+                "ROLLBACK TO fenced_transition_void_check; RELEASE fenced_transition_void_check",
+            )
+            .map_err(|_| StoreError::BackendUnavailable("void validation failed".into()))?;
+            match result {
+                Ok(_) => Err(StoreError::FencedTransitionVoided),
+                Err(error) => Err(error),
+            }
+        }
         SessionMutationIntent::FencedTransitionV2(request)
         | SessionMutationIntent::ActivateFencedTransitionV2 { request, .. } => {
             // Do not let the V1 executor bridge bypass V2's profiled logical
@@ -30948,6 +31086,8 @@ fn fenced_transition_access_is_authorized_sync(
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::ActivateFencedTransition { .. }
                 | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
+                | SessionMutationIntent::VoidFencedTransitionV2(_)
+                | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
@@ -30962,6 +31102,8 @@ fn fenced_transition_access_is_authorized_sync(
         }
         SessionMutationIntent::FencedTransition(_)
         | SessionMutationIntent::ActivateFencedTransition { .. }
+        | SessionMutationIntent::VoidFencedTransitionV2(_)
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
         | SessionMutationIntent::FencedTransitionV2(_)
         | SessionMutationIntent::FencedTransitionV2Batch(_)
         | SessionMutationIntent::ActivateFencedTransitionV2 { .. } => {
@@ -35407,13 +35549,12 @@ pub(crate) fn install_snapshot_database_extent_guard_sync(conn: &Connection) -> 
 }
 
 const SNAPSHOT_COMPACTION_SOURCE_DATABASE: &str = "consensus_compaction_source";
-const SNAPSHOT_COMPACTION_SCHEMA_MAX_OBJECTS: usize = CONSENSUS_SCHEMA_MAX_OBJECTS;
-
 struct SnapshotCompactionSourceSettings {
     page_size: u64,
     auto_vacuum: i64,
     application_id: i64,
     user_version: i64,
+    maximum_schema_objects: usize,
 }
 
 struct SnapshotCompactionSchemaObject {
@@ -35447,6 +35588,7 @@ fn snapshot_compaction_source_settings_sync(
         auto_vacuum,
         application_id,
         user_version,
+        maximum_schema_objects: consensus_schema_max_objects_in_sync(&source, false)?,
     })
 }
 
@@ -35466,6 +35608,7 @@ fn snapshot_compaction_attached_extent_sync(conn: &Connection) -> io::Result<(i3
 
 fn read_snapshot_compaction_schema_sync(
     conn: &Connection,
+    maximum_objects: usize,
 ) -> io::Result<Vec<SnapshotCompactionSchemaObject>> {
     let mut statement = conn
         .prepare(
@@ -35489,10 +35632,10 @@ fn read_snapshot_compaction_schema_sync(
             ))
         })
         .map_err(db_error)?;
-    let mut objects = Vec::with_capacity(SNAPSHOT_COMPACTION_SCHEMA_MAX_OBJECTS);
+    let mut objects = Vec::with_capacity(maximum_objects);
     let mut names = BTreeSet::new();
     for row in rows {
-        if objects.len() == SNAPSHOT_COMPACTION_SCHEMA_MAX_OBJECTS {
+        if objects.len() == maximum_objects {
             return Err(invalid_data(
                 "session consensus compacted snapshot schema has too many objects",
             ));
@@ -35667,7 +35810,8 @@ fn compact_pinned_snapshot_database_inner_sync(
             SNAPSHOT_COMPACTION_SOURCE_DATABASE,
         )?;
         snapshot_compaction_attached_extent_sync(&destination)?;
-        let schema = read_snapshot_compaction_schema_sync(&destination)?;
+        let schema =
+            read_snapshot_compaction_schema_sync(&destination, settings.maximum_schema_objects)?;
         validate_snapshot_compaction_table_keys_sync(&destination, &schema)?;
         // This descriptor is still private staging. Commit its complete
         // schema and data once, rather than syncing each intermediate table
@@ -38675,6 +38819,13 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_syn
         // source under the transaction that will copy it. A pathname swap or
         // later writer therefore cannot substitute bytes after validation.
         let incoming_fenced_layout = fenced_transition_receipt_ledger_layout_in_sync(&tx, true)?;
+        if fenced_transition_profile_in_sync(&tx, false)?
+            != fenced_transition_profile_in_sync(&tx, true)?
+        {
+            return Err(invalid_data(
+                "snapshot cannot convert fenced transition store profile",
+            ));
+        }
         let local_fenced_layout = fenced_transition_receipt_ledger_layout_sync(&tx)?;
         let incoming_v2_layout = fenced_transition_v2_ledger_layout_in_sync(&tx, true)?;
         let local_v2_layout = fenced_transition_v2_ledger_layout_sync(&tx)?;
@@ -38918,6 +39069,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_syn
             )
             .map_err(db_error)?;
         }
+        void_profile::copy_snapshot_layout(&tx)?;
         for (table, columns) in [
             (
                 "session_records",
@@ -40165,6 +40317,8 @@ mod tests {
     mod native;
     #[cfg(target_os = "linux")]
     mod sequential_wal;
+    #[cfg(target_os = "linux")]
+    mod void_profile_matrix;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -47090,7 +47244,16 @@ mod tests {
         record: &ProductionReservationRecord,
         committed_at: Timestamp,
     ) {
-        protected_roster_write_record_sync(conn, identity(), record).expect("persist roster row");
+        write_retirement_fixture_record_for_identity(conn, identity(), record, committed_at)
+    }
+
+    fn write_retirement_fixture_record_for_identity(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
+        record: &ProductionReservationRecord,
+        committed_at: Timestamp,
+    ) {
+        protected_roster_write_record_sync(conn, identity, record).expect("persist roster row");
         let admission = record.admission().expect("fixture admission");
         let stable_slot =
             protected_roster_stable_slot(admission.scope(), admission.key(), admission.roster_id());
@@ -47107,7 +47270,7 @@ mod tests {
                 stable_slot.as_slice(),
                 protected_roster_request_id(stable_slot).as_slice(),
                 protected_roster_request_id(*terminal_slot.as_bytes()).as_slice(),
-                epoch_i64(identity()).expect("configuration epoch"),
+                epoch_i64(identity).expect("configuration epoch"),
                 admission.logical_owner().as_str(),
                 1_i64,
                 1_i64,
@@ -47125,6 +47288,14 @@ mod tests {
         conn: &Connection,
         binding: RequestBindingKey,
     ) -> (IrreversibleHistoryFloor, ProductionFloorKey) {
+        write_retirement_fixture_floor_for_identity(conn, identity(), binding)
+    }
+
+    fn write_retirement_fixture_floor_for_identity(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+    ) -> (IrreversibleHistoryFloor, ProductionFloorKey) {
         let floor = IrreversibleHistoryFloor::initial(binding).expect("initial floor");
         let key = ProductionFloorKey::from_floor(floor).expect("floor key");
         conn.execute(
@@ -47132,7 +47303,7 @@ mod tests {
              (partition, configuration_epoch, canonical_floor) VALUES (?1, ?2, ?3)",
             params![
                 key.as_bytes().as_slice(),
-                epoch_i64(identity()).expect("configuration epoch"),
+                epoch_i64(identity).expect("configuration epoch"),
                 floor.to_canonical_bytes().expect("canonical floor"),
             ],
         )
@@ -47142,6 +47313,14 @@ mod tests {
 
     fn write_retirement_fixture_witness(
         conn: &Connection,
+        records: &[ProductionReservationRecord],
+    ) -> GlobalChargeWitness {
+        write_retirement_fixture_witness_for_identity(conn, identity(), records)
+    }
+
+    fn write_retirement_fixture_witness_for_identity(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
         records: &[ProductionReservationRecord],
     ) -> GlobalChargeWitness {
         let mut counters = crate::fenced_mutation_roster_storage::validate_production_snapshot(
@@ -47163,7 +47342,7 @@ mod tests {
             .expect("charge fixture floor");
         }
         let witness = GlobalChargeWitness::v1(0, 0, counters);
-        protected_roster_write_witness_sync(conn, identity(), witness).expect("persist witness");
+        protected_roster_write_witness_sync(conn, identity, witness).expect("persist witness");
         witness
     }
 
@@ -76523,3 +76702,7 @@ BEGIN IMMEDIATE;
         );
     }
 }
+
+#[cfg(test)]
+#[path = "consensus/void_profile_tests.rs"]
+mod void_profile_tests;

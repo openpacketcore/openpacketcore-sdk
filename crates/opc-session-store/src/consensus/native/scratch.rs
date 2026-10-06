@@ -115,7 +115,9 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
             | SessionMutationIntent::ReadConsumerRecord { .. } => {
                 count = 1;
             }
-            SessionMutationIntent::FencedTransitionV2(value)
+            SessionMutationIntent::VoidFencedTransitionV2(value)
+            | SessionMutationIntent::ActivateVoidFencedTransitionV2 { request: value, .. }
+            | SessionMutationIntent::FencedTransitionV2(value)
             | SessionMutationIntent::ActivateFencedTransitionV2 { request: value, .. } => {
                 request(value)
             }
@@ -271,7 +273,9 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
             SessionMutationIntent::AcquireLease {
                 key: value, owner, ..
             } => add(key(value)?, owner.allocation_capacity()),
-            SessionMutationIntent::FencedTransitionV2(value)
+            SessionMutationIntent::VoidFencedTransitionV2(value)
+            | SessionMutationIntent::ActivateVoidFencedTransitionV2 { request: value, .. }
+            | SessionMutationIntent::FencedTransitionV2(value)
             | SessionMutationIntent::ActivateFencedTransitionV2 { request: value, .. } => {
                 add(size_of::<FencedTransitionV2Request>(), request(value)?)
             }

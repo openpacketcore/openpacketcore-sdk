@@ -601,6 +601,7 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 #[allow(clippy::type_complexity)]
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
+    pub(crate) fenced_transition_profile: crate::FencedTransitionV2Profile,
     #[cfg(target_os = "linux")]
     pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -645,6 +646,10 @@ pub struct SqliteSessionBackend {
     fixed_quorum_v2_mutation_snapshot_cut: Arc<AtomicBool>,
     #[cfg(test)]
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) fenced_transition_v2_activation_lookup_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) fenced_transition_v2_activation_lookup_count: Arc<AtomicUsize>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
@@ -1027,10 +1032,23 @@ impl SqliteSessionBackend {
 
     /// Open (or create) a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_fenced_transition_v2_profile(path, crate::FencedTransitionV2Profile::V2)
+    }
+
+    /// Open a store with an explicit immutable fenced-transition profile.
+    ///
+    /// A new consensus store selects this profile atomically at creation.
+    /// Existing stores must have exactly the requested profile; stores are
+    /// created under one profile and are not converted. Ordinary [`Self::open`]
+    /// selects the original V2 profile, which never accepts void commands.
+    pub fn open_with_fenced_transition_v2_profile(
+        path: impl AsRef<Path>,
+        profile: crate::FencedTransitionV2Profile,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let conn = Connection::open(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
-        Self::finish_file_open(path, conn)
+        Self::finish_file_open_with_profile(path, conn, profile)
     }
 
     /// Open a test database through an explicitly selected SQLite test VFS.
@@ -1062,7 +1080,25 @@ impl SqliteSessionBackend {
         Ok(backend)
     }
 
+    #[cfg(feature = "test-vfs")]
     fn finish_file_open(path: &Path, conn: Connection) -> Result<Self, StoreError> {
+        Self::finish_file_open_with_profile(path, conn, crate::FencedTransitionV2Profile::V2)
+    }
+
+    fn finish_file_open_with_profile(
+        path: &Path,
+        conn: Connection,
+        profile: crate::FencedTransitionV2Profile,
+    ) -> Result<Self, StoreError> {
+        if consensus_identity_exists(&conn)?
+            && consensus::fenced_transition_profile_in_sync(&conn, false).map_err(|_| {
+                StoreError::BackendUnavailable("fenced_transition_store_profile_mismatch".into())
+            })? != profile
+        {
+            return Err(StoreError::BackendUnavailable(
+                "fenced_transition_store_profile_mismatch".into(),
+            ));
+        }
         let database_path = std::fs::canonicalize(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
         let database_bytes = std::fs::metadata(&database_path)
@@ -1098,7 +1134,7 @@ impl SqliteSessionBackend {
                     std::sync::atomic::Ordering::Relaxed,
                 );
         }
-        let backend = Self::new_with_conn(conn, false, Some(database_path))?;
+        let backend = Self::new_with_conn_and_profile(conn, false, Some(database_path), profile)?;
         if let Some(handoff) = classification.into_terminal_handoff() {
             backend
                 .terminal_recovery_handoff
@@ -1181,6 +1217,20 @@ impl SqliteSessionBackend {
         conn: Connection,
         in_memory: bool,
         database_path: Option<PathBuf>,
+    ) -> Result<Self, StoreError> {
+        Self::new_with_conn_and_profile(
+            conn,
+            in_memory,
+            database_path,
+            crate::FencedTransitionV2Profile::V2,
+        )
+    }
+
+    fn new_with_conn_and_profile(
+        conn: Connection,
+        in_memory: bool,
+        database_path: Option<PathBuf>,
+        fenced_transition_profile: crate::FencedTransitionV2Profile,
     ) -> Result<Self, StoreError> {
         apply_pragma_profile(&conn, in_memory, true)?;
 
@@ -1325,6 +1375,7 @@ impl SqliteSessionBackend {
 
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            fenced_transition_profile,
             #[cfg(target_os = "linux")]
             native_owner,
             #[cfg(all(test, target_os = "linux"))]
@@ -1365,6 +1416,10 @@ impl SqliteSessionBackend {
             fixed_quorum_v2_mutation_snapshot_cut: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fenced_transition_v2_activation_lookup_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            fenced_transition_v2_activation_lookup_count: Arc::new(AtomicUsize::new(0)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3035,6 +3090,15 @@ impl SqliteSessionBackend {
         }) {
             return result.map_err(|_| native::unavailable());
         }
+        #[cfg(test)]
+        self.fenced_transition_v2_activation_lookup_count
+            .fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        let _lookup_gate = self
+            .fenced_transition_v2_activation_lookup_gate
+            .acquire()
+            .await
+            .expect("test activation lookup gate");
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::fenced_transition_v2_activation_matches_scope_sync(
                 conn,

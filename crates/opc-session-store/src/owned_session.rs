@@ -437,6 +437,9 @@ impl OwnedSessionMutationError {
             StoreError::SessionRecordReserved => Self::StoreRejected {
                 code: "session-record-reserved",
             },
+            StoreError::FencedTransitionVoided => Self::StoreRejected {
+                code: "fenced-transition-voided",
+            },
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },

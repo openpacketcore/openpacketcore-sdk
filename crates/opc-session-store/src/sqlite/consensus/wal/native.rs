@@ -197,7 +197,12 @@ pub(super) fn from_pristine_basis(
     if globals != 2 || revision != 0 {
         return Err(invalid_data("native pristine root counters differ"));
     }
-    NativeStorage::empty_with_roster_root(binding.identity, authority.members.clone(), roster_root)
+    NativeStorage::empty_with_roster_root_and_profile(
+        binding.identity,
+        authority.members.clone(),
+        roster_root,
+        super::super::fenced_transition_profile_in_sync(conn, false)?,
+    )
 }
 
 pub(in crate::sqlite::consensus) struct Opening {

@@ -242,7 +242,9 @@ fn entry_requests(entry: &Entry<SessionRaftTypeConfig>) -> &[FencedTransitionV2R
         intent => intent,
     };
     match intent {
-        SessionMutationIntent::FencedTransitionV2(request)
+        SessionMutationIntent::VoidFencedTransitionV2(request)
+        | SessionMutationIntent::ActivateVoidFencedTransitionV2 { request, .. }
+        | SessionMutationIntent::FencedTransitionV2(request)
         | SessionMutationIntent::ActivateFencedTransitionV2 { request, .. } => {
             std::slice::from_ref(request)
         }

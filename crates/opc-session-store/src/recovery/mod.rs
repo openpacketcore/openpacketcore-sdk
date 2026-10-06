@@ -10,6 +10,43 @@ mod sqlite;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn inspect_consensus_replica_for_test(
+    topology: &crate::topology::ValidatedQuorumTopology,
+    database: &std::path::Path,
+    snapshots: &std::path::Path,
+) -> Result<RecoveryReplicaEvidence, RecoveryError> {
+    let replica = RecoveryReplica::from_topology(
+        topology,
+        topology
+            .summary()
+            .local_replica_id()
+            .cloned()
+            .ok_or(RecoveryError::InvalidRequest)?,
+        database,
+        snapshots,
+    )?;
+    let members = topology
+        .members()
+        .iter()
+        .map(|member| {
+            topology
+                .consensus_node_id(member.replica_id())
+                .ok_or(RecoveryError::InvalidRequest)
+        })
+        .collect::<Result<_, _>>()?;
+    inspect_replica(InspectionInput {
+        key: &RecoveryIntegrityKey::new([0x57; 32])?,
+        replica: &replica,
+        identity: topology
+            .consensus_identity()
+            .ok_or(RecoveryError::InvalidRequest)?,
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::PortableVerified,
+    })
+}
+
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};

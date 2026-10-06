@@ -93,7 +93,12 @@ pub(super) fn write_receipt(
     let response = row
         .response
         .as_deref()
-        .map(crate::sqlite::consensus::encode_fenced_transition_v2_response)
+        .map(|response| {
+            crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
+                response,
+                FencedTransitionV2Profile::V2WithVoid,
+            )
+        })
         .transpose()?;
     let length = response.as_ref().map_or(0, Vec::len);
     let timestamp = row.retained_until.as_offset_datetime();
@@ -156,8 +161,17 @@ fn decode(bytes: &[u8]) -> io::Result<(FencedTransitionV2RequestId, NativeReceip
     let response = if length == 0 {
         None
     } else {
-        let response = crate::sqlite::consensus::decode_fenced_transition_v2_response(remaining)?;
-        if crate::sqlite::consensus::encode_fenced_transition_v2_response(&response)? != remaining {
+        // Decoding alone grants no store authority. Every selected read and
+        // catalog admission validates the result against its immutable frontier.
+        let response = crate::sqlite::consensus::decode_fenced_transition_v2_response_with_profile(
+            remaining,
+            FencedTransitionV2Profile::V2WithVoid,
+        )?;
+        if crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
+            &response,
+            FencedTransitionV2Profile::V2WithVoid,
+        )? != remaining
+        {
             return Err(invalid("native cold response is not canonical"));
         }
         Some(Arc::new(response))
@@ -488,6 +502,7 @@ pub(super) fn copy_response(
             | StoreError::LeaseHeld
             | StoreError::LeaseExpired
             | StoreError::PayloadTooLarge { .. }
+            | StoreError::FencedTransitionVoided
             | StoreError::FencedTransitionStorageExhausted),
         ) => Err(error.clone()),
         _ => return Err(invalid("native cold output response outside V2 profile")),

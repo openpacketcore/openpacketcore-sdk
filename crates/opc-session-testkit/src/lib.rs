@@ -277,7 +277,27 @@ impl ConsensusTestCluster {
         Self::start_with_authority(3, true).await
     }
 
+    #[cfg(feature = "consumer-fixture")]
+    pub(crate) async fn start_fixed_durable_with_profile(
+        profile: opc_session_store::FencedTransitionV2Profile,
+    ) -> Self {
+        Self::start_with_authority_and_profile(3, true, profile).await
+    }
+
     async fn start_with_authority(member_count: usize, fixed: bool) -> Self {
+        Self::start_with_authority_and_profile(
+            member_count,
+            fixed,
+            opc_session_store::FencedTransitionV2Profile::V2,
+        )
+        .await
+    }
+
+    async fn start_with_authority_and_profile(
+        member_count: usize,
+        fixed: bool,
+        profile: opc_session_store::FencedTransitionV2Profile,
+    ) -> Self {
         assert!(
             member_count == 1 || member_count >= 3,
             "consensus test fleets require one or at least three members"
@@ -285,8 +305,11 @@ impl ConsensusTestCluster {
         let directory = tempfile::tempdir().expect("create consensus test directory");
         let backends = (0..member_count)
             .map(|index| {
-                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
-                    .expect("open consensus test SQLite backend")
+                SqliteSessionBackend::open_with_fenced_transition_v2_profile(
+                    directory.path().join(format!("node-{index}.sqlite")),
+                    profile,
+                )
+                .expect("open consensus test SQLite backend")
             })
             .collect::<Vec<_>>();
         let members = (0..member_count)

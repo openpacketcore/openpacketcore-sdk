@@ -53,6 +53,22 @@ const RECOVERY_JOURNAL_MAX_PAGE_ENTRIES: usize = FENCED_TRANSITION_V2_RECOVERY_R
 
 const RECOVERY_APPLICATION_ID: i64 = 0x4f50_4652;
 const RECOVERY_SCHEMA_VERSION: i64 = 1;
+const OWNED_RECOVERY_SCHEMA_VERSION: i64 = 2;
+
+#[cfg(unix)]
+#[path = "recovery/creation.rs"]
+mod creation;
+#[path = "recovery/ownership.rs"]
+mod ownership;
+use ownership::RecoveryOwnership;
+pub use ownership::{
+    FencedTransitionV2RecoveryCall, FencedTransitionV2RecoveryNotice,
+    FencedTransitionV2VoidEligibility,
+};
+
+#[cfg(all(test, unix))]
+#[path = "recovery/void_ownership_tests.rs"]
+mod void_ownership_tests;
 const RECOVERY_SCHEMA_OBJECT_COUNT: i64 = 4;
 const RECOVERY_METADATA_TABLE: &str = "protected_fenced_transition_v2_recovery_metadata";
 const RECOVERY_TABLE: &str = "protected_fenced_transition_v2_recovery_journal";
@@ -121,13 +137,14 @@ const RECOVERY_SCOPE_TAG_DOMAIN: &[u8] =
 /// path after a process restart; it is never stored in the database.
 pub struct FencedTransitionV2RecoveryJournalKey(
     Zeroizing<[u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES]>,
+    i64,
 );
 
 impl FencedTransitionV2RecoveryJournalKey {
     /// Import the stable recovery-journal integrity key from secret
     /// configuration.
     pub fn from_bytes(bytes: [u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES]) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self(Zeroizing::new(bytes), RECOVERY_SCHEMA_VERSION)
     }
 
     fn as_bytes(&self) -> &[u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES] {
@@ -143,16 +160,16 @@ impl FencedTransitionV2RecoveryJournalKey {
         let mut mac = ZeroizingHmacSha256::new(self.as_bytes());
         mac.update(RECOVERY_PATH_KEY_DOMAIN);
         mac.update(&RECOVERY_APPLICATION_ID.to_be_bytes());
-        mac.update(&RECOVERY_SCHEMA_VERSION.to_be_bytes());
+        mac.update(&self.1.to_be_bytes());
         mac.update(&path_length.to_be_bytes());
         mac.update(path);
-        Ok(Self(mac.finalize()))
+        Ok(Self(mac.finalize(), self.1))
     }
 }
 
 impl Clone for FencedTransitionV2RecoveryJournalKey {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1)
     }
 }
 
@@ -168,6 +185,7 @@ struct RecoveryJournalInner {
     progress_budget: Arc<JournalSqliteProgressBudget>,
     #[cfg(unix)]
     path_guard: SecureJournalPathGuard,
+    ownership: Option<Arc<RecoveryOwnership>>,
 }
 
 /// SDK-owned durable binding of caller-stable IDs to sealed V2 requests.
@@ -184,6 +202,7 @@ struct RecoveryJournalInner {
 #[derive(Clone)]
 pub struct FencedTransitionV2RecoveryJournal {
     inner: Arc<RecoveryJournalInner>,
+    capacity: usize,
     operation_permit: Arc<tokio::sync::Semaphore>,
     // Caller IDs whose preparation is between its cross-journal absence
     // check and its create-only insert, in this process.
@@ -254,6 +273,20 @@ struct RecoveryMember {
 }
 
 impl FencedTransitionV2RecoveryJournal {
+    /// Restrict admission capacity for bounded full-journal integration proofs.
+    /// The authenticated storage format and its production ceiling stay fixed.
+    #[cfg(any(test, feature = "test-control"))]
+    #[doc(hidden)]
+    pub fn with_capacity_for_test(mut self, capacity: usize) -> Result<Self, StoreError> {
+        if !(1..=FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES).contains(&capacity) {
+            return Err(StoreError::InvalidKey(
+                "invalid recovery journal test capacity".into(),
+            ));
+        }
+        self.capacity = capacity;
+        Ok(self)
+    }
+
     /// Provision one missing dedicated protected V2 recovery journal.
     ///
     /// This has the same local-filesystem, private-path, locking, fsync, and
@@ -278,38 +311,133 @@ impl FencedTransitionV2RecoveryJournal {
         Self::open_with_mode(path.as_ref(), key, JournalOpenMode::OpenExisting)
     }
 
+    /// Create a journal whose process ownership permits automatic void reclamation.
+    ///
+    /// This distinct format holds an exclusive OS lock through every active
+    /// operation and caller handle. The original reader rejects this format
+    /// before exposing rows. Other formats are refused; journals are not
+    /// converted. Crossing a stored-format boundary requires a fresh install.
+    pub fn create_new_owned(
+        path: impl AsRef<Path>,
+        mut key: FencedTransitionV2RecoveryJournalKey,
+    ) -> Result<Self, StoreError> {
+        key.1 = OWNED_RECOVERY_SCHEMA_VERSION;
+        Self::open_with_mode(path.as_ref(), key, JournalOpenMode::CreateNew)
+    }
+
+    /// Reopen an exclusively owned journal after its prior owner has exited.
+    ///
+    /// The OS releases ownership on process exit or crash. A still-live owner
+    /// is refused before any row can be treated as inherited.
+    pub fn open_existing_owned(
+        path: impl AsRef<Path>,
+        mut key: FencedTransitionV2RecoveryJournalKey,
+    ) -> Result<Self, StoreError> {
+        key.1 = OWNED_RECOVERY_SCHEMA_VERSION;
+        Self::open_with_mode(path.as_ref(), key, JournalOpenMode::OpenExisting)
+    }
+
     fn open_with_mode(
         path: &Path,
         key: FencedTransitionV2RecoveryJournalKey,
         mode: JournalOpenMode,
     ) -> Result<Self, StoreError> {
-        let path = prepare_secure_journal_path_with_bounds(
-            path,
-            mode,
-            #[cfg(unix)]
-            SecureJournalFileBounds {
+        let owned = key.1 == OWNED_RECOVERY_SCHEMA_VERSION;
+        #[cfg(unix)]
+        let (mut path, creation) = {
+            let bounds = SecureJournalFileBounds {
                 main: RECOVERY_MAIN_MAX_BYTES,
                 wal: RECOVERY_WAL_MAX_BYTES,
                 shm: RECOVERY_SHM_MAX_BYTES,
-            },
-        )
-        .map_err(|_| recovery_unavailable())?;
+            };
+            if owned && mode == JournalOpenMode::CreateNew {
+                let (path, creation) = creation::prepare(path, bounds)?;
+                (path, Some(creation))
+            } else {
+                (
+                    prepare_secure_journal_path_with_bounds(path, mode, bounds).map_err(
+                        |error| {
+                            if owned {
+                                recovery_path_error(error)
+                            } else {
+                                recovery_unavailable()
+                            }
+                        },
+                    )?,
+                    None,
+                )
+            }
+        };
+        #[cfg(not(unix))]
+        let path = prepare_secure_journal_path_with_bounds(path, mode)
+            .map_err(|_| recovery_unavailable())?;
+        #[cfg(test)]
+        if owned && mode == JournalOpenMode::CreateNew {
+            creation_crash_point("created");
+        }
         #[cfg(unix)]
         let key = key
             .bind_to_checked_path(&path.binding_path)
             .map_err(|_| recovery_unavailable())?;
+        #[cfg(unix)]
+        let owner_lock = owned
+            .then(|| ownership::lock(&path.path_guard))
+            .transpose()?;
+        #[cfg(test)]
+        if owned && mode == JournalOpenMode::CreateNew {
+            creation_crash_point("locked");
+        }
+        #[cfg(unix)]
+        if owned && mode == JournalOpenMode::OpenExisting {
+            creation::cleanup_after_open(&path)?;
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
         let mut conn = Connection::open_with_flags(&path.sqlite_path, flags)
             .map_err(|_| recovery_unavailable())?;
         configure_recovery_sqlite_limits(&conn)?;
-        let progress_budget = install_journal_progress_handler(&conn);
+        let mut progress_budget = install_journal_progress_handler(&conn);
+        #[cfg(test)]
+        if owned && mode == JournalOpenMode::CreateNew {
+            creation_crash_point("opened");
+        }
         #[cfg(unix)]
         path.path_guard
             .verify_connection(&conn)
             .map_err(|_| recovery_unavailable())?;
         initialize_recovery_connection(&mut conn, &key, mode, &progress_budget)?;
+        #[cfg(test)]
+        if owned && mode == JournalOpenMode::CreateNew {
+            creation_crash_point("initialized");
+        }
+        #[cfg(unix)]
+        if let Some(creation) = &creation {
+            let checkpoint: (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|_| recovery_unavailable())?;
+            if checkpoint != (0, 0, 0) {
+                return Err(recovery_unavailable());
+            }
+            #[cfg(test)]
+            creation_crash_point("checkpointed");
+            conn.close().map_err(|_| recovery_unavailable())?;
+            #[cfg(test)]
+            creation_crash_point("closed");
+            creation.publish(&mut path)?;
+            conn = Connection::open_with_flags(&path.sqlite_path, flags)
+                .map_err(|_| recovery_unavailable())?;
+            configure_recovery_sqlite_limits(&conn)?;
+            progress_budget = install_journal_progress_handler(&conn);
+            initialize_recovery_connection(
+                &mut conn,
+                &key,
+                JournalOpenMode::OpenExisting,
+                &progress_budget,
+            )?;
+        }
         #[cfg(unix)]
         {
             path.path_guard
@@ -319,6 +447,28 @@ impl FencedTransitionV2RecoveryJournal {
                 .sync_parent_directory()
                 .map_err(|_| recovery_unavailable())?;
         }
+        let ownership = if owned {
+            #[cfg(unix)]
+            {
+                let inherited = with_journal_progress_budget_limit(
+                    &mut conn,
+                    &progress_budget,
+                    RECOVERY_OPERATION_MAX_PROGRESS_CALLBACKS,
+                    |conn| scan_recovery_members(conn),
+                )?
+                .into_iter()
+                .map(|member| member.request_id)
+                .collect();
+                Some(Arc::new(RecoveryOwnership::new(
+                    owner_lock.ok_or_else(recovery_unavailable)?,
+                    inherited,
+                )))
+            }
+            #[cfg(not(unix))]
+            return Err(recovery_unavailable());
+        } else {
+            None
+        };
         Ok(Self {
             inner: Arc::new(RecoveryJournalInner {
                 conn: Mutex::new(conn),
@@ -326,7 +476,9 @@ impl FencedTransitionV2RecoveryJournal {
                 progress_budget,
                 #[cfg(unix)]
                 path_guard: path.path_guard,
+                ownership,
             }),
+            capacity: FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             admissions: Arc::new(Mutex::new(BTreeSet::new())),
             bound_scope: Arc::new(std::sync::OnceLock::new()),
@@ -442,13 +594,14 @@ impl FencedTransitionV2RecoveryJournal {
         scope: [u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES],
         request_id: FencedTransitionRequestId,
     ) -> Result<(), StoreError> {
+        let capacity = self.capacity;
         self.with_connection(false, move |conn, key| {
             let transaction = recovery_read_transaction(conn)?;
             let metadata = verify_recovery_metadata(&transaction, key, Some(&scope))?;
             if read_recovery_entry(&transaction, key, request_id)?.is_some() {
                 return Err(StoreError::FencedTransitionRequestConflict);
             }
-            if recovery_journal_full(metadata.membership.count)? {
+            if recovery_journal_full(metadata.membership.count, capacity)? {
                 return Err(StoreError::FencedTransitionHistoryFull);
             }
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
@@ -472,6 +625,9 @@ impl FencedTransitionV2RecoveryJournal {
     ) -> Result<(), StoreError> {
         let canonical = canonical_recovery_request(request)?;
         let epoch = recovery_epoch(request.request_id().epoch())?;
+        let ownership = self.inner.ownership.clone();
+        let physical_id = request.request_id();
+        let capacity = self.capacity;
         self.with_connection(true, move |conn, key| {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -480,7 +636,7 @@ impl FencedTransitionV2RecoveryJournal {
             if read_recovery_entry(&transaction, key, request_id)?.is_some() {
                 return Err(StoreError::FencedTransitionRequestConflict);
             }
-            if recovery_journal_full(metadata.membership.count)? {
+            if recovery_journal_full(metadata.membership.count, capacity)? {
                 return Err(StoreError::FencedTransitionHistoryFull);
             }
             let tag = recovery_entry_tag(key, request_id, epoch, &canonical)?;
@@ -516,7 +672,11 @@ impl FencedTransitionV2RecoveryJournal {
             publish_recovery_membership(&transaction, key, metadata.membership, expected_count)?;
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
-            transaction.commit().map_err(|_| recovery_unavailable())
+            transaction.commit().map_err(|_| recovery_unavailable())?;
+            if let Some(ownership) = ownership {
+                ownership.inserted(request_id, physical_id);
+            }
+            Ok(())
         })
         .await
     }
@@ -527,13 +687,35 @@ impl FencedTransitionV2RecoveryJournal {
         scope: [u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES],
         request_id: FencedTransitionRequestId,
     ) -> Result<Option<FencedTransitionV2Request>, StoreError> {
+        self.lookup_with_notice(scope, request_id)
+            .await
+            .map(|row| row.map(|(request, _)| request))
+    }
+
+    /// Pin the receipt notice under the same operation permit as the read.
+    /// A concurrent sweep may remove the row immediately after this returns.
+    pub(crate) async fn lookup_with_notice(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES],
+        request_id: FencedTransitionRequestId,
+    ) -> Result<
+        Option<(
+            FencedTransitionV2Request,
+            Option<FencedTransitionV2RecoveryNotice>,
+        )>,
+        StoreError,
+    > {
+        let journal = self.clone();
         self.with_connection(false, move |conn, key| {
             let transaction = recovery_read_transaction(conn)?;
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             let request = read_recovery_entry(&transaction, key, request_id)?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
-            Ok(request)
+            Ok(request.map(|request| {
+                let notice = journal.notice_for_exact(request_id, request.request_id());
+                (request, notice)
+            }))
         })
         .await
     }
@@ -552,6 +734,7 @@ impl FencedTransitionV2RecoveryJournal {
     ) -> Result<bool, StoreError> {
         let canonical = canonical_recovery_request(expected)?;
         let epoch = recovery_epoch(expected.request_id().epoch())?;
+        let ownership = self.inner.ownership.clone();
         self.with_connection(true, move |conn, key| {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -597,6 +780,9 @@ impl FencedTransitionV2RecoveryJournal {
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
+            if let Some(ownership) = ownership {
+                ownership.removed(request_id);
+            }
             Ok(true)
         })
         .await
@@ -618,6 +804,7 @@ impl FencedTransitionV2RecoveryJournal {
             return Err(recovery_unavailable());
         }
         let floor = recovery_epoch(retired_through)?;
+        let ownership = self.inner.ownership.clone();
         self.with_connection(true, move |conn, key| {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -666,6 +853,11 @@ impl FencedTransitionV2RecoveryJournal {
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
+            if let Some(ownership) = ownership {
+                for member in &retired {
+                    ownership.removed(FencedTransitionRequestId::from_bytes(member.request_id));
+                }
+            }
             Ok(retired.len())
         })
         .await
@@ -759,14 +951,37 @@ impl FencedTransitionV2RecoveryJournal {
     }
 }
 
+#[cfg(test)]
+fn creation_crash_point(point: &str) {
+    if std::env::var("OPC_RECOVERY_CREATION_CRASH_POINT").as_deref() == Ok(point) {
+        // A separate controlled test process exits without Rust destructors.
+        std::process::exit(73);
+    }
+}
+
+#[cfg(unix)]
+fn recovery_owner_locked() -> StoreError {
+    StoreError::BackendUnavailable(
+        "protected fenced-transition V2 recovery journal locked by a live owner".into(),
+    )
+}
+
+#[cfg(unix)]
+fn recovery_path_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::BackendUnavailable(reason) if reason == super::JOURNAL_OWNER_LOCKED => {
+            recovery_owner_locked()
+        }
+        _ => recovery_unavailable(),
+    }
+}
+
 fn recovery_unavailable() -> StoreError {
     StoreError::BackendUnavailable(RECOVERY_UNAVAILABLE.into())
 }
 
-fn recovery_journal_full(count: i64) -> Result<bool, StoreError> {
-    Ok(count
-        >= i64::try_from(FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES)
-            .map_err(|_| recovery_unavailable())?)
+fn recovery_journal_full(count: i64, capacity: usize) -> Result<bool, StoreError> {
+    Ok(count >= i64::try_from(capacity).map_err(|_| recovery_unavailable())?)
 }
 
 fn recovery_epoch(epoch: FencedTransitionV2HistoryEpoch) -> Result<i64, StoreError> {
@@ -805,7 +1020,7 @@ fn recovery_key_check(
     let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
     mac.update(RECOVERY_KEY_CHECK_DOMAIN);
     mac.update(&RECOVERY_APPLICATION_ID.to_be_bytes());
-    mac.update(&RECOVERY_SCHEMA_VERSION.to_be_bytes());
+    mac.update(&key.1.to_be_bytes());
     mac.finalize()
 }
 
@@ -816,7 +1031,7 @@ fn recovery_scope_tag(
     let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
     mac.update(RECOVERY_SCOPE_TAG_DOMAIN);
     mac.update(&RECOVERY_APPLICATION_ID.to_be_bytes());
-    mac.update(&RECOVERY_SCHEMA_VERSION.to_be_bytes());
+    mac.update(&key.1.to_be_bytes());
     mac.update(scope);
     mac.finalize()
 }
@@ -832,7 +1047,7 @@ fn recovery_entry_tag(
     let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
     mac.update(RECOVERY_ENTRY_DOMAIN);
     mac.update(&RECOVERY_APPLICATION_ID.to_be_bytes());
-    mac.update(&RECOVERY_SCHEMA_VERSION.to_be_bytes());
+    mac.update(&key.1.to_be_bytes());
     mac.update(request_id.as_bytes());
     mac.update(&epoch.to_be_bytes());
     mac.update(&length.to_be_bytes());
@@ -855,7 +1070,7 @@ fn recovery_membership_tag(
     let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
     mac.update(RECOVERY_MEMBERSHIP_TAG_DOMAIN);
     mac.update(&RECOVERY_APPLICATION_ID.to_be_bytes());
-    mac.update(&RECOVERY_SCHEMA_VERSION.to_be_bytes());
+    mac.update(&key.1.to_be_bytes());
     mac.update(incarnation);
     mac.update(&encoded_count);
     mac.update(root);
@@ -972,11 +1187,11 @@ fn verify_recovery_profile(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn recovery_metadata_table_sql() -> String {
+fn recovery_metadata_table_sql(schema_version: i64) -> String {
     format!(
         r#"CREATE TABLE {RECOVERY_METADATA_TABLE} (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            schema_version INTEGER NOT NULL CHECK (schema_version = {RECOVERY_SCHEMA_VERSION}),
+            schema_version INTEGER NOT NULL CHECK (schema_version = {schema_version}),
             journal_incarnation BLOB NOT NULL CHECK (
                 typeof(journal_incarnation) = 'blob' AND length(journal_incarnation) = 32
             ),
@@ -1059,6 +1274,7 @@ fn initialize_recovery_schema_and_profile(
     key: &FencedTransitionV2RecoveryJournalKey,
     mode: JournalOpenMode,
 ) -> Result<(), StoreError> {
+    let schema_version = key.1;
     conn.busy_timeout(RECOVERY_BUSY_TIMEOUT)
         .map_err(|_| recovery_unavailable())?;
     let application_id = journal_application_id(conn).map_err(|_| recovery_unavailable())?;
@@ -1067,7 +1283,7 @@ fn initialize_recovery_schema_and_profile(
     let empty = application_id == 0 && user_version == 0 && object_count == 0;
     if !(empty
         || (application_id == RECOVERY_APPLICATION_ID
-            && user_version == RECOVERY_SCHEMA_VERSION
+            && user_version == schema_version
             && object_count == RECOVERY_SCHEMA_OBJECT_COUNT))
     {
         return Err(recovery_unavailable());
@@ -1076,7 +1292,7 @@ fn initialize_recovery_schema_and_profile(
         return Err(recovery_unavailable());
     }
     if application_id == RECOVERY_APPLICATION_ID {
-        verify_recovery_schema(conn)?;
+        verify_recovery_schema(conn, key.1)?;
     }
     conn.execute_batch(&format!(
         "PRAGMA page_size = {RECOVERY_PAGE_SIZE_BYTES}; \
@@ -1107,8 +1323,8 @@ fn initialize_recovery_schema_and_profile(
             .execute_batch(&format!(
                 "{metadata}; {table}; {index}; \
                  PRAGMA application_id = {RECOVERY_APPLICATION_ID}; \
-                 PRAGMA user_version = {RECOVERY_SCHEMA_VERSION};",
-                metadata = recovery_metadata_table_sql(),
+                 PRAGMA user_version = {schema_version};",
+                metadata = recovery_metadata_table_sql(schema_version),
                 table = recovery_table_sql(),
                 index = recovery_membership_index_sql(),
             ))
@@ -1128,7 +1344,7 @@ fn initialize_recovery_schema_and_profile(
                      VALUES (1, ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7)"
                 ),
                 params![
-                    RECOVERY_SCHEMA_VERSION,
+                    schema_version,
                     incarnation.as_slice(),
                     root.as_slice(),
                     tag.as_slice(),
@@ -1142,7 +1358,7 @@ fn initialize_recovery_schema_and_profile(
         // the tight initialization budget. An existing journal is proved by
         // the caller under the full operation budget.
         verify_recovery_metadata(&transaction, key, None)?;
-    } else if application_id != RECOVERY_APPLICATION_ID || user_version != RECOVERY_SCHEMA_VERSION {
+    } else if application_id != RECOVERY_APPLICATION_ID || user_version != schema_version {
         return Err(recovery_unavailable());
     }
     verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
@@ -1165,7 +1381,7 @@ fn recovery_schema_catalog_count(conn: &Connection) -> Result<i64, StoreError> {
 
 /// Accept only the exact SDK catalog: both tables, the generated primary-key
 /// index, and the covering membership index.
-fn verify_recovery_schema(conn: &Connection) -> Result<(), StoreError> {
+fn verify_recovery_schema(conn: &Connection, schema_version: i64) -> Result<(), StoreError> {
     if recovery_schema_catalog_count(conn)? != RECOVERY_SCHEMA_OBJECT_COUNT {
         return Err(recovery_unavailable());
     }
@@ -1174,7 +1390,7 @@ fn verify_recovery_schema(conn: &Connection) -> Result<(), StoreError> {
             "table",
             RECOVERY_METADATA_TABLE,
             RECOVERY_METADATA_TABLE,
-            recovery_metadata_table_sql(),
+            recovery_metadata_table_sql(schema_version),
         ),
         (
             "table",
@@ -1228,14 +1444,23 @@ fn verify_recovery_metadata(
     key: &FencedTransitionV2RecoveryJournalKey,
     expected_scope: Option<&[u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES]>,
 ) -> Result<RecoveryMetadata, StoreError> {
+    verify_recovery_metadata_with_members(conn, key, expected_scope).map(|(metadata, _)| metadata)
+}
+
+/// Return the same authenticated members when the caller also needs them.
+/// The returned set belongs to the caller's current transaction only.
+fn verify_recovery_metadata_with_members(
+    conn: &Connection,
+    key: &FencedTransitionV2RecoveryJournalKey,
+    expected_scope: Option<&[u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES]>,
+) -> Result<(RecoveryMetadata, Vec<RecoveryMember>), StoreError> {
     verify_recovery_profile(conn)?;
     if journal_application_id(conn).map_err(|_| recovery_unavailable())? != RECOVERY_APPLICATION_ID
-        || journal_user_version(conn).map_err(|_| recovery_unavailable())?
-            != RECOVERY_SCHEMA_VERSION
+        || journal_user_version(conn).map_err(|_| recovery_unavailable())? != key.1
     {
         return Err(recovery_unavailable());
     }
-    verify_recovery_schema(conn)?;
+    verify_recovery_schema(conn, key.1)?;
     let mut statement = conn
         .prepare(&format!(
             "SELECT singleton, schema_version, key_check, journal_incarnation, \
@@ -1279,7 +1504,7 @@ fn verify_recovery_metadata(
             .map_err(|_| recovery_unavailable())?;
     if rows.next().map_err(|_| recovery_unavailable())?.is_some()
         || singleton != 1
-        || schema_version != RECOVERY_SCHEMA_VERSION
+        || schema_version != key.1
         || !valid_recovery_count(count)
         || !bool::from(key_check.ct_eq(recovery_key_check(key).as_slice()))
         || !bool::from(scope_tag.ct_eq(recovery_scope_tag(key, &scope).as_slice()))
@@ -1298,15 +1523,18 @@ fn verify_recovery_metadata(
     if expected_scope.is_some_and(|expected| !bool::from(expected.ct_eq(&scope))) {
         return Err(recovery_unavailable());
     }
-    Ok(RecoveryMetadata {
-        membership: RecoveryMembership {
-            incarnation,
-            count,
-            root,
-            tag,
+    Ok((
+        RecoveryMetadata {
+            membership: RecoveryMembership {
+                incarnation,
+                count,
+                root,
+                tag,
+            },
+            scope,
         },
-        scope,
-    })
+        members,
+    ))
 }
 
 /// Scan the bounded authoritative member set in caller-ID order.

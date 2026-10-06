@@ -216,6 +216,8 @@ enum InnerIntent {
     RosterTerminalV2(Request),
     FencedTransitionV2(Request),
     ActivateFencedTransitionV2 { request: Request },
+    VoidFencedTransitionV2(Request),
+    ActivateVoidFencedTransitionV2 { request: Request },
     FencedTransitionV2Batch(Batch),
 }
 impl InnerIntent {
@@ -239,6 +241,8 @@ impl InnerIntent {
             | Self::RosterTerminal(value)
             | Self::RosterTerminalV2(value)
             | Self::FencedTransitionV2(value)
+            | Self::VoidFencedTransitionV2(value)
+            | Self::ActivateVoidFencedTransitionV2 { request: value }
             | Self::ActivateFencedTransitionV2 { request: value } => value.0,
             Self::FencedTransitionV2Batch(value) => value.0,
         }
@@ -266,6 +270,8 @@ enum Intent {
     ActivateProtectedRosterProfileV2(Request),
     FencedTransitionV2(Request),
     ActivateFencedTransitionV2 { request: Request },
+    VoidFencedTransitionV2(Request),
+    ActivateVoidFencedTransitionV2 { request: Request },
     FencedTransitionV2Batch(Batch),
     Authorized { mutation: InnerIntent },
 }
@@ -288,6 +294,8 @@ impl Intent {
             | Self::ActivateFencedTransitionCapability(value)
             | Self::ActivateProtectedRosterProfileV2(value)
             | Self::FencedTransitionV2(value)
+            | Self::VoidFencedTransitionV2(value)
+            | Self::ActivateVoidFencedTransitionV2 { request: value }
             | Self::ActivateFencedTransitionV2 { request: value } => value.0,
             Self::FencedTransitionV2Batch(value) => value.0,
             Self::Authorized { mutation } => mutation.shape(),
