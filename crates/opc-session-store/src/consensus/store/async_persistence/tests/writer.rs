@@ -347,10 +347,28 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
             .as_ref()
             .unwrap()[&fleet.peers[follower].node]
             .unwrap();
-        assert!(
-            fleet.close_result(follower).await.is_err(),
-            "shutdown reports the failed persistence drain after joining the owner"
-        );
+        {
+            let closing = fleet.store(follower).clone();
+            let mut terminal_failure = Box::pin(closing.terminal_failure());
+            assert!(
+                terminal_failure.as_mut().now_or_never().is_none(),
+                "a retained background failure and failed explicit drain stay nonterminal"
+            );
+            assert!(
+                fleet.close_result(follower).await.is_err(),
+                "shutdown reports the failed persistence drain after joining the owner"
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), terminal_failure)
+                    .await
+                    .expect("failed final shutdown drain publishes the terminal fence"),
+                crate::SessionStoreTerminalFailure::StorageFenced
+            );
+            assert_eq!(
+                closing.persistence_health().storage_state,
+                SessionStorageState::Failed
+            );
+        }
         assert_eq!(fleet.selector(follower), selected);
         fleet
             .open(follower, SessionPersistenceMode::Async)

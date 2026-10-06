@@ -836,6 +836,22 @@ MUST return the original durable outcome, while reuse with different intent
 MUST fail closed. Caller-selected raw replication entries, whole-state rebuild,
 and lease sequencing MUST be rejected by this production adapter.
 
+A fatal local storage fence MUST publish a latched, value-free terminal-failure
+signal to the embedding process. Cancellation or late subscription MUST NOT
+lose that notification. The fenced incarnation MUST NOT reopen in process.
+Its embedder MUST exit for supervisor restart or stop all users and fully drain
+and replace the store. Successful shutdown and an Async background error that
+leaves resident storage usable MUST NOT signal a terminal failure. A failed
+final shutdown drain, including one after a retained Async background error,
+fences the owner and MUST resolve the signal. The reference voter exits with
+code 74 independently of its control I/O; its Kubernetes manifest relies on
+that exit and `restartPolicy: Always`. Startup MUST audit and replay retained
+durable state and recover its own stale control socket without a person cleaning
+up the node. Readiness or
+quorum loss alone MUST NOT trigger this terminal path. A fatal exit can interrupt
+in-flight replies but MUST NOT erase committed durable outcomes. This adds no
+voluntary lifecycle action that may cut an emergency session.
+
 Snapshots MUST be bounded, checksummed, tied to the exact consensus identity,
 and installed atomically as one coherent state-machine image. They MUST contain
 only payloads already admitted by the protection wrapper described in §14.1.

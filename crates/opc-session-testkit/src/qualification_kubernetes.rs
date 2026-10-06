@@ -710,6 +710,9 @@ fn member_stateful_set(
         },
     });
     stateful_set["spec"]["template"]["spec"]["nodeSelector"] = linux_node_selector;
+    // Terminal storage fences exit the voter with code 1. Kubelet restarts
+    // that container; readiness/quorum loss alone is not a liveness failure.
+    stateful_set["spec"]["template"]["spec"]["restartPolicy"] = json!("Always");
     stateful_set
 }
 

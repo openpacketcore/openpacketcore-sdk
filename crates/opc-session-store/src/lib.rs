@@ -190,7 +190,7 @@ pub use consensus::{
     SessionMutationIntent, SessionMutationOutcome, SessionPersistenceDrainError,
     SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
     SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
-    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
+    SessionStoreTerminalFailure, SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
     SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError, SnapshotDirectory,
     SnapshotIntegrityPolicy, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,

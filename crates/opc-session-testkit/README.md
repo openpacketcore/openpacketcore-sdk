@@ -191,6 +191,21 @@ local socket access, including Kubernetes `pods/exec` access used to launch
 the client, is node-administrator-equivalent qualification authority and must
 be restricted and audited accordingly.
 
+Both node control modes observe the store's terminal-failure signal independently
+of command I/O. A fatal native-storage fence exits the process with code 74 even
+if a client stalls, distinct from the generic failure code 1. Process exit
+closes all listeners and connections and releases storage locks. The rendered
+StatefulSets explicitly use `restartPolicy: Always` and rely on this exit for
+kubelet restart. They do not use readiness or quorum loss as a liveness failure.
+Restart audits and replays
+the existing durable state and replaces the exact stale control socket during
+startup, without node cleanup or Pod replacement by a person. Durable committed
+outcomes survive; in-flight replies and process-local handles can be lost and
+must be resolved or reacquired through the existing contracts. This fatal
+storage path is involuntary. It adds no voluntary drain, eviction, rollout, or
+emergency-session termination; planned lifecycle operations retain their
+existing emergency-session protection requirements.
+
 Its strict private node configuration/control schema is version 5. Version 4
 is explicitly rejected because it predates the distinct availability-episode
 counter in traffic-status evidence. Version 3 is rejected because it predates

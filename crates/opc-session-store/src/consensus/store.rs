@@ -5884,11 +5884,10 @@ impl ConsensusSessionStore {
     /// drain exceeding ten seconds without that relief can fence a healthy
     /// voter on very slow storage. A successful reservation resets the wait;
     /// shutdown cancels it without fencing the WAL or its accepted drain.
-    /// A storage fence is terminal for the embedding process: it must exit
-    /// non-zero so its supervisor restarts it and recovery re-audits/replays.
-    /// Automatic fatal-error exit is tracked separately in
-    /// [issue #1127](https://github.com/openpacketcore/openpacketcore-sdk/issues/1127);
-    /// this method does not restart the process or reopen a fenced store.
+    /// A storage fence is terminal for this store incarnation. The reference
+    /// voter observes [`Self::terminal_failure`] and exits with code 74. Its
+    /// supervisor restarts it so recovery re-audits and replays the durable state.
+    /// This method does not restart the process or reopen a fenced store.
     pub async fn maintain_fenced_transition_v2_history(
         &self,
         expected_state: FencedTransitionV2HistoryState,
@@ -6158,6 +6157,30 @@ impl ConsensusSessionStore {
     /// Storage acknowledgement policy chosen at construction.
     pub fn persistence_mode(&self) -> SessionPersistenceMode {
         self.inner.persistence
+    }
+
+    /// Wait until a fatal storage fence makes this incarnation terminal.
+    ///
+    /// The embedding process must exit so its supervisor can restart it, or
+    /// stop every user of this incarnation and replace the store after its
+    /// owners have drained. This store never reopens itself. A new process
+    /// audits and replays the existing durable state before rejoining.
+    ///
+    /// This is a latched, value-free notification shared by all clones, not a
+    /// health poll. Every waiter, including one registered after the fence,
+    /// receives the same reason. Dropping a waiting future does not consume
+    /// the signal. Successful shutdown, transient quorum loss, and an Async
+    /// background error that leaves resident storage usable do not signal a
+    /// terminal fence. A failed final shutdown drain, including one after a
+    /// retained Async background error, fences the owner and resolves this
+    /// signal. Stores without a native owner remain pending.
+    pub async fn terminal_failure(&self) -> super::SessionStoreTerminalFailure {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = &self.inner.private_wal {
+            wal.terminal_failure().await;
+            return super::SessionStoreTerminalFailure::StorageFenced;
+        }
+        std::future::pending().await
     }
 
     /// Observe local persistence and engine health without issuing work.

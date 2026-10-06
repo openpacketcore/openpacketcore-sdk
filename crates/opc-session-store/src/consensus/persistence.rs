@@ -39,6 +39,14 @@ pub enum SessionStorageState {
     Unavailable,
 }
 
+/// Closed, value-free reason why a store incarnation cannot serve again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionStoreTerminalFailure {
+    /// A fatal storage failure permanently fenced the native owner.
+    StorageFenced,
+}
+
 /// Fixed category of the operation which first fenced native storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]

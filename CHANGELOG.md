@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store`: expose a latched terminal storage-failure future shared
+  by every store clone. The reference quorum voter exits with code 74 on a fatal
+  fence in either control mode, allowing its supervisor to restart and replay
+  the same durable state without manual cleanup. Refs #1127.
+
 - `opc-gtpu-dataplane`: add `reset_strict_exclusive_workload_graph` for callers
   asserting a never-provisioned selector scope and ownership of the configured
   tc priority on the named interface in every chain. Remove selector markers,
@@ -79,8 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observable relief can still fence a healthy voter on very slow storage.
   Planner fallbacks have a value-free diagnostic counter.
   Shutdown cancels the wait without fencing the WAL or discarding
-  accepted WAL work. Terminal storage fences require supervised process
-  restart; automatic fatal-error exit is tracked separately in #1127.
+  accepted WAL work. On a terminal storage fence, the reference voter exits
+  with code 74 so its supervisor restarts it and recovery re-audits and replays
+  the durable state.
 
 - Hosted CI runs on Linux only: the macOS host lane, FreeBSD GTP-U cross-lint
   lane and Darwin runtime cross-lint step were removed in #1116. Retained

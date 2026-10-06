@@ -67,6 +67,18 @@ use crate::lease::SessionLeaseManager;
 use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
 use crate::record::EncryptedSessionPayload;
 
+/// Fence the live native owner through the production terminal-failure path.
+/// Durable files are untouched, so the next process can audit and replay them.
+#[cfg(target_os = "linux")]
+pub fn fence_consensus_storage_for_test(store: &ConsensusSessionStore) -> std::io::Result<()> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("native storage is absent"))?
+        .fence_for_test()
+}
+
 /// Clear only the application-admission latch on a real initialized store.
 ///
 /// This models the state left by an initialization attempt before readmission.

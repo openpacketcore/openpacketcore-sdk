@@ -7,6 +7,9 @@ mod void_tests;
 #[path = "sequential_wal_sdk_tests/scoped_reads.rs"]
 mod scoped_reads;
 
+#[path = "sequential_wal_sdk_tests/terminal_failure.rs"]
+mod terminal_failure;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
