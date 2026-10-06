@@ -16,7 +16,7 @@ pub(super) struct Target {
 }
 
 impl Target {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-control"))]
     pub(super) fn requested(state: &State) -> io::Result<Self> {
         let native = state
             .native
@@ -67,10 +67,110 @@ pub(super) fn needed(state: &State, disk: &Disk, limits: Limits) -> bool {
     state.status == Status::Running
         && !state.native_install_pending
         && state.sequence > state.base_sequence
-        && (state.sequence - state.base_sequence >= limits.history_count.div_ceil(4) as u64
+        && (state.native.as_ref().is_some_and(|native| {
+            native.business.changed_verification_bytes() >= JOURNAL_TRIGGER_BYTES
+        }) || state.sequence - state.base_sequence >= limits.history_count.div_ceil(4) as u64
             || state.history_bytes >= limits.history_bytes.div_ceil(4)
             || disk.segment - disk.base_position().segment >= limits.segments.div_ceil(4) as u64)
 }
+
+// These are process-local scheduling bounds, independent of the protocol's
+// reclaim batch and transport delivery. A captured journal keeps its charge
+// in VerificationMemory; allowing a second live journal does not refund it.
+// Partition the real 128 MiB cap: 1/4 for the existing optional journal-read
+// page pool, 1/8 for checkpoint/apply workspace, leaving 80 MiB at retirement
+// admission. The 16 MiB workspace matches the large-log decoder scheduling
+// threshold; ordinary reclaim scratch is much smaller (80 KiB capture,
+// 512 KiB generation header, two prefix-block buffers, and relocation only
+// for emitted log rows). It is an allowance, not a worst-case payload bound.
+// A 1/16-cap trigger starts draining after about 60 single-command
+// journals (1024*72 + 64 KiB + publication metadata ~= 137 KiB each).
+// The live stop is three triggers: 24 MiB leaves room for a second captured
+// journal of that size and 32 MiB of baseline/candidate within the 80 MiB line.
+// These are scheduling allowances, not caps on consumer writes or log/roster
+// journals. See docs/sdk-1122-reclaim-memory-evidence.md for the mixed-load gap.
+const JOURNAL_TRIGGER_BYTES: usize =
+    crate::consensus::verified_snapshot::PROCESS_VERIFICATION_BYTES / 16;
+const JOURNAL_STOP_BYTES: usize = 3 * JOURNAL_TRIGGER_BYTES;
+const CONSUMER_HEADROOM_BYTES: usize =
+    crate::consensus::verified_snapshot::PROCESS_VERIFICATION_BYTES / 4;
+const CHECKPOINT_AND_APPLY_BYTES: usize =
+    crate::consensus::verified_snapshot::PROCESS_VERIFICATION_BYTES / 8;
+const RETIREMENT_ADMISSION_BYTES: usize =
+    crate::consensus::verified_snapshot::PROCESS_VERIFICATION_BYTES
+        - CONSUMER_HEADROOM_BYTES
+        - CHECKPOINT_AND_APPLY_BYTES;
+
+pub(super) fn manages_retirement(state: &State) -> bool {
+    state.asynchronous.is_none() && !state.volatile_mode()
+}
+
+pub(super) fn retirement_ready(state: &State, candidate_bytes: usize) -> bool {
+    use crate::consensus::verified_snapshot::VerificationMemory;
+    // Asynchronous persistence has a separate writer/admission lifecycle.
+    // Its existing reservation and extent gates remain authoritative.
+    candidate_bytes == 0
+        || !manages_retirement(state)
+        || (state.native.as_ref().is_some_and(|native| {
+            native.business.changed_verification_bytes() < JOURNAL_STOP_BYTES
+        }) && VerificationMemory::used_bytes()
+            .checked_add(candidate_bytes)
+            .is_some_and(|bytes| bytes <= RETIREMENT_ADMISSION_BYTES))
+}
+
+pub(super) fn retirement_shortfall(candidate_bytes: usize) -> usize {
+    crate::consensus::verified_snapshot::VerificationMemory::used_bytes()
+        .saturating_add(candidate_bytes)
+        .saturating_sub(RETIREMENT_ADMISSION_BYTES)
+}
+
+pub(super) fn reserve_retirement(
+    candidate_bytes: usize,
+) -> Option<crate::consensus::verified_snapshot::VerificationMemory> {
+    crate::consensus::verified_snapshot::VerificationMemory::try_reserve_keeping(
+        candidate_bytes,
+        CONSUMER_HEADROOM_BYTES + CHECKPOINT_AND_APPLY_BYTES,
+    )
+}
+
+// A journal capture already in progress owns its own wakeup. Repeated
+// polls must never schedule empty or unhelpful generations, or interfere
+// with installation. Consumer writes can refill a journal while unrelated
+// owners keep admission closed; draining that journal must be able to reach
+// the admission line, unless the journal itself has reached its stop.
+pub(super) fn request_retirement_checkpoint(state: &mut State, candidate_bytes: usize) -> bool {
+    use crate::consensus::verified_snapshot::VerificationMemory;
+    if state.status != Status::Running
+        || state.retirement_stopped
+        || state.snapshot.is_some()
+        || state.native_install_pending
+        || state.native_basis_active
+        || state.checkpoint_requested
+    {
+        return false;
+    }
+    let journal_bytes = state
+        .native
+        .as_ref()
+        .map_or(0, |native| native.business.changed_verification_bytes());
+    let can_admit_after_capture = VerificationMemory::used_bytes()
+        .saturating_sub(journal_bytes)
+        .checked_add(candidate_bytes)
+        .is_some_and(|bytes| bytes <= RETIREMENT_ADMISSION_BYTES);
+    if journal_bytes == 0 || (journal_bytes < JOURNAL_STOP_BYTES && !can_admit_after_capture) {
+        return false;
+    }
+    state.checkpoint_requested = true;
+    true
+}
+
+// Allow one shared durable-operation budget (currently 10 s) without a lower
+// admission shortfall or live-journal size. Completion alone does not renew it;
+// a successful reservation ends that pressure episode. A single checkpoint or
+// relocation drain taking longer than 10 s without observable relief can still
+// fence a healthy voter on very slow storage.
+pub(super) const RETIREMENT_WAIT_TIMEOUT: Duration =
+    opc_consensus::DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 struct Capture {
     changes: crate::consensus::native::NativeChanges,
@@ -332,6 +432,13 @@ impl Owner {
                 "native basis capture is not a drained selected cut",
             ));
         }
+        #[cfg(feature = "test-control")]
+        if native.business.changed_verification_bytes() >= JOURNAL_TRIGGER_BYTES {
+            eprintln!(
+                "native_retirement_memory_checkpoint bytes={}",
+                native.business.changed_verification_bytes()
+            );
+        }
         let durable_cut = *state
             .durable_cuts
             .get(&disk.sequence)
@@ -524,6 +631,7 @@ fn prepare(
     control: &IoControl,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<Prepared> {
+    (control.hook)(Point::AfterNativeGenerationCapture)?;
     let Capture {
         changes,
         binding,

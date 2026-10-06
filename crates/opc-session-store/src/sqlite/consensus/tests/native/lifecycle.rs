@@ -1,7 +1,7 @@
 use super::*;
 use crate::consensus::native::lifecycle_tests as native_fixture;
 
-fn maintenance(
+pub(super) fn maintenance(
     index: u64,
     history: FencedTransitionV2HistoryState,
     now: Timestamp,

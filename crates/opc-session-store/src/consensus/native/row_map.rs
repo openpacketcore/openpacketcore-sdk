@@ -54,6 +54,20 @@ pub(super) struct RowMap<K, V> {
     rows: imbl::HashMap<Stored<K, V>, ()>,
 }
 
+/// Shares the complete existing key/value allocation without pinning other
+/// trie paths or copying inline receipt metadata into a change journal.
+pub(super) struct CapturedRow<K, V>(Arc<(K, V)>);
+
+impl<K, V> CapturedRow<K, V> {
+    pub(super) fn key(&self) -> &K {
+        &self.0 .0
+    }
+
+    pub(super) fn value(&self) -> &V {
+        &self.0 .1
+    }
+}
+
 impl<K, V> Clone for RowMap<K, V> {
     fn clone(&self) -> Self {
         Self {
@@ -106,6 +120,12 @@ impl<K, V> RowMap<K, V> {
 }
 
 impl<K: Hash + Eq, V> RowMap<K, V> {
+    pub(super) fn capture_row(&self, key: &K) -> Option<CapturedRow<K, V>> {
+        self.rows
+            .get_key_value(key)
+            .map(|(row, ())| CapturedRow(Arc::clone(&row.0)))
+    }
+
     pub(super) fn get(&self, key: &K) -> Option<&V> {
         self.rows.get_key_value(key).map(|(row, ())| &row.0 .1)
     }

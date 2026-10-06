@@ -24,6 +24,41 @@ const DIGEST_BYTES: usize = 32;
 const MAX_BLOCKS: usize = MAX_INDEX_BYTES / DIGEST_BYTES;
 pub(crate) const PROCESS_VERIFICATION_BYTES: usize = 128 * 1024 * 1024;
 static VERIFICATION_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-control"))]
+static VERIFICATION_PEAK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "test-control")]
+static PEAK_DIAGNOSTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-control"))]
+static RETIREMENT_PEAK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-control"))]
+static RETIREMENT_PHASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn record_peak(counter: &'static AtomicUsize, bytes: usize) {
+    #[cfg(any(test, feature = "test-control"))]
+    if std::ptr::eq(counter, &VERIFICATION_BYTES) {
+        if RETIREMENT_PHASE.load(Ordering::Acquire) {
+            let previous = RETIREMENT_PEAK.fetch_max(bytes, Ordering::AcqRel);
+            #[cfg(feature = "test-control")]
+            if bytes > previous && PEAK_DIAGNOSTICS.load(Ordering::Acquire) {
+                eprintln!(
+                    "native_retirement_peak bytes={bytes} limit={PROCESS_VERIFICATION_BYTES}"
+                );
+            }
+            #[cfg(not(feature = "test-control"))]
+            let _ = previous;
+        }
+        let previous = VERIFICATION_PEAK.fetch_max(bytes, Ordering::AcqRel);
+        #[cfg(feature = "test-control")]
+        if bytes > previous && PEAK_DIAGNOSTICS.load(Ordering::Acquire) {
+            eprintln!("native_verification_peak bytes={bytes} limit={PROCESS_VERIFICATION_BYTES}");
+        }
+        #[cfg(not(feature = "test-control"))]
+        let _ = previous;
+    }
+    #[cfg(not(any(test, feature = "test-control")))]
+    let _ = (counter, bytes);
+}
 
 // Optional journal-page construction must not consume the whole verifier.
 // This is a local admission policy, not a wire/page-cardinality limit. The
@@ -69,14 +104,117 @@ impl JournalPageMemory {
 pub(crate) struct VerificationMemory {
     bytes: usize,
     counter: &'static AtomicUsize,
+    #[cfg(test)]
+    refund_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl VerificationMemory {
+    /// Scale fixtures opt in before opening storage. Ordinary test-control
+    /// users retain their existing stderr contract; accounting is always on.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn enable_peak_diagnostics_for_test() {
+        if !PEAK_DIAGNOSTICS.swap(true, Ordering::AcqRel) {
+            let peak = VERIFICATION_PEAK.load(Ordering::Acquire);
+            eprintln!("native_verification_peak bytes={peak} limit={PROCESS_VERIFICATION_BYTES}");
+        }
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn usage_for_test() -> [usize; 3] {
+        [
+            Self::used_bytes(),
+            VERIFICATION_PEAK.load(Ordering::Acquire),
+            PROCESS_VERIFICATION_BYTES,
+        ]
+    }
+
+    /// A separate phase maximum; never reset the lifetime counter or its cap.
+    /// Repeated calls after restart setup are idempotent, retaining cold-open peaks.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn begin_retirement_phase_for_test() {
+        if !RETIREMENT_PHASE.swap(true, Ordering::AcqRel) {
+            let used = Self::used_bytes();
+            RETIREMENT_PEAK.fetch_max(used, Ordering::AcqRel);
+            #[cfg(feature = "test-control")]
+            if PEAK_DIAGNOSTICS.load(Ordering::Acquire) {
+                eprintln!("native_verification_phase retirement used={used}");
+                eprintln!("native_retirement_peak bytes={used} limit={PROCESS_VERIFICATION_BYTES}");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement_peak_for_test() -> usize {
+        RETIREMENT_PEAK.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn used_bytes() -> usize {
+        VERIFICATION_BYTES.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Optional work takes its allocation allowance atomically while leaving
+    /// capacity for independent consumers and the owner which drains it.
+    /// Pressure is a scheduling result, not a verification failure.
+    pub(crate) fn try_reserve_keeping(bytes: usize, headroom: usize) -> Option<Self> {
+        let limit = PROCESS_VERIFICATION_BYTES.checked_sub(headroom)?;
+        let mut used = VERIFICATION_BYTES.load(Ordering::Acquire);
+        loop {
+            let next = used.checked_add(bytes).filter(|total| *total <= limit)?;
+            match VERIFICATION_BYTES.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    record_peak(&VERIFICATION_BYTES, next);
+                    return Some(Self {
+                        bytes,
+                        counter: &VERIFICATION_BYTES,
+                        #[cfg(test)]
+                        refund_probe: None,
+                    });
+                }
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_refund_for_test(&mut self, probe: impl Fn() + Send + Sync + 'static) {
+        self.refund_probe = Some(Arc::new(probe));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes_for_test(&self) -> usize {
+        self.bytes
+    }
+
+    #[cfg_attr(feature = "test-control", track_caller)]
     pub(crate) fn reserve(bytes: usize) -> io::Result<Self> {
         Self::reserve_from(&VERIFICATION_BYTES, bytes, PROCESS_VERIFICATION_BYTES)
     }
 
-    /// Release only scratch which its owner has already destroyed. This
+    /// Divide an existing charge between owners without refunding or acquiring
+    /// any bytes. Each owner must outlive the allocations assigned to it.
+    pub(crate) fn split_off(&mut self, bytes: usize) -> io::Result<Self> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| io::Error::other("verification reservation split exceeds its owner"))?;
+        Ok(Self {
+            bytes,
+            counter: self.counter,
+            #[cfg(test)]
+            refund_probe: self.refund_probe.clone(),
+        })
+    }
+
+    /// Release destroyed scratch or allowance that was never allocated. This
     /// cannot acquire memory, transfer a reservation, or exceed the original
     /// process cap. The remaining allocation keeps this same counter owner.
     pub(crate) fn shrink_to(&mut self, bytes: usize) -> io::Result<()> {
@@ -84,8 +222,25 @@ impl VerificationMemory {
             .bytes
             .checked_sub(bytes)
             .ok_or_else(|| io::Error::other("verification reservation cannot grow by shrinking"))?;
+        #[cfg(test)]
+        if released != 0 {
+            if let Some(probe) = &self.refund_probe {
+                probe();
+            }
+        }
         self.bytes = bytes;
         self.counter.fetch_sub(released, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Charge an underestimated inventory before allocating its exact buffer.
+    pub(crate) fn grow_to(&mut self, bytes: usize) -> io::Result<()> {
+        if let Some(extra) = bytes.checked_sub(self.bytes) {
+            let mut additional =
+                Self::reserve_from(self.counter, extra, PROCESS_VERIFICATION_BYTES)?;
+            self.bytes = bytes;
+            additional.bytes = 0; // Move the new charge without refunding it.
+        }
         Ok(())
     }
 
@@ -98,30 +253,48 @@ impl VerificationMemory {
         Self::reserve_from(counter, bytes, limit)
     }
 
+    #[cfg_attr(feature = "test-control", track_caller)]
     fn reserve_from(counter: &'static AtomicUsize, bytes: usize, limit: usize) -> io::Result<Self> {
         let mut used = counter.load(Ordering::Acquire);
         loop {
             let Some(next) = used.checked_add(bytes).filter(|total| *total <= limit) else {
                 #[cfg(feature = "test-control")]
                 eprintln!(
-                    "verification_memory_admission_failure used={} requested={} limit={}",
-                    used, bytes, limit,
+                    "verification_memory_admission_failure used={} requested={} limit={} source={}",
+                    used,
+                    bytes,
+                    limit,
+                    std::panic::Location::caller(),
                 );
                 return Err(io::Error::other(
                     "portable snapshot verification memory limit reached",
                 ));
             };
             match counter.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
+                Ok(_) => {
+                    record_peak(counter, next);
+                    break;
+                }
                 Err(observed) => used = observed,
             }
         }
-        Ok(Self { bytes, counter })
+        Ok(Self {
+            bytes,
+            counter,
+            #[cfg(test)]
+            refund_probe: None,
+        })
     }
 }
 
 impl Drop for VerificationMemory {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.bytes != 0 {
+            if let Some(probe) = &self.refund_probe {
+                probe();
+            }
+        }
         self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
@@ -494,6 +667,24 @@ mod journal_page_memory_tests;
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn verification_reservation_split_preserves_total_until_each_owner_drops() {
+        static USED: AtomicUsize = AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(|| {
+            let mut retained = VerificationMemory::reserve_from(&USED, 90, 100).unwrap();
+            let scratch = retained.split_off(30).unwrap();
+            assert_eq!(USED.load(Ordering::Acquire), 90);
+            assert!(retained.split_off(61).is_err());
+            assert_eq!(USED.load(Ordering::Acquire), 90);
+            assert!(VerificationMemory::reserve_from(&USED, 11, 100).is_err());
+            drop(scratch);
+            assert_eq!(USED.load(Ordering::Acquire), 60);
+            panic!("release retained owner during unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(USED.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn verification_reservations_are_bounded_and_released() {

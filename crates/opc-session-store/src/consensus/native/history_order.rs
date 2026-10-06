@@ -54,6 +54,17 @@ pub(super) struct ReceiptOrder {
 }
 
 impl ReceiptOrder {
+    pub(super) const fn clone_metadata_bytes() -> usize {
+        (crate::fenced_transition::FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
+            * std::mem::size_of::<Epoch>()
+    }
+
+    pub(super) fn ranges(&self) -> impl Iterator<Item = (u64, u64, usize)> + '_ {
+        self.epochs
+            .iter()
+            .map(|epoch| (epoch.epoch.get(), epoch.first, epoch.rows.len()))
+    }
+
     pub(super) fn preparing(history: Option<FencedTransitionV2HistoryState>) -> io::Result<Self> {
         let epochs = lifecycle::ranges(history)?
             .into_iter()

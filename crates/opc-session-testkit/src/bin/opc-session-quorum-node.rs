@@ -419,14 +419,23 @@ struct QualificationNode {
     roster_attestation_root: RosterAttestationTrustRootV1,
     fixed_consensus_identity: SessionConsensusIdentity,
     isolated_scale: Option<QualificationIsolatedScaleConfig>,
+    isolated_scale_clock: Option<Arc<IsolatedScaleClock>>,
 }
 
 #[derive(Debug)]
-struct IsolatedScaleClock(Timestamp);
+struct IsolatedScaleClock {
+    initial: Timestamp,
+    after_retention: Timestamp,
+    expired: AtomicBool,
+}
 
 impl opc_session_store::Clock for IsolatedScaleClock {
     fn now_utc(&self) -> Timestamp {
-        self.0
+        if self.expired.load(Ordering::Acquire) {
+            self.after_retention
+        } else {
+            self.initial
+        }
     }
 }
 
@@ -1430,6 +1439,23 @@ impl QualificationNode {
         } else {
             None
         };
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        if config.isolated_scale.is_some_and(|scale| {
+            scale.workload
+                == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::BoundaryControl
+                && scale.persistence.store_mode()
+                    == opc_session_store::SessionPersistenceMode::Durable
+        }) {
+            opc_session_store::test_support::enable_native_verification_peak_diagnostics_for_test();
+        }
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        if config
+            .workspace_directory
+            .join("reclaim-retirement-phase")
+            .exists()
+        {
+            opc_session_store::test_support::begin_native_retirement_phase_for_test();
+        }
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
         #[cfg(all(target_os = "linux", feature = "test-control"))]
@@ -1446,6 +1472,35 @@ impl QualificationNode {
                 }
             }).map_err(|_| NodeFailure)?;
         }
+        let mut isolated_scale_clock = None;
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        if config.isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::BoundaryControl
+                && scale.persistence.store_mode() == opc_session_store::SessionPersistenceMode::Durable
+        }) {
+            let armed = config.workspace_directory.join(format!("reclaim-cut-{}", config.node_index));
+            let entered = armed.with_extension("entered");
+            backend.set_native_checkpoint_hook_for_test(move |cut| {
+                let requested = match std::fs::read_to_string(&armed) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                if requested != cut { return Ok(()); }
+                let [used, peak, limit] = opc_session_store::test_support::native_verification_memory_for_test();
+                eprintln!("native_verification_reservations used={used} peak={peak} limit={limit} cut={cut}");
+                std::fs::write(&entered, cut)?;
+                let started = std::time::Instant::now();
+                while armed.try_exists()? {
+                    if started.elapsed() > Duration::from_secs(30) {
+                        std::fs::write(armed.with_extension("timed_out"), cut)?;
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "qualification checkpoint cut was not released"));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            }).map_err(|_| NodeFailure)?;
+        }
         let store = Arc::new(if let Some(scale) = config.isolated_scale {
             let logical_time = time::OffsetDateTime::from_unix_timestamp(
                 QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
@@ -1456,7 +1511,18 @@ impl QualificationNode {
             {
                 Arc::new(SystemClock)
             } else {
-                Arc::new(IsolatedScaleClock(Timestamp::from_offset_datetime(logical_time)))
+                let initial = Timestamp::from_offset_datetime(logical_time);
+                let clock = Arc::new(IsolatedScaleClock {
+                    initial,
+                    after_retention: initial
+                        .add_seconds(opc_session_store::fenced_transition::FENCED_TRANSITION_OUTCOME_RETENTION.as_secs() as i64 + 1)
+                        .ok_or(NodeFailure)?,
+                    expired: AtomicBool::new(false),
+                });
+                if scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::BoundaryControl {
+                    isolated_scale_clock = Some(Arc::clone(&clock));
+                }
+                clock
             };
             ConsensusSessionStore::open_fixed_quorum_with_snapshot_directory(
                 topology,
@@ -1566,6 +1632,7 @@ impl QualificationNode {
         );
         Ok(Self {
             isolated_scale: config.isolated_scale,
+            isolated_scale_clock,
             store,
             protected,
             server: Some(server),
@@ -1989,6 +2056,34 @@ impl QualificationNode {
                 QualificationNodeReply::ShuttingDown
             }
             QualificationNodeCommand::IsolatedScaleProbe => self.isolated_scale_probe().await,
+            QualificationNodeCommand::IsolatedScaleCheckpoint => {
+                #[cfg(all(target_os = "linux", feature = "test-control"))]
+                {
+                    if self.isolated_scale.is_none() {
+                        return invalid_request_reply();
+                    }
+                    let store = Arc::clone(&self.store);
+                    match tokio::task::spawn_blocking(move || {
+                        opc_session_store::test_support::checkpoint_native_for_test(&store)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => QualificationNodeReply::IsolatedScaleCheckpointCompleted,
+                        _ => invalid_request_reply(),
+                    }
+                }
+                #[cfg(not(all(target_os = "linux", feature = "test-control")))]
+                invalid_request_reply()
+            }
+            QualificationNodeCommand::IsolatedScaleExpireHistoryClock => {
+                #[cfg(all(target_os = "linux", feature = "test-control"))]
+                opc_session_store::test_support::begin_native_retirement_phase_for_test();
+                let Some(clock) = &self.isolated_scale_clock else {
+                    return invalid_request_reply();
+                };
+                clock.expired.store(true, Ordering::Release);
+                QualificationNodeReply::IsolatedScaleHistoryClockExpired
+            }
             QualificationNodeCommand::IsolatedScaleHistoryState => {
                 if self.isolated_scale.is_none() {
                     return invalid_request_reply();
@@ -3256,6 +3351,12 @@ impl QualificationNode {
     }
 
     async fn isolated_scale_probe(&self) -> QualificationNodeReply {
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        {
+            let [used, peak, limit] =
+                opc_session_store::test_support::native_verification_memory_for_test();
+            eprintln!("native_verification_reservations used={used} peak={peak} limit={limit}");
+        }
         let Some(scale) = self.isolated_scale else {
             return invalid_request_reply();
         };

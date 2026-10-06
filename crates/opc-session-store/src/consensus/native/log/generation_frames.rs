@@ -38,6 +38,14 @@ impl NativeLog {
 }
 
 impl CapturedLog {
+    pub(in crate::consensus::native) fn relocation_count(&self) -> usize {
+        self.changes
+            .rows
+            .values()
+            .filter(|change| change.after.is_some())
+            .count()
+    }
+
     pub(in crate::consensus::native) fn generation_starts_at(
         &self,
         version: &GenerationLogVersion,

@@ -1030,6 +1030,22 @@ impl SqliteSessionBackend {
             .map_err(|_| StoreError::TopologyAuthorityRevoked)
     }
 
+    /// Install a test-only checkpoint cut hook before native construction.
+    /// The closed vocabulary is capture, before_append, append and selection;
+    /// every callback observes the production path without replacing it.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+    #[doc(hidden)]
+    pub fn set_native_checkpoint_hook_for_test(
+        &self,
+        hook: impl Fn(&'static str) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Result<(), StoreError> {
+        self.native_owner
+            .as_ref()
+            .ok_or(StoreError::TopologyAuthorityRevoked)?
+            .set_checkpoint_hook_for_test(Arc::new(hook))
+            .map_err(|_| StoreError::TopologyAuthorityRevoked)
+    }
+
     /// Open (or create) a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with_fenced_transition_v2_profile(path, crate::FencedTransitionV2Profile::V2)
@@ -3478,6 +3494,39 @@ impl SqliteSessionBackend {
                 })
         })
         .await
+    }
+
+    /// Optional history maintenance yields before consensus ordering when a
+    /// native checkpoint needs to drain its captured verification allocations.
+    pub(crate) async fn consensus_admit_history_maintenance(
+        &self,
+        deadline: tokio::time::Instant,
+        still_leader: impl Fn() -> bool,
+    ) -> Result<(), StoreError> {
+        #[cfg(target_os = "linux")]
+        loop {
+            if !still_leader() {
+                return Err(native::unavailable());
+            }
+            let ready = self.native_read(|wal| wal.native_retirement_ready());
+            if ready
+                .transpose()
+                .map_err(|_| native::unavailable())?
+                .unwrap_or(true)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(native::unavailable());
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(20)),
+            )
+            .await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (deadline, still_leader);
+        Ok(())
     }
 
     /// Read the durable V2 history lifecycle after a caller-owned barrier.

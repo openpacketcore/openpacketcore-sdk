@@ -2022,6 +2022,10 @@ async fn shutdown_consensus_session_store(
 ) -> Result<(), StoreError> {
     #[cfg(not(target_os = "linux"))]
     let _ = allow_closed_proof;
+    #[cfg(target_os = "linux")]
+    if let Some(wal) = inner.private_wal.as_ref() {
+        wal.stop_retirement_waits();
+    }
     match (
         inner.consensus_log_prune_lane.as_ref(),
         inner.proactive_checkpoint_lane.as_ref(),
@@ -5868,6 +5872,23 @@ impl ConsensusSessionStore {
     /// method is deliberately absent from the stateless consumer and
     /// forwarding surfaces; raw maintenance intents remain rejected unless
     /// this local boundary supplies the internal authority marker.
+    ///
+    /// Under verification-memory pressure this polls admission for up to the
+    /// operation timeout, sharing that deadline with the proposal. It may
+    /// return `BackendUnavailable` after waiting, including on leadership
+    /// loss. Retry using the current history state and the usual timeout policy.
+    ///
+    /// After commit, pressure can wait longer while the admission shortfall
+    /// or live journal reaches a new low. Checkpoint completion alone does not
+    /// renew the ten-second inactivity bound. A single checkpoint or relocation
+    /// drain exceeding ten seconds without that relief can fence a healthy
+    /// voter on very slow storage. A successful reservation resets the wait;
+    /// shutdown cancels it without fencing the WAL or its accepted drain.
+    /// A storage fence is terminal for the embedding process: it must exit
+    /// non-zero so its supervisor restarts it and recovery re-audits/replays.
+    /// Automatic fatal-error exit is tracked separately in
+    /// [issue #1127](https://github.com/openpacketcore/openpacketcore-sdk/issues/1127);
+    /// this method does not restart the process or reopen a fenced store.
     pub async fn maintain_fenced_transition_v2_history(
         &self,
         expected_state: FencedTransitionV2HistoryState,
@@ -5881,6 +5902,12 @@ impl ConsensusSessionStore {
         if self.inner.raft.metrics().borrow().current_leader != Some(self.inner.local_node_id) {
             return Err(consensus_unavailable());
         }
+        self.inner
+            .backend
+            .consensus_admit_history_maintenance(deadline, || {
+                self.inner.raft.metrics().borrow().current_leader == Some(self.inner.local_node_id)
+            })
+            .await?;
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {

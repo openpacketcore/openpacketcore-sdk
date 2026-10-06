@@ -5363,6 +5363,10 @@ pub enum QualificationNodeCommandKind {
     IsolatedScaleHistoryState,
     /// Invoke public local-operator maintenance in an explicit scale fleet.
     IsolatedScaleMaintainHistory,
+    /// Advance only the boundary fixture's receipt-retention clock.
+    IsolatedScaleExpireHistoryClock,
+    /// Request an ordinary native checkpoint at an opt-in crash cut.
+    IsolatedScaleCheckpoint,
 }
 
 impl QualificationNodeCommandKind {
@@ -5412,6 +5416,8 @@ impl QualificationNodeCommandKind {
         Self::IsolatedScaleProbe,
         Self::IsolatedScaleHistoryState,
         Self::IsolatedScaleMaintainHistory,
+        Self::IsolatedScaleExpireHistoryClock,
+        Self::IsolatedScaleCheckpoint,
     ];
 }
 
@@ -5566,6 +5572,11 @@ pub enum QualificationNodeCommand {
     IsolatedScaleMaintainHistory {
         expected_state: opc_session_store::FencedTransitionV2HistoryState,
     },
+    /// Move the boundary fixture's logical clock past one receipt-retention
+    /// window. Idempotent; real scheduling, deadlines and TLS time are unchanged.
+    IsolatedScaleExpireHistoryClock,
+    /// Join an ordinary native checkpoint; available only to explicit scale fixtures.
+    IsolatedScaleCheckpoint,
 }
 
 impl fmt::Debug for QualificationNodeCommand {
@@ -5706,6 +5717,12 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::IsolatedScaleMaintainHistory { .. } => {
                 formatter.write_str("QualificationNodeCommand::IsolatedScaleMaintainHistory")
             }
+            Self::IsolatedScaleExpireHistoryClock => {
+                formatter.write_str("QualificationNodeCommand::IsolatedScaleExpireHistoryClock")
+            }
+            Self::IsolatedScaleCheckpoint => {
+                formatter.write_str("QualificationNodeCommand::IsolatedScaleCheckpoint")
+            }
         }
     }
 }
@@ -5790,6 +5807,10 @@ impl QualificationNodeCommand {
             Self::IsolatedScaleMaintainHistory { .. } => {
                 QualificationNodeCommandKind::IsolatedScaleMaintainHistory
             }
+            Self::IsolatedScaleExpireHistoryClock => {
+                QualificationNodeCommandKind::IsolatedScaleExpireHistoryClock
+            }
+            Self::IsolatedScaleCheckpoint => QualificationNodeCommandKind::IsolatedScaleCheckpoint,
         }
     }
 
@@ -5828,6 +5849,8 @@ impl QualificationNodeCommand {
             | Self::IsolatedScaleProbe
             | Self::IsolatedScaleHistoryState
             | Self::IsolatedScaleMaintainHistory { .. }
+            | Self::IsolatedScaleExpireHistoryClock
+            | Self::IsolatedScaleCheckpoint
             | Self::StatelessConsumerAdmissionStatus => Ok(()),
             Self::StartStatelessConsumer {
                 consumer_identities,
@@ -6156,6 +6179,10 @@ pub enum QualificationNodeReply {
     IsolatedScaleHistory {
         state: opc_session_store::FencedTransitionV2HistoryState,
     },
+    /// The boundary fixture's logical clock crossed its retention window.
+    IsolatedScaleHistoryClockExpired,
+    /// The ordinary checkpoint completed without an injected crash.
+    IsolatedScaleCheckpointCompleted,
     Bound {
         node_index: usize,
         bind_addr: SocketAddr,
@@ -8535,6 +8562,8 @@ mod tests {
                     None, None, 0, 0, 1, 0,
                 ).expect("bounded expected history"),
             },
+            QualificationNodeCommand::IsolatedScaleExpireHistoryClock,
+            QualificationNodeCommand::IsolatedScaleCheckpoint,
         ];
         let kinds = commands
             .iter()

@@ -139,6 +139,16 @@ fn ordinary_notification_payload(op: &ReplicationOp) -> io::Result<usize> {
 }
 
 impl BusinessChanges {
+    pub(in crate::consensus::native) fn relocation_count(&self) -> io::Result<usize> {
+        self.receipts
+            .values()
+            .filter(|change| change.after.is_some())
+            .count()
+            .checked_add(self.notifications.len())
+            .and_then(|count| count.checked_add(self.roster.relocation_count()))
+            .ok_or_else(|| invalid("native business relocation count overflow"))
+    }
+
     pub(in crate::consensus::native) fn generation_roster_counts(&self) -> [usize; 2] {
         self.roster.generation_counts()
     }
@@ -178,7 +188,7 @@ impl BusinessChanges {
     pub(in crate::consensus::native) fn generation_counts(&self, logs: usize) -> [usize; 5] {
         [
             self.keys.len(),
-            self.receipts.len(),
+            self.receipts.len() + self.deleted_rows,
             self.generic.len(),
             self.notifications.len(),
             logs,
@@ -195,6 +205,18 @@ impl BusinessChanges {
             writer.write_all(&[0])?;
             frame::write_before(writer, change.before_hash.map(|stamp| stamp.content))?;
             frame::write_binary(writer, &(key, change.after.as_deref()))?;
+        }
+        for deleted in &self.deletions {
+            deleted.for_each(|id, _, _, hash| {
+                check()?;
+                if !self.receipts.contains_key(&id) {
+                    writer.write_all(&[1])?;
+                    frame::write_before(writer, hash.map(|stamp| stamp.content))?;
+                    writer.write_all(&id.to_bytes())?;
+                    writer.write_all(&[0])?;
+                }
+                Ok(())
+            })?;
         }
         for (id, change) in self
             .receipts
@@ -255,6 +277,18 @@ impl BusinessChanges {
                     reader,
                     &(key, change.after.as_deref()),
                 )
+            })?;
+        }
+        for deleted in &self.deletions {
+            deleted.for_each(|id, _, _, hash| {
+                check()?;
+                if !self.receipts.contains_key(&id) {
+                    frame::expect(reader, &[1])?;
+                    frame::expect_before(reader, hash.map(|stamp| stamp.content))?;
+                    frame::expect(reader, &id.to_bytes())?;
+                    frame::expect(reader, &[0])?;
+                }
+                Ok(())
             })?;
         }
         for (id, change) in self

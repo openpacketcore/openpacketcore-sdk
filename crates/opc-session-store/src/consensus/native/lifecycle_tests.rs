@@ -299,8 +299,7 @@ fn native_history_reclaim_omitted_changed_receipt_fails_before_atomic_publicatio
         delta.receipt_removals.len(),
         FENCED_TRANSITION_V2_RECLAIM_BATCH
     );
-    let removed = *delta.receipt_removals.iter().next().unwrap();
-    delta.receipt_removals.remove(&removed);
+    delta.receipt_removals.omit_first_for_test();
     assert!(changes::Publication::prepare(delta).is_err());
     assert!(std::sync::Arc::ptr_eq(
         &proof,

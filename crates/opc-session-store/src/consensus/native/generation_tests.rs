@@ -8,6 +8,98 @@ const BLOCK: usize = 64 * 1024;
 const ROOT: [u8; 32] = [0xBD; 32];
 
 #[test]
+fn native_reclaim_memory_deleted_rows_are_verified_without_relocation_capacity() {
+    deleted_rows_are_verified_without_relocation_capacity(false);
+}
+
+#[test]
+fn native_reclaim_memory_void_deletions_are_verified_without_relocation_capacity() {
+    deleted_rows_are_verified_without_relocation_capacity(true);
+}
+
+fn deleted_rows_are_verified_without_relocation_capacity(void: bool) {
+    use crate::consensus::native::lifecycle_tests::{maintenance, seed};
+    use crate::fenced_transition::{
+        FencedTransitionV2HistoryEpoch, FENCED_TRANSITION_V2_RECLAIM_BATCH,
+    };
+    let profile = if void {
+        crate::FencedTransitionV2Profile::V2WithVoid
+    } else {
+        crate::FencedTransitionV2Profile::V2
+    };
+    let (mut storage, _, previous) = super::super::changes::tests::fixture_with_profile(profile);
+    let (now, response) = if void {
+        let entry = super::super::changes::tests::void_command(
+            2,
+            &request(2, Some(&previous)),
+            time(2),
+            false,
+        );
+        let response = apply(&mut storage, &[entry]).responses.remove(0);
+        assert_eq!(
+            response.result,
+            Err(crate::StoreError::FencedTransitionVoided)
+        );
+        ("2026-08-12T00:00:00Z".parse().unwrap(), Some(response))
+    } else {
+        (time(10), None)
+    };
+    let remaining = FENCED_TRANSITION_V2_RECLAIM_BATCH;
+    let epoch = |value| FencedTransitionV2HistoryEpoch::new(value).unwrap();
+    let history = FencedTransitionV2HistoryState::new(
+        Some(epoch(2)),
+        Some(epoch(1)),
+        Some(epoch(1)),
+        remaining,
+        1,
+        0,
+        (FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - remaining) as u64,
+    )
+    .unwrap();
+    seed(&mut storage, history, now, response, false);
+    let mut file = FileFixture::new(&storage);
+    storage.begin_changes().unwrap();
+    let entry = maintenance(&storage, storage.business.applied().unwrap().index + 1, now);
+    apply(&mut storage, &[entry]);
+    let delta = PreparedDelta::prepare(
+        file.owner.current(),
+        &file.version,
+        12,
+        20,
+        [0xF2; 32],
+        storage.take_changes().unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(delta.header.changed[1], remaining);
+    let bytes = encode(&delta);
+    delta
+        .verify_payload(&mut bytes.as_slice(), &|| Ok(()), None)
+        .unwrap();
+    let mut changed = bytes.clone();
+    let id = crate::consensus::native::lifecycle_tests::synthetic_id(1, 131_072).to_bytes();
+    let offset = changed
+        .windows(id.len())
+        .position(|bytes| bytes == id)
+        .unwrap();
+    changed[offset + id.len() - 1] ^= 1;
+    assert!(delta
+        .verify_payload(&mut changed.as_slice(), &|| Ok(()), None)
+        .is_err());
+    assert!(delta
+        .verify_payload(&mut &bytes[..bytes.len() - 1], &|| Ok(()), None)
+        .is_err());
+    let (_, relocations) = delta
+        .append_with_relocations(&mut file.owner, &|| Ok(()))
+        .unwrap();
+    assert!(
+        relocations.reserved_bytes_for_test() <= 128 * 1024,
+        "only one log replacement, no replacement for 1,024 deleted receipts: {}",
+        relocations.reserved_bytes_for_test(),
+    );
+}
+
+#[test]
 fn native_generation_capture_preserves_business_and_log_admission_boundaries() {
     let (mut storage, _, _) = fixture();
     apply(&mut storage, &[clock(2, time(2))]);

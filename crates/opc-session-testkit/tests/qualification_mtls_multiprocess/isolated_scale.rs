@@ -6,6 +6,8 @@ mod majority_recovery;
 mod original;
 #[path = "isolated_scale/protected_roster.rs"]
 mod protected_roster;
+#[path = "isolated_scale/reclaim_memory.rs"]
+mod reclaim_memory;
 
 use super::*;
 use opc_session_testkit::qualification::{

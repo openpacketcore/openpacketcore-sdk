@@ -77,14 +77,38 @@ impl Fixture {
         control: IoControl,
         persistence: crate::SessionPersistenceMode,
     ) -> Self {
+        Self::with_fenced_profile(
+            limits,
+            control,
+            persistence,
+            crate::FencedTransitionV2Profile::V2,
+        )
+    }
+
+    fn with_fenced_profile(
+        limits: Limits,
+        control: IoControl,
+        persistence: crate::SessionPersistenceMode,
+        profile: crate::FencedTransitionV2Profile,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let oracle = SqliteSessionBackend::open(directory.path().join("oracle.sqlite")).unwrap();
+        let oracle = SqliteSessionBackend::open_with_fenced_transition_v2_profile(
+            directory.path().join("oracle.sqlite"),
+            profile,
+        )
+        .unwrap();
         let conn = oracle.conn.blocking_lock();
-        initialize_schema_with_profile(
+        initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
             &conn,
+            None,
             identity(),
             &fixed_members(),
+            &test_member_bindings(&fixed_members()),
+            None,
             ConsensusAuthorityProfile::FixedImmutable,
+            Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
+            None,
+            profile,
         )
         .unwrap();
         let wal = match persistence {

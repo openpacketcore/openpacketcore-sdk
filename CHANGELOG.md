@@ -70,6 +70,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `opc-session-store`: `maintain_fenced_transition_v2_history` may now poll
+  memory admission until the operation timeout and return `BackendUnavailable`
+  after waiting. Committed retirement pressure fails closed after ten seconds
+  without a new low in admission shortfall or live-journal size; checkpoint
+  completion alone does not renew that bound. A successful reservation resets
+  the wait. One checkpoint or relocation drain exceeding ten seconds without
+  observable relief can still fence a healthy voter on very slow storage.
+  Planner fallbacks have a value-free diagnostic counter.
+  Shutdown cancels the wait without fencing the WAL or discarding
+  accepted WAL work. Terminal storage fences require supervised process
+  restart; automatic fatal-error exit is tracked separately in #1127.
+
 - Hosted CI runs on Linux only: the macOS host lane, FreeBSD GTP-U cross-lint
   lane and Darwin runtime cross-lint step were removed in #1116. Retained
   non-Linux code in the following crates now receives compile-only,
@@ -106,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-session-store`: bound native durable V2 history-retirement preparation
+  within the existing 128 MiB verification cap, checkpoint and throttle by
+  memory pressure, and release publication scratch with its allocations.
+  Deletion inventories retain complete verification without reserving unused
+  relocation slots. Protocol batches, profile digests and stored formats are
+  unchanged. Fixes #1122.
 
 - `opc-session-net`: bounded protected V2 reclamation can void an exact
   unbound request after a known return, cancellation, drop, or its original

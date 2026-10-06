@@ -218,6 +218,10 @@ impl CacheCosts {
 
 #[derive(Default)]
 pub(super) struct ApplicationCosts {
+    pub(super) retirement_waits: u64,
+    pub(super) retirement_deferrals: u64,
+    pub(super) retirement_timeouts: u64,
+    pub(super) retirement_plan_fallbacks: u64,
     pub(super) successful_nonempty_batches: u64,
     pub(super) entries: u64,
     pub(super) lock_wait: Duration,
@@ -233,6 +237,10 @@ pub(super) struct ApplicationCosts {
 impl ApplicationCosts {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
+            "retirement_waits": self.retirement_waits,
+            "retirement_deferrals": self.retirement_deferrals,
+            "retirement_timeouts": self.retirement_timeouts,
+            "retirement_plan_fallbacks": self.retirement_plan_fallbacks,
             "successful_nonempty_batches": self.successful_nonempty_batches,
             "entries": self.entries,
             "lock_wait_us": self.lock_wait.as_micros(),

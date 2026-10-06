@@ -525,12 +525,14 @@ impl PreparedDelta {
         owner: &mut VerifiedAppendOwner,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<(Arc<VerifiedPrefix>, Relocations)> {
-        let maximum = self.header.changed[1]
-            .checked_add(self.header.changed[3])
-            .and_then(|count| count.checked_add(self.header.changed[4]))
-            .and_then(|count| {
-                count.checked_add(self.header.roster_changed.map_or(0, |counts| counts[0]))
-            })
+        // Tombstones remain in the encoded inventory and complete verifier,
+        // but cannot produce a selected-row replacement. Admission covers
+        // precisely the output population, not every changed input row.
+        let maximum = self
+            .capture
+            .business
+            .relocation_count()?
+            .checked_add(self.capture.log.relocation_count())
             .ok_or_else(|| invalid("native relocation captured count overflow"))?;
         let mut rows = RelocationBuilder::new(maximum)?;
         let source = owner.append(

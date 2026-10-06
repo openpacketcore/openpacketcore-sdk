@@ -19,6 +19,16 @@ use sha2::{Digest as _, Sha256};
 mod frames;
 pub(super) use frames::{generic_payload, notification_payload, ordinary_payload};
 
+mod removals;
+#[cfg(test)]
+mod staging;
+#[cfg(test)]
+type StagedRows<K, T> = staging::Rows<StagedRow<K, T>>;
+#[cfg(not(test))]
+type StagedRows<K, T> = Vec<StagedRow<K, T>>;
+use removals::DeletedRows;
+pub(super) use removals::Removals;
+
 #[path = "changes_selected_generic.rs"]
 mod selected_generic;
 pub(super) use selected_generic::GenericSelection;
@@ -348,7 +358,7 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint + RowVal
     base: &RowMap<K, SharedRow<T>>,
     tracking: bool,
     summary: &mut TableSummary,
-) -> io::Result<Vec<StagedRow<K, T>>> {
+) -> io::Result<StagedRows<K, T>> {
     let mut staged = Vec::with_capacity(rows.len());
     for (key, value) in rows {
         let before = base.get(&key).cloned();
@@ -371,6 +381,8 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint + RowVal
             },
         });
     }
+    #[cfg(test)]
+    let staged = staged.into();
     Ok(staged)
 }
 
@@ -400,6 +412,9 @@ pub(super) struct BusinessChanges {
     target: Arc<BusinessProof>,
     keys: HashMap<SessionKey, RowChange<NativeKeyState>>,
     receipts: HashMap<FencedTransitionV2RequestId, RowChange<NativeReceipt>>,
+    deletions: Vec<DeletedRows>,
+    deleted_rows: usize,
+    retained_bytes: usize,
     generic: HashMap<SessionConsensusRequestId, RowChange<NativeGenericReceipt>>,
     notifications: Vec<NotificationRow>,
     roster: roster::changes::Journal,
@@ -416,6 +431,9 @@ impl BusinessChanges {
             target: proof,
             keys: HashMap::new(),
             receipts: HashMap::new(),
+            deletions: Vec::new(),
+            deleted_rows: 0,
+            retained_bytes: 0,
             generic: HashMap::new(),
             notifications: Vec::new(),
             memory: Vec::new(),
@@ -472,6 +490,14 @@ impl BusinessChanges {
         }
         current(&self.keys, &state.keys)?;
         current(&self.receipts, &state.receipts)?;
+        for deleted in &self.deletions {
+            deleted.for_each(|id, _, _, _| {
+                if state.receipts.contains_key(&id) {
+                    return Err(invalid("native captured deletion is still live"));
+                }
+                Ok(())
+            })?;
+        }
         current(&self.generic, &state.generic_receipts)?;
         let start = self.base.tables[3].count;
         for (offset, row) in self.notifications.iter().enumerate() {
@@ -538,6 +564,7 @@ impl BusinessChanges {
         let mut tables = self.base.tables;
         Self::check_rows(0, &self.keys, &mut tables[0], check)?;
         Self::check_rows(1, &self.receipts, &mut tables[1], check)?;
+        let (deleted_before, deleted_transient) = self.check_deletions(&mut tables[1], check)?;
         Self::check_rows(2, &self.generic, &mut tables[2], check)?;
         let start = self.base.tables[3].count;
         for row in &self.notifications {
@@ -567,8 +594,8 @@ impl BusinessChanges {
             }
         }
         let mut added = 0usize;
-        let mut removed = 0usize;
-        let mut transient = 0usize;
+        let mut removed = deleted_before;
+        let mut transient = deleted_transient;
         for (id, change) in &self.receipts {
             check()?;
             if change.before.is_none()
@@ -651,6 +678,9 @@ impl BusinessChanges {
         self.receipts
             .try_reserve(publication.receipts.len())
             .map_err(|_| invalid("native dirty receipt allocation failed"))?;
+        self.deletions
+            .try_reserve(usize::from(publication.deletions.len() != 0))
+            .map_err(|_| invalid("native dirty deletion allocation failed"))?;
         self.generic
             .try_reserve(publication.generic.len())
             .map_err(|_| invalid("native dirty generic allocation failed"))?;
@@ -661,6 +691,67 @@ impl BusinessChanges {
             .try_reserve(1)
             .map_err(|_| invalid("native dirty reservation allocation failed"))?;
         Ok(())
+    }
+
+    fn check_deletions(
+        &self,
+        table: &mut TableSummary,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<(usize, usize)> {
+        let mut removed = 0;
+        let mut transient = 0;
+        let mut previous = None;
+        for deletion in &self.deletions {
+            deletion.for_each(|id, ordinal, before, expected| {
+                check()?;
+                if previous.is_some_and(|previous| previous >= (id.epoch(), ordinal)) {
+                    return Err(invalid(
+                        "native captured deletion inventory repeats or regresses",
+                    ));
+                }
+                previous = Some((id.epoch(), ordinal));
+                let observed = before.map(|row| stamp(1, &id, row)).transpose()?;
+                if observed != expected || before.is_some_and(|row| row.ordinal != ordinal) {
+                    return Err(invalid("native captured deletion fingerprint differs"));
+                }
+                lifecycle::removed_is_retired(
+                    id,
+                    before.map(|row| row.ordinal),
+                    self.target.frontiers.history,
+                )?;
+                if let Some(change) = self.receipts.get(&id) {
+                    if change.after.is_some() || change.after_hash.is_some() {
+                        return Err(invalid("native captured deletion overlaps a retained row"));
+                    }
+                    // The ordinary journal owns the original predecessor of
+                    // a create/update-then-delete identity. Its latest before
+                    // revision above is still independently fingerprinted.
+                    return Ok(());
+                }
+                if before.is_none()
+                    && self
+                        .base
+                        .frontiers
+                        .history
+                        .and_then(|history| history.active_epoch())
+                        .is_some_and(|active| id.epoch() < active)
+                {
+                    return Err(invalid(
+                        "native captured transient deletion predates its predecessor",
+                    ));
+                }
+                table.replace(observed, None)?;
+                removed += usize::from(before.is_some());
+                transient += usize::from(before.is_none());
+                Ok(())
+            })?;
+        }
+        if removed + transient != self.deleted_rows {
+            return Err(invalid(
+                "native captured deletion count differs from its inventory",
+            ));
+        }
+        Ok((removed, transient))
     }
 }
 
@@ -723,7 +814,7 @@ fn validate_staged<K: Eq + Hash, T: RowValue>(
 }
 
 fn publish_rows<K: Clone + Eq + Hash, T: RowValue>(
-    rows: Vec<StagedRow<K, T>>,
+    rows: StagedRows<K, T>,
     current: &mut RowMap<K, SharedRow<T>>,
     mut dirty: Option<&mut HashMap<K, RowChange<T>>>,
 ) {
@@ -762,15 +853,19 @@ pub(super) struct Publication {
     frontiers: NativeFrontiers,
     roster: roster::Ledger,
     roster_changes: roster::changes::Journal,
-    keys: Vec<StagedRow<SessionKey, NativeKeyState>>,
-    receipts: Vec<StagedRow<FencedTransitionV2RequestId, NativeReceipt>>,
-    generic: Vec<StagedRow<SessionConsensusRequestId, NativeGenericReceipt>>,
+    keys: StagedRows<SessionKey, NativeKeyState>,
+    receipts: StagedRows<FencedTransitionV2RequestId, NativeReceipt>,
+    deletions: DeletedRows,
+    generic: StagedRows<SessionConsensusRequestId, NativeGenericReceipt>,
     notifications: Vec<NotificationRow>,
     delivery: NativeApplied,
     memory: Arc<VerificationMemory>,
     tracking: bool,
     #[cfg(any(test, feature = "test-control"))]
     terminal_remainder_started: Option<std::time::Instant>,
+    // Declared after all staged allocations so drop/error/unwind cannot refund
+    // the temporary vectors while any of their elements are still alive.
+    _scratch: VerificationMemory,
 }
 
 impl Publication {
@@ -812,6 +907,7 @@ impl Publication {
             keys,
             receipts,
             receipt_removals,
+            reclaim_memory,
             generic_receipts,
             responses,
             notifications,
@@ -822,16 +918,13 @@ impl Publication {
         let predecessor = Arc::clone(base.require_business_proof()?);
         validate_frontier_transition(&predecessor.frontiers, &frontiers, false)?;
         let tracking = base.changes.is_some();
+        let deleted_before = DeletedRows::before_count(&receipt_removals, &base.receipts)?;
         let mut bytes = scratch_size::<SessionKey, NativeKeyState>(keys.len())?;
         add_bytes(
             &mut bytes,
-            scratch_size::<FencedTransitionV2RequestId, NativeReceipt>(
-                receipts
-                    .len()
-                    .checked_add(receipt_removals.len())
-                    .ok_or_else(|| invalid("native receipt change count overflow"))?,
-            )?,
+            scratch_size::<FencedTransitionV2RequestId, NativeReceipt>(receipts.len())?,
         )?;
+        add_bytes(&mut bytes, 4 * size_of::<DeletedRows>())?;
         add_bytes(
             &mut bytes,
             scratch_size::<SessionConsensusRequestId, NativeGenericReceipt>(
@@ -852,7 +945,29 @@ impl Publication {
                     .ok_or_else(|| invalid("native changed key reservation overflow"))?,
             )?;
         }
-        let memory = Arc::new(VerificationMemory::reserve(bytes)?);
+        let staging_bytes = keys
+            .len()
+            .checked_mul(size_of::<StagedRow<SessionKey, NativeKeyState>>())
+            .and_then(|bytes| {
+                receipts
+                    .len()
+                    .checked_mul(size_of::<
+                        StagedRow<FencedTransitionV2RequestId, NativeReceipt>,
+                    >())
+                    .and_then(|rows| bytes.checked_add(rows))
+            })
+            .and_then(|bytes| {
+                generic_receipts
+                    .len()
+                    .checked_mul(size_of::<
+                        StagedRow<SessionConsensusRequestId, NativeGenericReceipt>,
+                    >())
+                    .and_then(|rows| bytes.checked_add(rows))
+            })
+            .ok_or_else(|| invalid("native staging reservation overflow"))?;
+        let mut memory = VerificationMemory::reserve(bytes)?;
+        let scratch = memory.split_off(staging_bytes)?;
+        let memory = Arc::new(memory);
         for (key, row) in &keys {
             validation::validate_key(key, row, &frontiers)?;
             if base
@@ -864,7 +979,7 @@ impl Publication {
             }
         }
         let mut introduced = Vec::with_capacity(receipts.len());
-        let mut deleted = Vec::with_capacity(receipt_removals.len());
+        let mut deleted = 0usize;
         let mut transient = 0usize;
         let mut receipt_order = predecessor.receipt_order.clone();
         predecessor
@@ -876,7 +991,7 @@ impl Publication {
                 frontiers.async_fence_floor(),
             )?;
         for (id, row) in &receipts {
-            if receipt_removals.contains(id) {
+            if receipt_removals.contains(id, row.ordinal) {
                 return Err(invalid("native receipt is both retained and removed"));
             }
             let history = frontiers
@@ -915,11 +1030,16 @@ impl Publication {
                 introduced.push((*id, row.ordinal, row.retained_until));
             }
         }
-        for id in &receipt_removals {
-            let before = base.receipts.get(id);
-            lifecycle::removed_is_retired(*id, before.map(|row| row.ordinal), frontiers.history)?;
+        for entry in receipt_removals.iter() {
+            let (id, ordinal) = entry?;
+            let before = base.receipts.get(&id);
+            lifecycle::removed_is_retired(id, before.map(|row| row.ordinal), frontiers.history)?;
             if let Some(before) = before {
-                deleted.push((*id, before.ordinal));
+                if before.ordinal != ordinal {
+                    return Err(invalid("native deletion ordinal differs from its row"));
+                }
+                receipt_order.remove_prefix(id, ordinal)?;
+                deleted += 1;
             } else {
                 if predecessor
                     .frontiers
@@ -938,13 +1058,9 @@ impl Publication {
             &predecessor.frontiers,
             &frontiers,
             introduced.len(),
-            deleted.len(),
+            deleted,
             transient,
         )?;
-        deleted.sort_unstable_by_key(|(id, ordinal)| (id.epoch(), *ordinal));
-        for (id, ordinal) in deleted {
-            receipt_order.remove_prefix(id, ordinal)?;
-        }
         introduced.sort_unstable_by_key(|(id, ordinal, _)| (id.epoch(), *ordinal));
         for (id, ordinal, until) in introduced {
             receipt_order.append_captured(id, ordinal, until, frontiers.history)?;
@@ -979,23 +1095,14 @@ impl Publication {
         }
         expiry.validate_requests(&frontiers)?;
         let keys = staged(0, keys, &base.keys, tracking, &mut tables[0])?;
-        let mut receipts = staged(1, receipts, &base.receipts, tracking, &mut tables[1])?;
-        receipts.reserve(receipt_removals.len());
-        for key in receipt_removals {
-            let before = base.receipts.get(&key).cloned();
-            let before_hash = before.as_ref().map(|row| stamp(1, &key, row)).transpose()?;
-            tables[1].replace(before_hash, None)?;
-            receipts.push(StagedRow {
-                key,
-                journal_key: tracking.then_some(key),
-                change: RowChange {
-                    before: before.map(Box::new),
-                    after: None,
-                    before_hash,
-                    after_hash: None,
-                },
-            });
-        }
+        let receipts = staged(1, receipts, &base.receipts, tracking, &mut tables[1])?;
+        let deletions = DeletedRows::prepare(
+            receipt_removals,
+            &base.receipts,
+            deleted_before,
+            &mut tables[1],
+            reclaim_memory,
+        )?;
         let generic = staged(
             2,
             generic_receipts,
@@ -1052,6 +1159,7 @@ impl Publication {
             roster_changes,
             keys,
             receipts,
+            deletions,
             generic,
             notifications,
             delivery,
@@ -1059,10 +1167,11 @@ impl Publication {
             tracking,
             #[cfg(any(test, feature = "test-control"))]
             terminal_remainder_started,
+            _scratch: scratch,
         })
     }
 
-    pub(super) fn publish(self, state: &mut NativeState) -> io::Result<NativeApplied> {
+    pub(super) fn publish(mut self, state: &mut NativeState) -> io::Result<NativeApplied> {
         if !Arc::ptr_eq(&self.predecessor, state.require_business_proof()?)
             || self.tracking != state.changes.is_some()
             || state
@@ -1084,6 +1193,20 @@ impl Publication {
             &state.receipts,
             state.changes.as_ref().map(|dirty| &dirty.receipts),
         )?;
+        self.deletions.for_each(|id, _, before, before_hash| {
+            if !same_row(before, state.receipts.get(&id))
+                || state
+                    .changes
+                    .as_ref()
+                    .and_then(|dirty| dirty.receipts.get(&id))
+                    .is_some_and(|prior| {
+                        !same_row(before, prior.after.as_deref()) || before_hash != prior.after_hash
+                    })
+            {
+                return Err(invalid("native deletion publication predecessor changed"));
+            }
+            Ok(())
+        })?;
         validate_staged(
             &self.generic,
             &state.generic_receipts,
@@ -1096,60 +1219,70 @@ impl Publication {
         if let Some(dirty) = &mut state.changes {
             dirty.reserve(&self)?;
         }
-        let Self {
-            proof,
-            frontiers,
-            roster,
-            roster_changes,
-            keys,
-            receipts,
-            generic,
-            notifications,
-            delivery,
-            memory,
-            #[cfg(any(test, feature = "test-control"))]
-            terminal_remainder_started,
-            ..
-        } = self;
         let roster_append = state
             .changes
             .as_mut()
-            .map(|dirty| dirty.roster.prepare_append(roster_changes))
+            .map(|dirty| dirty.roster.prepare_append(self.roster_changes))
             .transpose()?;
+        let retained_bytes =
+            self.memory.reserved_bytes() + self.deletions.index_verification_bytes();
         // No fallible work follows. These exact row objects feed both maps
         // and the journal while the enclosing WAL State mutex fences unwind.
         if let Some(append) = roster_append {
             append.commit();
         }
+        // Attach the retained owner before publishing rows. If publication
+        // unwinds, the poisoned journal still owns every charge it received.
+        if let Some(dirty) = &mut state.changes {
+            dirty.memory.push(Arc::clone(&self.memory));
+            dirty.retained_bytes += retained_bytes;
+        }
         publish_rows(
-            keys,
+            std::mem::take(&mut self.keys),
             &mut state.keys,
             state.changes.as_mut().map(|dirty| &mut dirty.keys),
         );
         publish_rows(
-            receipts,
+            std::mem::take(&mut self.receipts),
             &mut state.receipts,
             state.changes.as_mut().map(|dirty| &mut dirty.receipts),
         );
+        self.deletions.publish_ids(|id| {
+            state.receipts.remove(&id);
+            if let Some(dirty) = &mut state.changes {
+                if let Some(prior) = dirty.receipts.get_mut(&id) {
+                    prior.after = None;
+                    prior.after_hash = None;
+                } else {
+                    dirty.deleted_rows += 1;
+                }
+            }
+        });
+        if self.deletions.len() != 0 {
+            if let Some(dirty) = &mut state.changes {
+                dirty.deletions.push(self.deletions);
+            }
+        }
         publish_rows(
-            generic,
+            std::mem::take(&mut self.generic),
             &mut state.generic_receipts,
             state.changes.as_mut().map(|dirty| &mut dirty.generic),
         );
         if let Some(dirty) = &mut state.changes {
-            dirty.notifications.extend(notifications.iter().cloned());
-            dirty.target = Arc::clone(&proof);
-            dirty.memory.push(memory);
+            dirty
+                .notifications
+                .extend(self.notifications.iter().cloned());
+            dirty.target = Arc::clone(&self.proof);
         }
-        state.notifications.extend(notifications);
-        state.roster = roster;
-        state.frontiers = frontiers;
-        state.proof = Some(proof);
+        state.notifications.extend(self.notifications);
+        state.roster = self.roster;
+        state.frontiers = self.frontiers;
+        state.proof = Some(self.proof);
         #[cfg(any(test, feature = "test-control"))]
-        if let Some(started) = terminal_remainder_started {
+        if let Some(started) = self.terminal_remainder_started {
             crate::sqlite::consensus::record_native_roster_publication_timing(started);
         }
-        Ok(delivery)
+        Ok(self.delivery)
     }
 }
 
@@ -1251,6 +1384,20 @@ pub(super) fn validate_frontier_transition(
 }
 
 impl NativeState {
+    pub(super) fn reclaim_rows_bytes(count: usize) -> io::Result<usize> {
+        count
+            .checked_mul(DeletedRows::row_bytes())
+            .ok_or_else(|| invalid("native reclaim candidate overflow"))
+    }
+
+    /// Charges follow the detached journal into its checkpoint owner. Only
+    /// this live journal is considered by the local checkpoint trigger.
+    pub(crate) fn changed_verification_bytes(&self) -> usize {
+        self.changes
+            .as_ref()
+            .map_or(0, |changes| changes.retained_bytes)
+    }
+
     pub(super) fn clone_for_application(&self) -> io::Result<Self> {
         let proof = self.require_business_proof()?;
         if self

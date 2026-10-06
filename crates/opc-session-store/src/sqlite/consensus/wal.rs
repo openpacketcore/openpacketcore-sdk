@@ -321,6 +321,8 @@ pub(crate) enum Point {
     AfterRecoveryPublicationSync,
     AfterNativeBasisAdmission,
     BeforeNativeApplyPrepare,
+    #[cfg(test)]
+    BeforeNativeRetirementPlan,
     BeforeNativeApplyPublish,
     BeforeNativeReceiptRead,
     BeforeNativeLogRead,
@@ -328,6 +330,7 @@ pub(crate) enum Point {
     BeforeNativeSnapshotWriteback,
     BeforeNativePublicRead,
     BeforeNativeGenerationAppend,
+    AfterNativeGenerationCapture,
     AfterNativeGenerationAppend,
     AfterNativeRelocationStep,
     BeforeAsyncClosedWrite,
@@ -554,6 +557,7 @@ struct State {
     native_relocations_pending: bool,
     native_install_pending: bool,
     native_operations: usize,
+    retirement_stopped: bool,
     native_sql_fallbacks: u64,
     #[cfg(feature = "test-control")]
     volatile_experiment: Option<volatile_experiment::Observation>,
@@ -651,6 +655,7 @@ impl State {
             native_relocations_pending: false,
             native_install_pending: false,
             native_operations: 0,
+            retirement_stopped: false,
             native_sql_fallbacks: 0,
             #[cfg(feature = "test-control")]
             volatile_experiment: None,

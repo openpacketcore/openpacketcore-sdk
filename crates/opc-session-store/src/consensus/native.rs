@@ -54,7 +54,7 @@ pub(crate) use image::snapshot_prefix;
 use shared::SharedRow;
 
 use imbl::{HashMap as ResidentMap, Vector as ResidentVector};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::sync::Arc;
 
@@ -549,6 +549,17 @@ impl NativeStorage {
     }
 
     pub(crate) fn replay_committed(&mut self) -> io::Result<()> {
+        // Recovery owns its decoder/application cohort. Transport packaging
+        // cannot enlarge preparation, and every durable entry is still
+        // audited before any recovery publication or file repair.
+        // This bounds preparation, not arbitrary retained mixed-load suffixes.
+        // A full eight-epoch generation permits at most two retired epochs
+        // without new receipts: 262144 * 72 B + <=34 * 64 KiB ranges and <=33
+        // publication guards is <21 MiB. The full-generation cold-replay test
+        // pins a <64 MiB process peak, then validates/appends that whole journal.
+        // Consumer/log/roster growth is a separate, pre-existing exposure; see
+        // docs/sdk-1122-reclaim-memory-evidence.md. No audit or repair cut moves.
+        const REPLAY_ENTRIES: usize = 8;
         let Some(committed) = self.log.committed else {
             return Ok(());
         };
@@ -557,12 +568,12 @@ impl NativeStorage {
             .applied()
             .map_or(0, |applied| applied.index + 1);
         while next <= committed.index {
-            let end = (next + LOG_RPC_ENTRIES as u64).min(committed.index + 1);
+            let end = (next + REPLAY_ENTRIES as u64).min(committed.index + 1);
             // Recovery holds exclusive NativeStorage ownership before a WAL
             // writer exists. The same detached codec still supplies complete
             // independently owned log and receipt results for cold rows.
             let capture = self.capture_log_read()?;
-            let rows = capture.resolve(next, Some(end), Some(LOG_RPC_ENTRIES), &|| Ok(()))?;
+            let rows = capture.resolve(next, Some(end), Some(REPLAY_ENTRIES), &|| Ok(()))?;
             capture.require_current_authority(self)?;
             let entries = rows.entries();
             if entries.len() != (end - next) as usize {
@@ -634,7 +645,8 @@ struct NativeDelta<'a> {
     keys: HashMap<SessionKey, NativeKeyState>,
     expiry: expiry::ExpiryIndex,
     receipts: HashMap<FencedTransitionV2RequestId, NativeReceipt>,
-    receipt_removals: HashSet<FencedTransitionV2RequestId>,
+    receipt_removals: changes::Removals,
+    reclaim_memory: Option<crate::consensus::verified_snapshot::VerificationMemory>,
     receipt_order: history_order::ReceiptOrder,
     generic_receipts: HashMap<SessionConsensusRequestId, NativeGenericReceipt>,
     responses: Vec<SessionConsensusResponse>,
@@ -1270,7 +1282,8 @@ impl NativeState {
             roster_changes: roster::changes::Journal::empty(&self.roster)?,
             expiry: self.require_business_proof()?.expiry.clone(),
             receipts: HashMap::new(),
-            receipt_removals: HashSet::new(),
+            receipt_removals: changes::Removals::default(),
+            reclaim_memory: None,
             receipt_order: self.require_business_proof()?.receipt_order.clone(),
             generic_receipts: HashMap::new(),
             responses: Vec::with_capacity(entries.len()),
@@ -1321,13 +1334,11 @@ impl NativeDelta<'_> {
     }
 
     fn receipt(&self, id: &FencedTransitionV2RequestId) -> Option<&NativeReceipt> {
-        if self.receipt_removals.contains(id) {
-            return None;
-        }
         self.receipts
             .get(id)
             .or_else(|| self.resolved.and_then(|resolved| resolved.get(id)))
             .or_else(|| self.base.receipts.get(id).map(|row| &**row))
+            .filter(|row| !self.receipt_removals.contains(id, row.ordinal))
     }
 
     fn entry(

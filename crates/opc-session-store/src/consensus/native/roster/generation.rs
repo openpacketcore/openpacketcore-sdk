@@ -118,6 +118,13 @@ fn verify_row(
 }
 
 impl Journal {
+    pub(in crate::consensus::native) fn relocation_count(&self) -> usize {
+        self.rows
+            .values()
+            .filter(|change| change.after.is_some())
+            .count()
+    }
+
     pub(in crate::consensus::native) fn generation_counts(&self) -> [usize; 2] {
         [self.rows.len(), self.partitions.len()]
     }
