@@ -13,6 +13,37 @@ use std::{fmt, path::PathBuf};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EbpfWorkloadScope([u8; 32]);
 
+/// Identifier-free counts of foreign objects removed by a strict workload reset.
+///
+/// Zero counts on a completed attempt mean no foreign objects of these classes
+/// were found. SDK hooks, valid ordinary exclusions, SDK exclusion-publication
+/// staging directories directly under the control directory, ordinary pins and
+/// other directories are not counted.
+/// Released pinned links are uncounted because the SDK has no ownership catalog
+/// to classify them as foreign. Failed attempts with confirmed removals return
+/// these counts in [`GtpuError::StrictWorkloadResetIncomplete`]; accumulate them
+/// across retries. Uncertain effects of a failed mutation remain unknown.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EbpfStrictWorkloadResetReport {
+    /// Selector-authority, decommission and legacy selector-terminal entries.
+    pub selector_markers: usize,
+    /// Detached kernel filter entries that do not match the SDK attach predicate.
+    /// Includes u32 table entries, but excludes classifier summaries.
+    pub tc_filters: usize,
+    /// Removed exclusion-marker directories outside valid ordinary exclusions
+    /// and SDK exclusion-publication staging directories directly under the
+    /// control directory.
+    pub exclusion_marker_directories: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkloadReset {
+    Conservative,
+    Exclusive,
+    StrictExclusive,
+}
+
 impl EbpfWorkloadScope {
     /// Construct a workload scope from a nonzero opaque identity digest.
     ///
@@ -87,7 +118,9 @@ impl EbpfGtpuDataplaneBackend {
         scope: EbpfWorkloadScope,
         interface: &str,
     ) -> Result<(), GtpuError> {
-        self.reset_workload(scope, interface, false).await
+        self.reset_workload(scope, interface, WorkloadReset::Conservative)
+            .await
+            .map(|_| ())
     }
 
     /// Reconcile an exclusively owned workload scope to absence.
@@ -128,12 +161,15 @@ impl EbpfGtpuDataplaneBackend {
     /// each map unpin. Empty writer-lock directories and existing exclusion
     /// markers retain their inodes. Success permits ordinary attachment on this
     /// backend; no sessions survive. Repetition on an absent scope succeeds.
-    /// Two foreign-only layouts can survive successful reset and still block
-    /// ordinary attach: a non-SDK `ETH_P_ALL` filter at the configured priority
-    /// and handle `0:1` in a nonzero chain, or a directory named
-    /// `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside a retained writer or
-    /// operation-lock directory. Existing SDK generations create neither layout;
-    /// the writer responsible must correct it.
+    /// Foreign filters outside the ordinary owned slot can survive successful
+    /// reset and still block ordinary attach: another handle or protocol at the
+    /// configured priority in chain zero (including other classifier kinds,
+    /// such as u32), or a non-SDK `ETH_P_ALL` filter at handle `0:1` in another
+    /// chain. A directory named `GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1` inside
+    /// a retained writer or operation-lock directory also survives. Existing
+    /// SDK generations create none of these layouts;
+    /// [`Self::reset_strict_exclusive_workload_graph`] also removes them when
+    /// the caller can make its additional ownership assertions.
     ///
     /// # Environment and interruption
     /// Requires `CAP_NET_ADMIN` for tc and `CAP_SYS_ADMIN` for global program
@@ -176,15 +212,97 @@ impl EbpfGtpuDataplaneBackend {
         scope: EbpfWorkloadScope,
         interface: &str,
     ) -> Result<(), GtpuError> {
-        self.reset_workload(scope, interface, true).await
+        self.reset_workload(scope, interface, WorkloadReset::Exclusive)
+            .await
+            .map(|_| ())
+    }
+
+    /// Reset an exclusively owned scope that has never provisioned a selector.
+    ///
+    /// Calling this method asserts all ownership and quiescence requirements of
+    /// [`Self::reset_exclusive_workload_graph`] and, additionally, that:
+    ///
+    /// - **No selector namespace has ever been provisioned in this scope.**
+    ///   Selector-authority, decommission and legacy selector-terminal markers
+    ///   protect no valid history here and may be removed with their contents.
+    /// - **The configured tc priority on the named interface belongs to the
+    ///   caller in every chain.** Every clsact ingress/egress filter at that
+    ///   priority may be detached, of any origin, classifier kind, protocol or
+    ///   handle. At every other priority on that interface, SDK hooks and filters
+    ///   whose programs reference the product's own scope maps are removed
+    ///   individually, preserving foreign filters sharing their classifier.
+    ///   An old priority therefore cannot strand the next ordinary attach,
+    ///   including when the predecessor's map pins are already gone.
+    ///
+    /// Declared interfaces are the name passed to this call and interface-shaped
+    /// scope-root entry names. Alternative names resolve to the same kernel
+    /// index. On other interfaces in the calling network namespace, SDK hooks
+    /// found through those entries or scope-map references are removed, as are
+    /// filters whose programs reference recognized product maps. These removals
+    /// use individual handles; non-SDK filters count as foreign. Other namespace
+    /// references, outside program/link pins, live descriptors, non-tc
+    /// attachments and references on interfaces whose filter dumps are skipped
+    /// during discovery keep the ordinary reference refusals. All direct tc
+    /// operations stay in the calling network namespace.
+    ///
+    /// A map is the product's when this build recognizes its pin name, kernel
+    /// name and definition. An unrecognized map is treated as foreign and
+    /// unpinned without an external-reference wait, even if it is a product map
+    /// whose pin was renamed or whose generation is unknown after a rollback.
+    /// Another SDK workload's recognized map pinned into this scope counts as
+    /// this product's, as in ordinary reset; recognition does not prove workload
+    /// ownership. Foreign-map references only locate filters matching the SDK
+    /// attach predicate, which are removed as the product's own hooks. They
+    /// confer no authority over other filters and do not block map unpinning.
+    /// A link pinned in the scope is released when the reset removes its pin,
+    /// wherever it is attached, regardless of who created it. Scope-wide pin
+    /// cleanup otherwise follows the ordinary exclusive reset contract.
+    ///
+    /// Misplaced exclusion-marker directories are removed throughout the root.
+    /// Inside retained lock directories the ordinary preservation rule remains,
+    /// except for operation locks and writer locks of interfaces known to this
+    /// call. Valid ordinary exclusions therefore retain their inodes, including
+    /// those of absent interfaces; unfinished exclusions of known interfaces are
+    /// completed before success. Lock inodes stay held and unchanged.
+    /// The ordinary reference guards apply to recognized product maps;
+    /// interruption rules remain those of the ordinary exclusive reset. Repeat
+    /// this strict reset after an interrupted call, before ordinary attachment.
+    /// No sessions survive; callers must drain or transfer emergency sessions
+    /// before voluntary teardown.
+    ///
+    /// A false assertion can erase permanent selector fencing/retirement history,
+    /// permit reuse of a retired namespace, or detach another owner's forwarding
+    /// or security policy. A writer/reference scan cannot prove the assertion.
+    /// This operation is outside RFC 016's selector lifecycle. Do not use it in
+    /// a scope that ever provisioned a selector, even after decommission.
+    ///
+    /// # Errors
+    /// Preserves the distinct writer-busy and program-reference reasons of
+    /// [`Self::reset_exclusive_workload_graph`], as well as its root, interface,
+    /// inspection and pending-terminal-admission guards. Selector marker names
+    /// alone no longer refuse. After confirmed foreign removals, an error is
+    /// [`GtpuError::StrictWorkloadResetIncomplete`], carrying this attempt's
+    /// counts and the original failure as its source. Other failures retain
+    /// their original variant. Retain reports across retries: a later successful
+    /// call cannot recount objects already removed. Failed-attempt counts are
+    /// lower bounds; an ACK-uncertain removal remains unknown, so a zero retry
+    /// report does not prove the whole sequence found nothing foreign.
+    /// Keep ingress isolated and do not attach or serve until reset succeeds.
+    pub async fn reset_strict_exclusive_workload_graph(
+        &self,
+        scope: EbpfWorkloadScope,
+        interface: &str,
+    ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
+        self.reset_workload(scope, interface, WorkloadReset::StrictExclusive)
+            .await
     }
 
     async fn reset_workload(
         &self,
         scope: EbpfWorkloadScope,
         interface: &str,
-        exclusive: bool,
-    ) -> Result<(), GtpuError> {
+        mode: WorkloadReset,
+    ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
         if self.inner.config.bpffs_pin_root != scope.bpffs_pin_root() {
             return Err(GtpuError::invalid_config(
                 "ebpf.workload_scope",
@@ -203,7 +321,7 @@ impl EbpfGtpuDataplaneBackend {
                 Err(GtpuError::NotFound) => None,
                 Err(error) => return Err(error),
             };
-            if exclusive {
+            if mode != WorkloadReset::Conservative {
                 if backend
                     .terminal_admissions()?
                     .keys()
@@ -213,17 +331,33 @@ impl EbpfGtpuDataplaneBackend {
                         feature: "exclusive_workload_cleanup_pending_terminal_admission",
                     });
                 }
-                backend.inner.runtime.reset_exclusive_workload_graph(
-                    ifindex,
-                    &backend.pin_dir(&interface),
-                    backend.inner.config.tc_priority,
-                )
+                if mode == WorkloadReset::StrictExclusive {
+                    backend.inner.runtime.reset_strict_exclusive_workload_graph(
+                        ifindex,
+                        &backend.pin_dir(&interface),
+                        backend.inner.config.tc_priority,
+                    )
+                } else {
+                    backend
+                        .inner
+                        .runtime
+                        .reset_exclusive_workload_graph(
+                            ifindex,
+                            &backend.pin_dir(&interface),
+                            backend.inner.config.tc_priority,
+                        )
+                        .map(|()| EbpfStrictWorkloadResetReport::default())
+                }
             } else {
-                backend.inner.runtime.reset_workload_graph(
-                    ifindex,
-                    &backend.pin_dir(&interface),
-                    backend.inner.config.tc_priority,
-                )
+                backend
+                    .inner
+                    .runtime
+                    .reset_workload_graph(
+                        ifindex,
+                        &backend.pin_dir(&interface),
+                        backend.inner.config.tc_priority,
+                    )
+                    .map(|()| EbpfStrictWorkloadResetReport::default())
             }
         })
         .await

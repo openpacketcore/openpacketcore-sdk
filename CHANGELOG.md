@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: add `reset_strict_exclusive_workload_graph` for callers
+  asserting a never-provisioned selector scope and ownership of the configured
+  tc priority on the named interface in every chain. Remove selector markers,
+  every filter at that priority and misplaced exclusion directories. At other
+  priorities on the named interface, remove SDK hooks and filters using recognized
+  product maps by handle; follow recognized-map references for per-handle cleanup
+  on other interfaces in the calling namespace. Unpin maps this build does not
+  recognize without waiting for their references, and release scope-pinned links
+  wherever attached. Retain valid ordinary exclusions and the writer guard; for
+  maps recognized by this build's names and definitions, retain external-reference
+  refusal wherever the ordinary form also refuses. Return identifier-free
+  foreign-removal counts in the non-exhaustive `EbpfStrictWorkloadResetReport`,
+  including partial counts in `GtpuError::StrictWorkloadResetIncomplete` on
+  failure. Refs #1118.
+
 - `opc-crypto` and `opc-persist`: add opt-in exact configuration byte evidence
   and eight-slot, destination-specific preparation leases retained through
   encryption claims and envelope aliases. Existing encryption and storage
