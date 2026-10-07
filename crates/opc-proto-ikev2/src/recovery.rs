@@ -152,6 +152,7 @@ impl Ikev2ExactReplay<'_> {
 /// ```
 pub struct Ikev2CommittedWindow {
     record: Ikev2CommittedWindowRecord,
+    canonical_binding: Ikev2AesGcmIvRecord,
     instance: Arc<()>,
     quiescent: bool,
     observed_peer_request: Cell<Option<u32>>,
@@ -182,8 +183,30 @@ impl Ikev2CommittedWindow {
         record: &Ikev2CommittedWindowRecord,
         iv_record: &Ikev2AesGcmIvRecord,
     ) -> Result<Self, Ikev2WindowError> {
+        let restored = Self::restore_checked(expected, profile, keys, record, iv_record);
+        if let Err(error) = &restored {
+            if *error == Ikev2WindowError::DomainMismatch {
+                crate::canonical::invalidate_binding(expected.send_iv_domain());
+                crate::canonical::invalidate_binding(iv_record.domain());
+                crate::canonical::invalidate_binding(record.domain.send_iv_domain());
+            } else {
+                crate::canonical::retire_capability(expected.send_iv_domain());
+            }
+        }
+        restored
+    }
+
+    fn restore_checked(
+        expected: &Ikev2CommittedWindowDomain,
+        profile: Ikev2SaInitCryptoProfile,
+        keys: &Ikev2SaInitKeyMaterial,
+        record: &Ikev2CommittedWindowRecord,
+        iv_record: &Ikev2AesGcmIvRecord,
+    ) -> Result<Self, Ikev2WindowError> {
         use Ikev2WindowError as Error;
-        if expected != &record.domain || expected.send_iv_domain() != iv_record.domain() {
+        if expected != &record.domain
+            || expected != &Ikev2CommittedWindowDomain::from_iv_record(iv_record)
+        {
             return Err(Error::DomainMismatch);
         }
         expected.check(profile, keys)?;
@@ -229,6 +252,7 @@ impl Ikev2CommittedWindow {
         }
         Ok(Self {
             record: record.clone(),
+            canonical_binding: iv_record.clone(),
             instance: Arc::new(()),
             quiescent: false,
             observed_peer_request: Cell::new(None),
@@ -238,6 +262,26 @@ impl Ikev2CommittedWindow {
                 .sync_recovery()
                 .map(|recovery| recovery.last_observed_unix_ms()),
         })
+    }
+
+    /// Derive a canonical recipe from this window's checked persisted IV binding.
+    ///
+    /// This primitive adds no empty-request admission, receive-floor advancement
+    /// or transmission authority. The consumer must still reject DPD deployments
+    /// until the zero-write handler and its volatile floor are qualified.
+    /// Recheck current admission and [`Self::ready`] for every reply, including
+    /// cached bytes; a minted capability does not track later lifecycle changes.
+    /// # Errors
+    /// Refuses a quiescent, syncing or terminal window, an ineligible marker or
+    /// key binding, or unavailable canonical provider policy/qualification.
+    pub fn canonical_replies(
+        &self,
+        policy: crate::canonical::Ikev2CanonicalPolicy,
+    ) -> Result<crate::canonical::Ikev2CanonicalEmptyReplies, crate::canonical::Ikev2CanonicalError>
+    {
+        self.ready()
+            .map_err(|_| crate::canonical::Ikev2CanonicalError::LifecycleBlocked)?;
+        crate::canonical::Ikev2CanonicalEmptyReplies::from_record(&self.canonical_binding, policy)
     }
 
     /// Last acknowledged record; while quiescent it may not be the latest durable state.
@@ -259,7 +303,14 @@ impl Ikev2CommittedWindow {
         packet::open(&self.record.domain, profile, keys, wire, true)
     }
 
-    fn ready(&self) -> Result<(), Ikev2WindowError> {
+    /// Check the window's current ordinary/canonical lifecycle availability.
+    ///
+    /// Check this and receive admission on every canonical reply, including reuse
+    /// of cached bytes. This snapshot grants no receive or transmission authority;
+    /// the consumer must keep the applicable authority through transmission.
+    /// # Errors
+    /// Refuses an uncertain commit, pending sync, uncertain outcome or closed SA.
+    pub fn ready(&self) -> Result<(), Ikev2WindowError> {
         if self.quiescent {
             return Err(Ikev2WindowError::CommitUncertain);
         }

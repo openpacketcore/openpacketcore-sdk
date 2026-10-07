@@ -43,7 +43,15 @@ use opc_proto_ikev2::{
 use opc_protocol::DecodeContext;
 use zeroize::Zeroizing;
 
+#[path = "support/canonical.rs"]
+mod canonical_fixtures;
 mod support;
+
+struct ObservedAead {
+    key_nonce: Vec<u8>,
+    aad: Vec<u8>,
+    plaintext: Vec<u8>,
+}
 
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
@@ -188,6 +196,11 @@ struct CountingModule {
     panic_protocol_msk: AtomicBool,
     sync_entropy_mode: AtomicU8,
     sync_entropy_byte: AtomicU8,
+    canonical_fault: AtomicU8,
+    canonical_failures: AtomicUsize,
+    canonical_seals: AtomicUsize,
+    monitor_aead: AtomicBool,
+    observed_aead: Mutex<Vec<ObservedAead>>,
 }
 
 impl CountingModule {
@@ -221,6 +234,11 @@ impl CountingModule {
             panic_protocol_msk: AtomicBool::new(false),
             sync_entropy_mode: AtomicU8::new(0),
             sync_entropy_byte: AtomicU8::new(0xa5),
+            canonical_fault: AtomicU8::new(0),
+            canonical_failures: AtomicUsize::new(0),
+            canonical_seals: AtomicUsize::new(0),
+            monitor_aead: AtomicBool::new(false),
+            observed_aead: Mutex::new(Vec::new()),
         }
     }
 
@@ -263,6 +281,29 @@ impl CountingModule {
 
     fn malformed_output(&self, mode: MalformedOutput) -> bool {
         self.malformed_output.load(Ordering::SeqCst) == mode as u8
+    }
+
+    fn observe_aead(&self, key: &[u8], salt: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) {
+        if !self.monitor_aead.load(Ordering::SeqCst) {
+            return;
+        }
+        let key_nonce = [&[u8::try_from(key.len()).unwrap()][..], key, salt, iv].concat();
+        let mut observed = self.observed_aead.lock().unwrap();
+        if let Some(previous) = observed.iter().find(|value| value.key_nonce == key_nonce) {
+            assert_eq!(
+                previous.aad, aad,
+                "different AAD under one actual key/nonce"
+            );
+            assert_eq!(
+                previous.plaintext, plaintext,
+                "different plaintext under one actual key/nonce"
+            );
+        }
+        observed.push(ObservedAead {
+            key_nonce,
+            aad: aad.to_vec(),
+            plaintext: plaintext.to_vec(),
+        });
     }
 }
 
@@ -464,14 +505,48 @@ impl IkeEncryptionOperations for CountingModule {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoOperationError> {
         self.counts.encryption.fetch_add(1, Ordering::SeqCst);
+        self.observe_aead(key, salt, explicit_iv, associated_data, plaintext);
+        let canonical = explicit_iv.starts_with(&[0xff; 4]);
+        let fault = if canonical {
+            self.canonical_seals.fetch_add(1, Ordering::SeqCst);
+            if self
+                .canonical_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.canonical_fault.load(Ordering::SeqCst)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        if fault == 5 {
+            return Err(CryptoOperationError::new(
+                CryptoOperationErrorCode::OperationFailed,
+            ));
+        }
+        if fault == 6 {
+            return Ok([explicit_iv, &[0; 17]].concat());
+        }
         let mut output = self.operations.seal_aead(
             algorithm,
             key,
             salt,
             explicit_iv,
             associated_data,
-            plaintext,
+            if fault == 4 { &[1] } else { plaintext },
         )?;
+        match fault {
+            1 => *output.last_mut().unwrap() ^= 1,
+            2 => output[0] ^= 1,
+            3 => {
+                output.pop();
+            }
+            _ => {}
+        }
         if self.malformed_output(MalformedOutput::AeadSeal) {
             output.pop();
         } else if self.malformed_output(MalformedOutput::AeadSealWrongExplicitIv) {
@@ -491,6 +566,16 @@ impl IkeEncryptionOperations for CountingModule {
         protected_body: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError> {
         self.counts.encryption.fetch_add(1, Ordering::SeqCst);
+        if self.canonical_fault.load(Ordering::SeqCst) == 7
+            && protected_body.starts_with(&[0xff; 4])
+        {
+            panic!("injected interruption before canonical release");
+        }
+        if self.canonical_fault.load(Ordering::SeqCst) == 6
+            && protected_body.starts_with(&[0xff; 4])
+        {
+            return Ok(Zeroizing::new(vec![0]));
+        }
         let mut output =
             self.operations
                 .open_aead(algorithm, key, salt, associated_data, protected_body)?;
@@ -1869,11 +1954,10 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: &CountingModule) {
     use opc_proto_ikev2::{
         recovery::{
-            Ikev2CommittedWindow as Window, Ikev2CommittedWindowDomain as Domain,
-            Ikev2CommittedWindowRecord as Record, Ikev2SyncClock as Clock,
-            Ikev2SyncDisposition as Disposition, Ikev2SyncInitiatorAction as Action,
-            Ikev2SyncRecoveryPolicy as SyncPolicy, Ikev2SyncResponderRecord as SyncRecord,
-            Ikev2WindowError as Error,
+            Ikev2CommittedWindow as Window, Ikev2CommittedWindowRecord as Record,
+            Ikev2SyncClock as Clock, Ikev2SyncDisposition as Disposition,
+            Ikev2SyncInitiatorAction as Action, Ikev2SyncRecoveryPolicy as SyncPolicy,
+            Ikev2SyncResponderRecord as SyncRecord, Ikev2WindowError as Error,
         },
         Ikev2AesGcmIvAllocator as Allocator, Ikev2AesGcmIvLimits as Limits,
         Ikev2AesGcmIvPurpose as Purpose, Ikev2AesGcmIvRecord as IvRecord,
@@ -1893,7 +1977,7 @@ fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: 
         &[0x33; 32],
     )
     .unwrap();
-    let domain = Domain::new(
+    let domain = support::window_domain(
         1,
         2,
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
@@ -1903,9 +1987,16 @@ fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: 
     .unwrap();
     let initial = Record::initial(domain.clone(), 1, 1);
     let iv_record = IvRecord::from_persisted(
-        domain.send_iv_domain().clone(),
+        support::epoch_inputs(
+            1,
+            2,
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            profile,
+            &keys,
+        ),
         Limits::new(128, 2, 1, 2).unwrap(),
         0,
+        Some(1),
     )
     .unwrap();
     let window = Window::restore(&domain, profile, &keys, &initial, &iv_record).unwrap();
@@ -1946,7 +2037,7 @@ fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: 
         &[0x33; 32],
     )
     .unwrap();
-    let other_domain = Domain::new(
+    let other_domain = support::window_domain(
         1,
         2,
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
@@ -1955,9 +2046,19 @@ fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: 
     )
     .unwrap();
     let other_record = Record::initial(other_domain.clone(), 1, 1);
-    let other_iv =
-        IvRecord::from_persisted(other_domain.send_iv_domain().clone(), iv_record.limits(), 0)
-            .unwrap();
+    let other_iv = IvRecord::from_persisted(
+        support::epoch_inputs(
+            1,
+            2,
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            unadmitted,
+            &other_keys,
+        ),
+        iv_record.limits(),
+        0,
+        Some(1),
+    )
+    .unwrap();
     let other = Window::restore(
         &other_domain,
         unadmitted,
@@ -2097,4 +2198,526 @@ fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: 
         [0xc7; 4]
     );
     module.sync_entropy_mode.store(0, Ordering::SeqCst);
+}
+
+#[test]
+fn canonical_module_policy_faults_and_process_restart() {
+    use std::{collections::BTreeMap, fs, process::Command};
+    let directory =
+        std::env::temp_dir().join(format!("ike-canonical-monitor-{}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    let mut transcripts = BTreeMap::new();
+    let mut repeated = 0;
+    for case in [
+        "not-installed",
+        "wrong-kat",
+        "validated",
+        "faults",
+        "recreation",
+        "readiness",
+        "concurrency",
+        "interruption",
+        "mixed-before",
+        "mixed-after",
+    ] {
+        let trace = directory.join(case);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "canonical_module_child", "--nocapture"])
+            .env("OPC_CANONICAL_MODULE_CASE", case)
+            .env("OPC_CANONICAL_TRANSCRIPT_PATH", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "case {case}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if case.starts_with("mixed-") {
+            let entries = fs::read_to_string(&trace).unwrap();
+            for line in entries.lines() {
+                let (key_nonce, inputs) = line.split_once(' ').unwrap();
+                if let Some(old) = transcripts.insert(key_nonce.to_owned(), inputs.to_owned()) {
+                    assert_eq!(old, inputs, "cross-process (K,N) maps to different (A,P)");
+                    repeated += 1;
+                }
+            }
+            fs::remove_file(trace).unwrap();
+        }
+    }
+    assert!(
+        transcripts.len() > 100,
+        "monitor includes actual ordinary/sync/canonical inputs"
+    );
+    assert!(
+        repeated >= 12,
+        "restart must actually reevaluate canonical nonces"
+    );
+    fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn canonical_module_child() {
+    use canonical_fixtures::{Fixture, ALGORITHMS, DIRECTIONS};
+    use opc_proto_ikev2::canonical::{
+        Ikev2CanonicalEmptyReplies as Canonical, Ikev2CanonicalError as Error,
+        Ikev2CanonicalPolicy as Policy,
+    };
+    let Ok(case) = std::env::var("OPC_CANONICAL_MODULE_CASE") else {
+        return;
+    };
+    if case == "not-installed" {
+        assert_eq!(
+            Canonical::preflight(ALGORITHMS[0], Policy::default()),
+            Err(Error::Unavailable)
+        );
+        return;
+    }
+    let module = Arc::new(CountingModule::new());
+    module
+        .drift_validation
+        .store(case == "validated", Ordering::SeqCst);
+    let requirements = Ikev2CryptoRequirements::all_software_supported();
+    let _report = block_on(install_ikev2_crypto_module(
+        module.clone(),
+        policy(&requirements),
+        requirements,
+    ))
+    .unwrap();
+    if case == "wrong-kat" {
+        module.canonical_fault.store(6, Ordering::SeqCst);
+        module.canonical_failures.store(100, Ordering::SeqCst);
+        // A consistently wrong implementation can pass its own round trip.
+        let body = module
+            .seal_aead(
+                IkeAeadAlgorithm::AesGcm16_128,
+                &[0; 16],
+                &[1; 4],
+                &[0xff; 8],
+                &[0; 32],
+                &[0],
+            )
+            .unwrap();
+        assert_eq!(
+            *module
+                .open_aead(
+                    IkeAeadAlgorithm::AesGcm16_128,
+                    &[0; 16],
+                    &[1; 4],
+                    &[0; 32],
+                    &body
+                )
+                .unwrap(),
+            [0]
+        );
+        assert_eq!(
+            Canonical::preflight(ALGORITHMS[0], Policy::default()),
+            Err(Error::QualificationFailed)
+        );
+        let calls = module.canonical_seals.load(Ordering::SeqCst);
+        module.canonical_fault.store(0, Ordering::SeqCst);
+        module.canonical_failures.store(0, Ordering::SeqCst);
+        assert_eq!(
+            Canonical::preflight(ALGORITHMS[0], Policy::default()),
+            Err(Error::QualificationFailed)
+        );
+        assert_eq!(
+            module.canonical_seals.load(Ordering::SeqCst),
+            calls,
+            "failure is sticky"
+        );
+        Canonical::preflight(ALGORITHMS[1], Policy::default()).unwrap();
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), calls + 8);
+        return;
+    }
+    if case == "validated" {
+        assert_eq!(
+            Canonical::preflight(ALGORITHMS[0], Policy::default()),
+            Err(Error::ValidationOptInRequired)
+        );
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), 0);
+        let policy = Policy::explicitly_allow_declared_validated();
+        Canonical::preflight(ALGORITHMS[0], policy).unwrap();
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), 8);
+        let fixture = Fixture::new(200, ALGORITHMS[0], DIRECTIONS[0]);
+        assert_eq!(
+            fixture
+                .window
+                .canonical_replies(Policy::default())
+                .unwrap_err(),
+            Error::ValidationOptInRequired
+        );
+        let replies = fixture.window.canonical_replies(policy).unwrap();
+        let request = fixture.request(0);
+        assert_eq!(replies.reply(&request).unwrap().bytes().len(), 57);
+        module.set_serviceable(
+            module
+                .capabilities()
+                .without(CryptoCapability::IkeEncryption),
+        );
+        assert_eq!(replies.reply(&request).unwrap_err(), Error::Unavailable);
+        return;
+    }
+    if case == "concurrency" {
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| Canonical::preflight(ALGORITHMS[0], Policy::default()).unwrap());
+            }
+        });
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), 8);
+        let fixture = Fixture::new(201, ALGORITHMS[0], DIRECTIONS[1]);
+        let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
+        let request = fixture.request(1);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| replies.reply(&request).unwrap().bytes().to_vec()))
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert!(results.iter().all(|result| result == &results[0]));
+        });
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), 9);
+        return;
+    }
+    if case.starts_with("mixed-") {
+        canonical_mixed_nonce_monitor(&module, case == "mixed-after");
+        return;
+    }
+    Canonical::preflight(ALGORITHMS[0], Policy::default()).unwrap();
+    if case == "interruption" {
+        let fixture = Fixture::new(204, ALGORITHMS[0], DIRECTIONS[0]);
+        let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
+        let request = fixture.request(2);
+        module.canonical_fault.store(7, Ordering::SeqCst);
+        module.canonical_failures.store(1, Ordering::SeqCst);
+        let before = module.canonical_seals.load(Ordering::SeqCst);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(replies.reply(&request));
+        }))
+        .is_err());
+        module.canonical_fault.store(0, Ordering::SeqCst);
+        assert_eq!(replies.reply(&request).unwrap_err(), Error::Unavailable);
+        drop(replies);
+        assert_eq!(
+            fixture
+                .window
+                .canonical_replies(Policy::default())
+                .unwrap_err(),
+            Error::Unavailable
+        );
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), before + 1);
+        return;
+    }
+    if case == "readiness" {
+        let fixture = Fixture::new(202, ALGORITHMS[0], DIRECTIONS[0]);
+        let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
+        let request = fixture.request(1);
+        let packet = replies.reply(&request).unwrap().bytes().to_vec();
+        let seals = module.canonical_seals.load(Ordering::SeqCst);
+        module.set_serviceable(
+            module
+                .capabilities()
+                .without(CryptoCapability::IkeEncryption),
+        );
+        assert_eq!(replies.reply(&request).unwrap_err(), Error::Unavailable);
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), seals);
+        module.set_serviceable(module.capabilities());
+        assert_eq!(replies.reply(&request).unwrap().bytes(), packet);
+        module.drift_validation.store(true, Ordering::SeqCst);
+        assert_eq!(replies.reply(&request).unwrap_err(), Error::Unavailable);
+        return;
+    }
+    if case == "recreation" {
+        let fixture = Fixture::new(203, ALGORITHMS[0], DIRECTIONS[0]);
+        let request = fixture.request(2);
+        module.canonical_fault.store(1, Ordering::SeqCst);
+        module.canonical_failures.store(10, Ordering::SeqCst);
+        let before = module.canonical_seals.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
+            assert_eq!(replies.reply(&request).unwrap_err(), Error::InvalidOutput);
+        }
+        let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
+        assert_eq!(
+            replies.reply(&request).unwrap_err(),
+            Error::AttemptsExhausted
+        );
+        assert_eq!(module.canonical_seals.load(Ordering::SeqCst), before + 3);
+        return;
+    }
+    assert_eq!(case, "faults");
+    for fault in 1..=5 {
+        for withheld in 0..=3 {
+            let fixture = Fixture::new(
+                300 + u64::from(fault) * 10 + withheld,
+                ALGORITHMS[0],
+                DIRECTIONS[0],
+            );
+            let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
+            let request = fixture.request(4);
+            module.canonical_fault.store(fault, Ordering::SeqCst);
+            module
+                .canonical_failures
+                .store(usize::try_from(withheld).unwrap(), Ordering::SeqCst);
+            let before = module.canonical_seals.load(Ordering::SeqCst);
+            for _ in 0..withheld {
+                let error = replies.reply(&request).unwrap_err();
+                assert!(matches!(error, Error::InvalidOutput | Error::Unavailable));
+                assert_eq!(format!("{replies:?}"), "Ikev2CanonicalEmptyReplies { .. }");
+                let diagnostic =
+                    format!("{error:?} {error} {:?}", std::error::Error::source(&error));
+                assert!(!diagnostic.contains(HOSTILE_PROVIDER_DIAGNOSTIC));
+                assert!(!diagnostic.contains("ciphertext"));
+                assert!(diagnostic.len() < 150);
+            }
+            if withheld == 3 {
+                assert_eq!(
+                    replies.reply(&request).unwrap_err(),
+                    Error::AttemptsExhausted
+                );
+                assert_eq!(module.canonical_seals.load(Ordering::SeqCst), before + 3);
+            } else {
+                let packet = replies.reply(&request).unwrap().bytes().to_vec();
+                assert_eq!(replies.reply(&request).unwrap().bytes(), packet);
+                replies.retire(4).unwrap();
+                assert_eq!(replies.reply(&request).unwrap_err(), Error::AlreadyReleased);
+                assert_eq!(
+                    module.canonical_seals.load(Ordering::SeqCst),
+                    before + usize::try_from(withheld).unwrap() + 1
+                );
+            }
+        }
+    }
+}
+
+fn canonical_mixed_nonce_monitor(module: &CountingModule, after_restart: bool) {
+    use bytes::Bytes;
+    use canonical_fixtures::{delete, empty, Fixture, ALGORITHMS, DIRECTIONS};
+    use opc_proto_ikev2::{
+        canonical::Ikev2CanonicalPolicy,
+        recovery::{
+            Ikev2CommittedWindow as Window, Ikev2CommittedWindowDomain as Domain,
+            Ikev2CommittedWindowRecord as Record, Ikev2SyncClock as Clock,
+            Ikev2SyncDisposition as Disposition, Ikev2SyncInitiatorAction as Action,
+            Ikev2SyncRecoveryPolicy, Ikev2SyncResponderRecord as SyncRecord,
+        },
+        Ikev2AesGcmIvAllocator as Allocator, Ikev2AesGcmIvPurpose as Purpose,
+        Ikev2ExchangeKind as Exchange, Ikev2MessageIdSyncAgreement as Agreement,
+        Ikev2MessageIdSyncMode as Mode, Ikev2MessageIdSyncRole as Role, Ikev2MessageIdSyncSa as Sa,
+    };
+    module.monitor_aead.store(true, Ordering::SeqCst);
+    for algorithm in ALGORITHMS {
+        for epoch in 0..2 {
+            for direction in DIRECTIONS {
+                let profile = canonical_fixtures::profile(algorithm);
+                let keys = canonical_fixtures::key_material(profile, 400 + epoch);
+                // The rekey epoch also exercises equal AES keys with distinct
+                // directional salts; aggregate usage includes both nonce domains.
+                let keys = if epoch == 1 {
+                    let mut er = keys.sk_ei().to_vec();
+                    let key_len = er.len() - 4;
+                    er[key_len..].copy_from_slice(&keys.sk_er()[key_len..]);
+                    opc_proto_ikev2::Ikev2SaInitKeyMaterial::from_established_keys(
+                        profile,
+                        false,
+                        keys.sk_d(),
+                        &[],
+                        &[],
+                        keys.sk_ei(),
+                        &er,
+                        keys.sk_pi(),
+                        keys.sk_pr(),
+                    )
+                    .unwrap()
+                } else {
+                    keys
+                };
+                let spis = (
+                    canonical_fixtures::SPIS.0 + epoch,
+                    canonical_fixtures::SPIS.1 + epoch,
+                );
+                let mut fixture = if after_restart {
+                    Fixture::from_persisted_keys(profile, keys, direction, spis, 64)
+                } else {
+                    Fixture::from_keys(profile, keys, direction, spis)
+                };
+                if after_restart {
+                    // Restore the persisted IV end, discarding the old unused tail.
+                    // Replaying an old same-binding window snapshot deliberately
+                    // checks that canonical nonce safety does not depend on floors.
+                    fixture.allocator =
+                        Allocator::restore(fixture.iv.domain(), &fixture.iv).unwrap();
+                    let prepared = fixture.allocator.prepare(64, Purpose::Ordinary).unwrap();
+                    fixture.iv = prepared.record().clone();
+                    prepared.activate_after_commit(&fixture.iv).unwrap();
+                    fixture.window = fixture.restore(&fixture.iv);
+                }
+                let domain = Domain::from_iv_record(&fixture.iv);
+                let role = if direction == DIRECTIONS[0] {
+                    Role::Initiator
+                } else {
+                    Role::Responder
+                };
+                let agreement = Agreement::from_persisted(
+                    Sa::new(fixture.spis.0, fixture.spis.1, role).unwrap(),
+                    Mode::Negotiated,
+                );
+                let record = Record::initial(domain.clone(), 0, 0)
+                    .with_sync_state(
+                        SyncRecord::from_persisted(
+                            agreement,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Disposition::Continue,
+                            0,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                fixture.window = Window::restore(
+                    &domain,
+                    fixture.profile,
+                    &fixture.keys,
+                    &record,
+                    &fixture.iv,
+                )
+                .unwrap();
+                let replies = fixture
+                    .window
+                    .canonical_replies(Ikev2CanonicalPolicy::default())
+                    .unwrap();
+                let empty_request = fixture.request(9);
+                let before = module.counts.entropy.load(Ordering::SeqCst);
+                let first = replies.reply(&empty_request).unwrap().bytes().to_vec();
+                assert_eq!(replies.reply(&empty_request).unwrap().bytes(), first);
+                assert_eq!(module.counts.entropy.load(Ordering::SeqCst), before);
+
+                let prepared = fixture
+                    .window
+                    .prepare_request(
+                        fixture.profile,
+                        &fixture.keys,
+                        fixture.allocator.allocate(Purpose::Ordinary).unwrap(),
+                        Exchange::Informational,
+                        delete(),
+                    )
+                    .unwrap();
+                let committed = prepared.record().clone();
+                let _receipt = prepared.commit_after_durable(&committed).unwrap();
+                let peer_request = fixture.peer(0, false, 37, delete(), 0, 0x2000);
+                let request = fixture
+                    .window
+                    .open_peer(fixture.profile, &fixture.keys, &peer_request)
+                    .unwrap();
+                let prepared = fixture
+                    .window
+                    .prepare_response(
+                        fixture.profile,
+                        &fixture.keys,
+                        fixture.allocator.allocate(Purpose::Ordinary).unwrap(),
+                        &request,
+                        empty(),
+                        Bytes::new(),
+                    )
+                    .unwrap();
+                let committed = prepared.record().clone();
+                let _receipt = prepared.commit_after_durable(&committed).unwrap();
+                let peer_response = fixture.peer(0, true, 37, empty(), 0, 0x2001);
+                let response = fixture
+                    .window
+                    .open_peer(fixture.profile, &fixture.keys, &peer_response)
+                    .unwrap();
+                let prepared = fixture
+                    .window
+                    .prepare_completion(&response, Bytes::new())
+                    .unwrap();
+                let committed = prepared.record().clone();
+                let _receipt = prepared.commit_after_durable(&committed).unwrap();
+                let sync = [
+                    0, 0, 0, 20, 0, 0, 0x40, 0x26, 1, 2, 3, 4, 0, 0, 0, 10, 0, 0, 0, 10,
+                ];
+                let wire = fixture.peer(
+                    0,
+                    false,
+                    37,
+                    opc_proto_ikev2::PayloadChain::new(PayloadType::Notify, &sync),
+                    0,
+                    0x2002,
+                );
+                let admitted = fixture
+                    .window
+                    .begin_sync_response(fixture.profile, &fixture.keys, &wire, None, None)
+                    .unwrap();
+                let prepared = admitted
+                    .prepare(
+                        fixture.profile,
+                        &fixture.keys,
+                        fixture.allocator.allocate(Purpose::Ordinary).unwrap(),
+                    )
+                    .unwrap();
+                let committed = prepared.record().clone();
+                let receipt = prepared.commit_after_durable(&committed).unwrap();
+                let _response = fixture.window.release_sync_response(receipt).unwrap();
+
+                let now = Clock::new(100, 1);
+                let policy = Ikev2SyncRecoveryPolicy::new(1, now, 200, 3, 10).unwrap();
+                module.sync_entropy_mode.store(1, Ordering::SeqCst);
+                let prepared = fixture
+                    .window
+                    .begin_sync(policy, now, None)
+                    .unwrap()
+                    .prepare(
+                        fixture.profile,
+                        &fixture.keys,
+                        fixture.allocator.allocate(Purpose::Ordinary).unwrap(),
+                    )
+                    .unwrap();
+                let committed = prepared.record().clone();
+                let receipt = prepared.commit_after_durable(&committed, now).unwrap();
+                assert!(matches!(
+                    fixture.window.release_sync_action(receipt, now).unwrap(),
+                    Action::SendRequest(_)
+                ));
+                assert_eq!(
+                    fixture
+                        .window
+                        .canonical_replies(Ikev2CanonicalPolicy::default())
+                        .unwrap_err(),
+                    opc_proto_ikev2::canonical::Ikev2CanonicalError::LifecycleBlocked
+                );
+                // A Child-SA rekey does not reset the IKE domain; the same
+                // pre-existing canonical recipe still yields the same bytes.
+                // Sending/admission is intentionally not granted by this primitive.
+                assert_eq!(replies.reply(&empty_request).unwrap().bytes(), first);
+            }
+        }
+    }
+    let observed = module.observed_aead.lock().unwrap();
+    let encode = |value: &[u8]| {
+        value
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let trace: String = observed
+        .iter()
+        .map(|value| {
+            format!(
+                "{} {}:{}\n",
+                encode(&value.key_nonce),
+                encode(&value.aad),
+                encode(&value.plaintext)
+            )
+        })
+        .collect();
+    std::fs::write(
+        std::env::var("OPC_CANONICAL_TRANSCRIPT_PATH").unwrap(),
+        trace,
+    )
+    .unwrap();
+    assert!(observed.len() > 100);
 }

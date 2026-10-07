@@ -95,7 +95,7 @@ impl Fixture {
         } else {
             Direction::ResponderToInitiator
         };
-        let domain = Domain::new(0x101, 0x202, direction, profile, &keys).unwrap();
+        let domain = support::window_domain(0x101, 0x202, direction, profile, &keys).unwrap();
         let agreement =
             Agreement::from_persisted(Sa::new(0x101, 0x202, role).unwrap(), Mode::Negotiated);
         Self {
@@ -132,11 +132,22 @@ impl Fixture {
         .unwrap()
     }
 
+    fn epoch_inputs(&self) -> opc_proto_ikev2::Ikev2AesGcmEpochInputs<'_> {
+        let domain = self.domain.send_iv_domain();
+        support::epoch_inputs(
+            domain.initiator_spi(),
+            domain.responder_spi(),
+            domain.direction(),
+            self.profile,
+            &self.keys,
+        )
+    }
     fn iv_record(&self, end: u64) -> IvRecord {
         IvRecord::from_persisted(
-            self.domain.send_iv_domain().clone(),
+            self.epoch_inputs(),
             Limits::new(128, 2, 1, 2).unwrap(),
             end,
+            Some(1),
         )
         .unwrap()
     }
@@ -146,10 +157,8 @@ impl Fixture {
     }
 
     fn start(&self, counters: Counters) -> (Window, Allocator, IvRecord) {
-        let mut allocator = Allocator::fresh(
-            self.domain.send_iv_domain().clone(),
-            self.iv_record(0).limits(),
-        );
+        let mut allocator =
+            Allocator::fresh(self.epoch_inputs(), self.iv_record(0).limits()).unwrap();
         let prepared = allocator.prepare(8, Purpose::Ordinary).unwrap();
         let iv_record = prepared.record().clone();
         prepared.activate_after_commit(&iv_record).unwrap();

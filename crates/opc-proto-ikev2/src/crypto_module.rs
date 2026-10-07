@@ -763,6 +763,19 @@ fn select_encryption(
     Ok((selected, mapped))
 }
 
+pub(crate) fn canonical_module_declares_validation(
+    algorithm: Ikev2EncryptionAlgorithm,
+) -> Result<bool, Ikev2CryptoModuleError> {
+    let (selected, mapped) = select_encryption(algorithm)?;
+    if !matches!(mapped, MappedEncryption::Aead(_)) {
+        return Err(algorithm_unsupported());
+    }
+    Ok(matches!(
+        selected.module().validation_state(),
+        opc_crypto_provider::ValidationState::DeclaredValidated { .. }
+    ))
+}
+
 pub(crate) fn execute_aead_seal(
     algorithm: Ikev2EncryptionAlgorithm,
     key: &[u8],
@@ -770,15 +783,17 @@ pub(crate) fn execute_aead_seal(
     explicit_iv: &[u8],
     associated_data: &[u8],
     plaintext: &[u8],
-) -> Result<Vec<u8>, Ikev2CryptoModuleError> {
+) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
     let (selected, mapped) = select_encryption(algorithm)?;
     let MappedEncryption::Aead(mapped) = mapped else {
         return Err(algorithm_unsupported());
     };
-    let output = selected
-        .module()
-        .seal_aead(mapped, key, salt, explicit_iv, associated_data, plaintext)
-        .map_err(|error| Ikev2CryptoModuleError::operation(&error))?;
+    let output = Zeroizing::new(
+        selected
+            .module()
+            .seal_aead(mapped, key, salt, explicit_iv, associated_data, plaintext)
+            .map_err(|error| Ikev2CryptoModuleError::operation(&error))?,
+    );
     let expected_len = mapped
         .explicit_iv_len()
         .checked_add(plaintext.len())
