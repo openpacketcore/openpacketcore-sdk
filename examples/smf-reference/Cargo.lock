@@ -1684,6 +1684,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "hex",
  "hmac",
  "imbl",
  "libc",

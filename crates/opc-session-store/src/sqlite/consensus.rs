@@ -15,6 +15,7 @@ pub(crate) mod roster_reads;
 pub(crate) mod roster_rows;
 #[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
+pub(crate) mod scope_lease;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -22049,6 +22050,14 @@ pub(crate) fn validate_command_for_log(
             "session fenced transition V2 maintenance logical time is outside the profiled range",
         ));
     }
+    if let SessionMutationIntent::ScopeLease(operation) = semantic_intent {
+        operation
+            .validate()
+            .map_err(|_| invalid_data("scope operation invalid"))?;
+        if !matches!(command.intent, SessionMutationIntent::Authorized { .. }) {
+            return Err(invalid_data("scope operation requires current authority"));
+        }
+    }
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
         crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
@@ -23583,7 +23592,8 @@ impl MembershipLogProjection {
                 terminal.finalization_log_index = Some(log_index);
                 Ok(())
             }
-            SessionMutationIntent::AdvanceLogicalTime
+            SessionMutationIntent::ScopeLease(_)
+            | SessionMutationIntent::AdvanceLogicalTime
             | SessionMutationIntent::BindConsumerRequest { .. }
             | SessionMutationIntent::ReadConsumerRecord { .. }
             | SessionMutationIntent::FencedTransition(_)
@@ -30624,6 +30634,11 @@ pub(crate) fn validate_consensus_outcome_records(
         | SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
             current: Some(record),
         }) => super::validate_consensus_record(record),
+        SessionMutationOutcome::ScopeLease(Ok(checkpoint)) => checkpoint
+            .state()
+            .map(|_| ())
+            .map_err(|_| StoreError::Serialization("scope checkpoint invalid".into())),
+        SessionMutationOutcome::ScopeLease(Err(_)) => Ok(()),
         SessionMutationOutcome::FencedTransition(outcome) => outcome.validate(),
         SessionMutationOutcome::FencedTransitionV2Batch(outcomes) => {
             validate_fenced_transition_v2_batch_outcomes(outcomes)
@@ -30677,6 +30692,11 @@ fn read_outcome_sync(
     if let Ok(outcome) = &response.result {
         validate_consensus_outcome_records(outcome)
             .map_err(|_| invalid_data("persisted session consensus outcome record is invalid"))?;
+    }
+    if let Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) = &response.result {
+        checkpoint
+            .validate_slot(request_id, digest)
+            .map_err(|_| invalid_data("scope checkpoint slot differs"))?;
     }
     Ok(Some((digest, response)))
 }
@@ -30803,6 +30823,10 @@ fn execute_application_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
+        SessionMutationIntent::ScopeLease(_) => Err(StoreError::BackendUnavailable(
+            "scope command reached ordinary apply".into(),
+        )),
+
         SessionMutationIntent::AdvanceLogicalTime
         | SessionMutationIntent::BindConsumerRequest { .. }
         | SessionMutationIntent::ActivateFencedTransitionCapability { .. } => {
@@ -31128,6 +31152,10 @@ fn execute_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
+        SessionMutationIntent::ScopeLease(_) => Err(StoreError::BackendUnavailable(
+            "scope command reached ordinary apply".into(),
+        )),
+
         SessionMutationIntent::PrepareTopologyTransition {
             transition_id,
             request_digest,
@@ -31771,6 +31799,20 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
         // exact durable terminal composite. Complete it before the unchanged
         // generic match so rustfmt does not obscure that mature apply path.
         if let EntryPayload::Normal(command) = &entry.payload {
+            if scope_lease::operation(&command.intent).is_some() {
+                let response = scope_lease::apply(
+                    &tx,
+                    identity,
+                    &scope,
+                    command,
+                    entry.log_id.index,
+                    &mut machine,
+                )?;
+                save_log_pointer(&tx, "consensus_applied", identity, &entry.log_id)?;
+                last_applied = Some(entry.log_id);
+                responses.push(response);
+                continue;
+            }
             if contains_protected_roster_command(&command.intent) {
                 protected_roster_changed = true;
                 let response = apply_protected_roster_command_sync(
@@ -40311,6 +40353,8 @@ pub(crate) mod historical_snapshot_fixture;
 
 #[cfg(test)]
 mod tests {
+    #[path = "scope_lease.rs"]
+    mod scope_lease_tests;
     #[cfg(target_os = "linux")]
     use crate::test_process::CommandExt as _;
     #[cfg(target_os = "linux")]

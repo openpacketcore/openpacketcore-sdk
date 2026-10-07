@@ -1,6 +1,7 @@
+use aes::{cipher::consts::U12, Aes192};
 use aes_gcm::{
     aead::{Aead, Key, KeyInit, Nonce, Payload},
-    Aes128Gcm, Aes256Gcm,
+    Aes128Gcm, Aes256Gcm, AesGcm,
 };
 use bytes::BytesMut;
 use opc_proto_ikev2::{
@@ -351,18 +352,166 @@ fn seal_with_iv_counter_persists_next_value_for_restore() {
     assert_eq!(restored.next_value(), 0x0000_0000_0000_1002);
 }
 
-#[test]
-fn explicit_iv_counter_fails_closed_before_wraparound() {
-    let mut counter = Ikev2AesGcmExplicitIvCounter::new(u64::MAX);
-    let err = counter
-        .next_explicit_iv()
-        .expect_err("counter must not wrap");
+// The upper 2^32 IVs are reserved for the later narrow canonical-reply path.
+const FIRST_RESERVED_IV: u64 = 0xffff_ffff_0000_0000;
 
-    assert_eq!(
-        err.as_str(),
-        "ike_protected_payload_crypto_explicit_iv_exhausted"
+#[test]
+fn explicit_iv_counter_stops_at_the_normal_domain_boundary() {
+    for value in [0, FIRST_RESERVED_IV - 1] {
+        let mut counter = Ikev2AesGcmExplicitIvCounter::new(value);
+        assert_eq!(counter.next_explicit_iv().unwrap(), value.to_be_bytes());
+        assert_eq!(counter.next_value(), value + 1);
+    }
+    for value in [FIRST_RESERVED_IV, FIRST_RESERVED_IV + 1, u64::MAX] {
+        let mut counter = Ikev2AesGcmExplicitIvCounter::new(value);
+        let err = counter
+            .next_explicit_iv()
+            .expect_err("reserved IV cannot be allocated");
+        assert_eq!(
+            err.as_str(),
+            "ike_protected_payload_crypto_explicit_iv_exhausted"
+        );
+        assert_eq!(counter.next_value(), value);
+    }
+}
+
+fn boundary_prefix(
+    kind: ProtectedPayloadKind,
+    direction: Ikev2ProtectedPayloadDirection,
+) -> Vec<u8> {
+    let fragmented = kind == ProtectedPayloadKind::EncryptedFragment;
+    let body_len = ikev2_aes_gcm_protected_body_len(INNER_PAYLOAD.len(), 0).unwrap();
+    let mut prefix = placeholder_message(
+        body_len + if fragmented { 4 } else { 0 },
+        PayloadType::ExtensibleAuthentication,
     );
-    assert_eq!(counter.next_value(), u64::MAX);
+    prefix.truncate(HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN);
+    prefix[19] = if direction == Ikev2ProtectedPayloadDirection::InitiatorToResponder {
+        8
+    } else {
+        0
+    };
+    if fragmented {
+        prefix[16] = PayloadType::EncryptedFragment.as_u8();
+        prefix.extend_from_slice(&[0, 1, 0, 2]);
+    }
+    prefix
+}
+
+fn gcm_profiles() -> [Ikev2SaInitCryptoProfile; 3] {
+    [
+        profile_128(),
+        Ikev2SaInitCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2DhGroup::Ecp256,
+            Ikev2EncryptionAlgorithm::AesGcm16_192,
+        )
+        .unwrap(),
+        profile_256(),
+    ]
+}
+
+#[test]
+fn ordinary_gcm_sealing_bounds_direct_and_counter_ivs_for_sk_and_skf() {
+    for profile in gcm_profiles() {
+        let material = key_material(profile);
+        for direction in [
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ] {
+            for kind in [
+                ProtectedPayloadKind::Encrypted,
+                ProtectedPayloadKind::EncryptedFragment,
+            ] {
+                let prefix = boundary_prefix(kind, direction);
+                let context = ProtectedPayloadSealContext {
+                    kind,
+                    message_prefix: &prefix,
+                };
+                for value in [
+                    0,
+                    FIRST_RESERVED_IV - 1,
+                    FIRST_RESERVED_IV,
+                    FIRST_RESERVED_IV + 1,
+                    u64::MAX,
+                ] {
+                    let direct = seal_ikev2_sa_init_protected_payload(
+                        profile,
+                        &material,
+                        direction,
+                        context,
+                        INNER_PAYLOAD,
+                        0,
+                        value.to_be_bytes(),
+                    );
+                    let mut counter = Ikev2AesGcmExplicitIvCounter::new(value);
+                    let counted = seal_ikev2_sa_init_protected_payload_with_iv_counter(
+                        profile,
+                        &material,
+                        direction,
+                        context,
+                        INNER_PAYLOAD,
+                        0,
+                        &mut counter,
+                    );
+                    if value < FIRST_RESERVED_IV {
+                        let body = direct.unwrap();
+                        assert_eq!(&body[..8], &value.to_be_bytes());
+                        assert_eq!(body, counted.unwrap());
+                        assert_eq!(counter.next_value(), value + 1);
+                    } else {
+                        assert_eq!(
+                            direct.unwrap_err().as_str(),
+                            "ike_protected_payload_crypto_explicit_iv_reserved"
+                        );
+                        assert_eq!(
+                            counted.unwrap_err().as_str(),
+                            "ike_protected_payload_crypto_explicit_iv_exhausted"
+                        );
+                        assert_eq!(counter.next_value(), value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn peer_gcm_reserved_ivs_still_open_in_sk_and_skf() {
+    for profile in gcm_profiles() {
+        let material = key_material(profile);
+        for direction in [
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ] {
+            for kind in [
+                ProtectedPayloadKind::Encrypted,
+                ProtectedPayloadKind::EncryptedFragment,
+            ] {
+                for value in [FIRST_RESERVED_IV, FIRST_RESERVED_IV + 1, u64::MAX] {
+                    // Independent peer encryption does not use the SDK's local transmit partition.
+                    let mut encoded = boundary_prefix(kind, direction);
+                    let mut plaintext = INNER_PAYLOAD.to_vec();
+                    plaintext.push(0);
+                    let ciphertext = encrypt_ciphertext_and_tag(
+                        profile,
+                        &material,
+                        direction,
+                        &encoded,
+                        &plaintext,
+                        value.to_be_bytes(),
+                    );
+                    encoded.extend_from_slice(&value.to_be_bytes());
+                    encoded.extend_from_slice(&ciphertext);
+                    let opened =
+                        open_with_provider(&encoded, profile, &material, direction).unwrap();
+                    assert_eq!(opened.len(), 1);
+                    assert_eq!(opened[0].kind, kind);
+                    assert_eq!(opened[0].cleartext.as_ref(), INNER_PAYLOAD);
+                }
+            }
+        }
+    }
 }
 
 fn encrypted_message_after_notify(
@@ -537,6 +686,12 @@ fn encrypt_ciphertext_and_tag(
                 Ok(bytes) => bytes,
                 Err(error) => panic!("test AES-GCM-128 encryption failed: {error}"),
             }
+        }
+        Ikev2EncryptionAlgorithm::AesGcm16_192 => {
+            type Aes192Gcm = AesGcm<Aes192, U12>;
+            let key = <&Key<Aes192Gcm>>::try_from(encryption_key).unwrap();
+            let nonce = <&Nonce<Aes192Gcm>>::try_from(nonce.as_slice()).unwrap();
+            Aes192Gcm::new(key).encrypt(nonce, payload).unwrap()
         }
         Ikev2EncryptionAlgorithm::AesGcm16_256 => {
             let key = match <&Key<Aes256Gcm>>::try_from(encryption_key) {

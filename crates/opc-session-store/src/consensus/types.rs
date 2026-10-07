@@ -2186,6 +2186,9 @@ pub enum SessionMutationIntent {
         /// Independently negotiated immutable void profile.
         profile_digest: [u8; 32],
     },
+    /// One atomic scope-authority operation; retains only its scope checkpoint.
+    #[doc(hidden)]
+    ScopeLease(Box<crate::scope_lease::ScopeLeaseCommand>),
 }
 
 /// Exact, self-contained precondition and effect request for the appended
@@ -2711,6 +2714,11 @@ pub enum SessionMutationOutcome {
     /// Compact outcome of one Profile V2 protected-roster terminalization.
     #[doc(hidden)]
     RosterTerminalV2(ConsensusRosterTerminalOutcome),
+    /// Current bounded scope checkpoint, or a deterministic no-effect refusal.
+    #[doc(hidden)]
+    ScopeLease(
+        Result<crate::scope_lease::ScopeLeaseCheckpoint, crate::scope_lease::ScopeLeaseError>,
+    ),
 }
 
 impl fmt::Debug for SessionMutationOutcome {

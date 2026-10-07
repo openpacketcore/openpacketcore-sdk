@@ -3341,6 +3341,32 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read the stable scope checkpoint and detect legacy authority without
+    /// a logical-time command or ordinary request receipt.
+    pub(crate) async fn consensus_scope_lease_checkpoint(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        scope: crate::scope_lease::ScopeLeaseId,
+    ) -> Result<consensus::scope_lease::StoredCheckpoint, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _| state.scope_lease_checkpoint(identity, &scope))
+                .await;
+        }
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn.unchecked_transaction().map_err(|_| {
+                StoreError::BackendUnavailable("scope checkpoint unavailable".into())
+            })?;
+            let result = consensus::scope_lease::read(&tx, identity, &scope)?;
+            tx.commit().map_err(|_| {
+                StoreError::BackendUnavailable("scope checkpoint unavailable".into())
+            })?;
+            Ok(result)
+        })
+        .await
+    }
+
     /// Check one exact consumer binding before the leader decides whether a
     /// marker proposal is necessary. This is a point read of the outcome
     /// ledger, not a receipt barrier, mutation, or consensus proposal.

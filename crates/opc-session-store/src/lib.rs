@@ -119,6 +119,7 @@ pub mod record;
 pub mod recovery;
 mod replication_watch;
 pub mod restore;
+pub mod scope_lease;
 pub mod sqlite;
 pub mod store;
 pub mod topology;

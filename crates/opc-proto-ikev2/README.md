@@ -60,10 +60,60 @@ wraps. Rekey also requires an available ordinary window and IV budget.
 These values are not authentication or persistence authority. Callers must
 authenticate packets through the admitted IKE provider and supply same-SA
 history. No automatic advertisement, nonce generation, durable commit, packet
-protection, once-only response consumption or restart recovery is implemented.
+protection, once-only response consumption or restart recovery is implemented
+by the pure rules. Ordinary GCM IV reservation ordering is described below.
 Production readiness requires complete runtime handling in both directions.
 ESP replay-counter synchronization is out of scope. See
 [CONFORMANCE.md](CONFORMANCE.md).
+
+## Ordinary GCM IV reservations
+
+All ordinary AES-GCM `SK`/`SKF` sealers, including caller-chosen IVs and
+`Ikev2AesGcmExplicitIvCounter`, now reject IVs at or above
+`IKEV2_AES_GCM_NORMAL_IV_END` (`0xffff_ffff_0000_0000`). Peer packets may still
+use the whole wire range. The upper 2^32 values are reserved for a later narrow
+canonical-reply builder. No ordinary IKE sealing API in this crate can seal in
+that region. The generic provider-level `IkeEncryptionOperations::seal_aead` on
+`Ikev2SoftwareCryptoOperations` is an unpartitioned raw cipher primitive, not an
+IKE send path. Consumers must not call it directly with SA keys; use the admitted
+IKE sealers or reservation tokens. The legacy counter alone provides neither
+durable ordering nor writer fencing.
+
+`iv_reservation` adds a non-cloneable `Ikev2AesGcmIvAllocator`. Establish its
+`Ikev2AesGcmIvDomain` from both nonzero SPIs, the original-role sending direction,
+the GCM algorithm and actual key/salt material. Use `fresh` only with new keys
+whose IV history is empty; changing SPIs or making a new descriptor is not a
+substitute for fresh keys. The consumer must fence one writer and must not mix
+legacy/raw-IV sealing with this allocator under the same key epoch.
+
+`prepare` burns a block locally and exposes an `Ikev2AesGcmIvRecord` without
+allocating an IV. Persist its exclusive end, descriptor inputs and immutable
+limits atomically with the SA keys, then consume the prepared token with
+`activate_after_commit` and that exact record. The SDK checks equality; the
+caller supplies the durable-commit fact. Failure, cancellation or uncertainty
+releases no IV. Resolve uncertain writes before an older write could roll back
+a higher reservation. On restore, rebuild from the latest trusted, fenced SA
+record and check the intended domain; the allocator discards the unused tail
+and requires another committed reservation before allocating. There is no SDK
+storage format or migration in this API.
+
+Limits derive control headroom from maximum newly sealed outbound control
+messages per attempt (at least two for IKE rekey and Delete), fragments per
+message and attempts. Ordinary allocations stop at the soft threshold with
+`RekeyRequired`; only bounded control traffic can consume the remaining reserve.
+The hard ceiling returns `Exhausted`, requiring closure if rekey did not finish.
+Limits are immutable for the key epoch. Their ceiling is at most 2^32 reserved
+ordinary positions per direction key, a conservative SDK policy rather than an
+RFC requirement; skipped blocks and tails count against it. Store the original
+`control_budget()` and `hard_ceiling()` inputs to rebuild the same limits.
+
+Each allocated token is consumed by `seal`, which checks the actual header,
+profile, key and salt and calls the existing admitted crypto module. Dropping a
+token or failing to seal burns its IV. Exact-byte retransmission needs no new
+allocation. Reserve blocks during initial key setup or state-changing work;
+DPD, keepalives and empty responses must not initiate reservation writes.
+These hooks provide no durable Message-ID admission or exchange commit, no
+canonical response, and no complete restart-recovery lifecycle. CBC is unchanged.
 
 ## NWu payload profiles
 

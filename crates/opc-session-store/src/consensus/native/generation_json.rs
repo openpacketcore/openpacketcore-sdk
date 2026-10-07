@@ -20,6 +20,7 @@ struct Body {
     containers: usize,
     payload: usize,
     limit: usize,
+    string_limit: usize,
 }
 
 impl Body {
@@ -101,7 +102,7 @@ impl<'de> Visitor<'de> for Scan<'_> {
         Ok(Atom::Other)
     }
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Atom, E> {
-        if value.len() > 128 {
+        if value.len() > self.0.string_limit {
             return Err(E::custom("native V2 string exceeds closed model shape"));
         }
         Ok(Atom::Other)
@@ -140,14 +141,15 @@ impl<'de> Visitor<'de> for Scan<'_> {
     }
 }
 
-struct Request<const BLOCKS: usize = 1>(Shape);
-impl<'de, const BLOCKS: usize> Deserialize<'de> for Request<BLOCKS> {
+struct Request<const BLOCKS: usize = 1, const STRING: usize = 128>(Shape);
+impl<'de, const BLOCKS: usize, const STRING: usize> Deserialize<'de> for Request<BLOCKS, STRING> {
     fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         let mut body = Body {
             fields: 0,
             containers: 0,
             payload: 0,
             limit: REQUEST_FIELDS * BLOCKS,
+            string_limit: STRING,
         };
         Scan(&mut body).deserialize(decoder)?;
         Ok(Self(Shape {
@@ -197,6 +199,7 @@ impl<'de> Deserialize<'de> for Batch {
 // all fields before those constructors run; it never expands capsule contents.
 #[derive(Deserialize)]
 enum InnerIntent {
+    ScopeLease(Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>),
     AdvanceLogicalTime,
     CompareAndSet(Request),
     DeleteFenced(Request),
@@ -223,6 +226,10 @@ enum InnerIntent {
 impl InnerIntent {
     fn shape(self) -> Shape {
         match self {
+            Self::ScopeLease(value) => Shape {
+                requests: value.0.requests,
+                payload: crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2,
+            },
             Self::AdvanceLogicalTime => Shape::default(),
             Self::CompareAndSet(value)
             | Self::DeleteFenced(value)

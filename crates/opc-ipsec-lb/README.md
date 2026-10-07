@@ -503,7 +503,10 @@ a window no wider than `2^31`, so validation requires the checked sum
 `2^31 - 1` is therefore only the absolute ceiling for an attested zero-lag
 peer; any lag reduces it. ESP checkpoints and all resumed SA identifiers must
 be non-zero. IKE's explicit-IV checkpoint may be zero and has no ESP-specific
-maximum, but checked `u64` overflow always fails closed and requires rekey.
+reconstruction maximum, but its resumed value must be below
+`0xffff_ffff_0000_0000`, matching the SDK's ordinary IKE sealing APIs. Reaching
+that reserved region or overflowing checked `u64` arithmetic fails closed with
+`UnsafeResume` and requires rekey.
 
 `IkeRandomIv` is the separate IKE encrypt-then-MAC path. It carries no counter
 fields and requires

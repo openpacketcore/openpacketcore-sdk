@@ -55,6 +55,13 @@ type Aes192Gcm = AesGcm<Aes192, U12>;
 /// RFC 5282 AES-GCM explicit IV length used in IKEv2 `SK` payload bodies.
 pub const IKEV2_AES_GCM_EXPLICIT_IV_LEN: usize = AES_GCM_EXPLICIT_IV_LEN;
 
+/// Exclusive upper bound for ordinary local AES-GCM explicit IVs.
+///
+/// The upper 2^32 values are reserved for canonical empty replies. This local
+/// transmit partition does not restrict peer IVs on receive. It is not a
+/// substitute for a lower per-key cryptographic usage limit.
+pub const IKEV2_AES_GCM_NORMAL_IV_END: u64 = 0xffff_ffff_0000_0000;
+
 /// RFC 7296 AES-CBC IV and block length used in IKEv2 `SK`/`SKF` payloads.
 pub const IKEV2_AES_CBC_IV_LEN: usize = AES_CBC_IV_LEN;
 
@@ -187,8 +194,10 @@ impl Ikev2ProtectedPayloadDirection {
 ///
 /// The value returned by [`Self::next_value`] is the next outbound explicit IV
 /// counter value to persist with the IKE SA. Restoring a counter with that value
-/// resumes sending strictly after the last successfully allocated IV and avoids
-/// nonce reuse with the same `SK_e*` key and salt.
+/// resumes strictly after the last allocated IV. A caller must durably record
+/// allocation before releasing ciphertext, including uncertain/failed sends;
+/// this legacy value helper does not enforce that ordering or writer fencing.
+/// Ordinary values are below [`IKEV2_AES_GCM_NORMAL_IV_END`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ikev2AesGcmExplicitIvCounter {
     next_value: u64,
@@ -213,12 +222,12 @@ impl Ikev2AesGcmExplicitIvCounter {
     /// # Errors
     ///
     /// Returns [`Ikev2ProtectedPayloadCryptoError::ExplicitIvExhausted`] when
-    /// the counter has reached its fail-closed wrap guard. Rekey the IKE SA
-    /// before sending more protected messages under this direction key.
+    /// the counter has reached the reserved region, including restored values.
+    /// Rekey the IKE SA before sending more protected messages under this key.
     pub fn next_explicit_iv(
         &mut self,
     ) -> Result<[u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN], Ikev2ProtectedPayloadCryptoError> {
-        if self.next_value == u64::MAX {
+        if self.next_value >= IKEV2_AES_GCM_NORMAL_IV_END {
             return Err(Ikev2ProtectedPayloadCryptoError::ExplicitIvExhausted);
         }
         let explicit_iv = self.next_value.to_be_bytes();
@@ -254,8 +263,10 @@ pub enum Ikev2ProtectedPayloadCryptoErrorCode {
     AuthenticationFailed,
     /// Decrypted IKE padding is structurally invalid.
     InvalidPadding,
-    /// AES-GCM explicit IV counter cannot allocate without wrapping.
+    /// AES-GCM explicit IV counter reached the reserved region.
     ExplicitIvExhausted,
+    /// The caller supplied an IV from the reserved canonical region.
+    ExplicitIvReserved,
     /// The selected secure entropy source could not produce a fresh AES-CBC IV.
     RandomIvGenerationFailed,
     /// The admitted process crypto module was absent, withdrawn, or failed.
@@ -282,6 +293,7 @@ impl Ikev2ProtectedPayloadCryptoErrorCode {
             Self::AuthenticationFailed => "ike_protected_payload_crypto_authentication_failed",
             Self::InvalidPadding => "ike_protected_payload_crypto_invalid_padding",
             Self::ExplicitIvExhausted => "ike_protected_payload_crypto_explicit_iv_exhausted",
+            Self::ExplicitIvReserved => "ike_protected_payload_crypto_explicit_iv_reserved",
             Self::RandomIvGenerationFailed => {
                 "ike_protected_payload_crypto_random_iv_generation_failed"
             }
@@ -351,6 +363,8 @@ pub enum Ikev2ProtectedPayloadCryptoError {
     },
     /// AES-GCM explicit IV counter is exhausted.
     ExplicitIvExhausted,
+    /// An ordinary seal attempted to use the reserved canonical IV region.
+    ExplicitIvReserved,
     /// The secure random source failed to generate an AES-CBC IV.
     RandomIvGenerationFailed,
     /// The admitted process crypto module was absent, withdrawn, or failed.
@@ -418,6 +432,7 @@ impl Ikev2ProtectedPayloadCryptoError {
             }
             Self::InvalidPadding { .. } => Ikev2ProtectedPayloadCryptoErrorCode::InvalidPadding,
             Self::ExplicitIvExhausted => Ikev2ProtectedPayloadCryptoErrorCode::ExplicitIvExhausted,
+            Self::ExplicitIvReserved => Ikev2ProtectedPayloadCryptoErrorCode::ExplicitIvReserved,
             Self::RandomIvGenerationFailed => {
                 Ikev2ProtectedPayloadCryptoErrorCode::RandomIvGenerationFailed
             }
@@ -494,6 +509,7 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
                 )
             }
             Self::ExplicitIvExhausted => f.write_str("IKEv2 AES-GCM explicit IV counter exhausted"),
+            Self::ExplicitIvReserved => f.write_str("IKEv2 AES-GCM explicit IV is reserved"),
             Self::RandomIvGenerationFailed => {
                 f.write_str("IKEv2 AES-CBC secure IV generation failed")
             }
@@ -647,7 +663,9 @@ pub fn decrypt_ikev2_sa_init_protected_payload(
 /// Callers must ensure it is never reused with the same direction key and salt.
 /// Reusing an AES-GCM nonce under one IKE SA can disclose plaintext relations
 /// and permit tag forgery. Production callers should allocate this value from a
-/// monotonic per-direction counter stored with the IKE SA state.
+/// monotonic per-direction counter stored with the IKE SA state. Values at or
+/// above [`IKEV2_AES_GCM_NORMAL_IV_END`] return
+/// [`Ikev2ProtectedPayloadCryptoError::ExplicitIvReserved`] before encryption.
 pub fn seal_ikev2_sa_init_protected_payload(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,
@@ -657,6 +675,9 @@ pub fn seal_ikev2_sa_init_protected_payload(
     padding_len: u8,
     explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
 ) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    if u64::from_be_bytes(explicit_iv) >= IKEV2_AES_GCM_NORMAL_IV_END {
+        return Err(Ikev2ProtectedPayloadCryptoError::ExplicitIvReserved);
+    }
     let keys = select_seal_keys(profile, key_material, direction)?;
     let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len)?;
     let sealed = encrypt_aes_gcm(
@@ -674,8 +695,9 @@ pub fn seal_ikev2_sa_init_protected_payload(
 ///
 /// This is the stateful counterpart to
 /// [`seal_ikev2_sa_init_protected_payload`]. Persist [`Ikev2AesGcmExplicitIvCounter::next_value`]
-/// with the sealed IKE SA state after each successful call, and restore the
-/// counter with that value before an HA adopter sends more protected messages.
+/// before releasing newly sealed bytes, and restore the counter with that value
+/// before sending more protected messages. Persist allocations even when sealing
+/// or sending fails after allocation. This helper performs no persistence.
 ///
 /// # Errors
 ///
