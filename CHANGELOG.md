@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: add opt-in committed ordinary GCM `SK` windows with
+  authenticated response correlation, strict request admission and exact replay.
+  Window restore requires the sending-IV reservation record and rejects a
+  high-water at or below any locally sent cached IV. Until zero-write empty
+  handling advances a volatile receive high-water, do not use these windows
+  with DPD-sending peers.
+  Prepared bytes/outcomes require exact durable acknowledgement; uncertain writes
+  quiesce until fenced readback. Add separately committed IV reservation attempt
+  charges, positive backoff and fixed operation deadlines, with no reserve-ahead
+  and at most three fresh-block attempts across restart. Storage, fencing, clock
+  continuity and operation semantics remain caller obligations. Fragmented/CBC
+  recovery, sync lifecycle, canonical replies and complete restart recovery are
+  not enabled.
+
 - `opc-proto-ikev2`: add ordinary GCM IV reservation records and
   prepare/commit/activate hooks bound to the SA, direction, algorithm, key and
   salt. Restore discards unused tails; checked soft/hard limits preserve bounded

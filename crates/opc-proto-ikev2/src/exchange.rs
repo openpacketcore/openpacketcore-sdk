@@ -192,6 +192,10 @@ pub struct Ikev2InitiatorMessageIdSnapshot {
 /// observed. Retransmission timers, timeout policy, and IKE SA teardown remain
 /// product-owned.
 ///
+/// This volatile helper is not a durable recovery authority. Use
+/// [`crate::recovery::Ikev2CommittedWindow`] for committed request bytes and
+/// outcomes, strict receive admission and exact replay ordering.
+///
 /// @spec IETF RFC7296 2.3
 /// @conformance boundary-only
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -343,6 +347,11 @@ pub struct Ikev2ResponderMessageIdSnapshot {
 /// high-water mark. Duplicate and stale IDs are rejected without changing
 /// state. Forward gaps are accepted because only the authenticated peer can
 /// produce them and an abandoned lower exchange must not wedge the SA.
+///
+/// This forward-gap policy and its snapshots are insufficient for durable
+/// restart recovery. [`crate::recovery::Ikev2CommittedWindow`] provides a separate
+/// exact-next-ID window and applicable committed-response cache; do not combine
+/// the two helpers as admission authorities for the same durable SA.
 ///
 /// Once `u32::MAX` is accepted, the window remains exhausted and rejects every
 /// request; Message IDs never wrap on an IKE SA.
