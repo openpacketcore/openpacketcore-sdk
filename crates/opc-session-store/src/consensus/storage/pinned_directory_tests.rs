@@ -10,6 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 const CHILD_TEST: &str = "consensus::storage::pinned_directory_tests::pinned_namespace_child";
 const CHILD_ROOT: &str = "OPC_SNAPSHOT_PIN_TEST_ROOT";
+const CHILD_SOCKET: &str = "OPC_SNAPSHOT_PIN_TEST_SOCKET";
 const CHILD_ROLE: &str = "OPC_SNAPSHOT_PIN_TEST_ROLE";
 const CHILD_MODE: &str = "OPC_SNAPSHOT_PIN_TEST_MODE";
 const CHILD_FD: &str = "OPC_SNAPSHOT_PIN_TEST_FD";
@@ -57,7 +58,14 @@ impl Actor {
         mode: &str,
         descriptor: i32,
     ) -> Self {
-        let socket_path = root.join("handshake.sock");
+        // Database and snapshot paths follow TMPDIR, which may exceed the
+        // Unix socket address limit. Only this private handshake uses /tmp.
+        let socket_directory = tempfile::Builder::new()
+            .prefix("opc-pin-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .expect("short private actor handshake directory");
+        let socket_path = socket_directory.path().join("handshake.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind synthetic actor handshake");
         let child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
@@ -68,6 +76,7 @@ impl Actor {
                 "--test-threads=1",
             ])
             .env(CHILD_ROOT, root)
+            .env(CHILD_SOCKET, &socket_path)
             .env(CHILD_ROLE, role)
             .env(CHILD_MODE, mode)
             .env(CHILD_FD, descriptor.to_string())
@@ -137,7 +146,9 @@ async fn pinned_namespace_child() {
         .expect("actor descriptor")
         .parse::<i32>()
         .expect("synthetic descriptor number");
-    let mut channel = UnixStream::connect(root.join("handshake.sock"))
+    let socket_path =
+        PathBuf::from(std::env::var_os(CHILD_SOCKET).expect("actor handshake socket"));
+    let mut channel = UnixStream::connect(socket_path)
         .await
         .expect("connect actor handshake");
     let namespace = std::env::var(CHILD_NAMESPACE).unwrap_or_else(|_| role.clone());
@@ -179,7 +190,12 @@ async fn pinned_namespace_child() {
 
 #[tokio::test]
 async fn independent_pinned_namespaces_survive_equal_procfd_spelling() {
-    let root = tempfile::tempdir().expect("private actor workspace");
+    // Keep the real directory names longer than a Unix socket address even
+    // when TMPDIR is short. The actor handshake must not constrain them.
+    let root = tempfile::Builder::new()
+        .prefix(&"long-root-".repeat(12))
+        .tempdir()
+        .expect("private actor workspace");
     for role in ["first", "second"] {
         private_directory(&root.path().join(role));
         private_directory(&root.path().join(role).join("snapshots"));
