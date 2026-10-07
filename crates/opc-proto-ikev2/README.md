@@ -72,8 +72,8 @@ ESP replay-counter synchronization is out of scope. See
 All ordinary AES-GCM `SK`/`SKF` sealers, including caller-chosen IVs and
 `Ikev2AesGcmExplicitIvCounter`, now reject IVs at or above
 `IKEV2_AES_GCM_NORMAL_IV_END` (`0xffff_ffff_0000_0000`). Peer packets may still
-use the whole wire range. The upper 2^32 values are reserved for a later narrow
-canonical-reply builder. No ordinary IKE sealing API in this crate can seal in
+use the whole wire range. The upper 2^32 values belong to the frozen V1
+canonical-reply builder for the whole key lifetime. No ordinary IKE sealing API in this crate can seal in
 that region. The generic provider-level `IkeEncryptionOperations::seal_aead` on
 `Ikev2SoftwareCryptoOperations` is an unpartitioned raw cipher primitive, not an
 IKE send path. Consumers must not call it directly with SA keys; use the admitted
@@ -81,15 +81,17 @@ IKE sealers or reservation tokens. The legacy counter alone provides neither
 durable ordering nor writer fencing.
 
 `iv_reservation` adds a non-cloneable `Ikev2AesGcmIvAllocator`. Establish its
-`Ikev2AesGcmIvDomain` from both nonzero SPIs, the original-role sending direction,
-the GCM algorithm and actual key/salt material. Use `fresh` only with new keys
+epoch through `Ikev2AesGcmEpochInputs`: both nonzero SPIs, the original-role
+sending direction, the GCM profile and actual key/salt material. `fresh(inputs,
+limits)` returns a `Result` and creates the immutable V1 marker before any
+encryption. Use `fresh` only with new keys
 whose IV history is empty; changing SPIs or making a new descriptor is not a
 substitute for fresh keys. The consumer must fence one writer and must not mix
 legacy/raw-IV sealing with this allocator under the same key epoch.
 
 `prepare` burns a block locally and exposes an `Ikev2AesGcmIvRecord` without
-allocating an IV. Persist its exclusive end, descriptor inputs and immutable
-limits atomically with the SA keys, then consume the prepared token with
+allocating an IV. Persist its exclusive end, both directional bindings, immutable format marker
+and limits atomically with the SA keys, then consume the prepared token with
 `activate_after_commit` and that exact record. The SDK checks equality; the
 caller supplies the durable-commit fact. Failure, cancellation or uncertainty
 releases no IV. Resolve uncertain writes before an older write could roll back
@@ -114,16 +116,147 @@ token or failing to seal burns its IV. Exact-byte retransmission needs no new
 allocation. Reserve blocks during initial key setup or state-changing work;
 DPD, keepalives and replies to empty requests must not initiate reservation writes.
 The allocator alone provides no durable Message-ID admission or exchange commit.
-The opt-in `recovery` module below adds those ordering hooks; canonical replies
-and a complete restart-recovery lifecycle remain separate. CBC is unchanged.
+The opt-in `recovery` module below adds those ordering hooks. Canonical byte
+regeneration is separate from complete restart recovery and receive admission.
+CBC is unchanged.
+
+## Canonical empty-reply primitive
+
+`canonical::Ikev2CanonicalEmptyReplies` produces the frozen 57-byte V1 reply
+to an authenticated, same-binding empty INFORMATIONAL request returned by
+`Ikev2CommittedWindow::open_peer`. It constructs its own header, padding and
+reserved IV (`0xffff_ffff_0000_0000 + Message ID`); there are no output overrides.
+It neither admits a receive ID nor grants permission to transmit. The zero-write
+handler and volatile receive high-water are still separate work: **these durable
+windows must not yet face peers that send DPD**.
+
+For every reply, including cached bytes, the consumer must check current receive
+admission and `Ikev2CommittedWindow::ready()` and retain send authority through
+transmission. A minted capability does not follow later window lifecycle changes.
+The lifecycle check alone supplies no receive admission or transmission authority.
+
+Create a capability through `Ikev2AesGcmIvAllocator::canonical_replies` only
+after fresh-epoch activation, or `Ikev2CommittedWindow::canonical_replies` after
+checked restore. Restored allocation alone cannot mint one. The complete IV
+binding and immutable `Some(1)` format marker must come from one trusted atomic
+SA record. Missing/unknown markers refuse canonical use; never synthesize or
+upgrade a marker for used keys. The SDK defines no durable byte format.
+
+The process checks all eight frozen wire answers for each intended algorithm
+through the admitted module once, using public test keys. Call
+`Ikev2CanonicalEmptyReplies::preflight` for each configured algorithm before
+accepting a deployment that will need this path. Every reply, including byte
+reuse, rechecks module admission and readiness. Every newly sealed packet must
+match an independently rebuilt 40-byte prefix and open to raw plaintext `00`.
+Withheld outputs remain private zeroizing buffers, never logs, errors, persisted
+values or Debug output; providers must observe the same confidentiality rule.
+
+At most three evaluations and one new release are allowed per sending key,
+salt and Message ID while its undeleted ledger is retained in the process.
+After release, only the same capability's
+cached bytes are returned. Dropping the capability or `retire(id)` discards
+bytes without resetting the process ledger. `invalidate()` permanently revokes
+that ledger and retains a recent deletion fingerprint. Invoke it and discard
+consumer-held copies
+when record trust, IV history or key provenance is lost. A changed/doubted
+binding requires fresh IKE keys. Failed mixed-record restores also invalidate
+all involved bindings, even before a capability existed. Reconciliation of a
+trusted mutable high-water discards the old cache but retains attempt/release
+history. `reply()` returns an owned, thread-safe `Ikev2CanonicalReply` containing
+57 verified octets; it holds no ledger lock. Consumer-held copies must also be
+discarded when trust or send authority is lost.
+Canonical packets never enter durable exchange caches or ordinary IV evidence.
+
+The process registry uses full SHA-256 fingerprints for sending key/salt and
+immutable binding, with expected O(1) hash lookup. It retains no SA
+keys: the capability's key copies are zeroized when it drops. As the receive
+window advances, call `retire_through(id)` below the retained reply window to
+discard per-ID entries and permanently close every ID at or below that floor,
+including unseen IDs. Entries above it retain their attempts and release status.
+Call `delete()` on a live capability, or `delete_epoch(&iv_record)` after it has
+dropped, once the SA is permanently deleted. After rekey, retain the old epoch
+for permitted retransmissions until the old SA has been deleted. Deletion clears
+all ID state and keeps only a recent fingerprint tombstone.
+
+`IKEV2_CANONICAL_MAX_TRACKED_KEYS` (1,048,576) is a per-process cap on concurrently
+retained live SA ledgers; they are never evicted, even if their capabilities have
+been dropped. This bound must exceed the consumer's largest session count per
+Pod, including old/new SA overlap and recovery headroom. Size the deployment's
+maximum concurrent sessions accordingly. Only live ledgers count toward
+`RegistryFull`, and deleting an SA frees its live slot. This is a concurrency
+bound, with no lifetime or per-day SA limit.
+
+Deletion and trust-loss fingerprints use a separate bounded FIFO of the most
+recent `IKEV2_CANONICAL_MAX_TOMBSTONES` (1,048,576) distinct deletions. Repeated
+deletion does not refresh an entry's age. The FIFO evicts the oldest fingerprint;
+deletion churn never causes `RegistryFull`. Restoring a deleted SA after its
+tombstone ages out requires a consumer bug and can create a fresh ledger. With
+the same persisted binding it can only repeat identical V1 bytes: no different
+plaintext or associated data is sealed under that nonce. The once-per-process
+release rule limits fault exposure; it is not a lifetime refusal of deleted keys.
+Re-admission with a changed binding already violates the key-use precondition,
+with the same exposure as after process restart. Consumers must never restore
+deleted records or treat tombstone eviction as permission to reuse keys. Refusal
+still never enables a fallback.
+
+The [construction and assumptions](../../docs/ikev2-canonical-empty-replies.md)
+explain why repeat evaluations have identical GCM inputs. Repeating an IV after
+restart deliberately departs from the literal SP 800-38D section 9.1 item 3;
+ordinary reservations and committed ordinary/sync recovery retain section 9.1's
+persist-ahead/discard behavior. The canonical path carries **no validated-module
+or FIPS 140-3 claim**. `Ikev2CanonicalPolicy::default()` refuses a module declaring
+`ValidationState::DeclaredValidated`; `explicitly_allow_declared_validated()` is
+the dedicated consumer opt-in. It bypasses neither qualification, module policy
+nor packet checks. General module admission is not canonical opt-in.
+
+### Constructor migration
+
+| Former public use | Replacement |
+| --- | --- |
+| `Ikev2AesGcmIvDomain::new` for initial allocation | `Ikev2AesGcmIvAllocator::fresh(Ikev2AesGcmEpochInputs { ... }, limits)?`, then `allocator.domain()`. |
+| `Ikev2AesGcmIvDomain::new` for a restore expectation | Use `window_record.domain().send_iv_domain()` from the separately persisted, trusted window record when restoring its IV allocator; see the cross-check below. |
+| `Ikev2AesGcmIvRecord::from_persisted(domain, limits, end)` | `from_persisted(epoch_inputs, limits, end, persisted_marker)` with both keys and all fields from that same atomic record. |
+| `Ikev2CommittedWindowDomain::new(...)` | `Ikev2CommittedWindowDomain::from_iv_record(&iv_record)` for initial window assembly; restore uses the persisted window domain and cross-checks the IV record. |
+
+Both domain `new` functions are now crate-private. Borrowed epoch inputs and
+raw established keys confer no canonical capability or historical-key proof.
+A successful constructor cannot make an untrusted record safe.
+
+`Allocator::restore(iv_record.domain(), &iv_record)` only compares the IV record
+with itself; it is not an independent binding check. The canonical restore
+guarantee comes from `Ikev2CommittedWindow::restore`: it compares the complete
+window domain, the separate IV record's two directional domains and marker, and
+the supplied profile/keys. Both records must come from the same latest trusted
+atomic SA snapshot. For example:
+
+```rust,ignore
+let window = Ikev2CommittedWindow::restore(
+    window_record.domain(), profile, &keys, &window_record, &iv_record,
+)?;
+let allocator = Ikev2AesGcmIvAllocator::restore(
+    window_record.domain().send_iv_domain(), &iv_record,
+)?;
+```
+
+These consistency checks cannot detect joint rollback or establish key provenance.
+
+Even after the zero-write empty-request handler is implemented, canonical
+refusal leaves empty requests unanswered: there is no ordinary-IV or committed
+window fallback. A V1 epoch answers them only with V1, or not at all.
+DPD-sending peers remain unsupported in durable deployments where canonical
+sealing cannot operate, including declared-validated modules without opt-in,
+unqualified modules and known-answer failures. The consumer must refuse such
+a configuration up front, checking canonical policy and qualification for the
+intended algorithms before accepting those peers. A later runtime refusal
+still withholds the reply and never enables a fallback.
 
 ## Committed ordinary windows and exact replay
 
 `recovery::Ikev2CommittedWindow` is an opt-in window-one profile for complete,
 unfragmented AES-GCM `SK` packets. It uses the admitted crypto module, binds both
 sending and receiving keys/salts plus the SPI pair and original role, and works
-with all three supported GCM key sizes. `SKF`, CBC recovery, canonical empty
-replies and receive-floor reconstruction are not enabled here.
+with all three supported GCM key sizes. `SKF`, CBC recovery, zero-write empty
+handling and receive-floor reconstruction are not enabled here.
 Existing generic crypto and fragmentation APIs retain their separate contracts.
 
 Commit an initial `Ikev2CommittedWindowRecord` with the new key epoch and correct

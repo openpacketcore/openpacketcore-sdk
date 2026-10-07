@@ -1261,6 +1261,7 @@ pub(crate) fn encrypt_aes_gcm(
         aad,
         plaintext,
     )
+    .map(|mut output| std::mem::take(&mut *output))
     .map_err(map_crypto_module_error)
 }
 

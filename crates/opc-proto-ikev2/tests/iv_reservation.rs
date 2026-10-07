@@ -55,7 +55,21 @@ fn keys(profile: Profile, key_change: u8, salt_change: u8) -> Keys {
 }
 
 fn domain(profile: Profile, keys: &Keys, direction: Direction) -> Domain {
-    Domain::new(INITIATOR_SPI, RESPONDER_SPI, direction, profile, keys).unwrap()
+    support::iv_domain(INITIATOR_SPI, RESPONDER_SPI, direction, profile, keys).unwrap()
+}
+
+fn inputs<'a>(
+    profile: Profile,
+    keys: &'a Keys,
+    domain: &Domain,
+) -> opc_proto_ikev2::Ikev2AesGcmEpochInputs<'a> {
+    support::epoch_inputs(
+        domain.initiator_spi(),
+        domain.responder_spi(),
+        domain.direction(),
+        profile,
+        keys,
+    )
 }
 
 fn fixture() -> (Profile, Keys, Domain, Limits) {
@@ -124,7 +138,7 @@ fn seal_next(
 #[test]
 fn reservation_must_commit_before_allocation_and_cannot_replace_an_active_block() {
     let (profile, keys, domain, limits) = fixture();
-    let mut allocator = Allocator::fresh(domain, limits);
+    let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
     assert_eq!(
         allocator.allocate(Purpose::Ordinary).unwrap_err(),
         Error::ReservationRequired
@@ -177,11 +191,12 @@ fn reservation_must_commit_before_allocation_and_cannot_replace_an_active_block(
 fn failed_uncertain_and_mismatched_commits_never_release_the_proposed_ivs() {
     for storage_outcome in ["failed", "uncertain", "mismatched"] {
         let (profile, keys, domain, limits) = fixture();
-        let mut allocator = Allocator::fresh(domain.clone(), limits);
+        let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
         let prepared = allocator.prepare(4, Purpose::Ordinary).unwrap();
         let proposed = prepared.record().clone();
         if storage_outcome == "mismatched" {
-            let old = Record::from_persisted(domain.clone(), limits, 0).unwrap();
+            let old = Record::from_persisted(inputs(profile, &keys, &domain), limits, 0, Some(1))
+                .unwrap();
             assert_eq!(
                 prepared.activate_after_commit(&old),
                 Err(Error::CommitMismatch)
@@ -221,7 +236,7 @@ fn failed_uncertain_and_mismatched_commits_never_release_the_proposed_ivs() {
 #[test]
 fn restore_discards_unused_tail_and_repeated_crashes_keep_advancing() {
     let (profile, keys, domain, limits) = fixture();
-    let mut allocator = Allocator::fresh(domain.clone(), limits);
+    let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
     let mut durable = commit(&mut allocator, 4, Purpose::Ordinary);
     assert_eq!(
         seal_next(
@@ -243,8 +258,13 @@ fn restore_discards_unused_tail_and_repeated_crashes_keep_advancing() {
             attempts,
         )
         .unwrap();
-        durable = Record::from_persisted(domain.clone(), restored_limits, durable.exclusive_end())
-            .unwrap();
+        durable = Record::from_persisted(
+            inputs(profile, &keys, &domain),
+            restored_limits,
+            durable.exclusive_end(),
+            durable.canonical_format(),
+        )
+        .unwrap();
         allocator = Allocator::restore(&domain, &durable).unwrap();
         assert_eq!(
             allocator.allocate(Purpose::Ordinary).unwrap_err(),
@@ -274,7 +294,7 @@ fn checked_control_budget_preserves_rekey_delete_headroom_until_hard_exhaustion(
     assert_eq!(limits.hard_ceiling(), 20);
     assert_eq!(limits.control_reserve(), 4);
     assert_eq!(limits.soft_threshold(), 16);
-    let mut allocator = Allocator::fresh(domain.clone(), limits);
+    let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
     assert_eq!(
         allocator.prepare(17, Purpose::Ordinary).unwrap_err(),
         Error::RekeyRequired
@@ -347,15 +367,16 @@ fn invalid_budgets_counts_and_persisted_bounds_are_rejected_without_wraparound()
             Err(Error::InvalidLimits)
         );
     }
-    let (_, _, domain, limits) = fixture();
+    let (profile, keys, domain, limits) = fixture();
     assert!(Limits::new(1_u64 << 32, 2, 1, 1).is_ok());
-    let mut allocator = Allocator::fresh(domain.clone(), limits);
+    let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
     assert_eq!(
         allocator.prepare(0, Purpose::Ordinary).unwrap_err(),
         Error::InvalidCount
     );
     commit(&mut allocator, 2, Purpose::Ordinary);
-    let record = Record::from_persisted(domain.clone(), limits, 10).unwrap();
+    let record =
+        Record::from_persisted(inputs(profile, &keys, &domain), limits, 10, Some(1)).unwrap();
     let mut allocator = Allocator::restore(&domain, &record).unwrap();
     assert_eq!(
         allocator.prepare(u64::MAX, Purpose::Control).unwrap_err(),
@@ -371,7 +392,7 @@ fn invalid_budgets_counts_and_persisted_bounds_are_rejected_without_wraparound()
         u64::MAX,
     ] {
         assert_eq!(
-            Record::from_persisted(domain.clone(), limits, end),
+            Record::from_persisted(inputs(profile, &keys, &domain), limits, end, Some(1)),
             Err(Error::InvalidRecord)
         );
     }
@@ -385,13 +406,18 @@ fn restore_and_commit_bind_exact_key_salt_direction_algorithm_and_spis() {
         for direction in DIRECTIONS {
             let domain = domain(profile, &keys, direction);
             let limits = Limits::new(12, 2, 1, 1).unwrap();
-            let record = Record::from_persisted(domain.clone(), limits, 4).unwrap();
+            let record =
+                Record::from_persisted(inputs(profile, &keys, &domain), limits, 4, Some(1))
+                    .unwrap();
             assert!(Allocator::restore(&domain, &record).is_ok());
             let changed_profile = different_profile(algorithm);
+            let make_record = |i, r, d, p, k: &Keys| {
+                Record::from_persisted(support::epoch_inputs(i, r, d, p, k), limits, 4, Some(1))
+            };
             let different = [
-                Domain::new(INITIATOR_SPI + 1, RESPONDER_SPI, direction, profile, &keys).unwrap(),
-                Domain::new(INITIATOR_SPI, RESPONDER_SPI + 1, direction, profile, &keys).unwrap(),
-                Domain::new(
+                make_record(INITIATOR_SPI + 1, RESPONDER_SPI, direction, profile, &keys).unwrap(),
+                make_record(INITIATOR_SPI, RESPONDER_SPI + 1, direction, profile, &keys).unwrap(),
+                make_record(
                     INITIATOR_SPI,
                     RESPONDER_SPI,
                     if direction == DIRECTIONS[0] {
@@ -403,7 +429,7 @@ fn restore_and_commit_bind_exact_key_salt_direction_algorithm_and_spis() {
                     &keys,
                 )
                 .unwrap(),
-                Domain::new(
+                make_record(
                     INITIATOR_SPI,
                     RESPONDER_SPI,
                     direction,
@@ -411,7 +437,7 @@ fn restore_and_commit_bind_exact_key_salt_direction_algorithm_and_spis() {
                     &self::keys(profile, 1, 0),
                 )
                 .unwrap(),
-                Domain::new(
+                make_record(
                     INITIATOR_SPI,
                     RESPONDER_SPI,
                     direction,
@@ -419,7 +445,7 @@ fn restore_and_commit_bind_exact_key_salt_direction_algorithm_and_spis() {
                     &self::keys(profile, 0, 1),
                 )
                 .unwrap(),
-                Domain::new(
+                make_record(
                     INITIATOR_SPI,
                     RESPONDER_SPI,
                     direction,
@@ -430,12 +456,13 @@ fn restore_and_commit_bind_exact_key_salt_direction_algorithm_and_spis() {
             ];
             for other in different {
                 assert_eq!(
-                    Allocator::restore(&other, &record).unwrap_err(),
+                    Allocator::restore(other.domain(), &record).unwrap_err(),
                     Error::DomainMismatch
                 );
-                let mut allocator = Allocator::fresh(domain.clone(), limits);
+                let mut allocator =
+                    Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
                 let prepared = allocator.prepare(4, Purpose::Ordinary).unwrap();
-                let wrong = Record::from_persisted(other, limits, 4).unwrap();
+                let wrong = other;
                 assert_eq!(
                     prepared.activate_after_commit(&wrong),
                     Err(Error::CommitMismatch)
@@ -445,12 +472,13 @@ fn restore_and_commit_bind_exact_key_salt_direction_algorithm_and_spis() {
                     Error::ReservationRequired
                 );
             }
-            let mut allocator = Allocator::fresh(domain, limits);
+            let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
             let prepared = allocator.prepare(4, Purpose::Ordinary).unwrap();
             let wrong = Record::from_persisted(
-                record.domain().clone(),
+                inputs(profile, &keys, &domain),
                 Limits::new(13, 2, 1, 1).unwrap(),
                 4,
+                Some(1),
             )
             .unwrap();
             assert_eq!(
@@ -474,7 +502,7 @@ fn invalid_and_colliding_directional_domains_are_rejected() {
     let (profile, keys, _, _) = fixture();
     for (i, r) in [(0, RESPONDER_SPI), (INITIATOR_SPI, 0)] {
         assert_eq!(
-            Domain::new(i, r, DIRECTIONS[0], profile, &keys),
+            support::iv_domain(i, r, DIRECTIONS[0], profile, &keys),
             Err(Error::InvalidDomain)
         );
     }
@@ -486,7 +514,7 @@ fn invalid_and_colliding_directional_domains_are_rejected() {
     )
     .unwrap();
     assert_eq!(
-        Domain::new(INITIATOR_SPI, RESPONDER_SPI, DIRECTIONS[0], cbc, &keys),
+        support::iv_domain(INITIATOR_SPI, RESPONDER_SPI, DIRECTIONS[0], cbc, &keys),
         Err(Error::InvalidDomain)
     );
     let equal_keys = Keys::from_established_keys(
@@ -502,7 +530,7 @@ fn invalid_and_colliding_directional_domains_are_rejected() {
     )
     .unwrap();
     assert_eq!(
-        Domain::new(
+        support::iv_domain(
             INITIATOR_SPI,
             RESPONDER_SPI,
             DIRECTIONS[0],
@@ -521,7 +549,11 @@ fn allocated_tokens_seal_both_payload_kinds_and_burn_on_failed_sealing() {
         let keys = keys(profile, 0, 0);
         for direction in DIRECTIONS {
             let domain = domain(profile, &keys, direction);
-            let mut allocator = Allocator::fresh(domain, Limits::new(16, 2, 1, 1).unwrap());
+            let mut allocator = Allocator::fresh(
+                inputs(profile, &keys, &domain),
+                Limits::new(16, 2, 1, 1).unwrap(),
+            )
+            .unwrap();
             commit(&mut allocator, 8, Purpose::Ordinary);
             for (value, kind) in [Kind::Encrypted, Kind::EncryptedFragment]
                 .into_iter()
@@ -609,9 +641,9 @@ fn allocated_tokens_seal_both_payload_kinds_and_burn_on_failed_sealing() {
 
 #[test]
 fn descriptor_records_and_tokens_redact_keys_counters_and_ivs() {
-    let (_, _, domain, limits) = fixture();
+    let (profile, keys, domain, limits) = fixture();
     assert_eq!(format!("{domain:?}"), "Ikev2AesGcmIvDomain { .. }");
-    let mut allocator = Allocator::fresh(domain, limits);
+    let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
     assert_eq!(format!("{allocator:?}"), "Ikev2AesGcmIvAllocator { .. }");
     let prepared = allocator.prepare(2, Purpose::Ordinary).unwrap();
     assert_eq!(
@@ -633,12 +665,13 @@ fn descriptor_records_and_tokens_redact_keys_counters_and_ivs() {
 
 #[test]
 fn exact_commit_binds_control_budget_even_when_total_headroom_is_equal() {
-    let (_, _, domain, limits) = fixture();
-    let mut allocator = Allocator::fresh(domain.clone(), limits);
+    let (profile, keys, domain, limits) = fixture();
+    let mut allocator = Allocator::fresh(inputs(profile, &keys, &domain), limits).unwrap();
     let prepared = allocator.prepare(2, Purpose::Ordinary).unwrap();
     let changed_budget = Limits::new(32, 2, 2, 1).unwrap();
     assert_eq!(limits.control_reserve(), changed_budget.control_reserve());
-    let wrong = Record::from_persisted(domain, changed_budget, 2).unwrap();
+    let wrong = Record::from_persisted(inputs(profile, &keys, &domain), changed_budget, 2, Some(1))
+        .unwrap();
     assert_eq!(
         prepared.activate_after_commit(&wrong),
         Err(Error::CommitMismatch)
@@ -650,7 +683,8 @@ fn maximum_per_key_ceiling_allocates_its_last_iv_then_stops() {
     let (profile, keys, domain, _) = fixture();
     let hard = IKEV2_AES_GCM_MAX_RESERVED_ALLOCATIONS;
     let limits = Limits::new(hard, 2, 1, 1).unwrap();
-    let previous = Record::from_persisted(domain.clone(), limits, hard - 1).unwrap();
+    let previous =
+        Record::from_persisted(inputs(profile, &keys, &domain), limits, hard - 1, Some(1)).unwrap();
     let mut allocator = Allocator::restore(&domain, &previous).unwrap();
     let last = commit(&mut allocator, 1, Purpose::Control);
     assert_eq!(
@@ -676,11 +710,16 @@ fn maximum_per_key_ceiling_allocates_its_last_iv_then_stops() {
 
 #[test]
 fn persisted_record_at_exact_hard_ceiling_restores_as_exhausted() {
-    let (_, _, domain, _) = fixture();
+    let (profile, keys, domain, _) = fixture();
     for hard in [32, IKEV2_AES_GCM_MAX_RESERVED_ALLOCATIONS] {
         let limits = Limits::new(hard, 2, 1, 1).unwrap();
-        let persisted = Record::from_persisted(domain.clone(), limits, limits.hard_ceiling())
-            .expect("a fully consumed key has a valid persisted record");
+        let persisted = Record::from_persisted(
+            inputs(profile, &keys, &domain),
+            limits,
+            limits.hard_ceiling(),
+            Some(1),
+        )
+        .expect("a fully consumed key has a valid persisted record");
         let mut restored = Allocator::restore(&domain, &persisted).unwrap();
         for purpose in [Purpose::Ordinary, Purpose::Control] {
             assert_eq!(restored.allocate(purpose).unwrap_err(), Error::Exhausted);

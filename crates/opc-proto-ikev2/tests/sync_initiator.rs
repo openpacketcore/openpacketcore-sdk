@@ -78,7 +78,7 @@ impl Fixture {
             Direction::ResponderToInitiator
         };
         Self {
-            domain: Domain::new(0x101, 0x202, direction, profile, &keys).unwrap(),
+            domain: support::window_domain(0x101, 0x202, direction, profile, &keys).unwrap(),
             agreement: Agreement::from_persisted(
                 Sa::new(0x101, 0x202, role).unwrap(),
                 Mode::Negotiated,
@@ -110,11 +110,22 @@ impl Fixture {
         )
         .unwrap()
     }
+    fn epoch_inputs(&self) -> opc_proto_ikev2::Ikev2AesGcmEpochInputs<'_> {
+        let domain = self.domain.send_iv_domain();
+        support::epoch_inputs(
+            domain.initiator_spi(),
+            domain.responder_spi(),
+            domain.direction(),
+            self.profile,
+            &self.keys,
+        )
+    }
     fn iv_record(&self, end: u64) -> IvRecord {
         IvRecord::from_persisted(
-            self.domain.send_iv_domain().clone(),
+            self.epoch_inputs(),
             Limits::new(128, 2, 1, 2).unwrap(),
             end,
+            Some(1),
         )
         .unwrap()
     }
@@ -416,10 +427,8 @@ fn release(window: &mut Window, token: Commit, time: u64) -> Bytes {
 }
 impl Fixture {
     fn start(&self, send: u32, receive: u32) -> (Window, Allocator) {
-        let mut allocator = Allocator::fresh(
-            self.domain.send_iv_domain().clone(),
-            self.iv_record(0).limits(),
-        );
+        let mut allocator =
+            Allocator::fresh(self.epoch_inputs(), self.iv_record(0).limits()).unwrap();
         let prepared = allocator.prepare(8, Purpose::Ordinary).unwrap();
         let iv_record = prepared.record().clone();
         prepared.activate_after_commit(&iv_record).unwrap();
@@ -1506,7 +1515,7 @@ fn readiness_negotiation_rejects_foreign_authenticated_domain_and_wrong_handshak
         assert_eq!(negotiation.observe_peer(&packet), Err(Error::Drop));
     }
     let mut foreign = Fixture::new(Encryption::AesGcm16_128, Role::Responder);
-    foreign.domain = Domain::new(
+    foreign.domain = support::window_domain(
         0x303,
         0x202,
         Direction::ResponderToInitiator,

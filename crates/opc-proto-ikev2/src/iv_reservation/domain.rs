@@ -16,6 +16,16 @@ use crate::{
 /// Rebuild this descriptor from the same atomic durable SA record as the IV
 /// high-water. Key copies are zeroized on drop and excluded from diagnostics.
 /// A new SPI or descriptor alone never makes reused key material fresh.
+/// Obtain a fresh allocator's [`super::Ikev2AesGcmIvAllocator::domain`] or a
+/// persisted [`super::Ikev2AesGcmIvRecord::domain`]; independent assembly is private.
+///
+/// ```compile_fail
+/// use opc_proto_ikev2::{Ikev2AesGcmEpochInputs, Ikev2AesGcmIvDomain};
+/// fn assemble(i: Ikev2AesGcmEpochInputs<'_>) {
+///     let _ = Ikev2AesGcmIvDomain::new(i.initiator_spi, i.responder_spi,
+///         i.sending_direction, i.profile, i.keys);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Ikev2AesGcmIvDomain {
     initiator_spi: u64,
@@ -31,7 +41,7 @@ impl Ikev2AesGcmIvDomain {
     /// # Errors
     /// Returns `InvalidDomain` for zero SPIs, non-GCM profiles, wrong key lengths,
     /// or identical directional key/salt pairs (which would collide at IV zero).
-    pub fn new(
+    pub(crate) fn new(
         initiator_spi: u64,
         responder_spi: u64,
         direction: Ikev2ProtectedPayloadDirection,
@@ -80,6 +90,10 @@ impl Ikev2AesGcmIvDomain {
     /// GCM key size bound by the descriptor.
     pub const fn encryption(&self) -> Ikev2EncryptionAlgorithm {
         self.encryption
+    }
+
+    pub(crate) fn key_and_salt(&self) -> &[u8] {
+        &self.key_and_salt
     }
 }
 

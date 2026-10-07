@@ -12,10 +12,20 @@ use crate::{
 /// Both directional key/salt pairs, algorithm and nonzero SPIs are bound. This
 /// descriptor establishes neither fresh-key provenance nor authenticated peers.
 /// Persist its inputs atomically with keys, IV reservations and window records.
+/// Derive it with [`Self::from_iv_record`], never separately from mutable fields.
+///
+/// ```compile_fail
+/// use opc_proto_ikev2::{Ikev2AesGcmEpochInputs, recovery::Ikev2CommittedWindowDomain};
+/// fn assemble(i: Ikev2AesGcmEpochInputs<'_>) {
+///     let _ = Ikev2CommittedWindowDomain::new(i.initiator_spi, i.responder_spi,
+///         i.sending_direction, i.profile, i.keys);
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct Ikev2CommittedWindowDomain {
-    pub(super) send: Ikev2AesGcmIvDomain,
-    pub(super) receive: Ikev2AesGcmIvDomain,
+    pub(crate) send: Ikev2AesGcmIvDomain,
+    pub(crate) receive: Ikev2AesGcmIvDomain,
+    pub(crate) canonical_format: Option<u8>,
 }
 
 impl Ikev2CommittedWindowDomain {
@@ -23,7 +33,7 @@ impl Ikev2CommittedWindowDomain {
     ///
     /// # Errors
     /// Rejects invalid SPIs, GCM profiles or directional key/salt material.
-    pub fn new(
+    pub(crate) fn new(
         initiator_spi: u64,
         responder_spi: u64,
         sending_direction: Direction,
@@ -35,6 +45,7 @@ impl Ikev2CommittedWindowDomain {
             Direction::ResponderToInitiator => Direction::InitiatorToResponder,
         };
         Ok(Self {
+            canonical_format: None,
             send: Ikev2AesGcmIvDomain::new(
                 initiator_spi,
                 responder_spi,
@@ -48,6 +59,18 @@ impl Ikev2CommittedWindowDomain {
         })
     }
 
+    /// Derive both directions and the immutable marker from the single IV record.
+    ///
+    /// Replaces independent SPI/key assembly. This is a descriptor only; window
+    /// restoration must still cross-check the same atomic persisted records.
+    pub fn from_iv_record(record: &crate::Ikev2AesGcmIvRecord) -> Self {
+        Self {
+            send: record.domain().clone(),
+            receive: record.receive_domain().clone(),
+            canonical_format: record.canonical_format(),
+        }
+    }
+
     /// Descriptor to use with the single local sending-IV allocator.
     pub const fn send_iv_domain(&self) -> &Ikev2AesGcmIvDomain {
         &self.send
@@ -58,13 +81,14 @@ impl Ikev2CommittedWindowDomain {
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
     ) -> Result<(), Error> {
-        let actual = Self::new(
+        let mut actual = Self::new(
             self.send.initiator_spi(),
             self.send.responder_spi(),
             self.send.direction(),
             profile,
             keys,
         )?;
+        actual.canonical_format = self.canonical_format;
         if self != &actual {
             return Err(Error::DomainMismatch);
         }

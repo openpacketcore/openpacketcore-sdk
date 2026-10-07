@@ -49,6 +49,44 @@ ePDG product-readiness claim.
 | Fuzz target registration | Scheduled smoke coverage | `fuzz/fuzz_targets/decode_message.rs`, `roundtrip.rs`, and `dedicated_bearer.rs` cover the message codec, raw-preserving encode, bounded RFC 7427 signature-hash Notify decoder, typed 3GPP Notify decoder, and every dedicated-bearer opened-payload decoder. The crate is registered in `.github/workflows/fuzz.yml` for scheduled fuzz-list and smoke-run coverage. |
 | `opc-protocol` integration | Implemented for scaffold | `Message` and `OwnedMessage` implement `BorrowDecode`, `OwnedDecode`, `Encode`, and `ToOwnedPdu`; errors use structured `opc-protocol` types and `SpecRef` references. |
 
+## Canonical AES-GCM reply boundary
+
+The `canonical` module implements the frozen V1 byte primitive from
+[the reviewed construction](../../docs/ikev2-canonical-empty-replies.md), for all
+three AES-GCM-16 key sizes and both original roles. `tests/canonical_empty_replies.rs`
+pins 24 independent wire vectors and checks binding, marker, restart, byte-cache,
+classification and durable-cache refusals. `tests/data/canonical_empty_v1.py`
+was first qualified on 1,125 published NIST CAVP encryptions; its committed
+provenance records the tool/backend and archive digest. `src/canonical/wire.rs`
+checks every prefix bit even when a faulty generator recomputes a valid tag.
+`tests/crypto_module_admission.rs` injects provider faults, readiness changes and
+interruptions, qualifies concurrent callers once, and monitors actual GCM inputs
+over mixed ordinary/sync/canonical workloads with restart, rekey and distinct
+salts under a shared AES key.
+
+`src/canonical/ledger/tests.rs` checks compaction over many keys and IDs, retained
+attempt/release history above the closed floor, deletion and live concurrency
+capacity refusal. Thousands of deletion cycles under a small cap preserve live
+ledgers while bounded recent tombstones evict in FIFO order; a delayed deletion
+cannot remove a newer re-admitted ledger. Tombstone expiry permits a deleted-record
+consumer bug to create a fresh ledger, whose unchanged binding still fixes the
+identical V1 transcript. Exhaustive field/type checks pin a static object graph without
+key material; counted hash probes check restoration scaling without timing.
+Public tests cover below-floor refusal, owned `Send` replies, same-thread restore
+and retirement without a held reply lock, deletion before/during/after capability
+ownership, and the consumer-visible lifecycle check. The consumer must advance
+the compaction floor, delete retired epochs and check admission plus `ready()`
+on every reply; the primitive does not follow later window lifecycle changes.
+
+This path deliberately departs from literal SP 800-38D §9.1 item 3 and makes
+no validated-module/FIPS claim. Declared validation requires dedicated opt-in.
+No receive-floor advancement, reconstruction admission, transmission authority,
+liveness or operation effects are supplied. DPD-sending peers remain unsupported
+until the separate zero-write receive handler is qualified; a deployment that
+cannot qualify canonical sealing must refuse that configuration, with no
+fallback. Third-party peer interoperability remains a composed qualification
+gate; these tests supply no peer-interoperability claim.
+
 ## Payload-chain parser plan
 
 The parser is intentionally staged so future work can add coverage without

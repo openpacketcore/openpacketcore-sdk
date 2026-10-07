@@ -82,6 +82,7 @@
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
 //! @conformance experimental-mechanism boundary — see CONFORMANCE.md
 
+pub mod canonical;
 pub mod certreq;
 pub mod child_sa_rekey;
 pub mod crypto;
@@ -248,8 +249,8 @@ pub use ike_sa_rekey::{
     IKEV2_REKEY_IKE_SPI_LEN,
 };
 pub use iv_reservation::{
-    Ikev2AesGcmIvAllocation, Ikev2AesGcmIvAllocator, Ikev2AesGcmIvDomain, Ikev2AesGcmIvLimits,
-    Ikev2AesGcmIvPurpose, Ikev2AesGcmIvRecord, Ikev2AesGcmIvReservationError,
+    Ikev2AesGcmEpochInputs, Ikev2AesGcmIvAllocation, Ikev2AesGcmIvAllocator, Ikev2AesGcmIvDomain,
+    Ikev2AesGcmIvLimits, Ikev2AesGcmIvPurpose, Ikev2AesGcmIvRecord, Ikev2AesGcmIvReservationError,
     Ikev2AesGcmPreparedIvReservation, IKEV2_AES_GCM_MAX_RESERVED_ALLOCATIONS,
 };
 pub use message::{

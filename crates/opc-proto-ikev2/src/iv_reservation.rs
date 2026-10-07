@@ -11,10 +11,40 @@
 
 use std::{error::Error, fmt};
 
-use crate::Ikev2ProtectedPayloadCryptoError;
+use crate::{
+    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile,
+    Ikev2SaInitKeyMaterial,
+};
 
 mod domain;
 pub use domain::{Ikev2AesGcmIvAllocation, Ikev2AesGcmIvDomain};
+
+/// Complete immutable SA inputs for new keys or one atomic persisted binding.
+///
+/// This borrowed input supplies neither freshness nor durability evidence. Use
+/// [`Ikev2AesGcmIvAllocator::fresh`] only before the key's first encryption;
+/// restore fields only from the same trusted, fenced record as its keys.
+/// General IV/window domain assembly is deliberately crate-private.
+#[derive(Clone, Copy)]
+pub struct Ikev2AesGcmEpochInputs<'a> {
+    /// Original initiator's nonzero SPI.
+    pub initiator_spi: u64,
+    /// Original responder's nonzero SPI.
+    pub responder_spi: u64,
+    /// Local sending direction in this IKE SA's original roles.
+    pub sending_direction: Ikev2ProtectedPayloadDirection,
+    /// Negotiated AES-GCM-16 profile.
+    pub profile: Ikev2SaInitCryptoProfile,
+    /// Both directions' key material from this same key epoch.
+    pub keys: &'a Ikev2SaInitKeyMaterial,
+}
+
+impl fmt::Debug for Ikev2AesGcmEpochInputs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2AesGcmEpochInputs")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Conservative SDK ceiling on reserved ordinary IV positions per direction key.
 ///
@@ -125,6 +155,8 @@ pub enum Ikev2AesGcmIvPurpose {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Ikev2AesGcmIvRecord {
     domain: Ikev2AesGcmIvDomain,
+    receive: Ikev2AesGcmIvDomain,
+    canonical_format: Option<u8>,
     limits: Ikev2AesGcmIvLimits,
     exclusive_end: u64,
 }
@@ -133,18 +165,47 @@ impl Ikev2AesGcmIvRecord {
     /// Rebuild validated fields from the consumer's durable SA record.
     ///
     /// # Errors
-    /// Returns `InvalidRecord` if the high-water exceeds the hard ceiling.
+    /// Preserve `canonical_format` exactly: absent/unknown markers remain
+    /// ineligible for canonical replies. There is no default or retrofit. Never
+    /// import a marker independently of the keys, binding and reservation end.
+    /// Returns `InvalidRecord` if the high-water exceeds the hard ceiling, or
+    /// `InvalidDomain` for invalid SPI/profile/directional key material.
     /// Construction does not prove durability or release an allocation.
     pub fn from_persisted(
-        domain: Ikev2AesGcmIvDomain,
+        inputs: Ikev2AesGcmEpochInputs<'_>,
         limits: Ikev2AesGcmIvLimits,
         exclusive_end: u64,
+        canonical_format: Option<u8>,
     ) -> Result<Self, Ikev2AesGcmIvReservationError> {
         if exclusive_end > limits.hard_ceiling {
             return Err(Ikev2AesGcmIvReservationError::InvalidRecord);
         }
+        let opposite = match inputs.sending_direction {
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder => {
+                Ikev2ProtectedPayloadDirection::ResponderToInitiator
+            }
+            Ikev2ProtectedPayloadDirection::ResponderToInitiator => {
+                Ikev2ProtectedPayloadDirection::InitiatorToResponder
+            }
+        };
+        let domain = Ikev2AesGcmIvDomain::new(
+            inputs.initiator_spi,
+            inputs.responder_spi,
+            inputs.sending_direction,
+            inputs.profile,
+            inputs.keys,
+        )?;
+        let receive = Ikev2AesGcmIvDomain::new(
+            inputs.initiator_spi,
+            inputs.responder_spi,
+            opposite,
+            inputs.profile,
+            inputs.keys,
+        )?;
         Ok(Self {
             domain,
+            receive,
+            canonical_format,
             limits,
             exclusive_end,
         })
@@ -153,6 +214,18 @@ impl Ikev2AesGcmIvRecord {
     /// Domain that must be persisted with this reservation.
     pub const fn domain(&self) -> &Ikev2AesGcmIvDomain {
         &self.domain
+    }
+
+    pub(crate) const fn receive_domain(&self) -> &Ikev2AesGcmIvDomain {
+        &self.receive
+    }
+
+    /// Immutable persisted format marker; `Some(1)` is the frozen V1 recipe.
+    ///
+    /// Persist absence/unknown values without inventing enablement. A fresh V1
+    /// key epoch is required to enable an older or incompatible record.
+    pub const fn canonical_format(&self) -> Option<u8> {
+        self.canonical_format
     }
 
     /// Immutable usage limits for this key epoch.
@@ -179,6 +252,10 @@ impl Ikev2AesGcmIvRecord {
 /// ```
 pub struct Ikev2AesGcmIvAllocator {
     domain: Ikev2AesGcmIvDomain,
+    receive: Ikev2AesGcmIvDomain,
+    canonical_format: Option<u8>,
+    initial_epoch: bool,
+    committed_binding: bool,
     limits: Ikev2AesGcmIvLimits,
     next: u64,
     end: u64,
@@ -189,14 +266,59 @@ impl Ikev2AesGcmIvAllocator {
     ///
     /// The caller must establish a fresh key epoch. Old keys with unknown IV
     /// history cannot be relabelled fresh: obtain new IKE keys through rekey.
-    /// Commit the descriptor and limits with the first reservation before use.
-    pub const fn fresh(domain: Ikev2AesGcmIvDomain, limits: Ikev2AesGcmIvLimits) -> Self {
-        Self {
-            domain,
+    /// Creates the immutable V1 marker before any encryption, including IKE_AUTH.
+    /// Commit the complete binding, marker and limits with the first reservation
+    /// before use. The entire reserved range belongs to V1 for the key's life.
+    /// # Errors
+    /// Rejects invalid SPI/profile/directional key material.
+    pub fn fresh(
+        inputs: Ikev2AesGcmEpochInputs<'_>,
+        limits: Ikev2AesGcmIvLimits,
+    ) -> Result<Self, Ikev2AesGcmIvReservationError> {
+        let record =
+            Ikev2AesGcmIvRecord::from_persisted(inputs, limits, 0, Some(crate::canonical::V1))?;
+        Ok(Self {
+            domain: record.domain,
+            receive: record.receive,
+            canonical_format: record.canonical_format,
+            initial_epoch: true,
+            committed_binding: false,
             limits,
             next: 0,
             end: 0,
+        })
+    }
+
+    /// Bound sending domain for reservation retries and expected-domain checks.
+    pub const fn domain(&self) -> &Ikev2AesGcmIvDomain {
+        &self.domain
+    }
+
+    /// Derive canonical authority after this fresh epoch's initial activation.
+    ///
+    /// Restored allocators must instead use a checked restored window. The
+    /// capability authenticates no peer and grants no window/send authority.
+    /// # Errors
+    /// Refuses before durable activation, on restored allocators, or when the
+    /// immutable format/binding or canonical provider qualification is unavailable.
+    pub fn canonical_replies(
+        &self,
+        policy: crate::canonical::Ikev2CanonicalPolicy,
+    ) -> Result<crate::canonical::Ikev2CanonicalEmptyReplies, crate::canonical::Ikev2CanonicalError>
+    {
+        if !self.initial_epoch || !self.committed_binding {
+            return Err(crate::canonical::Ikev2CanonicalError::NotCommitted);
         }
+        crate::canonical::Ikev2CanonicalEmptyReplies::from_record(
+            &Ikev2AesGcmIvRecord {
+                domain: self.domain.clone(),
+                receive: self.receive.clone(),
+                canonical_format: self.canonical_format,
+                limits: self.limits,
+                exclusive_end: self.end,
+            },
+            policy,
+        )
     }
 
     /// Restore the latest fenced record and discard its entire unused tail.
@@ -211,10 +333,16 @@ impl Ikev2AesGcmIvAllocator {
         record: &Ikev2AesGcmIvRecord,
     ) -> Result<Self, Ikev2AesGcmIvReservationError> {
         if expected != &record.domain {
+            crate::canonical::invalidate_binding(expected);
+            crate::canonical::invalidate_binding(&record.domain);
             return Err(Ikev2AesGcmIvReservationError::DomainMismatch);
         }
         Ok(Self {
             domain: record.domain.clone(),
+            receive: record.receive.clone(),
+            canonical_format: record.canonical_format,
+            initial_epoch: false,
+            committed_binding: false,
             limits: record.limits,
             next: record.exclusive_end,
             end: record.exclusive_end,
@@ -265,11 +393,14 @@ impl Ikev2AesGcmIvAllocator {
         self.limits.check_position(end - 1, purpose)?;
         let record = Ikev2AesGcmIvRecord {
             domain: self.domain.clone(),
+            receive: self.receive.clone(),
+            canonical_format: self.canonical_format,
             limits: self.limits,
             exclusive_end: end,
         };
         self.next = end;
         self.end = end;
+        self.committed_binding = false;
         Ok(Ikev2AesGcmPreparedIvReservation {
             allocator: self,
             start,
@@ -330,6 +461,7 @@ impl Ikev2AesGcmPreparedIvReservation<'_> {
             return Err(Ikev2AesGcmIvReservationError::CommitMismatch);
         }
         self.allocator.next = self.start;
+        self.allocator.committed_binding = true;
         Ok(())
     }
 }
