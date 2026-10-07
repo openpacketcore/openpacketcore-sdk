@@ -3,6 +3,10 @@
 use crate::error::IpsecLbError;
 use crate::model::SaId;
 
+// Keep the ordinary IKE transmit partition aligned with
+// opc-proto-ikev2::IKEV2_AES_GCM_NORMAL_IV_END without adding a crypto dependency.
+const IKE_NORMAL_EXPLICIT_IV_END: u64 = 0xffff_ffff_0000_0000;
+
 /// Minimum outbound IV forward-jump accepted for same-SPI failover.
 ///
 /// RFC 6311 gives `2^30` as an example skip for stale failover counters. The
@@ -24,7 +28,8 @@ pub const MIN_SEND_IV_FORWARD_JUMP: u64 = 1_u64 << 30;
 /// requires that checked sum to be at most `2^31`.
 ///
 /// This limit is specific to ESP ESN reconstruction. IKE's independent 64-bit
-/// AEAD explicit-IV counter is limited only by checked `u64` arithmetic.
+/// AEAD explicit-IV resume value must stay below `0xffff_ffff_0000_0000`, the
+/// exclusive end accepted by the SDK's ordinary IKE sealing APIs.
 pub const MAX_ESP_SEND_IV_FORWARD_JUMP: u64 = (1_u64 << 31) - 1;
 
 /// Send IV/counter state used to avoid AEAD nonce reuse on resume.
@@ -148,9 +153,10 @@ impl SendIvForwardJump {
     /// RFC 4303 sequence numbers start at 1; IKE explicit-IV counters may use
     /// zero. The restored counter must equal `checkpointed_next + forward_jump`;
     /// accepting a different value would disconnect the installed SA state from
-    /// this proof. The SA identifier must be non-zero. Arithmetic overflow, ESP
-    /// reconstruction-bound failure, or counter exhaustion requires a rekey
-    /// rather than same-SPI resume.
+    /// this proof. The SA identifier must be non-zero. IKE resumed IVs must be
+    /// below `0xffff_ffff_0000_0000`, reserving the upper 2^32 values for canonical
+    /// replies. Arithmetic overflow, ESP reconstruction-bound failure or IKE
+    /// ordinary-IV exhaustion requires a rekey rather than same-SPI resume.
     pub fn validate_restored_next(
         self,
         sa: SaId,
@@ -228,6 +234,13 @@ impl SendIvForwardJump {
                 "restored send IV counter does not match the proven forward-jump",
             ));
         }
+        if matches!(self.counter_mode, SendIvCounterMode::IkeAeadExplicitIv64)
+            && expected.next() >= IKE_NORMAL_EXPLICIT_IV_END
+        {
+            return Err(IpsecLbError::unsafe_resume(
+                "IKE explicit IV counter reached the reserved region; rekey before sending",
+            ));
+        }
         Ok(expected)
     }
 }
@@ -254,6 +267,8 @@ pub enum SendIvCounterMode {
         max_peer_sequence_lag: u64,
     },
     /// IKE SA with a monotonic 64-bit AEAD explicit-IV counter.
+    ///
+    /// Resumed values must remain below the ordinary-IV end `0xffff_ffff_0000_0000`.
     IkeAeadExplicitIv64,
 }
 

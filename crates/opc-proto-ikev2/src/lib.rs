@@ -94,6 +94,7 @@ mod hmac_sha2;
 pub mod ike_auth;
 pub mod ike_auth_signature;
 pub mod ike_sa_rekey;
+pub mod iv_reservation;
 pub mod message;
 pub mod message_id_sync;
 pub mod nat_detection;
@@ -243,6 +244,11 @@ pub use ike_sa_rekey::{
     Ikev2IkeSaRekeyResponseError, Ikev2IkeSaRekeyResponsePayloads, Ikev2IkeSaRekeySentRequest,
     IKEV2_REKEY_IKE_SPI_LEN,
 };
+pub use iv_reservation::{
+    Ikev2AesGcmIvAllocation, Ikev2AesGcmIvAllocator, Ikev2AesGcmIvDomain, Ikev2AesGcmIvLimits,
+    Ikev2AesGcmIvPurpose, Ikev2AesGcmIvRecord, Ikev2AesGcmIvReservationError,
+    Ikev2AesGcmPreparedIvReservation, IKEV2_AES_GCM_MAX_RESERVED_ALLOCATIONS,
+};
 pub use message::{
     Ikev2MessageRejection, Ikev2UnknownCriticalPayloadMessage, Message, OwnedMessage,
 };
@@ -322,7 +328,7 @@ pub use protected_payload_crypto::{
     Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
     Ikev2ProtectedPayloadDirection, Ikev2ProtectedPayloadOpenError,
     Ikev2SaInitProtectedPayloadProvider, ProtectedPayloadSealContext, IKEV2_AES_CBC_IV_LEN,
-    IKEV2_AES_GCM_EXPLICIT_IV_LEN,
+    IKEV2_AES_GCM_EXPLICIT_IV_LEN, IKEV2_AES_GCM_NORMAL_IV_END,
 };
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,

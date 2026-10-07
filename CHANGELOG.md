@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: add ordinary GCM IV reservation records and
+  prepare/commit/activate hooks bound to the SA, direction, algorithm, key and
+  salt. Restore discards unused tails; checked soft/hard limits preserve bounded
+  rekey/Delete headroom. Single-use allocation tokens seal through the admitted
+  crypto module. Persistence, writer fencing and fresh-key provenance remain
+  caller obligations; complete restart recovery and canonical replies are not
+  enabled.
+
 - `opc-proto-ikev2`: add pure RFC 6311 offer accumulation, immutable per-SA
   recovery-mode selection and counter decisions, including pending proposals,
   nonce correlation, strict replay drops and simultaneous-sync maxima. These
@@ -102,6 +110,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Changed
+
+- `opc-proto-ikev2`: all ordinary AES-GCM `SK`/`SKF` sealing now rejects
+  explicit IVs at or above `0xffff_ffff_0000_0000`, reserving the upper 2^32
+  values for canonical replies. This applies to caller-chosen IVs as well as
+  `Ikev2AesGcmExplicitIvCounter`, whose exhaustion boundary is now lower than
+  `u64::MAX`. Peer IVs in that region still open normally. Direct callers get
+  `ExplicitIvReserved`; counter callers get `ExplicitIvExhausted` and must
+  rekey; ordinary sealing never uses the reserved region. The IKE mode of
+  `opc-ipsec-lb::SendIvForwardJump` now applies the same bound to resumed IV
+  values, returning `UnsafeResume` with a rekey-required reason. Its ESP mode
+  and protocol-independent counter arithmetic are unchanged.
 
 - `opc-persist`: retained-voter admission without a compatible quorum now
   returns `CompatibleQuorumUnavailable` when no peer has proved incompatible;

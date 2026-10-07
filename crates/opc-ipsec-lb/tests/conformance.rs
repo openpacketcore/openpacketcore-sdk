@@ -684,6 +684,49 @@ fn failover_guards_reject_iv_and_replay_rollback() {
 }
 
 #[test]
+fn ike_forward_jump_respects_the_ordinary_iv_partition_without_limiting_esp() {
+    // Same local transmit partition as opc-proto-ikev2's ordinary GCM sealers.
+    const FIRST_RESERVED_IKE_IV: u64 = 0xffff_ffff_0000_0000;
+    let ike = SendIvForwardJump {
+        forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+        counter_mode: SendIvCounterMode::IkeAeadExplicitIv64,
+    };
+    let esp = SendIvForwardJump {
+        counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+            max_peer_sequence_lag: 0,
+        },
+        ..ike
+    };
+    for restored in [
+        FIRST_RESERVED_IKE_IV - 1,
+        FIRST_RESERVED_IKE_IV,
+        FIRST_RESERVED_IKE_IV + 1,
+        u64::MAX,
+    ] {
+        let checkpoint = restored - MIN_SEND_IV_FORWARD_JUMP;
+        let decision =
+            ike.validate_restored_next(SaId::Ike { responder_spi: 1 }, checkpoint, restored);
+        if restored < FIRST_RESERVED_IKE_IV {
+            assert_eq!(decision.unwrap(), SendIvCounter::new(restored));
+        } else {
+            assert_eq!(
+                decision.unwrap_err(),
+                IpsecLbError::UnsafeResume {
+                    reason:
+                        "IKE explicit IV counter reached the reserved region; rekey before sending",
+                }
+            );
+        }
+        // The IKE partition does not truncate ESP's full-width ESN counter.
+        assert_eq!(
+            esp.validate_restored_next(SaId::Esp { spi: 1 }, checkpoint, restored)
+                .unwrap(),
+            SendIvCounter::new(restored)
+        );
+    }
+}
+
+#[test]
 fn inline_nic_crypto_offload_requires_key_custody_documentation() {
     assert!(NicOffloadSecurityPosture::steering_only()
         .validate()
