@@ -13,6 +13,8 @@ use core::fmt;
 
 mod packet;
 
+pub mod scope_time;
+
 pub use packet::{classify_l3_udp_source, PacketEndpointDisposition};
 
 /// ABI version encoded into every configuration and control command.
