@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BOOTTIME deadline arithmetic, with explicit drift, suspend-error and validity
   bounds. This opt-in time model does not authenticate permits or install a
   packet gate; the existing cgroup fence ABI is unchanged.
+- `opc-proto-ikev2`: add frozen V1 AES-GCM empty-reply regeneration from the
+  committed epoch binding. Per-algorithm known-answer qualification, independent
+  prefix/raw-plaintext checks and a process ledger allow at most three withheld
+  attempts and one released packet per sending key, salt and Message ID while
+  its ledger is retained; subsequent replies reuse volatile bytes. Trust loss
+  discards the cache and revokes the
+  binding. Held-back outputs are zeroized and excluded from diagnostics. This
+  primitive supplies no receive-window admission or transmission authority;
+  DPD handling and complete restart recovery remain unimplemented. Canonical
+  restart deliberately departs from literal SP 800-38D section 9.1 item 3 on the
+  basis of section 8 and carries no validated-module or FIPS 140-3 claim. It
+  refuses declared-validated modules without explicit canonical opt-in.
+  Ordinary reservations and committed ordinary/sync recovery retain section
+  9.1's persist-ahead/discard behavior. Canonical refusal has no fallback.
+
 - `opc-proto-ikev2`: add initiating RFC 6311 sync for complete GCM `SK`, with
   admitted fresh nonces, persisted exact proposals, at most three attempts,
   fixed deadlines/clock epochs and response-result commits before ordinary
@@ -47,16 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charges, positive backoff and fixed operation deadlines, with no reserve-ahead
   and at most three fresh-block attempts across restart. Storage, fencing, clock
   continuity and operation semantics remain caller obligations. Fragmented/CBC
-  recovery, canonical replies and complete restart recovery are
-  not enabled.
+  recovery, zero-write empty handling and complete restart recovery remain open.
 
 - `opc-proto-ikev2`: add ordinary GCM IV reservation records and
   prepare/commit/activate hooks bound to the SA, direction, algorithm, key and
   salt. Restore discards unused tails; checked soft/hard limits preserve bounded
   rekey/Delete headroom. Single-use allocation tokens seal through the admitted
   crypto module. Persistence, writer fencing and fresh-key provenance remain
-  caller obligations; complete restart recovery and canonical replies are not
-  enabled.
+  caller obligations; complete restart recovery remains separate.
 
 - `opc-proto-ikev2`: add pure RFC 6311 offer accumulation, immutable per-SA
   recovery-mode selection and counter decisions, including pending proposals,
@@ -151,6 +164,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Changed
+
+- `opc-proto-ikev2`: canonical replies now own their 57 verified bytes and hold
+  no ledger lock. The process ledger uses key-free SHA-256 fingerprints and
+  hash lookup; live capability keys are zeroized on drop. `retire_through`
+  compacts ID history into a permanent closed floor, and `delete`/`delete_epoch`
+  discard state once the SA is deleted, retaining its fingerprint in a separate
+  FIFO of the most recent 1,048,576 deletions. Only live ledgers count against
+  the 1,048,576-entry concurrency cap; they are never evicted, and deletion churn
+  cannot cause `RegistryFull` or impose a lifetime/per-day SA limit. Consumers
+  must never restore deleted records after tombstone expiry: their original
+  binding still fixes identical bytes, but the fresh ledger resets fault exposure
+  accounting. Expose the existing window `ready()` lifecycle check;
+  consumers must check it and current admission on every canonical reply.
+
+- `opc-proto-ikev2`: make `Ikev2AesGcmIvDomain::new` and
+  `Ikev2CommittedWindowDomain::new` crate-private. New epochs use
+  `Ikev2AesGcmIvAllocator::fresh(Ikev2AesGcmEpochInputs, limits) -> Result`;
+  obtain the domain from `allocator.domain()`. Rebuild persisted IV records
+  with `Ikev2AesGcmIvRecord::from_persisted(epoch_inputs, limits, end, marker)`,
+  preserving both directional keys and the exact immutable marker from the
+  atomic record. Initial window domains use
+  `Ikev2CommittedWindowDomain::from_iv_record(&record)`; restoration cross-checks
+  the separately persisted window and IV records against the supplied keys.
+  Fresh epochs create V1 before first encryption; absent/unknown markers cannot
+  acquire canonical capability and cannot be upgraded on used keys.
 
 - `opc-proto-ikev2`: all ordinary AES-GCM `SK`/`SKF` sealing now rejects
   explicit IVs at or above `0xffff_ffff_0000_0000`, reserving the upper 2^32

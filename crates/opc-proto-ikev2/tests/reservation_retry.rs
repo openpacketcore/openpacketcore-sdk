@@ -10,7 +10,9 @@ use opc_proto_ikev2::{
     Ikev2SaInitKeyMaterial,
 };
 
-fn domain() -> Domain {
+mod support;
+
+fn key_material() -> (Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial) {
     let profile = Ikev2SaInitCryptoProfile::new_aead(
         Ikev2PrfAlgorithm::HmacSha2_256,
         Ikev2DhGroup::Ecp256,
@@ -29,7 +31,11 @@ fn domain() -> Domain {
         &[0x33; 32],
     )
     .unwrap();
-    Domain::new(
+    (profile, keys)
+}
+fn domain() -> Domain {
+    let (profile, keys) = key_material();
+    support::iv_domain(
         0x101,
         0x202,
         Ikev2ProtectedPayloadDirection::ResponderToInitiator,
@@ -42,7 +48,18 @@ fn policy() -> Policy {
     Policy::new(1_000, 2_000, 3, 100).unwrap()
 }
 fn allocator(domain: &Domain) -> Allocator {
-    Allocator::fresh(domain.clone(), Limits::new(128, 2, 1, 2).unwrap())
+    let (profile, keys) = key_material();
+    Allocator::fresh(
+        support::epoch_inputs(
+            domain.initiator_spi(),
+            domain.responder_spi(),
+            domain.direction(),
+            profile,
+            &keys,
+        ),
+        Limits::new(128, 2, 1, 2).unwrap(),
+    )
+    .unwrap()
 }
 fn initial(domain: &Domain) -> Record {
     Record::initial(domain.clone(), 7, policy())
@@ -341,10 +358,18 @@ fn failed_charge_and_wrong_domain_burn_no_block_and_one_attempt_policy_is_final(
         .prepare(&mut allocator, 4, Purpose::Ordinary, 1_000, false)
         .unwrap();
     assert_eq!(block.record().exclusive_end(), 4);
+    let (iv_profile, iv_keys) = key_material();
     let wrong_iv = opc_proto_ikev2::Ikev2AesGcmIvRecord::from_persisted(
-        domain.clone(),
+        support::epoch_inputs(
+            domain.initiator_spi(),
+            domain.responder_spi(),
+            domain.direction(),
+            iv_profile,
+            &iv_keys,
+        ),
         Limits::new(128, 2, 1, 2).unwrap(),
         5,
+        Some(1),
     )
     .unwrap();
     assert!(matches!(
@@ -379,7 +404,7 @@ fn failed_charge_and_wrong_domain_burn_no_block_and_one_attempt_policy_is_final(
         &[0x33; 32],
     )
     .unwrap();
-    let foreign = Domain::new(
+    let foreign = support::iv_domain(
         0x101,
         0x203,
         Ikev2ProtectedPayloadDirection::ResponderToInitiator,
@@ -391,7 +416,17 @@ fn failed_charge_and_wrong_domain_burn_no_block_and_one_attempt_policy_is_final(
         Retry::restore(&foreign, 7, &record),
         Err(Error::RecordMismatch)
     ));
-    let foreign_allocator = Allocator::fresh(foreign, Limits::new(128, 2, 1, 2).unwrap());
+    let foreign_allocator = Allocator::fresh(
+        support::epoch_inputs(
+            foreign.initiator_spi(),
+            foreign.responder_spi(),
+            foreign.direction(),
+            profile,
+            &keys,
+        ),
+        Limits::new(128, 2, 1, 2).unwrap(),
+    )
+    .unwrap();
     retry = restore(&domain, &record);
     assert!(matches!(
         retry.prepare_attempt(&foreign_allocator, 1_000, false),

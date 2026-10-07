@@ -16,3 +16,14 @@ ae4a66adf24cfdcbf5b5c504d28d7cb363473b69:crates/opc-ipsec-xfrm/src/ikev2.rs:gene
 3214d6090bfd889af0f55353aebf6d589a863d9b:crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json:generic-api-key:8
 3214d6090bfd889af0f55353aebf6d589a863d9b:scripts/n3iwf_key_lifecycle_reference.py:generic-api-key:18
 3214d6090bfd889af0f55353aebf6d589a863d9b:scripts/n3iwf_key_lifecycle_reference.py:generic-api-key:20
+
+# Public NIST GCM test vectors in the frozen canonical empty-reply data (#1136).
+# Each exception pins the original commit, file, rule and line; no path/rule allowlist.
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:24
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:41
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:75
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:92
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:109
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:126
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:143
+691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:160

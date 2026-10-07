@@ -24,6 +24,22 @@ pub struct Ikev2AuthenticatedOrdinary {
 }
 
 impl Ikev2AuthenticatedOrdinary {
+    pub(crate) fn canonical_message_id(
+        &self,
+        expected: &Domain,
+    ) -> Result<u32, crate::canonical::Ikev2CanonicalError> {
+        use crate::canonical::Ikev2CanonicalError as CanonicalError;
+        if &self.domain != expected {
+            return Err(CanonicalError::BindingMismatch);
+        }
+        if self.header.flags.response()
+            || self.header.exchange_type != Ikev2ExchangeKind::Informational.as_u8()
+            || !self.payloads().is_empty()
+        {
+            return Err(CanonicalError::InvalidRequest);
+        }
+        Ok(self.header.message_id)
+    }
     /// Authenticated header for consumer semantic validation.
     pub const fn header(&self) -> &Header {
         &self.header

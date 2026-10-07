@@ -80,7 +80,7 @@ impl Fixture {
         support::ensure_ike_crypto();
         let profile = profile(algorithm);
         let keys = keys(profile, 0);
-        let domain = Domain::new(0x101, 0x202, direction, profile, &keys).unwrap();
+        let domain = support::window_domain(0x101, 0x202, direction, profile, &keys).unwrap();
         Self {
             profile,
             keys,
@@ -105,20 +105,29 @@ impl Fixture {
         .unwrap()
     }
 
+    fn epoch_inputs(&self) -> opc_proto_ikev2::Ikev2AesGcmEpochInputs<'_> {
+        let domain = self.domain.send_iv_domain();
+        support::epoch_inputs(
+            domain.initiator_spi(),
+            domain.responder_spi(),
+            domain.direction(),
+            self.profile,
+            &self.keys,
+        )
+    }
     fn iv_record(&self, exclusive_end: u64) -> IvRecord {
         IvRecord::from_persisted(
-            self.domain.send_iv_domain().clone(),
+            self.epoch_inputs(),
             Limits::new(128, 2, 1, 2).unwrap(),
             exclusive_end,
+            Some(1),
         )
         .unwrap()
     }
 
     fn allocator(&self) -> Allocator {
-        let mut allocator = Allocator::fresh(
-            self.domain.send_iv_domain().clone(),
-            Limits::new(128, 2, 1, 2).unwrap(),
-        );
+        let mut allocator =
+            Allocator::fresh(self.epoch_inputs(), Limits::new(128, 2, 1, 2).unwrap()).unwrap();
         let prepared = allocator.prepare(32, Purpose::Ordinary).unwrap();
         let durable = prepared.record().clone();
         prepared.activate_after_commit(&durable).unwrap();
@@ -955,9 +964,11 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
             .unwrap(),
     );
     for domain in [
-        Domain::new(0x999, 0x202, DIRECTIONS[0], fixture.profile, &fixture.keys).unwrap(),
-        Domain::new(0x101, 0x202, DIRECTIONS[1], fixture.profile, &fixture.keys).unwrap(),
-        Domain::new(
+        support::window_domain(0x999, 0x202, DIRECTIONS[0], fixture.profile, &fixture.keys)
+            .unwrap(),
+        support::window_domain(0x101, 0x202, DIRECTIONS[1], fixture.profile, &fixture.keys)
+            .unwrap(),
+        support::window_domain(
             0x101,
             0x202,
             DIRECTIONS[0],
@@ -1130,29 +1141,17 @@ fn restore_accepts_unused_epoch_but_rejects_foreign_iv_records() {
             &fixture.iv_record(0),
         )
         .is_ok());
-        for foreign in [
-            Domain::new(0x999, 0x202, direction, fixture.profile, &fixture.keys).unwrap(),
-            Domain::new(
-                0x101,
-                0x202,
-                opposite(direction),
-                fixture.profile,
-                &fixture.keys,
-            )
-            .unwrap(),
-            Domain::new(
-                0x101,
-                0x202,
-                direction,
-                fixture.profile,
-                &keys(fixture.profile, 1),
-            )
-            .unwrap(),
+        let changed_keys = keys(fixture.profile, 1);
+        for (i, d, k) in [
+            (0x999, direction, &fixture.keys),
+            (0x101, opposite(direction), &fixture.keys),
+            (0x101, direction, &changed_keys),
         ] {
             let iv_record = IvRecord::from_persisted(
-                foreign.send_iv_domain().clone(),
+                support::epoch_inputs(i, 0x202, d, fixture.profile, k),
                 fixture.iv_record(0).limits(),
                 32,
+                Some(1),
             )
             .unwrap();
             assert!(matches!(
@@ -1310,7 +1309,7 @@ fn changing_only_the_peer_key_still_invalidates_the_window_domain() {
         )
         .unwrap();
         let changed_domain =
-            Domain::new(0x101, 0x202, direction, fixture.profile, &changed).unwrap();
+            support::window_domain(0x101, 0x202, direction, fixture.profile, &changed).unwrap();
         assert_eq!(
             fixture.domain.send_iv_domain(),
             changed_domain.send_iv_domain()

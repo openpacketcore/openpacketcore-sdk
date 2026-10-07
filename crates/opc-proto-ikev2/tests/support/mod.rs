@@ -24,6 +24,82 @@ pub(crate) fn ensure_ike_crypto() {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "each integration target compiles its own support module"
+)]
+pub(crate) fn epoch_inputs(
+    initiator_spi: u64,
+    responder_spi: u64,
+    sending_direction: opc_proto_ikev2::Ikev2ProtectedPayloadDirection,
+    profile: opc_proto_ikev2::Ikev2SaInitCryptoProfile,
+    keys: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+) -> opc_proto_ikev2::Ikev2AesGcmEpochInputs<'_> {
+    opc_proto_ikev2::Ikev2AesGcmEpochInputs {
+        initiator_spi,
+        responder_spi,
+        sending_direction,
+        profile,
+        keys,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "each integration target compiles its own support module"
+)]
+pub(crate) fn iv_domain(
+    initiator_spi: u64,
+    responder_spi: u64,
+    sending_direction: opc_proto_ikev2::Ikev2ProtectedPayloadDirection,
+    profile: opc_proto_ikev2::Ikev2SaInitCryptoProfile,
+    keys: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+) -> Result<opc_proto_ikev2::Ikev2AesGcmIvDomain, opc_proto_ikev2::Ikev2AesGcmIvReservationError> {
+    opc_proto_ikev2::Ikev2AesGcmIvRecord::from_persisted(
+        epoch_inputs(
+            initiator_spi,
+            responder_spi,
+            sending_direction,
+            profile,
+            keys,
+        ),
+        opc_proto_ikev2::Ikev2AesGcmIvLimits::new(128, 2, 1, 2).unwrap(),
+        0,
+        Some(1),
+    )
+    .map(|record| record.domain().clone())
+}
+
+#[allow(
+    dead_code,
+    reason = "each integration target compiles its own support module"
+)]
+pub(crate) fn window_domain(
+    initiator_spi: u64,
+    responder_spi: u64,
+    sending_direction: opc_proto_ikev2::Ikev2ProtectedPayloadDirection,
+    profile: opc_proto_ikev2::Ikev2SaInitCryptoProfile,
+    keys: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+) -> Result<
+    opc_proto_ikev2::recovery::Ikev2CommittedWindowDomain,
+    opc_proto_ikev2::recovery::Ikev2WindowError,
+> {
+    opc_proto_ikev2::Ikev2AesGcmIvRecord::from_persisted(
+        epoch_inputs(
+            initiator_spi,
+            responder_spi,
+            sending_direction,
+            profile,
+            keys,
+        ),
+        opc_proto_ikev2::Ikev2AesGcmIvLimits::new(128, 2, 1, 2).unwrap(),
+        0,
+        Some(1),
+    )
+    .map(|record| opc_proto_ikev2::recovery::Ikev2CommittedWindowDomain::from_iv_record(&record))
+    .map_err(|_| opc_proto_ikev2::recovery::Ikev2WindowError::DomainMismatch)
+}
+
 const TEST_INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
 const TEST_RESPONDER_SPI: u64 = 0x1112_1314_1516_1718;
 pub(crate) const TEST_INITIATOR_NONCE: &[u8] = &[0x66; 32];
