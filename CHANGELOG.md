@@ -229,6 +229,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptor integrity and cancelled-worker ownership remain serialized.
   Part of #1005.
 
+- `opc-session-net`: emit the existing bootstrap retirement control when
+  reauthentication or material retirement wins before the acknowledgement
+  write first starts. Both consensus and legacy direct listeners preserve
+  closure after a possibly partial acknowledgement and their existing
+  deadlines, avoiding a spurious transport failure before request admission.
+  Fixes #1098.
+
 - `opc-persist`: admit returning configuration voters with a majority whose
   compatibility is proved on authenticated connections, including the local
   voter. Reverify reconnects and reject incompatible engine traffic before
