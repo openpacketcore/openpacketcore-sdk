@@ -5,7 +5,9 @@
 //! prove a storage acknowledgement or prevent rollback of a consumer's record.
 //! Reservations belong to initial key setup or state-changing work, never a
 //! periodic liveness write. Replaying committed bytes needs no allocation.
-//! No canonical reply, Message-ID window or complete recovery lifecycle is enabled.
+//! These allocator hooks alone enable no Message-ID window or recovery lifecycle.
+//! [`crate::recovery`] adds opt-in committed windows and a finite retry guard;
+//! canonical replies and complete recovery remain separate.
 
 use std::{error::Error, fmt};
 
@@ -217,6 +219,20 @@ impl Ikev2AesGcmIvAllocator {
             next: record.exclusive_end,
             end: record.exclusive_end,
         })
+    }
+
+    // Retry charging checks availability without proposing/burning a block.
+    pub(crate) fn check_reservation_available(
+        &self,
+        expected: &Ikev2AesGcmIvDomain,
+    ) -> Result<(), Ikev2AesGcmIvReservationError> {
+        if expected != &self.domain {
+            return Err(Ikev2AesGcmIvReservationError::DomainMismatch);
+        }
+        if self.next != self.end {
+            return Err(Ikev2AesGcmIvReservationError::ActiveReservation);
+        }
+        Ok(())
     }
 
     /// Prepare an exclusive high-water record without releasing any IV.

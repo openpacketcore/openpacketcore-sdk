@@ -23,7 +23,8 @@
 //! self-verification, typed 3GPP DEVICE_IDENTITY,
 //! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
 //! RFC 6311 message-ID sync Notify codecs and IKE_AUTH support extraction
-//! (wire shape only, without sync exchange or recovery state),
+//! (without a complete sync lifecycle), opt-in committed ordinary GCM windows
+//! with exact replay and finite, durably charged IV reservation retry ordering,
 //! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
 //! KEYMAT, strict responder and initiator boundaries for opened IKE-SA rekey
@@ -106,6 +107,7 @@ pub mod pcscf_restoration;
 pub mod pre_admission;
 pub mod protected_payload_crypto;
 pub mod protocol_key;
+pub mod recovery;
 pub mod sa_init;
 pub mod sa_init_crypto;
 pub mod sa_init_negotiation;

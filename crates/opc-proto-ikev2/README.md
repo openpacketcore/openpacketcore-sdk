@@ -112,8 +112,108 @@ profile, key and salt and calls the existing admitted crypto module. Dropping a
 token or failing to seal burns its IV. Exact-byte retransmission needs no new
 allocation. Reserve blocks during initial key setup or state-changing work;
 DPD, keepalives and empty responses must not initiate reservation writes.
-These hooks provide no durable Message-ID admission or exchange commit, no
-canonical response, and no complete restart-recovery lifecycle. CBC is unchanged.
+The allocator alone provides no durable Message-ID admission or exchange commit.
+The opt-in `recovery` module below adds those ordering hooks; canonical replies
+and a complete restart-recovery lifecycle remain separate. CBC is unchanged.
+
+## Committed ordinary windows and exact replay
+
+`recovery::Ikev2CommittedWindow` is an opt-in window-one profile for complete,
+unfragmented AES-GCM `SK` packets. It uses the admitted crypto module, binds both
+sending and receiving keys/salts plus the SPI pair and original role, and works
+with all three supported GCM key sizes. `SKF`, CBC recovery, synchronization,
+canonical empty replies and receive-floor reconstruction are not enabled here.
+Existing generic crypto and fragmentation APIs retain their separate contracts.
+
+Commit an initial `Ikev2CommittedWindowRecord` with the new key epoch and correct
+post-handshake floors, then `restore` from the latest trusted fenced record.
+Zero means no prior request; an exhausted direction is explicitly `None`.
+Supply the latest sending `Ikev2AesGcmIvRecord` to `restore` as well. Restore
+validates cached packet authentication, directions, exchange correlation and
+counter consistency, and requires the sending-IV record's `exclusive_end` to
+exceed the IV in every cached outbound request and inbound response. Peer IVs
+belong to the other key and do not constrain this high-water. Restore the IV
+allocator from that same record, discarding its unused tail. This cross-check
+detects inconsistency visible in the cache; it cannot detect rollback of both
+records or prove the absence of forgotten IV use.
+
+Consumer serialization uses the record accessors and
+`from_persisted` constructors; this module defines no store format. Never seed
+it from a legacy window snapshot or an unknown IV history. The legacy responder
+window accepts forward gaps and is insufficient for this durable profile.
+
+Prepare a local request with a slice-3 single-use IV allocation. Persist the
+exact candidate record atomically with the SA and operation, then acknowledge
+it with `commit_after_durable`. Only then may `replay_request` release the exact
+packet. One outbound request remains pending until an authenticated matching
+response and consumer-validated outcome are committed. Outcomes are opaque
+consumer state; committing a packet does not establish application success.
+
+For peer requests, authenticate with `open_peer` and inspect
+`request_disposition`. Only the exact expected ID or the exact last cached
+request is admitted. Plan a new request's result without effects, prepare its
+exact response, and commit the response/outcome/floor together before effects or
+sending. This also applies to error replies and empty acknowledgements of
+nonempty operations. Storage failure grants no new reply, including
+`TEMPORARY_FAILURE`. A cached duplicate replays the last applicable response;
+same-ID different bytes, older cached entries and forward gaps are dropped.
+Any sync Notify is excluded from ordinary state, including ordinary Message ID 0.
+
+Prepared record accessors exist for persistence, not transmission. Equality of
+an acknowledgement checks identity, not durability. Cancellation, failure or an
+uncertain commit leaves the runtime quiescent. Fence/settle all older writes,
+read back the latest atomic record, and replace the runtime with `restore`.
+Do not guess whether an uncertain write committed. IVs already consumed by
+preparation remain burned. Completion tokens are single-use and must pass
+`apply_committed` in the same runtime/current commit generation; restoration or
+a later commit fences them. The consumer applies durable outcomes idempotently;
+restoration reads history and never manufactures a fresh completion.
+
+A probe replays the last committed request, pending or settled, with no new
+Message ID, IV, durable write or outcome. Without such a request there is no
+artificial probe. Replies to old bytes do not establish fresh liveness. Empty
+INFORMATIONAL requests are refused as durable work; a separate stateless handler
+with a volatile expected-receive high-water is required to answer them without
+writes and admit the next nonempty request. **Until that handler and high-water
+are implemented, this window must not face peers that send DPD requests.**
+Answering a DPD outside the window does not advance its committed receive floor,
+so the peer's next request would be dropped as a forward gap and the SA would
+stall. Keepalives remain outside IKE windows.
+This limitation applies in both recovery modes; negotiation alone grants no
+fresh-DPD bypass.
+
+### Bounded IV reservation attempts
+
+`Ikev2ReservationRetry` adds ordering for genuine state-changing operation work.
+Persist an operation identity and immutable `Ikev2ReservationRetryPolicy` with
+its start, fixed Unix-millisecond deadline, positive backoff and at most three
+fresh-block attempts (a consumer may choose fewer). The operation and policy
+survive restart; a replay, outage or restart cannot create a replacement budget.
+
+`prepare_attempt` exposes an attempt charge without preparing or burning a
+block. Persist that charge first, then consume `commit_after_durable`'s one-use
+permit to `prepare` a block. Persist its exact IV high-water with the same SA and
+already charged operation, and call `activate_after_commit` after another clock
+check. Never overwrite the charge with stale operation fields. Every fresh block
+attempt consumes a charge, including cancellation before block preparation.
+
+An active block refuses a new attempt without charging it: there is no
+reserve-ahead. Once the block is depleted, the message needing a new IV waits for
+both commitments. Failed or uncertain charge/block writes quiesce the guard;
+reconcile both records and all old writes before restoring and retrying. Restore
+discards unused IV tails and permits, retaining charges, deadline and backoff.
+The caller schedules backoff; the SDK starts no retry loop. Do not bypass the
+guard with raw allocator calls for the same operation. `Ordinary` and `Control`
+remain the existing exhaustive purpose enum; control is still limited to the
+caller's bounded rekey/Delete traffic.
+
+Provide a clock-step indication for either forward or backward discontinuity,
+including steps across restart; retain it until that operation is terminal.
+Observed rollback, deadline or budget exhaustion returns `Closed`, which must
+terminate the operation, never refresh its policy. Record terminal disposition
+in the consumer's lifecycle or close the affected SA. This guard is not a clock
+service or a complete recovery lifecycle. Replays, DPD, keepalives and replies to
+empty requests cannot initiate reservation writes.
 
 ## NWu payload profiles
 
