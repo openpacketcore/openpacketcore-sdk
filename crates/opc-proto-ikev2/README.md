@@ -22,6 +22,25 @@ state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
 programming, bearer admission or allocation policy, carrier acceptance
 evidence, or a production ePDG control-plane stack.
 
+## Message-ID synchronization wire primitives
+
+`message_id_sync` provides RFC 6311 support and synchronization Notify codecs.
+`Ikev2NotifyPayloadBuild::message_id_sync_supported()` builds the IKE_AUTH
+advertisement; `Ikev2IkeAuthCleartextPayloads::message_id_sync_supported()`
+distinguishes absence from malformed or duplicate offers. Those errors are
+diagnostic: do not select sync or, as responder, advertise it, but do not fail
+IKE_AUTH solely because of an invalid offer. `Ikev2MessageIdSync`
+preserves the four-octet nonce and the sender-relative next-send/next-receive
+counters: M1/P1 in a request, P2/M2 in its response. Builders emit Protocol ID
+zero; receivers ignore that field for an empty SPI as RFC 7296 requires.
+
+These are wire primitives only. Advertisement is opt-in and requires a complete
+sync handler; responders may advertise only after an initiator offer, and both
+peers must advertise before using sync. Authentication, Message-ID-zero exchange
+admission, nonce matching, counter transitions, persistence, IV reservation and
+restart recovery are not implemented by these helpers. They neither generate
+random nonces nor synchronize ESP counters. See [CONFORMANCE.md](CONFORMANCE.md).
+
 ## NWu payload profiles
 
 `nwu` adds the TS 24.502 V18.8.0 configuration and opened Child-SA payload

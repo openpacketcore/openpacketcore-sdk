@@ -22,6 +22,8 @@
 //! method-14 authorities including sealed local pre-transmit AUTH
 //! self-verification, typed 3GPP DEVICE_IDENTITY,
 //! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
+//! RFC 6311 message-ID sync Notify codecs and IKE_AUTH support extraction
+//! (wire shape only, without sync exchange or recovery state),
 //! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
 //! KEYMAT, strict responder and initiator boundaries for opened IKE-SA rekey
@@ -93,6 +95,7 @@ pub mod ike_auth;
 pub mod ike_auth_signature;
 pub mod ike_sa_rekey;
 pub mod message;
+pub mod message_id_sync;
 pub mod nat_detection;
 pub mod nat_traversal;
 pub mod notify;
@@ -243,6 +246,10 @@ pub use ike_sa_rekey::{
 pub use message::{
     Ikev2MessageRejection, Ikev2UnknownCriticalPayloadMessage, Message, OwnedMessage,
 };
+pub use message_id_sync::{
+    decode_ikev2_message_id_sync_notify, decode_ikev2_message_id_sync_supported_notify,
+    Ikev2MessageIdSync, Ikev2MessageIdSyncError, Ikev2MessageIdSyncSupported,
+};
 pub use nat_detection::{
     evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,
     Ikev2NatDetectionEvaluation, Ikev2NatDetectionObservedEndpoint, Ikev2NatDetectionOutcome,
@@ -269,6 +276,7 @@ pub use notify::{
     IKEV2_NOTIFY_INVALID_IKE_SPI, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
     IKEV2_NOTIFY_INVALID_MAJOR_VERSION, IKEV2_NOTIFY_INVALID_MESSAGE_ID,
     IKEV2_NOTIFY_INVALID_SELECTORS, IKEV2_NOTIFY_INVALID_SPI, IKEV2_NOTIFY_INVALID_SYNTAX,
+    IKEV2_NOTIFY_MESSAGE_ID_SYNC, IKEV2_NOTIFY_MESSAGE_ID_SYNC_SUPPORTED,
     IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
     IKEV2_NOTIFY_NO_ADDITIONAL_SAS, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
     IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT, IKEV2_NOTIFY_REKEY_SA,

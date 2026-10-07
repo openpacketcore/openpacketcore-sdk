@@ -176,6 +176,18 @@ pub const IKEV2_NOTIFY_COOKIE2: u16 = 16_401;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION: u16 = 16_417;
 
+/// IKEv2 Notify Message Type for IKEV2_MESSAGE_ID_SYNC_SUPPORTED.
+///
+/// @spec IETF RFC6311 6.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_MESSAGE_ID_SYNC_SUPPORTED: u16 = 16_420;
+
+/// IKEv2 Notify Message Type for IKEV2_MESSAGE_ID_SYNC.
+///
+/// @spec IETF RFC6311 6.3
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_MESSAGE_ID_SYNC: u16 = 16_422;
+
 /// IKEv2 Notify Message Type for SIGNATURE_HASH_ALGORITHMS.
 ///
 /// The Notify appears in `IKE_SA_INIT` and carries an ordered, unpadded list
