@@ -60,6 +60,18 @@ choices. Session and configuration adapters select only their non-secret
 cluster label; they cannot silently drift to separate timing or runtime
 behavior.
 
+Configuration admission may count a majority of fixed voters whose existing
+compatibility profile is mutually proved on authenticated connections,
+including the local voter. This is a compatibility gate, not another election
+or commit algorithm: Openraft still decides every vote, leader and committed
+index. New-to-new engine calls require proof on their actual connection before
+dispatch. The optional negotiated transport extension preserves the old
+handshake; legacy peers pass explicit probes and retain all-peer admission,
+without contributing verification credit to the new admission rule. Pristine
+formation also retains all-peer verification. Stored formats and profile
+values are unchanged. See the [configuration admission contract](../../crates/opc-persist/README.md#one-consensus-authority)
+for mixed-version operation and the legacy proof limitation.
+
 ### Interim engine-source and release gate
 
 The accepted one-engine rule applies to source selection as well as APIs. Until

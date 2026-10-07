@@ -1,5 +1,8 @@
 mod management_audit_authority;
 
+#[path = "consensus_openraft/quorum_admission.rs"]
+mod quorum_admission;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -53,6 +56,7 @@ const FORBIDDEN_RAFT_ARTIFACTS: &[(&str, &[u8])] = &[
 #[derive(Clone)]
 struct LoopbackPeer {
     target: ConfigConsensusNodeId,
+    compatibility: Option<opc_consensus::ConsensusCompatibility>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     drop_forward_responses: Arc<AtomicUsize>,
@@ -68,6 +72,7 @@ impl LoopbackPeer {
     fn new(target: ConfigConsensusNodeId) -> Self {
         Self {
             target,
+            compatibility: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
@@ -121,10 +126,30 @@ impl ConsensusPeer for LoopbackPeer {
         self.target
     }
 
+    fn with_compatibility(
+        &self,
+        compatibility: opc_consensus::ConsensusCompatibility,
+    ) -> Option<Arc<dyn ConsensusPeer>> {
+        let mut peer = self.clone();
+        peer.compatibility = Some(compatibility);
+        Some(Arc::new(peer))
+    }
+
     async fn call(
         &self,
         request: ConsensusWireRequest,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        self.call_with_compatibility(request, None, Duration::from_secs(30))
+            .await
+            .map(|reply| reply.response)
+    }
+
+    async fn call_with_compatibility(
+        &self,
+        request: ConsensusWireRequest,
+        required: Option<opc_consensus::ConsensusCompatibility>,
+        _timeout: Duration,
+    ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(ConsensusPeerError::Unavailable);
         }
@@ -151,7 +176,19 @@ impl ConsensusPeer for LoopbackPeer {
             .ok_or(ConsensusPeerError::Unavailable)?;
         let sender = request.sender;
         let family = request.family;
-        let response = handler.handle(sender, request).await;
+        // The owned handler pins this exact endpoint across verification and
+        // dispatch, even if the fixture reconnects the route in the meantime.
+        let compatibility = match (self.compatibility, handler.compatibility()) {
+            (Some(local), Some(remote)) if local == remote => Some(local),
+            (Some(_), Some(_)) => return Err(ConsensusPeerError::ScopeMismatch),
+            _ => None,
+        };
+        if required.is_some() && required != compatibility {
+            return Err(ConsensusPeerError::ScopeMismatch);
+        }
+        let response = handler
+            .handle_with_compatibility(sender, request, compatibility)
+            .await;
         if family == ConsensusRpcFamily::ForwardMutation
             && self.pause_forward_response.load(Ordering::SeqCst)
         {
@@ -161,7 +198,10 @@ impl ConsensusPeer for LoopbackPeer {
         if family == ConsensusRpcFamily::ForwardMutation && take_one(&self.drop_forward_responses) {
             return Err(ConsensusPeerError::Unavailable);
         }
-        Ok(response)
+        Ok(opc_consensus::ConsensusCallResponse {
+            response,
+            compatibility,
+        })
     }
 }
 

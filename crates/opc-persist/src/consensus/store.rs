@@ -2,6 +2,7 @@
 
 mod audit;
 mod audit_continuity;
+mod compatibility;
 
 #[cfg(test)]
 mod capacity_tests;
@@ -88,6 +89,11 @@ pub enum ConfigConsensusOpenError {
     /// Exact voter formation did not converge before the deadline.
     #[error("config consensus cluster formation was rejected")]
     ClusterFormationRejected,
+    /// Neither a connection-verified voter quorum nor the complete compatible
+    /// legacy fleet was reachable before the admission deadline. Retrying on
+    /// this same open store is supported when another voter returns.
+    #[error("config consensus compatible voter quorum is unavailable")]
+    CompatibleQuorumUnavailable,
 }
 
 impl From<ConfigConsensusStorageError> for ConfigConsensusOpenError {
@@ -293,6 +299,7 @@ struct ConsensusConfigStoreInner {
     identity: opc_consensus::ConsensusIdentity,
     local_node_id: ConsensusNodeId,
     peers: BTreeMap<ConsensusNodeId, Arc<dyn ConsensusPeer>>,
+    compatibility: Arc<compatibility::CompatibilityGate>,
     members: BTreeSet<ConsensusNodeId>,
     clock: Arc<dyn ConfigConsensusClock>,
     operation_timeout: Duration,
@@ -456,6 +463,21 @@ impl ConsensusConfigStore {
                 .attach_management_audit_keys(policy.keys.clone())
                 .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         }
+        // Configure connection negotiation before Openraft can emit a vote or
+        // replication request. Consumer admission alone cannot gate the engine.
+        let compatibility = compatibility::CompatibilityGate::new(
+            identity,
+            local_node_id,
+            ConfigPeerCompatibility {
+                wire_version: super::CONFIG_CONSENSUS_WIRE_VERSION,
+                command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+                audit_key_epoch: backend.audit_key().epoch(),
+                audit_key_fingerprint: backend.audit_key().fingerprint(),
+            },
+            peers,
+            operation_timeout,
+        );
+        let peers = compatibility.guarded_peers();
         let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
         let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
             storage::open_with_recovery(
@@ -496,6 +518,7 @@ impl ConsensusConfigStore {
                 identity,
                 local_node_id,
                 peers,
+                compatibility,
                 members,
                 clock,
                 operation_timeout,
@@ -527,6 +550,13 @@ impl ConsensusConfigStore {
     /// first formation fails closed if the canonical member is absent.
     /// A retained member provisioned for repair never invokes bootstrap; it
     /// must recover the existing membership through its authenticated peers.
+    ///
+    /// A returning voter needs a compatible majority of the fixed voter set,
+    /// including itself, proved on authenticated peer connections. Transports
+    /// without connection compatibility negotiation use the complete-fleet
+    /// explicit-probe rule; legacy peers never count toward the verified
+    /// majority. Pristine formation also retains the complete-fleet rule.
+    /// Admission can be retried on this same store after a peer returns.
     pub async fn initialize_cluster(&self) -> Result<(), ConfigConsensusOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
@@ -537,6 +567,10 @@ impl ConsensusConfigStore {
             .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
             .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
         let canonical_bootstrap = self.inner.members.first().copied();
+        self.inner
+            .compatibility
+            .verify(deadline, !initialized)
+            .await?;
         if !initialized
             && canonical_bootstrap == Some(self.inner.local_node_id)
             && !self.inner.backend.retained_repair_only
@@ -558,7 +592,6 @@ impl ConsensusConfigStore {
             }
         }
         self.wait_for_admissible_membership(deadline).await?;
-        self.verify_fleet_compatibility(deadline).await?;
         self.inner.admitted.store(true, Ordering::Release);
         if !self.exact_membership_is_admitted() {
             return Err(ConfigConsensusOpenError::ClusterFormationRejected);
@@ -1097,38 +1130,7 @@ impl ConsensusConfigStore {
     }
 
     fn peer_compatibility(&self) -> ConfigPeerCompatibility {
-        ConfigPeerCompatibility {
-            wire_version: super::CONFIG_CONSENSUS_WIRE_VERSION,
-            command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
-            audit_key_epoch: self.inner.backend.audit_key().epoch(),
-            audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
-        }
-    }
-
-    async fn verify_fleet_compatibility(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), ConfigConsensusOpenError> {
-        for target in self.inner.peers.keys().copied() {
-            let reply = self
-                .call_peer::<_, ReadBarrierReply>(
-                    target,
-                    ConsensusRpcFamily::ReadBarrier,
-                    &ReadBarrierRequest {
-                        compatibility: self.peer_compatibility(),
-                        compatibility_probe: true,
-                        budget: ForwardedBudget::from_deadline(deadline)
-                            .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?,
-                    },
-                    deadline,
-                )
-                .await
-                .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?;
-            if reply != ReadBarrierReply::Compatible {
-                return Err(ConfigConsensusOpenError::ClusterFormationRejected);
-            }
-        }
-        Ok(())
+        self.inner.compatibility.profile()
     }
 
     fn is_live_voter(&self, node_id: ConsensusNodeId) -> bool {
@@ -1739,10 +1741,24 @@ impl fmt::Debug for ConfigConsensusService {
 
 #[async_trait]
 impl ConsensusRpcHandler for ConfigConsensusService {
+    fn compatibility(&self) -> Option<opc_consensus::ConsensusCompatibility> {
+        Some(self.store.inner.compatibility.digest())
+    }
+
     async fn handle(
         &self,
         authenticated_sender: ConsensusNodeId,
         request: ConsensusWireRequest,
+    ) -> ConsensusWireResponse {
+        self.handle_with_compatibility(authenticated_sender, request, None)
+            .await
+    }
+
+    async fn handle_with_compatibility(
+        &self,
+        authenticated_sender: ConsensusNodeId,
+        request: ConsensusWireRequest,
+        compatibility: Option<opc_consensus::ConsensusCompatibility>,
     ) -> ConsensusWireResponse {
         if request.validate().is_err()
             || request.identity != self.store.inner.identity
@@ -1757,6 +1773,15 @@ impl ConsensusRpcHandler for ConfigConsensusService {
             ConsensusRpcFamily::Vote
             | ConsensusRpcFamily::AppendEntries
             | ConsensusRpcFamily::InstallSnapshot => {
+                if let Err(error) = self
+                    .store
+                    .inner
+                    .compatibility
+                    .authorize_inbound(authenticated_sender, compatibility)
+                    .await
+                {
+                    return ConsensusWireResponse { result: Err(error) };
+                }
                 self.store
                     .inner
                     .raft_handler
@@ -1840,12 +1865,14 @@ impl ConfigStore for ConsensusConfigStore {
     }
 
     async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        self.require_admission()?;
         self.inner.backend.load_committed_latest().await
     }
 
     async fn retained_history_floor(
         &self,
     ) -> Result<Option<opc_types::ConfigVersion>, PersistError> {
+        self.require_admission()?;
         self.inner.backend.retained_history_floor().await
     }
 
@@ -1854,6 +1881,7 @@ impl ConfigStore for ConsensusConfigStore {
         version: opc_types::ConfigVersion,
         limit: usize,
     ) -> Result<Vec<StoredConfig>, PersistError> {
+        self.require_admission()?;
         self.inner.backend.load_since(version, limit).await
     }
 
@@ -1863,6 +1891,7 @@ impl ConfigStore for ConsensusConfigStore {
     ) -> Result<(), PersistError> {
         let mut applied = self.inner.durable_progress.subscribe_applied();
         loop {
+            self.require_admission()?;
             if self
                 .inner
                 .backend

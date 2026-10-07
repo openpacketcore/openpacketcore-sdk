@@ -1,5 +1,6 @@
 //! Authenticated bounded transport port shared by consensus consumers.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -328,7 +329,40 @@ impl ConsensusWireResponse {
     }
 }
 
+/// Purpose-separated digest of a consumer's exact compatibility profile.
+///
+/// This is public compatibility metadata, never key material. Equality must
+/// be proved by both authenticated endpoints on the connection carrying the
+/// call; a previous connection's result is not reusable evidence.
+pub type ConsensusCompatibility = [u8; 32];
+
+/// A response and the compatibility proved on the connection that carried it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsensusCallResponse {
+    /// Existing bounded wire response, unchanged by compatibility negotiation.
+    pub response: ConsensusWireResponse,
+    /// Exact mutually verified profile, or `None` for a legacy connection.
+    pub compatibility: Option<ConsensusCompatibility>,
+}
+
 /// Outbound consensus-only peer port.
+///
+/// Wrappers using connection compatibility must forward both
+/// [`Self::with_compatibility`] and [`Self::call_with_compatibility`], retain the
+/// configured peer returned by the former, and pair them with a handler that
+/// forwards both [`ConsensusRpcHandler::compatibility`] and
+/// [`ConsensusRpcHandler::handle_with_compatibility`]. Forwarding none retains
+/// legacy behavior; configuration admission then needs every peer. Partial
+/// forwarding can prevent engine traffic: configuration receivers reject an
+/// unproved call when their reverse probe proves the sender supports the
+/// extension. The session-net plaintext transport always remains legacy;
+/// quorum admission requires the negotiated mTLS extension at both endpoints.
+///
+/// Configuration consensus probes compatibility before every engine RPC,
+/// including heartbeats. A receiver running the compatibility gate also
+/// reverse-probes calls without connection proof. Between updated endpoints
+/// this adds one round trip on modern links and two on legacy links, within
+/// the original call deadline. Old binaries retain their previous request path.
 #[async_trait]
 pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     /// Canonical ordinal expected for the authenticated remote peer.
@@ -363,17 +397,86 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
         self.call(request).await
     }
+
+    /// Return an independent peer configured to offer this compatibility
+    /// profile on every connection, including reconnects.
+    ///
+    /// Existing implementations may return `None`; they remain legacy peers
+    /// and cannot supply connection-bound verification. Configured clones must
+    /// not share connections negotiated for another profile.
+    fn with_compatibility(
+        &self,
+        _compatibility: ConsensusCompatibility,
+    ) -> Option<Arc<dyn ConsensusPeer>> {
+        None
+    }
+
+    /// Send a call, optionally requiring compatibility on its actual connection.
+    ///
+    /// When `required` is present, reject before sending application bytes
+    /// unless this connection proved that exact profile. A legacy connection
+    /// never satisfies this requirement. The default keeps existing peers
+    /// usable for explicit legacy probes but never reports them as verified.
+    async fn call_with_compatibility(
+        &self,
+        request: ConsensusWireRequest,
+        required: Option<ConsensusCompatibility>,
+        timeout: Duration,
+    ) -> Result<ConsensusCallResponse, ConsensusPeerError> {
+        if required.is_some() {
+            return Err(ConsensusPeerError::ScopeMismatch);
+        }
+        Ok(ConsensusCallResponse {
+            response: self.call_with_timeout(request, timeout).await?,
+            compatibility: None,
+        })
+    }
 }
 
 /// Inbound consensus-only handler exposed by an authenticated server.
+///
+/// A wrapper must forward both [`Self::compatibility`] and
+/// [`Self::handle_with_compatibility`] together with the corresponding
+/// [`ConsensusPeer`] methods. It must preserve the carrying connection's proof.
+/// Forwarding none retains legacy all-peer configuration admission; partial
+/// forwarding can make a receiver reject every engine call when an unproved
+/// sender answers a reverse probe with connection proof. The session-net
+/// plaintext transport supplies no proof and always takes the legacy path.
+/// An updated configuration receiver adds a reverse probe for calls without
+/// connection proof; an updated sender also sends an outbound probe. These
+/// probes share the existing call deadline. Old binaries retain their previous
+/// request path.
 #[async_trait]
 pub trait ConsensusRpcHandler: Send + Sync + std::fmt::Debug {
+    /// Exact consumer profile offered by the optional connection handshake.
+    ///
+    /// The profile must be immutable for this handler's lifetime. Returning
+    /// `None` preserves the existing transport handshake.
+    fn compatibility(&self) -> Option<ConsensusCompatibility> {
+        None
+    }
+
     /// Handle one already-authenticated bounded request.
     async fn handle(
         &self,
         authenticated_sender: ConsensusNodeId,
         request: ConsensusWireRequest,
     ) -> ConsensusWireResponse;
+
+    /// Handle a request with proof from its authenticated connection.
+    ///
+    /// Transports pass `Some` only after mutual negotiation and exact profile
+    /// equality on this connection. They must pass `None` for an old peer and
+    /// must never carry evidence over to a replacement connection. The default
+    /// preserves consumers that do not use compatibility negotiation.
+    async fn handle_with_compatibility(
+        &self,
+        authenticated_sender: ConsensusNodeId,
+        request: ConsensusWireRequest,
+        _compatibility: Option<ConsensusCompatibility>,
+    ) -> ConsensusWireResponse {
+        self.handle(authenticated_sender, request).await
+    }
 }
 
 #[cfg(test)]

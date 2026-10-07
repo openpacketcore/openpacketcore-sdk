@@ -94,6 +94,65 @@ the exact custody, apply ordering and rollback-freshness limits.
 
 ## One consensus authority
 
+Returning retained voters can call `initialize_cluster` with a majority of
+compatible configured voters, including themselves. Each remote voter counted
+in that majority must prove the exact existing configuration wire/command
+revisions and audit-key epoch/fingerprint on its authenticated connection.
+An absent peer is checked when it connects, and a mismatched peer cannot reach
+Vote, AppendEntries or InstallSnapshot. Proof belongs to the connection;
+reconnects and replacement processes negotiate again. If no compatible
+majority is available and no peer has proved incompatible, admission returns
+`CompatibleQuorumUnavailable`. A known mismatch without a verified majority
+returns `ClusterFormationRejected`, even when another peer is merely absent.
+The caller can retry `initialize_cluster` on the same open store as compatible
+peers return; the SDK does not schedule that retry itself.
+
+The optional handshake extension changes no stored format or compatibility
+profile value. First formation still requires every configured peer. Peers
+without the extension retain the explicit compatibility probe and never count
+toward the connection-verified majority. When that majority is unavailable,
+admission requires a successful explicit probe of every configured peer.
+Legacy engine calls are also explicitly probed before dispatch; that legacy
+evidence is not connection-bound. The new receiving gate cannot change the
+behavior of traffic between two old binaries.
+
+Quorum admission requires the negotiated mTLS extension at both endpoints.
+The plaintext transport always supplies legacy evidence and therefore needs
+the complete-fleet admission fallback. Wrappers must forward all four optional
+methods together: `ConsensusPeer::with_compatibility`,
+`ConsensusPeer::call_with_compatibility`, `ConsensusRpcHandler::compatibility`
+and `ConsensusRpcHandler::handle_with_compatibility`. Forwarding none selects
+legacy all-peer admission. Partial forwarding can prevent all engine traffic:
+a receiver rejects an unproved engine call when its reverse probe proves that
+the sender supports connection compatibility. Forward the configured peer
+returned by `with_compatibility` and preserve the actual connection's proof.
+
+Every configuration Vote, AppendEntries and InstallSnapshot, including each
+heartbeat, first sends an explicit compatibility `ReadBarrier` probe even on
+a modern connection. A receiver running the compatibility gate also
+reverse-probes calls without connection proof before engine dispatch. Between
+updated endpoints this adds one round trip on modern links and two on legacy
+links; old binaries retain their previous request path. Those probes share
+the existing engine-call deadline and grant no extra time for election,
+commitment or replication. The local probe reply only compares the profile
+and does not run a linearizable read.
+
+For a fixed three-voter set, rolling one voter at a time works in either
+direction while the retained membership and compatibility profile stay equal:
+
+| Running builds | Returning-voter admission | After admission |
+| --- | --- | --- |
+| Three new | Any two compatible voters suffice | Any compatible majority serves |
+| Two new, one old | The two new voters can admit while the old voter is absent; the old voter still requires all peers | An admitted new/old majority also serves |
+| One new, two old | All three must answer explicit probes; one new plus one old cannot use quorum admission | Any admitted compatible majority serves |
+| Three old | Existing all-peer admission | Existing majority operation |
+
+Unadmitted stores reject consumer reads and writes, including local committed
+projection/history reads. Admitted follower-local reads still use local applied
+state without a leader/read-index round. Failed admission needs no store
+replacement, volume cleanup or coordinated restart; the caller retries the
+same store as connectivity returns.
+
 The HA composition is:
 
 ```text

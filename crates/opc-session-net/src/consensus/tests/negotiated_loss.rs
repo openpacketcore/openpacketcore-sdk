@@ -44,6 +44,7 @@ impl Fixture {
         let (local, remote) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(local);
         let connection = ConsensusConnection {
+            compatibility: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -441,6 +442,7 @@ async fn verify_cold_bootstrap_preserves_negotiated_loss_backoff(
             write_frame(
                 &mut stream,
                 &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    compatibility: None,
                     transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                     contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                     identity: hello.identity,

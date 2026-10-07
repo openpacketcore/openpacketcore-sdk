@@ -15,8 +15,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use opc_consensus::{
-    ConsensusIdentity, ConsensusRpcFamily, DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
-    DURABLE_CONSENSUS_TIMING_PROFILE,
+    ConsensusCallResponse, ConsensusCompatibility, ConsensusIdentity, ConsensusRpcFamily,
+    DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_redaction::metrics::METRICS;
 use opc_session_store::{
@@ -43,9 +43,10 @@ use crate::protocol::{
     write_frame_bounded_until_cancellable, SessionConsensusBootstrapAck,
     SessionConsensusBootstrapHello, SessionConsensusBootstrapRequest,
     SessionConsensusBootstrapResponse, SessionConsensusTransportRequest,
-    SessionConsensusTransportResponse, CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
-    MAX_HANDSHAKE_FRAME_SIZE, MAX_NEGOTIATED_FRAME_SIZE, MIN_SESSION_CONSENSUS_FRAME_SIZE,
-    SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
+    SessionConsensusTransportResponse, CONSENSUS_COMPATIBILITY_ALPN,
+    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, MAX_HANDSHAKE_FRAME_SIZE,
+    MAX_NEGOTIATED_FRAME_SIZE, MIN_SESSION_CONSENSUS_FRAME_SIZE, SESSION_CONSENSUS_ALPN,
+    SESSION_CONSENSUS_TRANSPORT_REVISION,
 };
 
 const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
@@ -188,17 +189,33 @@ impl fmt::Debug for ConsensusTarget {
     }
 }
 
-fn consensus_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
+fn consensus_client_tls_config(
+    config: Arc<opc_tls::ClientConfig>,
+    compatibility: bool,
+) -> Arc<opc_tls::ClientConfig> {
     let mut config = config.as_ref().clone();
     config.alpn_protocols = vec![SESSION_CONSENSUS_ALPN.to_vec()];
+    if compatibility {
+        config
+            .alpn_protocols
+            .insert(0, CONSENSUS_COMPATIBILITY_ALPN.to_vec());
+    }
     config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     config.enable_early_data = false;
     Arc::new(config)
 }
 
-fn consensus_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
+fn consensus_server_tls_config(
+    config: Arc<opc_tls::ServerConfig>,
+    compatibility: bool,
+) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
     config.alpn_protocols = vec![SESSION_CONSENSUS_ALPN.to_vec()];
+    if compatibility {
+        config
+            .alpn_protocols
+            .insert(0, CONSENSUS_COMPATIBILITY_ALPN.to_vec());
+    }
     config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
     config.ticketer = Arc::new(DisabledSessionTickets);
     config.send_tls13_tickets = 0;
@@ -350,6 +367,7 @@ async fn wait_consensus_material_epoch_change(
 }
 
 struct ConsensusConnection {
+    compatibility: Option<ConsensusCompatibility>,
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     response_frame_size: usize,
@@ -1277,6 +1295,7 @@ async fn reap_cached_consensus_connection(
 
 #[derive(Clone)]
 struct ConsensusColdConnector {
+    compatibility: Option<ConsensusCompatibility>,
     target: ConsensusTarget,
     tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
@@ -1318,15 +1337,22 @@ impl ConsensusColdConnector {
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
                         configure_consensus_tcp_socket(&tcp)
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                        let tls_connector = tokio_rustls::TlsConnector::from(
-                            consensus_client_tls_config(attempt.rustls_config()),
-                        );
+                        let tls_connector =
+                            tokio_rustls::TlsConnector::from(consensus_client_tls_config(
+                                attempt.rustls_config(),
+                                connector.compatibility.is_some(),
+                            ));
                         let server_name = connector.target.tls_server_name(addr)?;
                         let tls_stream = tls_connector
                             .connect(server_name, tcp)
                             .await
                             .map_err(map_tls_connect_error)?;
-                        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
+                        let compatibility_extension = tls_stream.get_ref().1.alpn_protocol()
+                            == Some(CONSENSUS_COMPATIBILITY_ALPN);
+                        if !compatibility_extension
+                            && tls_stream.get_ref().1.alpn_protocol()
+                                != Some(SESSION_CONSENSUS_ALPN)
+                        {
                             return Err(SessionConsensusPeerError::Protocol);
                         }
                         let peer = opc_tls::peer_tls_identity_from_client_connection(
@@ -1360,8 +1386,8 @@ impl ConsensusColdConnector {
                         )
                         .map_err(|_| SessionConsensusPeerError::Protocol)?;
                         let (mut reader, mut writer) = tokio::io::split(tls_stream);
-                        let (response_frame_size, request_frame_size) = connector
-                            .bootstrap(&mut reader, &mut writer, deadline)
+                        let (response_frame_size, request_frame_size, compatibility) = connector
+                            .bootstrap(&mut reader, &mut writer, deadline, compatibility_extension)
                             .await?;
                         Ok::<_, SessionConsensusPeerError>((
                             Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
@@ -1370,6 +1396,7 @@ impl ConsensusColdConnector {
                             request_frame_size,
                             tls_completed_at,
                             lifecycle,
+                            compatibility,
                         ))
                     }
                 })
@@ -1392,9 +1419,11 @@ impl ConsensusColdConnector {
                 request_frame_size,
                 tls_completed_at,
                 lifecycle,
+                compatibility,
             ) = parts;
             return Ok(ConsensusConnection {
                 reader,
+                compatibility,
                 writer,
                 response_frame_size,
                 request_frame_size,
@@ -1416,10 +1445,12 @@ impl ConsensusColdConnector {
         configure_consensus_tcp_socket(&tcp).map_err(|_| SessionConsensusPeerError::Unavailable)?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let established_at = tokio::time::Instant::now();
-        let (response_frame_size, request_frame_size) =
-            self.bootstrap(&mut reader, &mut writer, deadline).await?;
+        let (response_frame_size, request_frame_size, compatibility) = self
+            .bootstrap(&mut reader, &mut writer, deadline, false)
+            .await?;
         Ok(ConsensusConnection {
             reader: Box::new(reader),
+            compatibility,
             writer: Box::new(writer),
             response_frame_size,
             request_frame_size,
@@ -1443,7 +1474,8 @@ impl ConsensusColdConnector {
         reader: &mut R,
         writer: &mut W,
         deadline: tokio::time::Instant,
-    ) -> Result<(usize, usize), SessionConsensusPeerError>
+        compatibility_extension: bool,
+    ) -> Result<(usize, usize, Option<ConsensusCompatibility>), SessionConsensusPeerError>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -1452,6 +1484,11 @@ impl ConsensusColdConnector {
         let requested_frame_size = checked_wire_frame_size(self.max_frame_size)
             .map_err(|_| SessionConsensusPeerError::Protocol)?;
         let hello = SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+            compatibility: if compatibility_extension {
+                self.compatibility
+            } else {
+                None
+            },
             transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
             contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
             sender_replica_id: self.binding.local_replica_id().as_str().to_owned(),
@@ -1478,6 +1515,13 @@ impl ConsensusColdConnector {
             || ack.server_node_id != self.binding.remote_consensus_node_id()
             || ack.accepted_sender_node_id != self.binding.local_consensus_node_id()
             || ack.handshake_nonce != nonce
+            || ack.compatibility
+                != (if compatibility_extension {
+                    self.compatibility
+                } else {
+                    None
+                })
+            || (compatibility_extension && ack.compatibility.is_none())
         {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
@@ -1492,7 +1536,7 @@ impl ConsensusColdConnector {
         {
             return Err(SessionConsensusPeerError::Protocol);
         }
-        Ok((response_frame_size, request_frame_size))
+        Ok((response_frame_size, request_frame_size, ack.compatibility))
     }
 }
 
@@ -1926,6 +1970,7 @@ async fn monitor_staged_consensus_connection(
 /// Authenticated outbound peer implementing only the session consensus port.
 #[derive(Clone)]
 pub struct RemoteSessionConsensusPeer {
+    compatibility: Option<ConsensusCompatibility>,
     target: ConsensusTarget,
     tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
@@ -2046,6 +2091,7 @@ impl RemoteSessionConsensusPeer {
         let lifecycle_policy = ConnectionLifecyclePolicy::default();
         Self {
             target,
+            compatibility: None,
             tls_config,
             binding,
             deadline_policy: ConsensusDeadlinePolicy::from_override(deadline),
@@ -2094,6 +2140,7 @@ impl RemoteSessionConsensusPeer {
 
     fn cold_connector(&self) -> ConsensusColdConnector {
         ConsensusColdConnector {
+            compatibility: self.compatibility,
             target: self.target.clone(),
             tls_config: self.tls_config.clone(),
             binding: self.binding.clone(),
@@ -2526,8 +2573,9 @@ impl RemoteSessionConsensusPeer {
         &self,
         connection_slot: &mut Option<ConsensusConnection>,
         request: SessionConsensusWireRequest,
+        required: Option<ConsensusCompatibility>,
         deadline: tokio::time::Instant,
-    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+    ) -> Result<ConsensusCallResponse, SessionConsensusPeerError> {
         checked_wire_frame_size(self.max_frame_size)
             .map_err(|_| SessionConsensusPeerError::Protocol)?;
         if self.max_frame_size < MIN_SESSION_CONSENSUS_FRAME_SIZE {
@@ -2550,6 +2598,13 @@ impl RemoteSessionConsensusPeer {
             if self.connection_is_current(&mut connection, now)
                 && !self.connection_idle_reuse_expired(&connection, now)
             {
+                let compatibility = connection.compatibility;
+                if required.is_some() && required != compatibility {
+                    // No request bytes were sent; this legacy lane is still
+                    // usable for an explicit compatibility probe.
+                    *connection_slot = Some(connection);
+                    return Err(SessionConsensusPeerError::ScopeMismatch);
+                }
                 // Sample no later than request dispatch, then commit only
                 // after a complete correlated and payload-validated response.
                 // A failed/cancelled write never refreshes this idle epoch.
@@ -2579,7 +2634,10 @@ impl RemoteSessionConsensusPeer {
                         .await;
                     }
                 }
-                return result;
+                return result.map(|response| ConsensusCallResponse {
+                    response,
+                    compatibility,
+                });
             }
             if let Some(reason) = connection.lifecycle.retirement(now) {
                 let epoch = self.connection_epoch(&connection);
@@ -2653,6 +2711,11 @@ impl RemoteSessionConsensusPeer {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(SessionConsensusPeerError::Unavailable);
         }
+        let compatibility = connection.compatibility;
+        if required.is_some() && required != compatibility {
+            *connection_slot = Some(connection);
+            return Err(SessionConsensusPeerError::ScopeMismatch);
+        }
         let dispatched_at = tokio::time::Instant::now();
         let result = self
             .call_negotiated(&mut connection, request, deadline)
@@ -2679,7 +2742,10 @@ impl RemoteSessionConsensusPeer {
                 .await;
             }
         }
-        result
+        result.map(|response| ConsensusCallResponse {
+            response,
+            compatibility,
+        })
     }
 
     async fn call_with_timeout_inner(
@@ -2687,6 +2753,17 @@ impl RemoteSessionConsensusPeer {
         request: SessionConsensusWireRequest,
         call_timeout: Duration,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        self.call_with_compatibility_inner(request, None, call_timeout)
+            .await
+            .map(|reply| reply.response)
+    }
+
+    async fn call_with_compatibility_inner(
+        &self,
+        request: SessionConsensusWireRequest,
+        required: Option<ConsensusCompatibility>,
+        call_timeout: Duration,
+    ) -> Result<ConsensusCallResponse, SessionConsensusPeerError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(call_timeout)
             .ok_or(SessionConsensusPeerError::Protocol)?;
@@ -2699,7 +2776,9 @@ impl RemoteSessionConsensusPeer {
         let mut slot = tokio::time::timeout_at(deadline, self.connection_pool.acquire())
             .await
             .map_err(|_| SessionConsensusPeerError::Timeout)?;
-        let result = self.call_once(slot.connection(), request, deadline).await;
+        let result = self
+            .call_once(slot.connection(), request, required, deadline)
+            .await;
         if slot.connection.is_some() {
             self.connection_pool.ensure_cached_connection_reaper(
                 slot.lane,
@@ -2895,6 +2974,27 @@ fn consensus_response_allows_connection_reuse(response: &SessionConsensusWireRes
 
 #[async_trait]
 impl SessionConsensusPeer for RemoteSessionConsensusPeer {
+    fn with_compatibility(
+        &self,
+        compatibility: ConsensusCompatibility,
+    ) -> Option<Arc<dyn SessionConsensusPeer>> {
+        let mut peer = self.clone();
+        peer.compatibility = Some(compatibility);
+        peer.connection_pool = Arc::new(ConsensusConnectionPool::new(self.lifecycle_policy));
+        Some(Arc::new(peer))
+    }
+
+    async fn call_with_compatibility(
+        &self,
+        request: SessionConsensusWireRequest,
+        required: Option<ConsensusCompatibility>,
+        timeout: Duration,
+    ) -> Result<ConsensusCallResponse, SessionConsensusPeerError> {
+        let call_timeout = timeout.min(self.deadline_policy.for_family(request.family));
+        self.call_with_compatibility_inner(request, required, call_timeout)
+            .await
+    }
+
     fn node_id(&self) -> SessionConsensusNodeId {
         self.binding.remote_consensus_node_id()
     }
@@ -3360,6 +3460,7 @@ enum ConnectionPeerIdentity {
 }
 
 struct PendingConsensusLifecycle {
+    compatibility_extension: bool,
     handshake: Option<opc_tls::TlsServerHandshake>,
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
     local_certificate_expiry: Option<CertificateExpiryEvidence>,
@@ -3379,6 +3480,7 @@ impl PendingConsensusLifecycle {
     fn insecure(generation: u64) -> Self {
         Self {
             handshake: None,
+            compatibility_extension: false,
             tls_config: None,
             local_certificate_expiry: None,
             peer_certificate_expiry: None,
@@ -3541,15 +3643,21 @@ async fn handle_consensus_connection(
         let handshake = tls_config
             .begin_handshake()
             .map_err(|_| ProtocolError::Authentication)?;
-        let acceptor =
-            tokio_rustls::TlsAcceptor::from(consensus_server_tls_config(handshake.rustls_config()));
+        let acceptor = tokio_rustls::TlsAcceptor::from(consensus_server_tls_config(
+            handshake.rustls_config(),
+            handler.compatibility().is_some(),
+        ));
         let tls_stream = tokio::time::timeout_at(setup_deadline, acceptor.accept(stream))
             .await
             .map_err(|_| consensus_setup_timeout_error())?
             .map_err(classify_tls_io_error)?;
         let tls_completion = TlsCompletionTime::now();
         let established_at = tls_completion.instant();
-        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
+        let compatibility_extension =
+            tls_stream.get_ref().1.alpn_protocol() == Some(CONSENSUS_COMPATIBILITY_ALPN);
+        if !compatibility_extension
+            && tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN)
+        {
             return Err(ProtocolError::UnexpectedResponse);
         }
         let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
@@ -3570,6 +3678,7 @@ async fn handle_consensus_connection(
             &mut writer,
             ConnectionPeerIdentity::Authenticated(peer.spiffe_id().clone()),
             PendingConsensusLifecycle {
+                compatibility_extension,
                 handshake: Some(handshake),
                 tls_config: Some(tls_config),
                 local_certificate_expiry: Some(local_certificate_expiry),
@@ -3808,6 +3917,33 @@ where
         }
     };
     let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+    let compatibility = if pending_lifecycle.compatibility_extension {
+        match (hello.compatibility, handler.compatibility()) {
+            (Some(offered), Some(local)) if offered == local => Some(local),
+            _ => {
+                reject_consensus_bootstrap(
+                    writer,
+                    SessionConsensusPeerError::ScopeMismatch,
+                    setup_deadline,
+                    server_cancellation,
+                )
+                .await?;
+                return Err(ProtocolError::ContractMismatch);
+            }
+        }
+    } else {
+        if hello.compatibility.is_some() {
+            reject_consensus_bootstrap(
+                writer,
+                SessionConsensusPeerError::Protocol,
+                setup_deadline,
+                server_cancellation,
+            )
+            .await?;
+            return Err(ProtocolError::ContractMismatch);
+        }
+        None
+    };
     if hello.transport_revision != SESSION_CONSENSUS_TRANSPORT_REVISION
         || !hello.contract_profile.is_current()
     {
@@ -3978,6 +4114,7 @@ where
         connection_cancellation.clone(),
     );
     let accepted = SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+        compatibility,
         transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
         contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
         identity: binding.consensus_identity(),
@@ -4156,7 +4293,13 @@ where
                         let mut handler_task = tokio::spawn(async move {
                             let _membership_lease = membership_lease;
                             let _execution_permit = execution_permit;
-                            handler.handle(authenticated_sender, request).await
+                            handler
+                                .handle_with_compatibility(
+                                    authenticated_sender,
+                                    request,
+                                    compatibility,
+                                )
+                                .await
                         });
                         let handled = tokio::select! {
                             biased;
@@ -4521,6 +4664,7 @@ mod tests {
         write_frame(
             &mut client,
             &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                compatibility: None,
                 transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                 contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                 sender_replica_id: client_binding.local_replica_id().as_str().to_owned(),
@@ -4871,6 +5015,7 @@ mod tests {
             write_frame(
                 &mut tcp,
                 &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    compatibility: None,
                     transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                     contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                     identity: hello.identity,
@@ -5070,6 +5215,7 @@ mod tests {
             write_frame(
                 &mut tcp,
                 &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    compatibility: None,
                     transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                     contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                     identity: hello.identity,
@@ -5288,6 +5434,7 @@ mod tests {
         )
         .expect("deadline publication connection lifecycle");
         let connection = Box::new(ConsensusConnection {
+            compatibility: None,
             reader: Box::new(tokio::io::empty()),
             writer: Box::new(tokio::io::sink()),
             response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
@@ -5340,6 +5487,7 @@ mod tests {
         .expect("publication-race lifecycle policy");
         let connection = |established_at| {
             Box::new(ConsensusConnection {
+                compatibility: None,
                 reader: Box::new(tokio::io::empty()),
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
@@ -6332,6 +6480,7 @@ mod tests {
                 remote_retirement_probe: false,
             };
             let connection = Box::new(ConsensusConnection {
+                compatibility: None,
                 reader: Box::new(tokio::io::empty()),
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
@@ -6587,6 +6736,7 @@ mod tests {
             attempt_id,
             epoch: staged_epoch,
             connection: Box::new(ConsensusConnection {
+                compatibility: None,
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6652,6 +6802,7 @@ mod tests {
             attempt_id,
             epoch: staged_epoch,
             connection: Box::new(ConsensusConnection {
+                compatibility: None,
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6711,6 +6862,7 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = ConsensusConnection {
+            compatibility: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6769,6 +6921,7 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = ConsensusConnection {
+            compatibility: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6826,6 +6979,7 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = ConsensusConnection {
+            compatibility: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -7452,6 +7606,7 @@ mod tests {
         write_frame(
             &mut bytes,
             &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                compatibility: None,
                 transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                 contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                 sender_replica_id: binding.local_replica_id().as_str().to_owned(),
@@ -7888,6 +8043,7 @@ mod tests {
             .expect("capture pre-rotation consensus material");
         let established_at = tokio::time::Instant::now();
         let pending = PendingConsensusLifecycle {
+            compatibility_extension: false,
             handshake: Some(handshake),
             tls_config: Some(tls_config),
             local_certificate_expiry: None,
@@ -7991,6 +8147,7 @@ mod tests {
         write_frame(
             &mut stream,
             &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                compatibility: None,
                 transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                 contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                 sender_replica_id: binding.local_replica_id().as_str().to_owned(),
@@ -8011,6 +8168,7 @@ mod tests {
         assert!(matches!(
             response,
             SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                compatibility: None,
                 handshake_nonce,
                 ..
             }) if handshake_nonce == nonce
@@ -8066,6 +8224,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        compatibility: None,
                         transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                         contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                         identity: hello.identity,
@@ -8151,6 +8310,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        compatibility: None,
                         transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                         contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                         identity: hello.identity,
@@ -8545,6 +8705,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        compatibility: None,
                         transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
                         contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
                         identity: hello.identity,
@@ -8667,6 +8828,7 @@ mod tests {
             write_frame(
                 &mut stream,
                 &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                    compatibility: None,
                     transport_revision,
                     contract_profile,
                     sender_replica_id: client_binding.local_replica_id().as_str().to_owned(),
@@ -8727,6 +8889,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        compatibility: None,
                         transport_revision,
                         contract_profile,
                         identity: hello.identity,
@@ -9299,6 +9462,7 @@ mod tests {
         {
             let mut primary = pool.primary.connection.lock().await;
             *primary = Some(ConsensusConnection {
+                compatibility: None,
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -9333,6 +9497,7 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         ConsensusConnection {
+            compatibility: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,

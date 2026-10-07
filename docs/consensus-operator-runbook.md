@@ -94,20 +94,39 @@ For each node:
    (or `open_with_operation_timeout`).
 2. Install `ConsensusConfigStore::rpc_handler()` on the authenticated shared
    consensus listener before cluster initialization.
-3. Make all configured peer routes reachable.
+3. On first formation, make all configured peer routes reachable. Returning
+   voters with retained membership can re-admit with a compatible majority,
+   including the local voter, when both endpoints of each counted link use the
+   negotiated mTLS compatibility extension. Plaintext and legacy peers never
+   count as connection-proved voters; without a verified majority, every
+   configured peer must answer an explicit compatibility probe.
 4. Call `initialize_cluster()` on every node. Concurrent calls are supported.
    On clean first formation only the canonical lowest stable node ID invokes
    Openraft initialization; other pristine nodes wait for its exact membership
    to replicate. Nodes reopening persisted Openraft state skip bootstrap and
    re-admit normally, including a noncanonical persistent majority. Clean
    first formation fails closed if the canonical node is absent; do not
-   designate a substitute initializer under the same topology epoch.
+   designate a substitute initializer under the same topology epoch. If no
+   compatible majority is available and no peer has proved incompatible,
+   returning admission reports `CompatibleQuorumUnavailable`. A known mismatch
+   without a verified majority retains `ClusterFormationRejected`, including
+   when another peer is absent. An absent or replacement peer is verified when
+   it connects; an incompatible minority cannot stop an admitted compatible
+   majority from serving.
 5. Keep the node out of traffic readiness until
    `probe_durable_readiness()` succeeds.
 
 `initialize_cluster` and every operation fail closed if durable identity,
 peer coverage, membership, or engine state does not match. Do not repair an
 identity mismatch by editing SQLite rows.
+
+Until admission, public reads and writes are unavailable, including local
+committed latest/history/floor/watch reads. After a failed admission attempt,
+the application's startup/recovery loop calls `initialize_cluster` again on
+the same open store when connectivity returns. The SDK does not schedule that
+retry. No store replacement, volume cleanup or coordinated restart is needed.
+Keep traffic readiness tied to `probe_durable_readiness`, including during
+one-at-a-time upgrades and rollbacks that use the legacy all-peer fallback.
 
 ### 2.3 Readiness and operation deadlines
 
@@ -118,6 +137,16 @@ Each forwarded mutation/read barrier carries the remaining caller budget, and
 the receiver uses the lesser of that remainder and its local cap. A route or
 receiver never starts a fresh full operation timeout. Each shared transport
 call also has its transport-owned complete deadline within that operation.
+
+Every configuration engine RPC (Vote, AppendEntries and InstallSnapshot,
+including heartbeats) first pays for an explicit compatibility `ReadBarrier`
+probe, even on a connection that already negotiated compatibility. A receiver
+running the compatibility gate adds a reverse probe for calls without
+connection proof. Between updated endpoints this adds one round trip on modern
+links and two on legacy links; old binaries retain their previous request path.
+These probes share the same engine-call budget; the probe's local profile
+comparison does not perform a linearizable read. Allow for this traffic and
+latency when assessing the fixed transport bounds below.
 
 The production transport profile is fixed, not operator-tunable:
 
