@@ -2441,13 +2441,26 @@ pub(crate) enum LiveTerminalRecoveryHandoffState {
 pub(crate) struct LiveTerminalRecoveryHandoffGate {
     snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    serving_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
 }
 
-/// A cancelled integrity worker must keep the single snapshot transaction
-/// and namespace lease until its last descriptor read has completed.
+/// A cancelled integrity worker retains exactly the ownership needed by its
+/// descriptor: the mutation transaction for unpublished work, or publication
+/// exclusion for admission of the already-published snapshot.
+#[derive(Clone)]
+enum SnapshotIntegrityGate {
+    Mutation {
+        _guard: LiveTerminalRecoveryHandoffGate,
+    },
+    Serving {
+        _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    },
+}
+
+/// Keep descriptor ownership and the namespace lease through detached work.
 #[derive(Clone)]
 struct SnapshotIntegrityWork {
-    _gate: LiveTerminalRecoveryHandoffGate,
+    _gate: SnapshotIntegrityGate,
     _lease: Arc<SnapshotDirectoryLease>,
 }
 
@@ -2712,12 +2725,26 @@ impl LiveTerminalRecoveryHandoffConsumer {
     pub(crate) async fn acquire_gate(
         &self,
     ) -> Result<LiveTerminalRecoveryHandoffGate, SessionConsensusStorageError> {
+        let mut gate = self.acquire_worker_gate().await;
+        gate.serving_guard = Some(Arc::new(
+            Arc::clone(&self.core.snapshot_serving_gate)
+                .lock_owned()
+                .await,
+        ));
+        Ok(gate)
+    }
+
+    /// Only a builder can defer publication exclusion until its offline
+    /// work is complete. The full mutation gate still excludes another
+    /// builder, installation, or recovery transaction throughout that work.
+    async fn acquire_worker_gate(&self) -> LiveTerminalRecoveryHandoffGate {
         let snapshot_gate = Arc::clone(&self.core.snapshot_gate);
         let guard = Arc::clone(&snapshot_gate).lock_owned().await;
-        Ok(LiveTerminalRecoveryHandoffGate {
+        LiveTerminalRecoveryHandoffGate {
             snapshot_gate,
             _guard: Arc::new(guard),
-        })
+            serving_guard: None,
+        }
     }
 
     /// Reconcile the recovery sidecar observed by this already-open core.
@@ -2787,7 +2814,9 @@ impl LiveTerminalRecoveryHandoffConsumer {
             wal.validate_application_cache(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
         }
-        if !Arc::ptr_eq(&self.core.snapshot_gate, &gate.snapshot_gate) {
+        if !Arc::ptr_eq(&self.core.snapshot_gate, &gate.snapshot_gate)
+            || gate.serving_guard.is_none()
+        {
             return Err(SessionConsensusStorageError::CorruptState);
         }
         // Current-snapshot selection, descriptor admission, terminal
@@ -2862,7 +2891,9 @@ impl LiveTerminalRecoveryHandoffConsumer {
         gate: &LiveTerminalRecoveryHandoffGate,
     ) -> Result<tokio::sync::OwnedMutexGuard<rusqlite::Connection>, SessionConsensusStorageError>
     {
-        if !Arc::ptr_eq(&self.core.snapshot_gate, &gate.snapshot_gate) {
+        if !Arc::ptr_eq(&self.core.snapshot_gate, &gate.snapshot_gate)
+            || gate.serving_guard.is_none()
+        {
             return Err(SessionConsensusStorageError::CorruptState);
         }
         let core = self.core.clone();
@@ -5441,20 +5472,15 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
-        // Selection, descriptor admission and handoff share the builder's
-        // transaction gate. Otherwise a legitimate successor can retire the
-        // selected inode while its original integrity checks are running.
-        let consumer = LiveTerminalRecoveryHandoffConsumer::from_live_snapshot_owner(
-            &self.core,
-            &self._snapshot_directory_lease,
+        // Openraft processes GetSnapshot on the same worker as Apply. Admit
+        // the current descriptor under publication exclusion, without waiting
+        // for an unpublished successor's offline capture or verification.
+        // Publication cannot retire the selected inode during these checks.
+        let serving_guard = Arc::new(
+            Arc::clone(&self.core.snapshot_serving_gate)
+                .lock_owned()
+                .await,
         );
-        let snapshot_guard = consumer.acquire_gate().await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(None),
-                ErrorVerb::Read,
-                io::Error::other(error),
-            )
-        })?;
         let current = self
             .core
             .read_current_snapshot_for_serving()
@@ -5500,7 +5526,9 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     expected_checksum,
                     expected_length,
                     Some(SnapshotIntegrityWork {
-                        _gate: snapshot_guard.clone(),
+                        _gate: SnapshotIntegrityGate::Serving {
+                            _guard: Arc::clone(&serving_guard),
+                        },
                         _lease: Arc::clone(&self._snapshot_directory_lease),
                     }),
                 )
@@ -5627,7 +5655,9 @@ impl SqliteConsensusStateMachine {
                 )
             })?;
         let integrity_work = SnapshotIntegrityWork {
-            _gate: snapshot_gate.clone(),
+            _gate: SnapshotIntegrityGate::Mutation {
+                _guard: snapshot_gate.clone(),
+            },
             _lease: Arc::clone(&self._snapshot_directory_lease),
         };
         reject_indeterminate_snapshot_publication(&self.core).map_err(|error| {
@@ -6702,22 +6732,15 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             &self.core,
             &self._snapshot_directory_lease,
         );
-        let snapshot_guard = live_terminal_consumer
-            .acquire_gate()
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(None),
-                    ErrorVerb::Write,
-                    io::Error::other(error),
-                )
-            })?;
+        let snapshot_guard = live_terminal_consumer.acquire_worker_gate().await;
         #[cfg(feature = "test-control")]
         self.core
             .snapshot_observation
             .record_phase_for_test("validating_directory");
         let integrity_work = SnapshotIntegrityWork {
-            _gate: snapshot_guard.clone(),
+            _gate: SnapshotIntegrityGate::Mutation {
+                _guard: snapshot_guard.clone(),
+            },
             _lease: Arc::clone(&self._snapshot_directory_lease),
         };
         reject_indeterminate_snapshot_publication(&self.core).map_err(|error| {
@@ -7166,6 +7189,12 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         self.core
             .snapshot_observation
             .record_phase_for_test("waiting_publication_connection");
+        let mut snapshot_guard = snapshot_guard;
+        snapshot_guard.serving_guard = Some(Arc::new(
+            Arc::clone(&self.core.snapshot_serving_gate)
+                .lock_owned()
+                .await,
+        ));
         let prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let conn = live_terminal_consumer
             .acquire_publication_connection(&snapshot_guard)
@@ -7293,6 +7322,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     )
                 })?;
         }
+        // The new current descriptor is durable and its predecessor retired.
+        // Returning a stream need not exclude another admission of that same
+        // immutable current descriptor while the builder prepares its result.
+        drop(snapshot_guard.serving_guard.take());
         #[cfg(feature = "test-control")]
         self.core
             .snapshot_observation
@@ -16501,6 +16534,139 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_current_snapshot_remains_available_during_successor_build() {
+        current_snapshot_remains_available_during_successor_build(true).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_current_snapshot_remains_available_during_successor_build() {
+        current_snapshot_remains_available_during_successor_build(false).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn current_snapshot_remains_available_during_successor_build(native: bool) {
+        use consensus::wal::integration::PrivateWalTest;
+
+        for policy in [
+            SnapshotIntegrityPolicy::FsVerity,
+            SnapshotIntegrityPolicy::PortableVerified,
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            let (mut log, mut machine, backend, token) = if native {
+                let token = Arc::new(PrivateWalTest::new_native(
+                    directory.path().join("wal"),
+                    [0xA8; 32],
+                ));
+                let (backend, log, machine) = Box::pin(open_private_snapshot_store_with_integrity(
+                    &directory,
+                    Arc::clone(&token),
+                    policy,
+                ))
+                .await
+                .expect("open native snapshot serving owner");
+                (log, machine, Some(backend), Some(token))
+            } else {
+                let (log, machine, _) =
+                    open_fixed_raw_read_store_with_integrity(&directory, None, policy).await;
+                (log, machine, None, None)
+            };
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry()],
+                "snapshot serving predecessor membership",
+            )
+            .await;
+            let mut predecessor = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .expect("publish predecessor");
+            let predecessor_meta = predecessor.meta.clone();
+            let predecessor_path = predecessor.snapshot.path().to_path_buf();
+            let mut predecessor_bytes = Vec::new();
+            predecessor
+                .snapshot
+                .read_to_end(&mut predecessor_bytes)
+                .await
+                .expect("read predecessor bytes");
+            drop(predecessor);
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [blank_entry(1)],
+                "successor snapshot cut",
+            )
+            .await;
+
+            let gate = Arc::new(SnapshotArtifactGate::new());
+            gate.arm();
+            let hook_directory =
+                snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease);
+            // This boundary is builder-only. The descriptor-scan gate also
+            // runs for the existing predecessor and would pause the reader
+            // itself instead of testing its independence from construction.
+            let _gate_guard =
+                FixedPrepublicationVerifyGateGuard::install(hook_directory, Arc::clone(&gate));
+            let mut builder = machine.get_snapshot_builder().await;
+            let build = tokio::spawn(async move { builder.build_snapshot().await });
+            tokio::time::timeout(SNAPSHOT_APPLY_WAIT, gate.wait_started())
+                .await
+                .expect("successor is verified but not yet published");
+
+            let served =
+                tokio::time::timeout(SNAPSHOT_APPLY_WAIT, machine.get_current_snapshot()).await;
+            let build_remained_held = !build.is_finished();
+            let applied = tokio::time::timeout(
+                SNAPSHOT_APPLY_WAIT,
+                append_commit_and_apply(
+                    &mut log,
+                    &mut machine,
+                    [blank_entry(2)],
+                    "apply after concurrent snapshot retrieval",
+                ),
+            )
+            .await;
+            // Release and join on RED too, before any result assertion can
+            // drop the filesystem still owned by the builder.
+            gate.release();
+            let successor = tokio::time::timeout(SNAPSHOT_APPLY_WAIT, build)
+                .await
+                .expect("successor finishes after release")
+                .expect("join successor")
+                .expect("publish successor");
+            let mut served = served
+                .expect("current snapshot admission does not wait for successor construction")
+                .expect("admit the original current descriptor")
+                .expect("the published predecessor remains available");
+            assert_eq!(served.meta, predecessor_meta, "native={native} {policy:?}");
+            assert!(build_remained_held, "successor remains deliberately held");
+            applied.expect("application progresses after retrieval while construction is held");
+            assert_eq!(successor.meta.last_log_id, Some(log_id(1)));
+            assert!(!predecessor_path.exists(), "predecessor is retired");
+            let mut served_bytes = Vec::new();
+            served
+                .snapshot
+                .read_to_end(&mut served_bytes)
+                .await
+                .expect("the admitted predecessor survives later retirement");
+            assert_eq!(served_bytes, predecessor_bytes);
+            assert_eq!(
+                machine.get_current_snapshot().await.unwrap().unwrap().meta,
+                successor.meta
+            );
+            assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(2)));
+            if let Some(token) = token {
+                token.current().unwrap().shutdown().unwrap();
+            }
+            drop(backend);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
     async fn current_snapshot_admission_survives_concurrent_publication(native: bool) {
         use consensus::wal::integration::PrivateWalTest;
 
@@ -16667,18 +16833,20 @@ mod tests {
             .await
             .expect_err("cancel snapshot caller")
             .is_cancelled());
-        let worker_owns_snapshot = Arc::clone(&core.snapshot_gate).try_lock_owned().is_err();
+        let worker_owns_publication = Arc::clone(&core.snapshot_serving_gate)
+            .try_lock_owned()
+            .is_err();
         gate.release();
         let released = tokio::time::timeout(
             Duration::from_secs(5),
-            Arc::clone(&core.snapshot_gate).lock_owned(),
+            Arc::clone(&core.snapshot_serving_gate).lock_owned(),
         )
         .await
-        .expect("detached scan releases snapshot transaction after completion");
+        .expect("detached scan releases publication exclusion after completion");
         drop(released);
         assert!(
-            worker_owns_snapshot,
-            "cancelled admission must retain the snapshot transaction until its worker stops"
+            worker_owns_publication,
+            "cancelled admission must exclude publication until its worker stops"
         );
         assert_eq!(
             machine

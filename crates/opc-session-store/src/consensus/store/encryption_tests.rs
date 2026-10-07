@@ -1972,3 +1972,105 @@ async fn snapshot_capture_does_not_starve_three_voter_commits() {
     }));
     cluster.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_retrieval_during_capture_does_not_starve_three_voter_commits() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    struct ReleaseCapture(Arc<crate::sqlite::consensus::SnapshotCaptureGate>);
+    impl Drop for ReleaseCapture {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let leader = cluster.current_leader();
+    let store = &cluster.stores[leader];
+    let owner = OwnerId::new("snapshot-retrieval-progress-owner").expect("owner");
+    store
+        .acquire(
+            &snapshot_progress_key(100),
+            owner.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("public preload commits before the predecessor snapshot");
+    store
+        .inner
+        .raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("request the predecessor snapshot");
+    store
+        .inner
+        .raft
+        .wait(Some(CONSENSUS_READY_TIMEOUT))
+        .metrics(|metrics| metrics.snapshot.is_some(), "predecessor snapshot")
+        .await
+        .expect("predecessor snapshot is published");
+    let predecessor = store
+        .inner
+        .raft
+        .get_snapshot()
+        .await
+        .expect("read predecessor snapshot")
+        .expect("predecessor snapshot exists")
+        .meta;
+    store
+        .acquire(
+            &snapshot_progress_key(101),
+            owner.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("advance the state before the held successor capture");
+
+    let gate = cluster.backends[leader].snapshot_capture_gate();
+    let _release = ReleaseCapture(Arc::clone(&gate));
+    gate.arm();
+    store
+        .inner
+        .raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("request successor capture");
+    tokio::time::timeout(CONSENSUS_READY_TIMEOUT, gate.wait_started())
+        .await
+        .expect("successor capture holds its consistent source cut");
+
+    // Openraft routes snapshot retrieval and state-machine application through
+    // the same worker. Poll once to enqueue retrieval before the public write;
+    // no scheduler sleep decides whether the requests overlap the held build.
+    let mut retrieval = Box::pin(store.inner.raft.get_snapshot());
+    let first_poll = poll_fn(|cx| Poll::Ready(retrieval.as_mut().poll(cx))).await;
+    let write_result = tokio::time::timeout(
+        DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout(),
+        store.acquire(&snapshot_progress_key(102), owner, Duration::from_secs(30)),
+    )
+    .await;
+    gate.release();
+    let retrieved = match first_poll {
+        Poll::Ready(result) => result,
+        Poll::Pending => tokio::time::timeout(CONSENSUS_READY_TIMEOUT, retrieval)
+            .await
+            .expect("retrieval terminates after capture release"),
+    }
+    .expect("snapshot retrieval succeeds")
+    .expect("the published predecessor remains available");
+    let retrieved_cut = retrieved.meta.last_log_id;
+    drop(retrieved);
+    cluster.shutdown().await;
+
+    write_result
+        .expect("public proposal retains its original operation deadline during snapshot retrieval")
+        .expect("snapshot retrieval must not park committed writes behind successor capture");
+    assert_eq!(
+        retrieved_cut, predecessor.last_log_id,
+        "retrieval during capture serves the already-published predecessor"
+    );
+}

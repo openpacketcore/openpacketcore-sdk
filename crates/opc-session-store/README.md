@@ -1350,6 +1350,14 @@ at that absolute deadline. Completion alone never permits deleting unapplied
 history. Fences, lease credentials, application sequence, request outcomes,
 and logical time move together with the authoritative state-machine image.
 
+Snapshot retrieval can admit the published predecessor while a successor is
+captured and verified offline. It excludes publication and predecessor
+retirement until descriptor admission finishes, so Openraft's shared
+snapshot-retrieval/application worker does not wait for the entire build.
+Builds, installation and recovery still retain one exclusive mutation owner;
+cancelled admission workers retain publication exclusion through their last
+read. Snapshot integrity checks and operation deadlines are unchanged.
+
 The pinned Openraft implementation also retains the donor's required log
 suffix while a snapshot transfer owns it. Successful snapshot or log
 replication hands that suffix to the next transfer before a pending purge can

@@ -223,6 +223,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: serve the published snapshot during offline successor
+  construction so a recovering voter's snapshot request cannot block the
+  leader's committed writes behind that build. Publication, retirement,
+  descriptor integrity and cancelled-worker ownership remain serialized.
+  Part of #1005.
+
 - `opc-persist`: admit returning configuration voters with a majority whose
   compatibility is proved on authenticated connections, including the local
   voter. Reverify reconnects and reject incompatible engine traffic before

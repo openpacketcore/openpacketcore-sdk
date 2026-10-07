@@ -5843,6 +5843,10 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_publication_indeterminate: Arc<AtomicBool>,
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize current-snapshot admission with publication and retirement,
+    /// without waiting for an unpublished snapshot's offline construction.
+    /// Mutators acquire `snapshot_gate` before this gate, then `conn`.
+    pub(crate) snapshot_serving_gate: Arc<tokio::sync::Mutex<()>>,
     /// Bound the current receiver plus OpenRaft's transient replacement handle.
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
@@ -6619,6 +6623,7 @@ impl SqliteConsensusCore {
             // advertised profile rather than SQLite's standalone ceiling.
             caps: backend.consensus_capabilities(),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_serving_gate: Arc::new(tokio::sync::Mutex::new(())),
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::consensus::snapshot::SNAPSHOT_RECEIVER_SLOTS,
             )),
