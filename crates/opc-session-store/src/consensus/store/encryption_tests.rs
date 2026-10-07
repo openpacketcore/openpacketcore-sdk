@@ -1809,7 +1809,7 @@ async fn snapshot_capture_does_not_starve_three_voter_commits() {
     // Build a bounded, real three-voter state-machine image through the public
     // lease proposal API. Snapshot construction is then requested from the
     // same Openraft instance that owns the committed state.
-    for index in 0..64 {
+    for index in 0..63 {
         cluster.stores[leader]
             .acquire(
                 &snapshot_progress_key(index),
@@ -1828,8 +1828,25 @@ async fn snapshot_capture_does_not_starve_three_voter_commits() {
     assert!(before.iter().all(|status| {
         status.admitted && status.term == before_term && status.leader_id == Some(before_leader)
     }));
+    assert_eq!(
+        cluster.stores[leader].status().completed_snapshot_count,
+        0,
+        "the fixture has no completed snapshot before the held capture"
+    );
 
     let gate = cluster.backends[leader].snapshot_capture_gate();
+    let capture_phase = || {
+        #[cfg(feature = "test-control")]
+        {
+            cluster.backends[leader]
+                .snapshot_observation()
+                .phase_for_test()
+        }
+        #[cfg(not(feature = "test-control"))]
+        {
+            "unavailable without test-control"
+        }
+    };
     gate.arm();
     let snapshot_log = cluster.stores[leader]
         .inner
@@ -1838,6 +1855,17 @@ async fn snapshot_capture_does_not_starve_three_voter_commits() {
         .borrow()
         .last_applied
         .expect("bounded preload applied before snapshot");
+    // A public commit can return before Openraft flushes its applied metrics.
+    // Make that stale observation deterministic: complete the last preload
+    // after sampling the index, so the held capture must cover a later log.
+    cluster.stores[leader]
+        .acquire(
+            &snapshot_progress_key(63),
+            owner.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("last preload commits beyond the sampled snapshot index");
     cluster.stores[leader]
         .inner
         .raft
@@ -1864,16 +1892,79 @@ async fn snapshot_capture_does_not_starve_three_voter_commits() {
         .expect("public proposal remains within the existing operation deadline")
         .expect("public proposal commits while snapshot capture is held");
 
+    let snapshot_metrics = cluster.stores[leader]
+        .inner
+        .raft
+        .wait(Some(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout()))
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .is_some_and(|log_id| log_id.index >= snapshot_log.index)
+            },
+            "snapshot covers the sampled index after concurrent public commit",
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "held snapshot completes after release: {error}; capture phase: {}",
+                capture_phase()
+            )
+        });
+    // Only the held capture was requested. Check its durable publication,
+    // not just progress in the asynchronously reported snapshot metrics.
+    assert_eq!(
+        cluster.stores[leader].status().completed_snapshot_count,
+        1,
+        "the held capture completes offline finalization and durable publication"
+    );
+    let held_snapshot = tokio::time::timeout(
+        DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout(),
+        async {
+            cluster.stores[leader]
+                .inner
+                .raft
+                .get_snapshot()
+                .await
+                .expect("read the held capture's published outcome")
+                .expect("the held capture published a snapshot")
+        },
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "read held snapshot within the existing operation deadline: {error}; capture phase: {}",
+            capture_phase()
+        )
+    });
+    assert_eq!(held_snapshot.meta.last_log_id, snapshot_metrics.snapshot);
+    let held_index = held_snapshot
+        .meta
+        .last_log_id
+        .expect("the held capture names its cut")
+        .index;
+    assert!(
+        held_index > snapshot_log.index,
+        "the held capture includes the preload committed after sampling metrics"
+    );
+    // The commit made while the capture was held is the only later entry, so
+    // the applied index can pass the snapshot only if the capture excluded it.
     cluster.stores[leader]
         .inner
         .raft
         .wait(Some(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout()))
-        .snapshot(
-            snapshot_log,
-            "snapshot capture after concurrent public commit",
+        .applied_index_at_least(
+            Some(held_index.saturating_add(1)),
+            "held capture cut precedes the commit made while it was held",
         )
         .await
-        .expect("held snapshot completes after release");
+        .unwrap_or_else(|error| {
+            panic!(
+                "the held capture excludes the concurrent public commit: {error}; capture phase: {}",
+                capture_phase()
+            )
+        });
+    drop(held_snapshot);
     cluster.wait_all_ready().await;
     let after = cluster.statuses(&(0..REMOTE_ROTATION_MEMBER_COUNT).collect::<Vec<_>>());
     assert!(after.iter().all(|status| {
