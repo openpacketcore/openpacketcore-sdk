@@ -1,19 +1,22 @@
-//! RFC 6311 message-ID synchronization Notify wire primitives.
+//! RFC 6311 message-ID synchronization wire primitives and pure rules.
 //!
-//! These codecs do not authenticate a peer, negotiate support, admit a sync
-//! exchange, generate randomness, update counters, or authorize persistence or
-//! transmission. Use them only inside the appropriate protected exchange:
-//! support in IKE_AUTH, synchronization in a Message-ID-zero INFORMATIONAL.
-//! Both peers must advertise support before synchronization can be used; an
-//! IKE responder must not advertise unless the initiator offered it. A caller
-//! must implement the complete RFC 6311 section 5.1 exchange before advertising.
+//! Codecs validate shape only. [`Ikev2MessageIdSyncNegotiation`] accumulates
+//! offers across IKE_AUTH rounds; [`Ikev2MessageIdSyncAgreement`] evaluates
+//! Message-ID-zero INFORMATIONAL admission, nonce correlation and counter
+//! maxima. Both original IKE roles can initiate synchronization. Agreement,
+//! counter and pending-proposal values are pure inputs/results, not evidence
+//! of authentication, entropy, durable storage or permission to transmit.
+//! Callers must authenticate the header and opened payloads with the admitted
+//! IKE provider before applying rules. A complete runtime handler for both
+//! directions, including durable ordering, is required before advertising.
 //!
 //! Sync data is a four-octet nonce followed by two network-order counters,
 //! always relative to the **sender of this notification**. A request carries
 //! M1/P1; its response echoes the nonce and carries P2/M2. The nonce must be
 //! randomly generated for a new request and checked against its response; it
 //! is distinct from the encryption IV. This module preserves these values
-//! without deciding their freshness or whether a counter may be used.
+//! independently of the separate pure admission/counter rules. No helper here
+//! generates nonces, seals packets, persists effects or performs recovery.
 //!
 //! IPsec replay-counter synchronization is intentionally not implemented.
 //!
@@ -21,6 +24,15 @@
 //! @conformance boundary-only
 
 use std::{error::Error, fmt};
+
+mod counters;
+mod negotiation;
+
+pub use counters::{Ikev2MessageIdSyncCounters, Ikev2MessageIdSyncPending};
+pub use negotiation::{
+    Ikev2MessageIdSyncAgreement, Ikev2MessageIdSyncMode, Ikev2MessageIdSyncNegotiation,
+    Ikev2MessageIdSyncRole, Ikev2MessageIdSyncRuleError, Ikev2MessageIdSyncSa,
+};
 
 use crate::{
     ike_auth::Ikev2IkeAuthCleartextPayloads,
@@ -244,9 +256,10 @@ impl Ikev2IkeAuthCleartextPayloads<'_> {
     /// caller must authenticate IKE_AUTH and record both peers' offers before
     /// selecting synchronization. An absent peer offer requires ordinary
     /// base-IKE behavior. Other notifications remain in [`Self::notifies`].
-    /// A malformed or duplicate offer is not a valid offer: do not select
-    /// synchronization and, as responder, do not advertise it. The error is
-    /// diagnostic and is not by itself a reason to fail IKE_AUTH.
+    /// A malformed or duplicate offer is not a valid offer: it cannot select
+    /// synchronization or authorize responder advertisement. The diagnostic
+    /// does not fail IKE_AUTH or revoke valid evidence from an earlier round;
+    /// use [`Ikev2MessageIdSyncNegotiation`] to accumulate that evidence.
     ///
     /// # Errors
     ///

@@ -248,7 +248,10 @@ pub use message::{
 };
 pub use message_id_sync::{
     decode_ikev2_message_id_sync_notify, decode_ikev2_message_id_sync_supported_notify,
-    Ikev2MessageIdSync, Ikev2MessageIdSyncError, Ikev2MessageIdSyncSupported,
+    Ikev2MessageIdSync, Ikev2MessageIdSyncAgreement, Ikev2MessageIdSyncCounters,
+    Ikev2MessageIdSyncError, Ikev2MessageIdSyncMode, Ikev2MessageIdSyncNegotiation,
+    Ikev2MessageIdSyncPending, Ikev2MessageIdSyncRole, Ikev2MessageIdSyncRuleError,
+    Ikev2MessageIdSyncSa, Ikev2MessageIdSyncSupported,
 };
 pub use nat_detection::{
     evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,

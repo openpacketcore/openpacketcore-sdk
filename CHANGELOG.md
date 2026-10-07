@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: add pure RFC 6311 offer accumulation, immutable per-SA
+  recovery-mode selection and counter decisions, including pending proposals,
+  nonce correlation, strict replay drops and simultaneous-sync maxima. These
+  helpers do not authenticate, generate randomness, persist, send or recover
+  an SA; automatic advertisement and durable runtime handling remain separate.
+
 - `opc-proto-ikev2`: add RFC 6311 message-ID synchronization Notify codecs,
   canonical support/sync builders and strict IKE_AUTH support extraction.
   These opt-in wire primitives do not implement synchronization exchanges,
