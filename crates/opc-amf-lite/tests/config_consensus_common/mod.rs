@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opc_consensus::engine::raft::{VoteRequest, VoteResponse};
 use opc_consensus::{
     ConsensusPeer, ConsensusPeerError, ConsensusRpcHandler, ConsensusWireRequest,
     ConsensusWireResponse, DURABLE_CONSENSUS_TIMING_PROFILE,
@@ -20,10 +21,10 @@ use opc_persist::{
 
 pub(super) fn cluster_transition_timeout() -> Duration {
     let profile = DURABLE_CONSENSUS_TIMING_PROFILE;
-    // Admit one complete resampled election after a split vote, followed by
-    // one complete profiled durable-readiness operation. This is a bounded
-    // test-evidence ceiling derived from the shared timing authority, not an
-    // operator-tunable production deadline.
+    // Preserve the bounded fixture ceiling derived from the shared timing
+    // authority. Random election retries have no fixed upper bound; fixtures
+    // that force a split schedule the follow-up campaign explicitly within
+    // this ceiling. This is not an operator-tunable production deadline.
     Duration::from_millis(profile.election_timeout_max_millis.saturating_mul(2))
         .saturating_add(profile.operation_timeout())
 }
@@ -52,12 +53,120 @@ pub enum ConfigClusterLifecycleError {
     OperationFailed(&'static str),
 }
 
+#[derive(Clone, Debug, Default)]
+struct SplitVoteProgress {
+    votes: BTreeMap<ConfigConsensusNodeId, VoteRequest<ConfigConsensusNodeId>>,
+    rejected: usize,
+    failure: Option<String>,
+}
+
+pub struct SplitVoteGate {
+    requests: tokio::sync::Barrier,
+    progress: tokio::sync::watch::Sender<SplitVoteProgress>,
+}
+
+impl SplitVoteGate {
+    fn new() -> Self {
+        Self {
+            requests: tokio::sync::Barrier::new(2),
+            progress: tokio::sync::watch::channel(SplitVoteProgress::default()).0,
+        }
+    }
+
+    fn record_vote(
+        &self,
+        sender: ConfigConsensusNodeId,
+        vote: VoteRequest<ConfigConsensusNodeId>,
+    ) -> Result<(), &'static str> {
+        let mut duplicate = false;
+        self.progress
+            .send_modify(|progress| match progress.votes.entry(sender) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(vote);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => duplicate = true,
+            });
+        if duplicate {
+            Err("one initial vote per survivor")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fail(&self, error: String) {
+        eprintln!("HA_SPLIT_FAILURE {error}");
+        self.progress.send_modify(|progress| {
+            progress.failure.get_or_insert(error);
+        });
+    }
+
+    async fn wait_for_rejections(&self) -> Result<SplitVoteProgress, String> {
+        let mut progress = self.progress.subscribe();
+        let observed = progress
+            .wait_for(|progress| progress.failure.is_some() || progress.rejected == 2)
+            .await
+            .map_err(|error| format!("split vote observation closed: {error}"))?;
+        match &observed.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(observed.clone()),
+        }
+    }
+}
+
+struct SplitVoteAttempt {
+    gate: Arc<SplitVoteGate>,
+    sender: ConfigConsensusNodeId,
+    target: ConfigConsensusNodeId,
+    started: std::time::Instant,
+    phase: &'static str,
+    completed: bool,
+}
+
+impl SplitVoteAttempt {
+    fn new(
+        gate: Arc<SplitVoteGate>,
+        sender: ConfigConsensusNodeId,
+        target: ConfigConsensusNodeId,
+    ) -> Self {
+        Self {
+            gate,
+            sender,
+            target,
+            started: std::time::Instant::now(),
+            phase: "request decode",
+            completed: false,
+        }
+    }
+
+    fn fail(&mut self, error: impl fmt::Display) {
+        self.completed = true;
+        self.gate.fail(format!(
+            "sender={:?} target={:?} phase={} elapsed_ms={}: {error}",
+            self.sender,
+            self.target,
+            self.phase,
+            self.started.elapsed().as_millis(),
+        ));
+    }
+}
+
+impl Drop for SplitVoteAttempt {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Barrier arrivals are not withdrawn when the engine's vote RPC
+            // deadline cancels this future. Wake the test waiter immediately.
+            self.fail("initial vote RPC cancelled");
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: ConfigConsensusNodeId,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     captured_frames: Arc<StdMutex<Vec<Vec<u8>>>>,
+    first_vote_gate: Arc<StdMutex<Option<Arc<SplitVoteGate>>>>,
 }
 
 impl LoopbackPeer {
@@ -67,6 +176,7 @@ impl LoopbackPeer {
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             captured_frames,
+            first_vote_gate: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -117,13 +227,80 @@ impl ConsensusPeer for LoopbackPeer {
         self.captured_frames.lock().expect("capture mutex").push(
             opc_consensus::encode_bounded(&request).map_err(|_| ConsensusPeerError::Protocol)?,
         );
-        let handler = self
-            .handler
-            .read()
-            .await
-            .clone()
-            .ok_or(ConsensusPeerError::Unavailable)?;
-        Ok(handler.handle(request.sender, request).await)
+        let vote_sender =
+            (request.family == opc_consensus::ConsensusRpcFamily::Vote).then_some(request.sender);
+        let mut first_vote = None;
+        if let Some(sender) = vote_sender {
+            first_vote = self
+                .first_vote_gate
+                .lock()
+                .expect("vote gate")
+                .take()
+                .map(|gate| SplitVoteAttempt::new(gate, sender, self.target));
+            let vote = opc_consensus::decode_bounded::<(u16, VoteRequest<ConfigConsensusNodeId>)>(
+                &request.payload,
+            )
+            .map(|(_, vote)| vote);
+            eprintln!(
+                "HA_VOTE sender={sender:?} target={:?} request={vote:?}",
+                self.target
+            );
+            if let Some(attempt) = &mut first_vote {
+                match vote {
+                    Ok(vote) => match attempt.gate.record_vote(sender, vote) {
+                        Ok(()) => {
+                            attempt.phase = "split barrier";
+                            attempt.gate.requests.wait().await;
+                        }
+                        Err(error) => attempt.fail(error),
+                    },
+                    Err(error) => attempt.fail(format!("decode diagnostic vote: {error:?}")),
+                }
+            }
+        }
+        if let Some(attempt) = &mut first_vote {
+            attempt.phase = "vote handler";
+        }
+        let Some(handler) = self.handler.read().await.clone() else {
+            if let Some(attempt) = &mut first_vote {
+                attempt.fail("first survivor vote has no handler");
+            }
+            return Err(ConsensusPeerError::Unavailable);
+        };
+        let response = handler.handle(request.sender, request).await;
+        if let Some(sender) = vote_sender {
+            type Reply = Result<
+                VoteResponse<ConfigConsensusNodeId>,
+                opc_consensus::engine::error::RaftError<ConfigConsensusNodeId>,
+            >;
+            let reply = response
+                .result
+                .as_ref()
+                .map_err(|error| format!("first survivor vote peer error: {error:?}"))
+                .and_then(|payload| {
+                    let (_, reply): (u16, Reply) = opc_consensus::decode_bounded(payload)
+                        .map_err(|error| format!("decode diagnostic vote reply: {error:?}"))?;
+                    reply.map_err(|error| format!("first survivor vote engine error: {error:?}"))
+                });
+            eprintln!(
+                "HA_VOTE_REPLY sender={sender:?} target={:?} reply={reply:?}",
+                self.target
+            );
+            if let Some(attempt) = first_vote.as_mut().filter(|attempt| !attempt.completed) {
+                match reply {
+                    Ok(vote) if !vote.vote_granted => {
+                        attempt.completed = true;
+                        attempt
+                            .gate
+                            .progress
+                            .send_modify(|progress| progress.rejected += 1);
+                    }
+                    Ok(_) => attempt.fail("both survivors must have voted for themselves"),
+                    Err(error) => attempt.fail(error),
+                }
+            }
+        }
+        Ok(response)
     }
 }
 
@@ -615,9 +792,99 @@ impl ConfigCluster {
         }
     }
 
-    pub async fn wait_for_survivor_leader(&self, excluded: usize) -> usize {
-        tokio::time::timeout(cluster_transition_timeout(), async {
+    pub fn prepare_survivor_split_vote(&self, node: usize) -> Arc<SplitVoteGate> {
+        let survivors = (0..self.stores.len())
+            .filter(|index| *index != node)
+            .collect::<Vec<_>>();
+        assert_eq!(survivors.len(), 2);
+        let gate = Arc::new(SplitVoteGate::new());
+        for (source, target) in [(survivors[0], survivors[1]), (survivors[1], survivors[0])] {
+            *self.paths[&(source, target)]
+                .first_vote_gate
+                .lock()
+                .expect("vote gate") = Some(gate.clone());
+        }
+        gate
+    }
+
+    pub async fn wait_for_survivor_after_split(
+        &self,
+        excluded: usize,
+        split: Arc<SplitVoteGate>,
+    ) -> usize {
+        let deadline = tokio::time::Instant::now() + cluster_transition_timeout();
+        tokio::time::timeout_at(deadline, async {
+            let split_progress = split.wait_for_rejections().await.unwrap_or_else(|error| {
+                panic!(
+                    "split survivor election: {error}; state={:?}",
+                    split.progress.borrow()
+                )
+            });
+            // This fixture proves recovery through a real elected quorum.
+            // Force the split first, then start one normal campaign rather
+            // than letting repeated random election samples decide whether
+            // the AMF recovery assertions run before their unchanged deadline.
+            // The engine still owns the vote, persistence and quorum proof.
+            let candidate = split_progress
+                .votes
+                .iter()
+                .max_by_key(|(_, vote)| vote.last_log_id)
+                .map(|(node, _)| *node)
+                .expect("survivor with the freshest log");
+            let index = self
+                .nodes
+                .iter()
+                .position(|node| *node == candidate)
+                .expect("survivor node index");
+            assert_ne!(index, excluded);
+            self.stores[index]
+                .trigger_election_for_test()
+                .await
+                .expect("survivor starts a normal Openraft campaign after the split");
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "split survivor election: {error}; state={:?}",
+                split.progress.borrow(),
+            )
+        });
+        self.wait_for_survivor_leader_until(excluded, deadline)
+            .await
+    }
+
+    async fn wait_for_survivor_leader_until(
+        &self,
+        excluded: usize,
+        deadline: tokio::time::Instant,
+    ) -> usize {
+        let started = std::time::Instant::now();
+        let mut last_status = None;
+        let mut last_readiness = None;
+        tokio::time::timeout_at(deadline, async {
             loop {
+                let statuses = self
+                    .stores
+                    .iter()
+                    .map(|store| {
+                        let status = store.status();
+                        (
+                            status.node_id,
+                            status.term,
+                            status.leader_id,
+                            status.applied_index,
+                            status.committed_index,
+                            status.admitted,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if last_status.as_ref() != Some(&statuses) {
+                    eprintln!(
+                        "HA_ELECTION elapsed_ms={} excluded={excluded} states={statuses:?}",
+                        started.elapsed().as_millis()
+                    );
+                    last_status = Some(statuses);
+                }
                 if let Some(index) = (0..self.stores.len()).find(|index| {
                     *index != excluded
                         && self.stores[*index]
@@ -625,15 +892,26 @@ impl ConfigCluster {
                             .leader_id
                             .is_some_and(|leader| leader != self.stores[excluded].status().node_id)
                 }) {
-                    if self.stores[index].probe_durable_readiness().await.is_ok() {
-                        return index;
+                    match self.stores[index].probe_durable_readiness().await {
+                        Ok(()) => return index,
+                        Err(error) => {
+                            last_readiness = Some((index, error));
+                            eprintln!(
+                                "HA_READINESS elapsed_ms={} result={last_readiness:?}",
+                                started.elapsed().as_millis()
+                            );
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .expect("survivor config leader")
+        .unwrap_or_else(|error| {
+            panic!(
+                "survivor config leader: {error}; states={last_status:?}; readiness={last_readiness:?}"
+            )
+        })
     }
 
     pub async fn shutdown(&mut self) -> Result<(), ConfigClusterLifecycleError> {
@@ -705,5 +983,215 @@ impl ConfigCluster {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opc_consensus::engine::Vote;
+
+    #[derive(Debug)]
+    struct RecordingHandler {
+        response: ConsensusWireResponse,
+        requests: StdMutex<Vec<(ConfigConsensusNodeId, ConsensusWireRequest)>>,
+    }
+
+    #[async_trait]
+    impl ConsensusRpcHandler for RecordingHandler {
+        async fn handle(
+            &self,
+            sender: ConfigConsensusNodeId,
+            request: ConsensusWireRequest,
+        ) -> ConsensusWireResponse {
+            self.requests
+                .lock()
+                .expect("record requests")
+                .push((sender, request));
+            self.response.clone()
+        }
+    }
+
+    fn vote_request(payload: Vec<u8>) -> ConsensusWireRequest {
+        ConsensusWireRequest::try_new(
+            opc_consensus::ConsensusIdentity::new(
+                opc_consensus::ConsensusClusterId::from_bytes([1; 32]),
+                opc_consensus::ConsensusConfigurationId::from_bytes([2; 32]),
+                opc_consensus::ConsensusConfigurationEpoch::new(1).expect("epoch"),
+            ),
+            ConfigConsensusNodeId::new(1).expect("sender"),
+            opc_consensus::ConsensusRpcFamily::Vote,
+            payload,
+        )
+        .expect("bounded vote request")
+    }
+
+    fn valid_vote_request() -> ConsensusWireRequest {
+        let sender = ConfigConsensusNodeId::new(1).expect("sender");
+        vote_request(
+            opc_consensus::encode_bounded(&(1_u16, VoteRequest::new(Vote::new(2, sender), None)))
+                .expect("encode vote request"),
+        )
+    }
+
+    fn vote_response(granted: bool) -> ConsensusWireResponse {
+        let target = ConfigConsensusNodeId::new(2).expect("target");
+        let reply: Result<_, opc_consensus::engine::error::RaftError<ConfigConsensusNodeId>> =
+            Ok(VoteResponse::new(Vote::new(2, target), None, granted));
+        ConsensusWireResponse {
+            result: Ok(opc_consensus::encode_bounded(&(1_u16, reply)).expect("encode vote reply")),
+        }
+    }
+
+    async fn peer_with_response(
+        response: ConsensusWireResponse,
+    ) -> (LoopbackPeer, Arc<RecordingHandler>) {
+        let handler = Arc::new(RecordingHandler {
+            response,
+            requests: StdMutex::new(Vec::new()),
+        });
+        let peer = LoopbackPeer::new(
+            ConfigConsensusNodeId::new(2).expect("target"),
+            Arc::new(StdMutex::new(Vec::new())),
+        );
+        peer.install(handler.clone()).await;
+        (peer, handler)
+    }
+
+    #[tokio::test]
+    async fn malformed_vote_diagnostics_preserve_request_delivery() {
+        let expected = vote_response(false);
+        let (peer, handler) = peer_with_response(expected.clone()).await;
+        let request = vote_request(Vec::new());
+        assert_eq!(
+            peer.call(request.clone()).await.expect("deliver request"),
+            expected
+        );
+        assert_eq!(
+            *handler.requests.lock().expect("recorded requests"),
+            vec![(request.sender, request)],
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_vote_diagnostics_preserve_response_delivery() {
+        let expected = ConsensusWireResponse {
+            result: Ok(Vec::new()),
+        };
+        let (peer, handler) = peer_with_response(expected.clone()).await;
+        let request = valid_vote_request();
+        assert_eq!(
+            peer.call(request.clone()).await.expect("deliver response"),
+            expected
+        );
+        assert_eq!(
+            *handler.requests.lock().expect("recorded requests"),
+            vec![(request.sender, request)],
+        );
+    }
+
+    async fn split_failure(gate: &SplitVoteGate) -> String {
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_for_rejections())
+            .await
+            .expect("split failure must wake the waiter without the election deadline")
+            .expect_err("split vote must fail")
+    }
+
+    #[tokio::test]
+    async fn split_vote_request_decode_failure_wakes_waiter() {
+        let expected = vote_response(false);
+        let (peer, handler) = peer_with_response(expected.clone()).await;
+        let gate = Arc::new(SplitVoteGate::new());
+        *peer.first_vote_gate.lock().expect("vote gate") = Some(gate.clone());
+        let request = vote_request(Vec::new());
+        assert_eq!(
+            peer.call(request.clone()).await.expect("deliver request"),
+            expected,
+        );
+        assert!(split_failure(&gate)
+            .await
+            .contains("decode diagnostic vote"));
+        assert_eq!(
+            *handler.requests.lock().expect("recorded requests"),
+            vec![(request.sender, request)],
+        );
+    }
+
+    #[tokio::test]
+    async fn split_vote_reply_failures_wake_waiter() {
+        let engine_error: Result<
+            VoteResponse<ConfigConsensusNodeId>,
+            opc_consensus::engine::error::RaftError<ConfigConsensusNodeId>,
+        > = Err(opc_consensus::engine::error::RaftError::Fatal(
+            opc_consensus::engine::error::Fatal::Stopped,
+        ));
+        for (expected, message) in [
+            (
+                vote_response(true),
+                "both survivors must have voted for themselves",
+            ),
+            (
+                ConsensusWireResponse {
+                    result: Err(ConsensusPeerError::Protocol),
+                },
+                "peer error: Protocol",
+            ),
+            (
+                ConsensusWireResponse {
+                    result: Ok(Vec::new()),
+                },
+                "decode diagnostic vote reply",
+            ),
+            (
+                ConsensusWireResponse {
+                    result: Ok(opc_consensus::encode_bounded(&(1_u16, engine_error))
+                        .expect("encode engine error")),
+                },
+                "engine error:",
+            ),
+        ] {
+            let (peer, handler) = peer_with_response(expected.clone()).await;
+            let gate = Arc::new(SplitVoteGate::new());
+            *peer.first_vote_gate.lock().expect("vote gate") = Some(gate.clone());
+            let request = valid_vote_request();
+            let (response, _) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(peer.call(request.clone()), gate.requests.wait())
+            })
+            .await
+            .expect("release diagnostic vote barrier");
+            assert_eq!(response.expect("deliver response"), expected);
+            assert!(split_failure(&gate).await.contains(message));
+            assert_eq!(
+                *handler.requests.lock().expect("recorded requests"),
+                vec![(request.sender, request)],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_split_vote_wakes_waiter() {
+        let (peer, handler) = peer_with_response(vote_response(false)).await;
+        let gate = Arc::new(SplitVoteGate::new());
+        *peer.first_vote_gate.lock().expect("vote gate") = Some(gate.clone());
+        let mut progress = gate.progress.subscribe();
+        let call = tokio::spawn(async move { peer.call(valid_vote_request()).await });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            progress.wait_for(|progress| progress.votes.len() == 1),
+        )
+        .await
+        .expect("vote must reach split barrier")
+        .expect("observe first vote");
+        call.abort();
+        assert!(call.await.expect_err("cancel vote call").is_cancelled());
+        let error = split_failure(&gate).await;
+        assert!(error.contains("initial vote RPC cancelled"), "{error}");
+        assert!(error.contains("phase=split barrier"), "{error}");
+        assert!(error.contains("elapsed_ms="), "{error}");
+        assert!(handler
+            .requests
+            .lock()
+            .expect("recorded requests")
+            .is_empty());
     }
 }

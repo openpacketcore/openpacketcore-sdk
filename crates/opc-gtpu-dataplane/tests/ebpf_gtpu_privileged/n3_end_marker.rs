@@ -121,6 +121,9 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         let desired = GtpuSessionGroup::new(old.id(), old.device_id(), entries)?;
         let (namespace, active) = reconcile_fresh_grouped(backend.clone(), desired.clone()).await?;
         run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+        // Inner IPv6 packets must reach tc before the redirect deadline; el9
+        // otherwise holds them while link-local DAD and neighbour discovery run.
+        resolve_s2bu_ipv6_gateway_neighbour();
         let peer = in_netns(&net.pgw_ns, || {
             UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
         });
@@ -155,6 +158,25 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         while pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED) < redirects_before + 6 {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "N3_END_MARKER_REDIRECTS before={redirects_before} current={}",
+                    pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED)
+                );
+                for arguments in [
+                    ["-6", "addr", "show", "dev", "s2bu"],
+                    ["-6", "neigh", "show", "dev", "s2bu"],
+                ] {
+                    let output = Command::new("ip")
+                        .args(arguments)
+                        .output()
+                        .expect("inspect End Marker fixture IPv6 readiness");
+                    eprintln!(
+                        "N3_END_MARKER_IPV6 {arguments:?}: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                }
+            }
             assert!(
                 Instant::now() < deadline,
                 "six GPDU redirects must precede retirement"

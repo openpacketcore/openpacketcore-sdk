@@ -38,6 +38,7 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0", features = ["dangerous-test-hooks"] }
 opc-security-testkit = { path = "../opc-security-testkit", version = "0.2.0" }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 tempfile = "3"

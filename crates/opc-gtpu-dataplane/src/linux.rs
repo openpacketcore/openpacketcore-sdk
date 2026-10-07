@@ -4001,6 +4001,93 @@ mod tests {
         sockets.userspace.len() + sockets.kernel.len()
     }
 
+    #[cfg(target_os = "linux")]
+    fn socket_description_fds(identity: &std::path::Path) -> Vec<PathBuf> {
+        let mut owners = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd").expect("enumerate test process descriptors")
+        {
+            let path = entry.expect("read test descriptor entry").path();
+            match std::fs::read_link(&path) {
+                Ok(target) if target == identity => owners.push(path),
+                Ok(_) => {}
+                // Other test threads may close a descriptor during the scan.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read test descriptor {path:?}: {error}"),
+            }
+        }
+        owners
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_socket_description_released(identity: &std::path::Path) {
+        // Rebinding a released ephemeral endpoint races unrelated sockets and
+        // pre-exec child references. Observe the backend's actual descriptor
+        // retirement instead, including any duplicate in this process.
+        assert_eq!(
+            socket_description_fds(identity),
+            Vec::<PathBuf>::new(),
+            "socket {identity:?} still has a descriptor in the test process"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_socket_retirement_probe_tracks_duplicates_while_endpoint_stays_bound() {
+        use nix::sys::socket::{
+            bind, getsockname, setsockopt, socket, sockopt, AddressFamily, SockFlag, SockType,
+            SockaddrIn,
+        };
+        use std::net::{SocketAddrV4, UdpSocket};
+        use std::os::fd::AsRawFd;
+
+        let original = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        setsockopt(&original, sockopt::ReusePort, &true).unwrap();
+        bind(
+            original.as_raw_fd(),
+            &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let endpoint: SockaddrIn = getsockname(original.as_raw_fd()).unwrap();
+        let identity =
+            std::fs::read_link(format!("/proc/self/fd/{}", original.as_raw_fd())).unwrap();
+        let duplicate = original.try_clone().unwrap();
+        let duplicate_path = PathBuf::from(format!("/proc/self/fd/{}", duplicate.as_raw_fd()));
+
+        // Reserve the endpoint with a distinct socket before closing the
+        // original, so this regression has no release/rebind race of its own.
+        let other = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        setsockopt(&other, sockopt::ReusePort, &true).unwrap();
+        bind(other.as_raw_fd(), &endpoint).unwrap();
+        let other_path = PathBuf::from(format!("/proc/self/fd/{}", other.as_raw_fd()));
+        let other_identity = std::fs::read_link(&other_path).unwrap();
+        assert_ne!(identity, other_identity);
+
+        drop(original);
+        assert_eq!(socket_description_fds(&identity), vec![duplicate_path]);
+        drop(duplicate);
+        assert_socket_description_released(&identity);
+        assert_eq!(socket_description_fds(&other_identity), vec![other_path]);
+        assert_eq!(
+            UdpSocket::bind(SocketAddrV4::new(endpoint.ip(), endpoint.port()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse,
+            "endpoint availability cannot identify retirement of the original socket"
+        );
+    }
+
     #[test]
     fn encodes_create_device_with_fd1_role_and_hashsize() {
         let request = CreateGtpDeviceRequest::new("gtp0");
@@ -5061,7 +5148,7 @@ mod tests {
                 io::ErrorKind::AddrInUse
             );
             drop(backend);
-            let _rebound = UdpSocket::bind(endpoint).unwrap();
+            assert_socket_description_released(&fd_identity);
         }
     }
 
@@ -5175,7 +5262,7 @@ mod tests {
             backend.remove_device(&previous_device).await.unwrap();
             assert_eq!(retained_socket_count(&backend), 0);
             assert_eq!(retained_ownership_count(&backend), 0);
-            let _rebound = UdpSocket::bind(endpoint).unwrap();
+            assert_socket_description_released(&fd_identity);
             drop(backend);
             let _ = std::fs::remove_dir_all(root);
         }

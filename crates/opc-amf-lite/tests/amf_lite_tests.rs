@@ -502,10 +502,11 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
     println!("[HA] Shutting down AMF node 0 and isolating its config leader");
     wait_for_shutdown(&amf_0).await;
     log_config_rpc_counts(&config_cluster, "before_failover");
+    let split_vote = config_cluster.prepare_survivor_split_vote(original_leader);
     config_cluster.isolate(original_leader);
     let failover_started = std::time::Instant::now();
     let survivor_leader = config_cluster
-        .wait_for_survivor_leader(original_leader)
+        .wait_for_survivor_after_split(original_leader, split_vote)
         .await;
     eprintln!(
         "HA_TIMING phase=failover elapsed_us={}",
