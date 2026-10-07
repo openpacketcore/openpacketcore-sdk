@@ -27,6 +27,7 @@ test-control = []
 test-vfs = ["opc-sqlite-file-control-sys/test-vfs"]
 
 [dependencies]
+hex = "0.4.3"
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
@@ -68,7 +69,6 @@ rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "limits
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
-hex = "0.4.3"
 # Measure native owner allocations in focused, single-threaded unit tests.
 # This workspace dependency is never linked into the production store.
 allocation-counter = { workspace = true }

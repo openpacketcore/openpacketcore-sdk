@@ -8,6 +8,71 @@ use crate::{EncryptedSessionPayload, FenceToken};
 mod roster;
 
 #[test]
+fn scope_lease_cold_checkpoint_preflight_matches_serializer_and_rejects_failure_rows() {
+    use crate::scope_lease::tests::{bounds, execution, request, scope};
+    use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseError, ScopeLeaseOperation};
+    let (mut storage, _, _) = fixture();
+    apply(&mut storage, &[clock(2, time(2))]);
+    let checkpoint = ScopeLeaseCommand {
+        request: request(
+            0,
+            1,
+            ScopeLeaseOperation::Select {
+                execution: execution(1),
+            },
+        ),
+        bounds: bounds(0),
+    }
+    .apply(None)
+    .unwrap();
+    let mut row = (**storage.business.generic_receipts.values().next().unwrap()).clone();
+    let NativeGenericReceipt::Ordinary(receipt) = &mut row else {
+        unreachable!()
+    };
+    receipt.payload_digest = checkpoint.digest().unwrap();
+    receipt.response.result = Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint)));
+    let id = scope().checkpoint_id().unwrap();
+    let bytes = postcard::to_allocvec(&(id, Some(&row))).unwrap();
+    assert_eq!(
+        generic_scratch(&bytes).unwrap(),
+        METADATA + 12 * crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES
+    );
+    verify_generic(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
+    for end in [0, 1, bytes.len() / 2, bytes.len() - 1] {
+        assert!(generic_scratch(&bytes[..end]).is_err());
+    }
+    let before = facts::Request::of(&row, Format::V3).unwrap();
+    let NativeGenericReceipt::Ordinary(receipt) = &mut row else {
+        unreachable!()
+    };
+    let next = ScopeLeaseCommand {
+        request: request(
+            1,
+            2,
+            ScopeLeaseOperation::Select {
+                execution: execution(2),
+            },
+        ),
+        bounds: bounds(1),
+    }
+    .apply(Some((receipt.payload_digest, (*receipt.response).clone())))
+    .unwrap();
+    receipt.payload_digest = next.digest().unwrap();
+    receipt.response.result = Ok(SessionMutationOutcome::ScopeLease(Ok(next)));
+    let after = facts::Request::of(&row, Format::V3).unwrap();
+    assert!(after.validate_replacement(before, true).is_ok());
+    assert!(before.validate_replacement(after, true).is_err());
+    ordinary_mut(&mut row).result = Ok(SessionMutationOutcome::Unit);
+    let ordinary = facts::Request::of(&row, Format::V3).unwrap();
+    assert!(ordinary.validate_replacement(after, true).is_err());
+    assert!(after.validate_replacement(ordinary, true).is_err());
+    ordinary_mut(&mut row).result = Ok(SessionMutationOutcome::ScopeLease(Err(
+        ScopeLeaseError::Held,
+    )));
+    assert!(generic_scratch(&postcard::to_allocvec(&(id, Some(&row))).unwrap()).is_err());
+}
+
+#[test]
 fn native_generation_cold_key_preflight_matches_complete_postcard_and_original_payload_bound() {
     let (storage, _, _) = fixture();
     let (key, row) = storage.business.keys.iter().next().unwrap();

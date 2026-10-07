@@ -671,6 +671,7 @@ async fn fixed_three_voter_public_eight_item_v2_batches_with_full_activation() {
 
 mod native_flow;
 mod paced_viability;
+mod scope_lease;
 
 #[derive(Debug)]
 struct QuorumAuthorityClock(crate::Timestamp);

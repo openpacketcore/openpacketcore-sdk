@@ -48,6 +48,18 @@ evidence.
   admission check.
 - `StoredSessionRecord` carries key, generation, owner, fence, state class/type,
   expiry, and encrypted payload bytes.
+- `scope_lease::ScopeLeaseStore` provides authenticated stable-scope selection,
+  acquire/renew, same-execution resume and gate-closed graceful release over
+  strictly durable consensus. Immutable permits fix the one-second renewal
+  cadence, sixty-second forwarding grace and conservative exclusion deadline.
+  A trusted admission policy and clock with explicit uncertainty bounds are
+  required. Each operation is one native command replacing a fixed authority
+  checkpoint, with no per-renewal receipt history. Stable cluster scopes survive
+  membership changes; apply can inspect their selection and grant floors.
+  Unsupported scope profiles are refused. Crossing a scope-record format change
+  requires a fresh installation. See [RFC 022](../../docs/rfc/022-scope-leases.md)
+  for cancellation, lost replies, emergency-session holds and the separate
+  packet-gate/consumer-transport composition boundary.
 - `FencedOwnershipStore` composes the existing backend lease, CAS, TTL, and
   committed-watch surfaces into key-agnostic logical ownership leases. Opaque
   keys contain 1 through 64 bytes, opaque metadata is capped at 64 KiB, every

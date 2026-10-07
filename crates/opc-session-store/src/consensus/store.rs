@@ -163,6 +163,7 @@ mod async_persistence;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
+mod scope_lease;
 
 use planned_shutdown::ConsensusRetirementCoordinator;
 
@@ -10469,11 +10470,17 @@ impl ConsensusSessionStore {
                 SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
                 _ => consensus_unavailable(),
             })?;
-        let page = self
+        let mut page = self
             .inner
             .backend
             .consensus_scan_restore_records_at(request, logical_time, deadline)
             .await?;
+        let before = page.records.len();
+        page.records
+            .retain(|record| !crate::scope_lease::is_scope_lease_key(&record.key));
+        page.loaded_count = page.records.len();
+        page.excluded_count += before - page.loaded_count;
+        // Keep the backend cursor and completion bit even for an empty page.
         self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(page)
@@ -10820,6 +10827,13 @@ fn committed_response_matches_intent(
         }
     }
     match (&response.result, intent) {
+        (
+            Ok(SessionMutationOutcome::ScopeLease(result)),
+            SessionMutationIntent::ScopeLease(operation),
+        ) => match result {
+            Ok(checkpoint) => operation.matches(checkpoint),
+            Err(_) => true,
+        },
         (Err(error), intent) => committed_error_matches_intent(intent, error),
         (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::AdvanceLogicalTime)
         | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::BindConsumerRequest { .. })
@@ -11439,7 +11453,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         );
     }
     match intent {
-        SessionMutationIntent::AdvanceLogicalTime => false,
+        SessionMutationIntent::AdvanceLogicalTime | SessionMutationIntent::ScopeLease(_) => false,
         SessionMutationIntent::BindConsumerRequest { .. } => {
             matches!(error, StoreError::CasIdempotencyConflict)
         }
@@ -11728,6 +11742,11 @@ fn validate_consensus_intent_with_recovery(
                 "fenced_transition_v2_expected_bound_entries_invalid".into(),
             ));
         }
+    }
+    if let SessionMutationIntent::ScopeLease(operation) = intent {
+        operation
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("scope operation invalid".into()))?;
     }
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_sealed_payload(op)?;
@@ -15945,11 +15964,17 @@ impl SessionBackend for ConsensusSessionStore {
                 .fetch_add(1, Ordering::AcqRel);
             return Err(consensus_unavailable());
         }
-        let page = self
+        let mut page = self
             .inner
             .backend
             .consensus_scan_restore_records_at(request, logical_time, deadline)
             .await?;
+        let before = page.records.len();
+        page.records
+            .retain(|record| !crate::scope_lease::is_scope_lease_key(&record.key));
+        page.loaded_count = page.records.len();
+        page.excluded_count += before - page.loaded_count;
+        // Keep the backend cursor and completion bit even for an empty page.
         self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(page)
@@ -21582,6 +21607,87 @@ mod membership_tests {
         );
         assert!(validate_consensus_physical_fenced_transition_request(&delete).is_ok());
         assert!(validate_consensus_physical_fenced_transition_request(&refresh).is_ok());
+    }
+
+    #[tokio::test]
+    async fn scope_lease_restore_scan_filters_reserved_rows_without_losing_cursor() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let (_directory, store, scope, authorization, key, lease) = consumer_boundary_store().await;
+        let reserved = SessionKey {
+            key_type: crate::SessionKeyType::other("opc-scope-lease").unwrap(),
+            stable_id: Bytes::from_static(&[1; 32]).try_into().unwrap(),
+            ..key.clone()
+        };
+        let reserved_lease = store
+            .acquire(&reserved, lease.owner().clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        for (key, lease) in [(&key, &lease), (&reserved, &reserved_lease)] {
+            assert_eq!(
+                store
+                    .compare_and_set(CompareAndSet {
+                        key: key.clone(),
+                        lease: lease.clone(),
+                        expected_generation: None,
+                        new_record: consumer_record_with_payload_len(key, lease, 1024),
+                    })
+                    .await
+                    .unwrap(),
+                CompareAndSetResult::Success
+            );
+        }
+        let mut scan = RestoreScanRequest::all(1);
+        scan.scope.tenant = Some(key.tenant.clone());
+        scan.scope.nf_kind = Some(key.nf_kind.clone());
+        let mut records = Vec::new();
+        for n in 1..=3 {
+            let response = store
+                .consumer_service()
+                .execute(
+                    &authorization,
+                    SessionConsumerRequest::new(
+                        scope,
+                        SessionConsumerRequestId::from_bytes([n; 16]),
+                        SessionConsumerOperation::ScanRestoreRecords {
+                            request: scan.clone(),
+                        },
+                    ),
+                )
+                .await;
+            let SessionConsumerResponse::ScanRestoreRecords(Ok(page)) = response else {
+                panic!("authorized restore scan failed: {response:?}");
+            };
+            assert_eq!(page.loaded_count, page.records.len());
+            records.extend(page.records);
+            if page.complete {
+                break;
+            }
+            scan.cursor = Some(
+                page.next_cursor
+                    .expect("filtered empty page retains continuation"),
+            );
+            assert!(n < 3, "bounded scan must terminate");
+        }
+        let authority = crate::scope_lease::ScopeLeaseId::new(
+            scope.consensus_identity(),
+            key.tenant.clone(),
+            key.nf_kind.clone(),
+            [1; 32],
+        )
+        .unwrap();
+        let legacy =
+            crate::scope_lease::service::ScopeLeaseBackend::current(&store, &authority).await;
+        store.shutdown().await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "scope authority must not appear in consumer restore"
+        );
+        assert_eq!(records[0].key, key);
+        assert_eq!(
+            legacy,
+            Err(crate::scope_lease::ScopeLeaseError::FormatMismatch)
+        );
     }
 
     async fn consumer_boundary_store() -> (
