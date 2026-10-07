@@ -1,4 +1,4 @@
-//! Committed ordinary IKE window-one ordering and exact replay hooks.
+//! Committed ordinary IKE windows, exact replay and durable RFC 6311 sync hooks.
 //!
 //! The consumer owns atomic persistence, a single fenced writer, semantic peer
 //! authentication and operation validation, and idempotent application of durable
@@ -6,13 +6,14 @@
 //! effect or new packet may escape preparation before that acknowledgement.
 //!
 //! This initial profile handles complete AES-GCM SK packets, not SKF or CBC
-//! recovery. It does not enable sync, canonical empty replies or receive-floor
-//! reconstruction. Empty INFORMATIONAL requests use no durable window write;
+//! recovery. Sync requires persisted negotiated metadata and fixed event/clock
+//! budgets. Canonical replies and receive-floor reconstruction remain separate.
+//! Empty INFORMATIONAL requests use no durable window write;
 //! until a stateless handler with a volatile receive high-water exists, this
 //! profile must not face peers that send DPD requests.
 //! Replay probes are old bytes, not fresh liveness or new outcome evidence.
 
-use std::{error::Error as StdError, fmt, sync::Arc};
+use std::{cell::Cell, error::Error as StdError, fmt, sync::Arc};
 
 use crate::{
     Ikev2AesGcmIvAllocation, Ikev2AesGcmIvRecord, Ikev2AesGcmIvReservationError, Ikev2ExchangeKind,
@@ -23,6 +24,12 @@ use bytes::Bytes;
 mod packet;
 mod record;
 mod reservation_retry;
+mod sync_initiator;
+mod sync_packet;
+mod sync_readiness;
+mod sync_record;
+mod sync_recovery_record;
+mod sync_responder;
 pub use packet::Ikev2AuthenticatedOrdinary;
 pub use record::{
     Ikev2CommittedExchangeRecord, Ikev2CommittedWindowDomain, Ikev2CommittedWindowRecord,
@@ -32,6 +39,19 @@ pub use reservation_retry::{
     Ikev2PreparedReservationAttempt, Ikev2PreparedRetryReservation, Ikev2ReservationAttempt,
     Ikev2ReservationRetry, Ikev2ReservationRetryError, Ikev2ReservationRetryPolicy,
     Ikev2ReservationRetryRecord,
+};
+pub use sync_initiator::{
+    Ikev2AdmittedSyncInitiation, Ikev2PreparedSyncInitiation, Ikev2SyncInitiatorAction,
+    Ikev2SyncInitiatorCommit,
+};
+pub use sync_readiness::{Ikev2RuntimeSyncNegotiation, Ikev2SyncReadiness};
+pub use sync_record::{Ikev2SyncDisposition, Ikev2SyncResponderRecord};
+pub use sync_recovery_record::{
+    Ikev2SyncAttemptRecord, Ikev2SyncClock, Ikev2SyncRecoveryPolicy, Ikev2SyncRecoveryRecord,
+    Ikev2SyncRecoveryStatus,
+};
+pub use sync_responder::{
+    Ikev2AdmittedSyncResponse, Ikev2PreparedSyncResponse, Ikev2SyncCommit, Ikev2SyncResponse,
 };
 
 /// Non-accepting durable-window failure. Every error releases no new authority.
@@ -56,6 +76,20 @@ pub enum Ikev2WindowError {
     NoDurableWork,
     /// Completion belongs to another runtime or an older commit generation.
     StaleCompletion,
+    /// Local synchronization remains pending; ordinary traffic is blocked.
+    SyncInProgress,
+    /// Recovery is terminal; persist/restore scoped close, never downgrade or retry.
+    SyncClosed,
+    /// Positive retry delay has not elapsed; wait without allocating/reserving an IV.
+    SyncBackoff,
+    /// Admitted entropy failed or repeated current-event nonces at the redraw bound.
+    SyncEntropy,
+    /// Current admitted encryption/entropy cannot back a production support offer.
+    SyncUnavailable,
+    /// A peer cutover interrupted uncommitted work; close this IKE SA and its Children.
+    OutcomeUncertain,
+    /// Pure synchronization returned a non-accepting rekey/close intent.
+    SyncRule(crate::Ikev2MessageIdSyncRuleError),
     /// Slice-3 allocation or admitted sealing failed; the supplied IV is burned.
     Iv(Ikev2AesGcmIvReservationError),
 }
@@ -72,6 +106,13 @@ impl fmt::Display for Ikev2WindowError {
             Self::Exhausted => "ike_committed_window_exhausted",
             Self::NoDurableWork => "ike_committed_window_no_durable_work",
             Self::StaleCompletion => "ike_committed_window_stale_completion",
+            Self::SyncInProgress => "ike_committed_window_sync_in_progress",
+            Self::SyncClosed => "ike_committed_window_sync_closed",
+            Self::SyncBackoff => "ike_committed_window_sync_backoff",
+            Self::SyncEntropy => "ike_committed_window_sync_entropy_failure",
+            Self::SyncUnavailable => "ike_committed_window_sync_unavailable",
+            Self::OutcomeUncertain => "ike_committed_window_outcome_uncertain",
+            Self::SyncRule(_) => "ike_committed_window_sync_rule_failure",
             Self::Iv(_) => "ike_committed_window_iv_failure",
         })
     }
@@ -113,6 +154,10 @@ pub struct Ikev2CommittedWindow {
     record: Ikev2CommittedWindowRecord,
     instance: Arc<()>,
     quiescent: bool,
+    observed_peer_request: Cell<Option<u32>>,
+    sync_live: bool,
+    sync_closed: bool,
+    sync_last_observed_unix_ms: Option<u64>,
 }
 
 impl Ikev2CommittedWindow {
@@ -120,15 +165,16 @@ impl Ikev2CommittedWindow {
     ///
     /// This creates no effect token. Stored outcomes are history for idempotent
     /// restoration by the consumer. Supply the latest fenced sending-IV record;
-    /// its exclusive end must cover the outbound request and inbound response IVs.
+    /// its exclusive end must cover locally sent cached IVs, initiating attempts
+    /// and the retained minimum in sync metadata even after caches are retired.
     /// Restore the IV allocator from that same record separately, discarding its
-    /// unconsumed tail. The cross-check detects inconsistency with cached packets,
+    /// unconsumed tail. The cross-check detects inconsistency with retained evidence,
     /// not rollback of both records or forgotten history. Writer fencing and
     /// trustworthy latest records remain caller obligations.
     /// # Errors
     /// Rejects mismatching domains, unauthentic packets, wrong directions/classes,
     /// response correlation failures, counters inconsistent with retained history,
-    /// or an IV high-water at or below any locally sent cached packet's IV.
+    /// or an IV high-water below the required retained sending-IV end.
     pub fn restore(
         expected: &Ikev2CommittedWindowDomain,
         profile: Ikev2SaInitCryptoProfile,
@@ -141,6 +187,15 @@ impl Ikev2CommittedWindow {
             return Err(Error::DomainMismatch);
         }
         expected.check(profile, keys)?;
+        if let Some(sync) = record.sync_state() {
+            sync.validate(record)?;
+            if iv_record.exclusive_end() < sync.minimum_send_iv_end() {
+                return Err(Error::InvalidRecord);
+            }
+        }
+        if let Some(recovery) = record.sync_recovery() {
+            recovery.validate_packets(record, profile, keys, iv_record.exclusive_end())?;
+        }
         for (entry, peer, next) in [
             (&record.outbound, false, record.next_send),
             (&record.inbound, true, record.next_receive),
@@ -176,6 +231,12 @@ impl Ikev2CommittedWindow {
             record: record.clone(),
             instance: Arc::new(()),
             quiescent: false,
+            observed_peer_request: Cell::new(None),
+            sync_live: false,
+            sync_closed: false,
+            sync_last_observed_unix_ms: record
+                .sync_recovery()
+                .map(|recovery| recovery.last_observed_unix_ms()),
         })
     }
 
@@ -200,9 +261,16 @@ impl Ikev2CommittedWindow {
 
     fn ready(&self) -> Result<(), Ikev2WindowError> {
         if self.quiescent {
-            Err(Ikev2WindowError::CommitUncertain)
-        } else {
-            Ok(())
+            return Err(Ikev2WindowError::CommitUncertain);
+        }
+        if self.sync_closed {
+            return Err(Ikev2WindowError::SyncClosed);
+        }
+        match self.record.sync_state().map(|state| state.disposition()) {
+            None | Some(Ikev2SyncDisposition::Continue) => Ok(()),
+            Some(Ikev2SyncDisposition::AwaitLocalSync) => Err(Ikev2WindowError::SyncInProgress),
+            Some(Ikev2SyncDisposition::OutcomeUncertain) => Err(Ikev2WindowError::OutcomeUncertain),
+            Some(Ikev2SyncDisposition::CloseIkeSa) => Err(Ikev2WindowError::SyncClosed),
         }
     }
     fn next_record(&self) -> Result<Ikev2CommittedWindowRecord, Ikev2WindowError> {
@@ -267,11 +335,16 @@ impl Ikev2CommittedWindow {
             outcome: None,
         });
         record.next_send = id.checked_add(1);
+        if let Some(sync) = &mut record.sync {
+            sync.highest_local_request = Some(id);
+        }
         Ok(self.prepared(record, None))
     }
 
     /// Classify an authenticated peer request against the exact window-one floor.
     ///
+    /// Returning `New` also retains its ID in the volatile synchronization drop
+    /// floor. It grants no effects and does not advance the ordinary receive floor.
     /// # Errors
     /// Drops wrong direction/domain, forward gaps, stale IDs and same-ID changed
     /// bytes. Stateless empty requests need a separate zero-write handler.
@@ -293,6 +366,11 @@ impl Ikev2CommittedWindow {
             return Ok(Ikev2OrdinaryRequestDisposition::CachedResponse);
         }
         if self.record.next_receive == Some(request.header.message_id) {
+            self.observed_peer_request.set(
+                self.observed_peer_request
+                    .get()
+                    .max(Some(request.header.message_id)),
+            );
             Ok(Ikev2OrdinaryRequestDisposition::New)
         } else {
             Err(Ikev2WindowError::Drop)
@@ -338,6 +416,9 @@ impl Ikev2CommittedWindow {
             outcome: Some(outcome.clone()),
         });
         record.next_receive = request.header.message_id.checked_add(1);
+        if let Some(sync) = &mut record.sync {
+            sync.highest_peer_request = Some(request.header.message_id);
+        }
         Ok(self.prepared(record, Some(outcome)))
     }
 
@@ -413,7 +494,7 @@ impl Ikev2CommittedWindow {
         &mut self,
         commit: Ikev2WindowCommit,
     ) -> Result<Option<Bytes>, Ikev2WindowError> {
-        if self.quiescent
+        if self.ready().is_err()
             || !Arc::ptr_eq(&self.instance, &commit.instance)
             || self.record.generation != commit.generation
         {
@@ -487,5 +568,20 @@ redacted_debug!(
     Ikev2CommittedWindow,
     Ikev2PreparedWindow<'_>,
     Ikev2WindowCommit,
-    Ikev2ExactReplay<'_>
+    Ikev2ExactReplay<'_>,
+    Ikev2SyncResponderRecord,
+    Ikev2AdmittedSyncResponse<'_>,
+    Ikev2PreparedSyncResponse<'_>,
+    Ikev2SyncCommit,
+    Ikev2SyncResponse,
+    Ikev2SyncClock,
+    Ikev2SyncRecoveryPolicy,
+    Ikev2SyncAttemptRecord,
+    Ikev2SyncRecoveryRecord,
+    Ikev2AdmittedSyncInitiation<'_>,
+    Ikev2PreparedSyncInitiation<'_>,
+    Ikev2SyncInitiatorCommit,
+    Ikev2SyncInitiatorAction,
+    Ikev2SyncReadiness,
+    Ikev2RuntimeSyncNegotiation
 );

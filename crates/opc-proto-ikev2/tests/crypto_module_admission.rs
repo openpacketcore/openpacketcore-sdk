@@ -186,6 +186,8 @@ struct CountingModule {
     provider_diagnostic: &'static str,
     protocol_msk_uses: AtomicUsize,
     panic_protocol_msk: AtomicBool,
+    sync_entropy_mode: AtomicU8,
+    sync_entropy_byte: AtomicU8,
 }
 
 impl CountingModule {
@@ -217,6 +219,8 @@ impl CountingModule {
             provider_diagnostic: HOSTILE_PROVIDER_DIAGNOSTIC,
             protocol_msk_uses: AtomicUsize::new(0),
             panic_protocol_msk: AtomicBool::new(false),
+            sync_entropy_mode: AtomicU8::new(0),
+            sync_entropy_byte: AtomicU8::new(0xa5),
         }
     }
 
@@ -335,6 +339,18 @@ impl IkeHashOperations for CountingModule {
 impl IkeEntropyOperations for CountingModule {
     fn fill_random(&self, output: &mut [u8]) -> Result<(), CryptoOperationError> {
         self.counts.entropy.fetch_add(1, Ordering::SeqCst);
+        match self.sync_entropy_mode.load(Ordering::SeqCst) {
+            1 => {
+                output.fill(self.sync_entropy_byte.load(Ordering::SeqCst));
+                return Ok(());
+            }
+            2 => {
+                return Err(CryptoOperationError::new(
+                    CryptoOperationErrorCode::OperationFailed,
+                ))
+            }
+            _ => {}
+        }
         self.operations.fill_random(output)
     }
 }
@@ -1847,4 +1863,238 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     ))
     .expect_err("the installed process slot must be immutable");
     assert_eq!(duplicate, Ikev2CryptoModuleInstallError::AlreadyInstalled);
+    initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(&module);
+}
+
+fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: &CountingModule) {
+    use opc_proto_ikev2::{
+        recovery::{
+            Ikev2CommittedWindow as Window, Ikev2CommittedWindowDomain as Domain,
+            Ikev2CommittedWindowRecord as Record, Ikev2SyncClock as Clock,
+            Ikev2SyncDisposition as Disposition, Ikev2SyncInitiatorAction as Action,
+            Ikev2SyncRecoveryPolicy as SyncPolicy, Ikev2SyncResponderRecord as SyncRecord,
+            Ikev2WindowError as Error,
+        },
+        Ikev2AesGcmIvAllocator as Allocator, Ikev2AesGcmIvLimits as Limits,
+        Ikev2AesGcmIvPurpose as Purpose, Ikev2AesGcmIvRecord as IvRecord,
+        Ikev2MessageIdSyncAgreement as Agreement, Ikev2MessageIdSyncMode as Mode,
+        Ikev2MessageIdSyncRole as Role, Ikev2MessageIdSyncSa as Sa, Ikev2SaInitKeyMaterial as Keys,
+    };
+    let profile = aead_profile();
+    let keys = Keys::from_established_keys(
+        profile,
+        false,
+        &[0x11; 32],
+        &[],
+        &[],
+        &[0x41; 20],
+        &[0x62; 20],
+        &[0x22; 32],
+        &[0x33; 32],
+    )
+    .unwrap();
+    let domain = Domain::new(
+        1,
+        2,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        profile,
+        &keys,
+    )
+    .unwrap();
+    let initial = Record::initial(domain.clone(), 1, 1);
+    let iv_record = IvRecord::from_persisted(
+        domain.send_iv_domain().clone(),
+        Limits::new(128, 2, 1, 2).unwrap(),
+        0,
+    )
+    .unwrap();
+    let window = Window::restore(&domain, profile, &keys, &initial, &iv_record).unwrap();
+    let all = module.capabilities();
+    for capability in [
+        CryptoCapability::ApprovedEntropy,
+        CryptoCapability::IkeEncryption,
+    ] {
+        let mut negotiation = window.sync_readiness(profile, &keys).unwrap().negotiate();
+        let before = module.counts.snapshot();
+        module.set_serviceable(all.without(capability));
+        assert!(matches!(
+            window.sync_readiness(profile, &keys),
+            Err(Error::SyncUnavailable)
+        ));
+        assert!(matches!(
+            negotiation.local_offer(),
+            Err(Error::SyncUnavailable)
+        ));
+        assert_eq!(module.counts.snapshot(), before);
+        module.set_serviceable(all);
+    }
+    let unadmitted = Ikev2SaInitCryptoProfile::new_aead(
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2DhGroup::Ecp256,
+        Ikev2EncryptionAlgorithm::AesGcm16_256,
+    )
+    .unwrap();
+    let other_keys = Keys::from_established_keys(
+        unadmitted,
+        false,
+        &[0x11; 32],
+        &[],
+        &[],
+        &[0x41; 36],
+        &[0x62; 36],
+        &[0x22; 32],
+        &[0x33; 32],
+    )
+    .unwrap();
+    let other_domain = Domain::new(
+        1,
+        2,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        unadmitted,
+        &other_keys,
+    )
+    .unwrap();
+    let other_record = Record::initial(other_domain.clone(), 1, 1);
+    let other_iv =
+        IvRecord::from_persisted(other_domain.send_iv_domain().clone(), iv_record.limits(), 0)
+            .unwrap();
+    let other = Window::restore(
+        &other_domain,
+        unadmitted,
+        &other_keys,
+        &other_record,
+        &other_iv,
+    )
+    .unwrap();
+    assert!(matches!(
+        other.sync_readiness(unadmitted, &other_keys),
+        Err(Error::SyncUnavailable)
+    ));
+    let agreement =
+        Agreement::from_persisted(Sa::new(1, 2, Role::Initiator).unwrap(), Mode::Negotiated);
+    let original = initial
+        .with_sync_state(
+            SyncRecord::from_persisted(agreement, None, None, None, None, Disposition::Continue, 0)
+                .unwrap(),
+        )
+        .unwrap();
+    let mut allocator = Allocator::restore(domain.send_iv_domain(), &iv_record).unwrap();
+    let block = allocator.prepare(8, Purpose::Ordinary).unwrap();
+    let iv_record = block.record().clone();
+    block.activate_after_commit(&iv_record).unwrap();
+    let policy = SyncPolicy::new(42, Clock::new(100, 7), 200, 3, 10).unwrap();
+    // Withdrawal makes zero provider calls; provider failure is exactly one admitted call.
+    for fail_provider in [false, true] {
+        let mut window = Window::restore(&domain, profile, &keys, &original, &iv_record).unwrap();
+        let admitted = window.begin_sync(policy, Clock::new(100, 7), None).unwrap();
+        if fail_provider {
+            module.sync_entropy_mode.store(2, Ordering::SeqCst);
+        } else {
+            module.set_serviceable(all.without(CryptoCapability::ApprovedEntropy));
+        }
+        let before = module.counts.snapshot();
+        assert!(matches!(
+            admitted.prepare(
+                profile,
+                &keys,
+                allocator.allocate(Purpose::Ordinary).unwrap()
+            ),
+            Err(Error::SyncEntropy)
+        ));
+        let after = module.counts.snapshot();
+        assert_eq!(after[1] - before[1], usize::from(fail_provider));
+        assert_eq!(after[4], before[4]);
+        assert_eq!(window.record(), &original);
+        assert!(matches!(
+            window.replay_request(),
+            Err(Error::CommitUncertain)
+        ));
+        module.set_serviceable(all);
+        module.sync_entropy_mode.store(0, Ordering::SeqCst);
+    }
+    let mut window = Window::restore(&domain, profile, &keys, &original, &iv_record).unwrap();
+    module.sync_entropy_mode.store(1, Ordering::SeqCst);
+    for (index, byte) in [(0, 0xa5), (1, 0xb6)] {
+        let now = Clock::new(100 + index * 10, 7);
+        module.sync_entropy_byte.store(byte, Ordering::SeqCst);
+        let before = module.counts.snapshot();
+        let admitted = if index == 0 {
+            window.begin_sync(policy, now, None).unwrap()
+        } else {
+            window.retry_sync(now).unwrap()
+        };
+        let prepared = admitted
+            .prepare(
+                profile,
+                &keys,
+                allocator.allocate(Purpose::Ordinary).unwrap(),
+            )
+            .unwrap();
+        let record = prepared.record().clone();
+        assert_eq!(
+            record
+                .sync_recovery()
+                .unwrap()
+                .pending()
+                .unwrap()
+                .notification()
+                .nonce(),
+            [byte; 4]
+        );
+        let token = prepared.commit_after_durable(&record, now).unwrap();
+        assert!(matches!(
+            window.release_sync_action(token, now).unwrap(),
+            Action::SendRequest(_)
+        ));
+        let after = module.counts.snapshot();
+        assert_eq!(after[1] - before[1], 1);
+        assert_eq!(after[4] - before[4], 1);
+    }
+    let stored = window.record().clone();
+    module.sync_entropy_byte.store(0xa5, Ordering::SeqCst); // First, not merely latest nonce.
+    let before = module.counts.snapshot();
+    let admitted = window.retry_sync(Clock::new(120, 7)).unwrap();
+    assert!(matches!(
+        admitted.prepare(
+            profile,
+            &keys,
+            allocator.allocate(Purpose::Ordinary).unwrap()
+        ),
+        Err(Error::SyncEntropy)
+    ));
+    let after = module.counts.snapshot();
+    assert_eq!(after[1] - before[1], 4);
+    assert_eq!(after[4], before[4]);
+    assert_eq!(window.record(), &stored);
+    assert!(matches!(
+        window.replay_request(),
+        Err(Error::CommitUncertain)
+    ));
+    let mut restored = Window::restore(&domain, profile, &keys, &stored, &iv_record).unwrap();
+    module.sync_entropy_byte.store(0xc7, Ordering::SeqCst);
+    let prepared = restored
+        .retry_sync(Clock::new(120, 7))
+        .unwrap()
+        .prepare(
+            profile,
+            &keys,
+            allocator.allocate(Purpose::Ordinary).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        prepared.record().sync_recovery().unwrap().attempts().len(),
+        3
+    );
+    assert_eq!(
+        prepared
+            .record()
+            .sync_recovery()
+            .unwrap()
+            .pending()
+            .unwrap()
+            .notification()
+            .nonce(),
+        [0xc7; 4]
+    );
+    module.sync_entropy_mode.store(0, Ordering::SeqCst);
 }

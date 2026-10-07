@@ -38,19 +38,23 @@ impl Ikev2AuthenticatedOrdinary {
     }
 
     pub(super) fn require_reserved_iv(&self, exclusive_end: u64) -> Result<(), Error> {
-        // This type contains only authenticated complete GCM SK packets, so the
-        // explicit IV immediately follows the fixed IKE and generic SK headers.
-        let start = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
-        let iv = self
-            .wire
-            .get(start..start + IKEV2_AES_GCM_EXPLICIT_IV_LEN)
-            .ok_or(Error::InvalidRecord)?;
-        let iv = u64::from_be_bytes(iv.try_into().map_err(|_| Error::InvalidRecord)?);
-        if iv >= exclusive_end {
+        if sending_iv_end(&self.wire)? > exclusive_end {
             return Err(Error::InvalidRecord);
         }
         Ok(())
     }
+}
+
+// Only for complete GCM SK packets already authenticated or sealed in this module.
+// This extracts evidence; it is never authentication or allocation authority.
+pub(super) fn sending_iv_end(wire: &[u8]) -> Result<u64, Error> {
+    let start = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
+    let iv = wire
+        .get(start..start + IKEV2_AES_GCM_EXPLICIT_IV_LEN)
+        .ok_or(Error::InvalidRecord)?;
+    u64::from_be_bytes(iv.try_into().map_err(|_| Error::InvalidRecord)?)
+        .checked_add(1)
+        .ok_or(Error::InvalidRecord)
 }
 
 pub(super) fn require_work(exchange: u8, payloads: PayloadChain<'_>) -> Result<(), Error> {

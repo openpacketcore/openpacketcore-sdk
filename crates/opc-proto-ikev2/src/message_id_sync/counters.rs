@@ -134,6 +134,26 @@ pub struct Ikev2MessageIdSyncPending {
 }
 
 impl Ikev2MessageIdSyncPending {
+    /// Rebuild a same-SA proposal from trusted latest persisted fields.
+    ///
+    /// This preserves wire data only. It grants no entropy, send or response
+    /// authority. The recovery runtime additionally validates attempt history,
+    /// floors, exact protected bytes and the original event budget. An uncertain
+    /// restored attempt must be superseded by a higher fresh proposal.
+    /// # Errors
+    /// Rejects counters at MAX, which cannot represent successful recovery.
+    pub fn from_persisted(
+        sa: Ikev2MessageIdSyncSa,
+        notification: Ikev2MessageIdSync,
+    ) -> Result<Self, Ikev2MessageIdSyncRuleError> {
+        if notification.expected_send_req_message_id() == u32::MAX
+            || notification.expected_recv_req_message_id() == u32::MAX
+        {
+            return Err(Ikev2MessageIdSyncRuleError::Drop);
+        }
+        Ok(Self { sa, notification })
+    }
+
     /// Return the proposed wire data, without authorizing its transmission.
     #[must_use]
     pub const fn notification(self) -> Ikev2MessageIdSync {

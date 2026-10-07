@@ -210,6 +210,18 @@ pub struct Ikev2MessageIdSyncAgreement {
 }
 
 impl Ikev2MessageIdSyncAgreement {
+    /// Rebuild an immutable mode from the latest trusted authenticated SA record.
+    ///
+    /// Persist the mode with that SA's keys, SPI pair and original role. This
+    /// constructor does not establish authentication or bilateral offer evidence;
+    /// callers must not relabel an existing negotiated SA as fallback or copy its
+    /// mode to unrelated keys. Durable recovery validates the SA binding against
+    /// its expected key-epoch domain before using the agreement.
+    #[must_use]
+    pub const fn from_persisted(sa: Ikev2MessageIdSyncSa, mode: Ikev2MessageIdSyncMode) -> Self {
+        Self { sa, mode }
+    }
+
     /// Return the SA binding.
     #[must_use]
     pub const fn sa(self) -> Ikev2MessageIdSyncSa {

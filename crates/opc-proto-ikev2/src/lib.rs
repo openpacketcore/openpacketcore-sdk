@@ -23,8 +23,9 @@
 //! self-verification, typed 3GPP DEVICE_IDENTITY,
 //! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
 //! RFC 6311 message-ID sync Notify codecs and IKE_AUTH support extraction
-//! (without a complete sync lifecycle), opt-in committed ordinary GCM windows
-//! with exact replay and finite, durably charged IV reservation retry ordering,
+//! with runtime-gated support offers, opt-in committed ordinary GCM windows
+//! with exact replay, durable initiating/responding sync cutovers, fixed recovery
+//! budgets and finite, durably charged IV reservation retry ordering,
 //! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
 //! KEYMAT, strict responder and initiator boundaries for opened IKE-SA rekey
