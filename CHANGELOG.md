@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-egress-fence-common`: add checked scope clock correlation and absolute
+  BOOTTIME deadline arithmetic, with explicit drift, suspend-error and validity
+  bounds. This opt-in time model does not authenticate permits or install a
+  packet gate; the existing cgroup fence ABI is unchanged.
+
 - `opc-proto-ikev2`: add opt-in committed ordinary GCM `SK` windows with
   authenticated response correlation, strict request admission and exact replay.
   Window restore requires the sending-IV reservation record and rejects a
