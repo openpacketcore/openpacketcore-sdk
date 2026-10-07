@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter recovery or persistence; ESP replay-counter synchronization is out of
   scope.
 
+- `opc-session-store`: add experimental quorum-side scope leases with
+  authenticated execution selection, acquire/renew, same-execution resume,
+  graceful release and immutable timed permits. Each operation is one native
+  command replacing a bounded scope checkpoint, with no receipt history per
+  renewal. Stable cluster scopes survive membership changes. Profile 2 requires
+  a fresh scope installation; child batches remain separate work. Refs #1134.
+  The custom key type `opc-scope-lease` is now reserved: consumer and roster
+  access is denied and consumer restore scans filter it.
+
 - `opc-consensus`: add optional connection compatibility through
   `ConsensusCompatibility`, `ConsensusCallResponse`,
   `ConsensusPeer::{with_compatibility, call_with_compatibility}` and

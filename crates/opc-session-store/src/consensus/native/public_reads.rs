@@ -72,6 +72,22 @@ impl ConsumerReceiptStore for ConsumerReceipts<'_> {
 }
 
 impl NativeState {
+    pub(crate) fn scope_lease_checkpoint(
+        &self,
+        identity: SessionConsensusIdentity,
+        scope: &crate::scope_lease::ScopeLeaseId,
+    ) -> Result<crate::sqlite::consensus::scope_lease::StoredCheckpoint, StoreError> {
+        let receipts = self.consumer_receipts()?;
+        let slot = scope.checkpoint_id().map_err(|_| unavailable())?;
+        let current = receipts
+            .outcome(identity, slot)
+            .map_err(|_| unavailable())?;
+        let key = scope.key().map_err(|_| unavailable())?;
+        let legacy = self.keys.get(&key).is_some_and(|row| row.record.is_some())
+            || receipts.fenced(identity, slot)?;
+        Ok((legacy, current))
+    }
+
     /// Passive test receipt witness from the selected native owner. No SQL
     /// materialization or consensus proposal participates in this observation.
     #[cfg(feature = "test-control")]

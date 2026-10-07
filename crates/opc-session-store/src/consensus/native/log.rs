@@ -176,7 +176,8 @@ impl NativeLog {
             };
             if !matches!(
                 intent,
-                SessionMutationIntent::AdvanceLogicalTime
+                SessionMutationIntent::ScopeLease(_)
+                    | SessionMutationIntent::AdvanceLogicalTime
                     | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
                     | SessionMutationIntent::VoidFencedTransitionV2(_)
                     | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }

@@ -62,6 +62,13 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
             intent => intent,
         };
         match intent {
+            SessionMutationIntent::ScopeLease(operation) => {
+                operation
+                    .validate()
+                    .map_err(|_| invalid("scope operation invalid"))?;
+                count = 1;
+                largest_payload = crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2;
+            }
             SessionMutationIntent::AdvanceLogicalTime => {}
             SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
                 count = 1;
@@ -211,6 +218,13 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
     }
     fn intent(value: &SessionMutationIntent, allow_authorized: bool) -> io::Result<usize> {
         match value {
+            SessionMutationIntent::ScopeLease(operation) => {
+                operation
+                    .validate()
+                    .map_err(|_| invalid("scope operation invalid"))?;
+                Ok(size_of::<crate::scope_lease::ScopeLeaseCommand>()
+                    + crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES)
+            }
             SessionMutationIntent::AdvanceLogicalTime => Ok(0),
             SessionMutationIntent::MaintainFencedTransitionV2History { .. } if allow_authorized => {
                 Ok(0)

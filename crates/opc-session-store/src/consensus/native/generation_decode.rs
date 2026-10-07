@@ -228,6 +228,21 @@ impl<'a> Cursor<'a> {
                     Ok(0)
                 }
                 3 => Ok(0),
+                10 => {
+                    // Appended ScopeLease outcome: only its one successful,
+                    // fixed-width checkpoint is persisted. Borrow the body
+                    // here; full decoding and slot validation follow after
+                    // reservation, just as for the other result families.
+                    if self.scalar::<u32>()? != 0 {
+                        return Err(invalid("scope failures cannot be persisted"));
+                    }
+                    let body: &str = self.scalar()?;
+                    let length = crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2;
+                    if body.len() != length {
+                        return Err(invalid("scope checkpoint width differs"));
+                    }
+                    Ok(length)
+                }
                 _ => Err(invalid(
                     "native generic result requires its versioned command codec",
                 )),

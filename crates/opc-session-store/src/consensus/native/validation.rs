@@ -124,6 +124,12 @@ pub(super) fn validate_generic(
     }
     changes::ordinary_payload(receipt)?;
     match &receipt.response.result {
+        Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) => checkpoint
+            .validate_slot(*id, receipt.payload_digest)
+            .map_err(|_| invalid("scope checkpoint slot differs"))?,
+        Ok(SessionMutationOutcome::ScopeLease(Err(_))) => {
+            return Err(invalid("scope failures are not retained"))
+        }
         Ok(SessionMutationOutcome::Lease(guard)) => guard
             .validate_profile()
             .map_err(|_| invalid("native generic lease invalid"))?,

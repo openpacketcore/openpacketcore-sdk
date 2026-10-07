@@ -110,6 +110,12 @@ fn intent(
 ) -> io::Result<SessionMutationIntent> {
     Ok(match value {
         SessionMutationIntent::AdvanceLogicalTime => SessionMutationIntent::AdvanceLogicalTime,
+        SessionMutationIntent::ScopeLease(operation) => {
+            operation
+                .validate()
+                .map_err(|_| invalid("scope operation invalid"))?;
+            SessionMutationIntent::ScopeLease(operation.clone())
+        }
         SessionMutationIntent::MaintainFencedTransitionV2History {
             expected_generation,
             expected_active_epoch,
@@ -456,6 +462,14 @@ pub(super) fn ordinary_response(
     use crate::backend::CompareAndSetResult;
     let result = match &value.result {
         Ok(SessionMutationOutcome::Unit) => Ok(SessionMutationOutcome::Unit),
+        Ok(SessionMutationOutcome::ScopeLease(result)) => {
+            if let Ok(checkpoint) = result {
+                checkpoint
+                    .state()
+                    .map_err(|_| invalid("scope checkpoint invalid"))?;
+            }
+            Ok(SessionMutationOutcome::ScopeLease(result.clone()))
+        }
         Ok(SessionMutationOutcome::Lease(value)) => {
             Ok(SessionMutationOutcome::Lease(lease(value)?))
         }

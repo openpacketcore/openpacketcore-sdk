@@ -1974,6 +1974,9 @@ impl SessionConsumerAuthorization {
     }
 
     fn permits_key(&self, key: &SessionKey) -> bool {
+        if crate::scope_lease::is_scope_lease_key(key) {
+            return false;
+        }
         let commitment =
             session_consumer_tenant_nf_fields_commitment(key.tenant.as_str(), key.nf_kind.as_str());
         self.allowed_scopes.contains(&commitment)
@@ -2134,6 +2137,9 @@ impl SessionConsumerRosterAuthorization {
     /// commitments or an allowed-scope enumeration.
     #[doc(hidden)]
     pub fn authorize_session_key(&self, key: &SessionKey) -> Result<(), SessionConsumerRejection> {
+        if crate::scope_lease::is_scope_lease_key(key) {
+            return Err(SessionConsumerRejection::Unauthorized);
+        }
         let commitment =
             session_consumer_tenant_nf_fields_commitment(key.tenant.as_str(), key.nf_kind.as_str());
         self.allowed_scopes
@@ -4185,6 +4191,46 @@ mod tests {
                 .authorize_operation(&SessionConsumerOperation::Watch { start_sequence: 77 }),
             Err(SessionConsumerRejection::Unauthorized),
             "a global sequence would reveal foreign-tenant mutation timing even after item filtering"
+        );
+    }
+
+    #[test]
+    fn scope_lease_records_are_reserved_from_ordinary_and_roster_consumers() {
+        let (authorization, ordinary) = authorization_fixture();
+        assert!(authorization
+            .authorize_operation(&SessionConsumerOperation::Get {
+                key: ordinary.clone()
+            })
+            .is_ok());
+        let reserved = SessionKey {
+            key_type: SessionKeyType::other("opc-scope-lease").unwrap(),
+            ..ordinary
+        };
+        for operation in [
+            SessionConsumerOperation::Get {
+                key: reserved.clone(),
+            },
+            SessionConsumerOperation::AcquireLease {
+                key: reserved.clone(),
+                owner: OwnerId::new("ordinary-consumer").unwrap(),
+                ttl: Duration::from_secs(10),
+            },
+            SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get {
+                    key: reserved.clone(),
+                }],
+            },
+        ] {
+            assert_eq!(
+                authorization.authorize_operation(&operation),
+                Err(SessionConsumerRejection::Unauthorized)
+            );
+        }
+        assert_eq!(
+            authorization
+                .roster_authorization()
+                .authorize_session_key(&reserved),
+            Err(SessionConsumerRejection::Unauthorized)
         );
     }
 

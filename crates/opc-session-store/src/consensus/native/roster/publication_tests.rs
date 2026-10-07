@@ -649,3 +649,81 @@ fn native_roster_publication_normal_command_maintains_and_captures_retirement() 
     assert_eq!(state.roster.witness.unwrap().retired_terminal_sequence(), 2);
     assert!(!state.keys[signed.authority.key()].reserved);
 }
+
+#[test]
+fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
+    use crate::scope_lease::{
+        ScopeClockBounds, ScopeLeaseCommand, ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest,
+    };
+    use crate::sqlite::consensus::native_roster_apply_fixture;
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut state = configured(&signed);
+    apply_logged(&mut state, &q1(&signed, 1));
+    apply_logged(&mut state, &q2(&signed, 2));
+    let binding = signed.admission.binding_key(1).unwrap();
+    let before = state.roster.rows[&binding].canonical().unwrap().to_vec();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scope-roster-parity.sqlite");
+    crate::sqlite::consensus::initialize_protected_roster_v2_recovery_fixture_with_members(
+        &path,
+        ProtectedRosterV2RecoveryFixtureState::Established,
+        state.members.clone(),
+    )
+    .unwrap();
+    let sql = Connection::open(&path).unwrap();
+    assert_eq!(sql_row(&sql, binding), before);
+    let due = signed
+        .authority
+        .acquired_at()
+        .add_seconds(1 + 24 * 60 * 60)
+        .unwrap();
+    let id = SessionConsensusRequestId::from_bytes([0xD3; 16]);
+    let scope = ScopeLeaseId::new(
+        signed.identity,
+        signed.authority.key().tenant.clone(),
+        signed.authority.key().nf_kind.clone(),
+        [1; 32],
+    )
+    .unwrap();
+    let mut scoped = entry(
+        &signed,
+        3,
+        id,
+        SessionMutationIntent::ScopeLease(Box::new(ScopeLeaseCommand {
+            request: ScopeLeaseRequest::new(
+                scope,
+                *id.as_bytes(),
+                0,
+                ScopeLeaseOperation::Select {
+                    execution: crate::scope_lease::tests::execution(1),
+                },
+            )
+            .unwrap(),
+            bounds: ScopeClockBounds::new(due, due).unwrap(),
+        })),
+    );
+    let EntryPayload::Normal(command) = &mut scoped.payload else {
+        unreachable!()
+    };
+    command.logical_time = due;
+    let native = apply_logged(&mut state, &scoped);
+    let sqlite = native_roster_apply_fixture(&path, signed.identity, vec![scoped]).unwrap();
+    assert_eq!(native.responses[0].result, sqlite.responses[0].result);
+    assert_eq!(sql_row(&sql, binding), before);
+    assert!(
+        state.roster.rows[&binding].canonical().unwrap() == before,
+        "a scope command must not perform another namespace's retention work"
+    );
+    let mut maintenance = ordinary(&signed, 4);
+    let EntryPayload::Normal(command) = &mut maintenance.payload else {
+        unreachable!()
+    };
+    command.logical_time = due;
+    apply_logged(&mut state, &maintenance);
+    native_roster_apply_fixture(&path, signed.identity, vec![maintenance]).unwrap();
+    assert!(state.roster.rows[&binding].facts.state == State::Tombstone);
+    assert_eq!(
+        state.roster.rows[&binding].canonical().unwrap(),
+        sql_row(&sql, binding)
+    );
+}

@@ -131,6 +131,7 @@ pub(in crate::consensus::native) struct Request {
     payload_digest: [u8; 32],
     pub(super) retained_until: Option<Timestamp>,
     response: Option<Response>,
+    scope: Option<crate::scope_lease::ScopeCheckpointFacts>,
 }
 
 impl Request {
@@ -144,6 +145,14 @@ impl Request {
             payload_digest,
             retained_until,
             response: row.response().map(Response::of).transpose()?,
+            scope: match row.response().map(|response| &response.result) {
+                Some(Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint)))) => Some(
+                    checkpoint
+                        .facts()
+                        .map_err(|_| invalid("scope catalog checkpoint invalid"))?,
+                ),
+                _ => None,
+            },
         })
     }
 
@@ -165,7 +174,22 @@ impl Request {
     }
 
     pub(super) fn validate_replacement(self, before: Self, changed: bool) -> io::Result<()> {
-        if before.payload_digest != self.payload_digest
+        if let (Some(next), Some(previous), Some(response), Some(old_response)) =
+            (self.scope, before.scope, self.response, before.response)
+        {
+            if next.can_replace(previous)
+                && self.retained_until.is_none()
+                && before.retained_until.is_none()
+                && response.sequence >= old_response.sequence
+                && response.raft_index >= old_response.raft_index
+                && response.logical_time >= old_response.logical_time
+            {
+                return Ok(());
+            }
+            return Err(invalid("native catalog scope checkpoint regressed"));
+        }
+        if self.scope.is_some() != before.scope.is_some()
+            || before.payload_digest != self.payload_digest
             || before.retained_until != self.retained_until
             || (changed
                 && !(self.retained_until.is_some()
