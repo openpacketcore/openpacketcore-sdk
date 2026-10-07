@@ -232,6 +232,17 @@ fn valid_sibling_notifies_do_not_cross_classification_or_ike_auth_support() {
     let (first, bytes) = chain(&[&REQUEST[4..]]);
     let opened = decode_ike_auth_cleartext_payloads(first, &bytes).unwrap();
     assert_eq!(opened.message_id_sync_supported(), Ok(None));
+
+    // Only support is counted: admitting both types to the aggregate filter
+    // would incorrectly report DuplicateSupport in either order.
+    for bodies in [
+        [&SUPPORT[4..], &REQUEST[4..]],
+        [&REQUEST[4..], &SUPPORT[4..]],
+    ] {
+        let (first, bytes) = chain(&bodies);
+        let opened = decode_ike_auth_cleartext_payloads(first, &bytes).unwrap();
+        assert!(opened.message_id_sync_supported().unwrap().is_some());
+    }
 }
 
 #[test]

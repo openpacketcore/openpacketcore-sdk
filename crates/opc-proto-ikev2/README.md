@@ -22,24 +22,48 @@ state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
 programming, bearer admission or allocation policy, carrier acceptance
 evidence, or a production ePDG control-plane stack.
 
-## Message-ID synchronization wire primitives
+## Message-ID synchronization primitives and pure rules
 
 `message_id_sync` provides RFC 6311 support and synchronization Notify codecs.
 `Ikev2NotifyPayloadBuild::message_id_sync_supported()` builds the IKE_AUTH
 advertisement; `Ikev2IkeAuthCleartextPayloads::message_id_sync_supported()`
 distinguishes absence from malformed or duplicate offers. Those errors are
-diagnostic: do not select sync or, as responder, advertise it, but do not fail
-IKE_AUTH solely because of an invalid offer. `Ikev2MessageIdSync`
+diagnostic non-offers: they cannot establish sync or authorize responder
+advertisement, and do not fail IKE_AUTH solely because of an invalid offer.
+They do not revoke evidence from an earlier valid EAP round. `Ikev2MessageIdSync`
 preserves the four-octet nonce and the sender-relative next-send/next-receive
 counters: M1/P1 in a request, P2/M2 in its response. Builders emit Protocol ID
 zero; receivers ignore that field for an empty SPI as RFC 7296 requires.
 
-These are wire primitives only. Advertisement is opt-in and requires a complete
-sync handler; responders may advertise only after an initiator offer, and both
-peers must advertise before using sync. Authentication, Message-ID-zero exchange
-admission, nonce matching, counter transitions, persistence, IV reservation and
-restart recovery are not implemented by these helpers. They neither generate
-random nonces nor synchronize ESP counters. See [CONFORMANCE.md](CONFORMANCE.md).
+`Ikev2MessageIdSyncNegotiation` accumulates valid offers across protected
+IKE_AUTH/EAP rounds. A ready initiator offers first; a responder waits for a
+valid initiator offer. Absent, malformed or duplicate offers contribute no new
+evidence. Only caller-confirmed full authentication and successful IKE_AUTH
+produce an `Ikev2MessageIdSyncAgreement`. Its mode is immutable, including after
+sync timeout. An authenticated same-peer IKE rekey can inherit the mode with a
+fresh SPI pair and new original role, transferring no counters or pending
+proposals. This inheritance is SDK policy still requiring peer qualification.
+
+The agreement's pure rules check SA/role binding, protected INFORMATIONAL
+headers, ID zero, a sole sync Notify and the exact response nonce. Counter
+inputs distinguish no prior request from ID zero, retain ordinary and sync
+history separately, and include a typed pending local proposal in simultaneous
+maxima. Responses map peer send/receive into local receive/send; neither a
+peer cutover nor a late response can roll back floors. A fresh proposal must
+exceed all known used/proposed local IDs. Received M1 at or below any observed
+peer ordinary request or accepted proposal silently drops, including duplicates.
+The non-normative Appendix A.2/A.3 tuples are arithmetic fixtures only: their
+stated histories drop under section 5.1. MAX-valued outcomes require rekey while
+an ordinary ID remains, or closure after local ID exhaustion; arithmetic never
+wraps. Rekey also requires an available ordinary window and IV budget.
+
+These values are not authentication or persistence authority. Callers must
+authenticate packets through the admitted IKE provider and supply same-SA
+history. No automatic advertisement, nonce generation, durable commit, packet
+protection, once-only response consumption or restart recovery is implemented.
+Production readiness requires complete runtime handling in both directions.
+ESP replay-counter synchronization is out of scope. See
+[CONFORMANCE.md](CONFORMANCE.md).
 
 ## NWu payload profiles
 
