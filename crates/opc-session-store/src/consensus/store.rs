@@ -1073,12 +1073,12 @@ fn protected_roster_profile_v2_capability_probe_reply(
 /// certificate lets later requests use normal Raft quorum availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FencedTransitionCapabilityAdmission {
-    Activated,
+    Activated { applied_log_index: u64 },
     FreshUnanimous,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum CapabilityActivationKind {
+pub(crate) enum CapabilityActivationKind {
     FencedTransitionV1,
     ProtectedRosterV1,
     ProtectedRosterV2,
@@ -4192,20 +4192,21 @@ impl ConsensusSessionStore {
         if !expected_scope.1.contains(&self.inner.local_node_id) {
             return Err(consensus_unavailable());
         }
-        let activated = self
+        let applied_log_index = self
             .inner
             .backend
-            .consensus_fenced_transition_activation_matches_scope(
+            .consensus_capability_activation_applied_index(
                 self.inner.storage_identity,
                 expected_scope.0,
                 expected_scope.1.clone(),
+                CapabilityActivationKind::FencedTransitionV1,
             )
             .await?;
-        if activated {
+        if let Some(applied_log_index) = applied_log_index {
             if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
                 return Err(consensus_unavailable());
             }
-            return Ok(FencedTransitionCapabilityAdmission::Activated);
+            return Ok(FencedTransitionCapabilityAdmission::Activated { applied_log_index });
         }
         let probes = expected_scope
             .1
@@ -4344,20 +4345,21 @@ impl ConsensusSessionStore {
         {
             return Err(unsupported_fenced_transition());
         }
-        if self
+        if let Some(applied_log_index) = self
             .inner
             .backend
-            .consensus_protected_roster_profile_activation_matches_scope(
+            .consensus_capability_activation_applied_index(
                 self.inner.storage_identity,
                 expected_scope.0,
                 expected_scope.1.clone(),
+                CapabilityActivationKind::ProtectedRosterV1,
             )
             .await?
         {
             if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
                 return Err(consensus_unavailable());
             }
-            return Ok(FencedTransitionCapabilityAdmission::Activated);
+            return Ok(FencedTransitionCapabilityAdmission::Activated { applied_log_index });
         }
         let profile_digest = crate::fenced_mutation_roster::profile_digest();
         let probes = expected_scope
@@ -4486,20 +4488,21 @@ impl ConsensusSessionStore {
         {
             return Err(unsupported_fenced_transition());
         }
-        if self
+        if let Some(applied_log_index) = self
             .inner
             .backend
-            .consensus_protected_roster_profile_v2_activation_matches_scope(
+            .consensus_capability_activation_applied_index(
                 self.inner.storage_identity,
                 expected_scope.0,
                 expected_scope.1.clone(),
+                CapabilityActivationKind::ProtectedRosterV2,
             )
             .await?
         {
             if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
                 return Err(consensus_unavailable());
             }
-            return Ok(FencedTransitionCapabilityAdmission::Activated);
+            return Ok(FencedTransitionCapabilityAdmission::Activated { applied_log_index });
         }
         let profile = crate::fenced_mutation_roster::Profile::v2();
         let probes = expected_scope
@@ -8312,6 +8315,11 @@ impl ConsensusSessionStore {
             None
         };
 
+        #[cfg(test)]
+        if activation_preflight {
+            activation_evidence::after_read_admit().await;
+        }
+
         if raw_v2_mutation {
             if let Err(reply) = self
                 .admit_raw_v2_mutation_on_local_leader_before(deadline)
@@ -8482,7 +8490,24 @@ impl ConsensusSessionStore {
                 fenced_activation_preflight,
                 capability,
             ) {
-                (true, false, false, FencedTransitionCapabilityAdmission::Activated) => {
+                (
+                    true,
+                    false,
+                    false,
+                    FencedTransitionCapabilityAdmission::Activated { applied_log_index },
+                )
+                | (
+                    false,
+                    true,
+                    false,
+                    FencedTransitionCapabilityAdmission::Activated { applied_log_index },
+                )
+                | (
+                    false,
+                    false,
+                    true,
+                    FencedTransitionCapabilityAdmission::Activated { applied_log_index },
+                ) => {
                     if self
                         .revalidate_fenced_transition_proposal_admission_before(
                             &admission,
@@ -8494,23 +8519,11 @@ impl ConsensusSessionStore {
                     {
                         return ForwardMutationReply::Unavailable;
                     }
-                    let applied_log_index = self
-                        .inner
-                        .raft
-                        .metrics()
-                        .borrow()
-                        .last_applied
-                        .as_ref()
-                        .map(|log_id| log_id.index)
-                        .filter(|index| *index != 0);
-                    return match applied_log_index {
-                        Some(applied_log_index) => {
-                            ForwardMutationReply::FencedTransitionActivation(Ok(
-                                FencedTransitionActivationReply { applied_log_index },
-                            ))
-                        }
-                        None => ForwardMutationReply::Unavailable,
-                    };
+                    // This index was observed with the exact certificate.
+                    // Openraft metrics can still precede that backend apply.
+                    return ForwardMutationReply::FencedTransitionActivation(Ok(
+                        FencedTransitionActivationReply { applied_log_index },
+                    ));
                 }
                 (true, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
                     request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
@@ -8520,36 +8533,6 @@ impl ConsensusSessionStore {
                             scope_identity,
                             &voters,
                         ),
-                    };
-                }
-                (false, true, false, FencedTransitionCapabilityAdmission::Activated) => {
-                    if self
-                        .revalidate_fenced_transition_proposal_admission_before(
-                            &admission,
-                            &request.required_consumer_scope,
-                            deadline,
-                        )
-                        .await
-                        .is_err()
-                    {
-                        return ForwardMutationReply::Unavailable;
-                    }
-                    let applied_log_index = self
-                        .inner
-                        .raft
-                        .metrics()
-                        .borrow()
-                        .last_applied
-                        .as_ref()
-                        .map(|log_id| log_id.index)
-                        .filter(|index| *index != 0);
-                    return match applied_log_index {
-                        Some(applied_log_index) => {
-                            ForwardMutationReply::FencedTransitionActivation(Ok(
-                                FencedTransitionActivationReply { applied_log_index },
-                            ))
-                        }
-                        None => ForwardMutationReply::Unavailable,
                     };
                 }
                 (false, true, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
@@ -8563,36 +8546,6 @@ impl ConsensusSessionStore {
                             &voters,
                         ),
                         profile_digest: profile.digest(),
-                    };
-                }
-                (false, false, true, FencedTransitionCapabilityAdmission::Activated) => {
-                    if self
-                        .revalidate_fenced_transition_proposal_admission_before(
-                            &admission,
-                            &request.required_consumer_scope,
-                            deadline,
-                        )
-                        .await
-                        .is_err()
-                    {
-                        return ForwardMutationReply::Unavailable;
-                    }
-                    let applied_log_index = self
-                        .inner
-                        .raft
-                        .metrics()
-                        .borrow()
-                        .last_applied
-                        .as_ref()
-                        .map(|log_id| log_id.index)
-                        .filter(|index| *index != 0);
-                    return match applied_log_index {
-                        Some(applied_log_index) => {
-                            ForwardMutationReply::FencedTransitionActivation(Ok(
-                                FencedTransitionActivationReply { applied_log_index },
-                            ))
-                        }
-                        None => ForwardMutationReply::Unavailable,
                     };
                 }
                 (false, false, true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
@@ -8612,7 +8565,7 @@ impl ConsensusSessionStore {
                         voter_set_digest,
                     };
                 }
-                (false, false, false, FencedTransitionCapabilityAdmission::Activated) => {}
+                (false, false, false, FencedTransitionCapabilityAdmission::Activated { .. }) => {}
                 _ => return ForwardMutationReply::Unavailable,
             }
             Some(admission)

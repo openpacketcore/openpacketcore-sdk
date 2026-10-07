@@ -236,6 +236,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlines, avoiding a spurious transport failure before request admission.
   Fixes #1098.
 
+- `opc-session-store`: bind startup capability acknowledgments to the applied
+  index observed with the exact backend certificate. Concurrent voter
+  activation now waits for the certificate even when Raft metrics publication
+  lags application, covering fenced transitions and both protected-roster
+  profiles. Fixes #1111.
+
 - `opc-persist`: admit returning configuration voters with a majority whose
   compatibility is proved on authenticated connections, including the local
   voter. Reverify reconnects and reject incompatible engine traffic before

@@ -50,7 +50,7 @@ use crate::backend::{
 use crate::capability::BackendCapabilities;
 use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES};
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
-use crate::consensus::store::ConsensusStoreDiagnosticCounters;
+use crate::consensus::store::{CapabilityActivationKind, ConsensusStoreDiagnosticCounters};
 use crate::consensus::types::{
     fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
     protected_roster_profile_v2_voter_set_digest, protected_roster_profile_voter_set_digest,
@@ -5864,6 +5864,8 @@ pub(crate) struct SqliteConsensusCore {
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
+    pub(crate) apply_publication_gate: Arc<crate::consensus::snapshot::SnapshotArtifactGate>,
+    #[cfg(test)]
     pub(crate) snapshot_capture_gate: Arc<SnapshotCaptureGate>,
 }
 
@@ -6633,6 +6635,8 @@ impl SqliteConsensusCore {
             watchers: Arc::clone(&backend.watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
+            #[cfg(test)]
+            apply_publication_gate: Arc::clone(&backend.consensus_apply_publication_gate),
             #[cfg(test)]
             snapshot_capture_gate: Arc::clone(&backend.consensus_snapshot_capture_gate),
         };
@@ -17056,6 +17060,61 @@ fn activate_protected_roster_profile_v2_scope_sync(
 }
 
 impl SqliteSessionBackend {
+    /// Observe the exact certificate and a covering applied index in one
+    /// backend snapshot. Openraft's metrics may lag state-machine application
+    /// and therefore cannot supply this acknowledgment's replication barrier.
+    pub(crate) async fn consensus_capability_activation_applied_index(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+        scope_identity: SessionConsensusIdentity,
+        voters: BTreeSet<SessionConsensusNodeId>,
+        activation: CapabilityActivationKind,
+    ) -> Result<Option<u64>, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(invalid_data("native activation storage identity differs"));
+                }
+                let activated = match activation {
+                    CapabilityActivationKind::FencedTransitionV1 => {
+                        state.v1_activation_matches(scope_identity, &voters)
+                    }
+                    CapabilityActivationKind::ProtectedRosterV1 => {
+                        state.protected_roster_activation_matches(scope_identity, &voters)
+                    }
+                    CapabilityActivationKind::ProtectedRosterV2 => {
+                        state.protected_roster_v2_activation_matches(scope_identity, &voters)
+                    }
+                };
+                if !activated {
+                    return Ok(None);
+                }
+                state
+                    .applied()
+                    .map(|log_id| log_id.index)
+                    .filter(|index| *index != 0)
+                    .map(Some)
+                    .ok_or_else(|| invalid_data("activation certificate has no applied index"))
+            })
+        }) {
+            return result.map_err(|_| super::native::unavailable());
+        }
+        self.run_store_sqlite_task(super::SqliteStoreWorkKind::Read, move |conn| {
+            capability_activation_applied_index_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+                activation,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable("capability activation is unavailable".into())
+            })
+        })
+        .await
+    }
+
     /// Read only the independent protected-roster V2 activation certificate.
     /// This lives here so the consensus adapter can expose the additive
     /// profile without changing the frozen V1 backend method surface.
@@ -17093,6 +17152,54 @@ impl SqliteSessionBackend {
         })
         .await
     }
+}
+
+fn capability_activation_applied_index_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    activation: CapabilityActivationKind,
+) -> io::Result<Option<u64>> {
+    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    let activated = match activation {
+        CapabilityActivationKind::FencedTransitionV1 => {
+            fenced_transition_activation_matches_scope_sync(
+                &tx,
+                storage_identity,
+                scope_identity,
+                voters,
+            )?
+        }
+        CapabilityActivationKind::ProtectedRosterV1 => {
+            protected_roster_profile_activation_matches_scope_sync(
+                &tx,
+                storage_identity,
+                scope_identity,
+                voters,
+            )?
+        }
+        CapabilityActivationKind::ProtectedRosterV2 => {
+            protected_roster_profile_v2_activation_matches_scope_sync(
+                &tx,
+                storage_identity,
+                scope_identity,
+                voters,
+            )?
+        }
+    };
+    let applied_log_index = if activated {
+        Some(
+            read_applied_sync(&tx, storage_identity)?
+                .map(|log_id| log_id.index)
+                .filter(|index| *index != 0)
+                .ok_or_else(|| invalid_data("activation certificate has no applied index"))?,
+        )
+    } else {
+        None
+    };
+    tx.commit().map_err(db_error)?;
+    Ok(applied_log_index)
 }
 
 fn fenced_transition_activation_voter_set_digest_matches_scope(
@@ -40358,6 +40465,7 @@ pub(crate) mod historical_snapshot_fixture;
 
 #[cfg(test)]
 mod tests {
+    mod activation_ack;
     #[path = "scope_lease.rs"]
     mod scope_lease_tests;
     #[cfg(target_os = "linux")]

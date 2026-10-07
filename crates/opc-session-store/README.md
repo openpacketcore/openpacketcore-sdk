@@ -527,6 +527,11 @@ Normal startup must still establish each capability that consumers require.
 V1 fenced-transition activation and V2 profile activation are independent;
 planned retirement does not manufacture a missing activation certificate.
 A new store incarnation must separately regain consensus admission.
+Activation acknowledgments carry an applied index observed with the exact
+backend certificate. A starting or returning voter waits for that index and
+checks its own certificate before activation succeeds, including when Raft
+metrics publication lags application. Concurrent activation requires no
+operator intervention and retains the existing operation deadline.
 
 After preparation completes and the RPC handler is removed,
 `shutdown()` joins the active consensus engine and every storage owner, drains

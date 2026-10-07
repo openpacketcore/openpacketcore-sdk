@@ -5321,6 +5321,8 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 self.core.applied_progress.send_replace(Some(last_applied));
             }
             notify_watchers(&self.core, &applied.notifications).await;
+            #[cfg(test)]
+            self.core.apply_publication_gate.block_if_armed().await;
             return Ok(applied.responses);
         }
         let applied = {
@@ -5375,6 +5377,8 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             self.core.applied_progress.send_replace(Some(last_applied));
         }
         notify_watchers(&self.core, &applied.notifications).await;
+        #[cfg(test)]
+        self.core.apply_publication_gate.block_if_armed().await;
         Ok(applied.responses)
     }
 
