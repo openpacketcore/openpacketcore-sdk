@@ -13,6 +13,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BOOTTIME deadline arithmetic, with explicit drift, suspend-error and validity
   bounds. This opt-in time model does not authenticate permits or install a
   packet gate; the existing cgroup fence ABI is unchanged.
+- `opc-proto-ikev2`: add initiating RFC 6311 sync for complete GCM `SK`, with
+  admitted fresh nonces, persisted exact proposals, at most three attempts,
+  fixed deadlines/clock epochs and response-result commits before ordinary
+  traffic resumes. Restore requires higher fresh retries and validates all
+  attempt history/IVs; simultaneous peer cutovers merge monotonically. Late or
+  stepped request acknowledgements release no bytes; results admitted in time
+  remain recovered once committed. Any pending sync window can commit closure.
+  Runtime readiness provides the production support-offer path and authenticated
+  negotiation. The DPD
+  restriction, fragmented/CBC recovery and composed qualification remain open.
+
+- `opc-proto-ikev2`: add opt-in authenticated responding RFC 6311 sync for GCM
+  `SK`, with persisted agreement/history and a committed ordinary-window cutover
+  before releasing a nonce-echoing reply. Duplicate proposals drop across restart;
+  simultaneous local proposal floors merge monotonically, and pending mutations
+  become `OutcomeUncertain` with scoped IKE/Child cleanup. Reply permissions are
+  runtime/generation-bound and never enter ordinary replay caches. Reservation
+  work uses the existing bounded retry guard; callers must choose Ordinary IVs.
+  Cutovers retain a minimum sending-IV end after clearing caches, and ordinary
+  request admission automatically updates volatile sync-drop history. Initiating sync and advertisement
+  are separate hooks; fragmented/CBC recovery and the DPD receive high-water
+  remain open. This is not a complete restart-recovery lifecycle.
 
 - `opc-proto-ikev2`: add opt-in committed ordinary GCM `SK` windows with
   authenticated response correlation, strict request admission and exact replay.
@@ -25,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charges, positive backoff and fixed operation deadlines, with no reserve-ahead
   and at most three fresh-block attempts across restart. Storage, fencing, clock
   continuity and operation semantics remain caller obligations. Fragmented/CBC
-  recovery, sync lifecycle, canonical replies and complete restart recovery are
+  recovery, canonical replies and complete restart recovery are
   not enabled.
 
 - `opc-proto-ikev2`: add ordinary GCM IV reservation records and

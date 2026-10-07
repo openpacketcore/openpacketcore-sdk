@@ -62,7 +62,8 @@ authenticate packets through the admitted IKE provider and supply same-SA
 history. No automatic advertisement, nonce generation, durable commit, packet
 protection, once-only response consumption or restart recovery is implemented
 by the pure rules. Ordinary GCM IV reservation ordering is described below.
-Production readiness requires complete runtime handling in both directions.
+Production offers use the runtime readiness path described below, after the
+consumer wires both handlers and their persistence/clock contracts.
 ESP replay-counter synchronization is out of scope. See
 [CONFORMANCE.md](CONFORMANCE.md).
 
@@ -111,7 +112,7 @@ Each allocated token is consumed by `seal`, which checks the actual header,
 profile, key and salt and calls the existing admitted crypto module. Dropping a
 token or failing to seal burns its IV. Exact-byte retransmission needs no new
 allocation. Reserve blocks during initial key setup or state-changing work;
-DPD, keepalives and empty responses must not initiate reservation writes.
+DPD, keepalives and replies to empty requests must not initiate reservation writes.
 The allocator alone provides no durable Message-ID admission or exchange commit.
 The opt-in `recovery` module below adds those ordering hooks; canonical replies
 and a complete restart-recovery lifecycle remain separate. CBC is unchanged.
@@ -121,8 +122,8 @@ and a complete restart-recovery lifecycle remain separate. CBC is unchanged.
 `recovery::Ikev2CommittedWindow` is an opt-in window-one profile for complete,
 unfragmented AES-GCM `SK` packets. It uses the admitted crypto module, binds both
 sending and receiving keys/salts plus the SPI pair and original role, and works
-with all three supported GCM key sizes. `SKF`, CBC recovery, synchronization,
-canonical empty replies and receive-floor reconstruction are not enabled here.
+with all three supported GCM key sizes. `SKF`, CBC recovery, canonical empty
+replies and receive-floor reconstruction are not enabled here.
 Existing generic crypto and fragmentation APIs retain their separate contracts.
 
 Commit an initial `Ikev2CommittedWindowRecord` with the new key epoch and correct
@@ -181,6 +182,174 @@ so the peer's next request would be dropped as a forward gap and the SA would
 stall. Keepalives remain outside IKE windows.
 This limitation applies in both recovery modes; negotiation alone grants no
 fresh-DPD bypass.
+
+### Responding to negotiated RFC 6311 synchronization
+
+Attach `Ikev2SyncResponderRecord` to the trusted window record with
+`with_sync_state`, and persist it atomically with all other SA/window fields.
+It retains the immutable agreement, known ordinary/proposal history and ordinary
+traffic disposition. `Ikev2MessageIdSyncAgreement::from_persisted` rebuilds an
+already authenticated agreement; it does not establish bilateral offers or let a
+consumer change modes. Window restore binds its original role and SPI pair to
+the expected key domain and checks history against floors and cached requests.
+Never omit existing sync metadata during readback or relabel unknown history.
+For a generation-zero window, seed each highest ordinary-request ID from its
+completed handshake floor minus one; use `None` only when that floor is zero.
+The trusted constructors do not infer missing handshake history. The enclosing
+stored format must require all persisted sync/recovery fields: omitting
+`with_sync_state` can produce a structurally valid ordinary-only record and is
+not detected by these hooks.
+
+Call `begin_sync_response` before allocating an IV or creating reservation work.
+It authenticates complete peer GCM `SK` packets through the admitted provider and
+requires negotiated mode, the matching SA/original direction, INFORMATIONAL
+request at ID zero, and exactly one sync Notify. Bad, unnegotiated and duplicate
+requests drop without freezing the window or allocating an IV. Both original
+roles can respond. `SKF` and CBC recovery remain unsupported.
+
+Admission returns an exclusive capability and freezes ordinary work. The caller
+must supply `prepare` a committed single-use **Ordinary** IV allocation to seal
+the fixed nonce-echoing P2/M2 reply; it does not reserve a block. When a new block
+is necessary, use the bounded reservation guard below with the same recovery
+operation, fixed deadline/backoff and at most three fresh-block attempts across
+restart. Allocation tokens carry no purpose: supplying **Control** would spend
+the rekey/Delete reserve. Persist one guard identity per SA key epoch and peer
+recovery event with the enclosing window state, and reuse it for every
+re-admission until a cutover lands. A `Closed` guard permits no reply; the peer's
+own recovery budget then decides its SA's fate. A duplicate packet cannot
+manufacture a new operation or replenish that budget.
+
+Persist `Ikev2PreparedSyncResponse::record()` and the consumer's operation
+dispositions together, then acknowledge the exact record with
+`commit_after_durable`. Consume its one-use token with `release_sync_response`
+before any later commit. Only this releases reply bytes and disposition.
+The cutover commits new floors, the highest accepted peer M1 and a new ordinary
+generation; it retires ordinary replay caches and fences old completion tokens.
+Its `minimum_send_iv_end` retains the largest locally sent cached/attempt/reply
+IV plus one across successive cutovers. Persist and restore this field even
+when the caches are empty; window restore refuses a lower sending-IV record.
+Rolling back both records together remains undetectable.
+Below-window, above-window and retired cached requests cannot bypass the newly
+declared receive window. Preserve already committed outcomes as idempotent
+consumer history in the same durable SA state.
+
+The responder does not wait for pending network replies. Pending outbound work
+is detected from the ordinary window; identify any admitted, uncommitted inbound
+operation through `pending_inbound`. Such work becomes `OutcomeUncertain`, which
+blocks ordinary traffic and requires idempotent scoped cleanup of this IKE SA and
+its Children. It never reports application success or permits retrying the
+mutation under a new ID. A simultaneous local `Ikev2MessageIdSyncPending` instead
+contributes its declared floors and retains `AwaitLocalSync` until the initiating
+lifecycle completes. When initiating history is attached, the responder uses its
+durable pending proposal automatically; an explicit argument must match it.
+Omitting the argument cannot unblock that state or discard its floors.
+The terminal window currently releases cleanup disposition only and has no
+Delete preparation path. Local-only closure leaves the peer to its own liveness
+or expiry, or the consumer's base-protocol invalid-SPI handling. Composed recovery
+qualification must decide whether to add one narrowly committed Delete using
+Control headroom or keep that local-only policy.
+
+Cancellation, failed sealing or uncertain/mismatching commitment leaves the
+window quiescent. Fence/settle old writes and restore the latest window and IV
+records; discard the unused IV tail. A landed cutover never recreates its reply
+permission. Sync replies are not cached: M1 at or below known peer ordinary or
+accepted-proposal history drops, even with a different nonce or after restart.
+Lost replies require the peer's higher fresh proposal.
+
+The drop floor deliberately excludes a peer's response P2 as a separate bound.
+A request withheld during simultaneous sync can therefore remain admissible
+before ordinary peer progress, but counter adoption only moves forward. This can
+trigger scoped cleanup if new mutations are pending. A minimal proposal M1 = P2
+remains admissible unless actual ordinary/proposal history rejects it.
+`request_disposition(New)` automatically retains the authenticated request's ID
+in the volatile sync drop floor. The consumer need not call an observer for this
+safety check. `observe_request_for_sync` also records an expected authenticated
+empty request; neither path grants a reply, liveness or ordinary receive-floor
+advancement. Any later reconstruction handler must add its admitted IDs too.
+After restart, empty requests answered only in memory cannot contribute to the
+drop floor. The DPD restriction above still applies.
+
+### Initiating negotiated RFC 6311 synchronization
+
+`begin_sync` admits one genuine local recovery event after pending ordinary
+mutations have been resolved. Identify admitted, uncommitted inbound work through
+`pending_inbound`; pending outbound work is detected from the window. Either
+refuses local initiation. Peer-initiated sync keeps the different interruption
+policy described above. Invalid packets, silence and replays cannot create an
+event. Consumer event identities increase within the same key epoch.
+
+Fix an `Ikev2SyncRecoveryPolicy` with that identity, original clock sample,
+exclusive deadline, positive retry delay and at most three proposals total.
+Admission freezes ordinary traffic before allocation. Its `prepare` generates a
+four-octet nonce only through the admitted module's entropy service, checks up to
+four draws against every nonce in this event's bounded history, and seals with a
+committed **Ordinary** IV allocation. It accepts no consumer nonce or RNG. Use the
+same event's bounded reservation guard when another block is needed; failed
+proposal writes never refund fresh-block charges.
+Choosing Ordinary remains the caller's obligation here too; the token carries
+no allocation purpose.
+
+Persist the complete `Ikev2PreparedSyncInitiation::record()` atomically, including
+the attempt count, pending proposal, exact protected request, clock/policy and
+`AwaitLocalSync` disposition. Acknowledge with `commit_after_durable(record, clock)`
+using a fresh clock sample, then consume its token through `release_sync_action`.
+Only `SendRequest` releases request bytes. Stored-byte accessors are serialization
+inputs, not send authority. Releasing a request rechecks the deadline.
+
+`complete_sync` authenticates the current live proposal's response, exact nonce,
+SA/role/class and non-undercutting counters. It merges component-wise maxima
+with concurrent peer cutovers. Commit that result before ordinary traffic resumes.
+A result admitted within the deadline stays `Recovered` when its commit lands,
+even if storage acknowledges after expiry or a clock step; restore reaches the
+same disposition. The acknowledgement clock check applies only to `SendRequest`.
+RFC 6311 §8.1 uses strict mode: every ordinary
+request, response, replay and completion is blocked while local sync is pending;
+after completion only the committed ordinary window is admitted. Old caches and
+completion permissions cannot bypass it. `Recovered` is counter synchronization,
+not application-mutation success or repeatable liveness evidence.
+
+Request loss, response loss and uncertain restoration use `retry_sync` after the
+original positive delay: a higher M1, fresh nonce and new IV-backed bytes, within
+the same count and deadline. No exact sync retransmission API is exposed. Restore
+preserves all consumed attempts but grants neither old send permission nor old
+response-completion authority; a higher fresh proposal is required. The responder
+can still merge that persisted pending proposal during simultaneous sync.
+Trusted pending/attempt/recovery constructors validate history and floors;
+window restoration authenticates all stored attempts and checks nonce/packet
+identity, increasing IVs and the sending-IV high-water. Never omit existing
+recovery fields or replace the policy on readback.
+
+`Ikev2SyncClock` names UTC milliseconds since the Unix epoch, with CLOCK_REALTIME
+semantics and a persistent clock-continuity epoch. The consumer's clock service
+changes that epoch on a step in either direction or unknown continuity across
+restart. A changed epoch, observed rollback, expiry or exhausted budget closes
+the event; it never extends time or selects fallback. Schedule
+`check_sync_deadline` even without incoming traffic. Pass epoch mismatch as the
+reservation guard's clock-step indication, retaining its original deadline.
+
+`close_sync` commits terminal IKE/Child cleanup before releasing `CloseIkeSa`.
+It can abandon any `AwaitLocalSync` window, including one entered through a pure
+pending proposal without an initiating record. A late or stepped request
+acknowledgement adopts the landed proposal but latches closure and emits no
+request. Retain expiry/step decisions for pending events across crashes and
+readback, and finish idempotent closure. A landed `Recovered` result needs no
+additional closure write due to acknowledgement latency or a later clock step.
+Uncertain writes still require fencing and latest readback before any retry.
+
+### Runtime readiness for support offers
+
+Before IKE_AUTH, a fresh initial GCM window can mint `Ikev2SyncReadiness` with
+`sync_readiness`. It checks the key domain/profile and current admitted encryption
+and entropy. Consume it with `negotiate`; `local_offer` rechecks admission and
+emits support only under the original-role/EAP offer rules. `observe_peer` takes
+an authenticated same-domain ordinary packet, and `finish` still requires the
+consumer's full IKE_AUTH authentication result. Active/negotiated windows cannot
+mint new handshake readiness. The pure `locally_ready` boolean and generic Notify
+builders do not replace this production path.
+
+This capability covers the two complete-GCM sync handlers. It does not establish
+consumer storage correctness, DPD support, fragmented/CBC recovery or complete
+restart-recovery qualification. The DPD restriction above remains in force.
 
 ### Bounded IV reservation attempts
 

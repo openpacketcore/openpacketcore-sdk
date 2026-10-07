@@ -5,12 +5,15 @@ use opc_proto_ikev2::{
         Ikev2CommittedExchangeRecord as ExchangeRecord, Ikev2CommittedWindow as Window,
         Ikev2CommittedWindowDomain as Domain, Ikev2CommittedWindowRecord as Record,
         Ikev2OrdinaryRequestDisposition as Disposition, Ikev2PreparedWindow as Prepared,
+        Ikev2SyncDisposition as SyncDisposition, Ikev2SyncResponderRecord as SyncRecord,
         Ikev2WindowCommit as Commit, Ikev2WindowError as Error,
     },
     seal_ikev2_sa_init_protected_payload, Ikev2AesGcmIvAllocator as Allocator,
     Ikev2AesGcmIvLimits as Limits, Ikev2AesGcmIvPurpose as Purpose,
     Ikev2AesGcmIvRecord as IvRecord, Ikev2DhGroup, Ikev2EncryptionAlgorithm as Encryption,
-    Ikev2ExchangeKind as Exchange, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadDirection as Direction,
+    Ikev2ExchangeKind as Exchange, Ikev2MessageIdSyncAgreement as Agreement,
+    Ikev2MessageIdSyncMode as Mode, Ikev2MessageIdSyncRole as Role, Ikev2MessageIdSyncSa as Sa,
+    Ikev2PrfAlgorithm, Ikev2ProtectedPayloadDirection as Direction,
     Ikev2SaInitCryptoProfile as Profile, Ikev2SaInitKeyMaterial as Keys,
     Ikev2SaInitProtectedPayloadProvider as Provider, Message, PayloadChain, PayloadType,
     ProtectedPayloadKind, ProtectedPayloadSealContext,
@@ -223,6 +226,244 @@ fn commit(prepared: Prepared<'_>) -> (Record, Commit) {
 }
 fn iv(packet: &[u8]) -> u64 {
     u64::from_be_bytes(packet[32..40].try_into().unwrap())
+}
+
+fn window_agreement(fixture: &Fixture, mode: Mode) -> Agreement {
+    let role = if fixture.direction == DIRECTIONS[0] {
+        Role::Initiator
+    } else {
+        Role::Responder
+    };
+    Agreement::from_persisted(Sa::new(0x101, 0x202, role).unwrap(), mode)
+}
+
+#[test]
+fn sync_metadata_round_trips_and_ordinary_commits_retain_request_history() {
+    for direction in DIRECTIONS {
+        let fixture = Fixture::new(ENCRYPTIONS[0], direction);
+        let metadata = SyncRecord::from_persisted(
+            window_agreement(&fixture, Mode::Negotiated),
+            None,
+            None,
+            None,
+            None,
+            SyncDisposition::Continue,
+            0,
+        )
+        .unwrap();
+        let initial = Record::initial(fixture.domain.clone(), 0, 0)
+            .with_sync_state(metadata)
+            .unwrap();
+        let mut window = fixture.restore(&initial);
+        let mut allocator = fixture.allocator();
+        let (record, _) = commit(
+            window
+                .prepare_request(
+                    fixture.profile,
+                    &fixture.keys,
+                    allocator.allocate(Purpose::Ordinary).unwrap(),
+                    Exchange::CreateChildSa,
+                    delete(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            record.sync_state().unwrap().highest_local_request(),
+            Some(0)
+        );
+        assert_eq!(record.sync_state().unwrap().highest_peer_request(), None);
+        let peer = fixture.peer(0, false, Exchange::Informational, delete(), 100);
+        let peer = window
+            .open_peer(fixture.profile, &fixture.keys, &peer)
+            .unwrap();
+        let (record, _) = commit(
+            window
+                .prepare_response(
+                    fixture.profile,
+                    &fixture.keys,
+                    allocator.allocate(Purpose::Ordinary).unwrap(),
+                    &peer,
+                    empty(),
+                    Bytes::from_static(b"committed"),
+                )
+                .unwrap(),
+        );
+        let state = record.sync_state().unwrap();
+        assert_eq!(state.highest_local_request(), Some(0));
+        assert_eq!(state.highest_peer_request(), Some(0));
+        let rebuilt_state = SyncRecord::from_persisted(
+            Agreement::from_persisted(state.agreement().sa(), state.agreement().mode()),
+            state.highest_local_request(),
+            state.highest_peer_request(),
+            state.highest_local_proposal(),
+            state.highest_peer_proposal(),
+            state.disposition(),
+            state.minimum_send_iv_end(),
+        )
+        .unwrap();
+        let rebuilt = Record::from_persisted(
+            record.domain().clone(),
+            record.generation(),
+            record.next_send(),
+            record.next_receive(),
+            record.outbound().cloned(),
+            record.inbound().cloned(),
+        )
+        .unwrap()
+        .with_sync_state(rebuilt_state)
+        .unwrap();
+        assert_eq!(fixture.restore(&rebuilt).record(), &record);
+        assert!(record.clone().with_sync_state(rebuilt_state).is_err());
+        let missing_history = SyncRecord::from_persisted(
+            state.agreement(),
+            None,
+            None,
+            None,
+            None,
+            SyncDisposition::Continue,
+            0,
+        )
+        .unwrap();
+        assert!(Record::from_persisted(
+            record.domain().clone(),
+            record.generation(),
+            record.next_send(),
+            record.next_receive(),
+            record.outbound().cloned(),
+            record.inbound().cloned(),
+        )
+        .unwrap()
+        .with_sync_state(missing_history)
+        .is_err());
+    }
+}
+
+#[test]
+fn sync_metadata_refuses_foreign_agreements_and_impossible_history() {
+    let fixture = Fixture::new(ENCRYPTIONS[0], DIRECTIONS[0]);
+    for foreign in [
+        Sa::new(0x999, 0x202, Role::Initiator).unwrap(),
+        Sa::new(0x101, 0x202, Role::Responder).unwrap(),
+    ] {
+        let state = SyncRecord::from_persisted(
+            Agreement::from_persisted(foreign, Mode::Negotiated),
+            None,
+            None,
+            None,
+            None,
+            SyncDisposition::Continue,
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            Record::initial(fixture.domain.clone(), 0, 0).with_sync_state(state),
+            Err(Error::DomainMismatch)
+        ));
+    }
+    let agreement = window_agreement(&fixture, Mode::Negotiated);
+    for (local, peer, local_proposal, peer_proposal) in [
+        (Some(5), None, None, None),
+        (None, Some(5), None, None),
+        (None, None, Some(6), None),
+        (None, None, None, Some(6)),
+    ] {
+        let state = SyncRecord::from_persisted(
+            agreement,
+            local,
+            peer,
+            local_proposal,
+            peer_proposal,
+            SyncDisposition::Continue,
+            0,
+        )
+        .unwrap();
+        let record =
+            Record::from_persisted(fixture.domain.clone(), 1, Some(5), Some(5), None, None)
+                .unwrap();
+        assert!(matches!(
+            record.with_sync_state(state),
+            Err(Error::InvalidRecord)
+        ));
+    }
+    assert!(SyncRecord::from_persisted(
+        agreement,
+        None,
+        None,
+        Some(u32::MAX),
+        None,
+        SyncDisposition::Continue,
+        0,
+    )
+    .is_err());
+    assert!(SyncRecord::from_persisted(
+        agreement,
+        None,
+        None,
+        None,
+        Some(u32::MAX),
+        SyncDisposition::Continue,
+        0,
+    )
+    .is_err());
+    assert!(SyncRecord::from_persisted(
+        agreement,
+        None,
+        None,
+        None,
+        None,
+        SyncDisposition::AwaitLocalSync,
+        0,
+    )
+    .is_err());
+    let fallback = window_agreement(&fixture, Mode::BaseFallback);
+    assert!(SyncRecord::from_persisted(
+        fallback,
+        None,
+        None,
+        None,
+        Some(1),
+        SyncDisposition::Continue,
+        0,
+    )
+    .is_err());
+}
+
+#[test]
+fn restoring_sync_disposition_keeps_ordinary_work_and_replay_blocked() {
+    let fixture = Fixture::new(ENCRYPTIONS[0], DIRECTIONS[0]);
+    for (disposition, expected) in [
+        (SyncDisposition::AwaitLocalSync, Error::SyncInProgress),
+        (SyncDisposition::OutcomeUncertain, Error::OutcomeUncertain),
+    ] {
+        let state = SyncRecord::from_persisted(
+            window_agreement(&fixture, Mode::Negotiated),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            disposition,
+            0,
+        )
+        .unwrap();
+        let record =
+            Record::from_persisted(fixture.domain.clone(), 1, Some(3), Some(4), None, None)
+                .unwrap()
+                .with_sync_state(state)
+                .unwrap();
+        let mut window = fixture.restore(&record);
+        assert!(matches!(window.replay_request(), Err(error) if error == expected));
+        let peer = fixture.peer(4, false, Exchange::Informational, delete(), 100);
+        let peer = window
+            .open_peer(fixture.profile, &fixture.keys, &peer)
+            .unwrap();
+        assert_eq!(window.request_disposition(&peer), Err(expected));
+        let mut allocator = fixture.allocator();
+        assert!(matches!(window.prepare_request(
+            fixture.profile, &fixture.keys, allocator.allocate(Purpose::Ordinary).unwrap(),
+            Exchange::Informational, delete(),
+        ), Err(error) if error == expected));
+        assert_eq!(window.record(), &record);
+    }
 }
 
 #[test]

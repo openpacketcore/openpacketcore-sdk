@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use super::Ikev2WindowError as Error;
+use super::{Ikev2SyncResponderRecord, Ikev2WindowError as Error};
 use crate::{
     Header, HeaderFlags, Ikev2AesGcmIvDomain, Ikev2ExchangeKind,
     Ikev2ProtectedPayloadDirection as Direction, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
@@ -148,9 +148,40 @@ pub struct Ikev2CommittedWindowRecord {
     pub(super) next_receive: Option<u32>,
     pub(super) outbound: Option<Ikev2CommittedExchangeRecord>,
     pub(super) inbound: Option<Ikev2CommittedExchangeRecord>,
+    pub(super) sync: Option<Ikev2SyncResponderRecord>,
+    pub(super) recovery: Option<super::Ikev2SyncRecoveryRecord>,
 }
 
 impl Ikev2CommittedWindowRecord {
+    // Preserve locally sent packet evidence before caches/history are retired.
+    pub(super) fn retain_local_iv_floor(&mut self) -> Result<(), Error> {
+        let Some(sync) = &mut self.sync else {
+            return Ok(());
+        };
+        let ordinary = self
+            .outbound
+            .as_ref()
+            .map(|entry| entry.request.as_ref())
+            .into_iter()
+            .chain(
+                self.inbound
+                    .as_ref()
+                    .and_then(|entry| entry.response.as_deref()),
+            );
+        let attempts = self.recovery.iter().flat_map(|recovery| {
+            recovery
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.request_bytes())
+        });
+        for wire in ordinary.chain(attempts) {
+            sync.minimum_send_iv_end = sync
+                .minimum_send_iv_end
+                .max(super::packet::sending_iv_end(wire)?);
+        }
+        Ok(())
+    }
+
     /// Initial fields to commit with a genuinely new durable key epoch.
     ///
     /// Floors must account for all completed handshake messages. Zero means no
@@ -168,6 +199,8 @@ impl Ikev2CommittedWindowRecord {
             next_receive: Some(next_receive),
             outbound: None,
             inbound: None,
+            sync: None,
+            recovery: None,
         }
     }
 
@@ -202,7 +235,54 @@ impl Ikev2CommittedWindowRecord {
             next_receive,
             outbound,
             inbound,
+            sync: None,
+            recovery: None,
         })
+    }
+
+    /// Attach the same atomic record's persisted synchronization metadata.
+    ///
+    /// Use after `initial` or `from_persisted`; never omit existing sync state on
+    /// readback or replace an active SA's immutable agreement. This is a trusted
+    /// record constructor, not negotiation, persistence or cutover authority.
+    /// # Errors
+    /// Rejects an already attached state, a foreign agreement or history that
+    /// contradicts this record's floors, generation or cached ordinary requests.
+    pub fn with_sync_state(mut self, state: Ikev2SyncResponderRecord) -> Result<Self, Error> {
+        if self.sync.is_some() {
+            return Err(Error::InvalidRecord);
+        }
+        state.validate(&self)?;
+        self.sync = Some(state);
+        Ok(self)
+    }
+
+    /// Persist this optional metadata atomically with all ordinary window fields.
+    pub const fn sync_state(&self) -> Option<&Ikev2SyncResponderRecord> {
+        self.sync.as_ref()
+    }
+
+    /// Attach the same atomic record's initiating-event history after sync metadata.
+    ///
+    /// Never omit existing recovery fields on readback or reset an unfinished event.
+    /// This constructor does not mint runtime send or response-completion permission.
+    /// # Errors
+    /// Rejects an already attached event, foreign SA, inconsistent floors or disposition.
+    pub fn with_sync_recovery(
+        mut self,
+        recovery: super::Ikev2SyncRecoveryRecord,
+    ) -> Result<Self, Error> {
+        if self.recovery.is_some() {
+            return Err(Error::InvalidRecord);
+        }
+        recovery.validate(&self)?;
+        self.recovery = Some(recovery);
+        Ok(self)
+    }
+
+    /// Initiating-event fields to persist atomically with the complete window.
+    pub const fn sync_recovery(&self) -> Option<&super::Ikev2SyncRecoveryRecord> {
+        self.recovery.as_ref()
     }
 
     /// Key/role binding that must be rebuilt from the same durable SA.

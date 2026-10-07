@@ -53,6 +53,22 @@ fn observe(negotiation: &mut Negotiation, role: Role, bodies: &[&[u8]]) {
 const OFFER: &[u8] = &[0, 0, 0x40, 0x24];
 const BAD_OFFER: &[u8] = &[0, 0, 0x40, 0x24, 1];
 
+#[test]
+fn persisted_agreement_preserves_mode_and_sa_without_repeating_negotiation() {
+    for role in [Role::Initiator, Role::Responder] {
+        for mode in [Mode::BaseFallback, Mode::Negotiated] {
+            let restored = Agreement::from_persisted(sa(role), mode);
+            assert_eq!(restored.sa(), sa(role));
+            assert_eq!(restored.mode(), mode);
+            if mode == Mode::Negotiated {
+                assert_eq!(restored, agreement(role));
+            } else {
+                assert_eq!(restored.propose(counts(0, 0), NONCE), Err(RuleError::Drop));
+            }
+        }
+    }
+}
+
 fn agreement(role: Role) -> Agreement {
     let mut negotiation = Negotiation::new(sa(role), true);
     if role == Role::Initiator {
@@ -575,4 +591,28 @@ fn diagnostics_redact_proposals_spis_and_counters() {
         format!("{:?}", sa(Role::Initiator)),
         "Ikev2MessageIdSyncSa { .. }"
     );
+}
+
+#[test]
+fn pending_restore_preserves_sa_and_wire_fields_without_send_authority() {
+    for role in [Role::Initiator, Role::Responder] {
+        let proposal = agreement(role).propose(counts(2, 3), NONCE).unwrap();
+        assert_eq!(
+            Pending::from_persisted(proposal.sa(), proposal.notification()),
+            Ok(proposal)
+        );
+        let zero = Sync::new([0; 4], 0, 0);
+        assert_eq!(
+            Pending::from_persisted(sa(role), zero)
+                .unwrap()
+                .notification(),
+            zero
+        );
+        for value in [Sync::new(NONCE, u32::MAX, 0), Sync::new(NONCE, 0, u32::MAX)] {
+            assert_eq!(
+                Pending::from_persisted(sa(role), value),
+                Err(RuleError::Drop)
+            );
+        }
+    }
 }

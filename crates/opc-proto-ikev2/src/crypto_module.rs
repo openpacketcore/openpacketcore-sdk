@@ -1022,6 +1022,16 @@ pub(crate) fn with_entropy_operation(
     operation(selected.module()).map_err(|error| Ikev2CryptoModuleError::operation(&error))
 }
 
+pub(crate) fn check_sync_admission(
+    algorithm: Ikev2EncryptionAlgorithm,
+) -> Result<(), Ikev2CryptoModuleError> {
+    let (_, mapped) = select_encryption(algorithm)?;
+    if !matches!(mapped, MappedEncryption::Aead(_)) {
+        return Err(algorithm_unsupported());
+    }
+    with_entropy_operation(|_| Ok(()))
+}
+
 fn validate_dh_handle(
     expected_group: IkeDhGroup,
     keypair: &dyn IkeDhKeyPair,
