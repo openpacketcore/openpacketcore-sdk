@@ -1149,6 +1149,7 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
     assert!(pre_stop_history[2].confirmed_deadline.is_some());
     assert!(!pre_stop_history[2].recovery_required);
 
+    let split_vote = cluster.prepare_survivor_split_vote(stopped_leader);
     cluster
         .stop_node(stopped_leader)
         .await
@@ -1168,7 +1169,9 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
         .await
         .is_err());
 
-    let ready_survivor = cluster.wait_for_survivor_leader(stopped_leader).await;
+    let ready_survivor = cluster
+        .wait_for_survivor_after_split(stopped_leader, split_vote)
+        .await;
     let replacement_id = cluster.stores[ready_survivor]
         .status()
         .leader_id
