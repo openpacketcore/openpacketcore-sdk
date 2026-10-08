@@ -318,6 +318,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain reports. Both terminal receipts must still resolve within the original
   five-second budget; the 250 ms attempt cap is unchanged. Fixes #1162.
 
+- `opc-session-store`: report voter progress and snapshot-transfer counters
+  if either compacted-successor preparation phase exceeds its original bound,
+  without adding observations to the command loop. Refs #1164.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,
