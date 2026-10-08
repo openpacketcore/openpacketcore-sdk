@@ -454,6 +454,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   license checker for the built and committed artifacts. Program and map bytes
   and functional relocations are unchanged. Part of #577.
 
+- `opc-gtpu-dataplane`: ordinary eBPF attachment creation, adoption,
+  cleanup-only acquisition and legacy successor preparation refuse an
+  interface name containing a dot with `InvalidConfig { field: "device.name" }`
+  before any runtime effect, because bpffs does not permit a dot in the pin
+  directory name. `create_device` previously failed late with a
+  `PermissionDenied` I/O error that named neither cause. Grouped attachments
+  pin under a device-ID directory and keep accepting dotted names such as VLAN
+  devices. Fixes #1099.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,

@@ -430,7 +430,13 @@ receives what arrives in its VLAN, and tc's lookup on the interface does not
 describe the delivery there, so tc gives a hand-off from there to no socket:
 it drops and counts it. For an endpoint that lives on a VLAN device, attach to
 that device. `create_device` pins its maps under the interface's name, and
-bpffs accepts no dot in a name, so that device needs a name without one. See
+bpffs accepts no dot in a name, so that device needs a name without one.
+Ordinary creation, adoption, cleanup-only acquisition, and legacy successor
+preparation reject a dotted name with `InvalidConfig { field: "device.name", .. }`
+explaining this bpffs restriction before publishing or fencing an attachment.
+Grouped attachments created with
+`create_device_with_endpoints` use a device-ID pin directory and accept dotted
+interface names. See
 [control port](docs/control-port.md#hand-offs-need-a-bound-consumer) for what
 is and is not enforced; a device that is stacked on the interface from
 another network namespace is not detected.

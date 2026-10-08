@@ -4571,7 +4571,7 @@ impl EbpfGtpuDataplaneBackend {
 
         let resolved = match target {
             crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request) => {
-                validate_interface_name(&request.name)?;
+                validate_ordinary_attachment_name(&request.name)?;
                 require_ebpf_executable_pmtu_policy(request.uplink_mtu_policy)?;
                 let local_ip = require_ipv4(request.bind_address, "device.bind_address")?;
                 if local_ip.is_unspecified() {
@@ -8984,7 +8984,7 @@ impl EbpfGtpuDataplaneBackend {
         authority_runtime: &tokio::runtime::Handle,
     ) -> Result<GtpDevice, GtpuError> {
         let _operation = self.operation_guard()?;
-        validate_interface_name(&request.name)?;
+        validate_ordinary_attachment_name(&request.name)?;
         require_ebpf_executable_pmtu_policy(request.uplink_mtu_policy)?;
         let local_ip = require_ipv4(request.bind_address, "device.bind_address")?;
         if local_ip.is_unspecified() {
@@ -9426,6 +9426,7 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
         drop(devices);
+        validate_ordinary_attachment_name(&name)?;
         self.invalidate_traffic_attempts_on_attachment(
             ifindex,
             GtpuTrafficProofInvalidation::AuthorityRevoked,
@@ -10673,7 +10674,7 @@ impl EbpfGtpuDataplaneBackend {
     ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
         let _operation = self.operation_guard()?;
         let device = request.device();
-        validate_interface_name(&device.name)?;
+        validate_ordinary_attachment_name(&device.name)?;
         if device.ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "device.ifindex",
@@ -10718,7 +10719,7 @@ impl EbpfGtpuDataplaneBackend {
         request: RetainedGraphCleanupRequest,
     ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
         let device = request.device();
-        validate_interface_name(&device.name)?;
+        validate_ordinary_attachment_name(&device.name)?;
         if device.ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "device.ifindex",
@@ -15767,6 +15768,17 @@ const IFNAMSIZ: usize = 16;
 
 fn validate_interface_name(name: &str) -> Result<(), GtpuError> {
     validate_linux_name(name, "device.name")
+}
+
+fn validate_ordinary_attachment_name(name: &str) -> Result<(), GtpuError> {
+    validate_interface_name(name)?;
+    if name.contains('.') {
+        return Err(GtpuError::invalid_config(
+            "device.name",
+            "ordinary eBPF attachments use the interface name as a bpffs directory; bpffs does not permit dots in entry names",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_linux_name(name: &str, field: &'static str) -> Result<(), GtpuError> {
@@ -80139,6 +80151,112 @@ mod tests {
                 operation: "ebpf_datapath_snapshot"
             }
         ));
+    }
+
+    fn backend_with_dotted_interface() -> (EbpfGtpuDataplaneBackend, Arc<FakeRuntime>) {
+        let mut runtime = FakeRuntime::new();
+        runtime.ifindexes.insert("test0.100".into(), S2BU_IFINDEX);
+        let runtime = Arc::new(runtime);
+        (
+            EbpfGtpuDataplaneBackend::with_runtime(runtime.clone()),
+            runtime,
+        )
+    }
+
+    fn assert_dotted_pin_name_refused<T: std::fmt::Debug>(result: Result<T, GtpuError>) {
+        assert!(
+            matches!(
+                result,
+                Err(GtpuError::InvalidConfig { field: "device.name", reason })
+                    if reason.contains("bpffs") && reason.contains("dot")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_attachment_rejects_dotted_pin_names_before_runtime_publication() {
+        for resolve in [false, true] {
+            let (backend, runtime) = backend_with_dotted_interface();
+            let mut request = create_request();
+            request.name = "test0.100".into();
+            let result = if resolve {
+                backend.resolve_device(&request.name).await
+            } else {
+                backend.create_device(request).await
+            };
+            assert_dotted_pin_name_refused(result);
+            assert!(runtime.state().operations.is_empty());
+            assert!(runtime.state().attached.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_successor_rejects_dotted_pin_names_before_runtime_publication() {
+        let (backend, runtime) = backend_with_dotted_interface();
+        let intent = crate::CurrentEbpfGraphRecoveryIntent::new(
+            "test0.100",
+            crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        )
+        .with_replacement_device(GtpDevice {
+            name: "test0.100".into(),
+            ifindex: S2BU_IFINDEX,
+        });
+        let mut request = create_request();
+        request.name = "test0.100".into();
+        assert_dotted_pin_name_refused(
+            backend
+                .resolve_current_successor_target(
+                    &intent,
+                    crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request),
+                )
+                .map(|_| ()),
+        );
+        assert!(runtime.state().operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_acquisition_rejects_dotted_pin_names_before_runtime_effects() {
+        for normalize_legacy in [false, true] {
+            let (backend, runtime) = backend_with_dotted_interface();
+            let request = RetainedGraphCleanupRequest::new(
+                GtpDevice {
+                    name: "test0.100".to_string(),
+                    ifindex: S2BU_IFINDEX,
+                },
+                Ipv4Addr::new(192, 0, 2, 1),
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            );
+            let result = if normalize_legacy {
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(request)
+                    .await
+            } else {
+                backend.acquire_cleanup_only_recovery(request).await
+            };
+            assert_dotted_pin_name_refused(result);
+            assert!(runtime.state().operations.is_empty());
+            assert!(runtime.state().cleanup_only.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_attachment_accepts_dotted_interface_names() {
+        let (backend, runtime) = backend_with_dotted_interface();
+        let device_id = grouped_device_id(0x75);
+        let endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap();
+        let device = backend
+            .create_device_with_endpoints(grouped_device_request("test0.100", device_id, endpoints))
+            .await
+            .unwrap();
+        assert_eq!(device.name, "test0.100");
+        assert_eq!(
+            runtime.state().attached[&S2BU_IFINDEX].pin_dir,
+            backend.grouped_pin_dir(device_id)
+        );
+        assert_eq!(backend.resolve_device("test0.100").await.unwrap(), device);
+        backend.remove_device(&device).await.unwrap();
     }
 
     #[tokio::test]
