@@ -3,8 +3,9 @@
 //! Consumers inject resolvers or use the legacy blocking system address
 //! adapter. [`DnsQuery`], [`DnsAnswer`] and [`DnsCache`] provide additive
 //! contracts for record TTL/provenance, typed failures, per-source identity,
-//! bounded retry and indefinite last-good retention. DNS wire I/O, SRV and
-//! S-NAPTR traversal are not implemented here yet. The original selection,
+//! bounded retry and indefinite last-good retention. [`DnsClient`] adds
+//! asynchronous, source-bound A/AAAA and RFC 2782 SRV wire I/O, including
+//! seeded weighted service selection. S-NAPTR remains a follow-up. The original selection,
 //! resolver and caller-TTL cache APIs remain available for compatibility.
 
 #![forbid(unsafe_code)]
@@ -17,6 +18,8 @@ use std::time::Duration;
 mod cache;
 mod dns;
 mod dns_cache;
+mod dns_client;
+mod dns_wire;
 mod resolve;
 
 pub use cache::{CachedPeers, PeerAddressCache};
@@ -27,6 +30,10 @@ pub use dns::{
 pub use dns_cache::{
     DnsCache, DnsCacheError, DnsCacheStatus, DnsCachedResult, DnsRefresh, DnsRefreshToken,
     DnsRetryPolicy,
+};
+pub use dns_client::{
+    DnsClient, DnsClientConfig, DnsClientResponse, DnsClientStats, DnsQueryOutcome,
+    DnsResponseSource, DnsTransport,
 };
 pub use resolve::{AddressLookup, AddressLookupError, AddressPeerResolver, StdAddressLookup};
 

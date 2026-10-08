@@ -313,7 +313,7 @@ impl fmt::Debug for DnsRecord {
 /// denotes a legacy lookup that supplied no DNS records or TTLs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DnsCandidate {
-    peer: PeerCandidate,
+    pub(crate) peer: PeerCandidate,
     records: Option<Box<[DnsRecord]>>,
 }
 
@@ -376,6 +376,8 @@ impl fmt::Debug for DnsCandidate {
 #[derive(Clone, PartialEq, Eq)]
 pub struct DnsAnswer {
     candidates: Box<[DnsCandidate]>,
+    freshness_bound: Option<PeerDiscoveryTime>,
+    negative_freshness_bound: Option<PeerDiscoveryTime>,
 }
 
 impl DnsAnswer {
@@ -395,6 +397,8 @@ impl DnsAnswer {
         }
         Ok(Self {
             candidates: candidates.into_boxed_slice(),
+            freshness_bound: None,
+            negative_freshness_bound: None,
         })
     }
 
@@ -403,9 +407,36 @@ impl DnsAnswer {
         &self.candidates
     }
 
-    /// Earliest expiry over every record of every candidate. `None` means at
+    /// Shorten freshness to an absolute deadline without rewriting provenance.
+    /// Repeated calls only shorten the bound. This cannot grant freshness to
+    /// an answer with unknown TTLs. A resolver can bound partial successes by
+    /// a failed family's retry deadline (RFC 2308 section 7). For SOA denials,
+    /// use [`Self::with_negative_freshness_bound`] so the negative cache cap applies.
+    pub fn with_freshness_bound(mut self, deadline: PeerDiscoveryTime) -> Self {
+        self.freshness_bound = Some(
+            self.freshness_bound
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        self
+    }
+
+    /// Shorten a partial positive answer by a denied component's SOA deadline.
+    /// Repeated calls only shorten the bound, without rewriting record TTLs or
+    /// granting freshness to unknown-TTL answers. The cache additionally applies
+    /// its configured negative TTL cap, as for a wholly negative response
+    /// ([RFC 2308 section 5](https://www.rfc-editor.org/rfc/rfc2308.html#section-5)).
+    /// This does not authorize negative caching of the positive query's key.
+    pub fn with_negative_freshness_bound(mut self, deadline: PeerDiscoveryTime) -> Self {
+        self.negative_freshness_bound = Some(
+            self.negative_freshness_bound
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        self
+    }
+
+    /// Earliest record expiry, shortened by any resolver freshness bound. `None` means at
     /// least one candidate lacks TTL provenance, so no fresh lifetime is known.
-    /// This describes record provenance without cache caps. For scheduling,
+    /// This excludes cache caps. For scheduling,
     /// use [`crate::DnsCacheStatus::fresh_until`] and its retry/refresh state.
     pub fn expires_at(&self) -> Option<PeerDiscoveryTime> {
         let mut earliest = None;
@@ -416,7 +447,27 @@ impl DnsAnswer {
                     Some(earliest.map_or(expires, |old: PeerDiscoveryTime| old.min(expires)));
             }
         }
-        earliest
+        earliest.map(|expiry| {
+            [self.freshness_bound, self.negative_freshness_bound]
+                .into_iter()
+                .flatten()
+                .fold(expiry, PeerDiscoveryTime::min)
+        })
+    }
+
+    pub(crate) fn capped_expires_at(
+        &self,
+        positive_cap: PeerDiscoveryTime,
+        negative_cap: PeerDiscoveryTime,
+    ) -> Option<PeerDiscoveryTime> {
+        self.expires_at().map(|expiry| {
+            let expiry = expiry.min(positive_cap);
+            if self.negative_freshness_bound.is_some() {
+                expiry.min(negative_cap)
+            } else {
+                expiry
+            }
+        })
     }
 }
 
@@ -508,6 +559,21 @@ pub enum DnsError {
     Timeout,
     /// DNS RCODE SERVFAIL.
     ServFail,
+    /// DNS RCODE REFUSED.
+    Refused,
+    /// All client query slots are occupied; no query was sent or queued.
+    Busy,
+    /// A valid SRV RRset explicitly declares the service unavailable with
+    /// one root target (RFC 2782, Target and Usage rules). No SOA is invented.
+    ServiceUnavailable {
+        /// Absolute SRV/CNAME-chain deadline in the cache clock domain.
+        /// Publication also applies the cache's negative TTL cap. Last-good
+        /// data remains stale, but consumers can observe this withdrawal.
+        expires_at: PeerDiscoveryTime,
+    },
+    /// No usable result fit within the remaining work budget, or a target
+    /// family could not be queried within its address-lookup allowance.
+    LimitExceeded,
     /// Socket or transport failure.
     Transport,
     /// Malformed, inconsistent or otherwise unacceptable answer.
@@ -529,6 +595,10 @@ impl DnsError {
             Self::NoData { .. } => "dns-nodata",
             Self::Timeout => "dns-timeout",
             Self::ServFail => "dns-servfail",
+            Self::Refused => "dns-refused",
+            Self::Busy => "dns-busy",
+            Self::ServiceUnavailable { .. } => "dns-service-unavailable",
+            Self::LimitExceeded => "dns-limit-exceeded",
             Self::Transport => "dns-transport",
             Self::MalformedAnswer => "dns-malformed-answer",
             Self::SourceUnavailable => "dns-source-unavailable",
@@ -541,6 +611,13 @@ impl DnsError {
         match self {
             Self::NxDomain { soa } | Self::NoData { soa } => soa,
             _ => None,
+        }
+    }
+
+    pub(crate) fn negative_deadline(self) -> Option<PeerDiscoveryTime> {
+        match self {
+            Self::ServiceUnavailable { expires_at } => Some(expires_at),
+            _ => self.soa().map(NegativeSoa::expires_at),
         }
     }
 }
@@ -559,7 +636,7 @@ pub fn order_dns_addresses(addresses: &mut Vec<SocketAddr>, family: AddressFamil
     addresses.sort_by_key(|address| destination_rank(address.ip()));
 }
 
-fn destination_rank(ip: IpAddr) -> (std::cmp::Reverse<u8>, u8) {
+pub(crate) fn destination_rank(ip: IpAddr) -> (std::cmp::Reverse<u8>, u8) {
     let (precedence, scope) = match ip {
         IpAddr::V4(ip) => (
             35,

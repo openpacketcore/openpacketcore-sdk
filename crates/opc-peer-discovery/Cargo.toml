@@ -10,6 +10,9 @@ description = "Transport-neutral peer discovery, resolver injection, and determi
 
 [dependencies]
 thiserror = { workspace = true }
+getrandom = { version = "0.4", default-features = false }
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 
 [lints]
 workspace = true

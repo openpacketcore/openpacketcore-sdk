@@ -123,11 +123,11 @@ rustup target add x86_64-unknown-freebsd aarch64-apple-darwin
 cargo clippy --locked \
   -p opc-gtpu-dataplane -p opc-linux-gtpu-sys -p opc-session-store \
   -p opc-fs-verity-sys -p opc-sqlite-file-control-sys \
-  -p opc-session-testkit -p opc-persist \
+  -p opc-session-testkit -p opc-persist -p opc-peer-discovery \
   --all-targets --target x86_64-unknown-freebsd -- -D warnings
 # The other five crates above need an Apple C toolchain for bundled
-# SQLite and/or ring. Keep the two sys crates checked on Apple too.
-cargo clippy --locked -p opc-linux-gtpu-sys -p opc-fs-verity-sys \
+# SQLite and/or ring. Check the sys crates and DNS client on Apple too.
+cargo clippy --locked -p opc-linux-gtpu-sys -p opc-fs-verity-sys -p opc-peer-discovery \
   --all-targets --target aarch64-apple-darwin -- -D warnings
 # Runtime test targets pull in AWS-LC through opc-sbi and need a
 # target C toolchain. Its library can be checked on both targets.

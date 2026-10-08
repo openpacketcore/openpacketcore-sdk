@@ -39,14 +39,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Consumers must reject configurations that cannot qualify canonical replies.
   Fragmented/CBC and complete restart qualification remain separate.
 
+- `opc-peer-discovery`: add RFC 2782 SRV resolution through the async DNS
+  client, with seeded priority/weight ordering, SRV ports, additional or fresh
+  target addresses, alias rejection, per-record TTL provenance and bounded
+  target fanout. Bound concurrent refreshes by an overall deadline derived from
+  transport settings by default, and remember timed-out servers across refreshes
+  for up to five minutes. Apply work limits after
+  ordering and expose skipped counts, partial-family outcomes and freshness
+  bounds. Preserve service-withdrawal deadlines, receive compressed targets,
+  keep DNS address order within equal precedence, and skip unusable records
+  and duplicate endpoints. S-NAPTR remains a follow-up.
+- `opc-peer-discovery`: add an async A/AAAA DNS client with configured/system
+  servers, source-bound UDP/TCP, EDNS fallback, strict reply matching, bounded
+  CNAME traversal and real TTL/SOA timing. Expose redacted server provenance,
+  per-family outcomes, bounded partial-answer freshness including the cache's
+  negative TTL cap, discard counters and bounded admission. Honor host ephemeral-port
+  policy and accept binary DNS
+  labels in unrelated names; retain the legacy system bridge.
 - `opc-peer-discovery`: add canonical DNS query identities, per-record TTL and
   provenance contracts, typed DNS failures, SOA-derived negative caching and a
   consumer-retained last-good cache with jittered retries and deduplicated
   refreshes. Expose capped positive freshness deadlines, bound configured TTL
   caps, pace uncacheable successes with an independent refresh interval, and
   bound retained candidate chains. Add destination address ordering and a
-  TTL-unknown bridge that preserves system resolver order; DNS wire I/O,
-  SRV and S-NAPTR remain follow-ups.
+  TTL-unknown bridge that preserves system resolver order.
 - `opc-egress-fence-common`: add checked scope clock correlation and absolute
   BOOTTIME deadline arithmetic, with explicit drift, suspend-error and validity
   bounds. This opt-in time model does not authenticate permits or install a

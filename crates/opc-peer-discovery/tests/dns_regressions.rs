@@ -61,6 +61,68 @@ fn cache() -> DnsCache {
     )
 }
 
+#[test]
+fn answer_freshness_bound_only_shortens_known_lifetimes() {
+    let bounded = answer(3600, 1_000)
+        .with_freshness_bound(t(301_000))
+        .with_freshness_bound(t(601_000));
+    assert_eq!(bounded.expires_at(), Some(t(301_000)));
+    assert_eq!(bounded.candidates()[0].records().unwrap()[0].ttl, 3600);
+    assert_eq!(
+        bounded.with_freshness_bound(t(2_000)).expires_at(),
+        Some(t(2_000))
+    );
+    assert_eq!(
+        answer(1, 1_000)
+            .with_freshness_bound(t(301_000))
+            .expires_at(),
+        Some(t(2_000))
+    );
+    let unknown = DnsAnswer::new(vec![DnsCandidate::without_ttl(peer())]).unwrap();
+    assert_eq!(unknown.with_freshness_bound(t(301_000)).expires_at(), None);
+}
+
+#[test]
+fn denial_bounds_preserve_ttls_and_apply_only_the_negative_cap_to_denials() {
+    let partial = answer(172_800, 1_000)
+        .with_negative_freshness_bound(t(86_401_000))
+        .with_negative_freshness_bound(t(172_801_000));
+    assert_eq!(partial.expires_at(), Some(t(86_401_000)));
+    assert_eq!(partial.candidates()[0].records().unwrap()[0].ttl, 172_800);
+    assert_eq!(
+        partial.with_freshness_bound(t(301_000)).expires_at(),
+        Some(t(301_000))
+    );
+
+    for denial in [false, true] {
+        let q = query("peer.example");
+        let mut cache = cache().with_ttl_caps(Duration::from_secs(3600), Duration::from_secs(60));
+        let token = start(&mut cache, &q, 1_000);
+        let answer = if denial {
+            answer(3600, 1_000).with_negative_freshness_bound(t(301_000))
+        } else {
+            answer(3600, 1_000).with_freshness_bound(t(301_000))
+        };
+        assert!(cache.finish_refresh(token, Ok(answer), t(1_000)));
+        assert_eq!(
+            cache.lookup(&q.cache_key(), t(1_000)).fresh_until,
+            Some(t(if denial { 61_000 } else { 301_000 }))
+        );
+    }
+
+    let q = query("peer.example");
+    let mut cache = cache();
+    let token = start(&mut cache, &q, 1_000);
+    let unknown = DnsAnswer::new(vec![DnsCandidate::without_ttl(peer())])
+        .unwrap()
+        .with_negative_freshness_bound(t(86_401_000));
+    assert_eq!(unknown.expires_at(), None);
+    assert!(cache.finish_refresh(token, Ok(unknown), t(1_000)));
+    let status = cache.lookup(&q.cache_key(), t(1_000));
+    assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+    assert!(status.retry_at.is_some_and(|retry| retry > t(1_000)));
+}
+
 fn start(cache: &mut DnsCache, q: &DnsQuery, now: u64) -> DnsRefreshToken {
     match cache
         .begin_refresh(q, t(now), Duration::from_secs(1))
