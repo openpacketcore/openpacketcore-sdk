@@ -16,6 +16,7 @@ pub(crate) mod roster_rows;
 #[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
 pub(crate) mod scope_batch;
+mod scope_continuity;
 pub(crate) mod scope_lease;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7115,7 +7116,7 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_pro
     // Reopen is an admission boundary too: a pre-cap, recovered, or externally
     // modified database must not expose state that live consensus proposals
     // could not create under the retained profile.
-    validate_sealed_state_sync(&tx).map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    validate_sealed_state_sync(&tx).map_err(SessionConsensusStorageError::from_validation_error)?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable
         && !fixed_quorum_authority_is_exact_sync(
             &tx,
@@ -9319,6 +9320,7 @@ pub(crate) fn fence_application_authority_in_tx(
     if pending.learners_ready_log_index.is_none() {
         return Err(MembershipScopeMutationError::TransitionNotQuiescent);
     }
+    scope_continuity::require_for_pending(conn, &scope)?;
     if scope.application_authority_epoch == pending.desired_identity.configuration_epoch()
         && scope.application_authority_members == pending.desired_members
     {
@@ -9656,6 +9658,7 @@ fn promote_membership_scope_at_in_tx(
     {
         return Err(MembershipScopeMutationError::CorruptState);
     }
+    scope_continuity::carry_at_cutover(conn, &scope)?;
     retain_completed_terminal_in_tx(conn, storage_identity, &scope)?;
     if let Some(predecessor) = &scope.predecessor {
         conn.execute(
@@ -17081,7 +17084,7 @@ impl SqliteSessionBackend {
                     return Err(invalid_data("native activation storage identity differs"));
                 }
                 let activated = match activation {
-                    CapabilityActivationKind::ScopeProfileV2 => {
+                    CapabilityActivationKind::ScopeProfileV3 => {
                         let key = crate::scope_storage::profile_key(scope_identity.cluster_id())
                             .map_err(|_| invalid_data("scope profile key invalid"))?;
                         let row = state
@@ -17177,7 +17180,7 @@ fn capability_activation_applied_index_sync(
 ) -> io::Result<Option<u64>> {
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     let activated = match activation {
-        CapabilityActivationKind::ScopeProfileV2 => {
+        CapabilityActivationKind::ScopeProfileV3 => {
             if read_storage_identity_sync(&tx)
                 .map_err(|_| invalid_data("scope activation storage identity is invalid"))?
                 != storage_identity
@@ -22144,10 +22147,23 @@ pub(crate) fn validate_command_for_log(
         }
     }
     match semantic_intent {
+        SessionMutationIntent::CertifyScopeProfileContinuation(certificate) => {
+            certificate
+                .validate()
+                .map_err(|_| invalid_data("scope continuation profile invalid"))?;
+            if matches!(command.intent, SessionMutationIntent::Authorized { .. })
+                || certificate.predecessor.identity.cluster_id() != command.identity.cluster_id()
+            {
+                return Err(invalid_data(
+                    "scope continuation requires transition authority",
+                ));
+            }
+        }
         SessionMutationIntent::PreflightScopeProfile => {
             return Err(invalid_data("scope activation preflight reached the log"))
         }
         SessionMutationIntent::ActivateScopeProfile(certificate) => {
+            crate::scope_storage::require_current_profile_format(certificate)?;
             certificate
                 .validate()
                 .map_err(|_| invalid_data("scope activation profile invalid"))?;
@@ -23759,7 +23775,8 @@ impl MembershipLogProjection {
                 terminal.finalization_log_index = Some(log_index);
                 Ok(())
             }
-            SessionMutationIntent::ScopeBatch(_)
+            SessionMutationIntent::CertifyScopeProfileContinuation(_)
+            | SessionMutationIntent::ScopeBatch(_)
             | SessionMutationIntent::ActivateScopeProfile(_)
             | SessionMutationIntent::PreflightScopeProfile
             | SessionMutationIntent::ScopeLease(_)
@@ -31214,7 +31231,8 @@ fn execute_application_intent_sync(
                 "operator_recovery_epoch_rejected".into(),
             )),
         },
-        SessionMutationIntent::PrepareTopologyTransition { .. }
+        SessionMutationIntent::CertifyScopeProfileContinuation(_)
+        | SessionMutationIntent::PrepareTopologyTransition { .. }
         | SessionMutationIntent::MarkTopologyLearnersReady { .. }
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
@@ -31333,6 +31351,11 @@ fn execute_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
+        SessionMutationIntent::CertifyScopeProfileContinuation(certificate) => {
+            scope_continuity::certify(conn, storage_identity, certificate, log_index)
+                .map_err(membership_mutation_store_error)
+                .map(|_| (SessionMutationOutcome::Unit, None))
+        }
         SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeLease(_) => Err(
             StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
         ),
@@ -31412,7 +31435,8 @@ fn execute_intent_sync(
             })?;
             if matches!(
                 mutation.as_ref(),
-                SessionMutationIntent::PrepareTopologyTransition { .. }
+                SessionMutationIntent::CertifyScopeProfileContinuation(_)
+                    | SessionMutationIntent::PrepareTopologyTransition { .. }
                     | SessionMutationIntent::MarkTopologyLearnersReady { .. }
                     | SessionMutationIntent::FenceTopologyAuthority { .. }
                     | SessionMutationIntent::AbortTopologyTransition { .. }
@@ -32682,7 +32706,26 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                             logical_time: Some(logical_time),
                             raft_log_index: entry.log_id.index,
                         };
-                        tx.execute(
+                        // These scope-control refusals have no effect and may
+                        // recover under the same exact request: a resumed
+                        // Prepare supplies the proof, or Abort permits initial
+                        // activation again. Do not turn them into permanent
+                        // receipt bindings. The log/applied digest still records
+                        // the refusal on every replica.
+                        let retryable_scope_refusal = matches!(
+                            (&command.intent, &response.result),
+                            (SessionMutationIntent::FenceTopologyAuthority { .. },
+                                Err(StoreError::InvalidKey(reason)))
+                                if reason == "topology_transition_rejected"
+                        ) || matches!(
+                            (&command.intent, &response.result),
+                            (SessionMutationIntent::Authorized { mutation, .. },
+                                Err(StoreError::TopologyAuthorityRevoked))
+                                if scope.pending.as_ref().is_some_and(|pending| pending.transition_start_log_index != 0)
+                                    && matches!(mutation.as_ref(), SessionMutationIntent::ActivateScopeProfile(_))
+                        );
+                        if !retryable_scope_refusal {
+                            tx.execute(
                         "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
                         params![
                             command.request_id.as_bytes().as_slice(),
@@ -32692,6 +32735,7 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                         ],
                     )
                     .map_err(db_error)?;
+                        }
                         compact_one_due_fenced_transition_receipt_sync(&tx, logical_time)?;
                         let changed = tx
                         .execute(
@@ -33949,7 +33993,8 @@ pub(crate) fn fixed_profile_entry_changes_topology(
 
 fn fixed_profile_intent_changes_topology(intent: &SessionMutationIntent) -> bool {
     match intent {
-        SessionMutationIntent::PrepareTopologyTransition { .. }
+        SessionMutationIntent::CertifyScopeProfileContinuation(_)
+        | SessionMutationIntent::PrepareTopologyTransition { .. }
         | SessionMutationIntent::MarkTopologyLearnersReady { .. }
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
@@ -34119,6 +34164,7 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
             encoding,
         )
         .map_err(|_| invalid_data("session consensus snapshot record is invalid"))?;
+        crate::scope_storage::require_current_record_format(&record)?;
         super::validate_consensus_record(&record).map_err(|error| match error {
             StoreError::PayloadTooLarge { .. } => invalid_data(
                 "session consensus snapshot record exceeds the consensus payload limit",
@@ -34600,7 +34646,7 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                  AND fence.key_type = record.key_type
                  AND fence.stable_id = record.stable_id
                 WHERE (fence.fence IS NULL OR fence.fence < record.fence)
-                  AND NOT (record.fence = 0 AND record.key_type IN (?1, ?2, ?3, ?4, ?5))
+                  AND NOT (record.fence = 0 AND record.key_type IN (?1, ?2, ?3, ?4, ?5, ?6))
                 UNION ALL
                 SELECT 1
                 FROM leases AS lease
@@ -40563,6 +40609,8 @@ mod tests {
     mod activation_ack;
     #[path = "scope_batch.rs"]
     mod scope_batch_tests;
+    #[path = "scope_continuity.rs"]
+    mod scope_continuity_tests;
     #[path = "scope_lease.rs"]
     mod scope_lease_tests;
     #[cfg(target_os = "linux")]
@@ -74853,6 +74901,20 @@ BEGIN IMMEDIATE;
         let request_digest = [0x85; 32];
         let desired_members = members(&[8, 9, 10]);
         let intents = [
+            SessionMutationIntent::CertifyScopeProfileContinuation(Box::new(
+                crate::scope_lease::ScopeProfileContinuation {
+                    transition_id,
+                    transition_digest: request_digest,
+                    predecessor: crate::scope_lease::ScopeProfileActivation::new(
+                        identity(),
+                        fenced_transition_voter_set_digest(identity(), &members(&[7, 8, 9])),
+                    ),
+                    successor: crate::scope_lease::ScopeProfileActivation::new(
+                        identity_at(2, 0x86),
+                        fenced_transition_voter_set_digest(identity_at(2, 0x86), &desired_members),
+                    ),
+                },
+            )),
             SessionMutationIntent::PrepareTopologyTransition {
                 transition_id,
                 request_digest,

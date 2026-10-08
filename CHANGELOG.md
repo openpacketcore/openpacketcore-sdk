@@ -110,6 +110,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter recovery or persistence; ESP replay-counter synchronization is out of
   scope.
 
+- `opc-session-store`: carry scope lease/batch activation across voter changes.
+  A replicated certificate binds exact joining-voter profile checks to the
+  transition and both voter configurations; uniform cutover preserves activation
+  atomically, so subsequent renewals and batches need only a quorum. The one
+  bounded `opc-scope-continuation` row per cluster survives receipt pruning,
+  abort, restart and snapshot compaction. Its key type is reserved and excluded
+  from consumer/roster access and restore scans. Profile 3 changes the scope
+  row format and requires a fresh installation, without migration or downgrade.
+  Incompatible storage returns the public
+  `SessionConsensusStorageError::FreshInstallationRequired` and
+  `ConsensusSessionStoreOpenError::FreshInstallationRequired` variants.
+  Pending transitions freeze initial activation; missing continuation proof
+  commits a retryable refusal without wedging apply. Active scopes continue
+  through learner catch-up until the replicated authority Fence, and resume
+  after a durable Abort decision while learner cleanup finishes.
+  Grace, stop and exclusion remain 77, 78 and 79 seconds. Refs #1134.
+
 - `opc-session-store`: add atomic scope child batches with typed create, CAS
   and delete, exact births/generations, per-scope unique claims and sixteen
   bounded counters. Up to 64 children commit in one command under the current

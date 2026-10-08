@@ -1108,6 +1108,7 @@ fn map_live_terminal_recovery_handoff_error(error: SessionConsensusStorageError)
         | SessionConsensusStorageError::IdentityMismatch
         | SessionConsensusStorageError::PersistenceModeMismatch
         | SessionConsensusStorageError::SchemaVersionMismatch
+        | SessionConsensusStorageError::FreshInstallationRequired
         | SessionConsensusStorageError::CorruptState
         | SessionConsensusStorageError::InvalidIdentity => RecoveryError::BackupCorrupt,
     }

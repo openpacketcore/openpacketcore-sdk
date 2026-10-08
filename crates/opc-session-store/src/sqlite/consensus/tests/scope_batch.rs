@@ -4,7 +4,7 @@ use crate::scope_batch::*;
 use crate::scope_lease::tests::execution;
 use crate::scope_lease::{
     ScopeClockBounds, ScopeLeaseCommand, ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest,
-    ScopeLeaseView, ScopePermit, ScopeProfileActivation,
+    ScopeLeaseView, ScopePermit, ScopeProfileActivation, ScopeProfileContinuation,
 };
 use crate::scope_storage::{self as rows, ScopeRow};
 
@@ -539,6 +539,47 @@ fn scope_batch_snapshot_install_preserves_authority_claim_and_deleted_birth_floo
     );
     both.batch(&delete, 4).unwrap();
     let conn = both.sql.conn.blocking_lock();
+    // An aborted transition retains its continuation floor alongside the
+    // predecessor activation and the existing scope rows.
+    let desired = identity_at(2, 0xA3);
+    let desired_members = members(&[7, 8, 10]);
+    let continuation = ScopeProfileContinuation {
+        transition_id: [0xA3; 16],
+        transition_digest: [0xA3; 32],
+        predecessor: ScopeProfileActivation::new(
+            identity(),
+            fenced_transition_voter_set_digest(identity(), &members(&[7, 8, 9])),
+        ),
+        successor: ScopeProfileActivation::new(
+            desired,
+            fenced_transition_voter_set_digest(desired, &desired_members),
+        ),
+    };
+    let intents = [
+        SessionMutationIntent::PrepareTopologyTransition {
+            transition_id: continuation.transition_id,
+            request_digest: continuation.transition_digest,
+            desired_identity: desired,
+            desired_bindings: test_member_bindings(&desired_members),
+            desired_members,
+        },
+        SessionMutationIntent::CertifyScopeProfileContinuation(Box::new(continuation.clone())),
+        SessionMutationIntent::AbortTopologyTransition {
+            transition_id: continuation.transition_id,
+            request_digest: continuation.transition_digest,
+        },
+    ];
+    for (offset, intent) in intents.into_iter().enumerate() {
+        let index = both.index + offset as u64 + 1;
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &both.sql.caps,
+            vec![topology_entry_at(index, index as u8, intent)],
+        )
+        .unwrap();
+        assert!(applied.responses.iter().all(|reply| reply.result.is_ok()));
+    }
     conn.execute("ATTACH DATABASE ':memory:' AS consensus_incoming", [])
         .unwrap();
     conn.execute(
@@ -549,11 +590,13 @@ fn scope_batch_snapshot_install_preserves_authority_claim_and_deleted_birth_floo
     let validate = || super::super::scope_batch::validate_snapshot_preserves_scopes(&conn);
     validate().expect("same complete snapshot preserves every floor");
     for kind in rows::RESERVED_KEY_TYPES {
-        conn.execute(
-            "DELETE FROM consensus_incoming.session_records WHERE key_type=?1",
-            [kind],
-        )
-        .unwrap();
+        let removed = conn
+            .execute(
+                "DELETE FROM consensus_incoming.session_records WHERE key_type=?1",
+                [kind],
+            )
+            .unwrap();
+        assert!(removed > 0, "fixture must retain a {kind} row");
         assert!(validate().is_err(), "snapshot cannot omit {kind}");
         conn.execute("INSERT INTO consensus_incoming.session_records SELECT * FROM main.session_records WHERE key_type=?1", [kind]).unwrap();
         validate().unwrap();

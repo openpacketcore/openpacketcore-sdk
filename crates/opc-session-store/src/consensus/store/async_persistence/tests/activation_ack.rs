@@ -23,7 +23,7 @@ fn activation_request(
     scope: SessionConsensusIdentity,
 ) -> ForwardMutationRequest {
     let (request_id, intent) = match activation {
-        CapabilityActivationKind::ScopeProfileV2 => (
+        CapabilityActivationKind::ScopeProfileV3 => (
             scope_profile::request_id(scope),
             SessionMutationIntent::PreflightScopeProfile,
         ),
@@ -59,7 +59,7 @@ fn backend_activation(
         .unwrap()
         .native_public_scalar_read(|state| {
             let active = match activation {
-                CapabilityActivationKind::ScopeProfileV2 => {
+                CapabilityActivationKind::ScopeProfileV3 => {
                     let key = crate::scope_storage::profile_key(scope.cluster_id()).unwrap();
                     let row = state.scope_record(store.inner.storage_identity, &key).unwrap();
                     matches!(row, Some(crate::scope_storage::ScopeRow::Activation(certificate))
@@ -246,7 +246,7 @@ async fn protected_roster_v2_activation_ack_covers_backend_before_metrics() {
 #[tokio::test]
 async fn scope_profile_activation_ack_covers_backend_before_metrics() {
     acknowledgment_covers_certificate_before_metrics(
-        CapabilityActivationKind::ScopeProfileV2,
+        CapabilityActivationKind::ScopeProfileV3,
         &[SessionPersistenceMode::Durable],
     )
     .await;

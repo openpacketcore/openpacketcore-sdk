@@ -2360,6 +2360,10 @@ pub enum SessionConsensusStorageError {
     /// The database was created by another consensus storage schema.
     #[error("unsupported session consensus storage schema")]
     SchemaVersionMismatch,
+    /// A recognized previous scope format cannot be opened by this profile.
+    /// This boundary requires new storage, never an in-place migration.
+    #[error("session consensus scope format changed; fresh installation required")]
+    FreshInstallationRequired,
     /// A required row, constraint, or typed high-water mark is invalid.
     #[error("session consensus durable state is corrupt")]
     CorruptState,
@@ -2369,6 +2373,18 @@ pub enum SessionConsensusStorageError {
     /// SQLite or snapshot storage could not be initialized.
     #[error("session consensus storage is unavailable")]
     BackendUnavailable,
+}
+
+impl SessionConsensusStorageError {
+    pub(crate) fn from_validation_error(error: io::Error) -> Self {
+        match error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Self>())
+        {
+            Some(Self::FreshInstallationRequired) => Self::FreshInstallationRequired,
+            _ => Self::CorruptState,
+        }
+    }
 }
 
 /// Immutable authority model bound to one durable consensus database.
@@ -3576,7 +3592,7 @@ async fn open_with_member_bindings_for_profile(
             persistence,
         )
         .await
-        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        .map_err(SessionConsensusStorageError::from_validation_error)?;
     }
     #[cfg(all(test, target_os = "linux"))]
     if let Some(test) = backend.private_wal_test.as_ref() {

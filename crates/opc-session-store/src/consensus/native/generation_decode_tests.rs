@@ -8,6 +8,31 @@ use crate::{EncryptedSessionPayload, FenceToken};
 mod roster;
 
 #[test]
+fn native_previous_scope_format_cold_admission_requires_fresh_installation() {
+    let (storage, _, _) = fixture();
+    let certificate = crate::scope_lease::ScopeProfileActivation::new(
+        storage.business.identity,
+        fenced_transition_voter_set_digest(storage.business.identity, &storage.business.members),
+    );
+    let record = crate::scope_storage::previous_profile_record_for_test(certificate);
+    let key = record.key.clone();
+    let row = NativeKeyState {
+        record: Some(record),
+        ..NativeKeyState::default()
+    };
+    let bytes = postcard::to_allocvec(&(&key, Some(&row))).unwrap();
+    let error = verify_key(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap_err();
+    assert!(
+        error.to_string().contains("fresh installation required"),
+        "native cold admission must retain the format reason: {error}"
+    );
+    assert_eq!(
+        crate::consensus::storage::SessionConsensusStorageError::from_validation_error(error),
+        crate::consensus::storage::SessionConsensusStorageError::FreshInstallationRequired
+    );
+}
+
+#[test]
 fn scope_lease_cold_checkpoint_preflight_validates_dedicated_rows_and_refuses_old_receipts() {
     use crate::scope_lease::tests::{bounds, execution, request, scope};
     use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseOperation};

@@ -1,6 +1,6 @@
-# Scope leases and atomic child batches, profile 2
+# Scope leases and atomic child batches, profile 3
 
-Status: experimental scope authority and atomic child batches, slices 1–2 of issue #1134.
+Status: experimental scope authority, atomic child batches and activation continuity, slices 1–3 of issue #1134.
 
 ## Authority and admission
 
@@ -205,16 +205,16 @@ current configuration and the committed apply path independently checks scope,
 expected revision, execution, selection, permit and clock bounds. A live
 membership transition changes request admission, not the stable scope. Existing
 services and checkpoints can renew, release and select after the transition's
-new voter set has activated the profile, subject to the availability limit below.
+new voter set has inherited durable activation as described below.
 If a command was stamped before the authority switch and applies afterward,
 apply returns retryable `Unavailable` without changing the checkpoint. The
 service resolves the retained request if possible, otherwise returns
 `OutcomeUnknown`; the caller retries that exact request through current
 admission. A configuration switch is not a platform admission refusal.
 
-Profile 2 retains one fixed 4096-byte authority checkpoint per scope. Its body
-starts with `OPSL` and version 2; length framing and zero padding are checked
-exactly. The command outcome uses fixed-width hexadecimal encoding, which is
+The authority row retains one fixed 4096-byte checkpoint per scope. Its body
+starts with `OPSL` and version 2, unchanged in profile 3; length framing and zero
+padding are checked exactly. The command outcome uses fixed-width hexadecimal encoding, which is
 not encryption. Checkpoints live in dedicated reserved authority rows, outside
 all ordinary request-receipt collections. Even deleting the ordinary receipt
 collection cannot remove selection or grant floors. Each successful operation
@@ -229,46 +229,80 @@ state. Renew and Resume replace deadlines while preserving the grant epoch.
 Child batches compare this stable fence and the currently retained permit's
 validity during apply. The per-renewal checkpoint revision is not a batch fence.
 
-Before either `ScopeLease` or `ScopeBatch` can be proposed, the leader probes
+Initial activation, before the first `ScopeLease` or `ScopeBatch`, probes
 **every voter** for the exact scope profile digest, under current configuration
 admission. A separately committed activation certificate binds that digest to
 the admitted identity and voter set. Apply checks the certificate again.
 After activation, normal operations require a quorum; an unavailable minority
-does not undo the established certificate. Joining voters must acknowledge the
-exact scope profile before learner replication whenever a retained activation
-row records scope format history, even if its certificate is no longer current.
+does not undo the established certificate. Before learner replication, joining
+voters acknowledge the exact lease and batch profile through the authenticated
+staged control path. The leader then commits `CertifyScopeProfileContinuation`,
+binding the profile to the exact transition ID and request digest, predecessor
+identity and voters, and successor identity and voters. Its evidence lives in
+one reserved continuation row per cluster, outside ordinary request receipts.
+The applied log index is its monotonic floor. A new leader uses this durable
+attestation; one process's remembered probe result cannot authorize a joiner.
+Once Prepare applies, initial profile activation is refused with a retryable,
+no-effect result until the transition settles. Thus the coordinator's check
+after Prepare sees every activation that can precede cutover. A resumed Prepare
+can certify after the learner marker: both certification and Fence accept an
+exact proof committed after Prepare. Before proposing Fence the coordinator
+checks this durable proof. Missing or mismatched decodable proof at apply is a
+committed `topology_transition_rejected` refusal, which permits normal resume or
+abort; only read/decode faults abort apply. These no-effect control refusals do
+not bind a permanent rejection receipt against an exact retry.
 
-**Current operational limit:** a configuration change requires activation for
-its new identity and voter set. Every member of that set must answer before any
-new scope operation, including renewal, can commit. One unreachable voter can
-therefore stop renewals despite a healthy quorum; if it remains unreachable for
-the remaining forwarding budget, existing permits lapse at their original stop
-deadlines (`h + G` after the last issuance). The packet gate may close earlier
-according to its clock envelope and correlation horizon.
-Stable scope identity preserves the authority record but does not remove this
-activation dependency. A command that reaches apply before activation returns
+Authority fencing and voter promotion require that exact committed evidence.
+The uniform membership cutover carries the activation certificate to the
+successor in the same transaction. No unanimous reactivation is needed after
+cutover: renewals and batches retain ordinary quorum availability. Scope commands
+for an already-active profile pass transition admission during Prepare and
+learner catch-up, until the Fence entry. The replicated Fence drains predecessor
+authority: an old stamp ordered after it returns retryable `Unavailable` without
+changing a checkpoint or child batch. Permits issued before Fence remain valid
+under the successor voter set; membership itself changes neither their grant nor
+their absolute deadlines.
+
+**Operational limit:** permits cannot be extended while no leader is available,
+or from the Fence entry until successor admission. If either window outlasts
+the remaining permit budget, permits lapse `h + G` after the last issuance;
+the packet gate may close earlier under its conservative clock bound. Learner
+catch-up and a coordinator paused before Fence no longer create this refusal
+window. Callers retain exact requests across retryable uncertainty.
+
+An aborted transition keeps the predecessor activation. The durable Abort
+decision restores predecessor authority, so active scope renewals, reads and
+batches continue while unreachable learners await cleanup. Its retained continuation
+cannot authorize another transition because all request and configuration
+bindings must match. A later transition replaces the one continuation row with
+a higher log index. Restart, compaction and snapshot installation retain this
+row; snapshot installation refuses to erase or regress its floor. Membership
+changes without scope activation do not create a continuation or activate scopes.
+
+A command that reaches apply before initial activation returns
 `ProfileNotActivated` with no effect. This is retryable: retain the exact request
 and retry it; the service attempts current-configuration activation automatically.
 `OutcomeUnknown` still requires exact retry to resolve a possibly committed effect.
 
-The immediate next slice, before any consumer relies on scope leases, must
-carry activation across membership transitions using the joining-voter checks
-and durable transition evidence. That work precedes the planned replay lanes.
-The initial cluster activation remains a separate prerequisite; each subsequent
-scope operation within an activated configuration is one command.
+Initial cluster activation remains a separate unanimous prerequisite. Each
+subsequent scope operation is one command, including after membership changes.
 
-The command and outcome variants are appended to the existing wire vocabulary.
+The continuation command is appended to the existing wire vocabulary. Profile 3
+changes the exact capability digest, probe domain, reserved-row codec (`OPSC` 3)
+and state type (`opc-scope-state-v3`); profile 2 is not compatible.
 Crossing this stored-format change requires deleting the old volumes and a
 fresh installation, with no migration or in-place conversion. Prior checkpoint
 placements, unsupported profiles and malformed records are refused instead of
-silently forgetting their floors. Ordinary consumer and roster APIs cannot
+silently forgetting their floors. Reopening recognized profile-2 storage returns
+the typed `ConsensusSessionStoreOpenError::FreshInstallationRequired` reason;
+the refusal preserves the retained bytes. Ordinary consumer and roster APIs cannot
 access any reserved scope key type; consumer restore scans filter those rows
 while retaining pagination progress. The in-process quorum service remains a
 trusted boundary and requires authenticated platform admission on every call.
 Downgrading after scope-profile activation is unsupported: older binaries may
-not decode the committed commands, snapshots or retained rows. The scope-lease
-merge and this atomic-batch slice form one unreleased format boundary; no SDK
-release or consumer dependency pin may occur between them.
+not decode the committed commands, snapshots or retained rows. The scope-lease,
+atomic-batch and activation-continuity slices must all land before an SDK
+release or consumer dependency pin uses these APIs.
 
 The checkpoint retains only the last exact request ID and digest. While that
 request remains current, retry returns its original state and absolute
@@ -330,8 +364,8 @@ An exact retry while retained returns that original outcome without another
 effect; a changed body with the same ID conflicts. After a successor replaces
 the result, `RevisionConflict` prevents an obsolete request from executing but
 does not recover its original outcome. Eight independent replay lanes and
-outcome reads follow the activation-continuity slice. Reserving their complete
-stored layout avoids another layout change, but enabling lanes also changes
+outcome reads are the next slice. Reserving their complete stored layout avoids
+another layout change, but enabling lanes also changes
 apply semantics and the profile digest. The planned lanes profile therefore
 requires another fresh installation: mixed binaries cannot safely apply a
 certificate checked against different local digests. A rolling transition would
@@ -339,8 +373,9 @@ need separately reviewed support for both profiles until unanimous activation;
 the reserved fields alone do not provide it.
 
 The reserved row types are `opc-scope-lease`, `opc-scope-batch`,
-`opc-scope-child`, `opc-scope-claim`, and `opc-scope-profile`. Their metadata
-codec is explicit and cannot be used through ordinary session operations.
+`opc-scope-child`, `opc-scope-claim`, `opc-scope-profile`, and
+`opc-scope-continuation`. Their metadata codec is explicit and cannot be used
+through ordinary session operations.
 Child values remain sealed inside that codec. Native publication and cold
 reconstruction validate child/claim links; compaction preserves authority,
 birth and generation floors. Tombstones remain until the future reclamation

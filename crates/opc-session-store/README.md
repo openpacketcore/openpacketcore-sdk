@@ -57,17 +57,24 @@ evidence.
   required. Each operation is one native command replacing a fixed authority
   checkpoint, with no per-renewal receipt history. Stable cluster scopes survive
   membership changes; apply can inspect their selection and grant floors. Each
-  new configuration currently needs every voter to answer profile activation
-  before renewal can continue, even when a quorum is available. Activation
-  continuity is required before consumers depend on these leases.
+  joining voter must prove the exact lease and batch profile before replication.
+  A committed transition certificate carries activation through voter changes,
+  so renewals retain quorum availability after cutover without unanimous
+  reactivation. Initial activation still requires every voter.
+  Active scopes continue through Prepare and learner cleanup after a durable
+  Abort. Permits cannot be extended while no leader is available, or from the
+  Fence entry until successor admission. If either window exhausts the remaining
+  budget, permits lapse `h + G` after their last issuance.
   Unsupported scope profiles are refused. Crossing a scope-record format change
-  requires a fresh installation. See [RFC 022](../../docs/rfc/022-scope-leases.md)
+  requires a fresh installation; profile 3 is incompatible with profile 2.
+  Reopening profile-2 storage returns the typed `FreshInstallationRequired` reason.
+  See [RFC 022](../../docs/rfc/022-scope-leases.md)
   for cancellation, lost replies, emergency-session holds and the separate
   packet-gate/consumer-transport composition boundary.
 - `scope_batch::ScopeBatchStore` atomically creates, replaces or deletes up to
   64 sealed child records under a live scope grant, with exact births and
   generations, unique per-scope claims and sixteen bounded accounting counters.
-  Each batch is one consensus command after unanimous profile activation.
+  Each batch is one consensus command after initial profile activation.
   This initial profile requires one unresolved batch per scope and exact retry
   after an unknown outcome. Child/claim links and birth floors survive durable
   snapshots; physical reclamation and independent replay lanes are later work.

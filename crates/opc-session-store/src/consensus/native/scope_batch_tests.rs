@@ -30,6 +30,41 @@ fn entry(
 }
 
 #[test]
+fn native_previous_scope_format_log_admission_requires_fresh_installation() {
+    let (storage, _, _) = fixture();
+    let record =
+        crate::scope_storage::previous_profile_record_for_test(ScopeProfileActivation::new(
+            storage.business.identity,
+            fenced_transition_voter_set_digest(
+                storage.business.identity,
+                &storage.business.members,
+            ),
+        ));
+    let crate::scope_storage::ScopeRow::Activation(certificate) =
+        postcard::from_bytes(&record.payload.as_bytes()[5..]).unwrap()
+    else {
+        unreachable!()
+    };
+    let old = entry(
+        &storage,
+        2,
+        SessionMutationIntent::ActivateScopeProfile(Box::new(certificate)),
+    );
+    let admission = log::NativeLog::validate_entry(&old, &storage.business).unwrap_err();
+    let owned = owned::entry(&old).err().unwrap();
+    for error in [admission, owned] {
+        assert!(
+            error.to_string().contains("fresh installation required"),
+            "retained native log admission must retain the format reason: {error}"
+        );
+        assert_eq!(
+            crate::consensus::storage::SessionConsensusStorageError::from_validation_error(error),
+            crate::consensus::storage::SessionConsensusStorageError::FreshInstallationRequired
+        );
+    }
+}
+
+#[test]
 fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_generation() {
     let (mut storage, _, _) = fixture();
     let identity = storage.business.identity;
