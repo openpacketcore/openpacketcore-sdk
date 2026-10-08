@@ -803,7 +803,7 @@ impl ConfigPrincipalMetadataProbe {
                         probe.duplicate_reserved_field = true;
                     }
                     probe.saw_principal = true;
-                    let value = parser.value(1)?;
+                    let value = parser.scalar(1)?;
                     match value {
                         crate::json_text::Json::String(principal) => {
                             probe.principal = Some(principal);
@@ -817,7 +817,7 @@ impl ConfigPrincipalMetadataProbe {
                         probe.duplicate_reserved_field = true;
                     }
                     probe.saw_replay_lookup_digest = true;
-                    let value = parser.value(1)?;
+                    let value = parser.scalar(1)?;
                     match value {
                         crate::json_text::Json::Null => probe.replay_lookup_digest = None,
                         crate::json_text::Json::String(digest) => {
@@ -832,7 +832,7 @@ impl ConfigPrincipalMetadataProbe {
                         probe.duplicate_reserved_field = true;
                     }
                     probe.saw_recovery_required = true;
-                    let value = parser.value(1)?;
+                    let value = parser.scalar(1)?;
                     match value {
                         crate::json_text::Json::Bool(required) => {
                             probe.recovery_required = Some(required);
@@ -846,7 +846,7 @@ impl ConfigPrincipalMetadataProbe {
                         probe.duplicate_reserved_field = true;
                     }
                     probe.saw_rollback_label = true;
-                    let value = parser.value(1)?;
+                    let value = parser.scalar(1)?;
                     match value {
                         crate::json_text::Json::Null => probe.rollback_label = None,
                         crate::json_text::Json::String(label) => {
@@ -1019,15 +1019,7 @@ pub(crate) fn validate_rollback_label(label: &str) -> Result<(), PersistError> {
 pub fn extract_tenant(principal: &str) -> String {
     let wrapped = wrapped_config_principal(principal);
     let principal = wrapped.as_deref().unwrap_or(principal);
-    if let Some(tenant) = crate::json_text::parse(principal)
-        .ok()
-        .and_then(|principal| {
-            principal
-                .get("tenant")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
-    {
+    if let Ok(Some(tenant)) = crate::json_text::tenant(principal) {
         return tenant;
     }
     if let Some(rest) = principal.strip_prefix("spiffe://") {

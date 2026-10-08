@@ -295,6 +295,31 @@ pub(super) fn capture() -> Vec<serde_json::Value> {
     for (name, command) in commands() {
         command.validate(identity()).unwrap();
         let mut row = encoded(name, &command);
+        let wire = encode_config_wire(&command).unwrap();
+        assert_eq!(
+            decode_config_wire::<ConfigConsensusCommand>(&wire).unwrap(),
+            command
+        );
+        row["wire"] = hex(&wire).into();
+        let entry = opc_consensus::engine::Entry::<crate::consensus::ConfigRaftTypeConfig> {
+            log_id: opc_consensus::engine::LogId::new(
+                opc_consensus::engine::CommittedLeaderId::new(
+                    1,
+                    ConfigConsensusNodeId::new(1).unwrap(),
+                ),
+                1,
+            ),
+            payload: opc_consensus::engine::EntryPayload::Normal(command.clone()),
+        };
+        let native = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            serde_json::from_str::<
+                opc_consensus::engine::Entry<crate::consensus::ConfigRaftTypeConfig>,
+            >(&native)
+            .unwrap(),
+            entry
+        );
+        row["native_json"] = native.into();
         row["payload_digest"] = hex(&command.payload_digest().unwrap()).into();
         row["applied_digest"] = hex(command
             .calculate_applied_digest(

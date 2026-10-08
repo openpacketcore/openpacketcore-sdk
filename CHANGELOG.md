@@ -426,6 +426,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   if either compacted-successor preparation phase exceeds its original bound,
   without adding observations to the command loop. Refs #1164.
 
+- `opc-persist`, `opc-session-net`: configuration wire revisions are checked before
+  the payload is decoded, and consensus RPC numeric payloads are bounded while
+  decoding (2 MiB, or the family's smaller limit). An oversized ordinary request
+  is now refused during decoding, so the receiving server closes the connection
+  instead of replying `Protocol`. Valid encodings are unchanged; bounded
+  configuration profile admission stays closed. Refs #957.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,

@@ -642,6 +642,7 @@ pub(crate) struct ConfigConsensusResponse {
     pub(crate) audit_receipt: Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConfigWirePayload<T> {
     revision: u16,
@@ -665,11 +666,86 @@ pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
 pub(crate) fn decode_config_wire<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, opc_consensus::ConsensusCodecError> {
-    let payload: ConfigWirePayload<T> = opc_consensus::decode_bounded(bytes)?;
-    if payload.revision != CONFIG_CONSENSUS_WIRE_VERSION {
-        return Err(opc_consensus::ConsensusCodecError::Decode);
+    // This decoder is exclusively for the positional binary wire format.
+    // Admit the revision before T can allocate any of its owned fields.
+    struct Checked<T>(T);
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Checked<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(input: D) -> Result<Self, D::Error> {
+            struct Visitor<T>(std::marker::PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
+                type Value = Checked<T>;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("an admitted configuration wire revision and payload")
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut fields: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let revision = fields.next_element::<u16>()?;
+                    if revision != Some(CONFIG_CONSENSUS_WIRE_VERSION) {
+                        return Err(serde::de::Error::custom(
+                            "unsupported configuration wire revision",
+                        ));
+                    }
+                    let value = fields.next_element()?.ok_or_else(|| {
+                        serde::de::Error::custom("missing configuration wire payload")
+                    })?;
+                    Ok(Checked(value))
+                }
+            }
+            input.deserialize_struct(
+                "ConfigWirePayload",
+                &["revision", "value"],
+                Visitor(std::marker::PhantomData),
+            )
+        }
     }
-    Ok(payload.value)
+    opc_consensus::decode_bounded::<Checked<T>>(bytes).map(|value| value.0)
+}
+
+#[cfg(test)]
+mod wire_revision_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static PAYLOAD_VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct Observed;
+
+    impl<'de> Deserialize<'de> for Observed {
+        fn deserialize<D: serde::Deserializer<'de>>(input: D) -> Result<Self, D::Error> {
+            PAYLOAD_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let _ = String::deserialize(input)?;
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn unsupported_wire_revision_precedes_owned_payload_decoding() {
+        for revision in [0, CONFIG_CONSENSUS_WIRE_VERSION - 1, 8, u16::MAX] {
+            let bytes = opc_consensus::encode_bounded(&ConfigWirePayload {
+                revision,
+                value: "synthetic payload",
+            })
+            .unwrap();
+            PAYLOAD_VISITS.with(|visits| visits.set(0));
+            assert!(matches!(
+                decode_config_wire::<Observed>(&bytes),
+                Err(opc_consensus::ConsensusCodecError::Decode)
+            ));
+            assert_eq!(PAYLOAD_VISITS.with(Cell::get), 0, "revision {revision}");
+        }
+    }
+
+    #[test]
+    fn current_wire_revision_decodes_payload_once() {
+        let bytes = encode_config_wire("synthetic payload").unwrap();
+        PAYLOAD_VISITS.with(|visits| visits.set(0));
+        assert!(decode_config_wire::<Observed>(&bytes).is_ok());
+        assert_eq!(PAYLOAD_VISITS.with(Cell::get), 1);
+    }
 }
 
 impl ConfigConsensusResponse {
