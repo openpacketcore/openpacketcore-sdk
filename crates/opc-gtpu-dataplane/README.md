@@ -1156,10 +1156,13 @@ IPv6 and legacy terminal-successor recovery accepts it. Publication writes the
 downlink selector, the uplink selector, then the record, so tc drops rather
 than falls back while it is incomplete; removal deletes the record, the uplink
 selector, then the downlink selector. The downlink selector is thus present in
-every interrupted state, and the family-scoped removal by local TEID always
-reaches the whole residue. An interrupted publication, removal or retirement
-reads back as indeterminate and is completed by the next ordinary install or
-family-scoped removal. Cleanup-only recovery accepts this ordinary family
+every interrupted selector update, and family-scoped removal by local TEID
+reaches its residue. An interrupted publication or removal that leaves a
+partial selector pair reads back as indeterminate. Once both selectors are
+absent, readback is `Absent`, even if authority retirement is unfinished.
+The next family-scoped plain or exact removal completes that retirement;
+exact removal also does so on cleanup-only attachments before returning
+`AlreadyAbsent`. Cleanup-only recovery accepts this ordinary family
 authority (its own IPv4 endpoint, no IPv6 endpoint, no grouped journal),
 including a config-only authority left between the two initialization writes,
 and removes stale IPv6 contexts exactly. Outer-IPv4 fragments carrying an inner

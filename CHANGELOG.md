@@ -470,6 +470,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses before any runtime effect instead of leaving an attached or fenced
   graph outside the managed-device index. Fixes #1015.
 
+- `opc-gtpu-dataplane`: exact removal of an inner-IPv6 PDP context completes
+  an interrupted ordinary IPv6 authority retirement (`GTPU_SCHEMA6`,
+  `GTPU_CONFIG6`) when both selectors are already absent, also on cleanup-only
+  attachments, before it returns `AlreadyAbsent`, and reports
+  `Indeterminate(MutationUnconfirmed)` instead of `Removed` when that
+  retirement fails. Before, only plain removal completed it, so legacy
+  terminal-successor recovery could keep refusing a drained graph after a
+  crash. Fixes #1011.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,

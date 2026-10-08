@@ -674,6 +674,72 @@ async fn ordinary_ipv6_removal_completes_an_interrupted_retirement() {
     }
 }
 
+/// Exact retry must finish authority retirement even when a crash left no
+/// selector to remove, including on a fenced cleanup-only attachment.
+#[tokio::test]
+async fn exact_ipv6_removal_completes_interrupted_retirement() {
+    for cleanup_only in [false, true] {
+        for schema_written in [false, true] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let config = GtpuSessionDeviceConfig::new(
+                GtpuSessionDeviceId::new([0x42; GTPU_SESSION_GROUP_ID_LEN]).unwrap(),
+                S2BU_IFINDEX,
+                Some([192, 0, 2, 1]),
+                None,
+            )
+            .unwrap();
+            {
+                let mut state = runtime.state();
+                let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+                state
+                    .pinned_grouped_config
+                    .insert(pin_dir.clone(), config.encode());
+                if schema_written {
+                    state.grouped_schema_ready.insert(pin_dir);
+                }
+            }
+            let backend = if cleanup_only {
+                simulate_process_loss(&runtime, false);
+                let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+                assert_eq!(
+                    recovered
+                        .acquire_cleanup_only_recovery(cleanup_request(
+                            Ipv4Addr::new(192, 0, 2, 1),
+                            S2BU_IFINDEX,
+                        ))
+                        .await
+                        .unwrap(),
+                    RetainedGraphCleanupClassification::Acquired
+                );
+                recovered
+            } else {
+                backend
+            };
+            assert_eq!(
+                backend
+                    .remove_pdp_context_exact(ipv6_context())
+                    .await
+                    .unwrap(),
+                PdpContextRemovalOutcome::AlreadyAbsent
+            );
+            assert_eq!(
+                ordinary_authority_present(&runtime.state()),
+                (false, false),
+                "cleanup-only: {cleanup_only}, schema written: {schema_written}"
+            );
+            assert_eq!(
+                backend
+                    .remove_pdp_context_exact(ipv6_context())
+                    .await
+                    .unwrap(),
+                PdpContextRemovalOutcome::AlreadyAbsent,
+                "a completed retry remains idempotent"
+            );
+        }
+    }
+}
+
 /// A crash between the authority's config and schema writes leaves a
 /// config-only authority with nothing published. Cleanup-only recovery
 /// accepts it as the ordinary attachment's own authority, exactly as the
@@ -730,5 +796,48 @@ async fn ordinary_ipv6_teid_removal_leaves_no_selector_after_an_interrupted_publ
         assert!(state.session_groups.is_empty(), "{failed_put}");
         assert!(state.session_uplink_index.is_empty(), "{failed_put}");
         assert!(state.session_downlink_index.is_empty(), "{failed_put}");
+    }
+}
+
+/// A failed final retirement must not report `Removed`: one transient failure is
+/// completed in the same call, a persistent one stays retryable.
+#[tokio::test]
+async fn exact_ipv6_removal_reports_a_failed_retirement() {
+    for failures in [1, 2] {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let first = ipv6_context();
+        backend.install_pdp_context(first.clone()).await.unwrap();
+        for _ in 0..failures {
+            runtime
+                .state()
+                .failures
+                .push_back("retire_ordinary_family_authority");
+        }
+        let outcome = backend
+            .remove_pdp_context_exact(first.clone())
+            .await
+            .unwrap();
+        let present = ordinary_authority_present(&runtime.state());
+        if failures == 1 {
+            assert_eq!(outcome, PdpContextRemovalOutcome::Removed);
+            assert_eq!(present, (false, false));
+        } else {
+            assert_eq!(
+                outcome,
+                PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::MutationUnconfirmed
+                )
+            );
+            assert_eq!(present, (true, true));
+            assert_eq!(
+                backend
+                    .remove_pdp_context_exact(first.clone())
+                    .await
+                    .unwrap(),
+                PdpContextRemovalOutcome::AlreadyAbsent
+            );
+            assert_eq!(ordinary_authority_present(&runtime.state()), (false, false));
+        }
     }
 }

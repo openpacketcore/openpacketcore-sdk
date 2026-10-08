@@ -11662,7 +11662,18 @@ impl EbpfGtpuDataplaneBackend {
                 ));
             }
             match classify_dual_selector_state(&local, &uplink, &expected) {
-                DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::AlreadyAbsent),
+                DualSelectorState::BothAbsent => {
+                    // Selector absence can outlive an interrupted authority
+                    // retirement. Exact retries, including cleanup-only
+                    // recovery, must finish that attachment-local work too.
+                    if expected.ms_address.is_ipv6() {
+                        self.remove_ordinary_ipv6_locked(
+                            expected.link_ifindex,
+                            expected.local_teid,
+                        )?;
+                    }
+                    Ok(PdpContextRemovalOutcome::AlreadyAbsent)
+                }
                 DualSelectorState::Conflict(conflict) => {
                     Ok(PdpContextRemovalOutcome::Conflict(conflict))
                 }
@@ -11702,7 +11713,24 @@ impl EbpfGtpuDataplaneBackend {
                         ));
                     }
                     match classify_dual_selector_state(&local, &uplink, &expected) {
-                        DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::Removed),
+                        DualSelectorState::BothAbsent => {
+                            // The selectors are gone. A failed authority
+                            // retirement must not report success, or no
+                            // exact retry would complete it.
+                            if expected.ms_address.is_ipv6()
+                                && self
+                                    .remove_ordinary_ipv6_locked(
+                                        expected.link_ifindex,
+                                        expected.local_teid,
+                                    )
+                                    .is_err()
+                            {
+                                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                                    PdpContextIndeterminateReason::MutationUnconfirmed,
+                                ));
+                            }
+                            Ok(PdpContextRemovalOutcome::Removed)
+                        }
                         DualSelectorState::Conflict(conflict) => {
                             Ok(PdpContextRemovalOutcome::Conflict(conflict))
                         }
