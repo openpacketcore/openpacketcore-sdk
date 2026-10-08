@@ -6,7 +6,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::process::{Child, Command, Stdio};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 
 const CHILD_TEST: &str = "consensus::storage::pinned_directory_tests::pinned_namespace_child";
 const CHILD_ROOT: &str = "OPC_SNAPSHOT_PIN_TEST_ROOT";
@@ -66,7 +66,10 @@ impl Actor {
             .tempdir_in("/tmp")
             .expect("short private actor handshake directory");
         let socket_path = socket_directory.path().join("handshake.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind synthetic actor handshake");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind synthetic actor handshake");
+        listener.set_nonblocking(true).unwrap();
+        let mut accepted = None;
         let child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -84,14 +87,33 @@ impl Actor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .test_spawn()
+            .test_spawn(|_| {
+                let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    match listener.accept() {
+                        Ok((channel, _)) => {
+                            accepted = Some(channel);
+                            return Ok(());
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "lease actor handshake deadline",
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
             .expect("spawn synthetic lease actor");
         // Install the child guard before any fallible handshake wait.
         let mut child = ChildGuard(Some(child));
-        let (mut channel, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, listener.accept())
-            .await
-            .expect("lease actor handshake deadline")
-            .expect("accept lease actor handshake");
+        let channel = accepted.expect("accept lease actor handshake");
+        channel.set_nonblocking(true).unwrap();
+        let mut channel = UnixStream::from_std(channel).unwrap();
         std::fs::remove_file(&socket_path).expect("unlink owned actor handshake name");
         let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, channel.read_u8())
             .await

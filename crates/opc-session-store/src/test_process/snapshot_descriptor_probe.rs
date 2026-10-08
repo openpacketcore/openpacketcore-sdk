@@ -319,7 +319,7 @@ mod tests {
         fn retaining(descriptor: File) -> Self {
             let (mut ready, child_ready) = UnixStream::pair().unwrap();
             ready.set_read_timeout(Some(CHILD_TIMEOUT)).unwrap();
-            let child = Self(
+            Self(
                 Command::new("/bin/sh")
                     .args(["-c", "printf 'ready\\n'; read -r release"])
                     .stdin(Stdio::piped())
@@ -328,13 +328,21 @@ mod tests {
                     // The child never writes stderr. This is not a pre-exec model.
                     .stdout(Stdio::from(OwnedFd::from(child_ready)))
                     .stderr(Stdio::from(descriptor))
-                    .test_spawn()
+                    .test_spawn(|_| {
+                        let mut message = [0; 6];
+                        ready.read_exact(&mut message)?;
+                        if &message != b"ready\n" {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "invalid child readiness {message:?}; expected ready newline"
+                                ),
+                            ));
+                        }
+                        Ok(())
+                    })
                     .unwrap(),
-            );
-            let mut message = [0; 6];
-            ready.read_exact(&mut message).unwrap();
-            assert_eq!(&message, b"ready\n");
-            child
+            )
         }
 
         fn release_and_wait(&mut self) {
