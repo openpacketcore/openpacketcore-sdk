@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: add opt-in zero-write empty INFORMATIONAL handling to
+  committed GCM windows. Canonical replies advance a volatile receive floor,
+  allowing DPD at ID n followed by stateful work at n+1, with exact byte reuse,
+  current admission/lifecycle checks and no fallback on refusal. Trusted restart
+  reconstruction admits a lost stateless prefix, locks the first nonempty
+  request, and ends when its exact outcome and repaired floor commit. Admitted
+  IDs join RFC 6311 drop history; uncertain or repeated requests supply no fresh
+  liveness. The reply borrows its window while the consumer retains it; keep that
+  value and the external SA fence through transport submission. A
+  consuming deletion hook retires canonical state on permanent SA teardown.
+  Consumers must reject configurations that cannot qualify canonical replies.
+  Fragmented/CBC and complete restart qualification remain separate.
+
 - `opc-egress-fence-common`: add checked scope clock correlation and absolute
   BOOTTIME deadline arithmetic, with explicit drift, suspend-error and validity
   bounds. This opt-in time model does not authenticate permits or install a
@@ -21,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discards the cache and revokes the
   binding. Held-back outputs are zeroized and excluded from diagnostics. This
   primitive supplies no receive-window admission or transmission authority;
-  DPD handling and complete restart recovery remain unimplemented. Canonical
+  window composition is supplied separately and complete restart qualification
+  remains open. Canonical
   restart deliberately departs from literal SP 800-38D section 9.1 item 3 on the
   basis of section 8 and carries no validated-module or FIPS 140-3 claim. It
   refuses declared-validated modules without explicit canonical opt-in.
@@ -36,8 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stepped request acknowledgements release no bytes; results admitted in time
   remain recovered once committed. Any pending sync window can commit closure.
   Runtime readiness provides the production support-offer path and authenticated
-  negotiation. The DPD
-  restriction, fragmented/CBC recovery and composed qualification remain open.
+  negotiation. Fragmented/CBC recovery and composed qualification remain open.
 
 - `opc-proto-ikev2`: add opt-in authenticated responding RFC 6311 sync for GCM
   `SK`, with persisted agreement/history and a committed ordinary-window cutover
@@ -47,22 +60,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime/generation-bound and never enter ordinary replay caches. Reservation
   work uses the existing bounded retry guard; callers must choose Ordinary IVs.
   Cutovers retain a minimum sending-IV end after clearing caches, and ordinary
-  request admission automatically updates volatile sync-drop history. Initiating sync and advertisement
-  are separate hooks; fragmented/CBC recovery and the DPD receive high-water
-  remain open. This is not a complete restart-recovery lifecycle.
+  request admission automatically updates volatile sync-drop history and counts
+  as pending work in both sync directions. Initiating sync and advertisement
+  are separate hooks; fragmented/CBC recovery remains open. This is not a
+  complete restart-recovery lifecycle.
 
 - `opc-proto-ikev2`: add opt-in committed ordinary GCM `SK` windows with
   authenticated response correlation, strict request admission and exact replay.
   Window restore requires the sending-IV reservation record and rejects a
-  high-water at or below any locally sent cached IV. Until zero-write empty
-  handling advances a volatile receive high-water, do not use these windows
-  with DPD-sending peers.
+  high-water at or below any locally sent cached IV. DPD-sending peers require
+  the qualified zero-write empty handler and its volatile receive floor.
   Prepared bytes/outcomes require exact durable acknowledgement; uncertain writes
   quiesce until fenced readback. Add separately committed IV reservation attempt
   charges, positive backoff and fixed operation deadlines, with no reserve-ahead
   and at most three fresh-block attempts across restart. Storage, fencing, clock
   continuity and operation semantics remain caller obligations. Fragmented/CBC
-  recovery, zero-write empty handling and complete restart recovery remain open.
+  recovery and complete restart qualification remain open.
 
 - `opc-proto-ikev2`: add ordinary GCM IV reservation records and
   prepare/commit/activate hooks bound to the SA, direction, algorithm, key and
@@ -180,6 +193,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Changed
+
+- `opc-proto-ikev2`: enabling empty replies on a restored window now always
+  recovers a lost zero-write prefix. Restore and enable are separate: a
+  capability-active or pending-sync enable refusal preserves the SA for retry
+  after the old capability drops or synchronization commits. Read both records
+  from one consistent fenced snapshot before restore. Every failed window
+  restore revokes canonical state; the consumer must discard that SA.
+  `request_disposition(New)` automatically counts as pending work for sync,
+  while `replay_response` leaves admission and sync history unchanged on a miss
+  and drops foreign or response packets before classifying their payloads.
+  An older ordinary cached response ceases to apply after a newer empty reply
+  advances the live floor or newer nonempty work is admitted. In-process
+  replacement still loses the last empty reply's bytes while retaining its
+  release flag, so a lost reply may stall the peer; preserving the capability
+  and cache during in-place readback is planned separately.
 
 - `opc-proto-ikev2`: canonical replies now own their 57 verified bytes and hold
   no ledger lock. The process ledger uses key-free SHA-256 fingerprints and

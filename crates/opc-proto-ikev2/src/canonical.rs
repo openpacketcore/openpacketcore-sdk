@@ -388,7 +388,3 @@ impl fmt::Debug for Ikev2CanonicalReply {
 pub(crate) fn invalidate_binding(domain: &Ikev2AesGcmIvDomain) {
     ledger::revoke(domain, true);
 }
-
-pub(crate) fn retire_capability(domain: &Ikev2AesGcmIvDomain) {
-    ledger::revoke(domain, false);
-}

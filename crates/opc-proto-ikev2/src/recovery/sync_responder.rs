@@ -17,11 +17,12 @@ use crate::{
 impl Window {
     /// Retain volatile sync-drop knowledge of an authenticated expected peer request.
     ///
-    /// Nonempty `request_disposition(New)` records this knowledge automatically.
+    /// `request_disposition(New)` and `reply_empty` record this automatically,
+    /// including IDs admitted by empty-enabled restart reconstruction.
     /// This explicit hook also observes an expected authenticated empty request. It
     /// grants no operation, reply, liveness or receive-floor advancement. In
-    /// particular, it is not the stateless empty handler: the DPD restriction still
-    /// applies. A crash loses this knowledge, including empty requests answered
+    /// particular, it does not replace `reply_empty`. A crash loses this knowledge,
+    /// including empty requests answered
     /// only in memory; restore can enforce only the latest durable history.
     /// # Errors
     /// Requires negotiated sync, a ready window, matching domain, request direction
@@ -34,7 +35,7 @@ impl Window {
             .is_none_or(|state| state.agreement.mode() != Mode::Negotiated)
             || request.domain != self.record.domain
             || request.header.flags.response()
-            || self.record.next_receive != Some(request.header.message_id)
+            || self.next_receive() != Some(request.header.message_id)
         {
             return Err(Error::Drop);
         }
@@ -110,7 +111,7 @@ impl Window {
             sync_packet::open_request(&self.record.domain, profile, keys, wire)?;
         let mut counters = Counters::new(
             self.record.next_send.unwrap_or(u32::MAX),
-            self.record.next_receive.unwrap_or(u32::MAX),
+            self.next_receive().unwrap_or(u32::MAX),
         );
         counters.highest_local_request = state.highest_local_request;
         counters.highest_peer_request = state
@@ -144,6 +145,7 @@ impl Window {
                 }
             })?;
         let uncertain = pending_inbound.is_some()
+            || self.receive.pending.borrow().is_some()
             || self
                 .record
                 .outbound
@@ -299,6 +301,7 @@ impl Ikev2PreparedSyncResponse<'_> {
         self.window.record = self.record;
         self.window.observed_peer_request.set(None);
         self.window.quiescent = false;
+        self.window.adopt_receive_boundary()?;
         Ok(Ikev2SyncCommit {
             instance: Arc::clone(&self.window.instance),
             generation: self.window.record.generation,

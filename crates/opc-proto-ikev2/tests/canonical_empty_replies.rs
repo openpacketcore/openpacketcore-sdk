@@ -650,7 +650,7 @@ fn every_mixed_binding_is_terminal_even_before_a_capability_exists() {
 }
 
 #[test]
-fn mutable_high_water_reconciliation_discards_cache_without_resetting_release_history() {
+fn failed_high_water_restore_permanently_revokes_the_epoch() {
     support::ensure_ike_crypto();
     let mut fixture = Fixture::new(530, ALGORITHMS[0], DIRECTIONS[0]);
     assert_eq!(fixture.window.ready(), Ok(()));
@@ -699,11 +699,9 @@ fn mutable_high_water_reconciliation_discards_cache_without_resetting_release_hi
         &fixture.iv,
     )
     .unwrap();
-    let replies = window.canonical_replies(Policy::default()).unwrap();
-    assert_eq!(replies.reply(&request).unwrap_err(), Error::AlreadyReleased);
     assert_eq!(
-        replies.reply(&fixture.request(2)).unwrap().bytes().len(),
-        57
+        window.canonical_replies(Policy::default()).unwrap_err(),
+        Error::Invalidated
     );
 }
 

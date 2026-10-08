@@ -1159,10 +1159,22 @@ fn new_request_admission_automatically_protects_the_sync_drop_floor() {
         );
         assert_eq!(record.sync_state().unwrap().highest_peer_request(), Some(7));
         assert_eq!(record.next_receive(), Some(8));
+        // Admission now retains the pending identity as well as the drop bound;
+        // omitting pending_inbound cannot make this unfinished mutation disappear.
+        assert_eq!(
+            record.sync_state().unwrap().disposition(),
+            Disposition::OutcomeUncertain
+        );
         let _reply = window.release_sync_response(token).unwrap();
-        assert_eq!(window.request_disposition(&request), Err(Error::Drop));
+        assert_eq!(
+            window.request_disposition(&request),
+            Err(Error::OutcomeUncertain)
+        );
         let restored = f.restore(&record, &iv_record);
-        assert_eq!(restored.request_disposition(&request), Err(Error::Drop));
+        assert_eq!(
+            restored.request_disposition(&request),
+            Err(Error::OutcomeUncertain)
+        );
     }
 }
 

@@ -2219,6 +2219,7 @@ fn canonical_module_policy_faults_and_process_restart() {
         "faults",
         "recreation",
         "readiness",
+        "empty-handler",
         "concurrency",
         "interruption",
         "mixed-before",
@@ -2354,12 +2355,35 @@ fn canonical_module_child() {
         let replies = fixture.window.canonical_replies(policy).unwrap();
         let request = fixture.request(0);
         assert_eq!(replies.reply(&request).unwrap().bytes().len(), 57);
+        let mut handler = Fixture::new(210, ALGORITHMS[0], DIRECTIONS[0]);
+        assert_eq!(
+            handler.window.enable_empty_replies(Policy::default()),
+            Err(opc_proto_ikev2::recovery::Ikev2WindowError::Canonical(
+                Error::ValidationOptInRequired
+            ))
+        );
+        handler.window.enable_empty_replies(policy).unwrap();
+        let handler_request = handler.request(0);
+        assert_eq!(
+            handler
+                .window
+                .reply_empty(&handler_request)
+                .unwrap()
+                .bytes()
+                .len(),
+            57
+        );
         module.set_serviceable(
             module
                 .capabilities()
                 .without(CryptoCapability::IkeEncryption),
         );
         assert_eq!(replies.reply(&request).unwrap_err(), Error::Unavailable);
+        assert_eq!(
+            handler.window.reply_empty(&handler_request).unwrap_err(),
+            opc_proto_ikev2::recovery::Ikev2WindowError::Canonical(Error::Unavailable)
+        );
+        handler.window.delete();
         return;
     }
     if case == "concurrency" {
@@ -2390,6 +2414,10 @@ fn canonical_module_child() {
         return;
     }
     Canonical::preflight(ALGORITHMS[0], Policy::default()).unwrap();
+    if case == "empty-handler" {
+        empty_handler_faults_and_cache(&module);
+        return;
+    }
     if case == "interruption" {
         let fixture = Fixture::new(204, ALGORITHMS[0], DIRECTIONS[0]);
         let replies = fixture.window.canonical_replies(Policy::default()).unwrap();
@@ -2494,6 +2522,108 @@ fn canonical_module_child() {
             }
         }
     }
+}
+
+fn empty_handler_faults_and_cache(module: &CountingModule) {
+    use canonical_fixtures::{Fixture, ALGORITHMS, DIRECTIONS};
+    use opc_proto_ikev2::{
+        canonical::{
+            Ikev2CanonicalEmptyReplies as Canonical, Ikev2CanonicalError as CanonicalError,
+            Ikev2CanonicalPolicy as Policy,
+        },
+        recovery::{Ikev2EmptyReplyObservation as Observation, Ikev2WindowError as Error},
+    };
+
+    for fault in 1..=5 {
+        for withheld in 0..=3 {
+            let mut f = Fixture::new(700 + fault * 10 + withheld, ALGORITHMS[0], DIRECTIONS[0]);
+            f.window.enable_empty_replies(Policy::default()).unwrap();
+            let request = f.request(0);
+            let changed = f.peer(0, false, 37, canonical_fixtures::empty(), 1, 999);
+            let changed = f.window.open_peer(f.profile, &f.keys, &changed).unwrap();
+            let original = f.window.record().clone();
+            module
+                .canonical_fault
+                .store(u8::try_from(fault).unwrap(), Ordering::SeqCst);
+            module
+                .canonical_failures
+                .store(usize::try_from(withheld).unwrap(), Ordering::SeqCst);
+            let seals = module.canonical_seals.load(Ordering::SeqCst);
+            let entropy = module.counts.entropy.load(Ordering::SeqCst);
+            for _ in 0..withheld {
+                let error = f.window.reply_empty(&request).unwrap_err();
+                assert!(matches!(
+                    error,
+                    Error::Canonical(CanonicalError::InvalidOutput | CanonicalError::Unavailable)
+                ));
+                assert_eq!(f.window.next_receive(), Some(0));
+                assert_eq!(f.window.record(), &original);
+                assert_eq!(f.window.reply_empty(&changed).unwrap_err(), Error::Drop);
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains("ciphertext"));
+                assert!(!diagnostic.contains(HOSTILE_PROVIDER_DIAGNOSTIC));
+            }
+            if withheld == 3 {
+                assert_eq!(
+                    f.window.reply_empty(&request).unwrap_err(),
+                    Error::Canonical(CanonicalError::AttemptsExhausted)
+                );
+                assert_eq!(module.canonical_seals.load(Ordering::SeqCst), seals + 3);
+            } else {
+                let reply = f.window.reply_empty(&request).unwrap();
+                assert_ne!(reply.observation(), Observation::Fresh);
+                assert_eq!(format!("{reply:?}"), "Ikev2EmptyReply<'_> { .. }");
+                let bytes = reply.bytes().to_vec();
+                drop(reply);
+                assert_eq!(f.window.next_receive(), Some(1));
+                assert_eq!(f.window.reply_empty(&request).unwrap().bytes(), bytes);
+                assert_eq!(
+                    module.canonical_seals.load(Ordering::SeqCst),
+                    seals + usize::try_from(withheld).unwrap() + 1
+                );
+            }
+            assert_eq!(module.counts.entropy.load(Ordering::SeqCst), entropy);
+            assert_eq!(f.window.record(), &original);
+            f.window.delete();
+        }
+    }
+    module.canonical_fault.store(0, Ordering::SeqCst);
+    module.canonical_failures.store(0, Ordering::SeqCst);
+    let mut f = Fixture::new(800, ALGORITHMS[0], DIRECTIONS[1]);
+    f.window.enable_empty_replies(Policy::default()).unwrap();
+    let request = f.request(0);
+    let bytes = f.window.reply_empty(&request).unwrap().bytes().to_vec();
+    let seals = module.canonical_seals.load(Ordering::SeqCst);
+    module.set_serviceable(
+        module
+            .capabilities()
+            .without(CryptoCapability::IkeEncryption),
+    );
+    assert_eq!(
+        f.window.reply_empty(&request).unwrap_err(),
+        Error::Canonical(CanonicalError::Unavailable)
+    );
+    assert_eq!(module.canonical_seals.load(Ordering::SeqCst), seals);
+    module.set_serviceable(module.capabilities());
+    assert_eq!(f.window.reply_empty(&request).unwrap().bytes(), bytes);
+    assert_eq!(module.canonical_seals.load(Ordering::SeqCst), seals);
+    Canonical::delete_epoch(&f.iv);
+    assert_eq!(
+        f.window.reply_empty(&request).unwrap_err(),
+        Error::Canonical(CanonicalError::Invalidated)
+    );
+    f.window.delete();
+
+    let mut f = Fixture::new(801, ALGORITHMS[0], DIRECTIONS[0]);
+    f.window.enable_empty_replies(Policy::default()).unwrap();
+    let request = f.request(0);
+    f.window.reply_empty(&request).unwrap();
+    module.drift_validation.store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.window.reply_empty(&request).unwrap_err(),
+        Error::Canonical(CanonicalError::Unavailable)
+    );
+    f.window.delete();
 }
 
 fn canonical_mixed_nonce_monitor(module: &CountingModule, after_restart: bool) {

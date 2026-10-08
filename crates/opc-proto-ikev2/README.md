@@ -126,20 +126,25 @@ CBC is unchanged.
 to an authenticated, same-binding empty INFORMATIONAL request returned by
 `Ikev2CommittedWindow::open_peer`. It constructs its own header, padding and
 reserved IV (`0xffff_ffff_0000_0000 + Message ID`); there are no output overrides.
-It neither admits a receive ID nor grants permission to transmit. The zero-write
-handler and volatile receive high-water are still separate work: **these durable
-windows must not yet face peers that send DPD**.
+The primitive neither admits a receive ID nor grants permission to transmit.
+`Ikev2CommittedWindow::enable_empty_replies` and `reply_empty` compose it with
+the zero-write receive handler described below.
 
 For every reply, including cached bytes, the consumer must check current receive
 admission and `Ikev2CommittedWindow::ready()` and retain send authority through
 transmission. A minted capability does not follow later window lifecycle changes.
 The lifecycle check alone supplies no receive admission or transmission authority.
+`reply_empty` performs both checks on every call, including cache hits, and its
+reply borrows the window exclusively while retained. The consumer must still
+retain its external fenced SA/send authority; copied bytes carry no authority.
 
-Create a capability through `Ikev2AesGcmIvAllocator::canonical_replies` only
-after fresh-epoch activation, or `Ikev2CommittedWindow::canonical_replies` after
-checked restore. Restored allocation alone cannot mint one. The complete IV
-binding and immutable `Some(1)` format marker must come from one trusted atomic
-SA record. Missing/unknown markers refuse canonical use; never synthesize or
+`Ikev2AesGcmIvAllocator::canonical_replies` requires fresh-epoch activation;
+`Ikev2CommittedWindow::canonical_replies` requires checked restore. Restored
+allocation alone cannot mint one.
+DPD-facing windows must use `enable_empty_replies` and `reply_empty`: primitive
+replies leave the window's receive floor behind and can drop the next nonempty
+request. The complete IV binding and immutable `Some(1)` format marker must come
+from one trusted atomic SA record. Missing/unknown markers refuse canonical use; never synthesize or
 upgrade a marker for used keys. The SDK defines no durable byte format.
 
 The process checks all eight frozen wire answers for each intended algorithm
@@ -159,10 +164,12 @@ bytes without resetting the process ledger. `invalidate()` permanently revokes
 that ledger and retains a recent deletion fingerprint. Invoke it and discard
 consumer-held copies
 when record trust, IV history or key provenance is lost. A changed/doubted
-binding requires fresh IKE keys. Failed mixed-record restores also invalidate
-all involved bindings, even before a capability existed. Reconciliation of a
-trusted mutable high-water discards the old cache but retains attempt/release
-history. `reply()` returns an owned, thread-safe `Ikev2CanonicalReply` containing
+binding requires fresh IKE keys. Every failed `Window::restore` invalidates all
+supplied bindings, even before a capability existed. Reconcile trusted mutable
+state and read the window and IV records from one consistent fenced snapshot
+before restore; a later corrected read cannot revive a failed epoch. Successful
+runtime replacement discards the old cache but retains attempt/release history.
+`reply()` returns an owned, thread-safe `Ikev2CanonicalReply` containing
 57 verified octets; it holds no ledger lock. Consumer-held copies must also be
 discarded when trust or send authority is lost.
 Canonical packets never enter durable exchange caches or ordinary IV evidence.
@@ -240,8 +247,7 @@ let allocator = Ikev2AesGcmIvAllocator::restore(
 
 These consistency checks cannot detect joint rollback or establish key provenance.
 
-Even after the zero-write empty-request handler is implemented, canonical
-refusal leaves empty requests unanswered: there is no ordinary-IV or committed
+Canonical refusal leaves empty requests unanswered: there is no ordinary-IV or committed
 window fallback. A V1 epoch answers them only with V1, or not at all.
 DPD-sending peers remain unsupported in durable deployments where canonical
 sealing cannot operate, including declared-validated modules without opt-in,
@@ -255,8 +261,8 @@ still withholds the reply and never enables a fallback.
 `recovery::Ikev2CommittedWindow` is an opt-in window-one profile for complete,
 unfragmented AES-GCM `SK` packets. It uses the admitted crypto module, binds both
 sending and receiving keys/salts plus the SPI pair and original role, and works
-with all three supported GCM key sizes. `SKF`, CBC recovery, zero-write empty
-handling and receive-floor reconstruction are not enabled here.
+with all three supported GCM key sizes. `SKF` and CBC recovery are outside this
+profile. Empty handling is opt-in and includes prefix reconstruction after restore.
 Existing generic crypto and fragmentation APIs retain their separate contracts.
 
 Commit an initial `Ikev2CommittedWindowRecord` with the new key epoch and correct
@@ -284,19 +290,34 @@ response and consumer-validated outcome are committed. Outcomes are opaque
 consumer state; committing a packet does not establish application success.
 
 For peer requests, authenticate with `open_peer` and inspect
-`request_disposition`. Only the exact expected ID or the exact last cached
-request is admitted. Plan a new request's result without effects, prepare its
+`request_disposition`. Returning `New` locks that exact request as pending work
+for both sync directions, even before response preparation. In strict mode, only
+the exact live expected ID or the exact last applicable cached request is
+admitted. Plan a new request's result without effects, prepare its
 exact response, and commit the response/outcome/floor together before effects or
 sending. This also applies to error replies and empty acknowledgements of
 nonempty operations. Storage failure grants no new reply, including
 `TEMPORARY_FAILURE`. A cached duplicate replays the last applicable response;
 same-ID different bytes, older cached entries and forward gaps are dropped.
+An older cached response ceases to apply once a newer empty reply advances the
+live floor or a newer nonempty request is admitted. `replay_response` is a
+read-only lookup: a miss does not admit work or alter sync history.
 Any sync Notify is excluded from ordinary state, including ordinary Message ID 0.
 
 Prepared record accessors exist for persistence, not transmission. Equality of
 an acknowledgement checks identity, not durability. Cancellation, failure or an
 uncertain commit leaves the runtime quiescent. Fence/settle all older writes,
 read back the latest atomic record, and replace the runtime with `restore`.
+Read the window and IV records from one consistent fenced snapshot before
+restore. For empty handling, then call `enable_empty_replies` to recover the
+lost zero-write prefix as described below. A refused enable preserves the
+checked runtime for retry after a pending sync completes or the old capability
+drops. In-process replacement currently discards the last empty reply's cached
+bytes but retains its release history. Retrying that ID returns
+`Canonical(AlreadyReleased)`. If that reply was lost, the peer may stall until
+synchronization or expiry. This is a known limit on reply retention under
+[RFC 7296 §2.3](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.3);
+the planned in-place readback API will retain the same capability and cache.
 Do not guess whether an uncertain write committed. IVs already consumed by
 preparation remain burned. Completion tokens are single-use and must pass
 `apply_committed` in the same runtime/current commit generation; restoration or
@@ -306,15 +327,99 @@ restoration reads history and never manufactures a fresh completion.
 A probe replays the last committed request, pending or settled, with no new
 Message ID, IV, durable write or outcome. Without such a request there is no
 artificial probe. Replies to old bytes do not establish fresh liveness. Empty
-INFORMATIONAL requests are refused as durable work; a separate stateless handler
-with a volatile expected-receive high-water is required to answer them without
-writes and admit the next nonempty request. **Until that handler and high-water
-are implemented, this window must not face peers that send DPD requests.**
-Answering a DPD outside the window does not advance its committed receive floor,
-so the peer's next request would be dropped as a forward gap and the SA would
-stall. Keepalives remain outside IKE windows.
-This limitation applies in both recovery modes; negotiation alone grants no
-fresh-DPD bypass.
+INFORMATIONAL requests are refused as durable work; use `reply_empty` below.
+Keepalives remain outside IKE windows. Negotiation alone grants no fresh-DPD
+bypass or permission to reserve an IV for one.
+
+### Zero-write empty requests and restart reconstruction
+
+Before accepting DPD-sending peers, qualify each intended algorithm with
+`Ikev2CanonicalEmptyReplies::preflight` and the deployment's canonical policy.
+After checked window restore, call `enable_empty_replies(policy)`. While a
+capability is held, another enable
+returns `Canonical(CapabilityActive)` without revoking it. For a restored
+`AwaitLocalSync`, finish and commit the sync result, then enable. Lifecycle and
+capability-active refusals leave the epoch intact and can be retried on the
+same checked runtime once the cause clears.
+The window owns that epoch's capability; do not mint a second one independently.
+Authenticate each complete peer packet with `open_peer`, then pass an empty
+INFORMATIONAL request to `reply_empty`. Every call rechecks current module
+admission, window `ready()` and receive admission, including byte-cache hits.
+Submit the returned `Ikev2EmptyReply` promptly while retaining it and the
+external fenced authority through transport submission. SDK lifecycle changes
+cannot occur while that reply borrows the window. Discard copied bytes on trust
+loss, teardown or a blocked lifecycle.
+
+An admitted request at ID `n` receives the canonical response and advances
+`window.next_receive()` to `n+1` without an IV allocation, entropy request,
+durable write, generation change or operation outcome. The persisted
+`window.record().next_receive()` stays unchanged. A following nonempty request
+at `n+1` is admitted normally and commits its response, outcome and repaired
+floor atomically. Empty acknowledgements of nonempty requests, including
+Delete, always use that ordinary committed path.
+
+The declared receive window is one: never send `SET_WINDOW_SIZE` on an SA using
+these windows. Within a runtime, retransmission requires
+the identical authenticated request bytes and reuses the same canonical reply
+without sealing again. A newer empty reply or pending nonempty request retires
+older applicable responses;
+canonical ledger entries below the retained window are compacted automatically.
+The window remembers at most one empty request identity and one pending
+nonempty identity. A canonical failure retains the request identity and charged
+attempt history but advances no receive counter or liveness authority. There
+is no ordinary-IV, storage or alternate-provider fallback. `u32::MAX` exhausts
+the receive direction without wrapping; independent outbound work still uses
+its own request window.
+
+After a restart, first fence and resolve all outstanding writes and obtain the
+latest trusted atomic SA/window/IV record. Enabling empty replies after `restore`
+automatically permits authenticated IDs above the saved floor to repair a
+forgotten zero-write prefix. Restore followed by enable is the only composed
+entry path. No enabled restored window can opt out of
+prefix recovery. Plain restore without empty handling retains strict admission;
+enabling after a new inbound or sync boundary commits also stays strict.
+Reconstruction never lowers the committed or declared floor or bypasses pending or
+terminal synchronization. Older replayed empty IDs cannot pin reconstruction
+below a later valid peer request. The first admitted nonempty request locks its
+exact identity; further empty or changed work is blocked until its response and
+outcome commit, or sync resolves the interruption. That commit ends
+reconstruction and restores strict admission. Outbound commits preserve the
+volatile receive prefix. Admitted empty and nonempty IDs automatically join
+RFC 6311's volatile drop history, even when canonical output is withheld.
+
+`Ikev2EmptyReplyObservation::Replayed` and `Uncertain` establish no fresh
+liveness. Restore may have forgotten an unwritten empty prefix,
+so it starts uncertain. `Fresh` is possible only beyond a new inbound boundary
+or synchronization cutover committed in the current runtime. These observations
+never authorize endpoint, key, bearer, lifetime or application-outcome changes.
+Outbound liveness checks remain replay-only. An idle peer's DPD after restart
+remains `Uncertain` until a nonempty exchange or sync boundary commits, so a
+consumer cannot require `Fresh` from DPD alone to recover liveness.
+The recovery extension is SDK policy justified by the trusted durable history;
+RFC 7296 does not specify crash reconstruction. Its relevant protocol rules are
+[§1.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.4) (empty
+INFORMATIONAL requests and responses),
+[§1.4.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.4.1) (Delete
+acknowledgements), [§2.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.1)
+(identical retransmissions and reply retention),
+[§2.2](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.2) (Message IDs),
+[§2.3](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.3) (independent
+request directions and the default window of one), and
+[§2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.4) (liveness).
+
+Every permanent consumer teardown calls `window.delete()`: peer Delete after
+its ordinary acknowledgement, local expiry, DPD timeout, RFC 6311
+`OutcomeUncertain` or `CloseIkeSa`, and deletion of the old SA after rekey.
+Retain the old epoch during permitted rekey overlap. Every window restore
+failure already revokes canonical state for the supplied bindings. A later
+recoverable enable refusal is not a restore failure. If decoding or record
+rebuilding fails before window restore, call
+`Ikev2CanonicalEmptyReplies::delete_epoch(&trusted_iv_record)` without a window.
+In every failed-restore or deletion case, discard outer keys, stored SA records
+and copied replies; never retry that discarded epoch. Dropping a runtime to perform
+fenced readback is not permanent SA deletion and does not free its live ledger.
+Timers, transport, peer operation semantics and teardown dispatch belong to the
+consumer; the SDK supplies the common deletion hook.
 
 ### Responding to negotiated RFC 6311 synchronization
 
@@ -367,11 +472,14 @@ declared receive window. Preserve already committed outcomes as idempotent
 consumer history in the same durable SA state.
 
 The responder does not wait for pending network replies. Pending outbound work
-is detected from the ordinary window; identify any admitted, uncommitted inbound
-operation through `pending_inbound`. Such work becomes `OutcomeUncertain`, which
+and inbound requests admitted as `request_disposition(New)` are detected from
+the window automatically. Use `pending_inbound` for additional semantic work
+admitted outside that SDK path; omitting it cannot hide SDK-admitted work.
+Such work becomes `OutcomeUncertain`, which
 blocks ordinary traffic and requires idempotent scoped cleanup of this IKE SA and
-its Children. It never reports application success or permits retrying the
-mutation under a new ID. A simultaneous local `Ikev2MessageIdSyncPending` instead
+its Children, including `window.delete()`. It never reports application success
+or permits retrying the mutation under a new ID. A simultaneous local
+`Ikev2MessageIdSyncPending` instead
 contributes its declared floors and retains `AwaitLocalSync` until the initiating
 lifecycle completes. When initiating history is attached, the responder uses its
 durable pending proposal automatically; an explicit argument must match it.
@@ -396,18 +504,21 @@ trigger scoped cleanup if new mutations are pending. A minimal proposal M1 = P2
 remains admissible unless actual ordinary/proposal history rejects it.
 `request_disposition(New)` automatically retains the authenticated request's ID
 in the volatile sync drop floor. The consumer need not call an observer for this
-safety check. `observe_request_for_sync` also records an expected authenticated
-empty request; neither path grants a reply, liveness or ordinary receive-floor
-advancement. Any later reconstruction handler must add its admitted IDs too.
+safety check. `reply_empty` also records admitted IDs, including reconstruction
+and withheld canonical evaluations. `observe_request_for_sync` only records an
+expected authenticated request; it grants no reply, liveness or receive-floor
+advancement and does not replace empty handling.
 After restart, empty requests answered only in memory cannot contribute to the
-drop floor. The DPD restriction above still applies.
+drop floor until admitted again under the recovery rules above.
 
 ### Initiating negotiated RFC 6311 synchronization
 
 `begin_sync` admits one genuine local recovery event after pending ordinary
-mutations have been resolved. Identify admitted, uncommitted inbound work through
-`pending_inbound`; pending outbound work is detected from the window. Either
-refuses local initiation. Peer-initiated sync keeps the different interruption
+mutations have been resolved. Pending outbound work and inbound requests admitted
+as `request_disposition(New)` are detected automatically and refuse initiation.
+Report additional semantic work admitted outside that SDK path through
+`pending_inbound`; omitting it cannot bypass the SDK's pending-work check.
+Peer-initiated sync keeps the different interruption
 policy described above. Invalid packets, silence and replays cannot create an
 event. Consumer event identities increase within the same key epoch.
 
@@ -461,6 +572,7 @@ the event; it never extends time or selects fallback. Schedule
 reservation guard's clock-step indication, retaining its original deadline.
 
 `close_sync` commits terminal IKE/Child cleanup before releasing `CloseIkeSa`.
+The consumer finishes scoped cleanup and calls `window.delete()`.
 It can abandon any `AwaitLocalSync` window, including one entered through a pure
 pending proposal without an initiating record. A late or stepped request
 acknowledgement adopts the landed proposal but latches closure and emits no
@@ -481,8 +593,8 @@ mint new handshake readiness. The pure `locally_ready` boolean and generic Notif
 builders do not replace this production path.
 
 This capability covers the two complete-GCM sync handlers. It does not establish
-consumer storage correctness, DPD support, fragmented/CBC recovery or complete
-restart-recovery qualification. The DPD restriction above remains in force.
+consumer storage correctness, canonical empty-reply readiness, fragmented/CBC
+recovery or complete restart-recovery qualification.
 
 ### Bounded IV reservation attempts
 
