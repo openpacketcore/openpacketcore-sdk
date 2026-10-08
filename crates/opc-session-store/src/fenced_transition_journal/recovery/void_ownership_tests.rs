@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_process::CommandExt as _;
 use crate::{
     FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionV2CallerNonce,
     Generation, LeaseGuard, OwnerId, SessionKey, SessionKeyType, StableId,
@@ -323,8 +324,14 @@ fn owned_journal_creation_is_crash_atomic() {
             .args(["--ignored", "--exact", "fenced_transition_journal::recovery::void_ownership_tests::owned_journal_creation_child"])
             .env("OPC_VOID_JOURNAL_TEST_PATH", &path)
             .env("OPC_RECOVERY_CREATION_CRASH_POINT", point)
-            .stdout(Stdio::null()).status().unwrap();
-        assert_eq!(result.code(), Some(73), "{point}");
+            .test_output().unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(73),
+            "{point}; stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
         let recovered = if path.exists() {
             FencedTransitionV2RecoveryJournal::open_existing_owned(&path, key())
         } else {
@@ -426,23 +433,38 @@ fn owned_journal_void_excludes_another_process_and_recovers_after_crash() {
         .args(["--ignored", "--exact", CHILD])
         .env("OPC_VOID_JOURNAL_TEST_PATH", &path)
         .stdout(Stdio::null());
-    assert!(command
+    let denied = command
         .env("OPC_VOID_JOURNAL_TEST_EXPECT_DENIED", "1")
-        .status()
-        .unwrap()
-        .success());
+        .test_output()
+        .unwrap();
+    assert!(
+        denied.status.success(),
+        "owned journal exclusion child; stdout={} stderr={}",
+        String::from_utf8_lossy(&denied.stdout),
+        String::from_utf8_lossy(&denied.stderr),
+    );
     drop(journal);
     let ready = directory.path().join("ready");
     let mut child = command
         .env_remove("OPC_VOID_JOURNAL_TEST_EXPECT_DENIED")
         .env("OPC_VOID_JOURNAL_TEST_READY", &ready)
         .stdin(Stdio::piped())
-        .spawn()
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .test_spawn(|_| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !ready.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "owned journal child did not signal readiness",
+                ));
+            }
+            Ok(())
+        })
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
     let was_ready = ready.exists();
     let denied = FencedTransitionV2RecoveryJournal::open_existing_owned(&path, key()).is_err();
     child.kill().unwrap();

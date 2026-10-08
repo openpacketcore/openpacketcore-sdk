@@ -45567,12 +45567,17 @@ mod tests {
         // The sync fault controller is process-global. Keep both its failure
         // injection and exact physical callback counts isolated from peers.
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new("/proc/self/exe")
+            let output = std::process::Command::new("/proc/self/exe")
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(CHILD, "1")
-                .test_status()
+                .test_output()
                 .expect("run isolated compaction sync regression");
-            assert!(status.success(), "isolated compaction regression succeeds");
+            assert!(
+                output.status.success(),
+                "isolated compaction regression succeeds; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
             return;
         }
         install_test_main_sync_block_vfs().expect("register compaction sync VFS");
@@ -46001,12 +46006,17 @@ mod tests {
         // target path: a concurrent linker may unlink that path while this
         // long-running test binary remains executable through /proc.
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new("/proc/self/exe")
+            let output = std::process::Command::new("/proc/self/exe")
                 .args(["--exact", TEST_NAME])
                 .env(CHILD, "1")
-                .test_status()
+                .test_output()
                 .expect("run isolated temporary-path failure regression");
-            assert!(status.success(), "isolated regression succeeds");
+            assert!(
+                output.status.success(),
+                "isolated regression succeeds; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
             return;
         }
 
