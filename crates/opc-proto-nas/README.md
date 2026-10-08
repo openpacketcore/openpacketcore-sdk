@@ -7,12 +7,12 @@ Experimental NAS-5GS codec for OpenPacketCore.
 `opc-proto-nas` implements a v2 subset of 3GPP TS 24.501 NAS-5GS. It covers
 plain 5GMM framing, 5GSM framing, security-protected envelope framing, selected
 5GMM message bodies, mobile identity helpers, BCD unpacking, and caller-owned
-NAS security hooks. The separate `tcp` module implements bounded TS 24.502
+NAS security hooks and a RustCrypto NIA2 provider with NEA2 or NEA0. The separate `tcp` module implements bounded TS 24.502
 NAS-over-TCP envelopes while leaving the enclosed NAS bytes opaque.
 
 It does not implement NAS procedure state machines, key derivation or key
-lifecycle, SUCI de-concealment, concrete non-null NAS algorithms, EPS NAS
-interworking, or AMF/SMF product policy.
+lifecycle, SUCI de-concealment, NIA1/NEA1 (SNOW 3G), NIA3/NEA3 (ZUC), EPS
+NAS interworking, or AMF/SMF product policy.
 
 ## API Shape
 
@@ -28,13 +28,22 @@ interworking, or AMF/SMF product policy.
 - `Sm::decode_body` dispatches registered 5GSM bodies into `SmMessageBody`;
   current 5GSM bodies are raw-preserving named variants.
 - `RegistrationRequest`, `RegistrationAccept`, `SecurityModeCommand`, and
-  `SecurityModeComplete` are the structured 5GMM body subset.
+  `SecurityModeComplete`, and Authentication Request/Response/Result/Failure/Reject
+  are the structured 5GMM body subset. Authentication bodies use checked
+  `NgKsi`, `Abba`, `EapMessage`, and `MmCause` values.
 - `MobileIdentity`, `IdentityView`, `SuciView`, and `GutiView` parse and expose
   5GS mobile identity content while preserving raw bytes.
 - `unpack_plmn`, `unpack_routing_indicator`, and `unpack_imei` provide BCD
   digit helpers.
-- `NasSecurityContext`, `NasSecurityAlgorithms`, `NasReplayWindow`, `NasCount`,
+- `NasSecurityContext`, `NasSecurityAlgorithms`, `NasCount`,
   and `NullNasSecurityAlgorithms` provide the security hook boundary.
+- `NasReplayWindow` is a standalone monotonic COUNT check;
+  `NasSecurityContext` does not use it.
+- `AesNasSecurityAlgorithms` resolves already-derived `NasAesKey` values through
+  a caller-supplied resolver, using the algorithm identity and the context's
+  `NasConnectionId`. `NasCountState` restores full receive/transmit counters.
+  `nia2_mac` and `nea2_cipher` expose validated bit-length primitives for the
+  TS 33.401 test vectors; ordinary NAS envelopes are octet-aligned.
 - `NasMessage` and implemented body structs use the shared `opc-protocol`
   decode/encode traits.
 
@@ -75,20 +84,41 @@ but is implemented separately in `opc-proto-ngap`.
 ## Status And Limits
 
 The crate is experimental and `publish = false`. Decode and encode are
-byte-exact for accepted inputs because unparsed bodies, optional IEs, and
-identity content are preserved raw. The in-tree null security provider is only
-for NIA0/NEA0 and tests; production use of NIA1/2/3 or NEA1/2/3 must supply an
-external `NasSecurityAlgorithms` implementation.
+byte-exact for raw-preserved bodies and identity content. Authentication
+encoding is canonical: known IEs in table order, then preserved extensions;
+ignored duplicates and spare bits are not emitted. This also applies when
+`EncodeContext::raw_preserving` is true; retain `PlainMm.body` for the original
+wire image. Default decode follows receiver rules: optional presence is not
+enforced, malformed/out-of-order optional IEs are ignored, and excess fixed-size
+IE octets and EAP padding are discarded. Strict/ProcedureAware enforce table
+order, exact lengths and sender presence rules; encoding always enforces these
+rules. Mandatory fields and decoding limits remain checked at every level.
+
+The AES provider supports NIA2 with NEA2 or NEA0 pass-through; NEA0 performs no
+cipher-key lookup, even for a ciphered security header. Each `NasSecurityContext`
+owns a `NasConnectionId` (3GPP=1, non-3GPP=2) and separate per-direction COUNT
+state. A provider can serve both accesses. Its resolver must authorize the
+handle and the algorithm-bearing `NasKeyUsage` before returning a derived key.
+`NasSecurityContext` authenticates the sequence-number octet and transmitted
+payload, and ciphers only the payload. `protect_payload` allocates a fresh COUNT
+atomically, including through clones or concurrent calls, and burns it on
+provider failure. Exhaustion refuses further protection. Restore the next
+unused transmit COUNT and highest authenticated receive COUNT, with exclusive
+ownership and no rollback under the same keys. Persistence, key replacement
+and cross-process fencing remain caller-owned. The separate null provider
+allows explicit NIA0, which provides no integrity or reliable replay detection.
+Plain, protected and verified NAS payloads, 5GSM bodies and `RawMessageBody`
+bytes are redacted in Debug output.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the full v2 coverage and known
-limitations, including optional-IE format heuristics.
+limitations, including the authentication IE matrix, vector sources and migration notes.
 
 ## Roadmap
 
 - Add typed 5GMM and 5GSM bodies as consuming NF profiles need them.
 - Replace optional-IE heuristics with explicit registry coverage for more IEs.
-- Keep key derivation, SUCI de-concealment, concrete algorithms, and procedure
-  state in higher-level security and NF crates.
+- Keep key derivation, SUCI de-concealment and procedure state in higher-level
+  security and NF crates.
 
 ## Verification
 

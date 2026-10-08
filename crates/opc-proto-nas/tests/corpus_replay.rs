@@ -20,7 +20,15 @@ use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 /// regardless of input. Decode returning `Err` is expected and fine.
 fn exercise(data: &[u8]) {
     // Borrowed decode at the default (Structural) level.
-    let _ = NasMessage::decode(data, DecodeContext::default());
+    if let Ok((_, NasMessage::PlainMm(message))) =
+        NasMessage::decode(data, DecodeContext::default())
+    {
+        let _ = message.decode_body(DecodeContext::default());
+        let _ = message.decode_body(DecodeContext {
+            validation_level: ValidationLevel::Strict,
+            ..DecodeContext::default()
+        });
+    }
 
     // Strict decode (spare-nibble enforcement).
     let ctx_strict = DecodeContext {

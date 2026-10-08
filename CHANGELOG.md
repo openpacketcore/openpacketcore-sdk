@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-nas`: typed 5GMM Authentication Request, Response, Result, Failure
+  and Reject bodies, checked authentication IEs, bounded extension parsing and
+  RustCrypto 128-NIA2 with 128-NEA2 or NEA0 and explicit key resolution. All six EEA2 and
+  eight EIA2 test sets from TS 33.401 Annex C are covered, including partial-bit
+  inputs. SNOW 3G and ZUC remain out of scope.
+
 - `opc-proto-ikev2`: add opt-in zero-write empty INFORMATIONAL handling to
   committed GCM windows. Canonical replies advance a volatile receive floor,
   allowing DPD at ID n followed by stateful work at n+1, with exact byte reuse,
@@ -201,6 +207,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Changed
+
+- `opc-proto-nas` migration: the five `MmMessageBody::Authentication*` variants
+  now contain typed bodies instead of `RawMessageBody`. Use each body's codec
+  traits and named fields; callers needing opaque preservation can retain the
+  original `PlainMm.body`. Authentication encoding emits known IEs in table
+  order, followed by preserved extensions, and omits ignored repetitions and
+  spare bits even with `EncodeContext::raw_preserving`; these typed bodies do
+  not retain the original wire image. `decode_mm_message_body` and
+  `PlainMm::decode_body` can now return errors for malformed authentication
+  bodies instead of returning an opaque raw body. Default decoding follows
+  receiver rules: optional presence does not cause errors, malformed/out-of-order
+  optional IEs are ignored, and excess fixed-size IE octets/EAP padding are
+  discarded. Table order, exact lengths and sender presence rules apply to
+  encoding and Strict/ProcedureAware decoding. Mandatory syntax and resource
+  limits remain checked at every level. `NgKsi` distinguishes the context-type
+  flag from identifier 7. Plain, protected and verified NAS payloads, 5GSM bodies and
+  `RawMessageBody` bytes are redacted in Debug output.
+- `NasSecurityAlgorithms::compute_mac` now receives the sequence-number octet
+  followed by the transmitted NAS payload from `NasSecurityContext`, as required
+  by TS 24.501 §4.4.3.3 and §4.4.4.1. Providers must authenticate these bytes
+  directly and remove any workaround that prepends the sequence number. Cipher
+  input remains the NAS payload alone. Both algorithm hooks now also take
+  `NasConnectionId` for the context-owned BEARER.
+- `NasSecurityContext::new` now takes a `NasConnectionId` and full
+  `NasCountState` for each direction instead of two overflow integers. Each
+  state holds the next transmit COUNT and highest authenticated receive COUNT;
+  `None` for next transmit means exhausted. `count_for` now returns a `Result`
+  and estimates strictly above the highest accepted COUNT across sequence wraps.
+  `count_state` exposes snapshots and `connection_id` exposes the fixed access.
+  `protect_payload` no longer accepts COUNT: the context reserves one atomically
+  and burns it even on provider failure. Clones share counters; exhaustion
+  refuses further protection. Restore current, exclusively owned state under
+  the same keys; snapshots do not provide persistence or process fencing.
+  `verify_and_decipher` consumes receive COUNT only after both operations succeed.
+  Replays can return `IntegrityCheckFailed` against a newer estimate, or
+  `ReplayRejected` on concurrent stale acceptance; NIA0 cannot authenticate COUNT.
+  With NIA0, replayed messages are now accepted with a higher COUNT, per
+  TS 24.501 §4.4.3.2.
+- `AesNasSecurityAlgorithms::new` now takes only a resolver and returns `Self`;
+  the provider no longer owns BEARER. `NasKeyUsage::Integrity` and `Ciphering`
+  now carry their selected algorithm identities for TS 33.501 Annex A.8 key
+  derivation. NIA2+NEA0 works with ciphered headers without cipher-key lookup;
+  NIA0 remains refused by this provider. `NasSecurityError` adds `InvalidBearer`,
+  `InvalidLength` and `KeyUnavailable`; downstream exhaustive matches must handle
+  them.
 
 - `opc-proto-ikev2`: enabling empty replies on a restored window now always
   recovers a lost zero-write prefix. Restore and enable are separate: a

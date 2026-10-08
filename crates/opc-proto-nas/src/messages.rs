@@ -2,10 +2,16 @@
 //!
 //! v2 adds first-CNF message body dispatch plus selected IE-level decoding for
 //! Registration Request, Registration Accept, Security Mode Command, and
-//! Security Mode Complete. Message bodies outside the typed subset are
+//! Security Mode Complete. Authentication bodies are typed in
+//! [`crate::authentication`]. Message bodies outside the typed subset are
 //! raw-preserved through named variants.
 
 use std::fmt;
+
+use crate::authentication::{
+    AuthenticationFailure, AuthenticationReject, AuthenticationRequest, AuthenticationResponse,
+    AuthenticationResult,
+};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
@@ -145,10 +151,20 @@ impl SelectedNasSecurityAlgorithms {
 }
 
 /// Raw-preserved NAS message body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Debug output redacts the bytes, which may carry authentication material.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawMessageBody {
     /// Original body bytes.
     pub raw: Bytes,
+}
+
+impl fmt::Debug for RawMessageBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawMessageBody")
+            .field("raw", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RawMessageBody {
@@ -367,15 +383,15 @@ pub enum MmMessageBody {
     /// Configuration Update Complete.
     ConfigurationUpdateComplete(RawMessageBody),
     /// Authentication Request.
-    AuthenticationRequest(RawMessageBody),
+    AuthenticationRequest(AuthenticationRequest),
     /// Authentication Response.
-    AuthenticationResponse(RawMessageBody),
+    AuthenticationResponse(AuthenticationResponse),
     /// Authentication Reject.
-    AuthenticationReject(RawMessageBody),
+    AuthenticationReject(AuthenticationReject),
     /// Authentication Failure.
-    AuthenticationFailure(RawMessageBody),
+    AuthenticationFailure(AuthenticationFailure),
     /// Authentication Result.
-    AuthenticationResult(RawMessageBody),
+    AuthenticationResult(AuthenticationResult),
     /// Identity Request.
     IdentityRequest(RawMessageBody),
     /// Identity Response.
@@ -928,19 +944,19 @@ pub fn decode_mm_message_body(
             MmMessageBody::ConfigurationUpdateComplete(raw_body(body))
         }
         Some(MmMessageType::AuthenticationRequest) => {
-            MmMessageBody::AuthenticationRequest(raw_body(body))
+            MmMessageBody::AuthenticationRequest(AuthenticationRequest::decode_body(body, ctx)?.1)
         }
         Some(MmMessageType::AuthenticationResponse) => {
-            MmMessageBody::AuthenticationResponse(raw_body(body))
+            MmMessageBody::AuthenticationResponse(AuthenticationResponse::decode_body(body, ctx)?.1)
         }
         Some(MmMessageType::AuthenticationReject) => {
-            MmMessageBody::AuthenticationReject(raw_body(body))
+            MmMessageBody::AuthenticationReject(AuthenticationReject::decode_body(body, ctx)?.1)
         }
         Some(MmMessageType::AuthenticationFailure) => {
-            MmMessageBody::AuthenticationFailure(raw_body(body))
+            MmMessageBody::AuthenticationFailure(AuthenticationFailure::decode_body(body, ctx)?.1)
         }
         Some(MmMessageType::AuthenticationResult) => {
-            MmMessageBody::AuthenticationResult(raw_body(body))
+            MmMessageBody::AuthenticationResult(AuthenticationResult::decode_body(body, ctx)?.1)
         }
         Some(MmMessageType::IdentityRequest) => MmMessageBody::IdentityRequest(raw_body(body)),
         Some(MmMessageType::IdentityResponse) => MmMessageBody::IdentityResponse(raw_body(body)),
@@ -1048,11 +1064,6 @@ impl Encode for MmMessageBody {
             | Self::ServiceReject(body)
             | Self::ConfigurationUpdateCommand(body)
             | Self::ConfigurationUpdateComplete(body)
-            | Self::AuthenticationRequest(body)
-            | Self::AuthenticationResponse(body)
-            | Self::AuthenticationReject(body)
-            | Self::AuthenticationFailure(body)
-            | Self::AuthenticationResult(body)
             | Self::IdentityRequest(body)
             | Self::IdentityResponse(body)
             | Self::SecurityModeReject(body)
@@ -1063,6 +1074,11 @@ impl Encode for MmMessageBody {
             | Self::DlNasTransport(body)
             | Self::Unknown(body) => body.encode(dst, ctx),
             Self::SecurityModeCommand(body) => body.encode(dst, ctx),
+            Self::AuthenticationRequest(body) => body.encode(dst, ctx),
+            Self::AuthenticationResponse(body) => body.encode(dst, ctx),
+            Self::AuthenticationReject(body) => body.encode(dst, ctx),
+            Self::AuthenticationFailure(body) => body.encode(dst, ctx),
+            Self::AuthenticationResult(body) => body.encode(dst, ctx),
             Self::SecurityModeComplete(body) => body.encode(dst, ctx),
         }
     }
@@ -1078,11 +1094,6 @@ impl Encode for MmMessageBody {
             | Self::ServiceReject(body)
             | Self::ConfigurationUpdateCommand(body)
             | Self::ConfigurationUpdateComplete(body)
-            | Self::AuthenticationRequest(body)
-            | Self::AuthenticationResponse(body)
-            | Self::AuthenticationReject(body)
-            | Self::AuthenticationFailure(body)
-            | Self::AuthenticationResult(body)
             | Self::IdentityRequest(body)
             | Self::IdentityResponse(body)
             | Self::SecurityModeReject(body)
@@ -1093,6 +1104,11 @@ impl Encode for MmMessageBody {
             | Self::DlNasTransport(body)
             | Self::Unknown(body) => body.wire_len(ctx),
             Self::SecurityModeCommand(body) => body.wire_len(ctx),
+            Self::AuthenticationRequest(body) => body.wire_len(ctx),
+            Self::AuthenticationResponse(body) => body.wire_len(ctx),
+            Self::AuthenticationReject(body) => body.wire_len(ctx),
+            Self::AuthenticationFailure(body) => body.wire_len(ctx),
+            Self::AuthenticationResult(body) => body.wire_len(ctx),
             Self::SecurityModeComplete(body) => body.wire_len(ctx),
         }
     }
@@ -1421,10 +1437,6 @@ mod tests {
             (
                 MmMessageType::RegistrationComplete as u8,
                 "registration complete",
-            ),
-            (
-                MmMessageType::AuthenticationResponse as u8,
-                "authentication response",
             ),
             (MmMessageType::UlNasTransport as u8, "uplink NAS transport"),
             (
