@@ -9,8 +9,9 @@
 //! identity decoding, BCD digit unpacking for PLMN/routing indicator/IMEI/
 //! IMEISV, and first-CNF message body dispatch. Registration Request,
 //! Registration Accept, Security Mode Command, and Security Mode Complete are
-//! structurally decoded; other registered 5GMM/5GSM bodies are named and
-//! preserved raw.
+//! structurally decoded, as are all five Authentication bodies. The AES
+//! provider implements NIA2/NEA2. Other registered 5GMM/5GSM bodies are named
+//! and preserved raw.
 //!
 //! NAS PDUs carry no internal length framing — the transport (NGAP, N1)
 //! delimits them — so decoding consumes the entire input slice.
@@ -21,6 +22,7 @@
 //! @req REQ-3GPP-TS24501-R18-001
 //! @conformance v2 — see CONFORMANCE.md
 
+pub mod authentication;
 pub mod bcd;
 pub mod identity;
 pub mod messages;
@@ -33,6 +35,10 @@ use opc_protocol::{
     EncodeError, OwnedDecode, SpecRef, ValidationLevel,
 };
 
+pub use authentication::{
+    Abba, AuthenticationFailure, AuthenticationReject, AuthenticationRequest,
+    AuthenticationResponse, AuthenticationResult, EapMessage, MmCause, NgKsi,
+};
 pub use bcd::{unpack_imei, unpack_plmn, unpack_routing_indicator, BcdError, Plmn};
 pub use identity::{GutiView, IdentityType, IdentityView, MobileIdentity, SuciView};
 pub use messages::{
@@ -42,9 +48,10 @@ pub use messages::{
     SelectedNasSecurityAlgorithms, SmMessageBody,
 };
 pub use security::{
-    NasCipheringAlgorithm, NasCount, NasIntegrityAlgorithm, NasReplayWindow, NasSecurityAlgorithms,
-    NasSecurityContext, NasSecurityDirection, NasSecurityError, NullNasSecurityAlgorithms,
-    VerifiedNasPayload,
+    nea2_cipher, nia2_mac, AesNasSecurityAlgorithms, NasAesKey, NasAesKeyResolver,
+    NasAlgorithmInput, NasCipheringAlgorithm, NasConnectionId, NasCount, NasCountState,
+    NasIntegrityAlgorithm, NasKeyUsage, NasReplayWindow, NasSecurityAlgorithms, NasSecurityContext,
+    NasSecurityDirection, NasSecurityError, NullNasSecurityAlgorithms, VerifiedNasPayload,
 };
 
 /// Extended protocol discriminator for 5GS mobility management (TS 24.007).
@@ -216,7 +223,7 @@ impl SmMessageType {
 /// @spec 3GPP TS24501 R18 9.1.1
 /// @req REQ-3GPP-TS24501-R18-9.1.1-001
 /// @conformance v2
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlainMm {
     /// Spare high nibble of the security-header octet (must be 0 in strict
     /// mode; preserved for byte-exact re-encode otherwise).
@@ -226,6 +233,16 @@ pub struct PlainMm {
     /// Everything after the 3-octet header, raw until [`PlainMm::decode_body`]
     /// is called.
     pub body: Bytes,
+}
+
+impl std::fmt::Debug for PlainMm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlainMm")
+            .field("spare", &self.spare)
+            .field("message_type", &self.message_type)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PlainMm {
@@ -241,7 +258,7 @@ impl PlainMm {
 /// @spec 3GPP TS24501 R18 9.1.1
 /// @req REQ-3GPP-TS24501-R18-9.1.1-002
 /// @conformance v2
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecurityProtected {
     /// Security header type (1–4).
     pub security_header_type: SecurityHeaderType,
@@ -256,12 +273,26 @@ pub struct SecurityProtected {
     pub payload: Bytes,
 }
 
+impl std::fmt::Debug for SecurityProtected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecurityProtected")
+            .field("security_header_type", &self.security_header_type)
+            .field("spare", &self.spare)
+            .field("mac", &self.mac)
+            .field("sequence_number", &self.sequence_number)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
 /// 5GSM message: EPD 0x2E.
+///
+/// Debug output redacts the body, which may carry authentication material.
 ///
 /// @spec 3GPP TS24501 R18 9.1.1
 /// @req REQ-3GPP-TS24501-R18-9.1.1-003
 /// @conformance v2
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sm {
     /// PDU session identity (octet 2).
     pub pdu_session_id: u8,
@@ -272,6 +303,17 @@ pub struct Sm {
     /// Everything after the 4-octet header, raw until [`Sm::decode_body`] is
     /// called.
     pub body: Bytes,
+}
+
+impl std::fmt::Debug for Sm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sm")
+            .field("pdu_session_id", &self.pdu_session_id)
+            .field("pti", &self.pti)
+            .field("message_type", &self.message_type)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Sm {

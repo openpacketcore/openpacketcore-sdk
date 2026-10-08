@@ -7,7 +7,8 @@ TS 24.502 V18.8.0 clause 9.4.
 ## Specification Baseline
 
 - **Document**: 3GPP TS 24.501 (with header formats per TS 24.007)
-- **Release**: Release 18 (R18)
+- **Release**: Release 18 framing baseline; the authentication subset below is
+  verified against TS 24.501 V17.15.0 (Release 17).
 - **Status**: v2 — experimental; message framing, mobile identity, BCD,
   first-CNF body dispatch, selected 5GMM message bodies, and NAS security
   helper hooks are structured. Procedure state machines are owned by consuming
@@ -49,15 +50,19 @@ digests, allocation measurements, fuzz scope and reproduction commands.
   (4 octets), NAS sequence number, and protected payload framed.
 - `NasSecurityContext` verifies/generates MACs and applies ciphering through
   caller-provided `NasSecurityAlgorithms`; `NullNasSecurityAlgorithms`
-  implements only NIA0/NEA0. NIA1/2/3 and NEA1/2/3 fail closed unless the
-  caller supplies a concrete provider.
-- NAS COUNT helpers model the 16-bit overflow plus 8-bit sequence number, and
-  `NasReplayWindow` rejects stale or repeated COUNT values for one direction.
+  implements only NIA0/NEA0. `AesNasSecurityAlgorithms` implements NIA2 with
+  NEA2 or NEA0 and a caller-owned key resolver. The connection context supplies
+  BEARER and owns transmit COUNT allocation.
+  NIA1/NEA1 and NIA3/NEA3 remain out of scope.
+- NAS COUNT helpers model the 16-bit overflow plus 8-bit sequence number.
+  `NasSecurityContext` estimates receive COUNT from full state and verifies the
+  MAC with that estimate. `NasReplayWindow` is a standalone helper that rejects
+  stale or repeated COUNT values for one direction; the context does not use it.
 - Reserved security header types (5–15) rejected.
 - NAS PDUs carry no internal length framing; decode consumes the entire
   input (the transport delimits PDUs).
-- All round-trips are byte-exact: spare bits and unparsed regions are
-  preserved verbatim. Conformance tests include hand-authored spec-byte
+- Framing and raw-preserved bodies round-trip byte-exactly. Authentication
+  bodies use the canonical encoding described below. Conformance tests include hand-authored spec-byte
   fixtures, not only this codec's own output.
 
 ### 2. 5GS Mobile Identity (§9.11.3.4)
@@ -125,7 +130,7 @@ Decodes IE *content* (caller strips IEI/length framing):
 #### 5.5 First-CNF Raw Body Dispatch
 - 5GMM first-CNF messages without field-level parsing are exposed through
   named `MmMessageBody` raw-preserving variants, including Registration
-  Complete, Authentication Response, UL NAS Transport, and DL NAS Transport.
+  Complete, UL NAS Transport, and DL NAS Transport.
 - 5GSM first-CNF messages are exposed through named `SmMessageBody`
   raw-preserving variants, including PDU Session Establishment and Release
   request/accept/command/complete/status messages.
@@ -134,20 +139,22 @@ Decodes IE *content* (caller strips IEI/length framing):
 
 ## Codec Boundary
 
-- NAS key derivation, key lifecycle, and concrete NIA1/2/3 or NEA1/2/3
-  implementations. This crate validates `opc-key` session key handles and
-  provides algorithm hooks; it does not own security context selection.
+- NAS key derivation, key lifecycle, NIA1/NEA1 (SNOW 3G), and NIA3/NEA3
+  (ZUC). This crate validates `opc-key` session key handles and supplies AES
+  algorithms and hooks; callers own resolver authorization, key derivation,
+  security-context selection, durable COUNT preservation and exclusive restore.
 - SUCI de-concealment (home-network private key operations).
 - NAS procedure state machines and policy validation.
 - Field-level parsing of 5GSM message bodies and 5GMM messages other than
-  Registration Request/Accept/Security Mode Command/Security Mode Complete.
+  Registration Request/Accept, Security Mode Command/Complete, and the five
+  Authentication messages.
 - Semantic validation of optional IE contents beyond length/format framing.
 - EPS (4G) NAS interworking formats.
 
 ## Known Limitations
 
-- Optional IE format detection for unknown IEIs uses a conservative
-  heuristic: IEIs `0x70–0x7F` are treated as TLV-E, IEIs with high nibble
+- Outside the authentication bodies, optional IE format detection for unknown
+  IEIs uses a conservative heuristic: IEIs `0x70–0x7F` are treated as TLV-E, IEIs with high nibble
   `0xA–0xF` as type-1 half-octet, and all others as TLV. Adding a new
   fixed-length type-3 IE to the registry is required for that IE to round
   trip correctly.
@@ -155,8 +162,8 @@ Decodes IE *content* (caller strips IEI/length framing):
   is not surfaced separately; the raw value is preserved for byte-exact
   re-encode.
 - The in-tree null security provider is useful only for explicit NIA0/NEA0
-  profiles and tests. Production deployments using non-null NAS algorithms
-  must supply an external `NasSecurityAlgorithms` implementation.
+  profiles and tests. The AES provider does not negotiate algorithms or manage
+  durable key/COUNT lifetimes, and has no live AMF interoperability qualification.
 
 ## Robustness & Fuzzing
 
@@ -180,3 +187,164 @@ length/cursor model, checks exact payloads, caller-owned tails, terminal states,
 encoding and redaction. A 61-second run completed 8,110,190 executions with no
 failure, using a 4,096-byte input cap. Ordinary tests cover the 65,535-byte wire
 maximum. The existing NAS fuzz workflow discovers both targets automatically.
+
+## Authentication bodies and AES security
+
+The body fixtures in `tests/nas_authentication.rs` are synthetic wire examples
+written from the tables in [TS 24.501 V17.15.0](https://www.etsi.org/deliver/etsi_ts/124500_124599/124501/17.15.00_60/ts_124501v171500p.pdf),
+§8.2.1–8.2.5. They cover AKA and EAP alternatives, all five message types,
+conditional presence, truncation, malformed lengths, duplicate/unknown IEs,
+redaction and encoding. These are codec fixtures, not captured peer exchanges.
+
+| IE | Specification clause | Value and framing |
+| --- | --- | --- |
+| ngKSI | TS 24.501 §9.11.3.32 | Four bits: identifier 0–7 plus native/mapped flag; value 7 refused in network-originated authentication |
+| ABBA | TS 24.501 §9.11.3.10 | 2–255 value octets; Request LV; Result optional TLV (0x38) |
+| RAND | TS 24.501 §9.11.3.16 → TS 24.008 §10.5.3.1 | 16 value octets, TV (0x21) |
+| AUTN | TS 24.501 §9.11.3.15 → TS 24.008 §10.5.3.1.1 | 16 value octets, TLV (0x20) |
+| EAP message | TS 24.501 §9.11.2.2; RFC 3748 §4 | 4–1500 value octets, matching embedded EAP length; TLV-E (0x78) or mandatory Result LV-E |
+| RES* | TS 24.501 §9.11.3.17 → TS 24.301 §9.9.3.4; Table 8.2.2.1.1 fixes the 16-octet size | 16 value octets, TLV (0x2d) |
+| AUTS | TS 24.501 §9.11.3.14 → TS 24.008 §10.5.3.2.2 | 14 value octets, TLV (0x30) |
+| 5GMM cause | TS 24.501 §9.11.3.2 | One octet; unknown values retained |
+
+RAND/AUTN/AUTS encodings were checked against
+[TS 24.008 V17.9.0](https://www.etsi.org/deliver/etsi_ts/124000_124099/124008/17.09.00_60/ts_124008v170900p.pdf).
+Sender validation requires RAND and AUTN together, or EAP exclusively, in a
+Request. Response requires
+exactly one of RES* and EAP. Result requires ABBA for EAP-Success. Failure
+requires AUTS if and only if the cause is synchronization failure (21). Reject
+can be empty or carry EAP-Failure. EAP method bodies and procedure state remain
+caller-owned; recognized EAP codes obey the header sizes in
+[RFC 3748 §4.1–4.2](https://www.rfc-editor.org/rfc/rfc3748#section-4.1).
+
+Encoding and Strict/ProcedureAware decoding enforce those sender rules. Default
+Structural (and HeaderOnly body) decoding follows TS 24.007 §11.2.5/§11.4.1:
+optional IEs do not cause missing/unexpected-presence errors. A Failure ignores
+AUTS unless cause=21; Result accepts EAP-Success without ABBA (TS 24.501
+§5.4.1.2.5.2), and Reject accepts a syntactically valid optional EAP packet.
+Per TS 24.007 §11.4.2, excess AUTN/RES*/AUTS octets are discarded; RFC 3748
+§4.1 EAP padding beyond its embedded Length is also discarded. Strict levels
+require exact lengths. The EAP packet itself must remain 4–1500 octets, fit
+inside its IE and obey its code's header size. Mandatory ngKSI, ABBA and EAP
+remain checked at all levels.
+
+Authentication-specific optional IE parsing follows
+[TS 24.007 V17.5.0 §11.2.4–11.2.5](https://www.etsi.org/deliver/etsi_ts/124000_124099/124007/17.05.00_60/ts_124007v170500p.pdf)
+and TS 24.501 §7.5–7.7. An unknown IE with bit 8 set occupies one octet;
+0x70–0x7f use two length octets; other unknown IEs use one. Unknown
+comprehension-required IEIs 0x00–0x0f and 0x7e–0x7f always fail. Other unknown
+IEs are preserved, dropped or rejected according to `UnknownIePolicy` (strict
+validation alone does not reject them). Repetitions use the first occurrence
+as §7.6.3 requires, including when the shared context defaults to `Last`;
+explicit `DuplicateIePolicy::Reject` refuses duplicates. A known IE appearing
+before an already accepted later table entry is out of order: default levels
+ignore it (§7.6.2), while Strict and ProcedureAware refuse it. At default levels,
+malformed optional values are treated as absent (§7.7.1); parsing continues at
+the next framed IE. If optional framing is
+truncated, no trustworthy next boundary exists, so the remaining optional bytes
+are ignored without attempting resynchronization. Strict levels refuse malformed
+optional IEs. All optional IEs,
+including ignored repetitions and dropped unknowns, count toward `max_ies`.
+Known lengths are checked before copying values, and `max_message_len` is
+checked before parsing. Syntactic failures are returned as redacted errors to
+the procedure layer, which owns the §7 status-message/recovery behavior.
+
+Authentication encoding validates mutable fields and raw extensions before
+writing, and uses canonical table order followed by retained unknown IEs.
+Duplicates, ignored values and spare bits are not retained. The typed bodies
+have no original wire image, so `EncodeContext::raw_preserving` still produces
+canonical output; use `PlainMm.body` for opaque forwarding. Default-decoded
+values that violate sender presence rules must be resolved by the procedure
+before encoding. The five `MmMessageBody` variants
+now contain typed bodies; use their fields and `Encode`/`BorrowDecode`/
+`OwnedDecode`, or retain `PlainMm.body` for opaque forwarding. The older
+`NasKeySetIdentifier` API remains separate; the authentication `NgKsi` type
+correctly distinguishes the context-type flag from the no-key identifier.
+
+### Algorithm implementation and vector sources
+
+[TS 33.501 V18.6.0 §D.2.1.3, §D.3.1.3, §D.4.4 and §D.4.5](https://www.etsi.org/deliver/etsi_ts/133500_133599/133501/18.06.00_60/ts_133501v180600p.pdf)
+map NEA2/NIA2 directly to EEA2/EIA2 and their test sets. The committed
+`tests/fixtures/nas_aes_33401.txt` records **all six** C.1 sets and **all eight**
+C.2 sets from [TS 33.401 V18.0.0 Annex C](https://www.etsi.org/deliver/etsi_ts/133400_133499/133401/18.00.00_60/ts_133401v180000p.pdf).
+Each row names its source clause and retains its key, COUNT, BEARER, DIRECTION,
+bit LENGTH, message and expected result. Printed zero padding beyond the last
+message octet is omitted. C.1 ciphertext is checked both ways; C.2 MACs are
+checked against the published 32-bit values.
+
+The provider uses RustCrypto `aes` 0.9.3, `cmac` 0.8 and `ctr` 0.10, all with
+zeroization enabled. AES 0.9.3 declares Rust 1.89; CMAC 0.8, CTR 0.10 and
+the CMAC `dbl` dependency declare Rust 1.85. Their MIT/Apache-2.0 licenses
+are compatible with `deny.toml`.
+`NasAesKey` owns a zeroizing 128-bit value and redacts `Debug`; the provider
+never formats the resolver. Key resolution receives the opaque SDK handle and
+an explicit integrity/ciphering usage and algorithm identity via
+`NasKeyUsage::Integrity(Nia2)` or `NasKeyUsage::Ciphering(Nea2)` (TS 33.501
+Annex A.8). The resolver must authorize that handle
+and return an already-derived KNASint/KNASenc; no SDK storage key is extracted
+or truncated. NIA1/NEA1 (SNOW 3G), NIA3/NEA3 (ZUC), KDFs and negotiation are
+out of scope. NEA0 is pass-through without cipher-key resolution and works
+with NIA2 under the ciphered header types (TS 24.501 §4.4.5). NIA0 remains
+refused by the AES provider and requires the separate null provider.
+
+NIA2 computes CMAC over the 64-bit COUNT/BEARER/DIRECTION/zero prefix followed
+by the specified message bits and returns the leftmost 32 tag bits. The
+partial-octet adapter uses the bit padding of NIST SP 800-38B §6.2 and adjusts
+the last complete block by K1 XOR K2 before RustCrypto CMAC finalization;
+RustCrypto supplies AES, subkey doubling, CBC chaining and finalization. Keys
+and adapter scratch are zeroized. Ordinary NAS messages use the direct
+byte-aligned CMAC path. NEA2 uses a big-endian 64-bit counter in the low half
+of the AES input. Non-byte-aligned cipher output zeros unused low bits.
+
+The context supplies `SQN || transmitted payload` to integrity and only the
+payload to ciphering (TS 24.501 §4.4.3.3 and §4.4.4.1). Existing custom
+providers must remove any SQN-prepending workaround and accept the new
+`NasConnectionId` argument in both algorithm hooks. NAS COUNT is zero-extended
+to 32 bits. BEARER is the immutable per-context connection identifier, 1 for
+3GPP or 2 for non-3GPP access (TS 33.501 §6.4.2); the provider owns no BEARER.
+
+`protect_payload` no longer takes an explicit COUNT. It reserves the next COUNT
+from the context atomically before calling providers. Clones share counters,
+provider errors burn the reservation, and 24-bit exhaustion never wraps.
+`NasCountState` distinguishes the next unused transmit COUNT (`None` when
+exhausted) from the highest authenticated receive COUNT. The receive estimate
+is strictly higher than the stored value, including across lost messages and
+restored sequence numbers (TS 24.501 §4.4.3.1). Authentication and deciphering
+must both succeed before `verify_and_decipher` advances receive state. Replays
+normally fail integrity against the newer estimate; concurrent stale acceptance
+returns `ReplayRejected`. NIA0 cannot reliably detect replay because its MAC
+does not authenticate COUNT.
+
+Callers own key derivation/replacement and exclusive, current per-connection
+state restoration. Snapshots do not supply durable reservations: persist and
+fence state before reusing keys across restarts, or establish fresh keys. These
+codec/provider changes do not implement Pod lifecycle, durable formats or
+session draining.
+
+The synthetic protected-envelope fixture was independently generated using
+OpenSSL 3.5.7. For uplink COUNT=1, BEARER=2, payload `7e0043`, KNASenc=`22`
+repeated 16 times and KNASint=`11` repeated 16 times:
+
+```sh
+printf '\x7e\x00\x43' | openssl enc -aes-128-ctr \
+  -K 22222222222222222222222222222222 \
+  -iv 00000001100000000000000000000000 | od -An -tx1
+# 89 1b 5d
+printf '\x00\x00\x00\x01\x10\x00\x00\x00\x01\x89\x1b\x5d' | \
+  openssl mac -macopt cipher:AES-128-CBC \
+  -macopt hexkey:11111111111111111111111111111111 CMAC
+# NAS MAC is the first four octets: 55 ea 2a 24
+```
+
+The corresponding downlink prefix ends in `14000000`, giving ciphertext
+`d6ca5a` and NAS MAC `f1ca634d`. Tests also cover tampering, replay, key-resolution
+failures, invalid bearer/length, all final-bit positions, and Debug redaction.
+The authentication QuickCheck test runs 2,000 generated bodies through all five
+dispatch paths with default, conservative and small decoding limits. Values
+that satisfy sender rules are encoded and decoded again; receiver-only values
+must fail encoding without writing output. Ten canonical authentication frames
+seed the fuzz corpus; both the fuzzer and corpus replay dispatch plain frame
+bodies at default and Strict levels. Tests cover both accesses, NEA0, lost and
+restored COUNTs, cloned/concurrent transmit allocation, exhaustion and redaction
+of PlainMm, SecurityProtected and VerifiedNasPayload. Independent cryptographic/codec review and live peer interoperability
+are separate qualification steps.

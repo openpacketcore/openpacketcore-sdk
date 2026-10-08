@@ -3,9 +3,9 @@
 use bytes::BytesMut;
 use opc_key::{KeyHandle, KeyId, KeyPurpose, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_proto_nas::{
-    MmMessageBody, NasCipheringAlgorithm, NasCount, NasIntegrityAlgorithm, NasMessage,
-    NasSecurityContext, NasSecurityDirection, NullNasSecurityAlgorithms, SecurityHeaderType,
-    SmMessageBody,
+    MmMessageBody, NasCipheringAlgorithm, NasConnectionId, NasCount, NasCountState,
+    NasIntegrityAlgorithm, NasMessage, NasSecurityContext, NasSecurityDirection,
+    NullNasSecurityAlgorithms, SecurityHeaderType, SmMessageBody,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 use opc_types::TenantId;
@@ -41,8 +41,15 @@ fn security_context() -> NasSecurityContext {
         NasCipheringAlgorithm::Nea0,
         session_key("nas-int", 0x11),
         session_key("nas-ciph", 0x22),
-        0,
-        1,
+        NasConnectionId::NonThreeGpp,
+        NasCountState {
+            next_transmit: Some(NasCount::new(0, 0x42)),
+            highest_received: None,
+        },
+        NasCountState {
+            next_transmit: Some(NasCount::new(1, 0x44)),
+            highest_received: Some(NasCount::new(1, 0)),
+        },
     )
     .unwrap()
 }
@@ -114,7 +121,6 @@ fn security_protected_nia0_nea0_payload_verifies_and_decodes() {
             &algorithms,
             NasSecurityDirection::Downlink,
             SecurityHeaderType::IntegrityProtectedAndCiphered,
-            NasCount::new(1, 0x44),
             &payload,
         )
         .unwrap();
@@ -158,7 +164,6 @@ fn security_protected_wrong_mac_fails_closed() {
             &algorithms,
             NasSecurityDirection::Uplink,
             SecurityHeaderType::IntegrityProtected,
-            NasCount::new(0, 0x01),
             &[0x7E, 0x00, 0x43],
         )
         .unwrap();
@@ -167,4 +172,63 @@ fn security_protected_wrong_mac_fails_closed() {
     assert!(context
         .verify_integrity(&algorithms, NasSecurityDirection::Uplink, &envelope)
         .is_err());
+}
+
+#[test]
+fn integrity_input_includes_sequence_number_but_cipher_input_does_not() {
+    use bytes::Bytes;
+    use opc_proto_nas::{NasSecurityAlgorithms, NasSecurityError};
+    use std::cell::RefCell;
+    #[derive(Default)]
+    struct Capture {
+        mac_inputs: RefCell<Vec<Vec<u8>>>,
+        cipher_inputs: RefCell<Vec<Vec<u8>>>,
+    }
+    impl NasSecurityAlgorithms for Capture {
+        fn compute_mac(
+            &self,
+            _: NasIntegrityAlgorithm,
+            _: &KeyHandle,
+            _: NasCount,
+            _: NasConnectionId,
+            _: NasSecurityDirection,
+            input: &[u8],
+        ) -> Result<[u8; 4], NasSecurityError> {
+            self.mac_inputs.borrow_mut().push(input.to_vec());
+            Ok([0; 4])
+        }
+        fn apply_cipher(
+            &self,
+            _: NasCipheringAlgorithm,
+            _: &KeyHandle,
+            _: NasCount,
+            _: NasConnectionId,
+            _: NasSecurityDirection,
+            input: &[u8],
+        ) -> Result<Bytes, NasSecurityError> {
+            self.cipher_inputs.borrow_mut().push(input.to_vec());
+            Ok(input.iter().map(|byte| byte ^ 0xff).collect())
+        }
+    }
+    let algorithms = Capture::default();
+    let ctx = security_context();
+    let payload = [0x7e, 0, 0x43];
+    let envelope = ctx
+        .protect_payload(
+            &algorithms,
+            NasSecurityDirection::Uplink,
+            SecurityHeaderType::IntegrityProtectedAndCiphered,
+            &payload,
+        )
+        .unwrap();
+    ctx.verify_and_decipher(&algorithms, NasSecurityDirection::Uplink, &envelope)
+        .unwrap();
+    assert_eq!(
+        *algorithms.cipher_inputs.borrow(),
+        vec![payload.to_vec(), vec![0x81, 0xff, 0xbc]]
+    );
+    assert_eq!(
+        *algorithms.mac_inputs.borrow(),
+        vec![vec![0x42, 0x81, 0xff, 0xbc]; 2]
+    );
 }

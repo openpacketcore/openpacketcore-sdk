@@ -1,14 +1,27 @@
-//! NAS security helper types and algorithm hooks.
+//! NAS security helpers, algorithm hooks and a RustCrypto AES provider.
 //!
-//! This module owns NAS COUNT handling, replay checks, and the interface used
-//! by real NAS integrity/ciphering implementations. It intentionally does not
-//! hard-code NIA1/2/3 or NEA1/2/3; callers provide those algorithms behind
-//! [`NasSecurityAlgorithms`] while this crate keeps framing and fail-closed
-//! policy local to the codec.
+//! This module owns NAS COUNT handling, replay checks and protected-envelope
+//! framing. [`AesNasSecurityAlgorithms`] implements NIA2 with NEA2 or NEA0 and
+//! an explicit caller-owned key resolver. The context owns COUNT allocation
+//! and the NAS connection identifier. SNOW 3G
+//! (NIA1/NEA1), ZUC (NIA3/NEA3), key derivation and algorithm negotiation remain
+//! outside this implementation. [`NullNasSecurityAlgorithms`] is separate and
+//! supports only explicitly selected NIA0/NEA0.
 
-use bytes::Bytes;
+mod aes;
+
+pub use aes::{
+    nea2_cipher, nia2_mac, AesNasSecurityAlgorithms, NasAesKey, NasAesKeyResolver,
+    NasAlgorithmInput, NasKeyUsage,
+};
+
+use bytes::{BufMut, Bytes, BytesMut};
 use opc_key::{KeyHandle, KeyPurpose};
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
+use subtle::ConstantTimeEq;
 
 use crate::{SecurityHeaderType, SecurityProtected};
 
@@ -143,47 +156,95 @@ impl NasReplayWindow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NasDirectionState {
-    overflow: u16,
-    replay_window: NasReplayWindow,
+/// NAS connection identifier used as BEARER (TS 33.501 §6.4.2).
+///
+/// Each access has its own context and COUNT pair, even when keys and the
+/// algorithm provider are shared. Raw algorithm vectors can use any five-bit
+/// BEARER through [`NasAlgorithmInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NasConnectionId {
+    /// 3GPP access, connection identifier 0x01.
+    ThreeGpp,
+    /// Non-3GPP access, connection identifier 0x02.
+    NonThreeGpp,
 }
 
-impl NasDirectionState {
-    const fn new(overflow: u16) -> Self {
-        Self {
-            overflow,
-            replay_window: NasReplayWindow::new(),
+impl NasConnectionId {
+    /// The five-bit BEARER input for this NAS connection.
+    pub const fn as_bearer(self) -> u8 {
+        match self {
+            Self::ThreeGpp => 1,
+            Self::NonThreeGpp => 2,
         }
     }
+}
 
+/// COUNT state for one direction of one connection (TS 24.501 §4.4.3.1).
+///
+/// The transmit value is the next unused COUNT; the receive value is the
+/// highest successfully authenticated COUNT. These have different restoration
+/// semantics. A caller restoring keys must supply current, exclusively owned
+/// state; this in-memory helper does not persist or fence contexts across
+/// process restarts. Never restore an older snapshot with the same keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NasCountState {
+    /// Next unused transmit COUNT; `None` means exhausted, never reset to zero.
+    pub next_transmit: Option<NasCount>,
+    /// Highest authenticated receive COUNT, or `None` for a fresh context.
+    pub highest_received: Option<NasCount>,
+}
+
+impl Default for NasCountState {
+    fn default() -> Self {
+        Self {
+            next_transmit: Some(NasCount::new(0, 0)),
+            highest_received: None,
+        }
+    }
+}
+
+impl NasCountState {
     fn candidate_count(&self, sequence_number: u8) -> Result<NasCount, NasSecurityError> {
+        let overflow = self.highest_received.map_or(0, NasCount::overflow);
+        let candidate = NasCount::new(overflow, sequence_number);
         if self
-            .replay_window
-            .highest()
-            .is_some_and(|highest| highest.sequence_number() == u8::MAX && sequence_number == 0)
+            .highest_received
+            .is_some_and(|highest| candidate <= highest)
         {
-            return self
-                .overflow
+            return overflow
                 .checked_add(1)
                 .map(|overflow| NasCount::new(overflow, sequence_number))
                 .ok_or(NasSecurityError::InvalidCount);
         }
-        Ok(NasCount::new(self.overflow, sequence_number))
+        Ok(candidate)
     }
 
     fn accept(&mut self, count: NasCount) -> Result<(), NasSecurityError> {
-        self.replay_window.accept(count)?;
-        self.overflow = count.overflow();
+        if self
+            .highest_received
+            .is_some_and(|highest| count <= highest)
+        {
+            return Err(NasSecurityError::ReplayRejected);
+        }
+        self.highest_received = Some(count);
         Ok(())
+    }
+
+    fn reserve_transmit(&mut self) -> Result<NasCount, NasSecurityError> {
+        let count = self.next_transmit.ok_or(NasSecurityError::InvalidCount)?;
+        self.next_transmit = count.checked_increment().ok();
+        Ok(count)
     }
 }
 
-/// NAS security context selected by NAS procedures.
+/// NAS security context for one connection, selected by NAS procedures.
 ///
-/// The key handles come from the SDK key substrate. This crate validates that
-/// they live in the `session` key lane but does not perform key lookup or
-/// lifecycle management.
+/// Clones share receive and transmit state. `protect_payload` reserves a fresh
+/// COUNT before invoking algorithms, including on failure, and refuses after
+/// exhaustion. Separate contexts for the same keys and connection must not be
+/// created from stale state. Key lookup, persistence and lifecycle belong to
+/// the caller; SDK key handles must belong to the `session` key lane.
+#[derive(Clone)]
 pub struct NasSecurityContext {
     /// Selected integrity algorithm.
     pub integrity_algorithm: NasIntegrityAlgorithm,
@@ -193,173 +254,214 @@ pub struct NasSecurityContext {
     pub integrity_key: KeyHandle,
     /// Ciphering key handle.
     pub ciphering_key: KeyHandle,
-    uplink: Mutex<NasDirectionState>,
-    downlink: Mutex<NasDirectionState>,
-}
-
-impl Clone for NasSecurityContext {
-    fn clone(&self) -> Self {
-        Self {
-            integrity_algorithm: self.integrity_algorithm,
-            ciphering_algorithm: self.ciphering_algorithm,
-            integrity_key: self.integrity_key.clone(),
-            ciphering_key: self.ciphering_key.clone(),
-            uplink: Mutex::new(self.state_snapshot(NasSecurityDirection::Uplink)),
-            downlink: Mutex::new(self.state_snapshot(NasSecurityDirection::Downlink)),
-        }
-    }
+    connection_id: NasConnectionId,
+    uplink: Arc<Mutex<NasCountState>>,
+    downlink: Arc<Mutex<NasCountState>>,
 }
 
 impl fmt::Debug for NasSecurityContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let uplink = self.state_snapshot(NasSecurityDirection::Uplink);
-        let downlink = self.state_snapshot(NasSecurityDirection::Downlink);
         f.debug_struct("NasSecurityContext")
             .field("integrity_algorithm", &self.integrity_algorithm)
             .field("ciphering_algorithm", &self.ciphering_algorithm)
             .field("integrity_key", &self.integrity_key)
             .field("ciphering_key", &self.ciphering_key)
-            .field("uplink_overflow", &uplink.overflow)
-            .field("downlink_overflow", &downlink.overflow)
-            .field("uplink_replay_highest", &uplink.replay_window.highest())
-            .field("downlink_replay_highest", &downlink.replay_window.highest())
+            .field("connection_id", &self.connection_id)
+            .field("uplink", &self.count_state(NasSecurityDirection::Uplink))
+            .field(
+                "downlink",
+                &self.count_state(NasSecurityDirection::Downlink),
+            )
             .finish()
     }
 }
 
 impl NasSecurityContext {
-    /// Build a NAS security context from SDK key handles.
+    /// Build a context with an immutable connection identifier and full COUNTs.
+    ///
+    /// Use [`NasCountState::default`] for a fresh context, or restore each
+    /// direction's next transmit and highest authenticated receive COUNTs.
     pub fn new(
         integrity_algorithm: NasIntegrityAlgorithm,
         ciphering_algorithm: NasCipheringAlgorithm,
         integrity_key: KeyHandle,
         ciphering_key: KeyHandle,
-        uplink_overflow: u16,
-        downlink_overflow: u16,
+        connection_id: NasConnectionId,
+        uplink: NasCountState,
+        downlink: NasCountState,
     ) -> Result<Self, NasSecurityError> {
         if integrity_key.purpose() != KeyPurpose::Session
             || ciphering_key.purpose() != KeyPurpose::Session
         {
             return Err(NasSecurityError::KeyPurposeMismatch);
         }
-
         Ok(Self {
             integrity_algorithm,
             ciphering_algorithm,
             integrity_key,
             ciphering_key,
-            uplink: Mutex::new(NasDirectionState::new(uplink_overflow)),
-            downlink: Mutex::new(NasDirectionState::new(downlink_overflow)),
+            connection_id,
+            uplink: Arc::new(Mutex::new(uplink)),
+            downlink: Arc::new(Mutex::new(downlink)),
         })
     }
 
-    /// Derive a direction-specific COUNT from the current overflow and SQN.
-    pub fn count_for(&self, direction: NasSecurityDirection, sequence_number: u8) -> NasCount {
-        self.state_snapshot(direction)
-            .candidate_count(sequence_number)
-            .unwrap_or_else(|_| NasCount::new(u16::MAX, sequence_number))
+    /// Connection identifier supplied to every integrity and cipher operation.
+    pub const fn connection_id(&self) -> NasConnectionId {
+        self.connection_id
     }
 
-    fn state_for(&self, direction: NasSecurityDirection) -> &Mutex<NasDirectionState> {
+    /// Snapshot this direction's counters; poisoned state fails closed.
+    ///
+    /// This is an observation, not a durable reservation. The caller owns
+    /// persistence and exclusive restoration under the same keys.
+    pub fn count_state(
+        &self,
+        direction: NasSecurityDirection,
+    ) -> Result<NasCountState, NasSecurityError> {
+        self.state_for(direction)
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| NasSecurityError::InvalidCount)
+    }
+
+    /// Estimate the next received COUNT, failing on 24-bit overflow.
+    ///
+    /// Without independent proof of non-replay, TS 24.501 §4.4.3.1 requires an
+    /// estimate above the highest accepted COUNT, including after lost messages.
+    pub fn count_for(
+        &self,
+        direction: NasSecurityDirection,
+        sequence_number: u8,
+    ) -> Result<NasCount, NasSecurityError> {
+        self.count_state(direction)?
+            .candidate_count(sequence_number)
+    }
+
+    fn state_for(&self, direction: NasSecurityDirection) -> &Mutex<NasCountState> {
         match direction {
             NasSecurityDirection::Uplink => &self.uplink,
             NasSecurityDirection::Downlink => &self.downlink,
         }
     }
 
-    fn state_snapshot(&self, direction: NasSecurityDirection) -> NasDirectionState {
-        match self.state_for(direction).lock() {
-            Ok(state) => state.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+    fn accept_count(
+        &self,
+        direction: NasSecurityDirection,
+        count: NasCount,
+    ) -> Result<(), NasSecurityError> {
+        self.state_for(direction)
+            .lock()
+            .map_err(|_| NasSecurityError::InvalidCount)?
+            .accept(count)
     }
 
-    /// Verify envelope integrity and return the COUNT used for verification.
+    fn check_integrity<A: NasSecurityAlgorithms + ?Sized>(
+        &self,
+        algorithms: &A,
+        direction: NasSecurityDirection,
+        envelope: &SecurityProtected,
+    ) -> Result<NasCount, NasSecurityError> {
+        if envelope.security_header_type == SecurityHeaderType::Plain {
+            return Err(NasSecurityError::InvalidSecurityHeader);
+        }
+        let count = self.count_for(direction, envelope.sequence_number)?;
+        let message = integrity_message(envelope.sequence_number, &envelope.payload)?;
+        let expected = algorithms.compute_mac(
+            self.integrity_algorithm,
+            &self.integrity_key,
+            count,
+            self.connection_id,
+            direction,
+            &message,
+        )?;
+        if !mac_eq(expected, envelope.mac) {
+            return Err(NasSecurityError::IntegrityCheckFailed);
+        }
+        Ok(count)
+    }
+
+    /// Verify and consume a received COUNT, without deciphering.
+    ///
+    /// Replayed authenticated envelopes normally fail integrity against the
+    /// newer estimated COUNT. A concurrent stale acceptance is ReplayRejected.
+    /// NIA0 cannot detect replay because its MAC does not authenticate COUNT.
     pub fn verify_integrity<A: NasSecurityAlgorithms + ?Sized>(
         &self,
         algorithms: &A,
         direction: NasSecurityDirection,
         envelope: &SecurityProtected,
     ) -> Result<NasCount, NasSecurityError> {
-        let count = {
-            let state = self
-                .state_for(direction)
-                .lock()
-                .map_err(|_| NasSecurityError::InvalidCount)?;
-            state.candidate_count(envelope.sequence_number)?
-        };
-        let expected = algorithms.compute_mac(
-            self.integrity_algorithm,
-            &self.integrity_key,
-            count,
-            direction,
-            &envelope.payload,
-        )?;
-        if !mac_eq(expected, envelope.mac) {
-            return Err(NasSecurityError::IntegrityCheckFailed);
-        }
-        self.state_for(direction)
-            .lock()
-            .map_err(|_| NasSecurityError::InvalidCount)?
-            .accept(count)?;
+        let count = self.check_integrity(algorithms, direction, envelope)?;
+        self.accept_count(direction, count)?;
         Ok(count)
     }
 
-    /// Verify integrity and decipher the envelope payload when the security
-    /// header type says the payload is ciphered.
+    /// Verify and decipher, accepting COUNT only after both operations succeed.
     pub fn verify_and_decipher<A: NasSecurityAlgorithms + ?Sized>(
         &self,
         algorithms: &A,
         direction: NasSecurityDirection,
         envelope: &SecurityProtected,
     ) -> Result<VerifiedNasPayload, NasSecurityError> {
-        let count = self.verify_integrity(algorithms, direction, envelope)?;
+        let count = self.check_integrity(algorithms, direction, envelope)?;
         let payload = if envelope.security_header_type.is_ciphered() {
             algorithms.apply_cipher(
                 self.ciphering_algorithm,
                 &self.ciphering_key,
                 count,
+                self.connection_id,
                 direction,
                 &envelope.payload,
             )?
         } else {
             envelope.payload.clone()
         };
-
+        self.accept_count(direction, count)?;
         Ok(VerifiedNasPayload { count, payload })
     }
 
-    /// Build a security-protected envelope from a plain or ciphered payload.
+    /// Protect a payload using the next unused COUNT for this direction.
+    ///
+    /// COUNT is reserved atomically and burned even if a provider fails. Clones
+    /// and concurrent callers share allocation; exhaustion fails closed. Each
+    /// retransmission also gets a new COUNT (TS 24.501 §4.4.3.1).
     pub fn protect_payload<A: NasSecurityAlgorithms + ?Sized>(
         &self,
         algorithms: &A,
         direction: NasSecurityDirection,
         security_header_type: SecurityHeaderType,
-        count: NasCount,
         payload: &[u8],
     ) -> Result<SecurityProtected, NasSecurityError> {
         if security_header_type == SecurityHeaderType::Plain {
             return Err(NasSecurityError::InvalidSecurityHeader);
         }
+        let count = self
+            .state_for(direction)
+            .lock()
+            .map_err(|_| NasSecurityError::InvalidCount)?
+            .reserve_transmit()?;
         let protected_payload = if security_header_type.is_ciphered() {
             algorithms.apply_cipher(
                 self.ciphering_algorithm,
                 &self.ciphering_key,
                 count,
+                self.connection_id,
                 direction,
                 payload,
             )?
         } else {
             Bytes::copy_from_slice(payload)
         };
+        let message = integrity_message(count.sequence_number(), &protected_payload)?;
         let mac = algorithms.compute_mac(
             self.integrity_algorithm,
             &self.integrity_key,
             count,
+            self.connection_id,
             direction,
-            &protected_payload,
+            &message,
         )?;
-
         Ok(SecurityProtected {
             security_header_type,
             spare: 0,
@@ -371,7 +473,7 @@ impl NasSecurityContext {
 }
 
 /// Verified and optionally deciphered NAS payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedNasPayload {
     /// NAS COUNT used for verification.
     pub count: NasCount,
@@ -379,25 +481,42 @@ pub struct VerifiedNasPayload {
     pub payload: Bytes,
 }
 
+impl fmt::Debug for VerifiedNasPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedNasPayload")
+            .field("count", &self.count)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Algorithm provider for NAS integrity and ciphering.
 pub trait NasSecurityAlgorithms {
     /// Compute a 32-bit NAS message authentication code.
+    ///
+    /// `message` is the complete integrity input: for protected NAS envelopes,
+    /// the sequence-number octet followed by the transmitted payload. Providers
+    /// must not prepend the sequence number again. `connection_id` supplies the
+    /// context-owned BEARER and must be used in the algorithm input.
     fn compute_mac(
         &self,
         algorithm: NasIntegrityAlgorithm,
         key: &KeyHandle,
         count: NasCount,
+        connection_id: NasConnectionId,
         direction: NasSecurityDirection,
         message: &[u8],
     ) -> Result<[u8; 4], NasSecurityError>;
 
     /// Apply the NAS stream cipher. NAS ciphering is symmetric, so the same
-    /// hook is used for ciphering and deciphering.
+    /// hook is used for ciphering and deciphering. Use the context-owned
+    /// `connection_id` for BEARER, including when one provider serves both accesses.
     fn apply_cipher(
         &self,
         algorithm: NasCipheringAlgorithm,
         key: &KeyHandle,
         count: NasCount,
+        connection_id: NasConnectionId,
         direction: NasSecurityDirection,
         input: &[u8],
     ) -> Result<Bytes, NasSecurityError>;
@@ -413,6 +532,7 @@ impl NasSecurityAlgorithms for NullNasSecurityAlgorithms {
         algorithm: NasIntegrityAlgorithm,
         _key: &KeyHandle,
         _count: NasCount,
+        _connection_id: NasConnectionId,
         _direction: NasSecurityDirection,
         _message: &[u8],
     ) -> Result<[u8; 4], NasSecurityError> {
@@ -427,6 +547,7 @@ impl NasSecurityAlgorithms for NullNasSecurityAlgorithms {
         algorithm: NasCipheringAlgorithm,
         _key: &KeyHandle,
         _count: NasCount,
+        _connection_id: NasConnectionId,
         _direction: NasSecurityDirection,
         input: &[u8],
     ) -> Result<Bytes, NasSecurityError> {
@@ -452,6 +573,12 @@ pub enum NasSecurityError {
     KeyPurposeMismatch,
     /// Invalid security header for a security operation.
     InvalidSecurityHeader,
+    /// BEARER does not fit the five-bit algorithm field.
+    InvalidBearer,
+    /// Bit length is invalid or does not match the supplied octets.
+    InvalidLength,
+    /// The resolver could not authorize or obtain the requested NAS key.
+    KeyUnavailable,
 }
 
 impl fmt::Display for NasSecurityError {
@@ -463,6 +590,9 @@ impl fmt::Display for NasSecurityError {
             Self::InvalidCount => "invalid NAS COUNT",
             Self::KeyPurposeMismatch => "invalid NAS security key purpose",
             Self::InvalidSecurityHeader => "invalid NAS security header",
+            Self::InvalidBearer => "invalid NAS bearer",
+            Self::InvalidLength => "invalid NAS algorithm input length",
+            Self::KeyUnavailable => "NAS key unavailable",
         };
         f.write_str(msg)
     }
@@ -470,12 +600,19 @@ impl fmt::Display for NasSecurityError {
 
 impl std::error::Error for NasSecurityError {}
 
+fn integrity_message(sequence_number: u8, payload: &[u8]) -> Result<Bytes, NasSecurityError> {
+    let len = payload
+        .len()
+        .checked_add(1)
+        .ok_or(NasSecurityError::InvalidLength)?;
+    let mut message = BytesMut::with_capacity(len);
+    message.put_u8(sequence_number);
+    message.extend_from_slice(payload);
+    Ok(message.freeze())
+}
+
 fn mac_eq(left: [u8; 4], right: [u8; 4]) -> bool {
-    let mut diff = 0_u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    bool::from(left.ct_eq(&right))
 }
 
 #[cfg(test)]
@@ -505,8 +642,15 @@ mod tests {
             NasCipheringAlgorithm::Nea0,
             session_key("nas-int", 0x11),
             session_key("nas-ciph", 0x22),
-            7,
-            9,
+            NasConnectionId::NonThreeGpp,
+            NasCountState {
+                next_transmit: Some(NasCount::new(7, 0)),
+                highest_received: Some(NasCount::new(7, 0)),
+            },
+            NasCountState {
+                next_transmit: Some(NasCount::new(9, 0x45)),
+                highest_received: Some(NasCount::new(9, 0)),
+            },
         )
         .unwrap()
     }
@@ -565,7 +709,6 @@ mod tests {
                 &algorithms,
                 NasSecurityDirection::Downlink,
                 SecurityHeaderType::IntegrityProtectedAndCiphered,
-                NasCount::new(9, 0x45),
                 &payload,
             )
             .unwrap();
@@ -576,24 +719,42 @@ mod tests {
 
     #[test]
     fn verify_integrity_rejects_replayed_count() {
-        let ctx = context();
-        let algorithms = NullNasSecurityAlgorithms;
-        let envelope = SecurityProtected {
-            security_header_type: SecurityHeaderType::IntegrityProtected,
-            spare: 0,
-            mac: [0; 4],
-            sequence_number: 0x44,
-            payload: Bytes::from_static(b"payload"),
-        };
-
-        let count = ctx
-            .verify_integrity(&algorithms, NasSecurityDirection::Uplink, &envelope)
+        let ctx = NasSecurityContext::new(
+            NasIntegrityAlgorithm::Nia2,
+            NasCipheringAlgorithm::Nea0,
+            session_key("nas-int", 0x11),
+            session_key("nas-ciph", 0x22),
+            NasConnectionId::NonThreeGpp,
+            NasCountState::default(),
+            NasCountState::default(),
+        )
+        .unwrap();
+        let algorithms = AesNasSecurityAlgorithms::new(|_: &KeyHandle, _: NasKeyUsage| {
+            Ok(NasAesKey::new(Zeroizing::new([0x11; 16])))
+        });
+        let envelope = ctx
+            .protect_payload(
+                &algorithms,
+                NasSecurityDirection::Uplink,
+                SecurityHeaderType::IntegrityProtected,
+                b"payload",
+            )
             .unwrap();
-        assert_eq!(count, NasCount::new(7, 0x44));
+        assert_eq!(
+            ctx.verify_integrity(&algorithms, NasSecurityDirection::Uplink, &envelope)
+                .unwrap(),
+            NasCount::new(0, 0)
+        );
         assert_eq!(
             ctx.verify_integrity(&algorithms, NasSecurityDirection::Uplink, &envelope)
                 .unwrap_err(),
-            NasSecurityError::ReplayRejected
+            NasSecurityError::IntegrityCheckFailed
+        );
+        assert_eq!(
+            ctx.count_state(NasSecurityDirection::Uplink)
+                .unwrap()
+                .highest_received,
+            Some(NasCount::new(0, 0))
         );
     }
 
@@ -604,8 +765,12 @@ mod tests {
             NasCipheringAlgorithm::Nea0,
             session_key("nas-int", 0x11),
             session_key("nas-ciph", 0x22),
-            0x1234,
-            0,
+            NasConnectionId::NonThreeGpp,
+            NasCountState {
+                next_transmit: Some(NasCount::new(0x1234, 0)),
+                highest_received: Some(NasCount::new(0x1234, 0)),
+            },
+            NasCountState::default(),
         )
         .unwrap();
         let algorithms = NullNasSecurityAlgorithms;
@@ -636,7 +801,7 @@ mod tests {
             NasCount::new(0x1235, 0x00)
         );
         assert_eq!(
-            ctx.count_for(NasSecurityDirection::Uplink, 0x01),
+            ctx.count_for(NasSecurityDirection::Uplink, 0x01).unwrap(),
             NasCount::new(0x1235, 0x01)
         );
     }
@@ -648,8 +813,9 @@ mod tests {
             NasCipheringAlgorithm::Nea2,
             session_key("nas-int", 0x11),
             session_key("nas-ciph", 0x22),
-            0,
-            0,
+            NasConnectionId::NonThreeGpp,
+            NasCountState::default(),
+            NasCountState::default(),
         )
         .unwrap();
         let envelope = SecurityProtected {
@@ -684,8 +850,9 @@ mod tests {
                 NasCipheringAlgorithm::Nea0,
                 bad_key,
                 session_key("nas-ciph", 0x22),
-                0,
-                0,
+                NasConnectionId::NonThreeGpp,
+                NasCountState::default(),
+                NasCountState::default(),
             )
             .unwrap_err(),
             NasSecurityError::KeyPurposeMismatch
