@@ -11,20 +11,21 @@ are unchanged. No stored-format boundary is introduced.
 The scope-lease profile in [RFC 022](rfc/022-scope-leases.md#time-and-packet-use),
 tracked by [#1134](https://github.com/openpacketcore/openpacketcore-sdk/issues/1134),
 currently fixes the next renewal at issuance plus `h = 1 second`, the packet
-stop at that renewal plus `G = 60 seconds`, and remote exclusion through the
+stop at that renewal plus `G = 77 seconds`, and remote exclusion through the
 stop plus a one-second guard. This arithmetic targets that profile; it does not
 implement scope authority. Exact retries retain these absolute times. The gate
 must not restart the permit's lifetime at receipt. A gate can close early if
 the clock guarantee runs out; it cannot promise the entire forwarding grace
 without a bound covering that entire interval.
 
-The selected follow-up in #1134 uses the smallest `G` that guarantees at least
-60 seconds of forwarding after the first missed renewal under any
-kernel-allowed slew, with a one-second missing-time allowance (`J = 1 second`):
-approximately 75 seconds. #1134 will set the exact constant in
-[RFC 022](rfc/022-scope-leases.md#time-and-packet-use). This is a store-side
-profile change. The gate continues to convert the immutable stop `S`; this
-slice changes no gate constants.
+[RFC 022](rfc/022-scope-leases.md#time-and-packet-use) derives the 77-second
+permit grace and the resulting `h + G` stop (78 seconds) and
+`h + G + 1 s` remote exclusion (79 seconds). Its sixty-second forwarding
+contract includes issuance-interval excess, both clock-rate directions,
+aggregate phase corrections and the first-send-to-stamp sampling budget, with
+a clock horizon covering the deadline. These are provider and transport
+qualification requirements. The gate still converts the immutable stop `S`;
+this documentation update changes no arithmetic or gate constants.
 
 `ScopeClockCorrelation::new` describes a trusted common-time interval `[L, U]`
 sampled between kernel BOOTTIME observations `b0` and `b1`. Its width must be at
@@ -70,7 +71,10 @@ adjustments of about 10%, and chrony's default maximum slew is 83,333.333 ppm;
 see the [chrony slew-rate contract](https://chrony-project.org/doc/4.6/chrony.conf.html#maxslewrate).
 The envelope bounds common-time growth per boot tick: a boot clock slowed by
 10% requires a rate factor of at least `1 / 0.9`, not `1.1`. A workload must not
-assume a smaller host slew limit it can neither verify nor control.
+assume a smaller host slew limit it can neither verify nor control. RFC 022
+also accounts for frequency and adjtime rates, aggregate phase gain and
+sampling delay in the full-grace availability bound; the ten-percent example
+alone is insufficient to qualify that bound.
 
 ## Deadline and non-overlap proof
 
@@ -146,7 +150,7 @@ Each slice requires separate review and merge before the next is implemented.
    and exempt packets return `TC_ACT_UNSPEC` to continue classification, and
    denied packets return `TC_ACT_SHOT`. Reject an installed deadline beyond
    either its derived bound or a fixed ceiling of `h + G + 1 s` from its
-   original sample (62 s under the current profile); that ceiling grants no
+   original sample (79 s under the RFC 022 profile); that ceiling grants no
    extra forwarding time. Test expiry, concurrency and mutation detectors
    against the real kernel.
 4. Namespace loader and lease integration: legacy netlink tc attachment owned

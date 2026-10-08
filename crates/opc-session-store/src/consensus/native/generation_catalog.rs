@@ -911,6 +911,18 @@ impl Rows {
             {
                 return Err(invalid("native catalog key floor regressed"));
             }
+            if let Some(old) = self.keys.get(&key).and_then(|old| old.row.facts.scope) {
+                if row.facts.scope.is_none_or(|next| !next.can_replace(old)) {
+                    return Err(invalid(
+                        "native catalog scope checkpoint pruned or regressed",
+                    ));
+                }
+            }
+            if let Some(old) = self.keys.get(&key).and_then(|old| old.row.facts.batch) {
+                if row.facts.batch.is_none_or(|next| !next.can_replace(old)) {
+                    return Err(invalid("native catalog scope row pruned or regressed"));
+                }
+            }
             self.summary[0].replace(before, Some(row.content))?;
             self.rosters.key_replaced(
                 key,

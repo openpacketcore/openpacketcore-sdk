@@ -126,10 +126,10 @@ fn early_resume_has_a_retryable_clock_boundary_result() {
         },
     );
     assert_eq!(
-        before.transition(&resume, ScopeClockBounds::new(at(60), at(61)).unwrap()),
+        before.transition(&resume, ScopeClockBounds::new(at(77), at(78)).unwrap()),
         Err(ScopeLeaseError::Held),
     );
-    assert!(apply(&before, &resume, 61).is_ok());
+    assert!(apply(&before, &resume, 78).is_ok());
 }
 
 #[test]
@@ -206,11 +206,11 @@ fn selection_after_expiry_loses_to_an_intervening_in_place_resume() {
                 permit: first.view.permit().unwrap().clone(),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     assert_eq!(
-        apply(&resumed, &delayed_selection, 62),
+        apply(&resumed, &delayed_selection, 79),
         Err(ScopeLeaseError::Conflict)
     );
     assert_eq!(
@@ -223,7 +223,7 @@ fn selection_after_expiry_loses_to_an_intervening_in_place_resume() {
                     execution: execution(2)
                 }
             ),
-            62
+            79
         ),
         Err(ScopeLeaseError::Held)
     );
@@ -309,17 +309,70 @@ fn selection_rejects_an_old_admission_even_with_a_fresh_record_revision() {
 }
 
 #[test]
+fn scope_grace_covers_issuance_excess_phase_gain_and_sampling_budget() {
+    // D-b0 = floor((h+G-J)*Q/(Q+d)) is measured in boot-clock nanoseconds.
+    // Tick +/-10%, frequency +/-500ppm, and adjtime +/-500ppm add.
+    // The provider also bounds aggregate PLL phase gain over the horizon;
+    // a per-update phase clamp is not an aggregate promise.
+    const Q: u128 = 1_000_000_000;
+    const RATE_DENOMINATOR: u128 = 1_000;
+    const SLOW_RATE_NUMERATOR: u128 = 899;
+    const FAST_RATE_NUMERATOR: u128 = 1_101;
+    const ISSUANCE_EXCESS: u128 = Q;
+    const PHASE_GAIN: u128 = Q / 2;
+    let d = ((RATE_DENOMINATOR - SLOW_RATE_NUMERATOR) * Q).div_ceil(SLOW_RATE_NUMERATOR);
+    assert_eq!(d, 112_347_053);
+    assert_eq!(SCOPE_RENEWAL_INTERVAL.as_nanos(), Q);
+    assert_eq!(SCOPE_CLOCK_GUARD.as_nanos(), Q);
+    // J=1s covers the whole safe-side error, independently of the queue guard.
+    let gate_span =
+        |grace: Duration| (SCOPE_RENEWAL_INTERVAL.as_nanos() + grace.as_nanos() - Q) * Q / (Q + d);
+    let forwarding = |grace: Duration, stamp_delay: u128| {
+        (gate_span(grace) - PHASE_GAIN) * RATE_DENOMINATOR / FAST_RATE_NUMERATOR
+            - SCOPE_RENEWAL_INTERVAL.as_nanos()
+            - ISSUANCE_EXCESS
+            - stamp_delay
+    };
+    assert!(
+        forwarding(SCOPE_FORWARDING_GRACE, 0) >= 60 * Q,
+        "issuance excess and phase gain must leave sixty seconds after renew_by"
+    );
+    assert!(
+        forwarding(SCOPE_FORWARDING_GRACE - Duration::from_secs(1), 0) < 60 * Q,
+        "the grace is the smallest qualifying whole-second value"
+    );
+    assert_eq!(SCOPE_FORWARDING_GRACE, Duration::from_secs(77));
+    assert_eq!(gate_span(SCOPE_FORWARDING_GRACE), 69_222_999_955);
+    assert_eq!(forwarding(Duration::from_secs(75), 0), 58_785_649_369);
+    assert_eq!(forwarding(Duration::from_secs(76), 0), 59_602_179_795);
+    assert_eq!(forwarding(SCOPE_FORWARDING_GRACE, 0), 60_418_710_222);
+    // Sampling cannot silently consume the remaining availability margin.
+    // This is a transport/provider qualification bound, not a new lifetime.
+    let maximum_stamp_delay = forwarding(SCOPE_FORWARDING_GRACE, 0) - 60 * Q;
+    assert_eq!(maximum_stamp_delay, 418_710_222);
+    assert_eq!(
+        forwarding(SCOPE_FORWARDING_GRACE, maximum_stamp_delay),
+        60 * Q
+    );
+    assert!(forwarding(SCOPE_FORWARDING_GRACE, maximum_stamp_delay + 1) < 60 * Q);
+    assert!(forwarding(SCOPE_FORWARDING_GRACE, 400_000_000) >= 60 * Q);
+    let permit = acquired().view.permit().unwrap().clone();
+    assert_eq!(permit.stop_at(), at(78));
+    assert_eq!(permit.excluded_until(), at(79));
+}
+
+#[test]
 fn acquire_returns_fixed_renewal_stop_and_exclusion_deadlines() {
     let state = acquired();
     let permit = state.view.permit().unwrap();
     assert_eq!(permit.renew_by(), at(1));
-    assert_eq!(permit.stop_at(), at(61));
-    assert_eq!(permit.excluded_until(), at(62));
+    assert_eq!(permit.stop_at(), at(78));
+    assert_eq!(permit.excluded_until(), at(79));
     assert_eq!(permit.grant_epoch(), 1);
     assert_eq!(permit.selection(), 1);
     assert_eq!(permit.scope(), &scope());
-    assert!(permit.is_live_at(bounds(60)));
-    assert!(!permit.is_live_at(bounds(61)));
+    assert!(permit.is_live_at(bounds(77)));
+    assert!(!permit.is_live_at(bounds(78)));
 }
 
 #[test]
@@ -375,7 +428,7 @@ fn renewal_replaces_the_exact_permit_and_old_requests_cannot_extend_it() {
         },
     );
     let renewed = apply(&first, &renewal, 1).unwrap();
-    assert_eq!(renewed.view.permit().unwrap().stop_at(), at(62));
+    assert_eq!(renewed.view.permit().unwrap().stop_at(), at(79));
     assert_eq!(renewed.view.permit().unwrap().grant_epoch(), 1);
     assert_eq!(apply(&renewed, &renewal, 50).unwrap(), renewed);
     assert_eq!(
@@ -402,7 +455,7 @@ fn expired_execution_resumes_in_place_only_without_intervening_selection() {
                     permit: permit.clone()
                 }
             ),
-            61
+            78
         ),
         Err(ScopeLeaseError::Expired)
     );
@@ -413,7 +466,7 @@ fn expired_execution_resumes_in_place_only_without_intervening_selection() {
             permit: permit.clone(),
         },
     );
-    let resumed = apply(&first, &resume, 70).unwrap();
+    let resumed = apply(&first, &resume, 79).unwrap();
     assert_eq!(
         resumed.view.permit().unwrap().execution(),
         permit.execution()
@@ -422,7 +475,7 @@ fn expired_execution_resumes_in_place_only_without_intervening_selection() {
         resumed.view.permit().unwrap().grant_epoch(),
         permit.grant_epoch()
     );
-    assert_eq!(resumed.view.permit().unwrap().stop_at(), at(131));
+    assert_eq!(resumed.view.permit().unwrap().stop_at(), at(157));
     let staged = apply(
         &first,
         &request(
@@ -432,7 +485,7 @@ fn expired_execution_resumes_in_place_only_without_intervening_selection() {
                 execution: execution(2),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     assert_eq!(
@@ -445,7 +498,7 @@ fn expired_execution_resumes_in_place_only_without_intervening_selection() {
                     permit: permit.clone()
                 }
             ),
-            70
+            79
         ),
         Err(ScopeLeaseError::Superseded)
     );
@@ -453,7 +506,7 @@ fn expired_execution_resumes_in_place_only_without_intervening_selection() {
         apply(
             &staged,
             &request(3, 7, ScopeLeaseOperation::Renew { permit }),
-            71
+            80
         ),
         Err(ScopeLeaseError::Superseded)
     );
@@ -471,7 +524,7 @@ fn remote_successor_waits_for_the_full_exclusion_deadline() {
                 execution: execution(2),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     let acquire = request(
@@ -482,8 +535,8 @@ fn remote_successor_waits_for_the_full_exclusion_deadline() {
             selection: 2,
         },
     );
-    assert_eq!(apply(&staged, &acquire, 61), Err(ScopeLeaseError::Held));
-    let successor = apply(&staged, &acquire, 62).unwrap();
+    assert_eq!(apply(&staged, &acquire, 78), Err(ScopeLeaseError::Held));
+    let successor = apply(&staged, &acquire, 79).unwrap();
     assert_eq!(successor.view.permit().unwrap().grant_epoch(), 2);
     assert_eq!(
         apply(
@@ -584,7 +637,7 @@ fn predecessor_can_release_after_successor_selection_without_reviving_itself() {
                 execution: execution(2),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     let released = apply(
@@ -596,7 +649,7 @@ fn predecessor_can_release_after_successor_selection_without_reviving_itself() {
                 closed: ScopeGateClosed::after_gate_closed(first.view.permit().unwrap().clone()),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     assert!(apply(
@@ -609,7 +662,7 @@ fn predecessor_can_release_after_successor_selection_without_reviving_itself() {
                 selection: 2
             }
         ),
-        61
+        78
     )
     .is_ok());
 }
@@ -626,7 +679,7 @@ fn selection_away_and_back_still_fences_the_original_permit() {
                 execution: execution(2),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     let mut readmitted = execution(1);
@@ -641,7 +694,7 @@ fn selection_away_and_back_still_fences_the_original_permit() {
                 execution: readmitted,
             },
         ),
-        62,
+        79,
     )
     .unwrap();
     assert_eq!(
@@ -672,7 +725,7 @@ fn conservative_clock_edges_refuse_early_takeover_and_late_traffic() {
     );
     let first = acquired();
     let permit = first.view.permit().unwrap();
-    assert!(!permit.is_live_at(ScopeClockBounds::new(at(60), at(61)).unwrap()));
+    assert!(!permit.is_live_at(ScopeClockBounds::new(at(77), at(78)).unwrap()));
     assert_eq!(
         first.transition(
             &request(
@@ -682,7 +735,7 @@ fn conservative_clock_edges_refuse_early_takeover_and_late_traffic() {
                     execution: execution(2)
                 }
             ),
-            ScopeClockBounds::new(at(60), at(61)).unwrap()
+            ScopeClockBounds::new(at(77), at(78)).unwrap()
         ),
         Err(ScopeLeaseError::Held)
     );
@@ -695,7 +748,7 @@ fn conservative_clock_edges_refuse_early_takeover_and_late_traffic() {
                 execution: execution(2),
             },
         ),
-        61,
+        78,
     )
     .unwrap();
     assert_eq!(
@@ -708,7 +761,7 @@ fn conservative_clock_edges_refuse_early_takeover_and_late_traffic() {
                     selection: 2
                 }
             ),
-            ScopeClockBounds::new(at(61), at(62)).unwrap()
+            ScopeClockBounds::new(at(78), at(79)).unwrap()
         ),
         Err(ScopeLeaseError::Held)
     );

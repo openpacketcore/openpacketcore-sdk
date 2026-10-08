@@ -184,7 +184,7 @@ impl Transaction<'_, '_> {
     }
 
     fn unreserved(&self, key: &SessionKey) -> Result<(), StoreError> {
-        if self.key(key).reserved {
+        if crate::scope_storage::is_scope_record_key(key) || self.key(key).reserved {
             Err(StoreError::SessionRecordReserved)
         } else {
             Ok(())
@@ -230,6 +230,30 @@ impl Transaction<'_, '_> {
         intent: &SessionMutationIntent,
     ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
         match intent {
+            SessionMutationIntent::ActivateScopeProfile(certificate) => {
+                if !certificate.matches(
+                    self.base.base.identity,
+                    fenced_transition_voter_set_digest(
+                        self.base.base.identity,
+                        &self.base.base.members,
+                    ),
+                ) {
+                    return Err(StoreError::CapabilityNotSupported(
+                        "scope_store_profile_v2".into(),
+                    ));
+                }
+                let record = crate::scope_storage::ScopeRow::Activation((**certificate).clone())
+                    .to_record()
+                    .map_err(|_| unavailable())?;
+                self.set_key(
+                    record.key.clone(),
+                    NativeKeyState {
+                        record: Some(record),
+                        ..NativeKeyState::default()
+                    },
+                );
+                Ok((SessionMutationOutcome::Unit, None))
+            }
             SessionMutationIntent::AdvanceLogicalTime
             | SessionMutationIntent::BindConsumerRequest { .. }
             | SessionMutationIntent::ActivateFencedTransitionCapability { .. } => {
@@ -275,6 +299,9 @@ impl Transaction<'_, '_> {
                 Ok((SessionMutationOutcome::ConsumerRecord(record), None))
             }
             SessionMutationIntent::AcquireLease { key, owner, ttl } => {
+                if crate::scope_storage::is_scope_record_key(key) {
+                    return Err(StoreError::SessionRecordReserved);
+                }
                 let expires_at = checked_session_deadline(self.now, *ttl)?;
                 self.prune()?;
                 let mut row = self.key(key);
@@ -325,6 +352,9 @@ impl Transaction<'_, '_> {
                 ))
             }
             SessionMutationIntent::RenewLease { lease: guard, ttl } => {
+                if crate::scope_storage::is_scope_record_key(guard.key()) {
+                    return Err(StoreError::SessionRecordReserved);
+                }
                 let expires_at = checked_session_deadline(self.now, *ttl)?;
                 if guard.expires_at() <= self.now {
                     return Err(StoreError::LeaseExpired);
@@ -354,6 +384,9 @@ impl Transaction<'_, '_> {
                 ))
             }
             SessionMutationIntent::ReleaseLease(guard) => {
+                if crate::scope_storage::is_scope_record_key(guard.key()) {
+                    return Err(StoreError::SessionRecordReserved);
+                }
                 self.prune()?;
                 let mut row = self.lease_guard(guard)?;
                 let lease = row.lease.as_mut().ok_or_else(unavailable)?;

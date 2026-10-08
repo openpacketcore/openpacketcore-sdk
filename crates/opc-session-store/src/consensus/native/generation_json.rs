@@ -21,6 +21,7 @@ struct Body {
     payload: usize,
     limit: usize,
     string_limit: usize,
+    string_payload: bool,
 }
 
 impl Body {
@@ -105,6 +106,11 @@ impl<'de> Visitor<'de> for Scan<'_> {
         if value.len() > self.0.string_limit {
             return Err(E::custom("native V2 string exceeds closed model shape"));
         }
+        if self.0.string_payload {
+            // Scope values use base64 strings. Their actual encoded width is
+            // a conservative bound for the envelope bytes, without decoding.
+            self.0.payload = self.0.payload.max(value.len());
+        }
         Ok(Atom::Other)
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Atom, A::Error> {
@@ -141,8 +147,12 @@ impl<'de> Visitor<'de> for Scan<'_> {
     }
 }
 
-struct Request<const BLOCKS: usize = 1, const STRING: usize = 128>(Shape);
-impl<'de, const BLOCKS: usize, const STRING: usize> Deserialize<'de> for Request<BLOCKS, STRING> {
+struct Request<const BLOCKS: usize = 1, const STRING: usize = 128, const STRINGS: bool = false>(
+    Shape,
+);
+impl<'de, const BLOCKS: usize, const STRING: usize, const STRINGS: bool> Deserialize<'de>
+    for Request<BLOCKS, STRING, STRINGS>
+{
     fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         let mut body = Body {
             fields: 0,
@@ -150,6 +160,7 @@ impl<'de, const BLOCKS: usize, const STRING: usize> Deserialize<'de> for Request
             payload: 0,
             limit: REQUEST_FIELDS * BLOCKS,
             string_limit: STRING,
+            string_payload: STRINGS,
         };
         Scan(&mut body).deserialize(decoder)?;
         Ok(Self(Shape {
@@ -157,6 +168,70 @@ impl<'de, const BLOCKS: usize, const STRING: usize> Deserialize<'de> for Request
             payload: body.payload,
         }))
     }
+}
+
+// Scope children are streamed independently so their actual count, rather
+// than the profile maximum, determines the verification metadata allowance.
+struct ScopeChildren(Shape);
+impl<'de> Deserialize<'de> for ScopeChildren {
+    fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Children;
+        impl<'de> Visitor<'de> for Children {
+            type Value = ScopeChildren;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a bounded scope child batch")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut shape = Shape::default();
+                for _ in 0..crate::scope_batch::MAX_SCOPE_BATCH_CHILDREN {
+                    let Some(child) = sequence.next_element::<Request<
+                        1,
+                        { crate::scope_batch::MAX_SCOPE_BATCH_COMMAND_BYTES },
+                        true,
+                    >>()?
+                    else {
+                        return Ok(ScopeChildren(shape));
+                    };
+                    shape.requests += 1;
+                    shape.payload = shape.payload.max(child.0.payload);
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom("native scope batch exceeds child count"));
+                }
+                Ok(ScopeChildren(shape))
+            }
+        }
+        decoder.deserialize_seq(Children)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeRequest {
+    #[serde(rename = "permit")]
+    _permit: Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>,
+    #[serde(rename = "request_id")]
+    _request_id: Request,
+    #[serde(rename = "lane")]
+    _lane: u8,
+    #[serde(rename = "sequence")]
+    _sequence: u64,
+    #[serde(rename = "expected_revision")]
+    _expected_revision: u64,
+    operations: ScopeChildren,
+    #[serde(rename = "counters")]
+    _counters: Request,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeBatch {
+    request: ScopeRequest,
+    #[serde(rename = "bounds")]
+    _bounds: Request,
 }
 
 struct Batch(Shape);
@@ -199,6 +274,8 @@ impl<'de> Deserialize<'de> for Batch {
 // all fields before those constructors run; it never expands capsule contents.
 #[derive(Deserialize)]
 enum InnerIntent {
+    ScopeBatch(ScopeBatch),
+    ActivateScopeProfile(Request),
     ScopeLease(Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>),
     AdvanceLogicalTime,
     CompareAndSet(Request),
@@ -226,6 +303,11 @@ enum InnerIntent {
 impl InnerIntent {
     fn shape(self) -> Shape {
         match self {
+            Self::ScopeBatch(value) => Shape {
+                requests: value.request.operations.0.requests.max(1),
+                payload: value.request.operations.0.payload,
+            },
+            Self::ActivateScopeProfile(value) => value.0,
             Self::ScopeLease(value) => Shape {
                 requests: value.0.requests,
                 payload: crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2,

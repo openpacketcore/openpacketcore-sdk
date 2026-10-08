@@ -48,13 +48,9 @@ pub(in crate::consensus::native) fn ordinary_payload(
 ) -> io::Result<usize> {
     use crate::backend::CompareAndSetResult;
     match &row.response.result {
-        Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) => {
-            checkpoint
-                .state()
-                .map_err(|_| invalid("scope checkpoint invalid"))?;
-            Ok(crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2)
-        }
-        Ok(SessionMutationOutcome::ScopeLease(Err(_))) => Ok(0),
+        Ok(SessionMutationOutcome::ScopeLease(_) | SessionMutationOutcome::ScopeBatch(_)) => Err(
+            invalid("scope format mismatch: checkpoint in ordinary receipt collection"),
+        ),
         Ok(
             SessionMutationOutcome::Unit
             | SessionMutationOutcome::Lease(_)

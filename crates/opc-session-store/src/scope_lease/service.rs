@@ -141,6 +141,9 @@ impl ScopeLeaseStore {
     }
 
     /// Apply one exact request, or replay its retained immutable outcome.
+    /// A configuration switch can return `OutcomeUnknown`; retry the exact request.
+    /// `ProfileNotActivated` has no effect and is retryable; the service attempts
+    /// activation under the current configuration when the exact request is retried.
     ///
     /// A successful return follows one durable consensus command. If another operation
     /// has superseded the retained result, the old expected revision conflicts;

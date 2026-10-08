@@ -53,19 +53,22 @@ impl<'a> Cursor<'a> {
         self.string(64)
     }
 
-    fn key(&mut self) -> io::Result<()> {
+    fn key(&mut self) -> io::Result<&'a str> {
         self.string(128)?; // TenantId
         self.string(64)?; // NfKind
-        self.string(SESSION_KEY_TYPE_MAX_BYTES)?;
+        let key_type: &str = self.scalar()?;
+        if key_type.len() > SESSION_KEY_TYPE_MAX_BYTES {
+            return Err(invalid("native generation string exceeds model bound"));
+        }
         let stable: &[u8] = self.scalar()?;
         if stable.len() > STABLE_ID_MAX_BYTES {
             return Err(invalid("native generation stable ID exceeds model bound"));
         }
-        Ok(())
+        Ok(key_type)
     }
 
     fn record(&mut self) -> io::Result<usize> {
-        self.key()?;
+        let key_type = self.key()?;
         self.scalar::<u64>()?; // generation
         self.string(OWNER_ID_MAX_BYTES)?;
         self.scalar::<u64>()?; // fence
@@ -75,9 +78,15 @@ impl<'a> Cursor<'a> {
             self.timestamp()?;
         }
         let payload: &[u8] = self.scalar()?;
-        // Materialized records already have this original backend bound.
+        // Only scope children carry metadata alongside the bounded sealed value.
+        // All other materialized records retain the original backend bound.
         // Raw Raft conflict bodies use their distinct 16MiB JSON row bound.
-        if payload.len() > crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES {
+        let maximum = if key_type == "opc-scope-child" {
+            crate::scope_storage::MAX_SCOPE_ROW_BYTES
+        } else {
+            crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
+        };
+        if payload.len() > maximum {
             return Err(invalid(
                 "native generation materialized payload exceeds model bound",
             ));
@@ -228,21 +237,6 @@ impl<'a> Cursor<'a> {
                     Ok(0)
                 }
                 3 => Ok(0),
-                10 => {
-                    // Appended ScopeLease outcome: only its one successful,
-                    // fixed-width checkpoint is persisted. Borrow the body
-                    // here; full decoding and slot validation follow after
-                    // reservation, just as for the other result families.
-                    if self.scalar::<u32>()? != 0 {
-                        return Err(invalid("scope failures cannot be persisted"));
-                    }
-                    let body: &str = self.scalar()?;
-                    let length = crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2;
-                    if body.len() != length {
-                        return Err(invalid("scope checkpoint width differs"));
-                    }
-                    Ok(length)
-                }
                 _ => Err(invalid(
                     "native generic result requires its versioned command codec",
                 )),

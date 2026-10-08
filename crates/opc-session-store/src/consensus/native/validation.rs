@@ -10,6 +10,13 @@ pub(super) fn validate_key(
     value: &NativeKeyState,
     frontiers: &NativeFrontiers,
 ) -> io::Result<()> {
+    if crate::scope_storage::is_scope_record_key(key)
+        && (value.record.is_none() || value.lease.is_some() || value.reserved || value.fence != 0)
+    {
+        return Err(invalid(
+            "scope checkpoint cannot carry ordinary lease authority",
+        ));
+    }
     if value.fence > COUNTER_MAX || value.fence >= frontiers.next_fence {
         return Err(invalid("native key floor invalid"));
     }
@@ -124,12 +131,6 @@ pub(super) fn validate_generic(
     }
     changes::ordinary_payload(receipt)?;
     match &receipt.response.result {
-        Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) => checkpoint
-            .validate_slot(*id, receipt.payload_digest)
-            .map_err(|_| invalid("scope checkpoint slot differs"))?,
-        Ok(SessionMutationOutcome::ScopeLease(Err(_))) => {
-            return Err(invalid("scope failures are not retained"))
-        }
         Ok(SessionMutationOutcome::Lease(guard)) => guard
             .validate_profile()
             .map_err(|_| invalid("native generic lease invalid"))?,
@@ -332,6 +333,7 @@ impl NativeState {
         )?;
         for (key, row) in &self.keys {
             validate_key(key, row, frontiers)?;
+            scope_batch::validate_links(key, |key| self.keys.get(key).map(|row| &**row))?;
         }
         // Cold admission clears the proof before entering this validator and
         // must construct the complete independent ordinal index. An already

@@ -58,6 +58,13 @@ impl ScopeLeaseBackend for ConsensusSessionStore {
     }
 
     async fn commit(&self, operation: ScopeLeaseCommand) -> Result<ScopeState, ScopeLeaseError> {
+        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+        self.ensure_scope_profile_before(deadline)
+            .await
+            .map_err(|error| match error {
+                StoreError::CapabilityNotSupported(_) => ScopeLeaseError::ProfileNotActivated,
+                _ => ScopeLeaseError::Unavailable,
+            })?;
         let (current, _) = self.current_scope().map_err(unavailable)?;
         if current.cluster_id() != operation.request.scope().store() {
             return Err(ScopeLeaseError::Unauthorized);

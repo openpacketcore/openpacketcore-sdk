@@ -33,7 +33,6 @@ pub struct ScopeLeaseCheckpoint(Vec<u8>);
 /// Fixed-size comparison facts for the validated native catalog. Complete
 /// checkpoint decoding and slot validation still precede these commitments.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg(any(target_os = "linux", test))]
 pub(crate) struct ScopeCheckpointFacts {
     scope: [u8; 32],
     body: [u8; 32],
@@ -44,7 +43,6 @@ pub(crate) struct ScopeCheckpointFacts {
     last_time: Timestamp,
 }
 
-#[cfg(any(target_os = "linux", test))]
 impl ScopeCheckpointFacts {
     pub(crate) fn can_replace(self, before: Self) -> bool {
         if self.scope != before.scope {
@@ -108,6 +106,51 @@ impl ScopeLeaseId {
 }
 
 impl ScopeLeaseCheckpoint {
+    pub(crate) fn to_record(&self) -> Result<crate::StoredSessionRecord, ScopeLeaseError> {
+        let state = self.state()?;
+        Ok(crate::StoredSessionRecord {
+            key: state.view.scope.key()?,
+            generation: crate::Generation::new(state.view.revision),
+            owner: crate::OwnerId::new("scope-authority")
+                .map_err(|_| ScopeLeaseError::FormatMismatch)?,
+            fence: crate::FenceToken::new(0),
+            state_class: crate::StateClass::AuthoritativeSession,
+            state_type: crate::StateType::from_static("opc-scope-authority-v2"),
+            expires_at: None,
+            // This reserved row contains only non-secret authority metadata.
+            // It is never accepted as an ordinary consumer session value.
+            payload: crate::EncryptedSessionPayload::new(&self.0),
+        })
+    }
+
+    pub(crate) fn from_record(
+        record: &crate::StoredSessionRecord,
+    ) -> Result<Self, ScopeLeaseError> {
+        if record.payload.encoding() != crate::SessionPayloadEncoding::Plaintext
+            || record.payload.len() != MAX_SCOPE_LEASE_RECORD_BYTES
+        {
+            return Err(ScopeLeaseError::FormatMismatch);
+        }
+        let checkpoint = Self(record.payload.as_bytes().to_vec());
+        if checkpoint.to_record()? != *record {
+            return Err(ScopeLeaseError::FormatMismatch);
+        }
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn stored(&self) -> Result<([u8; 32], SessionConsensusResponse), ScopeLeaseError> {
+        Ok((
+            self.digest()?,
+            SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::ScopeLease(Ok(self.clone()))),
+                sequence: 0,
+                digest: None,
+                logical_time: None,
+                raft_log_index: 0,
+            },
+        ))
+    }
+
     fn new(state: &ScopeState) -> Result<Self, ScopeLeaseError> {
         let body = state.encode()?;
         if body.len() > MAX_SCOPE_LEASE_RECORD_BYTES - 2 {
@@ -137,7 +180,6 @@ impl ScopeLeaseCheckpoint {
         Ok(self.state()?.last_digest)
     }
 
-    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn can_replace(&self, before: &Self) -> bool {
         let (Ok(old), Ok(new)) = (before.facts(), self.facts()) else {
             return false;
@@ -148,7 +190,6 @@ impl ScopeLeaseCheckpoint {
         new.can_replace(old)
     }
 
-    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn facts(&self) -> Result<ScopeCheckpointFacts, ScopeLeaseError> {
         let state = self.state()?;
         let scope = postcard::to_allocvec(&state.view.scope)

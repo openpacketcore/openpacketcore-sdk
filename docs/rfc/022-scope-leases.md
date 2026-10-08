@@ -1,6 +1,6 @@
-# Scope leases, profile 2
+# Scope leases and atomic child batches, profile 2
 
-Status: experimental scope authority, the first slice of issue #1134.
+Status: experimental scope authority and atomic child batches, slices 1–2 of issue #1134.
 
 ## Authority and admission
 
@@ -26,7 +26,10 @@ it must never copy that identity from a request body. This slice supplies the
 service boundary, not a new consumer transport protocol or packet gate.
 
 Constructing the service checks durable persistence and the immutable cluster
-binding. It grants no traffic authority and does not require an idle storage
+binding. Build `ScopeLeaseId` from the configured topology’s
+`consensus_identity()`, which does not require a synchronous store probe.
+`consumer_scope()` is a synchronous authority probe and may refuse while the
+WAL owner is busy. Constructing an identifier grants no traffic authority and does not require an idle storage
 reader. Each read and mutation separately checks current admission within its
 deadline; constructing a handle never bypasses fencing.
 
@@ -54,10 +57,10 @@ use this retained binding without an external platform lookup on every renewal.
 
 ## Time and packet use
 
-The profile fixes a one-second healthy renewal interval, followed by sixty
-seconds of forwarding grace. A grant records immutable issuance, next-renewal,
-stop and exclusion deadlines. Exclusion extends one additional second beyond
-the stop deadline. The next renewal deadline is not recomputed when a reply
+The profile fixes a healthy renewal interval `h = SCOPE_RENEWAL_INTERVAL`,
+a permit grace `G = SCOPE_FORWARDING_GRACE`, and a separate exclusion guard
+`SCOPE_CLOCK_GUARD`. A grant records immutable issuance, next-renewal, stop and
+exclusion deadlines. The next renewal deadline is not recomputed when a reply
 arrives. A delayed response or an exact retry never extends a deadline.
 
 The service requires a trusted clock source reporting an interval containing
@@ -67,14 +70,110 @@ Unknown, inverted, overly wide or regressing bounds refuse a new operation.
 There is deliberately no implementation which treats `SystemClock`,
 `CLOCK_MONOTONIC`, or a caller's timestamp as proof of these bounds.
 
-The permit's stop deadline is issuance's upper bound plus 61 seconds. A gate
-stops when its current upper bound reaches that deadline. A successor waits
-until its lower bound reaches the previous permit's exclusion deadline.
-Consequently, if both clock intervals contain true time, the old execution has
-stopped before the successor is admitted, including across a change of leader.
-If the clock provider loses its bound, an enforcing gate must close. A kernel
-adapter must preserve this rule while userspace is paused and across suspend;
-this module's `is_live_at` helper is not kernel enforcement.
+The permit's deadlines are:
+
+```text
+renew_by = issuance_upper + h
+stop = issuance_upper + h + G
+excluded_until = issuance_upper + h + G + guard
+```
+
+A gate stops when its current upper bound reaches `stop`. A successor waits
+until its lower bound reaches `excluded_until`. Consequently, if both clock
+intervals contain true time, the old execution has stopped before the successor
+is admitted, including across a change of leader. Remote takeover without
+graceful release follows `h + G + guard` from issuance, subject to the
+successor's trusted lower bound reaching exclusion. If the clock provider loses
+its bound, an enforcing gate must close. A kernel adapter must preserve this
+rule while userspace is paused and across suspend; this module's `is_live_at`
+helper is not kernel enforcement.
+
+The packet-gate deadline formula is
+`D = min(H, b0 + floor((S - U - J) * Q / (Q + d)))`, where `Q = 10^9`,
+`b0` is the original sample/first-send BOOTTIME, `U` the common-time upper bound,
+`S` the immutable stop, `J` the correlation/correction allowance, and `H` the
+clock guarantee's horizon. When the permit's issuance upper bound supplies `U`,
+the remaining interval `S - U` is `h + G`:
+
+```text
+D = min(H, b0 + floor((h + G - J) * Q / (Q + d)))
+```
+
+All durations in this formula use integer nanoseconds. Full-grace availability
+needs both directions of the clock envelope and the correct renewal reference
+point. Define `epsilon` as the issuance interval's excess above true time at its
+sample, and `tau` as elapsed time from the original first send to that sample.
+Then `renew_by` is `h + epsilon + tau` after true time at the original first send.
+The interval-width bound gives `epsilon <= 1 s`; it does not bound `tau`.
+
+For the qualified profile, tick adjustment is within ten percent, frequency
+adjustment within 500 ppm, and the additional adjtime rate within 500 ppm.
+These adjustments add in the
+[kernel rate calculation](https://github.com/torvalds/linux/blob/v6.18/kernel/time/ntp.c),
+so use the conservative combined bounds:
+
+```text
+r_min = 0.9 - 0.0005 - 0.0005 = 0.899
+r_max = 1.1 + 0.0005 + 0.0005 = 1.101
+d = ceil((1 / r_min - 1) * Q) = 112347053 ppb
+```
+
+The provider must additionally guarantee aggregate positive phase gain
+`P <= 0.5 s` over the entire horizon: for elapsed time `t`,
+`b(t) - b0 <= r_max * t + P`. The
+[kernel phase limit](https://github.com/torvalds/linux/blob/v6.18/include/linux/timex.h)
+is per offset update. It does not by itself prove this aggregate bound when
+updates repeat. Qualification must bound their total, include all other
+oscillator/domain errors, and retain the safe-side aggregate allowance
+`J <= 1 s` for residual corrections and missing elapsed time. A per-update
+bound or a synchronization-status flag is insufficient.
+
+Let `B = floor((h + G - J) * Q / (Q + d))`. Provided `H` covers `b0 + B`,
+the gate cannot close before elapsed time `(B - P) / r_max`. Its minimum
+remaining forwarding interval after the actual `renew_by` is therefore:
+
+```text
+F_min = floor((B - P) / r_max) - h - epsilon - tau
+F_min >= 60 s
+G >= ((h + epsilon + tau + 60 s) * r_max + P) * (Q + d) / Q + J - h
+```
+
+With `h = J = epsilon = 1 s`, `P = 0.5 s`, and initially `tau = 0`, the
+whole-second choice is:
+
+```text
+G >= (62 * 1.101 + 0.5) * 1.112347053 s
+  >= 76.487208058386 s
+smallest whole-second G = 77 s
+G = 75 s: F_min = 58.785649369 s - tau
+G = 76 s: F_min = 59.602179795 s - tau
+G = 77 s: F_min = 60.418710222 s - tau
+```
+
+These results round both the BOOTTIME deadline and elapsed-time conversion
+downward to nanoseconds. The full sixty-second guarantee therefore requires
+`tau <= 0.418710222 s` under the stated worst-case interval and phase bounds.
+A 400 ms transport qualification budget leaves at least 60.018710222 seconds.
+The clock-provider and authenticated-transport slices must prove this sampling
+budget together with the rate, aggregate phase and full-horizon bounds before
+advertising the guarantee. Interval width alone cannot establish it. The
+budget describes an already installed grant's deadline; a late initial reply
+cannot supply traffic authority retroactively. Unbounded transport delay cannot
+be covered by any finite fixed grace.
+
+For the selected profile, `h + G` is 78 seconds and remote exclusion
+`h + G + guard` is 79 seconds after issuance. The unrounded, zero-sampling-delay
+lower bound would give about 78.49 seconds of remote exclusion; whole-second
+grace rounding makes the implemented value 79 seconds. A remote successor still
+waits for its trusted lower bound to reach that immutable exclusion deadline.
+
+Sampling and reply delay are charged from the original `b0`; receipt and retry
+never start a new lifetime. The separate exclusion guard is reserved for
+post-gate queued packets and is not spent on clock error. A shorter horizon,
+larger error/phase allowance or excessive sampling delay preserves the safety
+rule by closing earlier, but does not meet the sixty-second availability
+contract. Such a profile must not be advertised as qualified for that contract;
+increasing the permit grace does not qualify a clock provider by itself.
 
 A store outage does not alter a previously issued permit. The consumer can
 retain existing traffic until its stop deadline, but changes still require
@@ -105,7 +204,8 @@ Each operation is one `ScopeLease` consensus command. Admission uses the exact
 current configuration and the committed apply path independently checks scope,
 expected revision, execution, selection, permit and clock bounds. A live
 membership transition changes request admission, not the stable scope. Existing
-services and checkpoints can renew, release and select after the transition.
+services and checkpoints can renew, release and select after the transition's
+new voter set has activated the profile, subject to the availability limit below.
 If a command was stamped before the authority switch and applies afterward,
 apply returns retryable `Unavailable` without changing the checkpoint. The
 service resolves the retained request if possible, otherwise returns
@@ -114,30 +214,61 @@ admission. A configuration switch is not a platform admission refusal.
 
 Profile 2 retains one fixed 4096-byte authority checkpoint per scope. Its body
 starts with `OPSL` and version 2; length framing and zero padding are checked
-exactly. The persisted wire representation uses a fixed-width hexadecimal
-encoding. This encoding is not encryption. The checkpoint shares the existing
-durable keyed-outcome storage collection under a domain-separated key derived
-from the full scope. A hash collision or another record kind at that key fails
-closed. Each successful operation replaces the same checkpoint; refused
-operations do not allocate receipts. There is no mutation lease, per-operation
-ordinary receipt, watch event, or child-record mutation. ReadIndex barriers
-issue no application command. Normal Raft log retention and snapshot compaction
-still apply, independently of the fixed per-scope business state.
+exactly. The command outcome uses fixed-width hexadecimal encoding, which is
+not encryption. Checkpoints live in dedicated reserved authority rows, outside
+all ordinary request-receipt collections. Even deleting the ordinary receipt
+collection cannot remove selection or grant floors. Each successful operation
+replaces the same checkpoint; refused operations do not allocate receipts.
+There is no per-scope mutation lease, per-operation ordinary receipt or watch
+event. ReadIndex barriers issue no application command. Normal Raft log
+retention and snapshot compaction still apply.
 
 The checkpoint contains an apply-visible grant fence: exact stable scope,
 selected execution, selection and grant epoch, current permit, and release
 state. Renew and Resume replace deadlines while preserving the grant epoch.
-Slice 2 must check that fence and permit validity during apply, never compare a
-child batch against the per-renewal checkpoint revision.
+Child batches compare this stable fence and the currently retained permit's
+validity during apply. The per-renewal checkpoint revision is not a batch fence.
+
+Before either `ScopeLease` or `ScopeBatch` can be proposed, the leader probes
+**every voter** for the exact scope profile digest, under current configuration
+admission. A separately committed activation certificate binds that digest to
+the admitted identity and voter set. Apply checks the certificate again.
+After activation, normal operations require a quorum; an unavailable minority
+does not undo the established certificate. Joining voters must acknowledge the
+exact scope profile before learner replication whenever a retained activation
+row records scope format history, even if its certificate is no longer current.
+
+**Current operational limit:** a configuration change requires activation for
+its new identity and voter set. Every member of that set must answer before any
+new scope operation, including renewal, can commit. One unreachable voter can
+therefore stop renewals despite a healthy quorum; if it remains unreachable for
+the remaining forwarding budget, existing permits lapse at their original stop
+deadlines (`h + G` after the last issuance). The packet gate may close earlier
+according to its clock envelope and correlation horizon.
+Stable scope identity preserves the authority record but does not remove this
+activation dependency. A command that reaches apply before activation returns
+`ProfileNotActivated` with no effect. This is retryable: retain the exact request
+and retry it; the service attempts current-configuration activation automatically.
+`OutcomeUnknown` still requires exact retry to resolve a possibly committed effect.
+
+The immediate next slice, before any consumer relies on scope leases, must
+carry activation across membership transitions using the joining-voter checks
+and durable transition evidence. That work precedes the planned replay lanes.
+The initial cluster activation remains a separate prerequisite; each subsequent
+scope operation within an activated configuration is one command.
 
 The command and outcome variants are appended to the existing wire vocabulary.
-Every voter must support this profile before use. This is a fresh-install
-boundary for scope authority, with no migration from profile 1. A legacy
-`opc-scope-lease` session record is refused instead of silently forgetting its
-selection or grant floor. Unsupported or malformed checkpoints fail closed.
-Ordinary consumer and roster APIs cannot access the reserved key type; consumer
-restore scans filter it while retaining pagination progress. The raw in-process
-consensus store remains a privileged trusted component.
+Crossing this stored-format change requires deleting the old volumes and a
+fresh installation, with no migration or in-place conversion. Prior checkpoint
+placements, unsupported profiles and malformed records are refused instead of
+silently forgetting their floors. Ordinary consumer and roster APIs cannot
+access any reserved scope key type; consumer restore scans filter those rows
+while retaining pagination progress. The in-process quorum service remains a
+trusted boundary and requires authenticated platform admission on every call.
+Downgrading after scope-profile activation is unsupported: older binaries may
+not decode the committed commands, snapshots or retained rows. The scope-lease
+merge and this atomic-batch slice form one unreleased format boundary; no SDK
+release or consumer dependency pin may occur between them.
 
 The checkpoint retains only the last exact request ID and digest. While that
 request remains current, retry returns its original state and absolute
@@ -146,12 +277,88 @@ obsolete; it never performs a new grant. A canceled command may still commit,
 so uncertainty must be resolved using the exact retained request before a new
 operation. A delayed command loses if another request changes its predecessor.
 
-This profile adds no session-count limit. Follow-on slices own batched child
-writes, eight replay lanes, coherent scans, physical reclamation, and scheduling.
+## Atomic child batches
+
+`ScopeBatchStore::execute` commits a typed `ScopeBatchRequest` with up to 64
+child mutations, up to eight unique claims per child, and comparisons for up
+to sixteen fixed counters. The complete serialized consensus command is capped
+at 2 MiB; each already sealed value is capped at 1 MiB. A maximum-size sealed
+value and its full claim set fit together. `ScopeSealedValue` accepts a bounded
+RFC 003 envelope; the consumer binds scope and child identity in its AAD and
+verifies that binding when decrypting. Plaintext child values are refused.
+
+Create requires an absent child and allocates a monotonically increasing birth
+at apply. CAS and Delete require the exact birth and generation. Updates
+advance that birth’s generation; delete retains a tombstone, and recreate uses
+a new birth. A stale delete, CAS or delayed create cannot affect a replacement.
+All child, claim and counter predicates are evaluated before any publication.
+A conflict identifies the children, claims or counters to reread and regroup;
+none of the batch takes effect, including its birth allocation and result.
+
+Claims are unique within their scope and bind to an exact child birth. A CAS
+supplies the complete successor claim set; deletion releases all predecessor
+claims. Releasing old claims before acquiring successors permits an atomic swap
+within one batch. A shared allocation pool spanning scopes needs a separately
+chosen shared claim authority; this API does not imply cross-scope uniqueness.
+Releasing a claim leaves its row with `owner = None`; it does not physically
+delete the key. Retained claim rows therefore grow with the number of distinct
+claim keys ever used. Native publication, cold reconstruction and SQLite
+snapshot validation currently require predecessor scope keys to remain present.
+The reclamation slice must make all three checks floor-aware before removing
+released claims or child tombstones; compaction alone does not reclaim them.
+Counters are exact compare-and-set values between zero and `i64::MAX`. They
+are bounded accounting fields, with no default session quota or capacity policy.
+
+Apply checks the authenticated admitted execution’s stable grant and selection
+against the authority checkpoint. It rejects a released, replaced or expired
+grant, including a command prepared while the permit was live but applied
+after its stop deadline. Renewal preserves the batch fence. Both the trusted
+clock upper bound and replicated application time must precede the current
+permit’s stop deadline. Point reads are linearizable and issue no application
+command; they are observations, not ownership or coherent scans.
+
+This initial batch profile permits one unresolved request per scope. Retain the
+complete request, serialize successors using the returned batch revision, and
+retry the exact request after `OutcomeUnknown`, including during configuration
+cutover, and retry the no-effect `Scope(ProfileNotActivated)` result as described
+above. The request and outcome already contain a lane and a positive sequence.
+Only lane zero is active, with sequence equal to expected batch revision plus one.
+The checkpoint reserves eight fixed lane slots, each with a floor, sequence,
+request ID, digest and bounded outcome; the other seven remain canonical zero.
+The current checkpoint retains one exact request digest and result in lane zero.
+An exact retry while retained returns that original outcome without another
+effect; a changed body with the same ID conflicts. After a successor replaces
+the result, `RevisionConflict` prevents an obsolete request from executing but
+does not recover its original outcome. Eight independent replay lanes and
+outcome reads follow the activation-continuity slice. Reserving their complete
+stored layout avoids another layout change, but enabling lanes also changes
+apply semantics and the profile digest. The planned lanes profile therefore
+requires another fresh installation: mixed binaries cannot safely apply a
+certificate checked against different local digests. A rolling transition would
+need separately reviewed support for both profiles until unanimous activation;
+the reserved fields alone do not provide it.
+
+The reserved row types are `opc-scope-lease`, `opc-scope-batch`,
+`opc-scope-child`, `opc-scope-claim`, and `opc-scope-profile`. Their metadata
+codec is explicit and cannot be used through ordinary session operations.
+Child values remain sealed inside that codec. Native publication and cold
+reconstruction validate child/claim links; compaction preserves authority,
+birth and generation floors. Tombstones remain until the future reclamation
+profile supplies a safe physical deletion boundary. A committed batch survives
+restart or a lost reply without exposing a partial child/claim/counter change.
+The service adds no shutdown or emergency-session interruption policy.
+
+This profile adds no session-count limit. Follow-on slices own eight replay
+lanes, coherent scans, physical reclamation, and scheduling.
 SafetyControl priority must include scope renewals under child-write load. The
 remaining integrations also have explicit owners in the slice plan: an
 authenticated consumer transport, a production bounded-clock provider, and
 store-side same-domain handover with independently verified predecessor-exit
-proof. Until that handover operation exists, a successor without graceful
-release follows the remote exclusion deadline. This slice supplies no packet
-gate, kernel reset or external predecessor-exit proof producer.
+proof. That planned operation allows immediate handover within the same
+workload instance once the store accepts proof of predecessor exit, closed
+gates, and retired or blocked old
+transports, with old forwarding state retired or safely adopted. It does not
+wait for the remote exclusion timer; another workload still does. Until that
+store operation exists, a successor without graceful release follows remote
+exclusion. This slice supplies no packet gate, kernel reset or external
+predecessor-exit proof producer.

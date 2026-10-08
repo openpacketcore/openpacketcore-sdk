@@ -673,6 +673,9 @@ mod native_flow;
 mod paced_viability;
 mod scope_lease;
 
+#[path = "sequential_wal_sdk_tests/scope_batch.rs"]
+mod scope_batch;
+
 #[derive(Debug)]
 struct QuorumAuthorityClock(crate::Timestamp);
 

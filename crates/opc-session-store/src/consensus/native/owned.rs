@@ -110,6 +110,18 @@ fn intent(
 ) -> io::Result<SessionMutationIntent> {
     Ok(match value {
         SessionMutationIntent::AdvanceLogicalTime => SessionMutationIntent::AdvanceLogicalTime,
+        SessionMutationIntent::ScopeBatch(operation) => {
+            operation
+                .validate()
+                .map_err(|_| invalid("scope batch invalid"))?;
+            SessionMutationIntent::ScopeBatch(operation.clone())
+        }
+        SessionMutationIntent::ActivateScopeProfile(certificate) => {
+            certificate
+                .validate()
+                .map_err(|_| invalid("scope activation invalid"))?;
+            SessionMutationIntent::ActivateScopeProfile(certificate.clone())
+        }
         SessionMutationIntent::ScopeLease(operation) => {
             operation
                 .validate()
@@ -462,6 +474,9 @@ pub(super) fn ordinary_response(
     use crate::backend::CompareAndSetResult;
     let result = match &value.result {
         Ok(SessionMutationOutcome::Unit) => Ok(SessionMutationOutcome::Unit),
+        Ok(SessionMutationOutcome::ScopeBatch(result)) => {
+            Ok(SessionMutationOutcome::ScopeBatch(result.clone()))
+        }
         Ok(SessionMutationOutcome::ScopeLease(result)) => {
             if let Ok(checkpoint) = result {
                 checkpoint

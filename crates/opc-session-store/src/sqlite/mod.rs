@@ -422,6 +422,16 @@ impl ProactiveCheckpointWorkerObservationForTest {
 }
 
 pub(crate) fn validate_consensus_record(record: &StoredSessionRecord) -> Result<(), StoreError> {
+    if crate::scope_storage::is_batch_record_key(&record.key) {
+        return crate::scope_storage::ScopeRow::from_record(record)
+            .map(|_| ())
+            .map_err(|_| StoreError::InvalidKey("scope_batch_format_mismatch".into()));
+    }
+    if crate::scope_lease::is_scope_lease_key(&record.key) {
+        return crate::scope_lease::ScopeLeaseCheckpoint::from_record(record)
+            .map(|_| ())
+            .map_err(|_| StoreError::InvalidKey("scope_lease_format_mismatch".into()));
+    }
     let actual = record.payload.len();
     if actual > SQLITE_CONSENSUS_MAX_VALUE_BYTES {
         return Err(StoreError::PayloadTooLarge {
@@ -3370,6 +3380,24 @@ impl SqliteSessionBackend {
                 StoreError::BackendUnavailable("scope checkpoint unavailable".into())
             })?;
             Ok(result)
+        })
+        .await
+    }
+
+    pub(crate) async fn consensus_scope_record(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        key: SessionKey,
+    ) -> Result<Option<crate::scope_storage::ScopeRow>, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _| state.scope_record(identity, &key))
+                .await;
+        }
+        let _ = identity;
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::scope_batch::read(conn, &key)
         })
         .await
     }

@@ -29,8 +29,12 @@ const RECORD_MAGIC: &[u8; 5] = b"OPSL\x02";
 pub const MAX_SCOPE_LEASE_RECORD_BYTES: usize = 4096;
 /// Healthy renewal interval fixed by the scope lease profile.
 pub const SCOPE_RENEWAL_INTERVAL: Duration = Duration::from_secs(1);
-/// Forwarding grace following the next scheduled renewal.
-pub const SCOPE_FORWARDING_GRACE: Duration = Duration::from_secs(60);
+/// Permit grace following the next scheduled renewal. Seventy-seven seconds
+/// preserve sixty seconds after `renew_by` under RFC 022's qualified rate,
+/// aggregate phase, issuance-excess and sampling-delay bounds. The clock
+/// guarantee must cover the full derived deadline; late replies and retries
+/// never start a new lifetime.
+pub const SCOPE_FORWARDING_GRACE: Duration = Duration::from_secs(77);
 /// Additional exclusion after the permit's absolute stop deadline.
 pub const SCOPE_CLOCK_GUARD: Duration = Duration::from_secs(1);
 
@@ -77,6 +81,11 @@ pub enum ScopeLeaseError {
     /// The authoritative backend could not be reached or validated.
     #[error("scope_lease_unavailable")]
     Unavailable,
+    /// The exact current voter configuration has not activated scope profile 2.
+    /// No effect occurred. Retry the exact request: the service automatically
+    /// attempts activation under the current configuration before submission.
+    #[error("scope_lease_profile_not_activated")]
+    ProfileNotActivated,
 }
 
 /// Exact store, tenant, network function and opaque stable slot.
@@ -92,6 +101,9 @@ pub struct ScopeLeaseId {
 impl ScopeLeaseId {
     /// Bind an opaque nonzero slot to the stable cluster identity.
     /// Configuration changes do not change the resulting scope.
+    /// Obtain `store` from `ValidatedQuorumTopology::consensus_identity()` in the
+    /// configured topology; constructing this identifier needs no live store
+    /// authority read and remains available while the WAL owner is busy.
     pub fn new(
         store: SessionConsensusIdentity,
         tenant: TenantId,
@@ -548,10 +560,13 @@ pub(crate) struct ScopeState {
 }
 
 mod command;
+mod profile;
 pub(crate) use command::checkpoint_state;
 #[cfg(target_os = "linux")]
 pub(crate) use command::ScopeCheckpointFacts;
 pub use command::{ScopeLeaseCheckpoint, ScopeLeaseCommand};
+pub(crate) use profile::scope_profile_digest;
+pub use profile::ScopeProfileActivation;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -62,6 +62,16 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
             intent => intent,
         };
         match intent {
+            SessionMutationIntent::ScopeBatch(operation) => {
+                operation
+                    .validate()
+                    .map_err(|_| invalid("scope batch invalid"))?;
+                count = operation.request.operations().len().max(1);
+                largest_payload = operation.largest_value_bytes();
+            }
+            SessionMutationIntent::ActivateScopeProfile(_) => {
+                count = 1;
+            }
             SessionMutationIntent::ScopeLease(operation) => {
                 operation
                     .validate()
@@ -218,6 +228,15 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
     }
     fn intent(value: &SessionMutationIntent, allow_authorized: bool) -> io::Result<usize> {
         match value {
+            SessionMutationIntent::ScopeBatch(operation) => {
+                operation
+                    .validate()
+                    .map_err(|_| invalid("scope batch invalid"))?;
+                operation
+                    .log_row_reuse_allocation_bytes()
+                    .ok_or_else(|| invalid("native owned scope batch allocation overflow"))
+            }
+            SessionMutationIntent::ActivateScopeProfile(_) => Ok(CONTEXT_METADATA),
             SessionMutationIntent::ScopeLease(operation) => {
                 operation
                     .validate()
