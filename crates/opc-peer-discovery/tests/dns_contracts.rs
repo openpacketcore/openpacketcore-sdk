@@ -415,6 +415,7 @@ fn destination_policy_uses_rfc_precedence_then_scope_and_stable_input_order() {
         "[fc00::1]:443",
         "[2002:c000:201::1]:443",
         "[2001:db8::2]:443",
+        "192.0.2.3:443",
     ]
     .into_iter()
     .map(|s| s.parse().unwrap())
@@ -431,6 +432,7 @@ fn destination_policy_uses_rfc_precedence_then_scope_and_stable_input_order() {
             "[2001:db8::2]:443",
             "192.0.2.1:443",
             "[::ffff:192.0.2.2]:443",
+            "192.0.2.3:443",
             "[2002:c000:201::1]:443",
             "[fc00::1]:443"
         ]
@@ -440,7 +442,8 @@ fn destination_policy_uses_rfc_precedence_then_scope_and_stable_input_order() {
         addresses,
         vec![
             "192.0.2.1:443".parse::<SocketAddr>().unwrap(),
-            "[::ffff:192.0.2.2]:443".parse().unwrap()
+            "[::ffff:192.0.2.2]:443".parse().unwrap(),
+            "192.0.2.3:443".parse().unwrap()
         ]
     );
 }

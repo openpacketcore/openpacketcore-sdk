@@ -97,7 +97,8 @@ pub enum DnsCachedResult {
         /// acceptance for unknown TTLs.
         age: Duration,
     },
-    /// A cold authoritative denial within its SOA-derived negative TTL.
+    /// A cold authoritative denial or SRV service withdrawal within its
+    /// observed deadline and the cache's negative TTL cap.
     Negative(DnsError),
     /// No positive answer or currently live authoritative denial.
     Miss,
@@ -198,8 +199,8 @@ impl Entry {
         // Retry pacing is separate from authority: an uncacheable denial must
         // remain a miss even while its next attempt is suppressed.
         self.negative_expires_at = error
-            .soa()
-            .map(|soa| soa.expires_at().min(deadline(now, max_negative_ttl)))
+            .negative_deadline()
+            .map(|expiry| expiry.min(deadline(now, max_negative_ttl)))
             .filter(|expiry| now < *expiry);
         let retry_at = if let Some(expiry) = self.negative_expires_at {
             self.failures = 0;
@@ -285,6 +286,8 @@ impl DnsCache {
     /// policy; the negative cap is at most the positive cap. Zero disables fresh
     /// caching but preserves retry pacing and positive last-good retention.
     /// Caps never extend record deadlines or rewrite their provenance.
+    /// The negative cap also bounds positive answers with a partial denial
+    /// recorded using [`DnsAnswer::with_negative_freshness_bound`].
     pub fn with_ttl_caps(mut self, max_ttl: Duration, max_negative_ttl: Duration) -> Self {
         self.max_ttl = max_ttl.min(MAX_TTL);
         self.max_negative_ttl = max_negative_ttl.min(self.max_ttl);
@@ -453,9 +456,11 @@ impl DnsCache {
         match result {
             Ok(answer) => {
                 let expires_at = answer
-                    .expires_at()
-                    .unwrap_or(now)
-                    .min(deadline(now, self.max_ttl));
+                    .capped_expires_at(
+                        deadline(now, self.max_ttl),
+                        deadline(now, self.max_negative_ttl),
+                    )
+                    .unwrap_or(now);
                 entry.expires_at = Some(expires_at);
                 entry.answer = Some(answer);
                 entry.last_error = None;

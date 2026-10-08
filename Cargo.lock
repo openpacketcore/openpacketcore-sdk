@@ -3295,7 +3295,10 @@ dependencies = [
 name = "opc-peer-discovery"
 version = "0.2.0"
 dependencies = [
+ "getrandom 0.4.2",
+ "socket2",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
