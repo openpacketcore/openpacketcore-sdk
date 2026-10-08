@@ -113,8 +113,8 @@ use opc_session_store::sqlite::test_support::{
 #[cfg(feature = "test-control")]
 use opc_session_store::test_support::{
     append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
-    consensus_padding_receipt_status_for_test, ConsensusEngineStateForTest,
-    ConsensusPaddingReceiptStatusForTest,
+    consensus_local_replication_sequence_for_test, consensus_padding_receipt_status_for_test,
+    ConsensusEngineStateForTest, ConsensusPaddingReceiptStatusForTest,
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::PreparedCompareAndSetPrepareError;
@@ -1901,7 +1901,8 @@ struct RecordedCompareAndSetCall {
 }
 
 /// A real consumer listener wrapper that records every compare-and-set it
-/// serves. It never changes a request or a response.
+/// serves. It never changes a request or a response, and observes the local
+/// application journal without adding consensus work before returning a reply.
 struct RecordingCompareAndSetConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
     binding_entries: Arc<AtomicUsize>,
@@ -1946,11 +1947,12 @@ impl SessionQuorumConsumer for RecordingCompareAndSetConsumer {
         let response = self.inner.execute(identity, request).await;
         if let Some(request) = recorded {
             let binding_entries_at_answer = self.binding_entries.load(Ordering::SeqCst);
-            let effects_at_answer = self
-                .effects
-                .max_replication_sequence()
+            // The real mutation has already returned. The public quorum read
+            // would propose another logical-time fence before the reply and
+            // spend the caller's physical-attempt budget on test observation.
+            let effects_at_answer = consensus_local_replication_sequence_for_test(&self.effects)
                 .await
-                .expect("replication sequence when the voter answers");
+                .expect("local replication sequence when the voter answers");
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6352,10 +6354,6 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
         )
         .expect("prepared failover budget")
     };
-    let mut prepared = protected
-        .prepare_compare_and_set(request_id, operation.clone(), budget())
-        .await
-        .expect("prepare the exact protected compare-and-set");
     let before = fleet.stores[leader]
         .max_replication_sequence()
         .await
@@ -6367,6 +6365,11 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
         .max()
         .expect("three-voter applied index");
     fleet.wait_all_application_sequences(settled).await;
+    // Finish fixture convergence before starting the immutable caller budget.
+    let mut prepared = protected
+        .prepare_compare_and_set(request_id, operation.clone(), budget())
+        .await
+        .expect("prepare the exact protected compare-and-set");
     fleet.consumer_binding_entries.store(0, Ordering::SeqCst);
     fleet.withhold_next_forward_mutation_reply(origin, leader);
 
@@ -6412,6 +6415,11 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
     assert_eq!(
         origin_calls[0].effects_at_answer, before,
         "the origin answered before any compare-and-set effect"
+    );
+    assert_eq!(
+        successor_calls[0].effects_at_answer,
+        before + 1,
+        "the successor answered after exactly one locally applied effect"
     );
     assert!(
         successor_calls[0].request == origin_calls[0].request,
