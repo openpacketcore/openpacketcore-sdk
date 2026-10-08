@@ -1,3 +1,4 @@
+use super::profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use std::{cell::RefCell, marker::PhantomData};
 
 use bytes::Bytes;
@@ -20,15 +21,15 @@ enum ReceivePhase {
     Current,
 }
 
-pub(super) struct ReceiveState {
+pub(super) struct ReceiveState<P: RecoveryProfile = Gcm> {
     pub next: Option<u32>,
     phase: ReceivePhase,
     pub pending: RefCell<Option<Bytes>>,
-    replies: Option<Canonical>,
+    replies: Option<Canonical<P>>,
     last_empty: Option<(u32, Bytes)>,
 }
 
-impl ReceiveState {
+impl<P: RecoveryProfile> ReceiveState<P> {
     pub fn new(next: Option<u32>) -> Self {
         Self {
             next,
@@ -129,13 +130,13 @@ pub enum Ikev2EmptyReplyObservation {
 ///     let _ = reply.bytes();
 /// }
 /// ```
-pub struct Ikev2EmptyReply<'a> {
+pub struct Ikev2EmptyReply<'a, P: RecoveryProfile = Gcm> {
     reply: Ikev2CanonicalReply,
     observation: Ikev2EmptyReplyObservation,
-    window: PhantomData<&'a mut Window>,
+    window: PhantomData<&'a mut Window<P>>,
 }
 
-impl Ikev2EmptyReply<'_> {
+impl<P: RecoveryProfile> Ikev2EmptyReply<'_, P> {
     /// Complete immutable IKE packet without transport framing.
     pub fn bytes(&self) -> &[u8] {
         self.reply.bytes()
@@ -147,7 +148,7 @@ impl Ikev2EmptyReply<'_> {
     }
 }
 
-impl Window {
+impl<P: RecoveryProfile> Window<P> {
     /// Enable zero-write empty handling for this checked window and canonical policy.
     ///
     /// Qualify every intended algorithm before admitting a DPD-sending deployment.
@@ -219,7 +220,7 @@ impl Window {
     /// # Errors
     /// Drops wrong class/binding, changed/stale/gapped requests and pending nonempty
     /// work; refuses disabled/blocked/unavailable canonical handling without fallback.
-    pub fn reply_empty(&mut self, request: &Request) -> Result<Ikev2EmptyReply<'_>, Error> {
+    pub fn reply_empty(&mut self, request: &Request<P>) -> Result<Ikev2EmptyReply<'_, P>, Error> {
         self.ready()?;
         let id = request
             .canonical_message_id(&self.record.domain)
@@ -299,7 +300,7 @@ impl Window {
         if let Some(replies) = self.receive.replies.take() {
             replies.delete();
         } else {
-            Canonical::delete_epoch(&self.canonical_binding);
+            crate::canonical::invalidate_profile(&P::from_epoch(&self.canonical_binding));
         }
     }
 }

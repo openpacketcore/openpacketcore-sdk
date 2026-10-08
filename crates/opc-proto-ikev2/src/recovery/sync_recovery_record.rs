@@ -1,4 +1,8 @@
+use super::profile::{
+    Ikev2CbcRecoveryProfile as Cbc, Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile,
+};
 use bytes::Bytes;
+use std::marker::PhantomData;
 
 use super::{
     sync_packet, Ikev2CommittedWindowRecord as Record, Ikev2SyncDisposition as Disposition,
@@ -7,7 +11,6 @@ use super::{
 use crate::{
     decode_ikev2_message_id_sync_notify, Ikev2MessageIdSyncPending as Pending, Ikev2NotifyPayload,
     Ikev2SaInitCryptoProfile as Profile, Ikev2SaInitKeyMaterial as Keys, PayloadChain, PayloadType,
-    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN,
 };
 
 /// UTC milliseconds since the Unix epoch, with persistent clock-step identity.
@@ -98,17 +101,27 @@ impl Ikev2SyncRecoveryPolicy {
 }
 
 /// One complete persisted attempt; its bytes are storage inputs, not send permission.
+/// A CBC attempt cannot become GCM recovery history:
+/// ```compile_fail
+/// use opc_proto_ikev2::recovery::{Ikev2CbcRecoveryProfile, Ikev2SyncAttemptRecord,
+///     Ikev2SyncRecoveryRecord, Ikev2SyncRecoveryPolicy, Ikev2SyncRecoveryStatus};
+/// fn mix(attempt: Ikev2SyncAttemptRecord<Ikev2CbcRecoveryProfile>, policy: Ikev2SyncRecoveryPolicy) {
+///     let _ = Ikev2SyncRecoveryRecord::from_persisted(policy, 100, vec![attempt],
+///         Ikev2SyncRecoveryStatus::Pending);
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct Ikev2SyncAttemptRecord {
+pub struct Ikev2SyncAttemptRecord<P: RecoveryProfile = Gcm> {
+    profile: PhantomData<P>,
     pub(super) pending: Pending,
     pub(super) prepared_unix_ms: u64,
     pub(super) request: Bytes,
 }
-impl Ikev2SyncAttemptRecord {
+impl<P: RecoveryProfile> Ikev2SyncAttemptRecord<P> {
     /// Rebuild stored inputs. Window restoration authenticates and correlates bytes.
     /// # Errors
     /// Rejects an empty packet; remaining checks need the enclosing SA/history.
-    pub fn from_persisted(
+    pub(super) fn from_parts(
         pending: Pending,
         prepared_unix_ms: u64,
         request: Bytes,
@@ -120,6 +133,7 @@ impl Ikev2SyncAttemptRecord {
             pending,
             prepared_unix_ms,
             request,
+            profile: PhantomData,
         })
     }
     /// Pure proposal for persistence and simultaneous counter calculations.
@@ -150,21 +164,21 @@ pub enum Ikev2SyncRecoveryStatus {
 
 /// Initiating history persisted atomically with the ordinary and responder state.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Ikev2SyncRecoveryRecord {
+pub struct Ikev2SyncRecoveryRecord<P: RecoveryProfile = Gcm> {
     pub(super) policy: Ikev2SyncRecoveryPolicy,
     pub(super) last_observed_unix_ms: u64,
-    pub(super) attempts: Vec<Ikev2SyncAttemptRecord>,
+    pub(super) attempts: Vec<Ikev2SyncAttemptRecord<P>>,
     pub(super) status: Ikev2SyncRecoveryStatus,
 }
-impl Ikev2SyncRecoveryRecord {
+impl<P: RecoveryProfile> Ikev2SyncRecoveryRecord<P> {
     /// Rebuild trusted latest fields without refunding an attempt or replacing policy.
     /// # Errors
     /// Rejects empty/oversized history, repeated nonces, non-increasing proposals,
     /// regressing receive floors, inconsistent times or a missing positive delay.
-    pub fn from_persisted(
+    pub(super) fn from_parts(
         policy: Ikev2SyncRecoveryPolicy,
         last_observed_unix_ms: u64,
-        attempts: Vec<Ikev2SyncAttemptRecord>,
+        attempts: Vec<Ikev2SyncAttemptRecord<P>>,
         status: Ikev2SyncRecoveryStatus,
     ) -> Result<Self, Error> {
         if attempts.is_empty()
@@ -209,7 +223,7 @@ impl Ikev2SyncRecoveryRecord {
         self.policy
     }
     /// All consumed attempt inputs, including abandoned nonces and exact bytes.
-    pub fn attempts(&self) -> &[Ikev2SyncAttemptRecord] {
+    pub fn attempts(&self) -> &[Ikev2SyncAttemptRecord<P>] {
         &self.attempts
     }
     /// Last durably recorded time, not a refreshed deadline.
@@ -227,7 +241,7 @@ impl Ikev2SyncRecoveryRecord {
             .flatten()
     }
 
-    pub(super) fn validate(&self, record: &Record) -> Result<(), Error> {
+    pub(super) fn validate(&self, record: &Record<P>) -> Result<(), Error> {
         let sync = record.sync_state().ok_or(Error::InvalidRecord)?;
         let last = self.attempts.last().ok_or(Error::InvalidRecord)?;
         let proposal = last.pending.notification();
@@ -263,18 +277,20 @@ impl Ikev2SyncRecoveryRecord {
         }
         Ok(())
     }
+}
 
+impl<P: RecoveryProfile> Ikev2SyncRecoveryRecord<P> {
     pub(super) fn validate_packets(
         &self,
-        record: &Record,
+        record: &Record<P>,
         profile: Profile,
         keys: &Keys,
-        iv_end: u64,
+        epoch: &P::Epoch,
     ) -> Result<(), Error> {
         self.validate(record)?;
-        let mut previous_iv = None;
+        let mut evidence = P::SyncValidation::default();
         for attempt in &self.attempts {
-            let (_, first, cleartext) = sync_packet::open_message(
+            let opened = sync_packet::open_message(
                 &record.domain,
                 profile,
                 keys,
@@ -283,7 +299,7 @@ impl Ikev2SyncRecoveryRecord {
                 false,
             )
             .map_err(|_| Error::InvalidRecord)?;
-            let mut chain = PayloadChain::new(first, &cleartext).iter();
+            let mut chain = PayloadChain::new(opened.first, &opened.cleartext).iter();
             let payload = chain
                 .next()
                 .ok_or(Error::InvalidRecord)?
@@ -298,17 +314,64 @@ impl Ikev2SyncRecoveryRecord {
             if value != Some(attempt.pending.notification()) {
                 return Err(Error::InvalidRecord);
             }
-            let start = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
-            let iv = attempt
-                .request
-                .get(start..start + 8)
-                .ok_or(Error::InvalidRecord)?;
-            let iv = u64::from_be_bytes(iv.try_into().map_err(|_| Error::InvalidRecord)?);
-            if iv >= iv_end || previous_iv.is_some_and(|previous| previous >= iv) {
-                return Err(Error::InvalidRecord);
-            }
-            previous_iv = Some(iv);
+            P::check_next_sync_attempt(&mut evidence, &opened, epoch)?;
         }
         Ok(())
+    }
+}
+
+impl Ikev2SyncAttemptRecord<Gcm> {
+    /// Rebuild stored inputs. Window restoration authenticates and correlates bytes.
+    /// # Errors
+    /// Rejects an empty packet; remaining checks need the enclosing SA/history.
+    pub fn from_persisted(
+        pending: Pending,
+        prepared_unix_ms: u64,
+        request: Bytes,
+    ) -> Result<Self, Error> {
+        Self::from_parts(pending, prepared_unix_ms, request)
+    }
+}
+
+impl Ikev2SyncAttemptRecord<Cbc> {
+    /// Rebuild stored inputs. Window restoration authenticates and correlates bytes.
+    /// # Errors
+    /// Rejects an empty packet; remaining checks need the enclosing SA/history.
+    pub fn from_persisted_cbc(
+        pending: Pending,
+        prepared_unix_ms: u64,
+        request: Bytes,
+    ) -> Result<Self, Error> {
+        Self::from_parts(pending, prepared_unix_ms, request)
+    }
+}
+
+impl Ikev2SyncRecoveryRecord<Gcm> {
+    /// Rebuild trusted latest fields without refunding an attempt or replacing policy.
+    /// # Errors
+    /// Rejects empty/oversized history, repeated nonces, non-increasing proposals,
+    /// regressing receive floors, inconsistent times or a missing positive delay.
+    pub fn from_persisted(
+        policy: Ikev2SyncRecoveryPolicy,
+        last_observed_unix_ms: u64,
+        attempts: Vec<Ikev2SyncAttemptRecord<Gcm>>,
+        status: Ikev2SyncRecoveryStatus,
+    ) -> Result<Self, Error> {
+        Self::from_parts(policy, last_observed_unix_ms, attempts, status)
+    }
+}
+
+impl Ikev2SyncRecoveryRecord<Cbc> {
+    /// Rebuild trusted latest fields without refunding an attempt or replacing policy.
+    /// # Errors
+    /// Rejects empty/oversized history, repeated nonces, non-increasing proposals,
+    /// regressing receive floors, inconsistent times or a missing positive delay.
+    pub fn from_persisted_cbc(
+        policy: Ikev2SyncRecoveryPolicy,
+        last_observed_unix_ms: u64,
+        attempts: Vec<Ikev2SyncAttemptRecord<Cbc>>,
+        status: Ikev2SyncRecoveryStatus,
+    ) -> Result<Self, Error> {
+        Self::from_parts(policy, last_observed_unix_ms, attempts, status)
     }
 }

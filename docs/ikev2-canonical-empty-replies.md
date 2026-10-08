@@ -1,4 +1,4 @@
-# Canonical AES-GCM empty IKEv2 replies
+# Canonical empty IKEv2 replies
 
 Status: design approved; V1 byte primitive and zero-write receive handler
 implemented in `opc-proto-ikev2`.
@@ -7,8 +7,12 @@ record-derived byte regeneration, without receive-window or transmission authori
 The [`empty` handler](../crates/opc-proto-ikev2/src/recovery/empty.rs) composes
 the primitive with receive admission and lifecycle checks. The current
 [recovery restrictions](../crates/opc-proto-ikev2/README.md) still apply,
-including deployment refusal when canonical replies cannot be qualified. CBC
-and fragmented recovery are outside this design.
+including deployment refusal when canonical replies cannot be qualified.
+The existing construction and implementation described below are AES-GCM V1.
+The [CBC-V1 extension](#cbc-v1-extension) specifies AES-CBC recovery separately;
+its frozen-format and crypto code reviews are complete. Production CBC canonical
+replies are enabled through the typed window with current provider qualification.
+Fragmented recovery is outside both profiles.
 
 The objective is to regenerate exactly the same authenticated empty
 INFORMATIONAL response after a crash without a durable write per response.
@@ -857,3 +861,300 @@ and aggregate limit passed design review. The implementation adds the exact
 key/salt fingerprint ledger, zeroizing withheld-output handling and API migration
 specified above. Independent review of the receive handler and composed peer
 qualification remain required before deployment.
+
+## CBC-V1 extension
+
+Status: approved construction and confirmed frozen labels, field encodings and
+byte table. The complete immutable descriptor, typed window/sync/readback
+integration and bounded canonical cache are implemented. CBC markers may be
+persisted only inside that fresh-epoch descriptor, atomically with the keys.
+The integration has passed crypto code review and production CBC canonical
+replies are enabled through the checked window. Deployments must run
+`preflight_cbc` for every intended profile and refuse a configuration if any
+preflight fails. Provider policy, full binding, lifecycle and release checks
+remain in force. GCM V1 bytes and its binding/reservation contract remain
+unchanged. CBC-V1 is a distinct typed profile, not another interpretation of
+a GCM format byte or IV record.
+
+### K1: IV key and permutation
+
+Let `D` contain the established epoch binding below, `dir = 00` for
+original-initiator output and `01` for original-responder output, and `m` be the
+admitted request's 32-bit Message ID. Integers use fixed-width network byte
+order. Freeze the following octet strings, including the single terminating
+zero on the KDF label and no terminator on `L96`:
+
+```text
+KDF_LABEL = ASCII("opc-ikev2-canonical-cbc-iv-key-v1") || 00  (34 octets)
+L96       = ASCII("opc-cbc-iv-1")                           (12 octets)
+P0        = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0f
+S_D       = KDF_LABEL || BE64(SPIi) || BE64(SPIr) || dir
+            || BE16(12) || BE16(AES key bits) || BE16(INTEG id)
+            || BE16(PRF id) || 01                          (60 octets)
+K_iv(D)   = first keylen octets of prf+(SK_d, S_D)
+X(m)      = L96 || BE32(m)
+IV(D,m)   = AES-ENC(K_iv(D), X(m))
+C(D,m)    = AES-ENC(SK_e(dir), IV(D,m) XOR P0)
+```
+
+`keylen` is 16, 24 or 32; AES key bits are 128, 192 or 256. The PRF is the
+epoch's negotiated HMAC-SHA1, SHA2-256, SHA2-384 or SHA2-512 (IDs 2, 5, 6, 7).
+Use the established `SK_d`, including any negotiated PPK mixing; SKEYSEED,
+traffic keys, fresh randomness and public data are not alternative key sources.
+The seed offsets are 0–33 label, 34–41 SPIi, 42–49 SPIr, 50 direction, 51–52
+ENCR, 53–54 key bits, 55–56 INTEG, 57–58 PRF and 59 format. For example,
+SPIi `0102030405060708`, SPIr `1112131415161718`, initiator output, AES-128,
+SHA2-256-128 integrity and SHA2-256 PRF give this seed:
+
+```text
+6f70632d696b6576322d63616e6f6e6963616c2d6362632d69762d6b65792d7631000102030405060708111213141516171800000c0080000c000501
+```
+
+Derive through the admitted `execute_prf_plus` at capability creation. Keep
+`K_iv` only in that live capability in zeroizing memory; never persist, log,
+publish, place it in a static or supply it to an ordinary sealer. The derivation
+is independent of clock, entropy, writer, process and retry count. An IKE rekey
+gets new `SK_d` and SPIs; a Child SA rekey changes neither. Preserve the old
+epoch's existing keys until deletion so its replies remain reproducible.
+
+The admitted `execute_cbc_encrypt` with `K_iv`, one block `X(m)` and a 16-zero
+chaining block implements the AES forward permutation. That internal chaining
+block is never the transmitted IV. A second admitted CBC encryption, under
+directional `SK_e` with the computed IV and exactly `P0`, produces `C`.
+`execute_integrity_checksum` under directional `SK_a` authenticates the whole
+header, IV and ciphertext with the negotiated truncation. No direct software
+crypto, entropy substitution, alternative KDF or runtime fallback is permitted.
+Provider refusal of either one-block operation withholds the packet.
+
+### K2: independent release self-check
+
+Before releasing any newly generated bytes:
+
+1. Require the exact profile length from K3. Independently rebuild bytes 0–31
+   from the binding, `m` and frozen constants in a separate buffer and compare.
+2. Pass the packet's bytes 32–47 through admitted `execute_cbc_decrypt` under
+   `K_iv`, with a zero chaining block. Require the raw 16-byte result to equal
+   independently assembled `L96 || BE32(m)`. Do not reuse the sealer's IV/input
+   buffer as the expected value. This inverse check is mandatory: a faulty IV
+   can otherwise yield a packet with a valid MAC and the correct plaintext.
+3. Use admitted `execute_integrity_verification` to verify the ICV over bytes 0–63
+   before decrypting the traffic ciphertext. Then use admitted CBC decryption
+   under directional `SK_e` and the transmitted IV; require the raw plaintext
+   to equal all 16 octets of `P0`, before any padding removal.
+
+All checks must succeed. Withhold and zeroize faulty output and temporary
+secret/plaintext buffers; expose neither bytes nor crypto internals in errors.
+The existing three charged attempts, single release, cache and retirement rules
+apply unchanged. A successful authenticated open alone is insufficient.
+Known-answer qualification checks the derivation separately. As with GCM, the
+fault model excludes a correlated failure that corrupts generation and its
+independent checks consistently.
+
+### K3: exact bytes and supported profiles
+
+All 48 triples of three AES-CBC key sizes, four integrity transforms and four
+PRFs are in scope. Each triple needs its own successful K6 qualification before
+preflight admits it; an unknown or uncovered triple is refused. The CBC format
+octet is `01`, meaningful only inside a CBC descriptor. It cannot stand in for
+the GCM marker. This layout is frozen for every epoch carrying CBC-V1:
+
+| Offsets | Length | Value |
+| --- | --- | --- |
+| 0–15 | 16 | `BE64(SPIi) || BE64(SPIr)` |
+| 16–18 | 3 | `2e 20 25`: SK, IKE version 2.0, INFORMATIONAL |
+| 19 | 1 | `28` for original-initiator output; `20` for original-responder output |
+| 20–23 | 4 | `BE32(m)` |
+| 24–27 | 4 | `BE32(IKE length)` from the integrity table |
+| 28–31 | 4 | `00 00 || BE16(SK length)` |
+| 32–47 | 16 | `IV(D,m)` |
+| 48–63 | 16 | `C(D,m)` |
+| 64–end | 12–32 | Truncated HMAC under `SK_a(dir)` over bytes 0–63 inclusive |
+
+| Integrity transform | ID | Key octets | ICV octets | SK length | IKE length |
+| --- | --- | --- | --- | --- | --- |
+| AUTH_HMAC_SHA1_96 | 2 | 20 | 12 | 48 (`0030`) | 76 (`0000004c`) |
+| AUTH_HMAC_SHA2_256_128 | 12 | 32 | 16 | 52 (`0034`) | 80 (`00000050`) |
+| AUTH_HMAC_SHA2_384_192 | 13 | 48 | 24 | 60 (`003c`) | 88 (`00000058`) |
+| AUTH_HMAC_SHA2_512_256 | 14 | 64 | 32 | 68 (`0044`) | 96 (`00000060`) |
+
+The shortest empty IKE padding is 15 zero octets followed by Pad Length `0f`;
+this is IKE padding, not PKCS#7. The builder owns all headers and padding.
+Authenticated legal noncanonical request padding remains accepted and cannot
+affect reply bytes. IP/UDP framing and the non-ESP marker remain outside this
+wire format. A format or KDF change requires a new reviewed marker on fresh
+epochs; upgrades must retain these bytes for existing CBC-V1 epochs.
+
+### K4: immutable binding, ledger and storage
+
+The CBC descriptor binds both nonzero SPIs, local original role/sending
+direction, ENCR and key bits, INTEG, PRF, `SK_ei`, `SK_er`, `SK_ai`, `SK_ar`,
+`SK_d` and the CBC format marker. Validate all key lengths against the profile.
+Refuse equal `SK_ei`/`SK_er` or equal `SK_ai`/`SK_ar`. No binding field may change
+on restore or readback; a mismatch refuses and permanently revokes the epoch.
+
+Once activation is authorized, persist the descriptor atomically with the
+epoch's keys and SA record before acquiring its first canonical capability.
+No derived key and no per-reply data is persisted. Fresh epochs only is the
+lifecycle policy; existing epochs cannot gain or change a marker. CBC has no
+IV partition, so this write may follow IKE_AUTH: it need not precede the first
+ordinary encryption. A missing, unknown or mismatched marker grants no
+canonical authority. Unqualified CBC-V1 empty replies have no random-IV fallback.
+
+Use separate, labelled SHA-256 fingerprints, with `LP(x) = BE16(len(x)) || x`:
+
+```text
+ledger_key = SHA256(ASCII("opc-ikev2-canonical-cbc-ledger-key-v1") || 00
+                   || BE16(12) || BE16(key bits) || BE16(INTEG id)
+                   || LP(sending SK_e) || LP(sending SK_a))
+binding    = SHA256(ASCII("opc-ikev2-canonical-cbc-binding-v1") || 00
+                   || BE64(SPIi) || BE64(SPIr) || dir
+                   || BE16(12) || BE16(key bits) || BE16(INTEG id)
+                   || BE16(PRF id) || 01
+                   || LP(SK_ei) || LP(SK_er) || LP(SK_ai) || LP(SK_ar)
+                   || LP(SK_d))
+```
+
+The ledger identity deliberately excludes SPIs, direction, PRF and `SK_d`, so
+a second binding over the same sending encryption/integrity keys reaches the
+same ledger and is refused, revoking the first. The full binding covers those
+fields and both key directions. Fingerprints are key-free process indexes,
+never persisted recipe inputs or encryption keys; compare them in constant
+time. Retain the global live-ledger limit, FIFO tombstones, exact ownership and
+all delete hooks. No static may retain `K_iv` or any raw `SK_*`; extend the
+static-state whitelist test accordingly.
+
+The zeroizing cache entry and returned canonical reply need a bounded buffer
+of up to 96 octets with a checked actual length. Neither unused tail bytes nor
+truncation may reach the caller. Preserve the 57-byte GCM representation on the
+wire and the prohibition on durable caching of canonical reply bytes.
+
+### K5: profile-typed recovery
+
+Separate CBC and GCM domain, epoch record, capability and packet evidence
+types, with sealed profile dispatch for the shared window lifecycle. GCM alone
+has an IV record/high-water, allocator, allocation token, reservation retry and
+required-IV-end evidence. CBC has an immutable descriptor and ordinary random
+sealing operations. A CBC window or authenticated CBC packet cannot be passed
+to a GCM counter extractor or reservation check. Do not model CBC by a dummy
+counter, ceiling, optional GCM allocation or a branch that merely skips a GCM
+check; CBC-specific constructors and methods cannot accept such evidence.
+
+The migration checklist covers:
+
+- `recovery/packet.rs`: GCM `sending_iv_end` and `require_reserved_iv` accept
+  only authenticated/sealed GCM evidence. CBC complete SK opening and sealing
+  use the CBC lengths and admitted ordinary sealer, without an allocation token.
+- Restore and reconcile: GCM retains D4 IV coverage and D5's live allocator.
+  CBC validates the immutable descriptor and authenticated packets, with no
+  IV arithmetic, reservation retry or allocator to retain.
+- `recovery/record.rs` and `recovery/sync_record.rs`: CBC sync records have no
+  `minimum_send_iv_end` field or floor-retention method. GCM keeps these in its
+  own record/evidence type; they are absent from CBC's persisted representation.
+- D1 preflight: CBC checks admitted, ready and serviceable CBC cipher,
+  integrity transform and PRF before validation. Withdrawal returns retryable
+  `ReconcileUnavailable`, preserving the capability, cache, witness and live
+  state, while fencing old tokens. Every other failure follows D1's existing
+  terminal/success rules.
+- Sync readiness: CBC checks cipher, integrity and entropy, including actual
+  module support. The offer and sync path cannot pass through AEAD-only checks.
+  Canonical readiness additionally checks PRF, policy and K6 qualification.
+- `canonical_module_declares_validation` and the qualification registry:
+  dispatch on the typed profile/triple; CBC never qualifies under a GCM entry.
+
+All seven witness constructors, exact pending-record matching, monotone live
+floors, token rotation, D6 retirement order, in-process reply retention, pending
+work and sync deadlines carry over. Reconcile generates no packet and releases
+no bytes for either profile. GCM-only APIs remain available for GCM callers;
+shared implementation cannot introduce GCM fields into a CBC record.
+
+### K6: qualification and standards interpretation
+
+Before a process's first canonical seal for each `(ENCR/key bits, INTEG, PRF)`
+triple, run frozen known answers through the production CBC-V1 sealer, including
+the `SK_d` derivation, zero-chaining-block permutation, traffic encryption,
+integrity and independent release checks. Compare complete literal bytes and
+intermediate `K_iv`/IV fixtures. Cache only key-free qualification state; latch
+failure for that triple. A provider refusing the internal zero chaining block
+fails qualification, with no software fallback. Ordinary CBC round trips alone
+cannot qualify deterministic regeneration across implementations.
+
+Pin independently generated fixtures for all 48 triples, both directions and
+IDs `0`, `1`, `0x12345678`, `u32::MAX` (384 packets). Validate the independent
+generator against FIPS 197 Appendix C, SP 800-38A F.1/F.2 for all AES sizes,
+RFC 3602 §4, RFC 4231/2202, RFC 4868 §2.7, RFC 2404, NIST CAVP SP 800-135 IKEv2
+prf+ vectors and the existing SDK prf+/complete-message fixtures before pinning
+its output. Reviewer examples are cross-checks, not the source of expected data.
+
+[RFC 7296 §3.14](https://www.rfc-editor.org/rfc/rfc7296.html#section-3.14)
+requires unpredictable CBC IVs; first generation at a new `m` meets that
+requirement under the secret independent IV key. Exact regeneration repeats
+the same message as permitted by
+[§2.3](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.3).
+[SP 800-38A §5.3 and Appendix C](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38a.pdf)
+state unpredictability per encryption execution; Appendix C's first method
+uses the traffic key's forward cipher on a nonce unique to that execution.
+CBC-V1 instead uses an independent key and repeats the identical input when
+regenerating. That departs from the literal per-execution wording; the security
+argument is that it encrypts no new message, and key separation avoids coupling
+IV generation to traffic encryption. This is an interpretation, not a NIST
+validation or a claim about a module's security policy. `DeclaredValidated`
+canonical CBC opt-in stays off by default, even if ordinary CBC is admitted.
+Opt-in cannot bypass admission, known answers or the release self-check.
+
+[RFC 8247 §2.1](https://www.rfc-editor.org/rfc/rfc8247.html#section-2.1)
+requires AES-CBC-128/256; 192-bit support is optional. Its
+[§2.3](https://www.rfc-editor.org/rfc/rfc8247.html#section-2.3)
+requires SHA2-256-128 integrity. Supporting the other existing triples does not
+change negotiation policy or claim a requirement for SHA2-384-192.
+
+### K7 and carry-over decisions: tests and ordinary CBC
+
+Inject a wrong IV followed by internally consistent ciphertext and ICV: K2 must
+withhold it even though ordinary open succeeds. Also inject prefix, ciphertext,
+ICV and length faults. Pin whole-packet parity with the ordinary test-vector
+sealer and the window's empty response header. Check every MAC-covered/ICV bit,
+omission of each MAC span, receive-direction keys, every KDF/binding field,
+equal directional keys and provider policy changes.
+
+CBC restore and readback tests use authenticated packets with random IVs whose
+top bits are set. Withdrawal of integrity or PRF must be retryable at D1; CBC
+sync readiness must include entropy and integrity. Run the window/witness,
+readback, sync and crash/restart suites in both roles across supported profiles.
+Prove exact post-restart replies with zero durable writes, qualification failure
+latching and validated-module refusal without opt-in. The process monitor
+checks one packet for each `(sending keys, binding, m)`, zero canonical entropy
+draws, and one 16-octet draw per ordinary seal.
+
+The implemented qualification spans all 48 triples and both original roles.
+`recovery/profile/lifecycle_tests.rs` exercises all seven record-exposing paths
+(including both initial and retry initiation), exact cancelled/landed witnesses,
+same-generation outcome substitution, pending identities, all completion-token
+types, clock and latched-close retention, exhausted live floors and crossed sync.
+Provider-isolated cases also cover retryable D1 failures without loss of the
+cache or witness, bounded nonce collisions and separate nonce/IV entropy draws.
+`recovery/profile/restart_tests.rs` runs nine fresh child processes, each with
+288 live fixture epochs across the profile/role/Message-ID matrix. Abrupt exits
+skip window and capability destructors before enablement, after enablement,
+after verification/submission and at ordinary acknowledgement boundaries.
+Restoration checks exact ordinary replay, canonical packet equality despite
+different authenticated peer padding, zero empty-exchange record changes,
+post-DPD ordinary admission and Message-ID exhaustion. The linked-library test
+also checks all 384 frozen packets under both canonical policies without a
+test-only send fixture. These SDK software fixtures do not establish third-party
+peer interoperability; composed peer qualification remains a separate gate.
+
+There is **no ordinary-IV rejection-sampling guard in any epoch**. Ordinary and
+sync CBC keep fresh random IVs from admitted entropy, exact committed ordinary
+retransmission bytes, and no derivation, inverse call or descriptor lookup on
+their sealing path. Existing caller-RNG and explicit-vector entry points retain
+their contracts; recovery uses the admitted-entropy entry point exclusively.
+An ordinary IV equal to a canonical IV does not warrant a new failure mode for
+this fixed public plaintext; exclusion would not eliminate CBC block-input
+collisions. No new CBC IV ceiling is introduced. Existing Message-ID exhaustion
+and SA lifecycle limits remain in force; canonical traffic adds at most `2^32`
+distinct one-block inputs per direction, subject to CBC's usual aggregate
+birthday bound. No GCM nonce argument is claimed for CBC.
+
+Fragmented SKF recovery and ESP counter synchronization remain out of scope.
+Composed third-party peer qualification is required before any CBC interop
+claim; software fixtures and this design are not peer acceptance evidence.

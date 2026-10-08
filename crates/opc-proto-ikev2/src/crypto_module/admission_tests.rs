@@ -46,6 +46,10 @@ use zeroize::Zeroizing;
 
 use crate::canonical_test_fixtures as canonical_fixtures;
 
+#[path = "cbc_runtime_tests.rs"]
+mod cbc_runtime_tests;
+#[path = "cbc_tests.rs"]
+mod cbc_tests;
 #[path = "reconcile_tests.rs"]
 mod reconcile_tests;
 #[path = "../../tests/support/mod.rs"]
@@ -150,6 +154,7 @@ enum MalformedOutput {
 struct OperationCounts {
     hash: AtomicUsize,
     entropy: AtomicUsize,
+    entropy_bytes: AtomicUsize,
     prf: AtomicUsize,
     integrity: AtomicUsize,
     encryption: AtomicUsize,
@@ -189,6 +194,7 @@ struct CountingModule {
     readiness_reads: AtomicUsize,
     withdraw_extra_after_first_readiness: AtomicBool,
     reject_prf_support: AtomicBool,
+    reject_integrity_support: AtomicBool,
     reject_hash_support: AtomicBool,
     fail_hash_operation: AtomicBool,
     drift_validation: AtomicBool,
@@ -203,6 +209,8 @@ struct CountingModule {
     canonical_fault: AtomicU8,
     canonical_failures: AtomicUsize,
     canonical_seals: AtomicUsize,
+    canonical_cbc_iv_fault: AtomicBool,
+    canonical_cbc_iv_faults: AtomicUsize,
     revoke_on_readiness: Mutex<
         Option<(
             opc_proto_ikev2::Ikev2AesGcmIvRecord,
@@ -233,6 +241,7 @@ impl CountingModule {
             readiness_reads: AtomicUsize::new(0),
             withdraw_extra_after_first_readiness: AtomicBool::new(false),
             reject_prf_support: AtomicBool::new(false),
+            reject_integrity_support: AtomicBool::new(false),
             reject_hash_support: AtomicBool::new(false),
             fail_hash_operation: AtomicBool::new(false),
             drift_validation: AtomicBool::new(false),
@@ -247,6 +256,8 @@ impl CountingModule {
             canonical_fault: AtomicU8::new(0),
             canonical_failures: AtomicUsize::new(0),
             canonical_seals: AtomicUsize::new(0),
+            canonical_cbc_iv_fault: AtomicBool::new(false),
+            canonical_cbc_iv_faults: AtomicUsize::new(0),
             revoke_on_readiness: Mutex::new(None),
             monitor_aead: AtomicBool::new(false),
             observed_aead: Mutex::new(Vec::new()),
@@ -410,6 +421,9 @@ impl IkeHashOperations for CountingModule {
 impl IkeEntropyOperations for CountingModule {
     fn fill_random(&self, output: &mut [u8]) -> Result<(), CryptoOperationError> {
         self.counts.entropy.fetch_add(1, Ordering::SeqCst);
+        self.counts
+            .entropy_bytes
+            .fetch_add(output.len(), Ordering::SeqCst);
         match self.sync_entropy_mode.load(Ordering::SeqCst) {
             1 => {
                 output.fill(self.sync_entropy_byte.load(Ordering::SeqCst));
@@ -419,6 +433,15 @@ impl IkeEntropyOperations for CountingModule {
                 return Err(CryptoOperationError::new(
                     CryptoOperationErrorCode::OperationFailed,
                 ))
+            }
+            3 => {
+                // CBC runtime tests vary sync nonces while repeating a high IV.
+                output.fill(if output.len() == 16 {
+                    0xff
+                } else {
+                    self.sync_entropy_byte.load(Ordering::SeqCst)
+                });
+                return Ok(());
             }
             _ => {}
         }
@@ -476,7 +499,8 @@ impl IkePrfOperations for CountingModule {
 
 impl IkeIntegrityOperations for CountingModule {
     fn supports_integrity(&self, algorithm: IkeIntegrityAlgorithm) -> bool {
-        self.operations.supports_integrity(algorithm)
+        !self.reject_integrity_support.load(Ordering::SeqCst)
+            && self.operations.supports_integrity(algorithm)
     }
 
     fn compute_integrity_checksum(
@@ -628,6 +652,14 @@ impl IkeEncryptionOperations for CountingModule {
     ) -> Result<Vec<u8>, CryptoOperationError> {
         self.counts.encryption.fetch_add(1, Ordering::SeqCst);
         let mut output = self.operations.encrypt_cbc(algorithm, key, iv, plaintext)?;
+        if self.canonical_cbc_iv_fault.load(Ordering::SeqCst)
+            && iv == [0; 16]
+            && plaintext.len() == 16
+            && plaintext.starts_with(b"opc-cbc-iv-1")
+        {
+            self.canonical_cbc_iv_faults.fetch_add(1, Ordering::SeqCst);
+            output[0] ^= 0x80;
+        }
         if self.malformed_output(MalformedOutput::CbcEncrypt) {
             output.pop();
         }

@@ -712,14 +712,7 @@ pub(crate) fn execute_integrity_checksum(
     message_prefix: &[u8],
     message_suffix: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
-    let selected = select_module(CryptoCapability::IkeIntegrity)?;
-    if !selected.integrity_admitted(algorithm) {
-        return Err(algorithm_not_admitted());
-    }
-    let mapped = map_integrity(algorithm);
-    if !selected.module().supports_integrity(mapped) {
-        return Err(algorithm_unsupported());
-    }
+    let (selected, mapped) = select_integrity(algorithm)?;
     let output = selected
         .module()
         .compute_integrity_checksum(mapped, key, message_prefix, message_suffix)
@@ -728,12 +721,9 @@ pub(crate) fn execute_integrity_checksum(
     Ok(output)
 }
 
-pub(crate) fn execute_integrity_verification(
+fn select_integrity(
     algorithm: Ikev2IntegrityAlgorithm,
-    key: &[u8],
-    authenticated_message: &[u8],
-    received_icv: &[u8],
-) -> Result<(), Ikev2CryptoModuleError> {
+) -> Result<(ModuleSelection, IkeIntegrityAlgorithm), Ikev2CryptoModuleError> {
     let selected = select_module(CryptoCapability::IkeIntegrity)?;
     if !selected.integrity_admitted(algorithm) {
         return Err(algorithm_not_admitted());
@@ -742,6 +732,16 @@ pub(crate) fn execute_integrity_verification(
     if !selected.module().supports_integrity(mapped) {
         return Err(algorithm_unsupported());
     }
+    Ok((selected, mapped))
+}
+
+pub(crate) fn execute_integrity_verification(
+    algorithm: Ikev2IntegrityAlgorithm,
+    key: &[u8],
+    authenticated_message: &[u8],
+    received_icv: &[u8],
+) -> Result<(), Ikev2CryptoModuleError> {
+    let (selected, mapped) = select_integrity(algorithm)?;
     selected
         .module()
         .verify_integrity_checksum(mapped, key, authenticated_message, received_icv)
@@ -769,10 +769,7 @@ fn select_encryption(
 pub(crate) fn canonical_module_declares_validation(
     algorithm: Ikev2EncryptionAlgorithm,
 ) -> Result<bool, Ikev2CryptoModuleError> {
-    let (selected, mapped) = select_encryption(algorithm)?;
-    if !matches!(mapped, MappedEncryption::Aead(_)) {
-        return Err(algorithm_unsupported());
-    }
+    let (selected, _) = select_encryption(algorithm)?;
     Ok(matches!(
         selected.module().validation_state(),
         opc_crypto_provider::ValidationState::DeclaredValidated { .. }
@@ -844,15 +841,17 @@ pub(crate) fn execute_cbc_encrypt(
     key: &[u8],
     iv: &[u8],
     plaintext: &[u8],
-) -> Result<Vec<u8>, Ikev2CryptoModuleError> {
+) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
     let (selected, mapped) = select_encryption(algorithm)?;
     let MappedEncryption::Cbc(mapped) = mapped else {
         return Err(algorithm_unsupported());
     };
-    let output = selected
-        .module()
-        .encrypt_cbc(mapped, key, iv, plaintext)
-        .map_err(|error| Ikev2CryptoModuleError::operation(&error))?;
+    let output = Zeroizing::new(
+        selected
+            .module()
+            .encrypt_cbc(mapped, key, iv, plaintext)
+            .map_err(|error| Ikev2CryptoModuleError::operation(&error))?,
+    );
     validate_output_len(output.len(), plaintext.len())?;
     Ok(output)
 }
@@ -1048,6 +1047,17 @@ pub(crate) fn check_aead_admission(
         return Err(algorithm_unsupported());
     }
     Ok(())
+}
+
+pub(crate) fn check_cbc_admission(
+    algorithm: Ikev2EncryptionAlgorithm,
+    integrity: Ikev2IntegrityAlgorithm,
+) -> Result<(), Ikev2CryptoModuleError> {
+    let (_, mapped) = select_encryption(algorithm)?;
+    if !matches!(mapped, MappedEncryption::Cbc(_)) {
+        return Err(algorithm_unsupported());
+    }
+    select_integrity(integrity).map(|_| ())
 }
 
 pub(crate) fn check_sync_admission(

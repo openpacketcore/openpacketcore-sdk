@@ -12,8 +12,8 @@ use opc_proto_ikev2::{
     Ikev2IkeAuthSignedOctets, Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SignaturePublicKey,
     Ikev2SoftwareCryptoOperations, IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
 };
+use rsa::sha2::{Digest, Sha256};
 use rsa::{pkcs8::DecodePrivateKey, Pkcs1v15Sign, RsaPrivateKey};
-use sha2::{Digest, Sha256};
 
 const RSA_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
 const RSA_SPKI_DER: &[u8] = include_bytes!("data/rsa2048_spki.der");

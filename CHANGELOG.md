@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: add typed CBC recovery epochs, committed ordinary windows,
+  exact replay, fenced readback and both RFC 6311 sync handlers for all 48
+  encryption/integrity/PRF combinations. Fresh immutable descriptors bind SK_d,
+  PRF, integrity, both traffic-key pairs, SPIs, role and the frozen CBC marker;
+  persist them atomically with the keys. CBC has no GCM IV counter, reservation
+  or coverage field. Ordinary and sync seals retain admitted random IVs. The
+  integrated canonical capability retains a zeroizing 96-octet cache, with
+  exact 76/80/88/96-octet replies and zero durable writes per empty exchange.
+  Production CBC canonical replies are enabled through the checked window;
+  deployments must refuse configurations whose `preflight_cbc` fails. GCM
+  remains the default recovery type and retains its existing constructors and
+  allocation contract.
+
+- `opc-proto-ikev2`: add non-persisting canonical CBC preflight for all 48
+  encryption/integrity/PRF combinations, with independently generated frozen
+  answers, latched qualification failures and default-off declared-validated
+  opt-in. The private byte recipe independently checks its derived IV, MAC and
+  exact padding before returning output. Preflight grants no send authority;
+  the window's immutable binding and lifecycle checks remain required.
+
 - `opc-proto-nas`: typed 5GMM Authentication Request, Response, Result, Failure
   and Reject bodies, checked authentication IEs, bounded extension parsing and
   RustCrypto 128-NIA2 with 128-NEA2 or NEA0 and explicit key resolution. All six EEA2 and
@@ -46,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value and the external SA fence through transport submission. A
   consuming deletion hook retires canonical state on permanent SA teardown.
   Consumers must reject configurations that cannot qualify canonical replies.
-  Fragmented/CBC and complete restart qualification remain separate.
+  Fragmented recovery and composed peer qualification remain separate.
 
 - `opc-peer-discovery`: add RFC 2782 SRV resolution through the async DNS
   client, with seeded priority/weight ordering, SRV ports, additional or fresh
@@ -84,8 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discards the cache and revokes the
   binding. Held-back outputs are zeroized and excluded from diagnostics. This
   primitive supplies no receive-window admission or transmission authority;
-  window composition is supplied separately and complete restart qualification
-  remains open. Canonical
+  the window handler supplies admission and lifecycle checks. Composed peer
+  qualification remains open. Canonical
   restart deliberately departs from literal SP 800-38D section 9.1 item 3 on the
   basis of section 8 and carries no validated-module or FIPS 140-3 claim. It
   refuses declared-validated modules without explicit canonical opt-in.
@@ -100,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stepped request acknowledgements release no bytes; results admitted in time
   remain recovered once committed. Any pending sync window can commit closure.
   Runtime readiness provides the production support-offer path and authenticated
-  negotiation. Fragmented/CBC recovery and composed qualification remain open.
+  negotiation. Fragmented recovery and composed peer qualification remain open.
 
 - `opc-proto-ikev2`: add opt-in authenticated responding RFC 6311 sync for GCM
   `SK`, with persisted agreement/history and a committed ordinary-window cutover
@@ -112,7 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cutovers retain a minimum sending-IV end after clearing caches, and ordinary
   request admission automatically updates volatile sync-drop history and counts
   as pending work in both sync directions. Initiating sync and advertisement
-  are separate hooks; fragmented/CBC recovery remains open. This is not a
+  are separate hooks; fragmented recovery remains open. This is not a
   complete restart-recovery lifecycle.
 
 - `opc-proto-ikev2`: add opt-in committed ordinary GCM `SK` windows with
@@ -124,8 +144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiesce until fenced readback. Add separately committed IV reservation attempt
   charges, positive backoff and fixed operation deadlines, with no reserve-ahead
   and at most three fresh-block attempts across restart. Storage, fencing, clock
-  continuity and operation semantics remain caller obligations. Fragmented/CBC
-  recovery and complete restart qualification remain open.
+  continuity and operation semantics remain caller obligations. Fragmented
+  recovery and composed peer qualification remain open.
 
 - `opc-proto-ikev2`: add ordinary GCM IV reservation records and
   prepare/commit/activate hooks bound to the SA, direction, algorithm, key and

@@ -4,9 +4,9 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
+use crate::recovery::profile::RecoveryProfile;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
 
 use super::{Ikev2CanonicalError as Error, Ikev2CommittedWindowDomain};
 use crate::{Ikev2AesGcmIvDomain, Ikev2EncryptionAlgorithm, Ikev2ProtectedPayloadDirection};
@@ -81,7 +81,7 @@ impl Eq for BindingFingerprint {}
 pub(super) struct Entry {
     pub(super) attempts: u8,
     pub(super) released: bool,
-    pub(super) bytes: Option<Zeroizing<[u8; 57]>>,
+    pub(super) bytes: Option<super::buffer::CanonicalBytes>,
 }
 
 pub(super) struct Ledger {
@@ -271,12 +271,12 @@ fn registry() -> &'static Registry {
     })
 }
 
-pub(super) fn acquire(
-    binding: &Ikev2CommittedWindowDomain,
+pub(super) fn acquire<P: RecoveryProfile>(
+    binding: &Ikev2CommittedWindowDomain<P>,
 ) -> Result<(Arc<Mutex<Ledger>>, Arc<()>), Error> {
     registry().acquire(
-        KeyFingerprint::of(&binding.send),
-        BindingFingerprint::of(binding),
+        KeyFingerprint(P::ledger_key(binding)),
+        BindingFingerprint(P::binding_fingerprint(binding)?),
     )
 }
 
@@ -286,3 +286,16 @@ pub(super) fn revoke(domain: &Ikev2AesGcmIvDomain, binding_untrusted: bool) {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn gcm_ledger_key(domain: &Ikev2CommittedWindowDomain) -> [u8; 32] {
+    KeyFingerprint::of(&domain.send).0
+}
+pub(super) fn gcm_binding_fingerprint(domain: &Ikev2CommittedWindowDomain) -> [u8; 32] {
+    BindingFingerprint::of(domain).0
+}
+pub(super) fn revoke_profile<P: RecoveryProfile>(
+    binding: &Ikev2CommittedWindowDomain<P>,
+    permanent: bool,
+) {
+    registry().revoke(KeyFingerprint(P::ledger_key(binding)), permanent);
+}

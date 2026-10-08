@@ -1,4 +1,4 @@
-//! Frozen V1 AES-GCM replies to authenticated empty INFORMATIONAL requests.
+//! Frozen empty INFORMATIONAL replies and admitted-provider qualification.
 //!
 //! This primitive reproduces one immutable transcript; it supplies no receive
 //! window admission, transmission authority, liveness or durable outcome. The
@@ -7,6 +7,10 @@
 //! there is no fallback. See `docs/ikev2-canonical-empty-replies.md` for the
 //! conditional nonce argument and the departure from SP 800-38D §9.1 item 3.
 //! No validated-module or FIPS 140-3 claim is made.
+//!
+//! The send-capable path currently supports AES-GCM. CBC byte qualification is
+//! separately available through [`Ikev2CanonicalEmptyReplies::preflight_cbc`];
+//! it creates no epoch record or send-capable CBC window.
 
 use std::{
     error::Error as StdError,
@@ -19,12 +23,17 @@ use crate::{
     Ikev2AesGcmIvDomain, Ikev2AesGcmIvRecord, Ikev2EncryptionAlgorithm,
 };
 
+use crate::recovery::profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use zeroize::Zeroizing;
 
+mod buffer;
+pub(crate) mod cbc;
 mod ledger;
 mod qualification;
 mod wire;
 
+#[cfg(test)]
+mod cbc_integration_tests;
 #[cfg(test)]
 mod qualification_tests;
 
@@ -72,6 +81,8 @@ pub enum Ikev2CanonicalError {
     NotCommitted,
     /// Missing, unknown or incompatible immutable format marker.
     FormatUnavailable,
+    /// Reserved for a canonical profile awaiting its required integration review.
+    IntegrationReviewRequired,
     /// Window lifecycle currently withholds ordinary/canonical send authority.
     LifecycleBlocked,
     /// Packet or record belongs to another complete immutable epoch binding.
@@ -88,7 +99,7 @@ pub enum Ikev2CanonicalError {
     AttemptsExhausted,
     /// Canonical use of the declared-validated module needs the dedicated opt-in.
     ValidationOptInRequired,
-    /// Frozen known-answer qualification failed and is latched for this algorithm.
+    /// Frozen known-answer qualification failed and is latched for this profile.
     QualificationFailed,
     /// Current admitted module/algorithm is unavailable or a ledger was poisoned.
     Unavailable,
@@ -103,6 +114,7 @@ impl fmt::Display for Ikev2CanonicalError {
         f.write_str(match self {
             Self::NotCommitted => "ike_canonical_not_committed",
             Self::FormatUnavailable => "ike_canonical_format_unavailable",
+            Self::IntegrationReviewRequired => "ike_canonical_integration_review_required",
             Self::LifecycleBlocked => "ike_canonical_lifecycle_blocked",
             Self::BindingMismatch => "ike_canonical_binding_mismatch",
             Self::InvalidRequest => "ike_canonical_invalid_request",
@@ -174,15 +186,16 @@ impl StdError for Ikev2CanonicalError {}
 ///     let _ = value.reply(request, &[1, 2, 3]);
 /// }
 /// ```
-pub struct Ikev2CanonicalEmptyReplies {
+pub struct Ikev2CanonicalEmptyReplies<P: RecoveryProfile = Gcm> {
     ledger: Arc<Mutex<ledger::Ledger>>,
     // Only the live capability owns these zeroizing key copies, never a static.
-    binding: Ikev2CommittedWindowDomain,
+    binding: Ikev2CommittedWindowDomain<P>,
+    recipe: P::CanonicalRecipe,
     instance: Arc<()>,
     policy: Ikev2CanonicalPolicy,
 }
 
-impl Ikev2CanonicalEmptyReplies {
+impl Ikev2CanonicalEmptyReplies<Gcm> {
     /// Qualify each intended algorithm before admitting DPD-sending peer configurations.
     ///
     /// Frozen public test keys are used once per process and algorithm. A cached
@@ -198,23 +211,60 @@ impl Ikev2CanonicalEmptyReplies {
         qualification::preflight(algorithm, policy)
     }
 
+    /// Qualify the immutable CBC byte recipe through the admitted module.
+    ///
+    /// This performs known-answer and module-policy checks only. It creates no
+    /// CBC epoch marker, canonical capability, receive or transmission authority.
+    /// CBC window activation requires the separately committed epoch contract.
+    ///
+    /// # Errors
+    /// Refuses unsupported profiles, unavailable operations, failed known answers
+    /// and declared-validated modules without the explicit canonical opt-in.
+    pub fn preflight_cbc(
+        profile: crate::Ikev2SaInitCryptoProfile,
+        policy: Ikev2CanonicalPolicy,
+    ) -> Result<(), Ikev2CanonicalError> {
+        cbc::preflight(profile, policy)
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_record(
         record: &Ikev2AesGcmIvRecord,
         policy: Ikev2CanonicalPolicy,
     ) -> Result<Self, Ikev2CanonicalError> {
-        if record.canonical_format() != Some(V1) {
-            invalidate_binding(record.domain());
+        Self::from_epoch(record, policy)
+    }
+
+    /// Delete an epoch even when no live capability remains.
+    /// Use the trusted IV record only when the SA is permanently deleted.
+    /// Discard all copied records, keys and replies; never restore a deleted SA.
+    pub fn delete_epoch(record: &Ikev2AesGcmIvRecord) {
+        ledger::revoke(record.domain(), true);
+    }
+}
+
+impl<P: RecoveryProfile> Ikev2CanonicalEmptyReplies<P> {
+    pub(crate) fn from_epoch(
+        epoch: &P::Epoch,
+        policy: Ikev2CanonicalPolicy,
+    ) -> Result<Self, Ikev2CanonicalError> {
+        let binding = P::from_epoch(epoch);
+        if binding.canonical_format != Some(V1) {
+            invalidate_profile(&binding);
             return Err(Ikev2CanonicalError::FormatUnavailable);
         }
-        let binding = Ikev2CommittedWindowDomain::from_iv_record(record);
+        P::canonical_gate()?;
+        // Ownership precedes readiness so a provider blip cannot bypass a live owner.
         let (ledger, instance) = ledger::acquire(&binding)?;
+        P::canonical_preflight(&binding, policy)?;
+        let recipe = P::canonical_recipe(&binding)?;
         let capability = Self {
             ledger,
             binding,
+            recipe,
             instance,
             policy,
         };
-        Self::preflight(record.domain().encryption(), policy)?;
         Ok(capability)
     }
 
@@ -246,7 +296,7 @@ impl Ikev2CanonicalEmptyReplies {
     /// failures, failed self-checks, retired IDs and exhausted attempt budgets.
     pub(crate) fn reply(
         &self,
-        request: &Ikev2AuthenticatedOrdinary,
+        request: &Ikev2AuthenticatedOrdinary<P>,
     ) -> Result<Ikev2CanonicalReply, Ikev2CanonicalError> {
         let mut state = self
             .ledger
@@ -254,7 +304,8 @@ impl Ikev2CanonicalEmptyReplies {
             .map_err(|_| Ikev2CanonicalError::Unavailable)?;
         state.check_instance(&self.instance)?;
         let id = request.canonical_message_id(&self.binding)?;
-        Self::preflight(self.binding.send.encryption(), self.policy)?;
+        P::canonical_gate()?;
+        P::canonical_preflight(&self.binding, self.policy)?;
         if state.closed_through.is_some_and(|floor| id <= floor) {
             return Err(Ikev2CanonicalError::AlreadyReleased);
         }
@@ -274,18 +325,13 @@ impl Ikev2CanonicalEmptyReplies {
         // Charge before entering the module. A panic poisons the ledger rather
         // than refunding the attempt or making a fresh capability bypass it.
         state.entries.entry(id).or_default().attempts += 1;
-        let packet = wire::seal(wire::Inputs::from_domain(&self.binding.send), id)?;
+        let packet = P::canonical_seal(&self.recipe, &self.binding, id)?;
         let entry = state
             .entries
             .get_mut(&id)
             .ok_or(Ikev2CanonicalError::Unavailable)?;
         entry.released = true;
-        let bytes: Zeroizing<[u8; 57]> = Zeroizing::new(
-            packet
-                .as_slice()
-                .try_into()
-                .map_err(|_| Ikev2CanonicalError::InvalidOutput)?,
-        );
+        let bytes = buffer::CanonicalBytes::from_verified(&packet)?;
         entry.bytes = Some(bytes.clone());
         Ok(Ikev2CanonicalReply { bytes })
     }
@@ -334,7 +380,7 @@ impl Ikev2CanonicalEmptyReplies {
     /// a recent fingerprint tombstone. Its eventual FIFO eviction does not restore
     /// trust or make this capability usable. A doubted binding requires a fresh SA.
     pub(crate) fn invalidate(&self) {
-        ledger::revoke(&self.binding.send, true);
+        invalidate_profile(&self.binding);
     }
 
     /// Delete this epoch's canonical state and zeroize this capability's keys.
@@ -346,19 +392,20 @@ impl Ikev2CanonicalEmptyReplies {
     pub(crate) fn delete(self) {
         self.invalidate();
     }
+}
 
-    /// Delete an epoch even when no live capability remains (for example after an error).
+impl Ikev2CanonicalEmptyReplies<crate::recovery::Ikev2CbcRecoveryProfile> {
+    /// Permanently delete a CBC epoch, including before a window could be restored.
     ///
-    /// Use its trusted IV record once the SA is deleted, including the old SA
-    /// after rekey. This clears all canonical ID/cache state and retains only a
-    /// recent fingerprint tombstone. Its eventual eviction grants no authority
-    /// to restore a deleted record.
-    pub fn delete_epoch(record: &Ikev2AesGcmIvRecord) {
-        ledger::revoke(record.domain(), true);
+    /// Use the trusted immutable descriptor, discard its stored SA/keys/replies,
+    /// and never restore it. Deletion removes the ledger and retains a bounded
+    /// recent fingerprint tombstone.
+    pub fn delete_cbc_epoch(record: &crate::recovery::Ikev2CbcEpochRecord) {
+        invalidate_profile(&Ikev2CommittedWindowDomain::from_cbc_epoch(record));
     }
 }
 
-impl Drop for Ikev2CanonicalEmptyReplies {
+impl<P: RecoveryProfile> Drop for Ikev2CanonicalEmptyReplies<P> {
     fn drop(&mut self) {
         let mut state = self
             .ledger
@@ -370,7 +417,7 @@ impl Drop for Ikev2CanonicalEmptyReplies {
     }
 }
 
-impl fmt::Debug for Ikev2CanonicalEmptyReplies {
+impl<P: RecoveryProfile> fmt::Debug for Ikev2CanonicalEmptyReplies<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ikev2CanonicalEmptyReplies")
             .finish_non_exhaustive()
@@ -379,17 +426,18 @@ impl fmt::Debug for Ikev2CanonicalEmptyReplies {
 
 /// Owned verified ciphertext; not receive-window or transmission authority.
 ///
-/// Owns exactly 57 IKE octets and no ledger lock or key material. It can cross
+/// Owns verified ciphertext of exactly 57, 76, 80, 88 or 96 IKE octets in a
+/// zeroizing 96-octet buffer, with no ledger lock or key material. It can cross
 /// threads. The consumer must discard copies when trust or lifecycle authority
 /// is lost. Held-back evaluations cannot construct this type.
 pub struct Ikev2CanonicalReply {
-    bytes: Zeroizing<[u8; 57]>,
+    bytes: buffer::CanonicalBytes,
 }
 
 impl Ikev2CanonicalReply {
-    /// The exact immutable 57 IKE octets, without transport framing.
+    /// The exact immutable IKE octets, without transport framing or unused tail.
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes[..]
+        self.bytes.as_slice()
     }
 }
 
@@ -402,4 +450,21 @@ impl fmt::Debug for Ikev2CanonicalReply {
 
 pub(crate) fn invalidate_binding(domain: &Ikev2AesGcmIvDomain) {
     ledger::revoke(domain, true);
+}
+
+pub(crate) fn invalidate_profile<P: RecoveryProfile>(domain: &Ikev2CommittedWindowDomain<P>) {
+    ledger::revoke_profile(domain, true);
+}
+
+pub(crate) fn gcm_ledger_key(domain: &Ikev2CommittedWindowDomain) -> [u8; 32] {
+    ledger::gcm_ledger_key(domain)
+}
+pub(crate) fn gcm_binding_fingerprint(domain: &Ikev2CommittedWindowDomain) -> [u8; 32] {
+    ledger::gcm_binding_fingerprint(domain)
+}
+pub(crate) fn gcm_seal(
+    domain: &Ikev2CommittedWindowDomain,
+    id: u32,
+) -> Result<Zeroizing<Vec<u8>>, Ikev2CanonicalError> {
+    wire::seal(wire::Inputs::from_domain(&domain.send), id)
 }

@@ -1,0 +1,33 @@
+{
+  "tool": "tests/data/canonical_empty_cbc_v1.py",
+  "tool_sha256": "124dfc69826dae348890d5922c970d3b9f7369c1807fbcaedd1a916cd4d822e2",
+  "python": "3.14.6",
+  "cryptography": "49.0.0",
+  "openssl": "OpenSSL 3.5.7 9 Jun 2026",
+  "nist_ikev2_source": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/components/800-135testvectors/ikev2.zip",
+  "nist_ikev2_sha256": "813c9fa9bf99a78659143d1898b3adffd09ad235be1580cf0ba8cd3663ae2950",
+  "published_checks": {
+    "FIPS197-C": 6,
+    "SP800-38A-F1": 6,
+    "SP800-38A-F2": 6,
+    "RFC3602-4": 8,
+    "RFC2202-4231-4868-PRF": 4,
+    "RFC4868-AUTH": 3,
+    "RFC2202-2404-SHA1-96": 1,
+    "SDK-prf-plus": 3,
+    "SDK-complete-message": 3
+  },
+  "cavp_skeyseed_and_dkm_cases": {
+    "sha1": 40,
+    "sha256": 60,
+    "sha384": 60,
+    "sha512": 60
+  },
+  "cavp_skipped_not_supported_by_sdk": {
+    "sha224": 60
+  },
+  "profile_triples": 48,
+  "cbc_v1_vectors": 384,
+  "cbc_v1_sha256": "148a32ed2c71da3345f7a14faaa5e3630b6e5b86b86345dd0c6170674f43a2c3",
+  "qualification_preceded_cbc_v1_calculation": true
+}

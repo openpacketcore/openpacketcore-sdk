@@ -1,5 +1,9 @@
 use bytes::Bytes;
 
+use super::profile::{
+    DirectionBinding, Ikev2CbcRecoveryProfile as Cbc, Ikev2GcmRecoveryProfile as Gcm,
+    RecoveryProfile,
+};
 use super::{Ikev2SyncResponderRecord, Ikev2WindowError as Error};
 use crate::{
     Header, HeaderFlags, Ikev2AesGcmIvDomain, Ikev2ExchangeKind,
@@ -7,12 +11,13 @@ use crate::{
     PayloadType,
 };
 
-/// Established GCM key epoch and local original role for committed windows.
+/// Established profile-bound key epoch and local original role for committed windows.
 ///
-/// Both directional key/salt pairs, algorithm and nonzero SPIs are bound. This
-/// descriptor establishes neither fresh-key provenance nor authenticated peers.
-/// Persist its inputs atomically with keys, IV reservations and window records.
-/// Derive it with [`Self::from_iv_record`], never separately from mutable fields.
+/// GCM binds both directional key/salt pairs, algorithm and nonzero SPIs. CBC
+/// additionally binds SK_d, PRF, INTEG and both integrity keys. This descriptor
+/// establishes neither fresh-key provenance nor authenticated peers. Persist its
+/// inputs atomically with the epoch's keys and window. Derive it with
+/// `from_iv_record` for GCM or `from_cbc_epoch` for CBC, never from mutable fields.
 ///
 /// ```compile_fail
 /// use opc_proto_ikev2::{Ikev2AesGcmEpochInputs, recovery::Ikev2CommittedWindowDomain};
@@ -21,14 +26,21 @@ use crate::{
 ///         i.sending_direction, i.profile, i.keys);
 /// }
 /// ```
+///
+/// Only SDK-defined profiles can name a domain; dispatch is sealed:
+/// ```compile_fail
+/// use opc_proto_ikev2::recovery::Ikev2CommittedWindowDomain;
+/// struct UncheckedProfile;
+/// let _: Option<Ikev2CommittedWindowDomain<UncheckedProfile>> = None;
+/// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct Ikev2CommittedWindowDomain {
-    pub(crate) send: Ikev2AesGcmIvDomain,
-    pub(crate) receive: Ikev2AesGcmIvDomain,
+pub struct Ikev2CommittedWindowDomain<P: RecoveryProfile = Gcm> {
+    pub(crate) send: P::Direction,
+    pub(crate) receive: P::Direction,
     pub(crate) canonical_format: Option<u8>,
 }
 
-impl Ikev2CommittedWindowDomain {
+impl Ikev2CommittedWindowDomain<Gcm> {
     /// Bind both key directions to an established SA and local sending direction.
     ///
     /// # Errors
@@ -75,24 +87,31 @@ impl Ikev2CommittedWindowDomain {
     pub const fn send_iv_domain(&self) -> &Ikev2AesGcmIvDomain {
         &self.send
     }
+}
 
+impl Ikev2CommittedWindowDomain<Cbc> {
+    /// Derive both directions and the exact marker from the immutable CBC epoch.
+    /// This descriptor grants no persistence acknowledgement or send permission.
+    pub fn from_cbc_epoch(record: &super::Ikev2CbcEpochRecord) -> Self {
+        let receive = match record.direction() {
+            Direction::InitiatorToResponder => Direction::ResponderToInitiator,
+            Direction::ResponderToInitiator => Direction::InitiatorToResponder,
+        };
+        Self {
+            send: super::cbc_epoch::CbcDirection::new(record, record.direction()),
+            receive: super::cbc_epoch::CbcDirection::new(record, receive),
+            canonical_format: record.canonical_format(),
+        }
+    }
+}
+
+impl<P: RecoveryProfile> Ikev2CommittedWindowDomain<P> {
     pub(super) fn check(
         &self,
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
     ) -> Result<(), Error> {
-        let mut actual = Self::new(
-            self.send.initiator_spi(),
-            self.send.responder_spi(),
-            self.send.direction(),
-            profile,
-            keys,
-        )?;
-        actual.canonical_format = self.canonical_format;
-        if self != &actual {
-            return Err(Error::DomainMismatch);
-        }
-        Ok(())
+        P::check_domain(self, profile, keys)
     }
 
     pub(super) fn header(&self, exchange: Ikev2ExchangeKind, id: u32, response: bool) -> Header {
@@ -164,55 +183,35 @@ impl Ikev2CommittedExchangeRecord {
 /// No storage format or authentication of the storage acknowledgement is defined.
 /// Persist every field atomically with the intended SA and its outcome. Never
 /// restore an arbitrary legacy Message-ID snapshot or a rolled-back record.
+/// CBC cannot attach GCM sync evidence:
+/// ```compile_fail
+/// use opc_proto_ikev2::recovery::{Ikev2CbcRecoveryProfile, Ikev2CommittedWindowRecord,
+///     Ikev2SyncResponderRecord};
+/// fn mix(record: Ikev2CommittedWindowRecord<Ikev2CbcRecoveryProfile>,
+///        gcm: Ikev2SyncResponderRecord) {
+///     let _ = record.with_sync_state(gcm);
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct Ikev2CommittedWindowRecord {
-    pub(super) domain: Ikev2CommittedWindowDomain,
+pub struct Ikev2CommittedWindowRecord<P: RecoveryProfile = Gcm> {
+    pub(super) domain: Ikev2CommittedWindowDomain<P>,
     pub(super) generation: u64,
     pub(super) next_send: Option<u32>,
     pub(super) next_receive: Option<u32>,
     pub(super) outbound: Option<Ikev2CommittedExchangeRecord>,
     pub(super) inbound: Option<Ikev2CommittedExchangeRecord>,
-    pub(super) sync: Option<Ikev2SyncResponderRecord>,
-    pub(super) recovery: Option<super::Ikev2SyncRecoveryRecord>,
+    pub(super) sync: Option<Ikev2SyncResponderRecord<P>>,
+    pub(super) recovery: Option<super::Ikev2SyncRecoveryRecord<P>>,
 }
 
-impl Ikev2CommittedWindowRecord {
-    // Preserve locally sent packet evidence before caches/history are retired.
-    pub(super) fn retain_local_iv_floor(&mut self) -> Result<(), Error> {
-        let Some(sync) = &mut self.sync else {
-            return Ok(());
-        };
-        let ordinary = self
-            .outbound
-            .as_ref()
-            .map(|entry| entry.request.as_ref())
-            .into_iter()
-            .chain(
-                self.inbound
-                    .as_ref()
-                    .and_then(|entry| entry.response.as_deref()),
-            );
-        let attempts = self.recovery.iter().flat_map(|recovery| {
-            recovery
-                .attempts()
-                .iter()
-                .map(|attempt| attempt.request_bytes())
-        });
-        for wire in ordinary.chain(attempts) {
-            sync.minimum_send_iv_end = sync
-                .minimum_send_iv_end
-                .max(super::packet::sending_iv_end(wire)?);
-        }
-        Ok(())
-    }
-
+impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// Initial fields to commit with a genuinely new durable key epoch.
     ///
     /// Floors must account for all completed handshake messages. Zero means no
     /// request has been used in that direction, not an unknown history. Neither
     /// this constructor nor cloning a record proves persistence or fresh keys.
     pub const fn initial(
-        domain: Ikev2CommittedWindowDomain,
+        domain: Ikev2CommittedWindowDomain<P>,
         next_send: u32,
         next_receive: u32,
     ) -> Self {
@@ -232,11 +231,12 @@ impl Ikev2CommittedWindowRecord {
     ///
     /// `None` is exhausted, distinct from ID zero. Complete restoration additionally
     /// authenticates every cached packet, correlates its response, checks floors
-    /// and cross-checks locally sent IVs against the sending-IV reservation record.
+    /// and, for GCM, cross-checks locally sent IVs against its reservation record.
+    /// CBC authenticates stored random-IV packets without counter interpretation.
     /// # Errors
     /// Rejects an incomplete inbound result or exhausted direction with no history.
     pub fn from_persisted(
-        domain: Ikev2CommittedWindowDomain,
+        domain: Ikev2CommittedWindowDomain<P>,
         generation: u64,
         next_send: Option<u32>,
         next_receive: Option<u32>,
@@ -272,7 +272,7 @@ impl Ikev2CommittedWindowRecord {
     /// # Errors
     /// Rejects an already attached state, a foreign agreement or history that
     /// contradicts this record's floors, generation or cached ordinary requests.
-    pub fn with_sync_state(mut self, state: Ikev2SyncResponderRecord) -> Result<Self, Error> {
+    pub fn with_sync_state(mut self, state: Ikev2SyncResponderRecord<P>) -> Result<Self, Error> {
         if self.sync.is_some() {
             return Err(Error::InvalidRecord);
         }
@@ -282,7 +282,7 @@ impl Ikev2CommittedWindowRecord {
     }
 
     /// Persist this optional metadata atomically with all ordinary window fields.
-    pub const fn sync_state(&self) -> Option<&Ikev2SyncResponderRecord> {
+    pub const fn sync_state(&self) -> Option<&Ikev2SyncResponderRecord<P>> {
         self.sync.as_ref()
     }
 
@@ -294,7 +294,7 @@ impl Ikev2CommittedWindowRecord {
     /// Rejects an already attached event, foreign SA, inconsistent floors or disposition.
     pub fn with_sync_recovery(
         mut self,
-        recovery: super::Ikev2SyncRecoveryRecord,
+        recovery: super::Ikev2SyncRecoveryRecord<P>,
     ) -> Result<Self, Error> {
         if self.recovery.is_some() {
             return Err(Error::InvalidRecord);
@@ -305,12 +305,12 @@ impl Ikev2CommittedWindowRecord {
     }
 
     /// Initiating-event fields to persist atomically with the complete window.
-    pub const fn sync_recovery(&self) -> Option<&super::Ikev2SyncRecoveryRecord> {
+    pub const fn sync_recovery(&self) -> Option<&super::Ikev2SyncRecoveryRecord<P>> {
         self.recovery.as_ref()
     }
 
     /// Key/role binding that must be rebuilt from the same durable SA.
-    pub const fn domain(&self) -> &Ikev2CommittedWindowDomain {
+    pub const fn domain(&self) -> &Ikev2CommittedWindowDomain<P> {
         &self.domain
     }
     /// Monotonic ordinary commit generation; it never wraps.
