@@ -69,6 +69,18 @@ pub enum SessionConsumerFencedTransitionV2ReleaseError {
     Unavailable,
 }
 
+/// Redaction-safe failure to abandon a never-executed protected V2 transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionConsumerFencedTransitionV2AbandonError {
+    /// Only the original handle, before execution has ever started, may abandon.
+    #[error("protected fenced transition V2 has no unused dispatch authority")]
+    NotAllowed,
+    /// Dispatch is permanently disabled, but local deletion must be retried.
+    #[error("protected fenced transition V2 recovery journal is unavailable")]
+    Unavailable,
+}
+
 /// Fixed numeric result of one bounded reclamation sweep.
 ///
 /// It contains no identity, epoch, key, or payload value.
@@ -1609,6 +1621,21 @@ impl SessionConsumerPreparedFencedTransitionV2 {
         self.inner.prepared.request_id()
     }
 
+    /// Abandon a request before `execute_once` has ever been polled.
+    ///
+    /// This permanently consumes dispatch authority before awaiting local
+    /// compare-and-delete of the exact retained row. It performs no network
+    /// I/O. Cancellation or a journal failure leaves dispatch disabled; retry
+    /// this method on the same handle to finish deletion. Successful retries
+    /// are no-ops. Once execution has started, even if cancelled before a
+    /// physical call, abandonment is refused and the existing execution and
+    /// receipt rules apply. Recovered status-only handles have no such method.
+    pub async fn abandon_unexecuted(
+        &mut self,
+    ) -> Result<(), SessionConsumerFencedTransitionV2AbandonError> {
+        self.inner.abandon_unexecuted().await
+    }
+
     /// Dispatch the retained mutation once.
     ///
     /// A possible send permanently removes dispatch authority and returns
@@ -1654,7 +1681,8 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// rejection except `RequestConflict`, or a terminal status other than
     /// `RequestConflict` permits release. Afterwards the caller-stable ID is
     /// no longer retained: recovery returns `None`, and the ID may name a new
-    /// transition. Callers must derive later work from authoritative
+    /// transition. An `abandon_unexecuted` call that failed or was cancelled
+    /// also permits release. Callers must derive later work from authoritative
     /// observation. Releasing twice is a no-op.
     pub async fn release_resolved(
         &mut self,
@@ -1673,6 +1701,14 @@ impl SessionConsumerPreparedFencedTransitionV2 {
 ///
 /// async fn cannot_replay(recovered: &mut SessionConsumerRecoveredFencedTransitionV2Status) {
 ///     let _ = recovered.execute_once().await;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_net::SessionConsumerRecoveredFencedTransitionV2Status;
+///
+/// async fn cannot_abandon(recovered: &mut SessionConsumerRecoveredFencedTransitionV2Status) {
+///     let _ = recovered.abandon_unexecuted().await;
 /// }
 /// ```
 pub struct SessionConsumerRecoveredFencedTransitionV2Status {
@@ -1720,6 +1756,10 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
     }
 }
 
+const V2_DISPATCH_UNUSED: u8 = 0;
+const V2_EXECUTION_STARTED: u8 = 1;
+const V2_DISPATCH_ABANDONED: u8 = 2;
+
 struct PersistentPreparedFencedTransitionV2Token {
     recovery_call: Option<opc_session_store::FencedTransitionV2RecoveryCall>,
     recovery_notice: Option<opc_session_store::FencedTransitionV2RecoveryNotice>,
@@ -1733,6 +1773,9 @@ struct PersistentPreparedFencedTransitionV2Token {
     // Only the handle that prepared the row holds dispatch authority, so only
     // it may conclude that no copy of the request was ever sent.
     original: bool,
+    // Unlike the retryable preparation phase, execution having started is
+    // permanent: cancellation before admission must not re-arm abandonment.
+    dispatch_authority: AtomicU8,
     terminal_receipt: StdMutex<
         Option<
             Result<FencedTransitionV2Status, SessionConsumerPreparedFencedTransitionStatusError>,
@@ -1856,6 +1899,11 @@ impl PersistentPreparedFencedTransitionV2Token {
             history,
             state,
             original,
+            dispatch_authority: AtomicU8::new(if original {
+                V2_DISPATCH_UNUSED
+            } else {
+                V2_EXECUTION_STARTED
+            }),
             terminal_receipt: StdMutex::new(None),
             resolution: StdMutex::new(V2Resolution::Unresolved),
         }
@@ -1915,7 +1963,38 @@ impl PersistentPreparedFencedTransitionV2Token {
         }
     }
 
+    async fn abandon_unexecuted(
+        &self,
+    ) -> Result<(), SessionConsumerFencedTransitionV2AbandonError> {
+        if !self.original {
+            return Err(SessionConsumerFencedTransitionV2AbandonError::NotAllowed);
+        }
+        match self.dispatch_authority.compare_exchange(
+            V2_DISPATCH_UNUSED,
+            V2_DISPATCH_ABANDONED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(V2_DISPATCH_ABANDONED) => {}
+            Err(_) => return Err(SessionConsumerFencedTransitionV2AbandonError::NotAllowed),
+        }
+        self.state.terminal();
+        self.set_resolution(V2Resolution::Resolved);
+        self.release_resolved()
+            .await
+            .map_err(|_| SessionConsumerFencedTransitionV2AbandonError::Unavailable)
+    }
+
     async fn execute_once(&self) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        match self.dispatch_authority.compare_exchange(
+            V2_DISPATCH_UNUSED,
+            V2_EXECUTION_STARTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(V2_EXECUTION_STARTED) => {}
+            Err(_) => return Err(FencedTransitionExecuteError::NotTransmitted),
+        }
         if let Some(FencedTransitionV2Status::Recorded(result)) = self.reclaimed_receipt() {
             self.terminal_receipt(Ok(FencedTransitionV2Status::Recorded(result.clone())))
                 .ok();
@@ -2589,6 +2668,192 @@ mod tests {
                 .await
                 .expect("retained count")
         }
+    }
+
+    #[tokio::test]
+    async fn v2_handle_abandons_a_never_executed_row_without_dispatch() {
+        let harness = harness(vec![]).await;
+        let mut handle = SessionConsumerPreparedFencedTransitionV2 {
+            inner: harness.prepare().await,
+        };
+        assert_eq!(harness.retained().await, 1);
+        assert_eq!(
+            handle
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted)
+        );
+        handle.abandon_unexecuted().await.unwrap();
+        assert_eq!(
+            harness.retained().await,
+            0,
+            "the original handle needs a way to release a never-executed row"
+        );
+        assert!(harness.physical.voters().is_empty());
+        assert_eq!(
+            handle.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        let _replacement = harness.prepare().await;
+        handle.abandon_unexecuted().await.unwrap();
+        assert_eq!(
+            harness.retained().await,
+            1,
+            "an old handle cannot delete a replacement row"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_recovered_handle_has_no_abandon_authority() {
+        let harness = harness(vec![]).await;
+        let mut original = SessionConsumerPreparedFencedTransitionV2 {
+            inner: harness.prepare().await,
+        };
+        let PreparedFencedTransitionV2Lookup::Found(prepared) = harness
+            .backend
+            .recover_protected_fenced_transition_v2(harness.request_id)
+            .await
+            .unwrap()
+        else {
+            panic!("prepared row is retained");
+        };
+        let state = PreparedRequestState::new(0);
+        state.receipt_only();
+        let recovered = SessionConsumerRecoveredFencedTransitionV2Status {
+            inner: PersistentPreparedFencedTransitionV2Token::new(
+                Arc::clone(&harness.backend),
+                prepared,
+                budget(),
+                PreparedFencedV2HandleRouting {
+                    voter_count: VOTERS,
+                    route: Arc::clone(&harness.route),
+                    history: Arc::clone(&harness.history),
+                },
+                state,
+                false,
+            ),
+        };
+        assert_eq!(
+            recovered.inner.abandon_unexecuted().await,
+            Err(SessionConsumerFencedTransitionV2AbandonError::NotAllowed)
+        );
+        assert_eq!(harness.retained().await, 1);
+        original.abandon_unexecuted().await.unwrap();
+        assert_eq!(harness.retained().await, 0);
+        assert!(harness.physical.voters().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_handle_abandon_is_refused_after_execution_started_even_without_dispatch() {
+        for admitted in [false, true] {
+            let harness = harness(vec![if admitted {
+                Step::HangAfterAdmission
+            } else {
+                Step::HangBeforeAdmission
+            }])
+            .await;
+            let mut handle = SessionConsumerPreparedFencedTransitionV2 {
+                inner: harness.prepare().await,
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), handle.execute_once())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(harness.route.may_have_dispatched(), admitted);
+            assert_eq!(
+                handle.abandon_unexecuted().await,
+                Err(SessionConsumerFencedTransitionV2AbandonError::NotAllowed)
+            );
+            assert_eq!(harness.retained().await, 1);
+            if admitted {
+                assert_eq!(
+                    handle.execute_once().await,
+                    Err(FencedTransitionExecuteError::NotTransmitted)
+                );
+                assert_eq!(
+                    handle.release_resolved().await,
+                    Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+                );
+            } else {
+                harness.physical.push(Step::Commit);
+                handle
+                    .execute_once()
+                    .await
+                    .expect("existing pre-admission retry remains usable");
+                handle.release_resolved().await.unwrap();
+                assert_eq!(harness.retained().await, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_handle_abandon_retries_failed_local_deletion_without_restoring_dispatch() {
+        let harness = harness(vec![]).await;
+        let mut handle = SessionConsumerPreparedFencedTransitionV2 {
+            inner: harness.prepare().await,
+        };
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        std::fs::rename(&journal, journal.with_extension("moved")).unwrap();
+        assert_eq!(
+            handle.abandon_unexecuted().await,
+            Err(SessionConsumerFencedTransitionV2AbandonError::Unavailable)
+        );
+        assert_eq!(
+            handle.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        std::fs::rename(journal.with_extension("moved"), &journal).unwrap();
+        assert_eq!(harness.retained().await, 1);
+        handle.abandon_unexecuted().await.unwrap();
+        assert_eq!(harness.retained().await, 0);
+        assert!(harness.physical.voters().is_empty());
+    }
+
+    #[test]
+    fn v2_handle_abandon_retries_after_cancellation_with_dispatch_consumed() {
+        // The journal uses spawn_blocking. Occupy the sole blocking worker
+        // after preparation so the first poll consumes authority and suspends
+        // before any local deletion can complete, without timing a disk write.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let harness = harness(vec![]).await;
+            let mut handle = SessionConsumerPreparedFencedTransitionV2 {
+                inner: harness.prepare().await,
+            };
+            let (entered, blocked) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            blocked.await.unwrap();
+            {
+                let mut abandon = Box::pin(handle.abandon_unexecuted());
+                assert!(futures_util::poll!(abandon.as_mut()).is_pending());
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(100), handle.execute_once())
+                    .await
+                    .unwrap(),
+                Err(FencedTransitionExecuteError::NotTransmitted)
+            );
+            assert!(harness.physical.voters().is_empty());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            handle.abandon_unexecuted().await.unwrap();
+            assert_eq!(harness.retained().await, 0);
+            handle.abandon_unexecuted().await.unwrap();
+            assert_eq!(
+                handle.execute_once().await,
+                Err(FencedTransitionExecuteError::NotTransmitted)
+            );
+            assert!(harness.physical.voters().is_empty());
+        });
     }
 
     #[tokio::test]

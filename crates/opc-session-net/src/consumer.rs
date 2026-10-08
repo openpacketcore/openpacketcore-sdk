@@ -21423,8 +21423,9 @@ mod prepared_fenced_v2;
 
 pub use prepared_fenced_v2::{
     ActivatedSessionConsumerFencedTransitionV2Voters,
-    SessionConsumerFencedTransitionV2ReclaimReport, SessionConsumerFencedTransitionV2ReleaseError,
-    SessionConsumerPreparedFencedTransitionV2, SessionConsumerPreparedFencedTransitionV2Backend,
+    SessionConsumerFencedTransitionV2AbandonError, SessionConsumerFencedTransitionV2ReclaimReport,
+    SessionConsumerFencedTransitionV2ReleaseError, SessionConsumerPreparedFencedTransitionV2,
+    SessionConsumerPreparedFencedTransitionV2Backend,
     SessionConsumerPreparedFencedTransitionV2BackendError,
     SessionConsumerRecoveredFencedTransition, SessionConsumerRecoveredFencedTransitionV2Status,
 };

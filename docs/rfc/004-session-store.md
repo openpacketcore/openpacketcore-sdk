@@ -2306,7 +2306,8 @@ Execution and status MUST dispatch only that authenticated journaled request.
 The recovery journal holds at most 4,096 live rows. That count is an
 authenticated admission fence, not an absorbing lifetime: a row is removed by
 exact compare-and-delete only after a proven all-voter pre-dispatch failure, a
-definitive unbound rejection, a caller `release_resolved` on a handle that
+definitive unbound rejection, an original handle's `abandon_unexecuted` before
+execution has ever started, a caller `release_resolved` on a handle that
 observed a resolution, or a bounded `reclaim_resolved_fenced_transitions`
 sweep. The sweep removes rows at or below the retired floor, or whose fresh
 exact status is `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`,

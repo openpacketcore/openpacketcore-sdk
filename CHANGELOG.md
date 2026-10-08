@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain the maximum live receive floor; enabling a revoked capability reports
   `Invalidated` instead of retryable `CapabilityActive`.
 
+- `opc-session-net`: add `SessionConsumerPreparedFencedTransitionV2::abandon_unexecuted`
+  and `SessionConsumerFencedTransitionV2AbandonError`. The original affine V2
+  handle can remove its retained recovery-journal row before `execute_once` is
+  first polled. It consumes dispatch authority before the exact local
+  compare-and-delete and performs no network I/O. A cancelled or failed
+  deletion is retried on the same handle, with dispatch still disabled. A handle
+  whose execution has started, and a recovered status-only handle, are refused.
+  Fixes #1123.
+
 - `opc-proto-ikev2`: add opt-in zero-write empty INFORMATIONAL handling to
   committed GCM windows. Canonical replies advance a volatile receive floor,
   allowing DPD at ID n followed by stateful work at n+1, with exact byte reuse,

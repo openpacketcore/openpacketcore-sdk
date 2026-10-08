@@ -904,8 +904,8 @@ compare-and-delete of its exact authenticated bytes, and only in these cases:
    `release_resolved` retries it.
 2. `release_resolved` on a live or recovered handle removes its row after
    that handle has observed a resolution: a matching outcome, one of the
-   execution results in case 1, any other definitive rejection, or a
-   terminal status other than `RequestConflict`.
+   execution results in case 1, abandonment in case 4, any other definitive
+   rejection, or a terminal status other than `RequestConflict`.
 3. `reclaim_resolved_fenced_transitions(limit, budget)` is a bounded,
    caller-scheduled sweep of at most 256 rows per call. The wrapper first
    reads the linearized history state itself and removes rows at or below
@@ -920,6 +920,13 @@ compare-and-delete of its exact authenticated bytes, and only in these cases:
    voter moves a row's read to the next canonical voter. The sweep stops as
    interrupted when every voter failed for one row, when a local journal
    read or removal fails, or at the caller's deadline.
+4. `abandon_unexecuted` on the original affine handle removes a request whose
+   `execute_once` future has never been polled. It consumes dispatch authority
+   before awaiting local deletion and performs no network I/O. If cancelled or
+   the journal is unavailable, the same handle can retry abandonment or
+   `release_resolved`; dispatch remains disabled. Once execution has started,
+   even if cancelled before dispatch, abandonment is refused. Recovered
+   status-only handles have no abandonment authority.
 
 After a row is removed, `recover_fenced_transition_status` returns `None` for
 that ID. Removal ends the caller-level binding: the SDK keeps no tombstone,
@@ -1008,8 +1015,10 @@ steps:
    prove only that it can no longer take effect; like V1 `Expired`, the
    caller derives later work from authoritative observation. `NotFound` is
    never an absence decision: keep the row and retry later.
-5. Call `release_resolved` once a transition's result has been consumed, and
-   run `reclaim_resolved_fenced_transitions` on a regular cadence. The
+5. If work is cancelled before `execute_once` starts, call `abandon_unexecuted`
+   on the original handle. Call `release_resolved` once a transition's result
+   has been consumed, and run `reclaim_resolved_fenced_transitions` on a
+   regular cadence. The
    consumer process owns that sweep. The state process's operator loop owns
    `ConsensusSessionStore::maintain_fenced_transition_v2_history`: it opens
    the successor once the active epoch is full and later advances the
