@@ -2,45 +2,13 @@ name: Egress fence
 
 on:
   pull_request:
-    paths:
-      - "crates/opc-egress-fence/**"
-      - "crates/opc-egress-fence-common/**"
-      - "crates/opc-egress-fence-ebpf/**"
-      - "crates/opc-linux-gtpu-sys/**"
-      - "crates/opc-linux-xfrm-sys/**"
-      - "crates/opc-fs-verity-sys/**"
-      - "crates/opc-runtime/**"
-      - "crates/opc-session-store/**"
-      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.json"
-      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.schema.json"
-      - "crates/opc-session-testkit/tests/qualification_profile.rs"
-      - "scripts/build-egress-fence-ebpf.sh"
-      - "ci/setup-fsverity-tmp.sh"
-      - "scripts/publish-order.py"
-      - ".github/workflows/egress-fence.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
+    branches:
+      - main
   push:
     branches:
       - main
-    paths:
-      - "crates/opc-egress-fence/**"
-      - "crates/opc-egress-fence-common/**"
-      - "crates/opc-egress-fence-ebpf/**"
-      - "crates/opc-linux-gtpu-sys/**"
-      - "crates/opc-linux-xfrm-sys/**"
-      - "crates/opc-fs-verity-sys/**"
-      - "crates/opc-runtime/**"
-      - "crates/opc-session-store/**"
-      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.json"
-      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.schema.json"
-      - "crates/opc-session-testkit/tests/qualification_profile.rs"
-      - "scripts/build-egress-fence-ebpf.sh"
-      - "ci/setup-fsverity-tmp.sh"
-      - "scripts/publish-order.py"
-      - ".github/workflows/egress-fence.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -53,8 +21,34 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  changes:
+    name: Egress fence changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Checkout comparison history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust for dependency resolution
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test the dependency decision
+        run: python3 -I ci/test-egress-fence-changes.py
+
+      - name: Decide whether full qualification is needed
+        id: decide
+        run: python3 -I ci/egress-fence-changes.py
+
   root-cgroup-egress:
     name: Root-cgroup egress fence
+    needs: changes
+    # Only a successful, explicit skip decision may avoid qualification.
+    # A failed/timed-out decision job or missing output must run the full job.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-24.04
     # Cold host builds and the full kernel proof suite can exceed one hour.
     # This job budget leaves every test and product latency bound unchanged.

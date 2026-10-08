@@ -261,6 +261,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI: run the root-cgroup egress-fence qualification when fence inputs or its
+  resolved dependency versions, sources, features or path dependencies change.
+  Unrelated workspace manifest and lockfile edits receive a quick decision
+  instead. Missing history or dependency-resolution errors require a full run;
+  nightly runs at 03:17 UTC and manual dispatch always run the complete job.
+
 - `opc-proto-nas` migration: the five `MmMessageBody::Authentication*` variants
   now contain typed bodies instead of `RawMessageBody`. Use each body's codec
   traits and named fields; callers needing opaque preservation can retain the
