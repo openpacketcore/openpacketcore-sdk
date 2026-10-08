@@ -25,6 +25,9 @@ mod ledger;
 mod qualification;
 mod wire;
 
+#[cfg(test)]
+mod qualification_tests;
+
 pub(crate) const V1: u8 = 1;
 
 /// Maximum concurrently retained directional key ledgers per process.
@@ -119,20 +122,21 @@ impl StdError for Ikev2CanonicalError {}
 
 /// Non-cloneable, record-derived canonical recipe and volatile exact-byte cache.
 ///
-/// Creation requires initial IV activation or a checked restored window. Neither
+/// Creation is private to the checked window's empty-reply handler. Neither
 /// raw keys nor a separately constructed descriptor can mint this type. Every
 /// reply still requires surrounding receive admission and current send authority.
 /// Check [`crate::recovery::Ikev2CommittedWindow::ready`] for every reply, including
 /// cached bytes: an existing capability does not track subsequent window changes.
-/// On untrusted/mixed state or unknown key/IV provenance, call [`Self::invalidate`],
+/// On untrusted/mixed state or unknown key/IV provenance, call
+/// [`crate::recovery::Ikev2CommittedWindow::delete`] or [`Self::delete_epoch`],
 /// discard consumer-held copies and withhold sending. A doubted immutable binding
 /// requires a fresh SA; do not "reconcile" it while retaining its keys.
 ///
 /// The process ledger retains only fingerprints, counters and verified ciphertext.
-/// Its key material is owned by the live capability and zeroized on drop. Advance
-/// [`Self::retire_through`] with the receive window to compact ID history into a
+/// Its key material is owned by the live capability and zeroized on drop. The
+/// owning window advances retirement to compact ID history into a
 /// closed floor; recreation cannot reopen closed IDs or reset attempts above it.
-/// On permanent SA deletion, use [`Self::delete`] or [`Self::delete_epoch`] to
+/// On permanent SA deletion, use the window's `delete()` or [`Self::delete_epoch`] to
 /// remove all ID state. A bounded FIFO retains recent fingerprint tombstones;
 /// older tombstones are evicted. [`IKEV2_CANONICAL_MAX_TRACKED_KEYS`] bounds only
 /// live ledgers, which are never evicted. Deletion churn cannot exhaust that cap.
@@ -146,7 +150,10 @@ impl StdError for Ikev2CanonicalError {}
 /// fn duplicate(value: Ikev2CanonicalEmptyReplies) { let _ = value.clone(); }
 /// ```
 ///
-/// A persisted record needs the allocator/window's checked activation route:
+/// The receive handler owns this primitive; public replies must use
+/// [`crate::recovery::Ikev2CommittedWindow::enable_empty_replies`] and
+/// [`crate::recovery::Ikev2CommittedWindow::reply_empty`]. A persisted record
+/// cannot bypass that checked route:
 /// ```compile_fail
 /// use opc_proto_ikev2::{Ikev2AesGcmIvRecord, canonical::*};
 /// fn unchecked(record: &Ikev2AesGcmIvRecord) {
@@ -211,6 +218,13 @@ impl Ikev2CanonicalEmptyReplies {
         Ok(capability)
     }
 
+    pub(crate) fn check_live(&self) -> Result<(), Ikev2CanonicalError> {
+        self.ledger
+            .lock()
+            .map_err(|_| Ikev2CanonicalError::Unavailable)?
+            .check_instance(&self.instance)
+    }
+
     /// Produce or reuse the exact V1 reply to an authenticated same-binding request.
     ///
     /// The input must come from `Ikev2CommittedWindow::open_peer`. This checks its
@@ -230,7 +244,7 @@ impl Ikev2CanonicalEmptyReplies {
     /// # Errors
     /// Refuses foreign/nonempty/wrong-class requests, invalidated bindings, module
     /// failures, failed self-checks, retired IDs and exhausted attempt budgets.
-    pub fn reply(
+    pub(crate) fn reply(
         &self,
         request: &Ikev2AuthenticatedOrdinary,
     ) -> Result<Ikev2CanonicalReply, Ikev2CanonicalError> {
@@ -282,7 +296,8 @@ impl Ikev2CanonicalEmptyReplies {
     /// to compact history and close previously unseen IDs as the window advances.
     /// # Errors
     /// Refuses an invalidated capability or poisoned process ledger.
-    pub fn retire(&self, message_id: u32) -> Result<(), Ikev2CanonicalError> {
+    #[cfg(test)]
+    pub(crate) fn retire(&self, message_id: u32) -> Result<(), Ikev2CanonicalError> {
         let mut state = self
             .ledger
             .lock()
@@ -303,7 +318,7 @@ impl Ikev2CanonicalEmptyReplies {
     /// attempt/release history. At MAX every ID is closed without arithmetic wrap.
     /// # Errors
     /// Refuses an invalidated capability or poisoned process ledger.
-    pub fn retire_through(&self, message_id: u32) -> Result<(), Ikev2CanonicalError> {
+    pub(crate) fn retire_through(&self, message_id: u32) -> Result<(), Ikev2CanonicalError> {
         let mut state = self
             .ledger
             .lock()
@@ -318,7 +333,7 @@ impl Ikev2CanonicalEmptyReplies {
     /// Discard consumer-held copies too. All per-ID state is dropped, leaving
     /// a recent fingerprint tombstone. Its eventual FIFO eviction does not restore
     /// trust or make this capability usable. A doubted binding requires a fresh SA.
-    pub fn invalidate(&self) {
+    pub(crate) fn invalidate(&self) {
         ledger::revoke(&self.binding.send, true);
     }
 
@@ -328,7 +343,7 @@ impl Ikev2CanonicalEmptyReplies {
     /// SA is deleted. A recent fingerprint tombstone refuses re-admission until it
     /// ages out. Discard consumer-held replies and the outer SA/key records too;
     /// never restore a deleted SA, even after its tombstone expires.
-    pub fn delete(self) {
+    pub(crate) fn delete(self) {
         self.invalidate();
     }
 

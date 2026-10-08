@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eight EIA2 test sets from TS 33.401 Annex C are covered, including partial-bit
   inputs. SNOW 3G and ZUC remain out of scope.
 
+- `opc-proto-ikev2`: add in-place committed-window `reconcile` for fenced
+  readback. Exact private candidate witnesses distinguish outbound-only changes
+  from newly landed inbound/sync boundaries. The same canonical capability and
+  last applicable empty reply survive unchanged/outbound readback, with no new
+  seal, IV allocation, durable write or effect. Every attempt fences old tokens
+  and live sync proposals; only a failed provider pre-check is retryable through
+  `ReconcileUnavailable`. Other failures revoke the epoch. Keep the live IV
+  allocator, and use `restore` for process start. CloseIkeSa commits and readback
+  retain the maximum live receive floor; enabling a revoked capability reports
+  `Invalidated` instead of retryable `CapabilityActive`.
+
 - `opc-proto-ikev2`: add opt-in zero-write empty INFORMATIONAL handling to
   committed GCM windows. Canonical replies advance a volatile receive floor,
   allowing DPD at ID n followed by stateful work at n+1, with exact byte reuse,
@@ -270,6 +281,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `InvalidLength` and `KeyUnavailable`; downstream exhaustive matches must handle
   them.
 
+- `opc-proto-ikev2`: restrict both former public `canonical_replies`
+  constructors. The window helper is crate-private and the allocator helper
+  exists only for internal qualification tests. For fresh or restored epochs,
+  use checked `Ikev2CommittedWindow::restore`, `enable_empty_replies` and
+  `reply_empty`; this keeps receive admission and floor advancement on every
+  reply path. A failed enable now publishes neither a capability nor a phase
+  change when permanent revocation races with initial retirement. Drop or
+  overwrite the old runtime before enabling its replacement.
+
 - `opc-proto-ikev2`: enabling empty replies on a restored window now always
   recovers a lost zero-write prefix. Restore and enable are separate: a
   capability-active or pending-sync enable refusal preserves the SA for retry
@@ -280,10 +300,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while `replay_response` leaves admission and sync history unchanged on a miss
   and drops foreign or response packets before classifying their payloads.
   An older ordinary cached response ceases to apply after a newer empty reply
-  advances the live floor or newer nonempty work is admitted. In-process
+  advances the live floor or newer nonempty work is admitted. In-process restore
   replacement still loses the last empty reply's bytes while retaining its
-  release flag, so a lost reply may stall the peer; preserving the capability
-  and cache during in-place readback is planned separately.
+  release flag, so a lost reply may stall the peer; use in-place `reconcile`
+  to preserve the capability and cache.
 
 - `opc-proto-ikev2`: canonical replies now own their 57 verified bytes and hold
   no ledger lock. The process ledger uses key-free SHA-256 fingerprints and

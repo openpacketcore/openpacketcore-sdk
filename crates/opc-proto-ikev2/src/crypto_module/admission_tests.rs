@@ -1,4 +1,5 @@
-//! Process-isolated proof for IKEv2 crypto-module admission and routing.
+//! Process-isolated proof for IKEv2 crypto-module admission and private primitives.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
     fmt,
@@ -43,8 +44,11 @@ use opc_proto_ikev2::{
 use opc_protocol::DecodeContext;
 use zeroize::Zeroizing;
 
-#[path = "support/canonical.rs"]
-mod canonical_fixtures;
+use crate::canonical_test_fixtures as canonical_fixtures;
+
+#[path = "reconcile_tests.rs"]
+mod reconcile_tests;
+#[path = "../../tests/support/mod.rs"]
 mod support;
 
 struct ObservedAead {
@@ -53,9 +57,9 @@ struct ObservedAead {
     plaintext: Vec<u8>,
 }
 
-const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
-const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
-const P256_CERT_DER: &[u8] = include_bytes!("data/p256_cert.der");
+const P256_PKCS8_DER: &[u8] = include_bytes!("../../tests/data/p256_pkcs8.der");
+const P256_SPKI_DER: &[u8] = include_bytes!("../../tests/data/p256_spki.der");
+const P256_CERT_DER: &[u8] = include_bytes!("../../tests/data/p256_cert.der");
 // Independently computed with OpenSSL 3:
 // `openssl dgst -sha1 tests/data/p256_spki.der`.
 const P256_SPKI_SHA1: [u8; 20] = [
@@ -65,7 +69,7 @@ const P256_SPKI_SHA1: [u8; 20] = [
 const HOSTILE_PROVIDER_DIAGNOSTIC: &str = "hostile-provider-diagnostic-marker";
 const HOSTILE_PROVIDER_OUTPUT: &[u8] = b"hostile-provider-output-marker";
 #[cfg(feature = "rsa-signing")]
-const RSA2048_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
+const RSA2048_PKCS8_DER: &[u8] = include_bytes!("../../tests/data/rsa2048_pkcs8.der");
 
 fn signature_hash_authorities() -> (
     Vec<u8>,
@@ -199,6 +203,12 @@ struct CountingModule {
     canonical_fault: AtomicU8,
     canonical_failures: AtomicUsize,
     canonical_seals: AtomicUsize,
+    revoke_on_readiness: Mutex<
+        Option<(
+            opc_proto_ikev2::Ikev2AesGcmIvRecord,
+            opc_proto_ikev2::recovery::Ikev2CommittedWindow,
+        )>,
+    >,
     monitor_aead: AtomicBool,
     observed_aead: Mutex<Vec<ObservedAead>>,
 }
@@ -237,6 +247,7 @@ impl CountingModule {
             canonical_fault: AtomicU8::new(0),
             canonical_failures: AtomicUsize::new(0),
             canonical_seals: AtomicUsize::new(0),
+            revoke_on_readiness: Mutex::new(None),
             monitor_aead: AtomicBool::new(false),
             observed_aead: Mutex::new(Vec::new()),
         }
@@ -338,6 +349,25 @@ impl CryptoModule for CountingModule {
     }
 
     fn readiness(&self) -> ModuleReadiness {
+        let revoke = self.revoke_on_readiness.lock().unwrap().take();
+        if let Some((record, mut competing)) = revoke {
+            assert_eq!(
+                competing.enable_empty_replies(
+                    opc_proto_ikev2::canonical::Ikev2CanonicalPolicy::default()
+                ),
+                Err(opc_proto_ikev2::recovery::Ikev2WindowError::Canonical(
+                    opc_proto_ikev2::canonical::Ikev2CanonicalError::CapabilityActive
+                )),
+                "readiness must run after canonical acquisition"
+            );
+            // Deterministically place another thread's permanent revoke after
+            // capability acquisition and before enable retires its old IDs.
+            std::thread::spawn(move || {
+                opc_proto_ikev2::canonical::Ikev2CanonicalEmptyReplies::delete_epoch(&record);
+            })
+            .join()
+            .unwrap();
+        }
         let mut serviceable = self.serviceable.lock().expect("serviceable lock");
         let snapshot = *serviceable;
         let read = self.readiness_reads.fetch_add(1, Ordering::SeqCst);
@@ -1169,6 +1199,28 @@ fn assert_protected_module_failure(
 
 #[test]
 fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back() {
+    if std::env::var_os("OPC_MODULE_ADMISSION_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crypto_module::admission_tests::one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back",
+                "--nocapture",
+            ])
+            .env("OPC_MODULE_ADMISSION_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ADMISSION_PROOF_COMPLETE"),
+            "the selected child must execute the complete proof"
+        );
+        return;
+    }
     let profile = profile();
     let requirements = requirements(profile);
     let module = Arc::new(CountingModule::new());
@@ -1953,6 +2005,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     .expect_err("the installed process slot must be immutable");
     assert_eq!(duplicate, Ikev2CryptoModuleInstallError::AlreadyInstalled);
     initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(&module);
+    println!("ADMISSION_PROOF_COMPLETE");
 }
 
 fn initiating_sync_uses_admitted_entropy_and_rechecks_runtime_readiness(module: &CountingModule) {
@@ -2220,6 +2273,10 @@ fn canonical_module_policy_faults_and_process_restart() {
         "recreation",
         "readiness",
         "empty-handler",
+        "enable-revocation",
+        "enabled-revocation",
+        "reconcile-provider",
+        "reconcile-monitor",
         "concurrency",
         "interruption",
         "mixed-before",
@@ -2227,7 +2284,11 @@ fn canonical_module_policy_faults_and_process_restart() {
     ] {
         let trace = directory.join(case);
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "canonical_module_child", "--nocapture"])
+            .args([
+                "--exact",
+                "crypto_module::admission_tests::canonical_module_child",
+                "--nocapture",
+            ])
             .env("OPC_CANONICAL_MODULE_CASE", case)
             .env("OPC_CANONICAL_TRANSCRIPT_PATH", &trace)
             .output()
@@ -2237,6 +2298,10 @@ fn canonical_module_policy_faults_and_process_restart() {
             "case {case}: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed; 0 failed"),
+            "case {case} must run its child"
         );
         if case.starts_with("mixed-") {
             let entries = fs::read_to_string(&trace).unwrap();
@@ -2275,6 +2340,14 @@ fn canonical_module_child() {
         assert_eq!(
             Canonical::preflight(ALGORITHMS[0], Policy::default()),
             Err(Error::Unavailable)
+        );
+        let mut fixture = Fixture::new(32_000, ALGORITHMS[0], DIRECTIONS[0]);
+        let record = fixture.window.record().clone();
+        assert_eq!(
+            fixture
+                .window
+                .reconcile(fixture.profile, &fixture.keys, &record, &fixture.iv),
+            Err(opc_proto_ikev2::recovery::Ikev2WindowError::ReconcileUnavailable)
         );
         return;
     }
@@ -2416,6 +2489,81 @@ fn canonical_module_child() {
     Canonical::preflight(ALGORITHMS[0], Policy::default()).unwrap();
     if case == "empty-handler" {
         empty_handler_faults_and_cache(&module);
+        return;
+    }
+    if case == "reconcile-provider" {
+        reconcile_tests::provider_failures(&module);
+        return;
+    }
+    if case == "reconcile-monitor" {
+        reconcile_tests::monitor(&module);
+        return;
+    }
+    if case == "enable-revocation" || case == "enabled-revocation" {
+        use opc_proto_ikev2::recovery::{
+            Ikev2CommittedWindow as Window, Ikev2CommittedWindowRecord as Record,
+            Ikev2WindowError as WindowError,
+        };
+        for (algorithm, encryption) in ALGORITHMS.into_iter().enumerate() {
+            for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+                let fixture = Fixture::new(
+                    21_000 + u64::try_from(algorithm * 2 + role).unwrap(),
+                    encryption,
+                    direction,
+                );
+                let record = Record::initial(fixture.window.record().domain().clone(), 0, 4);
+                let mut window = Window::restore(
+                    record.domain(),
+                    fixture.profile,
+                    &fixture.keys,
+                    &record,
+                    &fixture.iv,
+                )
+                .unwrap();
+                let request = fixture.request(4);
+                if case == "enabled-revocation" {
+                    window.enable_empty_replies(Policy::default()).unwrap();
+                    Canonical::delete_epoch(&fixture.iv);
+                    assert_eq!(
+                        window.enable_empty_replies(Policy::default()),
+                        Err(WindowError::Canonical(Error::Invalidated)),
+                        "a revoked capability is not a retryable active owner"
+                    );
+                    window.delete();
+                    continue;
+                }
+                let competing = Window::restore(
+                    record.domain(),
+                    fixture.profile,
+                    &fixture.keys,
+                    &record,
+                    &fixture.iv,
+                )
+                .unwrap();
+                *module.revoke_on_readiness.lock().unwrap() = Some((fixture.iv.clone(), competing));
+                assert_eq!(
+                    window.enable_empty_replies(Policy::default()),
+                    Err(WindowError::Canonical(Error::Invalidated))
+                );
+                assert_eq!(window.record(), &record);
+                assert_eq!(window.next_receive(), Some(4));
+                assert!(
+                    !window.is_reconstructing(),
+                    "a refused enable must not change phase"
+                );
+                assert_eq!(window.ready(), Ok(()));
+                assert_eq!(
+                    window.reply_empty(&request).unwrap_err(),
+                    WindowError::EmptyRepliesDisabled
+                );
+                assert_eq!(
+                    window.enable_empty_replies(Policy::default()),
+                    Err(WindowError::Canonical(Error::Invalidated)),
+                    "permanent revocation must not masquerade as retryable CapabilityActive"
+                );
+                window.delete();
+            }
+        }
         return;
     }
     if case == "interruption" {
@@ -2563,6 +2711,9 @@ fn empty_handler_faults_and_cache(module: &CountingModule) {
                 assert!(!diagnostic.contains("ciphertext"));
                 assert!(!diagnostic.contains(HOSTILE_PROVIDER_DIAGNOSTIC));
             }
+            f.window
+                .reconcile(f.profile, &f.keys, &original, &f.iv)
+                .unwrap();
             if withheld == 3 {
                 assert_eq!(
                     f.window.reply_empty(&request).unwrap_err(),

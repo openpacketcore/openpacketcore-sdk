@@ -50,10 +50,42 @@ impl ReceiveState {
             Some(next) => next.checked_sub(1),
             None => Some(u32::MAX),
         };
-        if let (Some(replies), Some(floor)) = (&self.replies, floor) {
-            replies.retire_through(floor).map_err(Error::Canonical)?;
+        if let Some(replies) = &self.replies {
+            match floor {
+                Some(floor) => replies.retire_through(floor),
+                None => replies.check_live(),
+            }
+            .map_err(Error::Canonical)?;
         }
         Ok(())
+    }
+
+    pub(super) fn boundary_next(&self, recorded: Option<u32>) -> Option<u32> {
+        match (self.next, recorded) {
+            (Some(live), Some(recorded)) => Some(live.max(recorded)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn adopt_boundary(&mut self, next: Option<u32>) {
+        self.next = next;
+        self.phase = ReceivePhase::Current;
+        self.pending.get_mut().take();
+        self.last_empty = None;
+    }
+
+    pub(super) fn retire_readback(&self, next: Option<u32>, boundary: bool) -> Result<(), Error> {
+        let retire_before = if boundary {
+            next
+        } else {
+            self.last_empty.as_ref().map_or(next, |(id, _)| Some(*id))
+        };
+        self.retire_before(retire_before)
+    }
+
+    pub(super) fn discard_replies(&mut self) {
+        self.replies = None;
+        self.last_empty = None;
     }
 }
 
@@ -130,18 +162,31 @@ impl Window {
     /// # Errors
     /// Refuses blocked lifecycle, an existing capability, or any canonical refusal.
     pub fn enable_empty_replies(&mut self, policy: Policy) -> Result<(), Error> {
+        if self.reconcile_terminal {
+            return Err(Error::Canonical(
+                crate::canonical::Ikev2CanonicalError::Invalidated,
+            ));
+        }
         self.ready()?;
-        if self.receive.replies.is_some() {
+        if let Some(replies) = &self.receive.replies {
+            replies.check_live().map_err(Error::Canonical)?;
             return Err(Error::Canonical(
                 crate::canonical::Ikev2CanonicalError::CapabilityActive,
             ));
         }
         let replies = self.canonical_replies(policy).map_err(Error::Canonical)?;
+        let floor = match self.receive.next {
+            Some(next) => next.checked_sub(1),
+            None => Some(u32::MAX),
+        };
+        if let Some(floor) = floor {
+            replies.retire_through(floor).map_err(Error::Canonical)?;
+        }
         self.receive.replies = Some(replies);
         if self.receive.phase == ReceivePhase::Restored {
             self.receive.phase = ReceivePhase::Reconstructing;
         }
-        self.receive.retire_before(self.receive.next)
+        Ok(())
     }
 
     /// Current volatile next peer ID, including empty exchanges; `None` is exhausted.
@@ -228,10 +273,8 @@ impl Window {
     // Called only after adopting a durably acknowledged inbound/cutover record.
     // Outbound commits must not discard a volatile empty prefix or its cache.
     pub(super) fn adopt_receive_boundary(&mut self) -> Result<(), Error> {
-        self.receive.next = self.record.next_receive;
-        self.receive.phase = ReceivePhase::Current;
-        self.receive.pending.get_mut().take();
-        self.receive.last_empty = None;
+        self.receive
+            .adopt_boundary(self.receive.boundary_next(self.record.next_receive));
         if let Err(error) = self.receive.retire_before(self.receive.next) {
             // The record is committed; failed cache revocation grants no authority.
             // Resolve through trusted readback or permanent SA teardown.
@@ -257,6 +300,40 @@ impl Window {
             replies.delete();
         } else {
             Canonical::delete_epoch(&self.canonical_binding);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical_test_fixtures::{Fixture, ALGORITHMS, DIRECTIONS};
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn terminal_reconcile_drops_the_canonical_capability_before_delete() {
+        crate::test_support::ensure_ike_crypto();
+        for (algorithm, encryption) in ALGORITHMS.into_iter().enumerate() {
+            for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+                let mut f = Fixture::new(
+                    33_000 + (algorithm * 2 + role) as u64,
+                    encryption,
+                    direction,
+                );
+                f.window.enable_empty_replies(Policy::default()).unwrap();
+                assert!(f.window.receive.replies.is_some());
+                let record = f.window.record().clone();
+                let changed = f.stored(None, 64);
+                assert_eq!(
+                    f.window.reconcile(f.profile, &f.keys, &record, &changed),
+                    Err(Error::DomainMismatch)
+                );
+                assert!(
+                    f.window.receive.replies.is_none(),
+                    "terminal readback must drop the capability before SA deletion"
+                );
+                f.window.delete();
+            }
         }
     }
 }

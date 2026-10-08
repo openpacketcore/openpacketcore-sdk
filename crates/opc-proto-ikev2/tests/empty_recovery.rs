@@ -29,6 +29,50 @@ fn fixture(tag: u64) -> Fixture {
     Fixture::new(tag, ALGORITHMS[0], DIRECTIONS[0])
 }
 
+#[test]
+fn close_commit_never_lowers_the_live_empty_receive_floor() {
+    support::ensure_ike_crypto();
+    for (algorithm, encryption) in ALGORITHMS.into_iter().enumerate() {
+        for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+            let f = Fixture::new(
+                22_000 + (algorithm * 2 + role) as u64,
+                encryption,
+                direction,
+            );
+            let mut window = start(&f, &record(&f, 0, true));
+            for id in 0..4 {
+                drop(window.reply_empty(&f.request(id)).unwrap());
+            }
+            let policy = RecoveryPolicy::new(1, Clock::new(100, 7), 200, 3, 10).unwrap();
+            assert_eq!(
+                window
+                    .begin_sync(policy, Clock::new(200, 7), None)
+                    .unwrap_err(),
+                Error::SyncClosed
+            );
+            let prepared = window.close_sync().unwrap();
+            let closed = prepared.record().clone();
+            assert_eq!(closed.next_receive(), Some(0));
+            let token = prepared
+                .commit_after_durable(&closed, Clock::new(200, 7))
+                .unwrap();
+            assert_eq!(
+                window.next_receive(),
+                Some(4),
+                "CloseIkeSa must preserve the live floor"
+            );
+            assert_eq!(window.ready(), Err(Error::SyncClosed));
+            assert!(matches!(
+                window
+                    .release_sync_action(token, Clock::new(200, 7))
+                    .unwrap(),
+                SyncAction::CloseIkeSa
+            ));
+            window.delete();
+        }
+    }
+}
+
 fn record(f: &Fixture, receive: u32, negotiated: bool) -> Record {
     let record = Record::initial(Domain::from_iv_record(&f.iv), 0, receive);
     if !negotiated {
@@ -566,8 +610,8 @@ fn cached_replies_recheck_quiescence_sync_wait_and_terminal_dispositions() {
         // Terminal sync, uncertain writes and pending-sync teardown all retire
         // the registry entry, not just the runtime's owned capability.
         assert_eq!(
-            f.window.canonical_replies(Policy::default()).unwrap_err(),
-            CanonicalError::Invalidated
+            f.window.enable_empty_replies(Policy::default()),
+            Err(Error::Canonical(CanonicalError::Invalidated))
         );
     }
 }
@@ -785,10 +829,11 @@ fn every_consumer_teardown_uses_delete_and_rekey_retains_the_old_epoch_until_del
             assert_eq!(window.reply_empty(&request).unwrap().bytes(), bytes);
         }
         window.delete();
-        let old = Window::restore(original.domain(), f.profile, &f.keys, &original, &f.iv).unwrap();
+        let mut old =
+            Window::restore(original.domain(), f.profile, &f.keys, &original, &f.iv).unwrap();
         assert!(matches!(
-            old.canonical_replies(Policy::default()),
-            Err(CanonicalError::Invalidated)
+            old.enable_empty_replies(Policy::default()),
+            Err(Error::Canonical(CanonicalError::Invalidated))
         ));
         new_window.reply_empty(&newer.request(0)).unwrap();
         new_window.delete();
@@ -848,21 +893,22 @@ fn replay_lookup_does_not_admit_pending_work_or_change_sync_history() {
 fn failed_record_rebuild_requires_the_explicit_epoch_teardown_hook() {
     // Review P2: discriminate delete_epoch itself, without a Window::restore
     // failure that already retired the key. Consumer decoding can fail first.
-    let f = fixture(11_010);
-    let replies = f.window.canonical_replies(Policy::default()).unwrap();
-    replies.reply(&f.request(0)).unwrap();
-    drop(replies);
+    let mut f = fixture(11_010);
+    let original = f.window.record().clone();
+    let mut window = start(&f, &original);
+    window.reply_empty(&f.request(0)).unwrap();
+    drop(window);
     assert_eq!(
         Record::from_persisted(Domain::from_iv_record(&f.iv), 1, None, Some(0), None, None)
             .unwrap_err(),
         Error::InvalidRecord
     );
-    let still_live = f.window.canonical_replies(Policy::default()).unwrap();
+    let still_live = start(&f, &original);
     drop(still_live);
     Canonical::delete_epoch(&f.iv);
     assert_eq!(
-        f.window.canonical_replies(Policy::default()).unwrap_err(),
-        CanonicalError::Invalidated
+        f.window.enable_empty_replies(Policy::default()),
+        Err(Error::Canonical(CanonicalError::Invalidated))
     );
 }
 
@@ -871,12 +917,12 @@ fn invalid_window_restore_retires_the_epoch_without_consumer_cleanup() {
     // Review P3, strengthened by the required automatic failed-restore cleanup.
     for has_capability in [false, true] {
         let mut f = fixture(11_020 + u64::from(has_capability));
-        let replies = f.window.canonical_replies(Policy::default()).unwrap();
-        replies.reply(&f.request(1)).unwrap();
-        let retained = if has_capability {
-            Some(replies)
+        let mut window = start(&f, f.window.record());
+        window.reply_empty(&f.request(1)).unwrap();
+        let mut retained = if has_capability {
+            Some(window)
         } else {
-            drop(replies);
+            drop(window);
             None
         };
         let prepared = f
@@ -897,18 +943,18 @@ fn invalid_window_restore_retires_the_epoch_without_consumer_cleanup() {
                 .unwrap_err(),
             Error::InvalidRecord
         );
-        if let Some(replies) = retained {
+        if let Some(window) = &mut retained {
             assert_eq!(
-                replies.reply(&f.request(1)).unwrap_err(),
-                CanonicalError::Invalidated
+                window.reply_empty(&f.request(1)).unwrap_err(),
+                Error::Canonical(CanonicalError::Invalidated)
             );
         }
         // No delete_epoch: a corrected record cannot resurrect a failed epoch.
-        let restored =
+        let mut restored =
             Window::restore(committed.domain(), f.profile, &f.keys, &committed, &f.iv).unwrap();
         assert_eq!(
-            restored.canonical_replies(Policy::default()).unwrap_err(),
-            CanonicalError::Invalidated
+            restored.enable_empty_replies(Policy::default()),
+            Err(Error::Canonical(CanonicalError::Invalidated))
         );
     }
 }
@@ -1004,16 +1050,16 @@ fn refused_empty_evaluation_still_blocks_changed_work_and_stale_sync() {
 #[test]
 fn deleting_a_window_without_an_owned_capability_removes_the_live_epoch() {
     // Review P6: exercise the None arm of Window::delete on a retained ledger.
-    let f = fixture(11_050);
-    let replies = f.window.canonical_replies(Policy::default()).unwrap();
-    replies.reply(&f.request(0)).unwrap();
-    drop(replies);
+    let mut f = fixture(11_050);
+    let mut window = start(&f, f.window.record());
+    window.reply_empty(&f.request(0)).unwrap();
+    drop(window);
     let record = f.window.record().clone();
     let restored = Window::restore(record.domain(), f.profile, &f.keys, &record, &f.iv).unwrap();
     restored.delete();
     assert_eq!(
-        f.window.canonical_replies(Policy::default()).unwrap_err(),
-        CanonicalError::Invalidated
+        f.window.enable_empty_replies(Policy::default()),
+        Err(Error::Canonical(CanonicalError::Invalidated))
     );
 }
 
@@ -1209,7 +1255,7 @@ fn newer_admitted_work_retires_an_ordinary_cached_reply_without_a_write() {
 
 #[test]
 fn repeated_empty_traffic_retires_old_ids_without_spending_ordinary_ivs() {
-    let f = fixture(10_200);
+    let mut f = fixture(10_200);
     let original = record(&f, 0, false);
     let mut window = start(&f, &original);
     let iv_before = f.iv.clone();
@@ -1228,13 +1274,14 @@ fn repeated_empty_traffic_retires_old_ids_without_spending_ordinary_ivs() {
     assert_eq!(&f.iv, &iv_before);
     assert_eq!(window.next_receive(), Some(256));
     drop(window);
-    let primitive = f.window.canonical_replies(Policy::default()).unwrap();
-    // A new primitive cannot regenerate even previously unseen compacted IDs.
+    f.window.enable_empty_replies(Policy::default()).unwrap();
+    let retired = f.request(254);
+    // Reconstruction cannot reopen an ID closed by the retained compacted ledger.
     assert!(matches!(
-        primitive.reply(&f.request(254)),
-        Err(CanonicalError::AlreadyReleased)
+        f.window.reply_empty(&retired),
+        Err(Error::Canonical(CanonicalError::AlreadyReleased))
     ));
-    primitive.delete();
+    f.window.delete();
 }
 
 #[test]

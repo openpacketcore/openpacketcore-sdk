@@ -375,6 +375,15 @@ pub use software_crypto::{
 };
 pub use validation::Ikev2ValidationProfile;
 
+// Shared qualification fixtures use the package name in integration and unit tests.
+#[cfg(test)]
+extern crate self as opc_proto_ikev2;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "../tests/support/canonical.rs"]
+mod canonical_test_fixtures;
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::OnceLock;

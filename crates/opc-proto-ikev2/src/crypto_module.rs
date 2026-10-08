@@ -26,6 +26,9 @@ use crate::sa_init_crypto::{
     Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
 };
 
+#[cfg(test)]
+mod admission_tests;
+
 /// The configured IKEv2 algorithms that must be executable before startup.
 ///
 /// Values are deduplicated as they are added. An algorithm is usable only when
@@ -1037,13 +1040,20 @@ pub(crate) fn with_entropy_operation(
     operation(selected.module()).map_err(|error| Ikev2CryptoModuleError::operation(&error))
 }
 
-pub(crate) fn check_sync_admission(
+pub(crate) fn check_aead_admission(
     algorithm: Ikev2EncryptionAlgorithm,
 ) -> Result<(), Ikev2CryptoModuleError> {
     let (_, mapped) = select_encryption(algorithm)?;
     if !matches!(mapped, MappedEncryption::Aead(_)) {
         return Err(algorithm_unsupported());
     }
+    Ok(())
+}
+
+pub(crate) fn check_sync_admission(
+    algorithm: Ikev2EncryptionAlgorithm,
+) -> Result<(), Ikev2CryptoModuleError> {
+    check_aead_admission(algorithm)?;
     with_entropy_operation(|_| Ok(()))
 }
 

@@ -23,6 +23,7 @@ use bytes::Bytes;
 
 mod empty;
 mod packet;
+mod reconcile;
 mod record;
 mod reservation_retry;
 mod sync_initiator;
@@ -68,8 +69,10 @@ pub enum Ikev2WindowError {
     InvalidRecord,
     /// An outbound ordinary request remains unsettled.
     RequestOutstanding,
-    /// A preparation was cancelled or its persistence is unresolved; restore latest readback.
+    /// A preparation was cancelled or its persistence is unresolved; reconcile latest readback.
     CommitUncertain,
+    /// Provider pre-check failed before readback validation; retain this runtime and retry.
+    ReconcileUnavailable,
     /// Acknowledgement did not equal the exact prepared record.
     CommitMismatch,
     /// Message-ID or commit-generation space is exhausted; never wrap.
@@ -108,6 +111,7 @@ impl fmt::Display for Ikev2WindowError {
             Self::InvalidRecord => "ike_committed_window_invalid_record",
             Self::RequestOutstanding => "ike_committed_window_request_outstanding",
             Self::CommitUncertain => "ike_committed_window_commit_uncertain",
+            Self::ReconcileUnavailable => "ike_committed_window_reconcile_unavailable",
             Self::CommitMismatch => "ike_committed_window_commit_mismatch",
             Self::Exhausted => "ike_committed_window_exhausted",
             Self::NoDurableWork => "ike_committed_window_no_durable_work",
@@ -151,13 +155,27 @@ impl Ikev2ExactReplay<'_> {
 ///
 /// Dropping a prepared transition leaves this runtime quiescent. Resolve all
 /// possibly outstanding writes under the fence, read back the latest atomic
-/// record, then replace it with [`Self::restore`]. Never guess whether a write
+/// window and IV records, then call [`Self::reconcile`] in place. Never guess whether a write
 /// landed, roll back persisted state or re-execute a historical outcome.
-/// Then enable empty replies with [`Self::enable_empty_replies`] to recover a lost
-/// empty prefix. A retryable enable refusal retains the checked runtime and epoch.
-/// Replacement within one process currently loses the last empty reply's bytes
+/// Reconcile retains the same canonical capability and last applicable empty
+/// reply, acquires no capability and creates no completion or send permission.
+/// Keep the live IV allocator so burned allocations remain burned.
+///
+/// Use [`Self::restore`] at process start, then [`Self::enable_empty_replies`] to
+/// recover a lost empty prefix. A retryable enable refusal retains the checked runtime and epoch.
+/// Drop or overwrite the old runtime before enabling its replacement; while the
+/// old capability lives, enable returns `Canonical(CapabilityActive)`.
+/// Restore-replacement within one process still loses the last empty reply's bytes
 /// while retaining its release history: that ID is refused as `AlreadyReleased`.
 /// A lost last reply may therefore stall the peer until synchronization or expiry.
+///
+/// Canonical reply construction cannot bypass this window's receive admission:
+/// ```compile_fail
+/// use opc_proto_ikev2::{canonical::Ikev2CanonicalPolicy, recovery::Ikev2CommittedWindow};
+/// fn bypass(window: &Ikev2CommittedWindow, policy: Ikev2CanonicalPolicy) {
+///     let _ = window.canonical_replies(policy);
+/// }
+/// ```
 ///
 /// Restore and empty-enable are separate operations so a refused enable retains
 /// the checked runtime for retry:
@@ -175,6 +193,8 @@ pub struct Ikev2CommittedWindow {
     canonical_binding: Ikev2AesGcmIvRecord,
     instance: Arc<()>,
     quiescent: bool,
+    witness: Option<reconcile::Witness>,
+    reconcile_terminal: bool,
     observed_peer_request: Cell<Option<u32>>,
     receive: empty::ReceiveState,
     sync_live: bool,
@@ -189,10 +209,12 @@ impl Ikev2CommittedWindow {
     /// restoration by the consumer. Supply the latest fenced sending-IV record;
     /// its exclusive end must cover locally sent cached IVs, initiating attempts
     /// and the retained minimum in sync metadata even after caches are retired.
-    /// Restore the IV allocator from that same record separately, discarding its
+    /// At process start restore the IV allocator from that same record separately, discarding its
     /// unconsumed tail. The cross-check detects inconsistency with retained evidence,
     /// not rollback of both records or forgotten history. Writer fencing and
     /// trustworthy latest records remain caller obligations.
+    /// For in-process readback use [`Self::reconcile`] and keep the live allocator
+    /// and canonical capability rather than constructing replacements.
     /// Read the window and IV records from one consistent fenced snapshot before
     /// calling this method; a failed restore is terminal for canonical use.
     /// # Errors
@@ -224,6 +246,31 @@ impl Ikev2CommittedWindow {
         record: &Ikev2CommittedWindowRecord,
         iv_record: &Ikev2AesGcmIvRecord,
     ) -> Result<Self, Ikev2WindowError> {
+        Self::validate_record(expected, profile, keys, record, iv_record)?;
+        Ok(Self {
+            record: record.clone(),
+            canonical_binding: iv_record.clone(),
+            instance: Arc::new(()),
+            quiescent: false,
+            witness: None,
+            reconcile_terminal: false,
+            observed_peer_request: Cell::new(None),
+            receive: empty::ReceiveState::new(record.next_receive),
+            sync_live: false,
+            sync_closed: false,
+            sync_last_observed_unix_ms: record
+                .sync_recovery()
+                .map(|recovery| recovery.last_observed_unix_ms()),
+        })
+    }
+
+    fn validate_record(
+        expected: &Ikev2CommittedWindowDomain,
+        profile: Ikev2SaInitCryptoProfile,
+        keys: &Ikev2SaInitKeyMaterial,
+        record: &Ikev2CommittedWindowRecord,
+        iv_record: &Ikev2AesGcmIvRecord,
+    ) -> Result<(), Ikev2WindowError> {
         use Ikev2WindowError as Error;
         if expected != &record.domain
             || expected != &Ikev2CommittedWindowDomain::from_iv_record(iv_record)
@@ -271,19 +318,7 @@ impl Ikev2CommittedWindow {
                 }
             }
         }
-        Ok(Self {
-            record: record.clone(),
-            canonical_binding: iv_record.clone(),
-            instance: Arc::new(()),
-            quiescent: false,
-            observed_peer_request: Cell::new(None),
-            receive: empty::ReceiveState::new(record.next_receive),
-            sync_live: false,
-            sync_closed: false,
-            sync_last_observed_unix_ms: record
-                .sync_recovery()
-                .map(|recovery| recovery.last_observed_unix_ms()),
-        })
+        Ok(())
     }
 
     /// Derive a canonical recipe from this window's checked persisted IV binding.
@@ -297,7 +332,7 @@ impl Ikev2CommittedWindow {
     /// # Errors
     /// Refuses a quiescent, syncing or terminal window, an ineligible marker or
     /// key binding, or unavailable canonical provider policy/qualification.
-    pub fn canonical_replies(
+    pub(crate) fn canonical_replies(
         &self,
         policy: crate::canonical::Ikev2CanonicalPolicy,
     ) -> Result<crate::canonical::Ikev2CanonicalEmptyReplies, crate::canonical::Ikev2CanonicalError>
@@ -362,7 +397,14 @@ impl Ikev2CommittedWindow {
         outcome: Option<Bytes>,
         receive_boundary: bool,
     ) -> Ikev2PreparedWindow<'_> {
-        self.quiescent = true;
+        self.remember_prepared(
+            &record,
+            if receive_boundary {
+                reconcile::Kind::Inbound
+            } else {
+                reconcile::Kind::Outbound
+            },
+        );
         Ikev2PreparedWindow {
             window: self,
             record,
@@ -639,6 +681,7 @@ impl Ikev2PreparedWindow<'_> {
         if committed != &self.record {
             return Err(Ikev2WindowError::CommitMismatch);
         }
+        self.window.witness = None;
         self.window.record = self.record;
         self.window.quiescent = false;
         if self.receive_boundary {

@@ -138,12 +138,12 @@ The lifecycle check alone supplies no receive admission or transmission authorit
 reply borrows the window exclusively while retained. The consumer must still
 retain its external fenced SA/send authority; copied bytes carry no authority.
 
-`Ikev2AesGcmIvAllocator::canonical_replies` requires fresh-epoch activation;
-`Ikev2CommittedWindow::canonical_replies` requires checked restore. Restored
-allocation alone cannot mint one.
-DPD-facing windows must use `enable_empty_replies` and `reply_empty`: primitive
-replies leave the window's receive floor behind and can drop the next nonempty
-request. The complete IV binding and immutable `Some(1)` format marker must come
+The former `Ikev2AesGcmIvAllocator::canonical_replies` and
+`Ikev2CommittedWindow::canonical_replies` constructors are no longer public.
+Use checked window restore, `enable_empty_replies` and `reply_empty` for both
+fresh and restored epochs. The window owns the primitive and advances its
+receive floor so DPD cannot leave the next nonempty request behind.
+The complete IV binding and immutable `Some(1)` format marker must come
 from one trusted atomic SA record. Missing/unknown markers refuse canonical use; never synthesize or
 upgrade a marker for used keys. The SDK defines no durable byte format.
 
@@ -159,28 +159,29 @@ values or Debug output; providers must observe the same confidentiality rule.
 At most three evaluations and one new release are allowed per sending key,
 salt and Message ID while its undeleted ledger is retained in the process.
 After release, only the same capability's
-cached bytes are returned. Dropping the capability or `retire(id)` discards
-bytes without resetting the process ledger. `invalidate()` permanently revokes
-that ledger and retains a recent deletion fingerprint. Invoke it and discard
-consumer-held copies
-when record trust, IV history or key provenance is lost. A changed/doubted
+cached bytes are returned. Dropping the runtime or retiring a reply discards
+bytes without resetting the process ledger. On loss of record trust, IV history
+or key provenance, call `window.delete()` (or `delete_epoch` without a runtime)
+and discard consumer-held copies. Deletion permanently revokes the ledger and
+retains a recent deletion fingerprint. A changed/doubted
 binding requires fresh IKE keys. Every failed `Window::restore` invalidates all
 supplied bindings, even before a capability existed. Reconcile trusted mutable
 state and read the window and IV records from one consistent fenced snapshot
 before restore; a later corrected read cannot revive a failed epoch. Successful
 runtime replacement discards the old cache but retains attempt/release history.
-`reply()` returns an owned, thread-safe `Ikev2CanonicalReply` containing
-57 verified octets; it holds no ledger lock. Consumer-held copies must also be
+The internal primitive returns 57 verified octets without retaining a ledger
+lock; the public `reply_empty` result also retains its window borrow.
+Consumer-held copies must also be
 discarded when trust or send authority is lost.
 Canonical packets never enter durable exchange caches or ordinary IV evidence.
 
 The process registry uses full SHA-256 fingerprints for sending key/salt and
 immutable binding, with expected O(1) hash lookup. It retains no SA
 keys: the capability's key copies are zeroized when it drops. As the receive
-window advances, call `retire_through(id)` below the retained reply window to
-discard per-ID entries and permanently close every ID at or below that floor,
+window advances, the handler retires entries below its retained reply window to
+discard per-ID state and permanently close every ID at or below that floor,
 including unseen IDs. Entries above it retain their attempts and release status.
-Call `delete()` on a live capability, or `delete_epoch(&iv_record)` after it has
+Call `window.delete()` on a live runtime, or `delete_epoch(&iv_record)` after it has
 dropped, once the SA is permanently deleted. After rekey, retain the old epoch
 for permitted retransmissions until the old SA has been deleted. Deletion clears
 all ID state and keeps only a recent fingerprint tombstone.
@@ -224,6 +225,8 @@ nor packet checks. General module admission is not canonical opt-in.
 | `Ikev2AesGcmIvDomain::new` for a restore expectation | Use `window_record.domain().send_iv_domain()` from the separately persisted, trusted window record when restoring its IV allocator; see the cross-check below. |
 | `Ikev2AesGcmIvRecord::from_persisted(domain, limits, end)` | `from_persisted(epoch_inputs, limits, end, persisted_marker)` with both keys and all fields from that same atomic record. |
 | `Ikev2CommittedWindowDomain::new(...)` | `Ikev2CommittedWindowDomain::from_iv_record(&iv_record)` for initial window assembly; restore uses the persisted window domain and cross-checks the IV record. |
+| `Ikev2AesGcmIvAllocator::canonical_replies(...)` | Restore a committed window from the same durable epoch, enable empty replies, then use `window.reply_empty(...)`. |
+| `Ikev2CommittedWindow::canonical_replies(...)` | `window.enable_empty_replies(policy)?`, then `window.reply_empty(...)`; the window enforces admission and owns the capability/cache. |
 
 Both domain `new` functions are now crate-private. Borrowed epoch inputs and
 raw established keys confer no canonical capability or historical-key proof.
@@ -307,20 +310,42 @@ Any sync Notify is excluded from ordinary state, including ordinary Message ID 0
 Prepared record accessors exist for persistence, not transmission. Equality of
 an acknowledgement checks identity, not durability. Cancellation, failure or an
 uncertain commit leaves the runtime quiescent. Fence/settle all older writes,
-read back the latest atomic record, and replace the runtime with `restore`.
+read the window and IV records from one consistent snapshot, and call
+`window.reconcile(profile, keys, &record, &iv_record)` in place. Reconcile accepts
+only the exact last acknowledged record or this runtime's private prepared
+candidate. It retains the same canonical capability, cache, attempts and release
+history without acquiring a capability, sealing a packet or granting effects.
+Unchanged and outbound-only readback retain the live receive floor, phase,
+pending identity and last applicable empty reply. A newly landed inbound or sync
+boundary retires superseded replies and adopts the maximum live/recorded floor,
+including CloseIkeSa and exhaustion. Keep the live IV allocator: prepared IVs
+and ranges remain burned. Only the IV record's high-water may rise; it must
+cover sealed candidates even when their window record did not land.
+
+`ReconcileUnavailable` means the provider pre-check failed before validation:
+retain the quiescent runtime and retry. Every other reconcile error is terminal;
+delete the SA and discard its keys, stored state and copied replies. Valid sync
+lifecycle states reconcile successfully; check `ready()` afterward. Every attempt
+fences old completion tokens and live local proposals, even unchanged readback.
+A pending proposal must take the existing higher-proposal retry, spending another
+of its bounded attempts. Readback preserves clock observations and latched closure.
+
+Use `restore` at process start, followed by `enable_empty_replies` to recover a
+lost zero-write prefix. If replacing a runtime within one process is unavoidable,
+drop or overwrite the old runtime before enabling empty replies on its replacement;
+while the old capability lives, enable returns `Canonical(CapabilityActive)`.
 Read the window and IV records from one consistent fenced snapshot before
-restore. For empty handling, then call `enable_empty_replies` to recover the
-lost zero-write prefix as described below. A refused enable preserves the
+restore. A refused enable preserves the
 checked runtime for retry after a pending sync completes or the old capability
-drops. In-process replacement currently discards the last empty reply's cached
+drops. Restore-replacement in one process still discards the last empty reply's cached
 bytes but retains its release history. Retrying that ID returns
 `Canonical(AlreadyReleased)`. If that reply was lost, the peer may stall until
 synchronization or expiry. This is a known limit on reply retention under
 [RFC 7296 §2.3](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.3);
-the planned in-place readback API will retain the same capability and cache.
+use in-place reconcile to preserve that reply.
 Do not guess whether an uncertain write committed. IVs already consumed by
 preparation remain burned. Completion tokens are single-use and must pass
-`apply_committed` in the same runtime/current commit generation; restoration or
+`apply_committed` in the same runtime/current commit generation; reconcile, restoration or
 a later commit fences them. The consumer applies durable outcomes idempotently;
 restoration reads history and never manufactures a fresh completion.
 
@@ -337,7 +362,8 @@ Before accepting DPD-sending peers, qualify each intended algorithm with
 `Ikev2CanonicalEmptyReplies::preflight` and the deployment's canonical policy.
 After checked window restore, call `enable_empty_replies(policy)`. While a
 capability is held, another enable
-returns `Canonical(CapabilityActive)` without revoking it. For a restored
+returns `Canonical(CapabilityActive)` without revoking it; an already revoked
+capability instead reports `Canonical(Invalidated)`. For a restored
 `AwaitLocalSync`, finish and commit the sync result, then enable. Lifecycle and
 capability-active refusals leave the epoch intact and can be retried on the
 same checked runtime once the cause clears.
