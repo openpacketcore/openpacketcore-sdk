@@ -402,15 +402,20 @@ fn ordinary_exclusion(root: &Path, interface: &str) -> PathBuf {
 async fn attach_interfaces(
     backend: &EbpfGtpuDataplaneBackend,
     interfaces: [&str; 2],
+    phase: &str,
 ) -> Result<(), GtpuError> {
     let mut devices = Vec::new();
     for interface in interfaces {
         let mut request = CreateGtpDeviceRequest::new(interface);
         request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        devices.push(backend.create_device(request).await?);
+        devices.push(backend.create_device(request).await.inspect_err(|error| {
+            eprintln!("strict reset phase={phase} interface={interface} create failed: {error:?}");
+        })?);
     }
-    for device in devices {
-        backend.remove_device(&device).await?;
+    for (interface, device) in interfaces.into_iter().zip(devices) {
+        backend.remove_device(&device).await.inspect_err(|error| {
+            eprintln!("strict reset phase={phase} interface={interface} remove failed: {error:?}");
+        })?;
     }
     Ok(())
 }
@@ -437,7 +442,7 @@ pub(super) async fn absent_interfaces_and_interruption() -> Result<(), Box<dyn s
             .await?;
         assert_eq!(fs::metadata(&marker).map(|m| (m.dev(), m.ino()))?, identity);
         let _first = ExclusiveTestInterface::new(std::ffi::OsStr::new(names[0]));
-        attach_interfaces(&backend, names).await?;
+        attach_interfaces(&backend, names, "absent-interface-reset").await?;
 
         // An interrupted finish can leave the other interface's retained lock
         // without its marker after its graph has already disappeared.
@@ -456,7 +461,7 @@ pub(super) async fn absent_interfaces_and_interruption() -> Result<(), Box<dyn s
         );
         assert!(other_marker.is_dir());
         assert!(!partial.exists());
-        attach_interfaces(&backend, names).await?;
+        attach_interfaces(&backend, names, "interrupted-reset").await?;
     }
 
     // A new namespace may reset every intended name before creating any link.
@@ -484,7 +489,7 @@ pub(super) async fn absent_interfaces_and_interruption() -> Result<(), Box<dyn s
             }
             let _first = ExclusiveTestInterface::new(std::ffi::OsStr::new("reset_a"));
             let _second = ExclusiveTestInterface::new(std::ffi::OsStr::new("reset_b"));
-            attach_interfaces(&backend, ["reset_a", "reset_b"])
+            attach_interfaces(&backend, ["reset_a", "reset_b"], "new-namespace-reset")
                 .await
                 .unwrap();
         });

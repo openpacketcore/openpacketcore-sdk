@@ -261,6 +261,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI: run the root-cgroup egress-fence qualification when fence inputs or its
+  resolved dependency versions, sources, features or path dependencies change.
+  Unrelated workspace manifest and lockfile edits receive a quick decision
+  instead. Missing history or dependency-resolution errors require a full run;
+  nightly runs at 03:17 UTC and manual dispatch always run the complete job.
+
 - `opc-proto-nas` migration: the five `MmMessageBody::Authentication*` variants
   now contain typed bodies instead of `RawMessageBody`. Use each body's codec
   traits and named fields; callers needing opaque preservation can retain the
@@ -426,6 +432,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
+  admitted append's final result before authenticated readback, retaining its
+  acknowledgement, shutdown and completion bounds. A backend-error control
+  distinguishes a failed append from a delayed commit. Fixes #868.
+
+- `opc-gtpu-dataplane`: tolerate BPF program IDs retired during current-graph
+  ownership scans, preventing unrelated program removal from refusing device
+  cleanup before or after hook detachment. Live foreign references and all
+  other inspection errors still block cleanup (#1170).
+
 - `opc-session-testkit`: make the void-cursor regression follow bounded
   reclamation across partial sweeps, with a forced late reply and complete
   drain reports. Both terminal receipts must still resolve within the original
@@ -478,6 +494,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retirement fails. Before, only plain removal completed it, so legacy
   terminal-successor recovery could keep refusing a drained graph after a
   crash. Fixes #1011.
+
+- `opc-session-testkit`: share initial source provenance capture across mTLS
+  qualification fleets in one process, including setup failures. Use one bounded
+  Git scan budget with environment diagnostics, while recapturing source state
+  before emitting campaign evidence. Regressions cover parallel fleets, retained
+  setup errors, slow scans, and source changes after startup. Fixes #1169.
 
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
