@@ -672,6 +672,19 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
     .unwrap();
     let sql = Connection::open(&path).unwrap();
     assert_eq!(sql_row(&sql, binding), before);
+    let activation = entry(
+        &signed,
+        3,
+        SessionConsensusRequestId::from_bytes([0xD2; 16]),
+        SessionMutationIntent::ActivateScopeProfile(Box::new(
+            crate::scope_lease::ScopeProfileActivation::new(
+                signed.identity,
+                fenced_transition_voter_set_digest(signed.identity, &state.members),
+            ),
+        )),
+    );
+    apply_logged(&mut state, &activation);
+    native_roster_apply_fixture(&path, signed.identity, vec![activation]).unwrap();
     let due = signed
         .authority
         .acquired_at()
@@ -687,7 +700,7 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
     .unwrap();
     let mut scoped = entry(
         &signed,
-        3,
+        4,
         id,
         SessionMutationIntent::ScopeLease(Box::new(ScopeLeaseCommand {
             request: ScopeLeaseRequest::new(
@@ -709,12 +722,16 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
     let native = apply_logged(&mut state, &scoped);
     let sqlite = native_roster_apply_fixture(&path, signed.identity, vec![scoped]).unwrap();
     assert_eq!(native.responses[0].result, sqlite.responses[0].result);
+    assert!(matches!(
+        native.responses[0].result,
+        Ok(SessionMutationOutcome::ScopeLease(Ok(_)))
+    ));
     assert_eq!(sql_row(&sql, binding), before);
     assert!(
         state.roster.rows[&binding].canonical().unwrap() == before,
         "a scope command must not perform another namespace's retention work"
     );
-    let mut maintenance = ordinary(&signed, 4);
+    let mut maintenance = ordinary(&signed, 5);
     let EntryPayload::Normal(command) = &mut maintenance.payload else {
         unreachable!()
     };

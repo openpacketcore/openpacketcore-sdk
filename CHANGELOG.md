@@ -83,12 +83,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter recovery or persistence; ESP replay-counter synchronization is out of
   scope.
 
+- `opc-session-store`: add atomic scope child batches with typed create, CAS
+  and delete, exact births/generations, per-scope unique claims and sixteen
+  bounded counters. Up to 64 children commit in one command under the current
+  live grant, with sealed values and no partial effects on conflict. Scope
+  checkpoints now live outside ordinary request receipts; an activation gate
+  requires every voter to support the exact lease/batch profile before use.
+  The custom key types `opc-scope-batch`, `opc-scope-child`, `opc-scope-claim`
+  and `opc-scope-profile` are now reserved: consumer and roster access is
+  denied, and consumer restore scans filter them. Requests and checkpoints
+  reserve lane/sequence fields and eight replay slots; only lane zero is active.
+  Raise scope permit grace to 77 seconds to budget sixty seconds at a packet
+  gate under the qualified clock and transport bounds, including issuance
+  excess and phase corrections; remote exclusion becomes 79 seconds
+  after issuance. The exact profile digest includes these timing constants.
+  This stored-format change requires a fresh installation. Refs #1134.
+
 - `opc-session-store`: add experimental quorum-side scope leases with
   authenticated execution selection, acquire/renew, same-execution resume,
   graceful release and immutable timed permits. Each operation is one native
   command replacing a bounded scope checkpoint, with no receipt history per
   renewal. Stable cluster scopes survive membership changes. Profile 2 requires
-  a fresh scope installation; child batches remain separate work. Refs #1134.
+  a fresh scope installation. Refs #1134.
   The custom key type `opc-scope-lease` is now reserved: consumer and roster
   access is denied and consumer restore scans filter it.
 

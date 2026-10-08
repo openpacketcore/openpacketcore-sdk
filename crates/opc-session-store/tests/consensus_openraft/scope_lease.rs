@@ -199,6 +199,9 @@ async fn scope_operations_each_commit_one_command_without_receipt_history() {
     let root = tempfile::tempdir().unwrap();
     let snapshots = fs_verity_snapshot_tempdir("scope-command-accounting-");
     let fleet = Fleet::open(root.path(), snapshots.path()).await;
+    // Initial unanimous profile activation is a cluster prerequisite. The
+    // scope operations below each still append exactly one command.
+    fleet.stores[0].activate_scope_profile().await.unwrap();
     let clock = Arc::new(BoundedClock(AtomicU64::new(0)));
     let authority = service(&fleet.stores[0], clock.clone());
     let scope = authority

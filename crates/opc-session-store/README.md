@@ -51,15 +51,26 @@ evidence.
 - `scope_lease::ScopeLeaseStore` provides authenticated stable-scope selection,
   acquire/renew, same-execution resume and gate-closed graceful release over
   strictly durable consensus. Immutable permits fix the one-second renewal
-  cadence, sixty-second forwarding grace and conservative exclusion deadline.
+  cadence, 77-second permit grace and conservative exclusion deadline. The grace
+  budgets sixty seconds of forwarding under RFC 022's clock and transport bounds.
   A trusted admission policy and clock with explicit uncertainty bounds are
   required. Each operation is one native command replacing a fixed authority
   checkpoint, with no per-renewal receipt history. Stable cluster scopes survive
-  membership changes; apply can inspect their selection and grant floors.
+  membership changes; apply can inspect their selection and grant floors. Each
+  new configuration currently needs every voter to answer profile activation
+  before renewal can continue, even when a quorum is available. Activation
+  continuity is required before consumers depend on these leases.
   Unsupported scope profiles are refused. Crossing a scope-record format change
   requires a fresh installation. See [RFC 022](../../docs/rfc/022-scope-leases.md)
   for cancellation, lost replies, emergency-session holds and the separate
   packet-gate/consumer-transport composition boundary.
+- `scope_batch::ScopeBatchStore` atomically creates, replaces or deletes up to
+  64 sealed child records under a live scope grant, with exact births and
+  generations, unique per-scope claims and sixteen bounded accounting counters.
+  Each batch is one consensus command after unanimous profile activation.
+  This initial profile requires one unresolved batch per scope and exact retry
+  after an unknown outcome. Child/claim links and birth floors survive durable
+  snapshots; physical reclamation and independent replay lanes are later work.
 - `FencedOwnershipStore` composes the existing backend lease, CAS, TTL, and
   committed-watch surfaces into key-agnostic logical ownership leases. Opaque
   keys contain 1 through 64 bytes, opaque metadata is capped at 64 KiB, every

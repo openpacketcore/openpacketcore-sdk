@@ -2189,6 +2189,15 @@ pub enum SessionMutationIntent {
     /// One atomic scope-authority operation; retains only its scope checkpoint.
     #[doc(hidden)]
     ScopeLease(Box<crate::scope_lease::ScopeLeaseCommand>),
+    /// One atomic batch of scope-fenced child, claim and counter changes.
+    #[doc(hidden)]
+    ScopeBatch(Box<crate::scope_batch::ScopeBatchCommand>),
+    /// Leader-only request to establish unanimous support for scope profile 2.
+    #[doc(hidden)]
+    PreflightScopeProfile,
+    /// Exact admitted configuration's unanimously supported scope profile.
+    #[doc(hidden)]
+    ActivateScopeProfile(Box<crate::scope_lease::ScopeProfileActivation>),
 }
 
 /// Exact, self-contained precondition and effect request for the appended
@@ -2719,6 +2728,9 @@ pub enum SessionMutationOutcome {
     ScopeLease(
         Result<crate::scope_lease::ScopeLeaseCheckpoint, crate::scope_lease::ScopeLeaseError>,
     ),
+    /// Atomic child-batch outcome; never an ordinary per-request receipt.
+    #[doc(hidden)]
+    ScopeBatch(Result<crate::scope_batch::ScopeBatchOutcome, crate::scope_batch::ScopeBatchError>),
 }
 
 impl fmt::Debug for SessionMutationOutcome {

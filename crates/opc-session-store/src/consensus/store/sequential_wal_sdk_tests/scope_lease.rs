@@ -6,7 +6,7 @@ use crate::scope_lease::*;
 use std::sync::atomic::AtomicU64;
 
 #[derive(Debug)]
-struct Clock(AtomicU64);
+pub(super) struct Clock(pub(super) AtomicU64);
 impl crate::Clock for Clock {
     fn now_utc(&self) -> opc_types::Timestamp {
         at(self.0.load(Ordering::SeqCst) as i64)
@@ -17,7 +17,7 @@ impl ScopeLeaseClock for Clock {
         Ok(bounds(self.0.load(Ordering::SeqCst) as i64))
     }
 }
-struct Admission;
+pub(super) struct Admission;
 #[async_trait]
 impl ScopeLeaseAdmission for Admission {
     async fn authorize(
@@ -35,7 +35,7 @@ impl ScopeLeaseAdmission for Admission {
     }
 }
 
-async fn compact(store: &ConsensusSessionStore) -> u64 {
+pub(super) async fn compact(store: &ConsensusSessionStore) -> u64 {
     use crate::consensus::test_support::{
         consensus_local_durable_progress_for_test, trigger_consensus_log_purge_through_for_test,
         trigger_consensus_snapshot_for_test,
@@ -107,6 +107,14 @@ async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admi
             let wal = store.inner.private_wal.as_ref().unwrap();
             let (discovery, constructed, wrong_cluster) = wal
                 .with_native_owner_held_for_test(|| {
+                    let configured_scope = ScopeLeaseId::new(
+                        fleet.topologies[0].consensus_identity().unwrap(),
+                        TenantId::from_static("scope-construction"),
+                        NetworkFunctionKind::smf(),
+                        [1; 32],
+                    )
+                    .unwrap();
+                    assert_eq!(configured_scope, scope);
                     // Ordinary apply and snapshot publication own this same
                     // mutex. No membership change or follower lag is needed
                     // to make synchronous authority discovery unavailable.
@@ -114,7 +122,7 @@ async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admi
                         store.consumer_scope(),
                         ScopeLeaseStore::new(
                             Arc::new(store.clone()),
-                            scope.clone(),
+                            configured_scope,
                             clock.clone(),
                             Arc::new(Admission),
                         ),
@@ -180,10 +188,7 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
     fleet.open().await;
     let result = AssertUnwindSafe(async {
         let scope = ScopeLeaseId::new(
-            fleet.stores[0]
-                .consumer_scope()
-                .unwrap()
-                .consensus_identity(),
+            fleet.topologies[0].consensus_identity().unwrap(),
             TenantId::from_static("scope-bound"),
             NetworkFunctionKind::smf(),
             [1; 32],
@@ -271,6 +276,10 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
                     assert!(
                         counts.1 < 9216,
                         "fixed encoded checkpoint plus bounded response metadata"
+                    );
+                    assert_eq!(
+                        counts.4, 1,
+                        "only one cluster activation receipt, no renewal history"
                     );
                     assert_eq!(wal.native_sql_fallback_count().unwrap(), 0);
                     footprint.push(counts.1);

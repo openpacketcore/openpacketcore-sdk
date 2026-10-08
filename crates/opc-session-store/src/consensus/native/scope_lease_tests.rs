@@ -26,6 +26,10 @@ fn scope_checkpoint_replacement_does_not_weaken_ordinary_receipt_immutability() 
             raft_log_index: 1,
         }),
     });
+    assert!(
+        changes::generic_payload(Some(&scoped)).is_err(),
+        "cold admission must refuse checkpoints in the previous receipt placement"
+    );
     let mut ordinary = scoped.clone();
     let NativeGenericReceipt::Ordinary(row) = &mut ordinary else {
         unreachable!()

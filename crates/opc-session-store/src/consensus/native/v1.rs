@@ -1,8 +1,6 @@
 //! The original 16-byte request namespace and permanent V1 tombstones. The
 //! shared binding map makes an ordinary/V1 collision impossible to publish.
 //! Only the scalar capability certificate lives in the generation header.
-//! Typed scope checkpoints also use this map, with monotonic replacement
-//! instead of ordinary request immutability.
 
 use super::*;
 use crate::fenced_transition::FENCED_TRANSITION_MAX_HISTORY_ENTRIES;
@@ -28,21 +26,7 @@ impl NativeGenericReceipt {
     ) -> io::Result<()> {
         let valid = match (before, self) {
             (Self::Ordinary(before), Self::Ordinary(after)) => {
-                match (&before.response.result, &after.response.result) {
-                    (
-                        Ok(SessionMutationOutcome::ScopeLease(Ok(old))),
-                        Ok(SessionMutationOutcome::ScopeLease(Ok(new))),
-                    ) => {
-                        new.can_replace(old)
-                            && after.response.sequence >= before.response.sequence
-                            && after.response.raft_log_index >= before.response.raft_log_index
-                            && after.response.logical_time >= before.response.logical_time
-                    }
-                    _ => {
-                        before.payload_digest == after.payload_digest
-                            && before.response == after.response
-                    }
-                }
+                before.payload_digest == after.payload_digest && before.response == after.response
             }
             (Self::FencedV1(before), Self::FencedV1(after)) => {
                 before.payload_digest == after.payload_digest

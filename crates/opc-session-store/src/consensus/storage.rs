@@ -11089,7 +11089,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fixed_snapshot_seal_can_complete_while_a_test_child_is_still_running() {
-        use std::io::{BufRead as _, Write as _};
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
         use std::process::{Child, Command, Stdio};
 
         struct ChildGuard(Child);
@@ -11100,19 +11102,28 @@ mod tests {
             }
         }
 
+        let (mut ready, child_ready) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut child = ChildGuard(
             Command::new("/bin/sh")
                 .args(["-c", "printf 'ready\\n'; read -r release"])
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .test_spawn()
+                .stdout(Stdio::from(OwnedFd::from(child_ready)))
+                .test_spawn(|_| {
+                    let mut message = [0; 6];
+                    ready.read_exact(&mut message)?;
+                    if &message != b"ready\n" {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid child readiness {message:?}; expected ready newline"),
+                        ));
+                    }
+                    Ok(())
+                })
                 .unwrap(),
         );
-        let mut ready = String::new();
-        std::io::BufReader::new(child.0.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        assert_eq!(ready, "ready\n");
         let directory = fs_verity_snapshot_tempdir("live-child-seal-");
         let path = directory.path().join("snapshot");
         std::fs::write(&path, b"synthetic fixed snapshot").unwrap();
@@ -12722,6 +12733,65 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sequential_wal_snapshot_source_and_cache_races_preserve_exact_ownership() {
         use consensus::wal::{integration::PrivateWalTest, Point};
+        const CHILD: &str = "OPC_SNAPSHOT_SOURCE_CACHE_RACE_CHILD";
+        const TEST: &str = "consensus::storage::tests::sequential_wal_snapshot_source_and_cache_races_preserve_exact_ownership";
+        if std::env::var_os(CHILD).is_none() {
+            // Fork bursts also inherit unrelated fixtures' namespace leases.
+            // Keep the stress in its own process so their close/reopen checks
+            // are independent of this fixture's deliberately frequent forks.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=4", "--nocapture"])
+                .env(CHILD, "1")
+                .test_output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "isolated snapshot source/cache races: {stdout}\n{stderr}"
+            );
+            eprint!("{stderr}");
+            return;
+        }
+        // Exercise the same inherited-descriptor interference as concurrent
+        // subprocess fixtures in the shared harness. Completing spawn alone
+        // does not prove that the child has retired its inherited writers.
+        struct LaunchStorm {
+            stop: std::sync::mpsc::Sender<()>,
+            worker: Option<std::thread::JoinHandle<()>>,
+        }
+        impl LaunchStorm {
+            fn start() -> Self {
+                let (stop, stopping) = std::sync::mpsc::channel();
+                let (started, starting) = std::sync::mpsc::channel();
+                let storm = Self {
+                    stop,
+                    worker: Some(std::thread::spawn(move || {
+                        started.send(()).unwrap();
+                        while matches!(
+                            stopping.try_recv(),
+                            Err(std::sync::mpsc::TryRecvError::Empty)
+                        ) {
+                            assert!(std::process::Command::new("/bin/true")
+                                .test_status()
+                                .unwrap()
+                                .success());
+                        }
+                    })),
+                };
+                starting.recv_timeout(Duration::from_secs(5)).unwrap();
+                storm
+            }
+        }
+        impl Drop for LaunchStorm {
+            fn drop(&mut self) {
+                let _ = self.stop.send(());
+                let joined = self.worker.take().unwrap().join();
+                if !std::thread::panicking() {
+                    joined.unwrap();
+                }
+            }
+        }
         const FOREIGN_SQL: &str = "CREATE TABLE wal_snapshot_foreign_write(value INTEGER NOT NULL); INSERT INTO wal_snapshot_foreign_write VALUES (7)";
         struct ReleaseCapture(Arc<consensus::SnapshotCaptureGate>);
         impl Drop for ReleaseCapture {
@@ -12784,6 +12854,7 @@ mod tests {
                 "race initial membership",
             )
             .await;
+            let launch_storm = LaunchStorm::start();
             drop(
                 machine
                     .get_snapshot_builder()
@@ -12889,6 +12960,8 @@ mod tests {
                 }
                 assert!(token.current().unwrap().shutdown().is_err());
             }
+            // Reap every child before retiring this fixture's namespace lease.
+            drop(launch_storm);
             drop(machine);
             drop(log);
             drop(backend);
@@ -21355,14 +21428,19 @@ mod tests {
         );
         drop(lease);
 
-        let status =
+        let output =
             std::process::Command::new(std::env::current_exe().expect("current test executable"))
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(UMASK_CHILD, "1")
                 .env(UMASK_ROOT, directory.path())
-                .test_status()
+                .test_output()
                 .expect("run restrictive-umask child");
-        assert!(status.success(), "restrictive-umask child passes");
+        assert!(
+            output.status.success(),
+            "restrictive-umask child passes; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[cfg(target_os = "linux")]

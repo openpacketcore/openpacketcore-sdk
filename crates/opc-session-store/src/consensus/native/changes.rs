@@ -587,6 +587,16 @@ impl BusinessChanges {
         })?;
         for (key, change) in &self.keys {
             check()?;
+            scope_lease::validate_replacement(
+                key,
+                change.before.as_deref().map(|row| &**row),
+                change.after.as_deref().map(|row| &**row),
+            )?;
+            scope_batch::validate_replacement(
+                key,
+                change.before.as_deref().map(|row| &**row),
+                change.after.as_deref().map(|row| &**row),
+            )?;
             if let Some(row) = &change.after {
                 scratch::key(row, check, || {
                     validation::validate_key(key, row, &self.target.frontiers)
@@ -970,6 +980,24 @@ impl Publication {
         let memory = Arc::new(memory);
         for (key, row) in &keys {
             validation::validate_key(key, row, &frontiers)?;
+            scope_lease::validate_replacement(
+                key,
+                base.keys.get(key).map(|row| &**row),
+                Some(row),
+            )?;
+            scope_batch::validate_replacement(
+                key,
+                base.keys.get(key).map(|row| &**row),
+                Some(row),
+            )?;
+            scope_batch::validate_changed_links(
+                key,
+                base.keys.get(key).map(|row| &**row),
+                |key| {
+                    keys.get(key)
+                        .or_else(|| base.keys.get(key).map(|row| &**row))
+                },
+            )?;
             if base
                 .keys
                 .get(key)

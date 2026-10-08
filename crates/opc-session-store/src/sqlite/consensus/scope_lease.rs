@@ -1,5 +1,5 @@
-//! Bounded scope checkpoints share the durable keyed outcome collection, but
-//! replace one scope key instead of appending operation receipt keys.
+//! Bounded authority rows in the reserved scope namespace. Ordinary request
+//! receipt pruning cannot remove scope selection, grant, or replay floors.
 
 use super::*;
 use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseError, ScopeLeaseId};
@@ -15,10 +15,26 @@ pub(crate) fn read(
         .checkpoint_id()
         .map_err(|_| state_machine_intent_error())?;
     let key = scope.key().map_err(|_| state_machine_intent_error())?;
-    let legacy = ops::get_raw_sync(conn, &key)?.is_some()
-        || request_id_has_fenced_transition_receipt_sync(conn, identity, slot)?;
-    let current =
-        read_outcome_sync(conn, identity, slot).map_err(|_| state_machine_intent_error())?;
+    // Receipt-backed checkpoints are a different stored profile. Crossing
+    // this boundary is a fresh install; never interpret their absence as a
+    // reset authority row or silently move an old grant into this namespace.
+    let legacy = request_id_has_fenced_transition_receipt_sync(conn, identity, slot)?
+        || conn
+            .query_row(
+                "SELECT 1 FROM consensus_request_outcomes WHERE request_id=?1",
+                [slot.as_bytes().as_slice()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| state_machine_intent_error())?
+            .is_some();
+    let current = ops::get_raw_sync(conn, &key)?
+        .map(|record| {
+            crate::scope_lease::ScopeLeaseCheckpoint::from_record(&record)
+                .and_then(|checkpoint| checkpoint.stored())
+        })
+        .transpose()
+        .map_err(|_| state_machine_intent_error())?;
     Ok((legacy, current))
 }
 
@@ -75,15 +91,16 @@ pub(super) fn apply(
         } => application_authority_matches(scope, *origin, *authority_identity),
         _ => false,
     };
-    let slot = target
-        .checkpoint_id()
-        .map_err(|_| invalid_data("scope key invalid"))?;
     let (legacy, current) =
         read(conn, identity, target).map_err(|_| invalid_data("scope checkpoint unavailable"))?;
     let result = if target.store() != identity.cluster_id() {
         Err(ScopeLeaseError::Unauthorized)
     } else if !authorized {
         Err(authority_error(command, scope.application_authority_epoch))
+    } else if !super::scope_batch::active(conn, scope)
+        .map_err(|_| invalid_data("scope activation unavailable"))?
+    {
+        Err(ScopeLeaseError::ProfileNotActivated)
     } else if legacy {
         Err(ScopeLeaseError::FormatMismatch)
     } else {
@@ -108,13 +125,11 @@ pub(super) fn apply(
         raft_log_index: index,
     };
     if let Ok(checkpoint) = result {
-        let checkpoint_digest = checkpoint
-            .digest()
+        let record = checkpoint
+            .to_record()
             .map_err(|_| invalid_data("scope checkpoint invalid"))?;
-        conn.execute(
-            "INSERT INTO consensus_request_outcomes(request_id,configuration_epoch,payload_digest,response_json) VALUES(?1,?2,?3,?4) ON CONFLICT(request_id) DO UPDATE SET payload_digest=excluded.payload_digest,response_json=excluded.response_json",
-            params![slot.as_bytes().as_slice(), epoch_i64(identity)?, checkpoint_digest.as_slice(), encode_json(&response)?],
-        ).map_err(db_error)?;
+        ops::insert_or_replace_scope_record_sync(conn, &record)
+            .map_err(|_| invalid_data("scope checkpoint write failed"))?;
     }
     let changed = conn.execute(
         "UPDATE consensus_machine SET application_sequence=?1,last_digest=?2,logical_time=?3 WHERE singleton=1 AND configuration_epoch=?4",

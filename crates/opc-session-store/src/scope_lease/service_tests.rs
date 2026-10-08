@@ -305,7 +305,7 @@ async fn lost_reply_replay_and_restart_preserve_the_original_absolute_deadline()
         .await
         .unwrap();
     assert_eq!(replayed, acquired);
-    assert_eq!(replayed.permit().unwrap().stop_at(), at(61));
+    assert_eq!(replayed.permit().unwrap().stop_at(), at(78));
     assert!(!replayed.permit().unwrap().is_live_at(bounds(90)));
 }
 
@@ -356,7 +356,7 @@ async fn stale_configuration_outcome_remains_retryable_with_the_exact_request() 
         .await
         .unwrap();
     assert_eq!(retried.revision(), 3);
-    assert_eq!(retried.permit().unwrap().stop_at(), at(62));
+    assert_eq!(retried.permit().unwrap().stop_at(), at(79));
     assert_eq!(backend.commands.load(Ordering::SeqCst), 3);
 }
 
@@ -385,7 +385,7 @@ async fn uncertain_command_resolves_after_reply_and_readback_loss() {
         .await
         .unwrap();
     assert_eq!(recovered.revision(), 3);
-    assert_eq!(recovered.permit().unwrap().stop_at(), at(62));
+    assert_eq!(recovered.permit().unwrap().stop_at(), at(79));
     assert_eq!(
         backend.commands.load(Ordering::SeqCst),
         3,

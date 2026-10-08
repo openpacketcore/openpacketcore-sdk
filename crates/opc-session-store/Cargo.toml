@@ -27,6 +27,7 @@ test-control = []
 test-vfs = ["opc-sqlite-file-control-sys/test-vfs"]
 
 [dependencies]
+base64 = { workspace = true }
 hex = "0.4.3"
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }

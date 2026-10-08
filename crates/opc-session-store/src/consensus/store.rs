@@ -163,7 +163,9 @@ mod async_persistence;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
+mod scope_batch;
 mod scope_lease;
+mod scope_profile;
 
 use planned_shutdown::ConsensusRetirementCoordinator;
 
@@ -1082,6 +1084,7 @@ pub(crate) enum CapabilityActivationKind {
     FencedTransitionV1,
     ProtectedRosterV1,
     ProtectedRosterV2,
+    ScopeProfileV2,
 }
 
 /// The one local quorum proof that a physical V1 transition or V1 activation
@@ -1920,6 +1923,8 @@ impl ConsensusStoreDiagnosticCounters {
 }
 
 struct ConsensusSessionStoreInner {
+    #[cfg(test)]
+    scope_profile_supported: AtomicBool,
     raft: SessionRaft,
     persistence: SessionPersistenceMode,
     persistence_protocol: PersistenceProtocol,
@@ -3609,6 +3614,8 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
 
         let inner = Arc::new(ConsensusSessionStoreInner {
+            #[cfg(test)]
+            scope_profile_supported: AtomicBool::new(true),
             raft,
             persistence,
             persistence_protocol,
@@ -3839,6 +3846,8 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
 
         let inner = Arc::new(ConsensusSessionStoreInner {
+            #[cfg(test)]
+            scope_profile_supported: AtomicBool::new(true),
             raft,
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
@@ -4018,6 +4027,10 @@ impl ConsensusSessionStore {
     /// must be recreated with a successor scope after a completed topology
     /// transition; this accessor never weakens the exact-scope check at the
     /// consumer service boundary.
+    /// This synchronous authority probe can refuse while the WAL owner is
+    /// busy. Construct stable `ScopeLeaseId` values from the configured
+    /// topology's `consensus_identity()`; scope service operations perform
+    /// their own bounded, asynchronous authority admission.
     pub fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
         self.require_exact_membership_admission()?;
         if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
@@ -7720,6 +7733,9 @@ impl ConsensusSessionStore {
             observe_activation_result!(InitialScope, deadline, self.current_scope())?;
         let request = ForwardMutationRequest {
             request_id: match activation {
+                CapabilityActivationKind::ScopeProfileV2 => {
+                    scope_profile::request_id(scope_identity)
+                }
                 CapabilityActivationKind::FencedTransitionV1 => {
                     fenced_transition_activation_request_id(scope_identity)
                 }
@@ -7731,6 +7747,9 @@ impl ConsensusSessionStore {
                 }
             },
             intent: match activation {
+                CapabilityActivationKind::ScopeProfileV2 => {
+                    SessionMutationIntent::PreflightScopeProfile
+                }
                 CapabilityActivationKind::FencedTransitionV1 => {
                     SessionMutationIntent::PreflightFencedTransitionCapability
                 }
@@ -7830,6 +7849,9 @@ impl ConsensusSessionStore {
                     let (scope_identity, voters) =
                         observe_activation_result!(PostApplyScope, deadline, self.current_scope())?;
                     let activated = match activation {
+                        CapabilityActivationKind::ScopeProfileV2 => {
+                            self.scope_profile_matches(scope_identity, &voters).await
+                        }
                         CapabilityActivationKind::FencedTransitionV1 => {
                             self.inner
                                 .backend
@@ -8143,9 +8165,14 @@ impl ConsensusSessionStore {
             &request.intent,
             SessionMutationIntent::PreflightProtectedRosterProfileV2
         );
+        let scope_profile_preflight = matches!(
+            &request.intent,
+            SessionMutationIntent::PreflightScopeProfile
+        );
         let activation_preflight = fenced_activation_preflight
             || protected_roster_profile_preflight
-            || protected_roster_profile_v2_preflight;
+            || protected_roster_profile_v2_preflight
+            || scope_profile_preflight;
         let consumer_scoped = request.required_consumer_scope.is_consumer_scoped();
         let raw_v2_mutation =
             is_raw_fenced_transition_v2_mutation(&request.intent, allow_operator_recovery);
@@ -8177,6 +8204,16 @@ impl ConsensusSessionStore {
             None => true,
         };
         if !roster_profile_activated {
+            return ForwardMutationReply::Unavailable;
+        }
+        if matches!(
+            &request.intent,
+            SessionMutationIntent::ScopeLease(_) | SessionMutationIntent::ScopeBatch(_)
+        ) && !self
+            .activated_scope_profile_is_current()
+            .await
+            .unwrap_or(false)
+        {
             return ForwardMutationReply::Unavailable;
         }
         let initial_authority = if fixed_raw_v2_mutation || activated_fenced_transition {
@@ -8269,6 +8306,7 @@ impl ConsensusSessionStore {
                 | SessionMutationIntent::PreflightFencedTransitionCapability
                 | SessionMutationIntent::PreflightProtectedRosterProfile
                 | SessionMutationIntent::PreflightProtectedRosterProfileV2
+                | SessionMutationIntent::PreflightScopeProfile
         ) {
             #[cfg(test)]
             FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -8435,7 +8473,10 @@ impl ConsensusSessionStore {
                 required_consumer_scope: request.required_consumer_scope.clone(),
             })
         } else if let Some(read_admit) = fenced_read_admit {
-            let capability = match if protected_roster_profile_v2_preflight {
+            let capability = match if scope_profile_preflight {
+                self.require_scope_profile_after_read_admit(&read_admit, deadline)
+                    .await
+            } else if protected_roster_profile_v2_preflight {
                 self.require_protected_roster_profile_v2_activation_after_read_admit(
                     &read_admit,
                     deadline,
@@ -8484,30 +8525,10 @@ impl ConsensusSessionStore {
                 voter_set_digest,
                 required_consumer_scope: request.required_consumer_scope.clone(),
             };
-            match (
-                protected_roster_profile_preflight,
-                protected_roster_profile_v2_preflight,
-                fenced_activation_preflight,
-                capability,
-            ) {
-                (
-                    true,
-                    false,
-                    false,
-                    FencedTransitionCapabilityAdmission::Activated { applied_log_index },
-                )
-                | (
-                    false,
-                    true,
-                    false,
-                    FencedTransitionCapabilityAdmission::Activated { applied_log_index },
-                )
-                | (
-                    false,
-                    false,
-                    true,
-                    FencedTransitionCapabilityAdmission::Activated { applied_log_index },
-                ) => {
+            if scope_profile_preflight {
+                if let FencedTransitionCapabilityAdmission::Activated { applied_log_index } =
+                    capability
+                {
                     if self
                         .revalidate_fenced_transition_proposal_admission_before(
                             &admission,
@@ -8519,54 +8540,106 @@ impl ConsensusSessionStore {
                     {
                         return ForwardMutationReply::Unavailable;
                     }
-                    // This index was observed with the exact certificate.
-                    // Openraft metrics can still precede that backend apply.
+                    // Scope certificates use the same atomic backend frontier
+                    // as the other activation kinds, never lagging Raft metrics.
                     return ForwardMutationReply::FencedTransitionActivation(Ok(
                         FencedTransitionActivationReply { applied_log_index },
                     ));
                 }
-                (true, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
-                    request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
-                        schema_version: FENCED_TRANSITION_SCHEMA_V1,
-                        scope_identity,
-                        voter_set_digest: protected_roster_profile_voter_set_digest(
+                request.intent = Self::scope_profile_activation(scope_identity, voter_set_digest);
+            } else {
+                match (
+                    protected_roster_profile_preflight,
+                    protected_roster_profile_v2_preflight,
+                    fenced_activation_preflight,
+                    capability,
+                ) {
+                    (
+                        true,
+                        false,
+                        false,
+                        FencedTransitionCapabilityAdmission::Activated { applied_log_index },
+                    )
+                    | (
+                        false,
+                        true,
+                        false,
+                        FencedTransitionCapabilityAdmission::Activated { applied_log_index },
+                    )
+                    | (
+                        false,
+                        false,
+                        true,
+                        FencedTransitionCapabilityAdmission::Activated { applied_log_index },
+                    ) => {
+                        if self
+                            .revalidate_fenced_transition_proposal_admission_before(
+                                &admission,
+                                &request.required_consumer_scope,
+                                deadline,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return ForwardMutationReply::Unavailable;
+                        }
+                        // This index was observed with the exact certificate.
+                        // Openraft metrics can still precede that backend apply.
+                        return ForwardMutationReply::FencedTransitionActivation(Ok(
+                            FencedTransitionActivationReply { applied_log_index },
+                        ));
+                    }
+                    (true, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                        request.intent =
+                            SessionMutationIntent::ActivateFencedTransitionCapability {
+                                schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                                scope_identity,
+                                voter_set_digest: protected_roster_profile_voter_set_digest(
+                                    scope_identity,
+                                    &voters,
+                                ),
+                            };
+                    }
+                    (false, true, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                        let profile = crate::fenced_mutation_roster::Profile::v2();
+                        request.intent = SessionMutationIntent::ActivateProtectedRosterProfileV2 {
+                            schema_version: profile.schema(),
+                            consumer_revision: profile.consumer_revision(),
                             scope_identity,
-                            &voters,
-                        ),
-                    };
-                }
-                (false, true, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
-                    let profile = crate::fenced_mutation_roster::Profile::v2();
-                    request.intent = SessionMutationIntent::ActivateProtectedRosterProfileV2 {
-                        schema_version: profile.schema(),
-                        consumer_revision: profile.consumer_revision(),
-                        scope_identity,
-                        voter_set_digest: protected_roster_profile_v2_voter_set_digest(
+                            voter_set_digest: protected_roster_profile_v2_voter_set_digest(
+                                scope_identity,
+                                &voters,
+                            ),
+                            profile_digest: profile.digest(),
+                        };
+                    }
+                    (false, false, true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                        request.intent =
+                            SessionMutationIntent::ActivateFencedTransitionCapability {
+                                schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                                scope_identity,
+                                voter_set_digest,
+                            };
+                    }
+                    (false, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                        let SessionMutationIntent::FencedTransition(transition) = request.intent
+                        else {
+                            return ForwardMutationReply::Unavailable;
+                        };
+                        request.intent = SessionMutationIntent::ActivateFencedTransition {
+                            request: transition,
                             scope_identity,
-                            &voters,
-                        ),
-                        profile_digest: profile.digest(),
-                    };
+                            voter_set_digest,
+                        };
+                    }
+                    (
+                        false,
+                        false,
+                        false,
+                        FencedTransitionCapabilityAdmission::Activated { .. },
+                    ) => {}
+                    _ => return ForwardMutationReply::Unavailable,
                 }
-                (false, false, true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
-                    request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
-                        schema_version: FENCED_TRANSITION_SCHEMA_V1,
-                        scope_identity,
-                        voter_set_digest,
-                    };
-                }
-                (false, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
-                    let SessionMutationIntent::FencedTransition(transition) = request.intent else {
-                        return ForwardMutationReply::Unavailable;
-                    };
-                    request.intent = SessionMutationIntent::ActivateFencedTransition {
-                        request: transition,
-                        scope_identity,
-                        voter_set_digest,
-                    };
-                }
-                (false, false, false, FencedTransitionCapabilityAdmission::Activated { .. }) => {}
-                _ => return ForwardMutationReply::Unavailable,
             }
             Some(admission)
         } else {
@@ -10430,7 +10503,7 @@ impl ConsensusSessionStore {
             .await?;
         let before = page.records.len();
         page.records
-            .retain(|record| !crate::scope_lease::is_scope_lease_key(&record.key));
+            .retain(|record| !crate::scope_storage::is_scope_record_key(&record.key));
         page.loaded_count = page.records.len();
         page.excluded_count += before - page.loaded_count;
         // Keep the backend cursor and completion bit even for an empty page.
@@ -10603,6 +10676,9 @@ fn fenced_transition_activation_scope(
     intent: &SessionMutationIntent,
 ) -> Option<FencedTransitionActivationScope<'_>> {
     match intent {
+        SessionMutationIntent::ActivateScopeProfile(certificate) => {
+            Some((&certificate.identity, &certificate.voters, None))
+        }
         SessionMutationIntent::ActivateFencedTransition {
             scope_identity,
             voter_set_digest,
@@ -10685,6 +10761,10 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
                 | SessionMutationIntent::RosterTerminalV2(_)
                 | SessionMutationIntent::RosterAdmission(_)
                 | SessionMutationIntent::RosterTerminal(_)
+                | SessionMutationIntent::ScopeLease(_)
+                | SessionMutationIntent::ScopeBatch(_)
+                | SessionMutationIntent::PreflightScopeProfile
+                | SessionMutationIntent::ActivateScopeProfile(_)
         )
 }
 
@@ -10768,7 +10848,9 @@ fn committed_response_matches_intent(
     if let Ok(outcome) = &response.result {
         let uses_dedicated_roster_validation = matches!(
             outcome,
-            SessionMutationOutcome::RosterAdmission(_)
+            SessionMutationOutcome::ScopeBatch(_)
+                | SessionMutationOutcome::ScopeLease(_)
+                | SessionMutationOutcome::RosterAdmission(_)
                 | SessionMutationOutcome::RosterTerminal(_)
                 | SessionMutationOutcome::RosterAdmissionV2(_)
                 | SessionMutationOutcome::RosterTerminalV2(_)
@@ -10780,6 +10862,13 @@ fn committed_response_matches_intent(
         }
     }
     match (&response.result, intent) {
+        (
+            Ok(SessionMutationOutcome::ScopeBatch(result)),
+            SessionMutationIntent::ScopeBatch(operation),
+        ) => match result {
+            Ok(outcome) => operation.matches(outcome),
+            Err(error) => operation.matches_error(error),
+        },
         (
             Ok(SessionMutationOutcome::ScopeLease(result)),
             SessionMutationIntent::ScopeLease(operation),
@@ -11383,6 +11472,19 @@ fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreEr
 }
 
 fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
+    if matches!(error, StoreError::SessionRecordReserved) {
+        return matches!(
+            intent,
+            SessionMutationIntent::CompareAndSet(_)
+                | SessionMutationIntent::DeleteFenced(_)
+                | SessionMutationIntent::RefreshTtl { .. }
+                | SessionMutationIntent::AcquireLease { .. }
+                | SessionMutationIntent::RenewLease { .. }
+                | SessionMutationIntent::ReleaseLease(_)
+                | SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::FencedTransitionV2(_)
+        );
+    }
     // Application-authority revocation is a deterministic committed outcome
     // for every user mutation. The response is matched against the original
     // unwrapped intent, not the state-machine-only `Authorized` envelope.
@@ -11406,7 +11508,11 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         );
     }
     match intent {
-        SessionMutationIntent::AdvanceLogicalTime | SessionMutationIntent::ScopeLease(_) => false,
+        SessionMutationIntent::AdvanceLogicalTime
+        | SessionMutationIntent::ScopeLease(_)
+        | SessionMutationIntent::ScopeBatch(_)
+        | SessionMutationIntent::PreflightScopeProfile
+        | SessionMutationIntent::ActivateScopeProfile(_) => false,
         SessionMutationIntent::BindConsumerRequest { .. } => {
             matches!(error, StoreError::CasIdempotencyConflict)
         }
@@ -11676,6 +11782,7 @@ fn validate_consensus_intent_with_recovery(
             | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
+            | SessionMutationIntent::ActivateScopeProfile(_)
             | SessionMutationIntent::Authorized { .. }
     ) {
         return Err(StoreError::CapabilityNotSupported(
@@ -11700,6 +11807,11 @@ fn validate_consensus_intent_with_recovery(
         operation
             .validate()
             .map_err(|_| StoreError::InvalidKey("scope operation invalid".into()))?;
+    }
+    if let SessionMutationIntent::ScopeBatch(operation) = intent {
+        operation
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("scope batch invalid".into()))?;
     }
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_sealed_payload(op)?;
@@ -12121,6 +12233,11 @@ impl SessionConsensusService {
                         .checked_add(self.store.inner.operation_timeout)
                         .unwrap_or_else(tokio::time::Instant::now);
                     return encode_service_reply(&self.store.local_read_barrier(deadline).await);
+                }
+                if let Ok(probe) =
+                    decode_bounded::<scope_profile::ScopeProfileProbe>(&request.payload)
+                {
+                    return encode_service_reply(&self.store.scope_profile_probe_reply(probe));
                 }
                 if let Ok(probe) =
                     decode_bounded::<FencedTransitionCapabilityProbe>(&request.payload)
@@ -15924,7 +16041,7 @@ impl SessionBackend for ConsensusSessionStore {
             .await?;
         let before = page.records.len();
         page.records
-            .retain(|record| !crate::scope_lease::is_scope_lease_key(&record.key));
+            .retain(|record| !crate::scope_storage::is_scope_record_key(&record.key));
         page.loaded_count = page.records.len();
         page.excluded_count += before - page.loaded_count;
         // Keep the backend cursor and completion bit even for an empty page.
@@ -18891,6 +19008,13 @@ mod membership_tests {
         let authority = roster_response_authority(&admission);
         let profile_v2 = crate::fenced_mutation_roster::Profile::v2();
         let mutations = vec![
+            SessionMutationIntent::PreflightScopeProfile,
+            SessionMutationIntent::ActivateScopeProfile(Box::new(
+                crate::scope_lease::ScopeProfileActivation::new(
+                    singleton_topology().consensus_identity().unwrap(),
+                    [0x42; 32],
+                ),
+            )),
             SessionMutationIntent::RosterAdmission(Box::new(
                 roster_response_production_admission_command(admission.clone(), authority.clone()),
             )),
@@ -19190,6 +19314,7 @@ mod membership_tests {
             .expect("initialize activation receiver effect store");
 
         for (label, activation) in [
+            ("scope profile 2", CapabilityActivationKind::ScopeProfileV2),
             (
                 "fenced transition V1",
                 CapabilityActivationKind::FencedTransitionV1,
@@ -19216,6 +19341,13 @@ mod membership_tests {
             let (result, failure) =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
+                        CapabilityActivationKind::ScopeProfileV2 => {
+                            store
+                                .ensure_scope_profile_before(
+                                    tokio::time::Instant::now() + store.inner.operation_timeout,
+                                )
+                                .await
+                        }
                         CapabilityActivationKind::FencedTransitionV1 => {
                             store.activate_fenced_transition_capability().await
                         }
@@ -19268,6 +19400,7 @@ mod membership_tests {
             .expect("initialize deadline activation receiver store");
 
         for (label, activation) in [
+            ("scope profile 2", CapabilityActivationKind::ScopeProfileV2),
             (
                 "fenced transition V1",
                 CapabilityActivationKind::FencedTransitionV1,
@@ -19297,6 +19430,13 @@ mod membership_tests {
             let activation_call =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
+                        CapabilityActivationKind::ScopeProfileV2 => {
+                            store
+                                .ensure_scope_profile_before(
+                                    tokio::time::Instant::now() + store.inner.operation_timeout,
+                                )
+                                .await
+                        }
                         CapabilityActivationKind::FencedTransitionV1 => {
                             store.activate_fenced_transition_capability().await
                         }
@@ -19343,6 +19483,13 @@ mod membership_tests {
             let (resolved, failure) =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
+                        CapabilityActivationKind::ScopeProfileV2 => {
+                            store
+                                .ensure_scope_profile_before(
+                                    tokio::time::Instant::now() + store.inner.operation_timeout,
+                                )
+                                .await
+                        }
                         CapabilityActivationKind::FencedTransitionV1 => {
                             store.activate_fenced_transition_capability().await
                         }
@@ -21571,24 +21718,44 @@ mod membership_tests {
             stable_id: Bytes::from_static(&[1; 32]).try_into().unwrap(),
             ..key.clone()
         };
-        let reserved_lease = store
-            .acquire(&reserved, lease.owner().clone(), Duration::from_secs(60))
-            .await
-            .unwrap();
-        for (key, lease) in [(&key, &lease), (&reserved, &reserved_lease)] {
-            assert_eq!(
-                store
-                    .compare_and_set(CompareAndSet {
-                        key: key.clone(),
-                        lease: lease.clone(),
-                        expected_generation: None,
-                        new_record: consumer_record_with_payload_len(key, lease, 1024),
-                    })
-                    .await
-                    .unwrap(),
-                CompareAndSetResult::Success
-            );
+        assert_eq!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: consumer_record_with_payload_len(&key, &lease, 1024),
+                })
+                .await
+                .unwrap(),
+            CompareAndSetResult::Success,
+        );
+        let scope_id = crate::scope_lease::ScopeLeaseId::new(
+            scope.consensus_identity(),
+            key.tenant.clone(),
+            key.nf_kind.clone(),
+            [1; 32],
+        )
+        .unwrap();
+        let checkpoint = crate::scope_lease::ScopeLeaseCommand {
+            request: crate::scope_lease::ScopeLeaseRequest::new(
+                scope_id,
+                [0xFA; 16],
+                0,
+                crate::scope_lease::ScopeLeaseOperation::Select {
+                    execution: crate::scope_lease::tests::execution(1),
+                },
+            )
+            .unwrap(),
+            bounds: crate::scope_lease::tests::bounds(0),
         }
+        .apply(None)
+        .unwrap();
+        let row = checkpoint.to_record().unwrap();
+        assert_eq!(row.key, reserved);
+        let fixture_conn =
+            rusqlite::Connection::open(_directory.path().join("store.sqlite")).unwrap();
+        crate::sqlite::ops::insert_or_replace_scope_record_sync(&fixture_conn, &row).unwrap();
         let mut scan = RestoreScanRequest::all(1);
         scan.scope.tenant = Some(key.tenant.clone());
         scan.scope.nf_kind = Some(key.nf_kind.clone());
@@ -21628,7 +21795,16 @@ mod membership_tests {
             [1; 32],
         )
         .unwrap();
-        let legacy =
+        // Local authority-row corruption refuses the read independently of
+        // the successful current-profile restore scan above. It must not be
+        // confused with a deterministic old-format command refusal.
+        fixture_conn
+            .execute(
+                "UPDATE session_records SET payload=x'00' WHERE key_type='opc-scope-lease'",
+                [],
+            )
+            .unwrap();
+        let corrupt =
             crate::scope_lease::service::ScopeLeaseBackend::current(&store, &authority).await;
         store.shutdown().await.unwrap();
         assert_eq!(
@@ -21638,8 +21814,8 @@ mod membership_tests {
         );
         assert_eq!(records[0].key, key);
         assert_eq!(
-            legacy,
-            Err(crate::scope_lease::ScopeLeaseError::FormatMismatch)
+            corrupt,
+            Err(crate::scope_lease::ScopeLeaseError::Unavailable)
         );
     }
 
@@ -25776,9 +25952,40 @@ mod membership_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn v2_submit_effect_boundary_retains_an_openraft_accepted_request() {
+        async fn stage<F: std::future::Future>(name: &str, future: F) -> F::Output {
+            let (cancel, waiting) = std::sync::mpsc::channel::<()>();
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut watchdog = tokio::task::spawn_blocking(move || {
+                waiting.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            });
+            let result = tokio::select! {
+                biased;
+                result = future => Some(result),
+                expired = &mut watchdog => {
+                    let _ = expired.expect("V2 effect phase wall guard");
+                    None
+                }
+            };
+            drop(cancel);
+            match result {
+                Some(result) => {
+                    let _ = watchdog.await.expect("retire V2 effect phase wall guard");
+                    result
+                }
+                None => panic!("{name}: one-second V2 effect phase wall guard elapsed"),
+            }
+        }
+
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        // Host scheduling and real disk work must not exhaust the 150ms
+        // protocol deadline before this fixture reaches accepted-but-unapplied
+        // work. This blocking receive inhibits automatic clock advance without
+        // putting setup or cleanup inside a real-time performance bound.
+        // Dropping its sender releases it on both success and panic.
+        let (release_clock, held_clock) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || held_clock.recv());
         let directory = tempfile::tempdir().expect("V2 accepted effect boundary directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("V2 accepted effect boundary SQLite backend");
@@ -25812,48 +26019,69 @@ mod membership_tests {
             .expect("hold V2 accepted effect state-machine apply");
         let submitting_store = store.clone();
         let submitted_request = request.clone();
-        let submission = tokio::spawn(async move {
-            submitting_store
-                .submit_request_effect_before(
-                    fenced_transition_v2_outer_request_id(&submitted_request),
-                    SessionMutationIntent::FencedTransitionV2(Box::new(submitted_request)),
-                    None,
-                    tokio::time::Instant::now() + Duration::from_millis(150),
-                )
-                .await
-        });
-        wait_for_log_index_after(&store, before, "V2 effect-boundary accepted proposal").await;
-        assert!(matches!(
-            submission.await.expect("V2 effect submission task"),
-            ConsensusSubmissionEffect::OutcomeUnknown
-        ));
+        stage("accepting the proposal and observing its deadline", async {
+            let mut submission = tokio::spawn(async move {
+                submitting_store
+                    .submit_request_effect_before(
+                        fenced_transition_v2_outer_request_id(&submitted_request),
+                        SessionMutationIntent::FencedTransitionV2(Box::new(submitted_request)),
+                        None,
+                        tokio::time::Instant::now() + Duration::from_millis(150),
+                    )
+                    .await
+            });
+            // The enclosing wall guard bounds this wait while protocol time is
+            // frozen, including the accepted request's deadline completion.
+            wait_for_log_index_after(&store, before, "V2 effect-boundary accepted proposal").await;
+            tokio::time::advance(Duration::from_millis(149)).await;
+            assert!(
+                matches!(
+                    futures_util::poll!(&mut submission),
+                    std::task::Poll::Pending
+                ),
+                "the accepted request remains pending before its original 150ms deadline"
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(matches!(
+                submission.await.expect("V2 effect submission task"),
+                ConsensusSubmissionEffect::OutcomeUnknown
+            ));
+        })
+        .await;
 
-        drop(held_apply);
-        let permits = tokio::time::timeout(
-            Duration::from_secs(1),
-            Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
-                    .expect("proposal slot count fits u32"),
-            ),
+        stage(
+            "releasing admission and reading the retained receipt",
+            async {
+                drop(held_apply);
+                let permits = Arc::clone(&store.inner.proposal_admission)
+                    .acquire_many_owned(
+                        u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                            .expect("proposal slot count fits u32"),
+                    )
+                    .await
+                    .expect("proposal admission remains open");
+                drop(permits);
+
+                let (authority_identity, _) = store.current_scope().expect("current V2 authority");
+                assert!(matches!(
+                    store
+                        .inner
+                        .backend
+                        .consensus_fenced_transition_v2_status(
+                            store.inner.storage_identity,
+                            authority_identity,
+                            &request,
+                        )
+                        .await,
+                    Ok(FencedTransitionV2Status::Recorded(_))
+                ));
+            },
         )
-        .await
-        .expect("accepted V2 supervisor releases admission")
-        .expect("proposal admission remains open");
-        drop(permits);
-
-        let (authority_identity, _) = store.current_scope().expect("current V2 authority");
-        assert!(matches!(
-            store
-                .inner
-                .backend
-                .consensus_fenced_transition_v2_status(
-                    store.inner.storage_identity,
-                    authority_identity,
-                    &request,
-                )
-                .await,
-            Ok(FencedTransitionV2Status::Recorded(_))
-        ));
+        .await;
+        drop(release_clock);
+        let _ = clock_guard
+            .await
+            .expect("retire V2 effect protocol clock guard");
     }
 
     #[tokio::test]

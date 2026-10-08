@@ -79,13 +79,18 @@ impl NativeState {
     ) -> Result<crate::sqlite::consensus::scope_lease::StoredCheckpoint, StoreError> {
         let receipts = self.consumer_receipts()?;
         let slot = scope.checkpoint_id().map_err(|_| unavailable())?;
-        let current = receipts
-            .outcome(identity, slot)
-            .map_err(|_| unavailable())?;
         let key = scope.key().map_err(|_| unavailable())?;
-        let legacy = self.keys.get(&key).is_some_and(|row| row.record.is_some())
-            || receipts.fenced(identity, slot)?;
-        Ok((legacy, current))
+        let legacy = receipts.occupied(identity, slot)?;
+        let current = self
+            .keys
+            .get(&key)
+            .and_then(|row| row.record.as_ref())
+            .map(|record| {
+                crate::scope_lease::ScopeLeaseCheckpoint::from_record(record)
+                    .and_then(|checkpoint| checkpoint.stored())
+            })
+            .transpose();
+        Ok((legacy || current.is_err(), current.unwrap_or(None)))
     }
 
     /// Passive test receipt witness from the selected native owner. No SQL

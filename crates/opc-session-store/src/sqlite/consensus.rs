@@ -15,6 +15,7 @@ pub(crate) mod roster_reads;
 pub(crate) mod roster_rows;
 #[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
+pub(crate) mod scope_batch;
 pub(crate) mod scope_lease;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14381,6 +14382,9 @@ fn ensure_session_record_unreserved_sync(
     conn: &Connection,
     key: &crate::model::SessionKey,
 ) -> Result<(), StoreError> {
+    if crate::scope_storage::is_scope_record_key(key) {
+        return Err(StoreError::SessionRecordReserved);
+    }
     let commitment = session_key_commitment(key);
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn).map_err(|_| {
         StoreError::BackendUnavailable("protected roster reservation validation failed".into())
@@ -17077,6 +17081,16 @@ impl SqliteSessionBackend {
                     return Err(invalid_data("native activation storage identity differs"));
                 }
                 let activated = match activation {
+                    CapabilityActivationKind::ScopeProfileV2 => {
+                        let key = crate::scope_storage::profile_key(scope_identity.cluster_id())
+                            .map_err(|_| invalid_data("scope profile key invalid"))?;
+                        let row = state
+                            .scope_record(storage_identity, &key)
+                            .map_err(|_| invalid_data("scope activation unavailable"))?;
+                        matches!(row, Some(crate::scope_storage::ScopeRow::Activation(certificate))
+                            if certificate.matches(scope_identity,
+                                fenced_transition_voter_set_digest(scope_identity, &voters)))
+                    }
                     CapabilityActivationKind::FencedTransitionV1 => {
                         state.v1_activation_matches(scope_identity, &voters)
                     }
@@ -17163,6 +17177,21 @@ fn capability_activation_applied_index_sync(
 ) -> io::Result<Option<u64>> {
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     let activated = match activation {
+        CapabilityActivationKind::ScopeProfileV2 => {
+            if read_storage_identity_sync(&tx)
+                .map_err(|_| invalid_data("scope activation storage identity is invalid"))?
+                != storage_identity
+            {
+                return Err(invalid_data("scope activation storage identity differs"));
+            }
+            let key = crate::scope_storage::profile_key(scope_identity.cluster_id())
+                .map_err(|_| invalid_data("scope profile key invalid"))?;
+            let row = scope_batch::read(&tx, &key)
+                .map_err(|_| invalid_data("scope activation unavailable"))?;
+            matches!(row, Some(crate::scope_storage::ScopeRow::Activation(certificate))
+                if certificate.matches(scope_identity,
+                    fenced_transition_voter_set_digest(scope_identity, voters)))
+        }
         CapabilityActivationKind::FencedTransitionV1 => {
             fenced_transition_activation_matches_scope_sync(
                 &tx,
@@ -22115,6 +22144,17 @@ pub(crate) fn validate_command_for_log(
         }
     }
     match semantic_intent {
+        SessionMutationIntent::PreflightScopeProfile => {
+            return Err(invalid_data("scope activation preflight reached the log"))
+        }
+        SessionMutationIntent::ActivateScopeProfile(certificate) => {
+            certificate
+                .validate()
+                .map_err(|_| invalid_data("scope activation profile invalid"))?;
+            if !matches!(command.intent, SessionMutationIntent::Authorized { .. }) {
+                return Err(invalid_data("scope activation requires current authority"));
+            }
+        }
         SessionMutationIntent::PreflightFencedTransitionCapability
         | SessionMutationIntent::PreflightProtectedRosterProfile
         | SessionMutationIntent::PreflightProtectedRosterProfileV2 => {
@@ -22168,6 +22208,21 @@ pub(crate) fn validate_command_for_log(
             .map_err(|_| invalid_data("scope operation invalid"))?;
         if !matches!(command.intent, SessionMutationIntent::Authorized { .. }) {
             return Err(invalid_data("scope operation requires current authority"));
+        }
+    }
+    if let SessionMutationIntent::ScopeBatch(operation) = semantic_intent {
+        operation
+            .validate()
+            .map_err(|_| invalid_data("scope batch invalid"))?;
+        if !matches!(command.intent, SessionMutationIntent::Authorized { .. }) {
+            return Err(invalid_data("scope batch requires current authority"));
+        }
+        if serde_json::to_vec(command)
+            .map_err(|_| invalid_data("scope batch encoding invalid"))?
+            .len()
+            > crate::scope_batch::MAX_SCOPE_BATCH_COMMAND_BYTES
+        {
+            return Err(invalid_data("scope batch exceeds encoded command bound"));
         }
     }
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
@@ -23704,7 +23759,10 @@ impl MembershipLogProjection {
                 terminal.finalization_log_index = Some(log_index);
                 Ok(())
             }
-            SessionMutationIntent::ScopeLease(_)
+            SessionMutationIntent::ScopeBatch(_)
+            | SessionMutationIntent::ActivateScopeProfile(_)
+            | SessionMutationIntent::PreflightScopeProfile
+            | SessionMutationIntent::ScopeLease(_)
             | SessionMutationIntent::AdvanceLogicalTime
             | SessionMutationIntent::BindConsumerRequest { .. }
             | SessionMutationIntent::ReadConsumerRecord { .. }
@@ -30742,15 +30800,15 @@ pub(crate) fn validate_consensus_outcome_records(
     outcome: &SessionMutationOutcome,
 ) -> Result<(), StoreError> {
     match outcome {
+        SessionMutationOutcome::ScopeBatch(_) | SessionMutationOutcome::ScopeLease(_) => {
+            Err(StoreError::Serialization(
+                "scope format mismatch: checkpoint in ordinary receipt collection".into(),
+            ))
+        }
         SessionMutationOutcome::ConsumerRecord(Some(record))
         | SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
             current: Some(record),
         }) => super::validate_consensus_record(record),
-        SessionMutationOutcome::ScopeLease(Ok(checkpoint)) => checkpoint
-            .state()
-            .map(|_| ())
-            .map_err(|_| StoreError::Serialization("scope checkpoint invalid".into())),
-        SessionMutationOutcome::ScopeLease(Err(_)) => Ok(()),
         SessionMutationOutcome::FencedTransition(outcome) => outcome.validate(),
         SessionMutationOutcome::FencedTransitionV2Batch(outcomes) => {
             validate_fenced_transition_v2_batch_outcomes(outcomes)
@@ -30804,11 +30862,6 @@ fn read_outcome_sync(
     if let Ok(outcome) = &response.result {
         validate_consensus_outcome_records(outcome)
             .map_err(|_| invalid_data("persisted session consensus outcome record is invalid"))?;
-    }
-    if let Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) = &response.result {
-        checkpoint
-            .validate_slot(request_id, digest)
-            .map_err(|_| invalid_data("scope checkpoint slot differs"))?;
     }
     Ok(Some((digest, response)))
 }
@@ -30935,9 +30988,16 @@ fn execute_application_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
-        SessionMutationIntent::ScopeLease(_) => Err(StoreError::BackendUnavailable(
-            "scope command reached ordinary apply".into(),
+        SessionMutationIntent::ActivateScopeProfile(certificate) => {
+            scope_batch::activate(conn, certificate)?;
+            Ok((SessionMutationOutcome::Unit, None))
+        }
+        SessionMutationIntent::PreflightScopeProfile => Err(StoreError::CapabilityNotSupported(
+            "scope activation preflight reached apply".into(),
         )),
+        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeLease(_) => Err(
+            StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
+        ),
 
         SessionMutationIntent::AdvanceLogicalTime
         | SessionMutationIntent::BindConsumerRequest { .. }
@@ -31079,6 +31139,9 @@ fn execute_application_intent_sync(
             ))
         }
         SessionMutationIntent::AcquireLease { key, owner, ttl } => {
+            if crate::scope_storage::is_scope_record_key(key) {
+                return Err(StoreError::SessionRecordReserved);
+            }
             let guard = lease::acquire_sync(conn, key, owner.clone(), *ttl, logical_time)
                 .map_err(lease_error_to_store)?;
             Ok((
@@ -31094,6 +31157,9 @@ fn execute_application_intent_sync(
             ))
         }
         SessionMutationIntent::RenewLease { lease: guard, ttl } => {
+            if crate::scope_storage::is_scope_record_key(guard.key()) {
+                return Err(StoreError::SessionRecordReserved);
+            }
             let renewed =
                 lease::renew_sync(conn, guard, *ttl, logical_time).map_err(lease_error_to_store)?;
             Ok((
@@ -31109,6 +31175,9 @@ fn execute_application_intent_sync(
             ))
         }
         SessionMutationIntent::ReleaseLease(guard) => {
+            if crate::scope_storage::is_scope_record_key(guard.key()) {
+                return Err(StoreError::SessionRecordReserved);
+            }
             lease::release_sync(conn, guard.clone(), logical_time).map_err(lease_error_to_store)?;
             Ok((
                 SessionMutationOutcome::Unit,
@@ -31264,9 +31333,9 @@ fn execute_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
-        SessionMutationIntent::ScopeLease(_) => Err(StoreError::BackendUnavailable(
-            "scope command reached ordinary apply".into(),
-        )),
+        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeLease(_) => Err(
+            StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
+        ),
 
         SessionMutationIntent::PrepareTopologyTransition {
             transition_id,
@@ -31911,6 +31980,20 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
         // exact durable terminal composite. Complete it before the unchanged
         // generic match so rustfmt does not obscure that mature apply path.
         if let EntryPayload::Normal(command) = &entry.payload {
+            if scope_batch::operation(&command.intent).is_some() {
+                let response = scope_batch::apply(
+                    &tx,
+                    identity,
+                    &scope,
+                    command,
+                    entry.log_id.index,
+                    &mut machine,
+                )?;
+                save_log_pointer(&tx, "consensus_applied", identity, &entry.log_id)?;
+                last_applied = Some(entry.log_id);
+                responses.push(response);
+                continue;
+            }
             if scope_lease::operation(&command.intent).is_some() {
                 let response = scope_lease::apply(
                     &tx,
@@ -34047,6 +34130,9 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
             }
             _ => invalid_data("session consensus snapshot envelope is invalid"),
         })?;
+        if crate::scope_storage::is_batch_record_key(&record.key) {
+            scope_batch::validate_links(conn, &record)?;
+        }
     }
 
     validate_lease_state_sync(conn)?;
@@ -34440,8 +34526,11 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
             expires_at_unix_ms,
             guard_expires_at,
         ) = row.map_err(db_error)?;
-        ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
+        let key = ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
             .map_err(|_| invalid_lease_state())?;
+        if crate::scope_storage::is_scope_record_key(&key) {
+            return Err(invalid_lease_state());
+        }
         if !matches!(active, 0 | 1) {
             return Err(invalid_lease_state());
         }
@@ -34490,8 +34579,11 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
         .map_err(db_error)?;
     for row in fences {
         let (tenant, nf_kind, key_type, stable_id, fence) = row.map_err(db_error)?;
-        ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
+        let key = ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
             .map_err(|_| invalid_lease_state())?;
+        if crate::scope_storage::is_scope_record_key(&key) {
+            return Err(invalid_lease_state());
+        }
         maximum_fence =
             maximum_fence.max(checked_positive_u64(fence).map_err(|_| invalid_lease_state())?);
     }
@@ -34507,7 +34599,8 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                  AND fence.nf_kind = record.nf_kind
                  AND fence.key_type = record.key_type
                  AND fence.stable_id = record.stable_id
-                WHERE fence.fence IS NULL OR fence.fence < record.fence
+                WHERE (fence.fence IS NULL OR fence.fence < record.fence)
+                  AND NOT (record.fence = 0 AND record.key_type IN (?1, ?2, ?3, ?4, ?5))
                 UNION ALL
                 SELECT 1
                 FROM leases AS lease
@@ -34529,7 +34622,7 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                 WHERE record.owner != lease.owner
             )
             "#,
-            [],
+            crate::scope_storage::RESERVED_KEY_TYPES,
             |row| row.get::<_, bool>(0),
         )
         .map_err(db_error)?;
@@ -39148,6 +39241,8 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_syn
         validation?;
         drop_views?;
 
+        scope_batch::validate_snapshot_preserves_scopes(&tx)?;
+
         // Only a fully validated incoming ledger may participate in the
         // anti-rollback comparison. A snapshot may add receipts or compact an
         // exact result after its deadline, but it must never erase or rewrite
@@ -40466,6 +40561,8 @@ pub(crate) mod historical_snapshot_fixture;
 #[cfg(test)]
 mod tests {
     mod activation_ack;
+    #[path = "scope_batch.rs"]
+    mod scope_batch_tests;
     #[path = "scope_lease.rs"]
     mod scope_lease_tests;
     #[cfg(target_os = "linux")]
@@ -45567,12 +45664,17 @@ mod tests {
         // The sync fault controller is process-global. Keep both its failure
         // injection and exact physical callback counts isolated from peers.
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new("/proc/self/exe")
+            let output = std::process::Command::new("/proc/self/exe")
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(CHILD, "1")
-                .test_status()
+                .test_output()
                 .expect("run isolated compaction sync regression");
-            assert!(status.success(), "isolated compaction regression succeeds");
+            assert!(
+                output.status.success(),
+                "isolated compaction regression succeeds; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
             return;
         }
         install_test_main_sync_block_vfs().expect("register compaction sync VFS");
@@ -46001,12 +46103,17 @@ mod tests {
         // target path: a concurrent linker may unlink that path while this
         // long-running test binary remains executable through /proc.
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new("/proc/self/exe")
+            let output = std::process::Command::new("/proc/self/exe")
                 .args(["--exact", TEST_NAME])
                 .env(CHILD, "1")
-                .test_status()
+                .test_output()
                 .expect("run isolated temporary-path failure regression");
-            assert!(status.success(), "isolated regression succeeds");
+            assert!(
+                output.status.success(),
+                "isolated regression succeeds; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
             return;
         }
 

@@ -41,6 +41,8 @@ pub(in crate::consensus::native) struct Key {
     pub(in crate::consensus::native) commitment: [u8; 32],
     pub(in crate::consensus::native) reserved: bool,
     pub(in crate::consensus::native) business: Business,
+    pub(in crate::consensus::native) scope: Option<crate::scope_lease::ScopeCheckpointFacts>,
+    pub(in crate::consensus::native) batch: Option<crate::scope_storage::Facts>,
 }
 
 /// Comparison of an original fully validated authoritative business value.
@@ -83,6 +85,30 @@ impl Key {
             commitment: crate::fenced_mutation_roster::session_key_commitment(key),
             reserved: row.reserved,
             business,
+            scope: if crate::scope_lease::is_scope_lease_key(key) {
+                row.record
+                    .as_ref()
+                    .map(|record| {
+                        crate::scope_lease::ScopeLeaseCheckpoint::from_record(record)
+                            .and_then(|checkpoint| checkpoint.facts())
+                            .map_err(|_| invalid("scope catalog checkpoint invalid"))
+                    })
+                    .transpose()?
+            } else {
+                None
+            },
+            batch: if crate::scope_storage::is_batch_record_key(key) {
+                row.record
+                    .as_ref()
+                    .map(|record| {
+                        crate::scope_storage::ScopeRow::from_record(record)
+                            .and_then(|row| row.facts())
+                            .map_err(|_| invalid("scope catalog row invalid"))
+                    })
+                    .transpose()?
+            } else {
+                None
+            },
         })
     }
 }
@@ -131,7 +157,6 @@ pub(in crate::consensus::native) struct Request {
     payload_digest: [u8; 32],
     pub(super) retained_until: Option<Timestamp>,
     response: Option<Response>,
-    scope: Option<crate::scope_lease::ScopeCheckpointFacts>,
 }
 
 impl Request {
@@ -145,14 +170,6 @@ impl Request {
             payload_digest,
             retained_until,
             response: row.response().map(Response::of).transpose()?,
-            scope: match row.response().map(|response| &response.result) {
-                Some(Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint)))) => Some(
-                    checkpoint
-                        .facts()
-                        .map_err(|_| invalid("scope catalog checkpoint invalid"))?,
-                ),
-                _ => None,
-            },
         })
     }
 
@@ -174,22 +191,7 @@ impl Request {
     }
 
     pub(super) fn validate_replacement(self, before: Self, changed: bool) -> io::Result<()> {
-        if let (Some(next), Some(previous), Some(response), Some(old_response)) =
-            (self.scope, before.scope, self.response, before.response)
-        {
-            if next.can_replace(previous)
-                && self.retained_until.is_none()
-                && before.retained_until.is_none()
-                && response.sequence >= old_response.sequence
-                && response.raft_index >= old_response.raft_index
-                && response.logical_time >= old_response.logical_time
-            {
-                return Ok(());
-            }
-            return Err(invalid("native catalog scope checkpoint regressed"));
-        }
-        if self.scope.is_some() != before.scope.is_some()
-            || before.payload_digest != self.payload_digest
+        if before.payload_digest != self.payload_digest
             || before.retained_until != self.retained_until
             || (changed
                 && !(self.retained_until.is_some()

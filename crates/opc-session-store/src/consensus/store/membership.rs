@@ -1781,6 +1781,11 @@ enum TopologyAdmissionBarrierAction {
         abort_decision_log_index: u64,
         abort_cleanup_log_index: u64,
     },
+    /// A scope-profile cluster must check a learner before replicating any
+    /// authority or child rows that its binary might not understand.
+    ConfirmScopeProfile {
+        profile_digest: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2118,6 +2123,8 @@ impl ConsensusSessionStore {
         let (fenced_transition_v2_status_batch, fenced_transition_v2_status_batch_receiver) =
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
+            #[cfg(test)]
+            scope_profile_supported: AtomicBool::new(true),
             raft,
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
@@ -2742,6 +2749,14 @@ impl ConsensusSessionStore {
             deadline,
         )
         .await?;
+        self.require_scope_profile_prospective_learner_capability_before(
+            request,
+            &durable,
+            &current_members,
+            &desired_members,
+            deadline,
+        )
+        .await?;
         for learner in desired_members.difference(&current_members).copied() {
             operation_guard = self
                 .add_learner_before(learner, operation_guard, deadline)
@@ -2785,6 +2800,75 @@ impl ConsensusSessionStore {
         )
         .await?;
         Ok(proof)
+    }
+
+    /// A retained activation row is format history even after its voter-bound
+    /// certificate stops authorizing operations. Check every joining voter
+    /// before handing it any Raft log or snapshot containing that format.
+    async fn require_scope_profile_prospective_learner_capability_before(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        durable: &DurableTransitionState,
+        current_members: &BTreeSet<SessionConsensusNodeId>,
+        desired_members: &BTreeSet<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let key = crate::scope_storage::profile_key(self.inner.storage_identity.cluster_id())
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        match self
+            .inner
+            .backend
+            .consensus_scope_record(self.inner.storage_identity, key)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+        {
+            None => return Ok(()),
+            Some(crate::scope_storage::ScopeRow::Activation(certificate)) => certificate
+                .validate()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?,
+            Some(_) => return Err(SessionTopologyTransitionError::Unavailable),
+        }
+        let profile_digest = self
+            .local_scope_profile()
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let peers = self.inner.topology_coordinator.staged_peers(request)?;
+        for learner in desired_members.difference(current_members).copied() {
+            if learner == self.inner.local_node_id {
+                continue;
+            }
+            let peer = peers
+                .get(&learner)
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let payload = encode_bounded(&TopologyAdmissionBarrierRequest {
+                transition_id: request.transition_id().as_bytes(),
+                request_digest: request.request_digest().as_bytes(),
+                action: TopologyAdmissionBarrierAction::ConfirmScopeProfile { profile_digest },
+            })
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let wire = SessionConsensusWireRequest::try_new(
+                durable.scope.current_identity,
+                self.inner.local_node_id,
+                SessionConsensusRpcFamily::TopologyAdmissionBarrier,
+                payload,
+            )
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let response = tokio::time::timeout_at(deadline, peer.call(wire))
+                .await
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            response
+                .validate()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let payload = response
+                .result
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let reply: TopologyAdmissionBarrierReply = decode_bounded(&payload)
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            if !matches!(reply, TopologyAdmissionBarrierReply::Ready) {
+                return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+            }
+        }
+        Ok(())
     }
 
     /// A predecessor with durable V2 history must never add a learner that
@@ -4123,6 +4207,7 @@ impl ConsensusSessionStore {
             TopologyAdmissionBarrierAction::ConfirmStaged
                 | TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. }
                 | TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 { .. }
+                | TopologyAdmissionBarrierAction::ConfirmScopeProfile { .. }
         ) {
             self.inner.topology_coordinator.transport()?;
             let _staged_request = self
@@ -4136,6 +4221,7 @@ impl ConsensusSessionStore {
             TopologyAdmissionBarrierAction::ConfirmStaged => Ok(()),
             TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. } => Ok(()),
             TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 { .. } => Ok(()),
+            TopologyAdmissionBarrierAction::ConfirmScopeProfile { .. } => Ok(()),
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { log_index } => {
                 let observed_marker = durable
                     .evidence
@@ -4384,6 +4470,16 @@ impl ConsensusSessionStore {
                     Err(_) => return TopologyAdmissionBarrierReply::NotReady,
                 }
             }
+            TopologyAdmissionBarrierAction::ConfirmScopeProfile { profile_digest } => {
+                match self.inner.peer_directory.current_scope() {
+                    Ok((current_identity, current_members)) => (
+                        current_identity,
+                        current_members.contains(&authenticated_sender)
+                            && self.local_scope_profile() == Some(profile_digest),
+                    ),
+                    Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+                }
+            }
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { .. }
             | TopologyAdmissionBarrierAction::AdmitJointVoting => (
                 request.desired_identity(),
@@ -4418,6 +4514,7 @@ impl ConsensusSessionStore {
             barrier.action,
             TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. }
                 | TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 { .. }
+                | TopologyAdmissionBarrierAction::ConfirmScopeProfile { .. }
         ) {
             return TopologyAdmissionBarrierReply::Ready;
         }
@@ -4966,6 +5063,9 @@ mod scope_refresh_tests {
                         && consumer_revision == profile.consumer_revision()
                         && profile_digest == profile.digest()
                 }
+                TopologyAdmissionBarrierAction::ConfirmScopeProfile { profile_digest } => {
+                    profile_digest == crate::scope_lease::scope_profile_digest()
+                }
                 _ => return Err(SessionConsensusPeerError::Protocol),
             };
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -5330,6 +5430,194 @@ mod scope_refresh_tests {
         assert!(state.staged.is_none());
         assert!(state.retained_transitions.is_empty());
         assert_eq!(Some(0), state.last_scope_progress_index);
+    }
+
+    #[tokio::test]
+    async fn scope_profile_history_gates_joining_voters_before_replication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConsensusSessionStore::open(
+            gate_singleton_topology(),
+            SqliteSessionBackend::open(directory.path().join("store.sqlite")).unwrap(),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        store.initialize_cluster().await.unwrap();
+        let current = [gate_descriptor(0), gate_descriptor(1), gate_descriptor(2)];
+        let storage_identity = store.inner.storage_identity;
+        let request = SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([0xB2; 16]),
+            storage_identity.cluster_id(),
+            storage_identity.configuration_epoch(),
+            SessionConsensusConfigurationEpoch::new(2).unwrap(),
+            vec![gate_descriptor(0), gate_descriptor(1), gate_descriptor(3)],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let current_nodes = current
+            .iter()
+            .map(|descriptor| {
+                opc_consensus::derive_node_id(
+                    storage_identity.cluster_id(),
+                    descriptor.replica_id().as_str().as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        let desired_nodes = request.desired_consensus_node_ids();
+        let candidate = *desired_nodes.difference(&current_nodes).next().unwrap();
+        store
+            .inner
+            .topology_coordinator
+            .bindings
+            .write()
+            .unwrap()
+            .current_descriptors = current
+            .iter()
+            .map(|descriptor| {
+                (
+                    opc_consensus::derive_node_id(
+                        storage_identity.cluster_id(),
+                        descriptor.replica_id().as_str().as_bytes(),
+                    )
+                    .unwrap(),
+                    descriptor.clone(),
+                )
+            })
+            .collect();
+        let candidate_peer = Arc::new(StagedV2ProfilePeer::new(
+            candidate,
+            request.desired_identity(),
+            storage_identity,
+        ));
+        let peers = desired_nodes
+            .iter()
+            .copied()
+            .filter(|node| *node != store.inner.local_node_id)
+            .map(|node| {
+                let peer: Arc<dyn SessionConsensusPeer> = if node == candidate {
+                    candidate_peer.clone()
+                } else {
+                    Arc::new(StagedV2ProfilePeer::new(
+                        node,
+                        request.desired_identity(),
+                        storage_identity,
+                    ))
+                };
+                (node, peer)
+            })
+            .collect::<SessionTopologyTransitionPeers>();
+        store
+            .inner
+            .topology_coordinator
+            .stage_bindings(&request, &peers)
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let durable = store
+            .read_transition_state_before(&request, deadline)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .require_scope_profile_prospective_learner_capability_before(
+                    &request,
+                    &durable,
+                    &current_nodes,
+                    &desired_nodes,
+                    deadline,
+                )
+                .await,
+            Ok(()),
+            "clusters without scope history retain their membership behavior"
+        );
+        assert_eq!(candidate_peer.calls.load(Ordering::SeqCst), 0);
+        store.activate_scope_profile().await.unwrap();
+        for reply in [
+            StagedV2ProfileReply::V1Only,
+            StagedV2ProfileReply::MismatchedV2,
+        ] {
+            candidate_peer.set_reply(reply);
+            assert_eq!(
+                store
+                    .require_scope_profile_prospective_learner_capability_before(
+                        &request,
+                        &durable,
+                        &current_nodes,
+                        &desired_nodes,
+                        deadline,
+                    )
+                    .await,
+                Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+                "a joining voter must prove the exact scope profile before add_learner"
+            );
+        }
+        candidate_peer.set_reply(StagedV2ProfileReply::ExactV2);
+        assert_eq!(
+            store
+                .require_scope_profile_prospective_learner_capability_before(
+                    &request,
+                    &durable,
+                    &current_nodes,
+                    &desired_nodes,
+                    deadline,
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(candidate_peer.calls.load(Ordering::SeqCst), 3);
+        store
+            .inner
+            .scope_profile_supported
+            .store(false, Ordering::Release);
+        assert_eq!(
+            store
+                .require_scope_profile_prospective_learner_capability_before(
+                    &request,
+                    &durable,
+                    &current_nodes,
+                    &desired_nodes,
+                    deadline,
+                )
+                .await,
+            Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+            "a locally incompatible coordinator cannot certify the successor"
+        );
+        for (supported, digest, expected) in [
+            (
+                false,
+                crate::scope_lease::scope_profile_digest(),
+                TopologyAdmissionBarrierReply::NotReady,
+            ),
+            (true, [0; 32], TopologyAdmissionBarrierReply::NotReady),
+            (
+                true,
+                crate::scope_lease::scope_profile_digest(),
+                TopologyAdmissionBarrierReply::Ready,
+            ),
+        ] {
+            store
+                .inner
+                .scope_profile_supported
+                .store(supported, Ordering::Release);
+            assert!(
+                store
+                    .handle_topology_admission_barrier(
+                        store.inner.local_node_id,
+                        storage_identity,
+                        TopologyAdmissionBarrierRequest {
+                            transition_id: request.transition_id().as_bytes(),
+                            request_digest: request.request_digest().as_bytes(),
+                            action: TopologyAdmissionBarrierAction::ConfirmScopeProfile {
+                                profile_digest: digest
+                            },
+                        },
+                    )
+                    .await
+                    == expected,
+            );
+        }
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]

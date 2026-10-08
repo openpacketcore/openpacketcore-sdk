@@ -23,6 +23,10 @@ fn activation_request(
     scope: SessionConsensusIdentity,
 ) -> ForwardMutationRequest {
     let (request_id, intent) = match activation {
+        CapabilityActivationKind::ScopeProfileV2 => (
+            scope_profile::request_id(scope),
+            SessionMutationIntent::PreflightScopeProfile,
+        ),
         CapabilityActivationKind::FencedTransitionV1 => (
             fenced_transition_activation_request_id(scope),
             SessionMutationIntent::PreflightFencedTransitionCapability,
@@ -55,6 +59,12 @@ fn backend_activation(
         .unwrap()
         .native_public_scalar_read(|state| {
             let active = match activation {
+                CapabilityActivationKind::ScopeProfileV2 => {
+                    let key = crate::scope_storage::profile_key(scope.cluster_id()).unwrap();
+                    let row = state.scope_record(store.inner.storage_identity, &key).unwrap();
+                    matches!(row, Some(crate::scope_storage::ScopeRow::Activation(certificate))
+                        if certificate.matches(scope, fenced_transition_voter_set_digest(scope, &voters)))
+                }
                 CapabilityActivationKind::FencedTransitionV1 => {
                     state.v1_activation_matches(scope, &voters)
                 }
@@ -70,12 +80,12 @@ fn backend_activation(
         .unwrap()
 }
 
-async fn acknowledgment_covers_certificate_before_metrics(activation: CapabilityActivationKind) {
+async fn acknowledgment_covers_certificate_before_metrics(
+    activation: CapabilityActivationKind,
+    modes: &[SessionPersistenceMode],
+) {
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
-    for mode in [
-        SessionPersistenceMode::Durable,
-        SessionPersistenceMode::Async,
-    ] {
+    for &mode in modes {
         let mut fleet = Fleet::new(3);
         for index in 0..3 {
             fleet.open(index, mode).await.unwrap();
@@ -199,18 +209,45 @@ async fn acknowledgment_covers_certificate_before_metrics(activation: Capability
 
 #[tokio::test]
 async fn fenced_activation_ack_covers_backend_before_metrics() {
-    acknowledgment_covers_certificate_before_metrics(CapabilityActivationKind::FencedTransitionV1)
-        .await;
+    acknowledgment_covers_certificate_before_metrics(
+        CapabilityActivationKind::FencedTransitionV1,
+        &[
+            SessionPersistenceMode::Durable,
+            SessionPersistenceMode::Async,
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn protected_roster_v1_activation_ack_covers_backend_before_metrics() {
-    acknowledgment_covers_certificate_before_metrics(CapabilityActivationKind::ProtectedRosterV1)
-        .await;
+    acknowledgment_covers_certificate_before_metrics(
+        CapabilityActivationKind::ProtectedRosterV1,
+        &[
+            SessionPersistenceMode::Durable,
+            SessionPersistenceMode::Async,
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn protected_roster_v2_activation_ack_covers_backend_before_metrics() {
-    acknowledgment_covers_certificate_before_metrics(CapabilityActivationKind::ProtectedRosterV2)
-        .await;
+    acknowledgment_covers_certificate_before_metrics(
+        CapabilityActivationKind::ProtectedRosterV2,
+        &[
+            SessionPersistenceMode::Durable,
+            SessionPersistenceMode::Async,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn scope_profile_activation_ack_covers_backend_before_metrics() {
+    acknowledgment_covers_certificate_before_metrics(
+        CapabilityActivationKind::ScopeProfileV2,
+        &[SessionPersistenceMode::Durable],
+    )
+    .await;
 }

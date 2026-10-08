@@ -489,6 +489,20 @@ pub fn consensus_local_durable_progress_for_test(
     }
 }
 
+/// Read the locally applied application-journal head without proposing a
+/// logical-time fence or issuing a quorum read. This is a passive test
+/// observation, not a linearizable read: callers must establish the relevant
+/// apply boundary themselves and choose the voter whose state they observe.
+pub async fn consensus_local_replication_sequence_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<u64, StoreError> {
+    store
+        .inner
+        .backend
+        .consensus_max_replication_sequence()
+        .await
+}
+
 /// Passive value-free snapshot phase for bounded integration diagnostics.
 pub fn consensus_snapshot_build_phase_for_test(store: &ConsensusSessionStore) -> &'static str {
     store.inner.backend.snapshot_observation().phase_for_test()

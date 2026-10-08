@@ -1336,6 +1336,26 @@ pub(crate) fn insert_or_replace_record_sync(
     conn: &Connection,
     record: &StoredSessionRecord,
 ) -> Result<(), StoreError> {
+    write_record_sync(conn, record)?;
+    advance_restore_scan_revision_sync(conn)
+}
+
+/// Scope metadata has its own revisions and is excluded from consumer scans.
+/// It must not continually invalidate an unrelated consumer restore cursor.
+pub(crate) fn insert_or_replace_scope_record_sync(
+    conn: &Connection,
+    record: &StoredSessionRecord,
+) -> Result<(), StoreError> {
+    if !crate::scope_storage::is_scope_record_key(&record.key) {
+        return Err(StoreError::InvalidKey(
+            "scope record namespace differs".into(),
+        ));
+    }
+    super::validate_consensus_record(record)?;
+    write_record_sync(conn, record)
+}
+
+fn write_record_sync(conn: &Connection, record: &StoredSessionRecord) -> Result<(), StoreError> {
     let expires_at_str = record.expires_at.map(format_rfc3339_normalized);
     let encoding_val = match record.payload.encoding() {
         SessionPayloadEncoding::Plaintext => 0,
@@ -1375,8 +1395,6 @@ pub(crate) fn insert_or_replace_record_sync(
         ],
     )
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-
-    advance_restore_scan_revision_sync(conn)?;
 
     Ok(())
 }

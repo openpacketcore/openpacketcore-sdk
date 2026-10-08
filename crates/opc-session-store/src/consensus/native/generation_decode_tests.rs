@@ -8,9 +8,9 @@ use crate::{EncryptedSessionPayload, FenceToken};
 mod roster;
 
 #[test]
-fn scope_lease_cold_checkpoint_preflight_matches_serializer_and_rejects_failure_rows() {
+fn scope_lease_cold_checkpoint_preflight_validates_dedicated_rows_and_refuses_old_receipts() {
     use crate::scope_lease::tests::{bounds, execution, request, scope};
-    use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseError, ScopeLeaseOperation};
+    use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseOperation};
     let (mut storage, _, _) = fixture();
     apply(&mut storage, &[clock(2, time(2))]);
     let checkpoint = ScopeLeaseCommand {
@@ -25,51 +25,151 @@ fn scope_lease_cold_checkpoint_preflight_matches_serializer_and_rejects_failure_
     }
     .apply(None)
     .unwrap();
-    let mut row = (**storage.business.generic_receipts.values().next().unwrap()).clone();
-    let NativeGenericReceipt::Ordinary(receipt) = &mut row else {
+    let key = scope().key().unwrap();
+    let row = NativeKeyState {
+        record: Some(checkpoint.to_record().unwrap()),
+        ..NativeKeyState::default()
+    };
+    let bytes = postcard::to_allocvec(&(&key, Some(&row))).unwrap();
+    verify_key(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
+    for end in [0, 1, bytes.len() / 2, bytes.len() - 1] {
+        assert!(key_scratch(&bytes[..end]).is_err());
+    }
+    let mut legacy = (**storage.business.generic_receipts.values().next().unwrap()).clone();
+    let NativeGenericReceipt::Ordinary(receipt) = &mut legacy else {
         unreachable!()
     };
     receipt.payload_digest = checkpoint.digest().unwrap();
     receipt.response.result = Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint)));
-    let id = scope().checkpoint_id().unwrap();
-    let bytes = postcard::to_allocvec(&(id, Some(&row))).unwrap();
-    assert_eq!(
-        generic_scratch(&bytes).unwrap(),
-        METADATA + 12 * crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES
-    );
-    verify_generic(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
-    for end in [0, 1, bytes.len() / 2, bytes.len() - 1] {
-        assert!(generic_scratch(&bytes[..end]).is_err());
-    }
-    let before = facts::Request::of(&row, Format::V3).unwrap();
-    let NativeGenericReceipt::Ordinary(receipt) = &mut row else {
-        unreachable!()
+    let bytes = postcard::to_allocvec(&(scope().checkpoint_id().unwrap(), Some(&legacy))).unwrap();
+    assert!(generic_scratch(&bytes).is_err());
+    assert!(verify_generic(&bytes, &storage.business.frontiers, &|| Ok(())).is_err());
+}
+
+#[test]
+fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
+    use crate::scope_batch::tests::{claim, key, value};
+    use crate::scope_batch::{
+        ScopeBatchCommand, ScopeBatchRequest, ScopeChildMutation, ScopeSealedValue,
     };
-    let next = ScopeLeaseCommand {
-        request: request(
-            1,
-            2,
-            ScopeLeaseOperation::Select {
-                execution: execution(2),
-            },
-        ),
-        bounds: bounds(1),
-    }
-    .apply(Some((receipt.payload_digest, (*receipt.response).clone())))
+    use crate::scope_lease::tests::{bounds, execution};
+    use crate::scope_lease::{ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest, ScopeState};
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    let (storage, _, _) = fixture();
+    let scope = ScopeLeaseId::new(
+        storage.business.identity,
+        TenantId::from_static("batch-memory"),
+        NetworkFunctionKind::smf(),
+        [1; 32],
+    )
     .unwrap();
-    receipt.payload_digest = next.digest().unwrap();
-    receipt.response.result = Ok(SessionMutationOutcome::ScopeLease(Ok(next)));
-    let after = facts::Request::of(&row, Format::V3).unwrap();
-    assert!(after.validate_replacement(before, true).is_ok());
-    assert!(before.validate_replacement(after, true).is_err());
-    ordinary_mut(&mut row).result = Ok(SessionMutationOutcome::Unit);
-    let ordinary = facts::Request::of(&row, Format::V3).unwrap();
-    assert!(ordinary.validate_replacement(after, true).is_err());
-    assert!(after.validate_replacement(ordinary, true).is_err());
-    ordinary_mut(&mut row).result = Ok(SessionMutationOutcome::ScopeLease(Err(
-        ScopeLeaseError::Held,
-    )));
-    assert!(generic_scratch(&postcard::to_allocvec(&(id, Some(&row))).unwrap()).is_err());
+    let selected = ScopeState::empty(scope.clone())
+        .transition(
+            &ScopeLeaseRequest::new(
+                scope.clone(),
+                [1; 16],
+                0,
+                ScopeLeaseOperation::Select {
+                    execution: execution(1),
+                },
+            )
+            .unwrap(),
+            bounds(0),
+        )
+        .unwrap();
+    let authority = selected
+        .transition(
+            &ScopeLeaseRequest::new(
+                scope,
+                [2; 16],
+                1,
+                ScopeLeaseOperation::Acquire {
+                    execution: execution(1),
+                    selection: 1,
+                },
+            )
+            .unwrap(),
+            bounds(0),
+        )
+        .unwrap();
+    for (count, maximum_value) in [(1, false), (64, false), (1, true)] {
+        let mut value = value(1);
+        if maximum_value {
+            let mut envelope = opc_crypto::CryptoEnvelopeV1::decode(value.envelope()).unwrap();
+            let overhead = value.envelope().len() - envelope.ciphertext_and_tag.len();
+            envelope.ciphertext_and_tag =
+                vec![1; crate::scope_batch::MAX_SCOPE_CHILD_VALUE_BYTES - overhead];
+            value = ScopeSealedValue::new(envelope.encode().unwrap()).unwrap();
+        }
+        let operations = (1..=count)
+            .map(|n| ScopeChildMutation::Create {
+                key: key(n),
+                value: value.clone(),
+                claims: vec![claim(n)],
+            })
+            .collect();
+        let batch = ScopeBatchCommand {
+            request: ScopeBatchRequest::new(
+                authority.view.permit().unwrap(),
+                [3; 16],
+                0,
+                operations,
+                vec![],
+            )
+            .unwrap(),
+            bounds: bounds(1),
+        };
+        let mut entry = clock(2, time(2));
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            unreachable!()
+        };
+        command.request_id = SessionConsensusRequestId::from_bytes([3; 16]);
+        command.intent = SessionMutationIntent::Authorized {
+            origin: *storage.business.members.first().unwrap(),
+            authority_identity: storage.business.identity,
+            mutation: Box::new(SessionMutationIntent::ScopeBatch(Box::new(batch))),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let temporary = json::log_scratch(&bytes).unwrap();
+        if count == 1 && !maximum_value {
+            assert!(
+                temporary < 256 * 1024,
+                "one small child must not reserve a maximum batch"
+            );
+        }
+        let decoding = allocation_counter::measure(|| {
+            verify_log(
+                &bytes,
+                2,
+                storage.business.identity,
+                &storage.business.members,
+                &|| Ok(()),
+            )
+            .unwrap();
+        });
+        assert!(
+            decoding.bytes_max <= temporary as u64,
+            "preflight covers full decoder peak"
+        );
+        let mut copy = None;
+        let allocation = allocation_counter::measure(|| {
+            copy = Some(owned::entry(&entry).unwrap());
+        });
+        let copy = copy.unwrap();
+        let held = scratch::log_owned(&copy).unwrap();
+        assert!(
+            allocation.bytes_current <= i64::try_from(held).unwrap(),
+            "retained charge covers actual owned allocations"
+        );
+        if count == 1 && !maximum_value {
+            assert!(
+                held < 32 * 1024,
+                "one small child must not retain a maximum batch reservation"
+            );
+        }
+        assert_eq!(serde_json::to_vec(&copy).unwrap(), bytes);
+    }
 }
 
 #[test]
@@ -124,6 +224,40 @@ fn native_generation_cold_key_preflight_matches_complete_postcard_and_original_p
     assert!(key_scratch(&postcard::to_allocvec(&(key, Some(&row))).unwrap()).is_err());
     // A forged length is rejected while the cursor still borrows the input.
     assert!(key_scratch(&postcard::to_allocvec(&usize::MAX).unwrap()).is_err());
+}
+
+#[test]
+fn native_generation_cold_key_preflight_bounds_scope_child_metadata_separately() {
+    use crate::scope_batch::tests::{claim, key, value};
+    use crate::scope_batch::{ScopeChildRecord, ScopeChildRevision, ScopeSealedValue};
+    use crate::scope_storage::ScopeRow;
+
+    let (storage, _, _) = fixture();
+    let mut envelope = opc_crypto::CryptoEnvelopeV1::decode(value(1).envelope()).unwrap();
+    let overhead = envelope.encode().unwrap().len() - envelope.ciphertext_and_tag.len();
+    envelope.ciphertext_and_tag =
+        vec![0; crate::scope_batch::MAX_SCOPE_CHILD_VALUE_BYTES - overhead];
+    let record = ScopeRow::Child(ScopeChildRecord {
+        scope: crate::scope_lease::tests::scope(),
+        key: key(1),
+        revision: ScopeChildRevision::new(1, 1).unwrap(),
+        batch_revision: 1,
+        value: Some(ScopeSealedValue::new(envelope.encode().unwrap()).unwrap()),
+        claims: (1..=8).map(claim).collect(),
+    })
+    .to_record()
+    .unwrap();
+    assert!(record.payload.len() > crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES);
+    let key = record.key.clone();
+    let mut row = NativeKeyState {
+        record: Some(record),
+        ..NativeKeyState::default()
+    };
+    let bytes = postcard::to_allocvec(&(&key, Some(&row))).unwrap();
+    verify_key(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
+    row.record.as_mut().unwrap().payload =
+        EncryptedSessionPayload::new(vec![0; crate::scope_storage::MAX_SCOPE_ROW_BYTES + 1]);
+    assert!(key_scratch(&postcard::to_allocvec(&(&key, Some(&row))).unwrap()).is_err());
 }
 
 #[test]
