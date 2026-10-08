@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -3850,7 +3850,14 @@ impl CandidatePublicMaterialManifest {
 
 impl CandidateEvidenceInputs {
     fn verify_unchanged(&self, config_paths: &[PathBuf]) -> io::Result<()> {
-        let source = candidate_source_provenance()?;
+        // Initial fleet captures are shared, but evidence must still detect
+        // changes made after startup. Never verify against the startup cache.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        self.verify_unchanged_at(config_paths, &repository)
+    }
+
+    fn verify_unchanged_at(&self, config_paths: &[PathBuf], repository: &Path) -> io::Result<()> {
+        let source = candidate_source_provenance_at(repository)?;
         let child_sha256 = candidate_sha256_file(
             Path::new(env!("CARGO_BIN_EXE_opc-session-quorum-node")),
             MAX_CANDIDATE_ARTIFACT_BYTES,
@@ -8619,10 +8626,35 @@ fn candidate_configuration_sha256(config_paths: &[PathBuf]) -> io::Result<String
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
-fn candidate_source_provenance_at(
+type CandidateSourceProvenance = (String, SessionMtlsCandidateSourceTreeStatus, String);
+
+// A cold checkout scan is environment setup, not a product request. All Git
+// operations in a capture share this one hang guard; fleets share the result
+// rather than each starting another full scan with a fresh command budget.
+const CANDIDATE_SOURCE_GIT_CAPTURE_BUDGET: Duration = Duration::from_secs(60);
+
+fn candidate_source_provenance_at(repository: &Path) -> io::Result<CandidateSourceProvenance> {
+    let deadline = Instant::now() + CANDIDATE_SOURCE_GIT_CAPTURE_BUDGET;
+    candidate_source_provenance_before(repository, deadline).map_err(|error| {
+        let environment = if env::var_os("CI").is_some() { "ci" } else { "local" };
+        io::Error::new(
+            error.kind(),
+            format!(
+                "qualification environment source provenance capture failed: environment={environment} \
+                 platform={} architecture={} git_capture_budget_ms={}: {error}",
+                env::consts::OS,
+                env::consts::ARCH,
+                CANDIDATE_SOURCE_GIT_CAPTURE_BUDGET.as_millis(),
+            ),
+        )
+    })
+}
+
+fn candidate_source_provenance_before(
     repository: &Path,
-) -> io::Result<(String, SessionMtlsCandidateSourceTreeStatus, String)> {
-    let revision = candidate_git_output(repository, &["rev-parse", "HEAD"], 64)?;
+    deadline: Instant,
+) -> io::Result<CandidateSourceProvenance> {
+    let revision = candidate_git_output_before(repository, &["rev-parse", "HEAD"], 64, deadline)?;
     if revision.len() != 41 {
         return Err(io::Error::other("candidate source revision is unavailable"));
     }
@@ -8630,7 +8662,7 @@ fn candidate_source_provenance_at(
         .map_err(|_| io::Error::other("candidate source revision is invalid"))?
         .trim_end()
         .to_owned();
-    let source_status = candidate_git_output(
+    let source_status = candidate_git_output_before(
         repository,
         &[
             "status",
@@ -8640,13 +8672,14 @@ fn candidate_source_provenance_at(
             "--ignore-submodules=none",
         ],
         MAX_CANDIDATE_SOURCE_BYTES,
+        deadline,
     )?;
     let tree_status = if source_status.is_empty() {
         SessionMtlsCandidateSourceTreeStatus::Clean
     } else {
         SessionMtlsCandidateSourceTreeStatus::DirtyUnqualified
     };
-    let tracked_diff = candidate_git_output(
+    let tracked_diff = candidate_git_output_before(
         repository,
         &[
             "diff",
@@ -8660,11 +8693,13 @@ fn candidate_source_provenance_at(
             "--",
         ],
         MAX_CANDIDATE_SOURCE_BYTES,
+        deadline,
     )?;
-    let untracked_paths = candidate_git_output(
+    let untracked_paths = candidate_git_output_before(
         repository,
         &["ls-files", "--others", "--exclude-standard", "-z", "--"],
         MAX_CANDIDATE_SOURCE_BYTES,
+        deadline,
     )?;
 
     let mut total = u64::try_from(source_status.len())
@@ -8727,6 +8762,20 @@ fn candidate_git_output(
     arguments: &[&str],
     maximum_bytes: u64,
 ) -> io::Result<Vec<u8>> {
+    candidate_git_output_before(
+        repository,
+        arguments,
+        maximum_bytes,
+        Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT,
+    )
+}
+
+fn candidate_git_output_before(
+    repository: &Path,
+    arguments: &[&str],
+    maximum_bytes: u64,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
     // Qualification provenance never resolves a caller-controlled `git` from
     // PATH or inherits Git configuration/environment overrides.
     let mut command = Command::new("/usr/bin/git");
@@ -8751,15 +8800,17 @@ fn candidate_git_output(
         ["ls-files", ..] => "index",
         _ => "other",
     };
-    let output =
-        bounded_candidate_git_command_output(&mut command, maximum_bytes).map_err(|error| {
+    let output = bounded_candidate_git_command_output_before(&mut command, maximum_bytes, deadline)
+        .map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("candidate Git operation={operation}: {error}"),
             )
         })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(io::Error::other("candidate source state is unavailable"));
+        return Err(io::Error::other(format!(
+            "candidate Git operation={operation}: candidate source state is unavailable"
+        )));
     }
     Ok(output.stdout)
 }
@@ -8842,8 +8893,25 @@ fn bounded_candidate_git_command_output(
     command: &mut Command,
     maximum_stdout_bytes: u64,
 ) -> io::Result<BoundedCandidateGitOutput> {
+    bounded_candidate_git_command_output_before(
+        command,
+        maximum_stdout_bytes,
+        Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT,
+    )
+}
+
+fn bounded_candidate_git_command_output_before(
+    command: &mut Command,
+    maximum_stdout_bytes: u64,
+    deadline: Instant,
+) -> io::Result<BoundedCandidateGitOutput> {
     let started = Instant::now();
-    let deadline = started + CANDIDATE_GIT_COMMAND_TIMEOUT;
+    if started >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "candidate Git capture budget exhausted before command spawn",
+        ));
+    }
     // This creates a fresh process group before exec whose PGID is exactly
     // the child PID; only that freshly-created group is ever signalled below.
     command.process_group(0);
@@ -9175,10 +9243,29 @@ fn hash_candidate_source_part(hasher: &mut Sha256, label: &[u8], encoded: &[u8])
     Ok(())
 }
 
-fn candidate_source_provenance(
-) -> io::Result<(String, SessionMtlsCandidateSourceTreeStatus, String)> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    candidate_source_provenance_at(&repository)
+static CANDIDATE_SOURCE_PROVENANCE_CAPTURES: AtomicUsize = AtomicUsize::new(0);
+static CANDIDATE_SOURCE_PROVENANCE: OnceLock<io::Result<CandidateSourceProvenance>> =
+    OnceLock::new();
+
+fn cached_candidate_source_provenance(
+    cache: &OnceLock<io::Result<CandidateSourceProvenance>>,
+    capture: impl FnOnce() -> io::Result<CandidateSourceProvenance>,
+) -> io::Result<CandidateSourceProvenance> {
+    // Cache errors as well: a failed environment check is not authorization
+    // for each waiting fleet to launch another capture or retry the failure.
+    cache
+        .get_or_init(capture)
+        .as_ref()
+        .cloned()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
+
+fn candidate_source_provenance() -> io::Result<CandidateSourceProvenance> {
+    cached_candidate_source_provenance(&CANDIDATE_SOURCE_PROVENANCE, || {
+        CANDIDATE_SOURCE_PROVENANCE_CAPTURES.fetch_add(1, Ordering::Relaxed);
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        candidate_source_provenance_at(&repository)
+    })
 }
 
 fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProvenance> {
@@ -12047,6 +12134,8 @@ fn batch_release_evidence_feature_gate_matches_the_compiled_transport_profile() 
 
 #[test]
 fn candidate_execution_bindings_fail_when_a_preexecution_input_changes() {
+    let repository = candidate_source_test_repository();
+    let initial_source = OnceLock::new();
     let workspace = tempfile::tempdir().expect("create candidate binding workspace");
     let config_paths = (0..3)
         .map(|index| {
@@ -12057,7 +12146,10 @@ fn candidate_execution_bindings_fail_when_a_preexecution_input_changes() {
         })
         .collect::<Vec<_>>();
     let (source_revision, source_tree_status, source_worktree_sha256) =
-        candidate_source_provenance().expect("capture candidate source binding");
+        cached_candidate_source_provenance(&initial_source, || {
+            candidate_source_provenance_at(repository.path())
+        })
+        .expect("capture candidate source binding");
     let harness_path = env::current_exe().expect("locate candidate harness artifact");
     let inputs = CandidateEvidenceInputs {
         source_revision,
@@ -12074,12 +12166,33 @@ fn candidate_execution_bindings_fail_when_a_preexecution_input_changes() {
             .expect("hash preexecution configurations"),
     };
     inputs
-        .verify_unchanged(&config_paths)
+        .verify_unchanged_at(&config_paths, repository.path())
         .expect("unchanged preexecution bindings remain valid");
+
+    fs::write(repository.path().join("tracked.txt"), b"changed source\n")
+        .expect("change bound candidate source");
+    assert_eq!(
+        cached_candidate_source_provenance(&initial_source, || {
+            panic!("initial source capture must remain shared")
+        })
+        .expect("initial source is cached")
+        .2,
+        inputs.source_worktree_sha256,
+    );
+    assert!(inputs
+        .verify_unchanged_at(&config_paths, repository.path())
+        .is_err());
+    fs::write(repository.path().join("tracked.txt"), b"tracked\n")
+        .expect("restore source before independently changing configuration");
+    inputs
+        .verify_unchanged_at(&config_paths, repository.path())
+        .expect("restored source and original configuration still match");
 
     fs::write(&config_paths[1], b"{\"node_index\":99}\n")
         .expect("change bound candidate configuration");
-    assert!(inputs.verify_unchanged(&config_paths).is_err());
+    assert!(inputs
+        .verify_unchanged_at(&config_paths, repository.path())
+        .is_err());
 }
 
 #[test]
@@ -12118,8 +12231,7 @@ fn candidate_public_material_manifest_binds_order_epoch_and_public_bytes() {
     assert!(invalid.sha256().is_err());
 }
 
-#[test]
-fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
+fn candidate_source_test_repository() -> TempDir {
     let repository = tempfile::tempdir().expect("create provenance repository");
     let run_git = |arguments: &[&str]| {
         let status = Command::new("git")
@@ -12143,6 +12255,12 @@ fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
         "-m",
         "test fixture",
     ]);
+    repository
+}
+
+#[test]
+fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
+    let repository = candidate_source_test_repository();
 
     let (revision, status, clean_digest) =
         candidate_source_provenance_at(repository.path()).expect("read clean provenance");
@@ -12194,6 +12312,51 @@ fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
         64,
     )
     .is_err());
+}
+
+#[test]
+fn candidate_source_provenance_shares_capture_failure_without_retry() {
+    let cache = OnceLock::new();
+    let captures = AtomicUsize::new(0);
+    let start = Barrier::new(8);
+    thread::scope(|threads| {
+        for _ in 0..8 {
+            threads.spawn(|| {
+                start.wait();
+                let error = cached_candidate_source_provenance(&cache, || {
+                    captures.fetch_add(1, Ordering::Relaxed);
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "environment scan limit",
+                    ))
+                })
+                .expect_err("all waiting fleets must receive the capture failure");
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert_eq!(error.to_string(), "environment scan limit");
+            });
+        }
+    });
+    assert_eq!(captures.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn candidate_source_provenance_failure_names_the_environment() {
+    let repository = tempfile::tempdir().expect("create uncommitted repository environment");
+    assert!(Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .expect("initialize a repository without a source revision")
+        .success());
+    let error = candidate_source_provenance_at(repository.path())
+        .expect_err("qualification requires source provenance");
+    let message = error.to_string();
+    assert!(message.contains("qualification environment source provenance capture failed"));
+    assert!(message.contains("environment="));
+    assert!(message.contains("platform=linux"));
+    assert!(message.contains("git_capture_budget_ms=60000"));
+    assert!(message.contains("operation=revision"));
+    assert!(!message.contains(repository.path().to_str().expect("temporary UTF-8 path")));
 }
 
 struct CandidateGitPipeReadFn<F>(F);
@@ -12300,6 +12463,35 @@ fn candidate_git_process_is_gone(process_id: u32) -> bool {
         Err(error) if error.raw_os_error() == 3 => true, // ESRCH
         Err(_) => false,
     }
+}
+
+#[test]
+fn candidate_source_git_capture_accepts_slow_environment_work() {
+    let workspace = tempfile::tempdir().expect("create slow Git helper workspace");
+    let helper = workspace.path().join("fake-git");
+    write_candidate_git_helper_script(&helper, b"#!/bin/sh\nsleep 5.1\nprintf 'source-output'\n");
+    let started = Instant::now();
+    let output = bounded_candidate_git_command_output_before(
+        &mut Command::new(&helper),
+        64,
+        started + CANDIDATE_SOURCE_GIT_CAPTURE_BUDGET,
+    )
+    .expect("source setup can outlast the unrelated five-second command guard");
+    assert!(started.elapsed() > CANDIDATE_GIT_COMMAND_TIMEOUT);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"source-output");
+
+    // Another command cannot reset an exhausted aggregate capture deadline.
+    let marker = workspace.path().join("must-not-spawn");
+    let error = bounded_candidate_git_command_output_before(
+        Command::new("/usr/bin/touch").arg(&marker),
+        64,
+        started,
+    )
+    .err()
+    .expect("an exhausted capture must fail before starting another Git operation");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -13579,6 +13771,38 @@ fn candidate_evidence_persistence_is_bounded_private_and_create_new() {
     fs::write(&oversized, b"12345").expect("write oversized evidence");
     assert!(read_bounded_candidate_file(&oversized, 4).is_err());
     assert!(candidate_sha256_file(&oversized, 4).is_err());
+}
+
+#[test]
+fn parallel_fleets_share_initial_candidate_source_provenance() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let start = Barrier::new(2);
+    let sources = thread::scope(|threads| {
+        let fleets = [3, 5].map(|member_count| {
+            let start = &start;
+            threads.spawn(move || {
+                start.wait();
+                // Fleet::start proves material readiness and a durable canary
+                // write before returning; these are real concurrent fleets.
+                let fleet = Fleet::start(member_count);
+                let source = &fleet.candidate_evidence_inputs;
+                (
+                    source.source_revision.clone(),
+                    source.source_tree_status,
+                    source.source_worktree_sha256.clone(),
+                )
+            })
+        });
+        fleets.map(|fleet| fleet.join().expect("parallel qualification fleet"))
+    });
+    assert_eq!(sources[0], sources[1]);
+    assert_eq!(
+        CANDIDATE_SOURCE_PROVENANCE_CAPTURES.load(Ordering::Relaxed),
+        1,
+        "all fleets in one harness process must share one initial source capture"
+    );
 }
 
 #[test]

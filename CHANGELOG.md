@@ -479,6 +479,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal-successor recovery could keep refusing a drained graph after a
   crash. Fixes #1011.
 
+- `opc-session-testkit`: share initial source provenance capture across mTLS
+  qualification fleets in one process, including setup failures. Use one bounded
+  Git scan budget with environment diagnostics, while recapturing source state
+  before emitting campaign evidence. Regressions cover parallel fleets, retained
+  setup errors, slow scans, and source changes after startup. Fixes #1169.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,
