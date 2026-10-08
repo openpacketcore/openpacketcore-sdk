@@ -81,7 +81,7 @@ pub enum ScopeLeaseError {
     /// The authoritative backend could not be reached or validated.
     #[error("scope_lease_unavailable")]
     Unavailable,
-    /// The exact current voter configuration has not activated scope profile 2.
+    /// The exact current voter configuration has not activated scope profile 3.
     /// No effect occurred. Retry the exact request: the service automatically
     /// attempts activation under the current configuration before submission.
     #[error("scope_lease_profile_not_activated")]
@@ -566,7 +566,7 @@ pub(crate) use command::checkpoint_state;
 pub(crate) use command::ScopeCheckpointFacts;
 pub use command::{ScopeLeaseCheckpoint, ScopeLeaseCommand};
 pub(crate) use profile::scope_profile_digest;
-pub use profile::ScopeProfileActivation;
+pub use profile::{ScopeProfileActivation, ScopeProfileContinuation};
 
 #[cfg(test)]
 pub(crate) mod tests;

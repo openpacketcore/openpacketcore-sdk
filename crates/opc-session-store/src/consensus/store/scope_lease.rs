@@ -29,17 +29,17 @@ impl ScopeLeaseBackend for ConsensusSessionStore {
         }
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         let admission = self
-            .admit_consumer_scope(current, deadline)
+            .admit_scope_read_before(current, deadline)
             .await
             .map_err(unavailable)?;
         drop(admission);
         // Authority has no record TTL: a ReadIndex barrier suffices. Never
         // propose AdvanceLogicalTime for a scope read or replay.
-        self.linearizable_barrier_before(deadline)
+        self.scope_read_barrier_before(deadline)
             .await
             .map_err(unavailable)?;
         let _admission = self
-            .admit_consumer_scope(current, deadline)
+            .admit_scope_read_before(current, deadline)
             .await
             .map_err(unavailable)?;
         let (legacy, checkpoint) = self
@@ -48,7 +48,7 @@ impl ScopeLeaseBackend for ConsensusSessionStore {
             .consensus_scope_lease_checkpoint(self.inner.storage_identity, scope.clone())
             .await
             .map_err(unavailable)?;
-        self.require_application_traffic_authority_before(deadline)
+        self.require_scope_read_authority_before(current, deadline)
             .await
             .map_err(unavailable)?;
         if legacy {

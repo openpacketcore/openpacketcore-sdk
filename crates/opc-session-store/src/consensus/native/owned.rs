@@ -117,6 +117,7 @@ fn intent(
             SessionMutationIntent::ScopeBatch(operation.clone())
         }
         SessionMutationIntent::ActivateScopeProfile(certificate) => {
+            crate::scope_storage::require_current_profile_format(certificate)?;
             certificate
                 .validate()
                 .map_err(|_| invalid("scope activation invalid"))?;

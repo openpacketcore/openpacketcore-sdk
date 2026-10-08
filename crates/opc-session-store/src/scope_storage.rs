@@ -12,28 +12,91 @@ use crate::scope_batch::{
     ScopeBatchCheckpoint, ScopeBatchError, ScopeChildKey, ScopeChildRecord, ScopeClaimKey,
     MAX_SCOPE_CHILD_CLAIMS, MAX_SCOPE_CHILD_VALUE_BYTES,
 };
-use crate::scope_lease::{ScopeLeaseId, ScopeProfileActivation};
+use crate::scope_lease::{ScopeLeaseId, ScopeProfileActivation, ScopeProfileContinuation};
 use crate::{
     EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
     SessionKey, SessionKeyType, SessionPayloadEncoding, StableId, StateClass, StateType,
     StoredSessionRecord,
 };
 
-const MAGIC: &[u8; 5] = b"OPSC\x02";
+const MAGIC: &[u8; 5] = b"OPSC\x03";
 const BATCH: &str = "opc-scope-batch";
 const CHILD: &str = "opc-scope-child";
 const CLAIM: &str = "opc-scope-claim";
 const PROFILE: &str = "opc-scope-profile";
-pub(crate) const RESERVED_KEY_TYPES: [&str; 5] = ["opc-scope-lease", BATCH, CHILD, CLAIM, PROFILE];
+const CONTINUATION: &str = "opc-scope-continuation";
+pub(crate) const RESERVED_KEY_TYPES: [&str; 6] = [
+    "opc-scope-lease",
+    BATCH,
+    CHILD,
+    CLAIM,
+    PROFILE,
+    CONTINUATION,
+];
 pub(crate) const MAX_SCOPE_ROW_BYTES: usize = MAX_SCOPE_CHILD_VALUE_BYTES + 4096;
 const MAX_METADATA_BYTES: usize = 16 * 1024;
+
+/// Recognize the declared fresh-install boundary without decoding or migrating
+/// a previous row. Unknown or malformed current formats remain corruption.
+pub(crate) fn require_current_record_format(record: &StoredSessionRecord) -> std::io::Result<()> {
+    if is_batch_record_key(&record.key)
+        && record.payload.encoding() == SessionPayloadEncoding::Plaintext
+        && record.state_type == StateType::from_static("opc-scope-state-v2")
+        && record.payload.as_bytes().starts_with(b"OPSC\x02")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            crate::consensus::storage::SessionConsensusStorageError::FreshInstallationRequired,
+        ));
+    }
+    Ok(())
+}
+
+/// Log replay can encounter activation before any scope row is materialized.
+/// This is the frozen profile-2 digest, not an additional supported profile.
+pub(crate) fn require_current_profile_format(
+    certificate: &ScopeProfileActivation,
+) -> std::io::Result<()> {
+    const PREVIOUS: [u8; 32] = [
+        0xe2, 0xed, 0x8b, 0x85, 0x7a, 0x26, 0x81, 0x98, 0x12, 0x86, 0x56, 0x7a, 0xaf, 0xe5, 0x24,
+        0xd0, 0xc9, 0x7e, 0xdc, 0x99, 0x9e, 0xf5, 0x8f, 0x92, 0x1b, 0x17, 0x40, 0x14, 0x7b, 0x4f,
+        0x97, 0x15,
+    ];
+    if certificate.profile == PREVIOUS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            crate::consensus::storage::SessionConsensusStorageError::FreshInstallationRequired,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn previous_profile_record_for_test(
+    mut certificate: ScopeProfileActivation,
+) -> StoredSessionRecord {
+    let mut record = ScopeRow::Activation(certificate.clone())
+        .to_record()
+        .unwrap();
+    // Frozen profile-2 encoding from eb1a60bfd, including G = 77 seconds.
+    certificate.profile =
+        hex::decode("e2ed8b857a2681981286567aafe524d0c97edc999ef58f921b1740147b4f9715")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let mut bytes = b"OPSC\x02".to_vec();
+    bytes.extend(postcard::to_allocvec(&ScopeRow::Activation(certificate)).unwrap());
+    record.state_type = StateType::from_static("opc-scope-state-v2");
+    record.payload = EncryptedSessionPayload::new(bytes);
+    record
+}
 
 pub(crate) fn is_scope_record_key(key: &SessionKey) -> bool {
     RESERVED_KEY_TYPES.contains(&key.key_type.as_str())
 }
 
 pub(crate) fn is_batch_record_key(key: &SessionKey) -> bool {
-    matches!(&key.key_type, SessionKeyType::Other(name) if matches!(name.as_str(), BATCH | CHILD | CLAIM | PROFILE))
+    matches!(&key.key_type, SessionKeyType::Other(name) if matches!(name.as_str(), BATCH | CHILD | CLAIM | PROFILE | CONTINUATION))
 }
 
 fn scoped_key(
@@ -82,6 +145,24 @@ pub(crate) fn profile_key(
     })
 }
 
+pub(crate) fn continuation_key(
+    cluster: SessionConsensusClusterId,
+) -> Result<SessionKey, ScopeBatchError> {
+    let mut key = profile_key(cluster)?;
+    key.key_type =
+        SessionKeyType::other(CONTINUATION).map_err(|_| ScopeBatchError::FormatMismatch)?;
+    Ok(key)
+}
+
+/// One bounded retained row per cluster. The log index prevents an aborted
+/// transition or a stale snapshot from rolling back the latest attestation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContinuationRow {
+    pub(crate) certificate: ScopeProfileContinuation,
+    pub(crate) log_index: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClaimOwner {
@@ -105,6 +186,7 @@ pub(crate) enum ScopeRow {
     Child(ScopeChildRecord),
     Claim(ClaimRow),
     Activation(ScopeProfileActivation),
+    Continuation(Box<ContinuationRow>),
 }
 
 impl fmt::Debug for ScopeRow {
@@ -145,6 +227,9 @@ impl ScopeRow {
             Self::Child(row) => child_key(&row.scope, row.key),
             Self::Claim(row) => claim_key(&row.scope, row.key),
             Self::Activation(row) => profile_key(row.identity.cluster_id()),
+            Self::Continuation(row) => {
+                continuation_key(row.certificate.predecessor.identity.cluster_id())
+            }
         }
     }
     fn revision(&self) -> u64 {
@@ -153,6 +238,7 @@ impl ScopeRow {
             Self::Child(row) => row.batch_revision,
             Self::Claim(row) => row.revision,
             Self::Activation(row) => row.identity.configuration_epoch().get(),
+            Self::Continuation(row) => row.log_index,
         }
     }
     pub(crate) fn scope(&self) -> Option<&ScopeLeaseId> {
@@ -160,7 +246,7 @@ impl ScopeRow {
             Self::Batch(row) => Some(&row.scope),
             Self::Child(row) => Some(&row.scope),
             Self::Claim(row) => Some(&row.scope),
-            Self::Activation(_) => None,
+            Self::Activation(_) | Self::Continuation(_) => None,
         }
     }
     pub(crate) fn validate(&self) -> Result<(), ScopeBatchError> {
@@ -198,6 +284,10 @@ impl ScopeRow {
                 Ok(())
             }
             Self::Activation(row) => row.validate().map_err(|_| ScopeBatchError::FormatMismatch),
+            Self::Continuation(row) => row
+                .certificate
+                .validate()
+                .map_err(|_| ScopeBatchError::FormatMismatch),
         }
     }
     fn body(&self) -> Result<Vec<u8>, ScopeBatchError> {
@@ -221,7 +311,7 @@ impl ScopeRow {
             owner: OwnerId::new("scope-state").map_err(|_| ScopeBatchError::FormatMismatch)?,
             fence: FenceToken::new(0),
             state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::from_static("opc-scope-state-v2"),
+            state_type: StateType::from_static("opc-scope-state-v3"),
             expires_at: None,
             payload: EncryptedSessionPayload::new_zeroizing(zeroize::Zeroizing::new(self.body()?)),
         })

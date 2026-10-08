@@ -239,7 +239,7 @@ impl Transaction<'_, '_> {
                     ),
                 ) {
                     return Err(StoreError::CapabilityNotSupported(
-                        "scope_store_profile_v2".into(),
+                        "scope_store_profile_v3".into(),
                     ));
                 }
                 let record = crate::scope_storage::ScopeRow::Activation((**certificate).clone())

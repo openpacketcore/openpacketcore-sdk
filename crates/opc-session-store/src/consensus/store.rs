@@ -481,6 +481,10 @@ pub enum ConsensusSessionStoreOpenError {
     /// workflow before this member may join.
     #[error("session consensus durable recovery is required")]
     RecoveryRequired,
+    /// The retained scope format belongs to the previous profile. Start with
+    /// fresh storage; this error does not authorize migrating or deleting it.
+    #[error("session consensus scope format changed; fresh installation required")]
+    FreshInstallationRequired,
     /// Persisted identity/schema does not match this deployment.
     #[error("session consensus durable identity does not match configuration")]
     DurableIdentityMismatch,
@@ -546,6 +550,9 @@ impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
             SessionConsensusStorageError::PersistenceModeMismatch => Self::PersistenceModeMismatch,
+            SessionConsensusStorageError::FreshInstallationRequired => {
+                Self::FreshInstallationRequired
+            }
             SessionConsensusStorageError::SnapshotIntegrityUnavailable => {
                 Self::SnapshotIntegrityUnavailable
             }
@@ -860,7 +867,7 @@ struct LocalProposalAuthority {
 /// cohort and is set immediately before Openraft accepts the command.
 struct LocalProposalExecution {
     proposal_permit: tokio::sync::OwnedSemaphorePermit,
-    operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    operation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     persistence_submission: Option<persistence_protocol::EngineAdmission>,
     cohort_freeze: Option<Arc<AtomicBool>>,
     /// Private observation of this exact accepted client-write completion.
@@ -1084,7 +1091,7 @@ pub(crate) enum CapabilityActivationKind {
     FencedTransitionV1,
     ProtectedRosterV1,
     ProtectedRosterV2,
-    ScopeProfileV2,
+    ScopeProfileV3,
 }
 
 /// The one local quorum proof that a physical V1 transition or V1 activation
@@ -7529,7 +7536,11 @@ impl ConsensusSessionStore {
         }
         let fixed_raw_v2_consumer_warm_route = self
             .fixed_raw_v2_consumer_warm_route_for_intent(&intent, required_consumer_scope.as_ref());
-        if !fixed_raw_v2_consumer_warm_route {
+        if scope_profile::is_scope_command(&intent) {
+            if let Err(error) = self.require_scope_traffic_authority_before(deadline).await {
+                return ConsensusSubmissionEffect::NotTransmitted(error);
+            }
+        } else if !fixed_raw_v2_consumer_warm_route {
             if let Err(error) = self
                 .require_application_traffic_authority_before(deadline)
                 .await
@@ -7733,7 +7744,7 @@ impl ConsensusSessionStore {
             observe_activation_result!(InitialScope, deadline, self.current_scope())?;
         let request = ForwardMutationRequest {
             request_id: match activation {
-                CapabilityActivationKind::ScopeProfileV2 => {
+                CapabilityActivationKind::ScopeProfileV3 => {
                     scope_profile::request_id(scope_identity)
                 }
                 CapabilityActivationKind::FencedTransitionV1 => {
@@ -7747,7 +7758,7 @@ impl ConsensusSessionStore {
                 }
             },
             intent: match activation {
-                CapabilityActivationKind::ScopeProfileV2 => {
+                CapabilityActivationKind::ScopeProfileV3 => {
                     SessionMutationIntent::PreflightScopeProfile
                 }
                 CapabilityActivationKind::FencedTransitionV1 => {
@@ -7849,7 +7860,7 @@ impl ConsensusSessionStore {
                     let (scope_identity, voters) =
                         observe_activation_result!(PostApplyScope, deadline, self.current_scope())?;
                     let activated = match activation {
-                        CapabilityActivationKind::ScopeProfileV2 => {
+                        CapabilityActivationKind::ScopeProfileV3 => {
                             self.scope_profile_matches(scope_identity, &voters).await
                         }
                         CapabilityActivationKind::FencedTransitionV1 => {
@@ -8143,16 +8154,25 @@ impl ConsensusSessionStore {
                 error,
             )));
         }
+        let scope_traffic = scope_profile::is_scope_command(&request.intent);
         // Membership changes take the exclusive side of this gate. Holding a
         // shared guard through the definitive proposal result lets the
         // transition driver drain every already-admitted application write
-        // before it commits learner-ready/fencing evidence.
+        // before it commits learner-ready/fencing evidence. Dynamic scope
+        // commands instead drain at the replicated Fence: apply rejects any
+        // predecessor stamp ordered after it, without blocking renewals on
+        // learner catch-up or a paused coordinator.
         let operation_gate = self.inner.topology_coordinator.operation_gate();
-        let operation_guard =
+        let operation_guard = if scope_traffic
+            && self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
+        {
+            None
+        } else {
             match tokio::time::timeout_at(deadline, operation_gate.read_owned()).await {
-                Ok(guard) => guard,
+                Ok(guard) => Some(guard),
                 Err(_) => return ForwardMutationReply::Unavailable,
-            };
+            }
+        };
         let fenced_activation_preflight = matches!(
             &request.intent,
             SessionMutationIntent::PreflightFencedTransitionCapability
@@ -8210,13 +8230,15 @@ impl ConsensusSessionStore {
             &request.intent,
             SessionMutationIntent::ScopeLease(_) | SessionMutationIntent::ScopeBatch(_)
         ) && !self
-            .activated_scope_profile_is_current()
+            .activated_scope_profile_is_current(deadline)
             .await
             .unwrap_or(false)
         {
             return ForwardMutationReply::Unavailable;
         }
-        let initial_authority = if fixed_raw_v2_mutation || activated_fenced_transition {
+        let initial_authority = if scope_traffic {
+            self.require_scope_traffic_authority_before(deadline).await
+        } else if fixed_raw_v2_mutation || activated_fenced_transition {
             // The operation gate remains held, and the exact durable
             // authority is consumed at its respective final acceptance
             // boundary. Reading it here as well would only add an avoidable
@@ -8329,7 +8351,9 @@ impl ConsensusSessionStore {
                 .await
             {
                 EnsureLinearizableOutcome::Ready { .. } => {
-                    let authority = if allow_operator_recovery {
+                    let authority = if scope_traffic {
+                        self.require_scope_traffic_authority_before(deadline).await
+                    } else if allow_operator_recovery {
                         self.require_durable_fixed_quorum_admission_before(deadline)
                             .await
                     } else {
@@ -8448,7 +8472,9 @@ impl ConsensusSessionStore {
             None
         };
 
-        let authority = if activated_fenced_transition {
+        let authority = if scope_traffic {
+            self.require_scope_traffic_authority_before(deadline).await
+        } else if activated_fenced_transition {
             Ok(())
         } else if allow_operator_recovery {
             self.require_durable_fixed_quorum_admission_before(deadline)
@@ -8747,10 +8773,15 @@ impl ConsensusSessionStore {
         if !is_raw_fenced_transition_v2_mutation(&request.intent, allow_operator_recovery)
             && !allow_operator_recovery
             && fenced_transition_admission.is_none()
-            && self
-                .require_application_traffic_intermediate_authority_before(deadline)
-                .await
-                .is_err()
+            && if scope_traffic {
+                self.require_scope_traffic_authority_before(deadline)
+                    .await
+                    .is_err()
+            } else {
+                self.require_application_traffic_intermediate_authority_before(deadline)
+                    .await
+                    .is_err()
+            }
         {
             return ForwardMutationReply::Unavailable;
         }
@@ -8882,6 +8913,7 @@ impl ConsensusSessionStore {
         let consumer_compare_and_set =
             matches!(&request.intent, SessionMutationIntent::CompareAndSet(_));
         let required_consumer_scope = request.required_consumer_scope.clone();
+        let scope_traffic = scope_profile::is_scope_command(&request.intent);
         let reroute_receiver_forward_to_leader =
             !mutation_requires_exact_status_resolution(&request);
         let roster_mutation = is_roster_mutation_intent(&request.intent);
@@ -8950,10 +8982,15 @@ impl ConsensusSessionStore {
             }
         } else if !authority.allows_operator_recovery
             && !authority.fixed_raw_v2_snapshot
-            && self
-                .require_application_traffic_authority_before(deadline)
-                .await
-                .is_err()
+            && if scope_traffic {
+                self.require_scope_traffic_authority_before(deadline)
+                    .await
+                    .is_err()
+            } else {
+                self.require_application_traffic_authority_before(deadline)
+                    .await
+                    .is_err()
+            }
         {
             return ForwardMutationReply::Unavailable;
         }
@@ -9266,7 +9303,7 @@ impl ConsensusSessionStore {
                 authority_time,
                 LocalProposalExecution {
                     proposal_permit,
-                    operation_guard,
+                    operation_guard: Some(operation_guard),
                     persistence_submission: None,
                     cohort_freeze: None,
                     cold_completion: None,
@@ -9562,8 +9599,30 @@ impl ConsensusSessionStore {
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
+        self.local_read_barrier_with_scope_admission(deadline, false)
+            .await
+    }
+
+    async fn require_read_barrier_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+        scope_traffic: bool,
+    ) -> Result<(), StoreError> {
+        if scope_traffic {
+            self.require_scope_traffic_authority_before(deadline).await
+        } else {
+            self.require_durable_fixed_quorum_admission_before(deadline)
+                .await
+        }
+    }
+
+    async fn local_read_barrier_with_scope_admission(
+        &self,
+        deadline: tokio::time::Instant,
+        scope_traffic: bool,
+    ) -> ReadBarrierReply {
         if self
-            .require_durable_fixed_quorum_admission_before(deadline)
+            .require_read_barrier_authority_before(deadline, scope_traffic)
             .await
             .is_err()
         {
@@ -9579,7 +9638,7 @@ impl ConsensusSessionStore {
         match self.inner.read_barrier.admit(deadline).await {
             Ok(admit) => {
                 if self
-                    .require_durable_fixed_quorum_admission_before(deadline)
+                    .require_read_barrier_authority_before(deadline, scope_traffic)
                     .await
                     .is_err()
                 {
@@ -9605,6 +9664,15 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
+        self.linearizable_barrier_with_scope_admission_before(deadline, false)
+            .await
+    }
+
+    async fn linearizable_barrier_with_scope_admission_before(
+        &self,
+        deadline: tokio::time::Instant,
+        scope_traffic: bool,
+    ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
         #[cfg(test)]
         ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
@@ -9620,7 +9688,7 @@ impl ConsensusSessionStore {
         }) {
             return Err(failure);
         }
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_read_barrier_authority_before(deadline, scope_traffic)
             .await
             .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
         match self.operator_recovery_gate_before(deadline).await {
@@ -9642,17 +9710,27 @@ impl ConsensusSessionStore {
                     .map_err(|_| LinearizableBarrierFailure::Unavailable)?,
             };
             let reply = if leader == self.inner.local_node_id {
-                self.local_read_barrier(deadline).await
+                self.local_read_barrier_with_scope_admission(deadline, scope_traffic)
+                    .await
             } else {
-                match self
-                    .call_peer::<_, ReadBarrierReply>(
+                let reply = if scope_traffic {
+                    self.call_peer::<_, ReadBarrierReply>(
+                        leader,
+                        SessionConsensusRpcFamily::ReadBarrier,
+                        &scope_profile::READ_BARRIER_DOMAIN,
+                        deadline,
+                    )
+                    .await
+                } else {
+                    self.call_peer::<_, ReadBarrierReply>(
                         leader,
                         SessionConsensusRpcFamily::ReadBarrier,
                         &ReadBarrierRequest,
                         deadline,
                     )
                     .await
-                {
+                };
+                match reply {
                     Ok(reply) => reply,
                     Err(_) => {
                         self.wait_for_route_refresh(leader, deadline)
@@ -9671,7 +9749,7 @@ impl ConsensusSessionStore {
                             .await
                             .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
                     }
-                    self.require_durable_fixed_quorum_admission_before(deadline)
+                    self.require_read_barrier_authority_before(deadline, scope_traffic)
                         .await
                         .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
                     match self.operator_recovery_gate_before(deadline).await {
@@ -11512,6 +11590,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::ScopeLease(_)
         | SessionMutationIntent::ScopeBatch(_)
         | SessionMutationIntent::PreflightScopeProfile
+        | SessionMutationIntent::CertifyScopeProfileContinuation(_)
         | SessionMutationIntent::ActivateScopeProfile(_) => false,
         SessionMutationIntent::BindConsumerRequest { .. } => {
             matches!(error, StoreError::CasIdempotencyConflict)
@@ -12233,6 +12312,17 @@ impl SessionConsensusService {
                         .checked_add(self.store.inner.operation_timeout)
                         .unwrap_or_else(tokio::time::Instant::now);
                     return encode_service_reply(&self.store.local_read_barrier(deadline).await);
+                }
+                if request.payload.as_slice() == scope_profile::READ_BARRIER_DOMAIN {
+                    let deadline = tokio::time::Instant::now()
+                        .checked_add(self.store.inner.operation_timeout)
+                        .unwrap_or_else(tokio::time::Instant::now);
+                    return encode_service_reply(
+                        &self
+                            .store
+                            .local_read_barrier_with_scope_admission(deadline, true)
+                            .await,
+                    );
                 }
                 if let Ok(probe) =
                     decode_bounded::<scope_profile::ScopeProfileProbe>(&request.payload)
@@ -19314,7 +19404,7 @@ mod membership_tests {
             .expect("initialize activation receiver effect store");
 
         for (label, activation) in [
-            ("scope profile 2", CapabilityActivationKind::ScopeProfileV2),
+            ("scope profile 3", CapabilityActivationKind::ScopeProfileV3),
             (
                 "fenced transition V1",
                 CapabilityActivationKind::FencedTransitionV1,
@@ -19341,7 +19431,7 @@ mod membership_tests {
             let (result, failure) =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
-                        CapabilityActivationKind::ScopeProfileV2 => {
+                        CapabilityActivationKind::ScopeProfileV3 => {
                             store
                                 .ensure_scope_profile_before(
                                     tokio::time::Instant::now() + store.inner.operation_timeout,
@@ -19400,7 +19490,7 @@ mod membership_tests {
             .expect("initialize deadline activation receiver store");
 
         for (label, activation) in [
-            ("scope profile 2", CapabilityActivationKind::ScopeProfileV2),
+            ("scope profile 3", CapabilityActivationKind::ScopeProfileV3),
             (
                 "fenced transition V1",
                 CapabilityActivationKind::FencedTransitionV1,
@@ -19430,7 +19520,7 @@ mod membership_tests {
             let activation_call =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
-                        CapabilityActivationKind::ScopeProfileV2 => {
+                        CapabilityActivationKind::ScopeProfileV3 => {
                             store
                                 .ensure_scope_profile_before(
                                     tokio::time::Instant::now() + store.inner.operation_timeout,
@@ -19483,7 +19573,7 @@ mod membership_tests {
             let (resolved, failure) =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
-                        CapabilityActivationKind::ScopeProfileV2 => {
+                        CapabilityActivationKind::ScopeProfileV3 => {
                             store
                                 .ensure_scope_profile_before(
                                     tokio::time::Instant::now() + store.inner.operation_timeout,
@@ -20443,7 +20533,7 @@ mod membership_tests {
                 store.inner.clock.now_utc(),
                 LocalProposalExecution {
                     proposal_permit,
-                    operation_guard,
+                    operation_guard: Some(operation_guard),
                     persistence_submission: None,
                     cohort_freeze: None,
                     cold_completion: None,
@@ -24592,7 +24682,7 @@ mod membership_tests {
                 store.inner.clock.now_utc(),
                 LocalProposalExecution {
                     proposal_permit,
-                    operation_guard,
+                    operation_guard: Some(operation_guard),
                     persistence_submission: None,
                     cohort_freeze: None,
                     cold_completion: None,

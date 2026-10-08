@@ -39,6 +39,7 @@ pub(super) fn validate_key(
         }
     }
     if let Some(record) = &value.record {
+        crate::scope_storage::require_current_record_format(record)?;
         crate::sqlite::validate_consensus_record(record)
             .map_err(|_| invalid("native image record invalid"))?;
         if &record.key != key || record.fence.get() > value.fence {

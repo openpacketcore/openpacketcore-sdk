@@ -389,6 +389,8 @@ pub(super) struct SessionTopologyCoordinatorState {
     #[cfg(feature = "test-control")]
     reconciliation_staging_check_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
     #[cfg(feature = "test-control")]
+    scope_continuation_reply_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
+    #[cfg(feature = "test-control")]
     outbound_learner_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
     #[cfg(feature = "test-control")]
     outbound_voting_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
@@ -591,6 +593,37 @@ pub fn pause_next_reconciliation_after_staging_check_for_test(
         .inner
         .topology_coordinator
         .reconciliation_staging_check_pause_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if slot.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *slot = Some(LocalTransitionPauseForTest {
+        entered,
+        release: released,
+    });
+    Ok((observed, release))
+}
+
+/// Pause after a scope-continuation command commits, before its caller receives
+/// completion or starts learner replication. Dropping the release channel
+/// injects a lost local command acknowledgement with its durable effect retained.
+#[cfg(feature = "test-control")]
+pub fn pause_next_scope_continuation_reply_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<
+    (
+        tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    SessionTopologyTransitionError,
+> {
+    let mut slot = store
+        .inner
+        .topology_coordinator
+        .scope_continuation_reply_pause_for_test
         .lock()
         .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
     if slot.is_some() {
@@ -1001,6 +1034,8 @@ impl SessionTopologyCoordinatorState {
             #[cfg(feature = "test-control")]
             reconciliation_staging_check_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
+            scope_continuation_reply_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
             outbound_learner_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             outbound_voting_pause_for_test: Mutex::new(None),
@@ -1400,7 +1435,7 @@ impl SessionTopologyCoordinatorState {
             .map_err(map_transport_error)
     }
 
-    fn staged_request(
+    pub(super) fn staged_request(
         &self,
         transition_id: crate::membership::SessionTopologyTransitionId,
         request_digest: crate::membership::SessionTopologyTransitionDigest,
@@ -1682,6 +1717,7 @@ enum TransitionControlKind {
     Abort = 4,
     Finalize = 5,
     AbortCleanup = 6,
+    ScopeContinuation = 7,
 }
 
 fn transition_request_id(
@@ -1801,7 +1837,7 @@ struct DurableTransitionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppliedMembershipShape {
+pub(super) enum AppliedMembershipShape {
     CurrentUniform,
     Learners,
     Joint,
@@ -1809,7 +1845,7 @@ enum AppliedMembershipShape {
     Invalid,
 }
 
-fn classify_applied_membership(
+pub(super) fn classify_applied_membership(
     membership: &StoredMembership<SessionConsensusNodeId, EmptyNode>,
     current_members: &BTreeSet<SessionConsensusNodeId>,
     desired_members: &BTreeSet<SessionConsensusNodeId>,
@@ -2749,14 +2785,39 @@ impl ConsensusSessionStore {
             deadline,
         )
         .await?;
-        self.require_scope_profile_prospective_learner_capability_before(
-            request,
-            &durable,
-            &current_members,
-            &desired_members,
-            deadline,
-        )
-        .await?;
+        if let Some(certificate) = self
+            .scope_profile_continuation_before(request, &durable)
+            .await?
+        {
+            if !self
+                .scope_profile_continuation_is_committed(&certificate, &durable)
+                .await?
+            {
+                self.require_scope_profile_prospective_learner_capability_before(
+                    request,
+                    &durable,
+                    &current_members,
+                    &desired_members,
+                    deadline,
+                )
+                .await?;
+                // The probes do not survive leadership loss. Commit their
+                // exact transition-bound attestation before any new member
+                // receives this profile through a log or snapshot.
+                let (returned_guard, _) = self
+                    .propose_transition_control(
+                        request,
+                        TransitionControlKind::ScopeContinuation,
+                        SessionMutationIntent::CertifyScopeProfileContinuation(Box::new(
+                            certificate,
+                        )),
+                        operation_guard,
+                        deadline,
+                    )
+                    .await?;
+                operation_guard = returned_guard;
+            }
+        }
         for learner in desired_members.difference(&current_members).copied() {
             operation_guard = self
                 .add_learner_before(learner, operation_guard, deadline)
@@ -2800,6 +2861,78 @@ impl ConsensusSessionStore {
         )
         .await?;
         Ok(proof)
+    }
+
+    async fn scope_profile_continuation_before(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        durable: &DurableTransitionState,
+    ) -> Result<Option<crate::scope_lease::ScopeProfileContinuation>, SessionTopologyTransitionError>
+    {
+        use crate::scope_lease::{ScopeProfileActivation, ScopeProfileContinuation};
+        let key = crate::scope_storage::profile_key(self.inner.storage_identity.cluster_id())
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let row = self
+            .inner
+            .backend
+            .consensus_scope_record(self.inner.storage_identity, key)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let predecessor = match row {
+            None => return Ok(None),
+            Some(crate::scope_storage::ScopeRow::Activation(certificate))
+                if certificate.matches(
+                    durable.scope.current_identity,
+                    fenced_transition_voter_set_digest(
+                        durable.scope.current_identity,
+                        &durable.scope.current_members,
+                    ),
+                ) =>
+            {
+                certificate
+            }
+            _ => return Err(SessionTopologyTransitionError::Unavailable),
+        };
+        if self.local_scope_profile().is_none() {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        Ok(Some(ScopeProfileContinuation {
+            transition_id: request.transition_id().as_bytes(),
+            transition_digest: request.request_digest().as_bytes(),
+            predecessor,
+            successor: ScopeProfileActivation::new(
+                request.desired_identity(),
+                fenced_transition_voter_set_digest(
+                    request.desired_identity(),
+                    &request.desired_consensus_node_ids(),
+                ),
+            ),
+        }))
+    }
+
+    async fn scope_profile_continuation_is_committed(
+        &self,
+        certificate: &crate::scope_lease::ScopeProfileContinuation,
+        durable: &DurableTransitionState,
+    ) -> Result<bool, SessionTopologyTransitionError> {
+        let pending = durable
+            .scope
+            .pending
+            .as_ref()
+            .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+        let key = crate::scope_storage::continuation_key(self.inner.storage_identity.cluster_id())
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let retained = self
+            .inner
+            .backend
+            .consensus_scope_record(self.inner.storage_identity, key)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        Ok(
+            matches!(retained, Some(crate::scope_storage::ScopeRow::Continuation(row))
+            if row.certificate == *certificate
+                && row.log_index > pending.transition_start_log_index),
+        )
     }
 
     /// A retained activation row is format history even after its voter-bound
@@ -3137,6 +3270,17 @@ impl ConsensusSessionStore {
         if durable.scope.application_authority_epoch != request.desired_epoch()
             || durable.scope.application_authority_members != request.desired_consensus_node_ids()
         {
+            if let Some(certificate) = self
+                .scope_profile_continuation_before(request, &durable)
+                .await?
+            {
+                if !self
+                    .scope_profile_continuation_is_committed(&certificate, &durable)
+                    .await?
+                {
+                    return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+                }
+            }
             let (returned_guard, _) = self
                 .propose_transition_control(
                     request,
@@ -3590,7 +3734,25 @@ impl ConsensusSessionStore {
                     return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
                 }
             };
-        result.map(|index| (operation_guard, index))
+        let index = result?;
+        #[cfg(feature = "test-control")]
+        if kind == TransitionControlKind::ScopeContinuation {
+            let pause = self
+                .inner
+                .topology_coordinator
+                .scope_continuation_reply_pause_for_test
+                .lock()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                .take();
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(deadline);
+                tokio::time::timeout_at(deadline, pause.release)
+                    .await
+                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            }
+        }
+        Ok((operation_guard, index))
     }
 
     async fn add_learner_before(
@@ -4966,6 +5128,8 @@ mod scope_refresh_tests {
             reconciliation_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             reconciliation_staging_check_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            scope_continuation_reply_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]
             outbound_learner_pause_for_test: Mutex::new(None),
             #[cfg(feature = "test-control")]

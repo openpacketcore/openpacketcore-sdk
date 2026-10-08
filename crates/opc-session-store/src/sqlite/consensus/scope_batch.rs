@@ -75,7 +75,7 @@ pub(super) fn validate_snapshot_preserves_scopes(conn: &Connection) -> io::Resul
                 new.tenant,new.nf_kind,new.key_type,new.stable_id,new.generation,new.owner,new.fence,new.state_class,new.state_type,new.expires_at,new.payload,new.encoding \
          FROM main.session_records old LEFT JOIN consensus_incoming.session_records new \
          ON new.tenant=old.tenant AND new.nf_kind=old.nf_kind AND new.key_type=old.key_type AND new.stable_id=old.stable_id \
-         WHERE old.key_type IN (?1,?2,?3,?4,?5)"
+         WHERE old.key_type IN (?1,?2,?3,?4,?5,?6)"
     ).map_err(db_error)?;
     let mut rows = statement
         .query(scope_storage::RESERVED_KEY_TYPES)
@@ -147,9 +147,19 @@ pub(super) fn activate(
     let scope = read_membership_scope_sync(conn, identity).map_err(|_| {
         StoreError::BackendUnavailable("scope activation authority unavailable".into())
     })?;
+    // Durable Prepare fixes the formats that must be certified before cutover.
+    // A candidate's provisional bootstrap scope precedes historical replay;
+    // it must apply that old prefix exactly as the current voters did.
+    if scope
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.transition_start_log_index != 0)
+    {
+        return Err(StoreError::TopologyAuthorityRevoked);
+    }
     if !certificate_matches(&scope, certificate) {
         return Err(StoreError::CapabilityNotSupported(
-            "scope_store_profile_v2".into(),
+            "scope_store_profile_v3".into(),
         ));
     }
     let record = ScopeRow::Activation(certificate.clone())

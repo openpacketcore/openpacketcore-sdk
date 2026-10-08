@@ -14,6 +14,9 @@ use std::process::{Child, Command, Stdio};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+#[path = "process_quorum/membership.rs"]
+mod membership;
+
 const NODE_ENV: &str = "OPC_SCOPE_PROCESS_NODE";
 const TEST_NAME: &str = "scope_lease::process_quorum::scope_quorum_processes_fail_over_race_and_recover_compacted_authority";
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
@@ -51,6 +54,7 @@ enum Request {
         keys: Vec<ScopeChildKey>,
     },
     Snapshot,
+    Membership(membership::Control),
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +88,7 @@ enum Reply {
         purged: u64,
         rows: u64,
     },
+    Membership(membership::ControlReply),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,12 +146,16 @@ struct Peer {
     source: SessionConsensusNodeId,
     address: SocketAddr,
     votes: Arc<VoteControl>,
+    scope: Option<ConsensusIdentity>,
 }
 
 #[async_trait]
 impl SessionConsensusPeer for Peer {
     fn node_id(&self) -> SessionConsensusNodeId {
         self.node
+    }
+    fn scope_identity(&self) -> Option<ConsensusIdentity> {
+        self.scope
     }
     async fn call(
         &self,
@@ -217,6 +226,7 @@ impl SessionConsensusPeer for Peer {
 
 async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[SocketAddr]) {
     let listener = TcpListener::bind(addresses[index]).await.unwrap();
+    let configuration = membership::Configuration::from_environment();
     let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
     let identity = consensus_identity(&members);
     let topologies = (0..MEMBER_COUNT)
@@ -238,37 +248,74 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
         released: tokio::sync::watch::channel(false).0,
     });
     let peers = (0..MEMBER_COUNT)
-        .filter(|n| *n != index)
+        .filter(|n| configuration.is_none() && *n != index)
         .map(|n| {
             let peer: Arc<dyn SessionConsensusPeer> = Arc::new(Peer {
                 node: nodes[n],
                 source: nodes[index],
                 address: addresses[n],
                 votes: votes.clone(),
+                scope: None,
             });
             (nodes[n], peer)
         })
         .collect();
     let database = root.join(format!("voter-{index}.sqlite"));
-    let store = ConsensusSessionStore::open_with_clock(
-        topologies[index].clone(),
-        SqliteSessionBackend::open(&database).unwrap(),
-        snapshots.join(format!("voter-{index}")),
-        peers,
-        Arc::new(SystemClock),
-        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    // Current voters use ordinary initialization/admission after reopen.
+    // A candidate or an in-flight predecessor is admitted by the coordinator.
+    let initialize = configuration
+        .as_ref()
+        .is_none_or(membership::Configuration::initializes);
+    let store = if let Some(configuration) = &configuration {
+        membership::open_voter(
+            index,
+            root,
+            snapshots,
+            addresses,
+            votes.clone(),
+            configuration,
+        )
+        .await
+    } else {
+        ConsensusSessionStore::open_with_clock(
+            topologies[index].clone(),
+            SqliteSessionBackend::open(&database).unwrap(),
+            snapshots.join(format!("voter-{index}")),
+            peers,
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+        )
+        .await
+        .unwrap()
+    };
+    let controls = Arc::new(membership::Controls::default());
+    let scope = ScopeLeaseId::new(
+        identity,
+        TenantId::new("scope-quorum-test").unwrap(),
+        NetworkFunctionKind::new("test").unwrap(),
+        [1; 32],
     )
-    .await
     .unwrap();
     let initializing = store.clone();
     let clock = Arc::new(BoundedClock(AtomicU64::new(0)));
     let authority = Arc::new(tokio::sync::OnceCell::new());
     let initialized = authority.clone();
     let initial_clock = clock.clone();
+    let initial_scope = scope.clone();
     tokio::spawn(async move {
-        initializing.initialize_cluster().await.unwrap();
+        if initialize {
+            initializing.initialize_cluster().await.unwrap();
+        }
         initialized
-            .set(service(&initializing, initial_clock))
+            .set(
+                ScopeLeaseStore::new(
+                    Arc::new(initializing),
+                    initial_scope.clone(),
+                    initial_clock,
+                    Arc::new(Admission(initial_scope)),
+                )
+                .unwrap(),
+            )
             .unwrap();
     });
     loop {
@@ -278,14 +325,33 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
         let clock = clock.clone();
         let database = database.clone();
         let votes = votes.clone();
+        let controls = controls.clone();
+        let scope = scope.clone();
+        let addresses = addresses.to_vec();
         tokio::spawn(async move {
             let Ok(request) = read_frame::<Request>(&mut socket).await else {
                 return;
             };
             let reply = match request {
                 Request::Rpc { sender, request } => {
+                    controls.observe_snapshot(&request);
+                    if controls.reject_profile_probe(&request) {
+                        let _ = write_frame(
+                            &mut socket,
+                            &Reply::Rpc(SessionConsensusWireResponse {
+                                result: Err(SessionConsensusPeerError::Rejected),
+                            }),
+                        )
+                        .await;
+                        return;
+                    }
                     Reply::Rpc(store.rpc_handler().handle(sender, request).await)
                 }
+                Request::Membership(control) => Reply::Membership(
+                    controls
+                        .handle(&store, index, &addresses, &votes, &database, control)
+                        .await,
+                ),
                 Request::PrepareSplitVote { peer } => {
                     *votes.state.lock().unwrap() = VoteState {
                         peer: Some(peer),
@@ -348,6 +414,9 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                         // two voter processes still running and serving Raft.
                         std::process::exit(77);
                     }
+                    if result.is_ok() && controls.lose_lease_reply() {
+                        return;
+                    }
                     Reply::Scope(Box::new(result))
                 }
                 Request::ExecuteBatch {
@@ -357,14 +426,6 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                     crash_after_commit,
                 } => {
                     clock.0.store(at, Ordering::SeqCst);
-                    let scope = authority
-                        .get()
-                        .unwrap()
-                        .current(&principal("worker-1"))
-                        .await
-                        .unwrap()
-                        .scope()
-                        .clone();
                     let batch = batch_service(&store, clock, &scope);
                     let result = batch.execute(&principal(&actor), &request).await;
                     if crash_after_commit {
@@ -374,17 +435,12 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                         );
                         std::process::exit(77);
                     }
+                    if result.is_ok() && controls.lose_batch_reply() {
+                        return;
+                    }
                     Reply::Batch(Box::new(result))
                 }
                 Request::ReadBatch { keys } => {
-                    let scope = authority
-                        .get()
-                        .unwrap()
-                        .current(&principal("worker-1"))
-                        .await
-                        .unwrap()
-                        .scope()
-                        .clone();
                     let batch = batch_service(&store, clock, &scope);
                     let view = batch.current(&principal("worker-1")).await.unwrap();
                     let mut rows = Vec::new();
@@ -461,6 +517,7 @@ struct Processes {
     addresses: Vec<SocketAddr>,
     root: PathBuf,
     snapshots: PathBuf,
+    configurations: Vec<Option<membership::Configuration>>,
 }
 
 impl Processes {
@@ -478,6 +535,7 @@ impl Processes {
             addresses,
             root: root.to_path_buf(),
             snapshots: snapshots.to_path_buf(),
+            configurations: vec![None; MEMBER_COUNT],
         };
         for n in 0..MEMBER_COUNT {
             fleet.spawn(n);
@@ -495,6 +553,10 @@ impl Processes {
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
                 .env(NODE_ENV, index.to_string())
+                .env(
+                    membership::CONFIG_ENV,
+                    serde_json::to_string(&self.configurations[index]).unwrap(),
+                )
                 .env(ROOT_ENV, &self.root)
                 .env(SNAPSHOT_ENV, &self.snapshots)
                 .env(

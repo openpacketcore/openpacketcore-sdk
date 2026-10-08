@@ -25,15 +25,15 @@ impl ConsensusSessionStore {
         let current = SessionConsumerScope::new(identity);
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         drop(
-            self.admit_consumer_scope(current, deadline)
+            self.admit_scope_read_before(current, deadline)
                 .await
                 .map_err(unavailable)?,
         );
-        self.linearizable_barrier_before(deadline)
+        self.scope_read_barrier_before(deadline)
             .await
             .map_err(unavailable)?;
         let _admission = self
-            .admit_consumer_scope(current, deadline)
+            .admit_scope_read_before(current, deadline)
             .await
             .map_err(unavailable)?;
         let row = self
@@ -42,7 +42,7 @@ impl ConsensusSessionStore {
             .consensus_scope_record(self.inner.storage_identity, key)
             .await
             .map_err(unavailable)?;
-        self.require_application_traffic_authority_before(deadline)
+        self.require_scope_read_authority_before(current, deadline)
             .await
             .map_err(unavailable)?;
         if row.as_ref().is_some_and(|row| row.scope() != Some(scope)) {

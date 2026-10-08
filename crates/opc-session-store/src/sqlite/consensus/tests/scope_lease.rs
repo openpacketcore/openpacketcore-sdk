@@ -140,7 +140,7 @@ fn scope_lease_refuses_mutation_before_scope_profile_activation() {
             applied.responses.last().unwrap().result,
             Ok(SessionMutationOutcome::ScopeLease(Ok(_)))
         ),
-        "scope profile 2 cannot be used before every voter supports it"
+        "scope profile 3 cannot be used before every voter supports it"
     );
 }
 
