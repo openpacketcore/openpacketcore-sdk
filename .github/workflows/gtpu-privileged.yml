@@ -170,7 +170,7 @@ jobs:
               cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
               # All filters go after `--`: cargo accepts only one positional
               # TESTNAME, while libtest itself takes any number.
-              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation
+              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation detach_accepts_unrelated_program_retirement_ detach_keeps_foreign_reference_despite_unrelated_program_retirement
             ' 2>&1 | tee "${datapath_log}"
 
           # Every one of these tests returns Ok early when
@@ -238,11 +238,15 @@ jobs:
           # the environment is not privileged, so the skip check above cannot
           # see them. Require the markers each emits only after real kernel
           # provenance/recovery work, as the QEMU jobs do.
+          grep -Fq 'test result: ok. 8 passed; 0 failed;' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1' "${datapath_log}"
 
       - name: Require native shared GTP-U control queue and both injection contracts
         run: |
@@ -543,17 +547,20 @@ jobs:
 
           if ! history_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation detach_accepts_unrelated_program_retirement_ detach_keeps_foreign_reference_despite_unrelated_program_retirement"' \
               2>&1
           )"; then
             printf '%s\n' "${history_output}"
             exit 1
           fi
           printf '%s\n' "${history_output}"
-          grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${history_output}"
+          grep -Fq 'test result: ok. 6 passed; 0 failed;' <<< "${history_output}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN' <<< "${history_output}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' <<< "${history_output}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' <<< "${history_output}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN' <<< "${history_output}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2' <<< "${history_output}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1' <<< "${history_output}"
 
           if ! live_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
@@ -897,17 +904,20 @@ jobs:
 
           if ! history_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation detach_accepts_unrelated_program_retirement_ detach_keeps_foreign_reference_despite_unrelated_program_retirement"' \
               2>&1
           )"; then
             printf '%s\n' "${history_output}"
             exit 1
           fi
           printf '%s\n' "${history_output}"
-          grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${history_output}"
+          grep -Fq 'test result: ok. 6 passed; 0 failed;' <<< "${history_output}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN' <<< "${history_output}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' <<< "${history_output}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' <<< "${history_output}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN' <<< "${history_output}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2' <<< "${history_output}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1' <<< "${history_output}"
 
           # The suite shells out to ip, tc, ethtool, nft, wg and python3.
           # iproute2, ethtool and python3 ship on the cloud image; nftables and

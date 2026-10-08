@@ -17675,7 +17675,12 @@ mod aya_runtime {
     const HISTORICAL_25_RECOVERY_PROOF_LEN: usize = HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET + 8;
 
     #[cfg(test)]
+    type CurrentProgramScanTestHook = Box<dyn FnMut(&ProgramInfo)>;
+
+    #[cfg(test)]
     std::thread_local! {
+        static CURRENT_PROGRAM_SCAN_TEST_HOOK: std::cell::RefCell<Option<CurrentProgramScanTestHook>> =
+            const { std::cell::RefCell::new(None) };
         static HISTORICAL_25_TEST_CRASH_AFTER_QUALIFIED_PROOF: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
         static HISTORICAL_25_TEST_CRASH_AFTER_EXCLUSION_RETIREMENT: std::cell::Cell<bool> =
@@ -36034,12 +36039,26 @@ mod aya_runtime {
             let mut exact_seen = false;
             let mut foreign_seen = false;
             for result in loaded_programs() {
-                let info =
-                    result.map_err(|error| program_error("ebpf_current_program_scan", &error))?;
-                let mut referenced = info
-                    .map_ids()
-                    .map_err(|error| program_error("ebpf_current_program_scan", &error))?
-                    .ok_or_else(|| state_indeterminate("ebpf_current_program_scan"))?;
+                // Enumeration and map_ids() reopen program IDs separately.
+                // A program retired in either gap no longer retains a graph;
+                // every other inspection failure still prevents proving it safe.
+                let info = match result {
+                    Err(error) if program_id_disappeared_during_scan(&error) => continue,
+                    result => result
+                        .map_err(|error| program_error("ebpf_current_program_scan", &error))?,
+                };
+                #[cfg(test)]
+                CURRENT_PROGRAM_SCAN_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook(&info);
+                    }
+                });
+                let mut referenced = match info.map_ids() {
+                    Err(error) if program_id_disappeared_during_scan(&error) => continue,
+                    result => result
+                        .map_err(|error| program_error("ebpf_current_program_scan", &error))?,
+                }
+                .ok_or_else(|| state_indeterminate("ebpf_current_program_scan"))?;
                 if !referenced.iter().any(|id| graph_ids.contains(id)) {
                     continue;
                 }
@@ -49416,6 +49435,15 @@ mod aya_runtime {
         Ok(false)
     }
 
+    fn program_id_disappeared_during_scan(error: &ProgramError) -> bool {
+        matches!(
+            error,
+            ProgramError::SyscallError(error)
+                if error.call == "bpf_prog_get_fd_by_id"
+                    && error.io_error.raw_os_error() == Some(rustix::io::Errno::NOENT.raw_os_error())
+        )
+    }
+
     /// Map aya program errors to redaction-safe errors. Program-load
     /// failures retain a typed failure class, while verifier output and aya
     /// error strings (which can embed implementation details, interface
@@ -52457,6 +52485,201 @@ mod aya_runtime {
                 .collect();
             names.sort();
             names
+        }
+
+        #[test]
+        fn program_scan_retirement_requires_a_missing_program_id() {
+            for (call, errno, disappeared) in [
+                ("bpf_prog_get_fd_by_id", rustix::io::Errno::NOENT, true),
+                ("bpf_prog_get_fd_by_id", rustix::io::Errno::PERM, false),
+                ("bpf_prog_get_fd_by_id", rustix::io::Errno::ACCESS, false),
+                ("bpf_prog_get_fd_by_id", rustix::io::Errno::IO, false),
+                ("bpf_prog_get_info_by_fd", rustix::io::Errno::NOENT, false),
+                ("bpf_prog_get_next_id", rustix::io::Errno::NOENT, false),
+            ] {
+                let error = ProgramError::SyscallError(aya::sys::SyscallError {
+                    call,
+                    io_error: errno.into(),
+                });
+                assert_eq!(
+                    program_id_disappeared_during_scan(&error),
+                    disappeared,
+                    "{call}: {errno}"
+                );
+            }
+            assert!(!program_id_disappeared_during_scan(
+                &ProgramError::AlreadyAttached
+            ));
+        }
+
+        fn detach_with_unrelated_program_retirement(
+            retire_on_scan: usize,
+            retain_foreign_reference: bool,
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+            let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-program-retirement-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("create unique program-retirement root");
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    CURRENT_PROGRAM_SCAN_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(root.clone());
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("create a current private namespace root");
+            let pin_dir = root.join("lo");
+            let ifindex = sys::ifindex_by_name("lo").expect("fresh namespace loopback");
+            let runtime = AyaGtpuRuntime::new();
+            runtime
+                .attach("lo", ifindex, &pin_dir, 50, [192, 0, 2, 1], None, None)
+                .expect("attach the owned current graph");
+            let unrelated_dir = root.join("unrelated");
+            fs::create_dir(&unrelated_dir).expect("create unrelated graph pins");
+            let mut unrelated = EbpfLoader::new()
+                .default_map_pin_directory(&unrelated_dir)
+                .load(DATAPATH_OBJECT)
+                .expect("load unrelated map graph");
+            let info = load_program(&mut unrelated, PROG_UPLINK)
+                .expect("load an unattached unrelated program");
+            let unrelated_id = info.id();
+            let owned_ids = AyaGtpuRuntime::pinned_map_ids(
+                &AyaGtpuRuntime::pinned_map_identity(&pin_dir).expect("owned graph identities"),
+            );
+            assert!(info
+                .map_ids()
+                .expect("unrelated program map identities")
+                .expect("kernel reports map identities")
+                .iter()
+                .all(|id| !owned_ids.contains(id)));
+            let foreign = retain_foreign_reference.then(|| {
+                const FOREIGN_NAME: &str = "foreign_uplink0";
+                assert_eq!(PROG_UPLINK.len(), FOREIGN_NAME.len());
+                let mut object = DATAPATH_OBJECT.to_vec();
+                let mut renamed = 0;
+                for offset in 0..=object.len() - PROG_UPLINK.len() {
+                    if &object[offset..offset + PROG_UPLINK.len()] == PROG_UPLINK.as_bytes() {
+                        object[offset..offset + PROG_UPLINK.len()]
+                            .copy_from_slice(FOREIGN_NAME.as_bytes());
+                        renamed += 1;
+                    }
+                }
+                assert!(renamed > 0);
+                let mut foreign = EbpfLoader::new()
+                    .default_map_pin_directory(&pin_dir)
+                    .load(&object)
+                    .expect("reuse owned maps in an unrelated named program");
+                let info = load_program(&mut foreign, FOREIGN_NAME)
+                    .expect("load the foreign map reference");
+                assert!(info
+                    .map_ids()
+                    .expect("read foreign map references")
+                    .expect("kernel reports foreign map IDs")
+                    .iter()
+                    .any(|id| owned_ids.contains(id)));
+                foreign
+            });
+            let retired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed_retirement = std::rc::Rc::clone(&retired);
+            let mut remaining = retire_on_scan;
+            let mut unrelated = Some(unrelated);
+            CURRENT_PROGRAM_SCAN_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |info| {
+                    if info.id() != unrelated_id || remaining == 0 {
+                        return;
+                    }
+                    remaining -= 1;
+                    if remaining != 0 {
+                        return;
+                    }
+                    // Aya's enumerated ProgramInfo does not retain a descriptor.
+                    // Closing the final owner here forces the real kernel race
+                    // before the production map_ids() reopens this ID.
+                    drop(unrelated.take());
+                    assert!(matches!(
+                        info.fd(),
+                        Err(ProgramError::SyscallError(error))
+                            if error.io_error.kind() == io::ErrorKind::NotFound
+                    ));
+                    observed_retirement.set(true);
+                    println!(
+                        "OPC_GTPU_PROGRAM_RETIRED scan={retire_on_scan} program_id={unrelated_id}"
+                    );
+                }));
+            });
+            let result = runtime.detach("lo", ifindex, &pin_dir, 50);
+            CURRENT_PROGRAM_SCAN_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+            assert!(
+                retired.get(),
+                "the selected scan must retire the real program"
+            );
+            if retain_foreign_reference {
+                assert!(matches!(result, Err(GtpuError::AlreadyExists)));
+                assert_eq!(
+                    AyaGtpuRuntime::pinned_map_ids(
+                        &AyaGtpuRuntime::pinned_map_identity(&pin_dir)
+                            .expect("refused graph pins remain readable")
+                    ),
+                    owned_ids
+                );
+                let devices = runtime.devices.lock().expect("read retained owned device");
+                assert!(AyaGtpuRuntime::loaded_datapath_is_current(
+                    ifindex,
+                    devices
+                        .get(&ifindex)
+                        .expect("refused device remains managed")
+                ));
+                drop(devices);
+                drop(foreign);
+                runtime
+                    .detach("lo", ifindex, &pin_dir, 50)
+                    .expect("removing the foreign reference permits normal cleanup");
+                assert!(AyaGtpuRuntime::cleanup_only_hook_slots_empty(ifindex, 50).unwrap());
+                assert!(CURRENT_MAP_NAMES
+                    .iter()
+                    .all(|name| !pin_dir.join(name).exists()));
+                println!("OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN");
+                return;
+            }
+            // Preserve the first result, while cleaning up a pre-detach refusal
+            // so both cuts can execute in the same isolated namespace on RED.
+            if result.is_err() {
+                let _ = runtime.detach("lo", ifindex, &pin_dir, 50);
+            }
+            assert!(
+                result.is_ok(),
+                "unrelated retirement in scan {retire_on_scan} must not refuse detach: {result:?}"
+            );
+            assert!(AyaGtpuRuntime::cleanup_only_hook_slots_empty(ifindex, 50).unwrap());
+            assert!(CURRENT_MAP_NAMES
+                .iter()
+                .all(|name| !pin_dir.join(name).exists()));
+            println!("OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan={retire_on_scan}");
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, and a fresh netns"]
+        fn detach_accepts_unrelated_program_retirement_before_exclusivity_scan() {
+            detach_with_unrelated_program_retirement(1, false);
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, and a fresh netns"]
+        fn detach_accepts_unrelated_program_retirement_before_fence_scan() {
+            detach_with_unrelated_program_retirement(2, false);
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, and a fresh netns"]
+        fn detach_keeps_foreign_reference_despite_unrelated_program_retirement() {
+            detach_with_unrelated_program_retirement(1, true);
         }
 
         #[test]

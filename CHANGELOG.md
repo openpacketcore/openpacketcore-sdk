@@ -426,6 +426,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: tolerate BPF program IDs retired during current-graph
+  ownership scans, preventing unrelated program removal from refusing device
+  cleanup before or after hook detachment. Live foreign references and all
+  other inspection errors still block cleanup (#1170).
+
 - `opc-session-testkit`: make the void-cursor regression follow bounded
   reclamation across partial sweeps, with a forced late reply and complete
   drain reports. Both terminal receipts must still resolve within the original
