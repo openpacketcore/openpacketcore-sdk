@@ -294,6 +294,13 @@ rustup toolchain install nightly-2026-06-22 --profile minimal --component rust-s
 cargo install bpf-linker --version 0.10.3 --locked
 ```
 
+The helper also requires a GNU-compatible `readelf` (from binutils). It checks
+that both the built and copied object contain exactly the kernel-readable
+`Dual MIT/GPL\0` declaration also used by `opc-egress-fence-ebpf` and
+`opc-ipsec-xfrm-ebpf`.
+CI checks the committed object's declaration before rebuilding, so a missing
+license section cannot silently fall back to the loader's default.
+
 ## Roadmap
 
 - Keep the committed object reproducible from source and checked in CI.

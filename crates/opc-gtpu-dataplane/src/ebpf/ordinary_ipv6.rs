@@ -30,7 +30,8 @@
 //! drains the last record, selector, and journal retires it (schema marker,
 //! then configuration), so a drained graph is identical to one that never
 //! carried inner IPv6. An interrupted retirement is completed by the next
-//! family-scoped removal on the attachment.
+//! family-scoped plain or exact removal on the attachment, including exact
+//! removal during cleanup-only recovery.
 
 use super::*;
 use crate::GtpuSessionGroupId;

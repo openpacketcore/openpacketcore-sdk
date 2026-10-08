@@ -61,6 +61,18 @@ jobs:
         with:
           shared-key: opc-rust-gates
 
+      - name: Check every Cargo lockfile
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' lockfile; do
+            manifest="${lockfile%Cargo.lock}Cargo.toml"
+            # Fetch with the lock intact so fresh runners can then resolve
+            # every separate workspace without accessing the network.
+            cargo fetch --locked --manifest-path "$manifest"
+            cargo metadata --locked --offline --format-version 1 \
+              --manifest-path "$manifest" > /dev/null
+          done < <(git ls-files -z -- Cargo.lock '**/Cargo.lock')
+
       - name: Check formatting
         run: cargo fmt --all --check
 

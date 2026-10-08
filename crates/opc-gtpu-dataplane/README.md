@@ -430,7 +430,13 @@ receives what arrives in its VLAN, and tc's lookup on the interface does not
 describe the delivery there, so tc gives a hand-off from there to no socket:
 it drops and counts it. For an endpoint that lives on a VLAN device, attach to
 that device. `create_device` pins its maps under the interface's name, and
-bpffs accepts no dot in a name, so that device needs a name without one. See
+bpffs accepts no dot in a name, so that device needs a name without one.
+Ordinary creation, adoption, cleanup-only acquisition, and legacy successor
+preparation reject a dotted name with `InvalidConfig { field: "device.name", .. }`
+explaining this bpffs restriction before publishing or fencing an attachment.
+Grouped attachments created with
+`create_device_with_endpoints` use a device-ID pin directory and accept dotted
+interface names. See
 [control port](docs/control-port.md#hand-offs-need-a-bound-consumer) for what
 is and is not enforced; a device that is stacked on the interface from
 another network namespace is not detected.
@@ -1150,10 +1156,13 @@ IPv6 and legacy terminal-successor recovery accepts it. Publication writes the
 downlink selector, the uplink selector, then the record, so tc drops rather
 than falls back while it is incomplete; removal deletes the record, the uplink
 selector, then the downlink selector. The downlink selector is thus present in
-every interrupted state, and the family-scoped removal by local TEID always
-reaches the whole residue. An interrupted publication, removal or retirement
-reads back as indeterminate and is completed by the next ordinary install or
-family-scoped removal. Cleanup-only recovery accepts this ordinary family
+every interrupted selector update, and family-scoped removal by local TEID
+reaches its residue. An interrupted publication or removal that leaves a
+partial selector pair reads back as indeterminate. Once both selectors are
+absent, readback is `Absent`, even if authority retirement is unfinished.
+The next family-scoped plain or exact removal completes that retirement;
+exact removal also does so on cleanup-only attachments before returning
+`AlreadyAbsent`. Cleanup-only recovery accepts this ordinary family
 authority (its own IPv4 endpoint, no IPv6 endpoint, no grouped journal),
 including a config-only authority left between the two initialization writes,
 and removes stale IPv6 contexts exactly. Outer-IPv4 fragments carrying an inner

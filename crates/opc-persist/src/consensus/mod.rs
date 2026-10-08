@@ -13,6 +13,10 @@ mod audit_mutation;
 // preparation caller until bounded store admission is implemented.
 #[allow(dead_code)]
 mod capacity_record;
+// Representation support is compiled in every profile. Admission stays closed;
+// network and replay entry points must never call these private decoders yet.
+#[allow(dead_code)]
+mod config_capacity_decode;
 mod encoding;
 pub use audit_mutation::PreparedAuditedMutation;
 pub(crate) mod history;

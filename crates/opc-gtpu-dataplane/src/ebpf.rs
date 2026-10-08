@@ -4571,7 +4571,7 @@ impl EbpfGtpuDataplaneBackend {
 
         let resolved = match target {
             crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request) => {
-                validate_interface_name(&request.name)?;
+                validate_ordinary_attachment_name(&request.name)?;
                 require_ebpf_executable_pmtu_policy(request.uplink_mtu_policy)?;
                 let local_ip = require_ipv4(request.bind_address, "device.bind_address")?;
                 if local_ip.is_unspecified() {
@@ -8984,7 +8984,7 @@ impl EbpfGtpuDataplaneBackend {
         authority_runtime: &tokio::runtime::Handle,
     ) -> Result<GtpDevice, GtpuError> {
         let _operation = self.operation_guard()?;
-        validate_interface_name(&request.name)?;
+        validate_ordinary_attachment_name(&request.name)?;
         require_ebpf_executable_pmtu_policy(request.uplink_mtu_policy)?;
         let local_ip = require_ipv4(request.bind_address, "device.bind_address")?;
         if local_ip.is_unspecified() {
@@ -9034,6 +9034,7 @@ impl EbpfGtpuDataplaneBackend {
                 .uplink_mtu_policy
                 .map(GtpuUplinkMtuPolicy::map_value),
         };
+        let mut sequence_sources = self.traffic_sequence_sources()?;
         let attachment = self.inner.runtime.attach(
             &request.name,
             ifindex,
@@ -9061,7 +9062,8 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_current_terminal_successor_sequence_reset",
             });
         }
-        self.reset_traffic_sequence_source(ifindex)?;
+        sequence_sources.remove(&ifindex);
+        drop(sequence_sources);
         if terminal_currentness.as_ref().is_some_and(|currentness| {
             currentness.verify_current().is_err() || currentness.first_failure().is_some()
         }) {
@@ -9258,6 +9260,7 @@ impl EbpfGtpuDataplaneBackend {
                 .uplink_mtu_policy
                 .map(GtpuUplinkMtuPolicy::map_value),
         };
+        let mut sequence_sources = self.traffic_sequence_sources()?;
         let attachment = self.inner.runtime.attach_grouped(
             &request.name,
             ifindex,
@@ -9285,7 +9288,8 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_current_terminal_successor_grouped_sequence_reset",
             });
         }
-        self.reset_traffic_sequence_source(ifindex)?;
+        sequence_sources.remove(&ifindex);
+        drop(sequence_sources);
         if terminal_currentness.as_ref().is_some_and(|currentness| {
             currentness.verify_current().is_err() || currentness.first_failure().is_some()
         }) {
@@ -9426,18 +9430,21 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
         drop(devices);
+        validate_ordinary_attachment_name(&name)?;
         self.invalidate_traffic_attempts_on_attachment(
             ifindex,
             GtpuTrafficProofInvalidation::AuthorityRevoked,
         );
         let mut devices = self.devices()?;
+        let mut sequence_sources = self.traffic_sequence_sources()?;
         let local_ip = self.inner.runtime.adopt(
             &name,
             ifindex,
             &self.pin_dir(&name),
             self.inner.config.tc_priority,
         )?;
-        self.reset_traffic_sequence_source(ifindex)?;
+        sequence_sources.remove(&ifindex);
+        drop(sequence_sources);
         devices.insert(
             ifindex,
             ManagedDevice {
@@ -10673,7 +10680,7 @@ impl EbpfGtpuDataplaneBackend {
     ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
         let _operation = self.operation_guard()?;
         let device = request.device();
-        validate_interface_name(&device.name)?;
+        validate_ordinary_attachment_name(&device.name)?;
         if device.ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "device.ifindex",
@@ -10718,7 +10725,7 @@ impl EbpfGtpuDataplaneBackend {
         request: RetainedGraphCleanupRequest,
     ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
         let device = request.device();
-        validate_interface_name(&device.name)?;
+        validate_ordinary_attachment_name(&device.name)?;
         if device.ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "device.ifindex",
@@ -10750,16 +10757,14 @@ impl EbpfGtpuDataplaneBackend {
         // managed name is part of the identity: a renamed interface that still
         // resolves to this ifindex is not the same attachment the registry
         // holds, so it is refused rather than silently re-acquired.
-        let managed = {
-            let devices = self.devices()?;
-            devices.get(&ifindex).map(|managed| {
-                (
-                    managed.cleanup_only,
-                    managed.name == device.name,
-                    managed.local_ip == Some(request.local_endpoint()),
-                )
-            })
-        };
+        let mut devices = self.devices()?;
+        let managed = devices.get(&ifindex).map(|managed| {
+            (
+                managed.cleanup_only,
+                managed.name == device.name,
+                managed.local_ip == Some(request.local_endpoint()),
+            )
+        });
         if let Some((cleanup_only, same_name, same_endpoint)) = managed {
             return if !cleanup_only {
                 Ok(RetainedGraphCleanupClassification::Refused(
@@ -10795,6 +10800,7 @@ impl EbpfGtpuDataplaneBackend {
         {
             return Ok(RetainedGraphCleanupClassification::Refused(refusal));
         }
+        let mut sequence_sources = self.traffic_sequence_sources()?;
         match self.inner.runtime.adopt_cleanup_only(
             &device.name,
             ifindex,
@@ -10807,8 +10813,7 @@ impl EbpfGtpuDataplaneBackend {
             // hooks are absent regardless of whether a live hook was detached
             // or both slots were already empty.
             Ok(EbpfCleanupOnlyAdoption::Adopted { local_ip, .. }) => {
-                self.reset_traffic_sequence_source(ifindex)?;
-                let mut devices = self.devices()?;
+                sequence_sources.remove(&ifindex);
                 devices.insert(
                     ifindex,
                     ManagedDevice {
@@ -10872,7 +10877,7 @@ impl EbpfGtpuDataplaneBackend {
         // before it, so this flag and the runtime change together or not at
         // all. The host sequence window is held across the call and dropped
         // only once the runtime reports that its fresh traffic source is
-        // reset and enabled, as `reset_traffic_sequence_source` requires.
+        // reset and enabled, as `traffic_sequence_sources` requires.
         let mut sequence_sources = self.traffic_sequence_sources()?;
         self.inner.runtime.activate_cleanup_only(
             &device.name,
@@ -11657,7 +11662,18 @@ impl EbpfGtpuDataplaneBackend {
                 ));
             }
             match classify_dual_selector_state(&local, &uplink, &expected) {
-                DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::AlreadyAbsent),
+                DualSelectorState::BothAbsent => {
+                    // Selector absence can outlive an interrupted authority
+                    // retirement. Exact retries, including cleanup-only
+                    // recovery, must finish that attachment-local work too.
+                    if expected.ms_address.is_ipv6() {
+                        self.remove_ordinary_ipv6_locked(
+                            expected.link_ifindex,
+                            expected.local_teid,
+                        )?;
+                    }
+                    Ok(PdpContextRemovalOutcome::AlreadyAbsent)
+                }
                 DualSelectorState::Conflict(conflict) => {
                     Ok(PdpContextRemovalOutcome::Conflict(conflict))
                 }
@@ -11697,7 +11713,24 @@ impl EbpfGtpuDataplaneBackend {
                         ));
                     }
                     match classify_dual_selector_state(&local, &uplink, &expected) {
-                        DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::Removed),
+                        DualSelectorState::BothAbsent => {
+                            // The selectors are gone. A failed authority
+                            // retirement must not report success, or no
+                            // exact retry would complete it.
+                            if expected.ms_address.is_ipv6()
+                                && self
+                                    .remove_ordinary_ipv6_locked(
+                                        expected.link_ifindex,
+                                        expected.local_teid,
+                                    )
+                                    .is_err()
+                            {
+                                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                                    PdpContextIndeterminateReason::MutationUnconfirmed,
+                                ));
+                            }
+                            Ok(PdpContextRemovalOutcome::Removed)
+                        }
                         DualSelectorState::Conflict(conflict) => {
                             Ok(PdpContextRemovalOutcome::Conflict(conflict))
                         }
@@ -12727,6 +12760,11 @@ impl EbpfGtpuDataplaneBackend {
             .cloned())
     }
 
+    /// Acquire after the managed-device guard and before a runtime source
+    /// reset. The reset starts its producer sequence from zero, so remove
+    /// only the matching host high-water after the runtime reports success.
+    /// Holding this guard across publication prevents a poisoned host lock
+    /// from stranding a runtime attachment outside the managed-device index.
     fn traffic_sequence_sources(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<u32, TrafficObservationSequenceWindow>>, GtpuError>
@@ -12735,17 +12773,6 @@ impl EbpfGtpuDataplaneBackend {
             .traffic_observation_sequences
             .lock()
             .map_err(|_| GtpuError::io("ebpf_traffic_sequence", poisoned_lock()))
-    }
-
-    /// The kernel source reset starts its producer sequence from zero. Drop
-    /// only the matching host high-water after the runtime reports that reset
-    /// fully succeeded; retaining it would reject every new-source event as a
-    /// replay. A caller that must not fail once the runtime has committed
-    /// (cleanup-only activation) instead holds [`Self::traffic_sequence_sources`]
-    /// across the runtime call and removes the entry after it succeeds.
-    fn reset_traffic_sequence_source(&self, ifindex: u32) -> Result<(), GtpuError> {
-        self.traffic_sequence_sources()?.remove(&ifindex);
-        Ok(())
     }
 
     fn require_healthy_traffic_sequence_source(&self, ifindex: u32) -> Result<(), GtpuError> {
@@ -15767,6 +15794,17 @@ const IFNAMSIZ: usize = 16;
 
 fn validate_interface_name(name: &str) -> Result<(), GtpuError> {
     validate_linux_name(name, "device.name")
+}
+
+fn validate_ordinary_attachment_name(name: &str) -> Result<(), GtpuError> {
+    validate_interface_name(name)?;
+    if name.contains('.') {
+        return Err(GtpuError::invalid_config(
+            "device.name",
+            "ordinary eBPF attachments use the interface name as a bpffs directory; bpffs does not permit dots in entry names",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_linux_name(name: &str, field: &'static str) -> Result<(), GtpuError> {
@@ -79857,6 +79895,84 @@ mod tests {
         );
     }
 
+    async fn assert_device_publication_takes_host_guards_first(operation: &str) {
+        for poison_devices in [false, true] {
+            let (initial, runtime) = backend_with_fake();
+            if matches!(operation, "adopt" | "adopt_cleanup_only") {
+                initial.create_device(create_request()).await.unwrap();
+                simulate_process_loss(&runtime, false);
+            }
+            let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            std::thread::scope(|scope| {
+                let poisoner = scope.spawn(|| {
+                    if poison_devices {
+                        let _devices = backend.inner.devices.lock().unwrap();
+                        panic!("poison the managed-device index");
+                    } else {
+                        let _sequences =
+                            backend.inner.traffic_observation_sequences.lock().unwrap();
+                        panic!("poison the host traffic sequence window");
+                    }
+                });
+                assert!(poisoner.join().is_err());
+            });
+            let operations_before = runtime.state().operations.len();
+            let result = match operation {
+                "attach" => backend.create_device(create_request()).await.map(|_| ()),
+                "attach_grouped" => {
+                    let endpoints =
+                        GtpuLocalEndpointSet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None)
+                            .unwrap();
+                    backend
+                        .create_device_with_endpoints(grouped_device_request(
+                            "s2bu",
+                            grouped_device_id(0x73),
+                            endpoints,
+                        ))
+                        .await
+                        .map(|_| ())
+                }
+                "adopt" => backend.resolve_device("s2bu").await.map(|_| ()),
+                "adopt_cleanup_only" => backend
+                    .acquire_cleanup_only_recovery(cleanup_request(
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        S2BU_IFINDEX,
+                    ))
+                    .await
+                    .map(|_| ()),
+                _ => panic!("unknown publication operation"),
+            };
+            assert!(matches!(result, Err(GtpuError::Io { .. })), "{result:?}");
+            let state = runtime.state();
+            assert!(
+                !state.operations[operations_before..].contains(&operation),
+                "{operation} must not run after a host guard fails"
+            );
+            assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+            assert!(!state.cleanup_only.contains(&S2BU_IFINDEX));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_device_takes_host_guards_before_runtime_publication() {
+        assert_device_publication_takes_host_guards_first("attach").await;
+    }
+
+    #[tokio::test]
+    async fn grouped_create_device_takes_host_guards_before_runtime_publication() {
+        assert_device_publication_takes_host_guards_first("attach_grouped").await;
+    }
+
+    #[tokio::test]
+    async fn resolve_device_takes_host_guards_before_runtime_publication() {
+        assert_device_publication_takes_host_guards_first("adopt").await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_acquisition_takes_host_guards_before_runtime_publication() {
+        assert_device_publication_takes_host_guards_first("adopt_cleanup_only").await;
+    }
+
     #[tokio::test]
     async fn create_device_attaches_to_existing_interface() {
         let (backend, runtime) = backend_with_fake();
@@ -80139,6 +80255,112 @@ mod tests {
                 operation: "ebpf_datapath_snapshot"
             }
         ));
+    }
+
+    fn backend_with_dotted_interface() -> (EbpfGtpuDataplaneBackend, Arc<FakeRuntime>) {
+        let mut runtime = FakeRuntime::new();
+        runtime.ifindexes.insert("test0.100".into(), S2BU_IFINDEX);
+        let runtime = Arc::new(runtime);
+        (
+            EbpfGtpuDataplaneBackend::with_runtime(runtime.clone()),
+            runtime,
+        )
+    }
+
+    fn assert_dotted_pin_name_refused<T: std::fmt::Debug>(result: Result<T, GtpuError>) {
+        assert!(
+            matches!(
+                result,
+                Err(GtpuError::InvalidConfig { field: "device.name", reason })
+                    if reason.contains("bpffs") && reason.contains("dot")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_attachment_rejects_dotted_pin_names_before_runtime_publication() {
+        for resolve in [false, true] {
+            let (backend, runtime) = backend_with_dotted_interface();
+            let mut request = create_request();
+            request.name = "test0.100".into();
+            let result = if resolve {
+                backend.resolve_device(&request.name).await
+            } else {
+                backend.create_device(request).await
+            };
+            assert_dotted_pin_name_refused(result);
+            assert!(runtime.state().operations.is_empty());
+            assert!(runtime.state().attached.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_successor_rejects_dotted_pin_names_before_runtime_publication() {
+        let (backend, runtime) = backend_with_dotted_interface();
+        let intent = crate::CurrentEbpfGraphRecoveryIntent::new(
+            "test0.100",
+            crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        )
+        .with_replacement_device(GtpDevice {
+            name: "test0.100".into(),
+            ifindex: S2BU_IFINDEX,
+        });
+        let mut request = create_request();
+        request.name = "test0.100".into();
+        assert_dotted_pin_name_refused(
+            backend
+                .resolve_current_successor_target(
+                    &intent,
+                    crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request),
+                )
+                .map(|_| ()),
+        );
+        assert!(runtime.state().operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_acquisition_rejects_dotted_pin_names_before_runtime_effects() {
+        for normalize_legacy in [false, true] {
+            let (backend, runtime) = backend_with_dotted_interface();
+            let request = RetainedGraphCleanupRequest::new(
+                GtpDevice {
+                    name: "test0.100".to_string(),
+                    ifindex: S2BU_IFINDEX,
+                },
+                Ipv4Addr::new(192, 0, 2, 1),
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            );
+            let result = if normalize_legacy {
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(request)
+                    .await
+            } else {
+                backend.acquire_cleanup_only_recovery(request).await
+            };
+            assert_dotted_pin_name_refused(result);
+            assert!(runtime.state().operations.is_empty());
+            assert!(runtime.state().cleanup_only.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_attachment_accepts_dotted_interface_names() {
+        let (backend, runtime) = backend_with_dotted_interface();
+        let device_id = grouped_device_id(0x75);
+        let endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap();
+        let device = backend
+            .create_device_with_endpoints(grouped_device_request("test0.100", device_id, endpoints))
+            .await
+            .unwrap();
+        assert_eq!(device.name, "test0.100");
+        assert_eq!(
+            runtime.state().attached[&S2BU_IFINDEX].pin_dir,
+            backend.grouped_pin_dir(device_id)
+        );
+        assert_eq!(backend.resolve_device("test0.100").await.unwrap(), device);
+        backend.remove_device(&device).await.unwrap();
     }
 
     #[tokio::test]
@@ -84664,12 +84886,16 @@ mod tests {
                 RetainedGraphCleanupRefusal::IndeterminateState
             )
         );
-        // The panicked attempt registered nothing.
+        // Publication owns both host guards before entering the runtime, so
+        // unwinding poisons them together with the operation lock. Inspect
+        // the poisoned registry only to prove that nothing was registered.
+        assert!(recovered.inner.devices.is_poisoned());
+        assert!(recovered.inner.traffic_observation_sequences.is_poisoned());
         assert!(!recovered
             .inner
             .devices
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&S2BU_IFINDEX));
         // The panicked backend fails closed while its operation lock is
         // poisoned; recovery proceeds on a fresh backend instance, which

@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain the maximum live receive floor; enabling a revoked capability reports
   `Invalidated` instead of retryable `CapabilityActive`.
 
+- `opc-session-net`: add `SessionConsumerPreparedFencedTransitionV2::abandon_unexecuted`
+  and `SessionConsumerFencedTransitionV2AbandonError`. The original affine V2
+  handle can remove its retained recovery-journal row before `execute_once` is
+  first polled. It consumes dispatch authority before the exact local
+  compare-and-delete and performs no network I/O. A cancelled or failed
+  deletion is retried on the same handle, with dispatch still disabled. A handle
+  whose execution has started, and a recovered status-only handle, are refused.
+  Fixes #1123.
+
 - `opc-proto-ikev2`: add opt-in zero-write empty INFORMATIONAL handling to
   committed GCM windows. Canonical replies advance a volatile receive floor,
   allowing DPD at ID n followed by stateful work at n+1, with exact byte reuse,
@@ -425,6 +434,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: report voter progress and snapshot-transfer counters
   if either compacted-successor preparation phase exceeds its original bound,
   without adding observations to the command loop. Refs #1164.
+
+- `opc-persist`, `opc-session-net`: configuration wire revisions are checked before
+  the payload is decoded, and consensus RPC numeric payloads are bounded while
+  decoding (2 MiB, or the family's smaller limit). An oversized ordinary request
+  is now refused during decoding, so the receiving server closes the connection
+  instead of replying `Protocol`. Valid encodings are unchanged; bounded
+  configuration profile admission stays closed. Refs #957.
+
+- `opc-gtpu-dataplane-ebpf`: the GTP-U datapath object now declares its
+  kernel license explicitly as `Dual MIT/GPL` in its `license` ELF section,
+  as the repository's other Rust eBPF objects do, instead of relying on the
+  loader's implicit `GPL` default. The build helper and the eBPF object CI job
+  verify the exact declaration in the committed and rebuilt objects. Program
+  and map bytes are unchanged. Fixes #577.
+
+- `opc-ipsec-lb-ebpf`: declare the same explicit `Dual MIT/GPL` kernel
+  license in the XDP object. Its build helper and object CI job use the shared
+  license checker for the built and committed artifacts. Program and map bytes
+  and functional relocations are unchanged. Part of #577.
+
+- `opc-gtpu-dataplane`: ordinary eBPF attachment creation, adoption,
+  cleanup-only acquisition and legacy successor preparation refuse an
+  interface name containing a dot with `InvalidConfig { field: "device.name" }`
+  before any runtime effect, because bpffs does not permit a dot in the pin
+  directory name. `create_device` previously failed late with a
+  `PermissionDenied` I/O error that named neither cause. Grouped attachments
+  pin under a device-ID directory and keep accepting dotted names such as VLAN
+  devices. Fixes #1099.
+
+- `opc-gtpu-dataplane`: ordinary and grouped device creation, `resolve_device`
+  and cleanup-only acquisition take the managed-device and traffic-sequence
+  host guards before the runtime attaches or adopts the graph, and only
+  infallible map updates follow the runtime commit. A poisoned host lock now
+  refuses before any runtime effect instead of leaving an attached or fenced
+  graph outside the managed-device index. Fixes #1015.
+
+- `opc-gtpu-dataplane`: exact removal of an inner-IPv6 PDP context completes
+  an interrupted ordinary IPv6 authority retirement (`GTPU_SCHEMA6`,
+  `GTPU_CONFIG6`) when both selectors are already absent, also on cleanup-only
+  attachments, before it returns `AlreadyAbsent`, and reports
+  `Indeterminate(MutationUnconfirmed)` instead of `Removed` when that
+  retirement fails. Before, only plain removal completed it, so legacy
+  terminal-successor recovery could keep refusing a drained graph after a
+  crash. Fixes #1011.
 
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the

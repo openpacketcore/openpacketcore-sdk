@@ -43,7 +43,10 @@ rustflags=(
     cargo "+${toolchain}" build --release --locked
 )
 
+built_object="${target_dir}/bpfel-unknown-none/release/opc-ipsec-lb-xdp"
+"${repo_root}/scripts/check-ebpf-license.sh" "${built_object}"
 mkdir -p "$(dirname "${artifact}")"
-cp "${target_dir}/bpfel-unknown-none/release/opc-ipsec-lb-xdp" "${artifact}"
+cp "${built_object}" "${artifact}"
+"${repo_root}/scripts/check-ebpf-license.sh" "${artifact}"
 echo "wrote ${artifact}"
 sha256sum "${artifact}"

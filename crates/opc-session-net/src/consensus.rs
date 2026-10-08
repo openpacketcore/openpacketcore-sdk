@@ -39,7 +39,8 @@ use crate::lifecycle::{
 use crate::membership::SessionMembershipAdmission;
 use crate::protocol::{
     checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size,
-    read_authenticated_frame_within, read_frame, write_frame_bounded_until,
+    read_authenticated_frame_within, read_consensus_response_frame, read_frame,
+    write_consensus_frame_bounded_until, write_frame_bounded_until,
     write_frame_bounded_until_cancellable, SessionConsensusBootstrapAck,
     SessionConsensusBootstrapHello, SessionConsensusBootstrapRequest,
     SessionConsensusBootstrapResponse, SessionConsensusTransportRequest,
@@ -2895,7 +2896,7 @@ impl RemoteSessionConsensusPeer {
             response_allows_reuse: false,
         };
         let call = async {
-            write_frame_bounded_until(
+            write_consensus_frame_bounded_until(
                 &mut connection.writer,
                 &request,
                 connection.request_frame_size,
@@ -2903,10 +2904,12 @@ impl RemoteSessionConsensusPeer {
             )
             .await
             .map_err(|error| map_protocol_error(&error))?;
-            let response: SessionConsensusTransportResponse =
-                read_frame(&mut connection.reader, connection.response_frame_size)
-                    .await
-                    .map_err(|error| map_protocol_error(&error))?;
+            let response: SessionConsensusTransportResponse = read_consensus_response_frame(
+                &mut connection.reader,
+                connection.response_frame_size,
+            )
+            .await
+            .map_err(|error| map_protocol_error(&error))?;
             let SessionConsensusTransportResponse::Call {
                 call_id: response_call_id,
                 response,

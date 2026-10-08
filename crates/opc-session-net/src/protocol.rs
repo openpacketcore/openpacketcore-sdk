@@ -40,6 +40,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
+mod consensus_decode;
+mod consensus_json;
+
+#[cfg(test)]
+mod legacy_capture;
+
 pub const CONTRACT_VERSION: u32 = 5;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
@@ -3873,7 +3879,7 @@ where
     if let Err(halted) = control.check() {
         return Err(encoding_halt_protocol_error(halted));
     }
-    match serde_json::to_writer(&mut buffer, frame) {
+    match consensus_json::to_writer(&mut buffer, frame) {
         Ok(()) => {
             control.check().map_err(encoding_halt_protocol_error)?;
             Ok(buffer.frame)
@@ -4239,6 +4245,23 @@ where
     write_frame_bounded_until_classified(writer, frame, max_frame_size, deadline)
         .await
         .map_err(FrameWriteError::into_protocol_error)
+}
+
+/// Encode the ordinary consensus payload by borrowing its original byte owner.
+/// The bounded writer and its single absolute deadline remain authoritative.
+pub(crate) async fn write_consensus_frame_bounded_until<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &SessionConsensusTransportRequest,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProtocolError> {
+    write_frame_bounded_until(
+        writer,
+        &consensus_json::BorrowedRequest(frame),
+        max_frame_size,
+        deadline,
+    )
+    .await
 }
 
 /// Write one frame while preserving whether the transport effect boundary was
@@ -4693,6 +4716,15 @@ where
     serde_json::from_slice(&payload).map_err(ProtocolError::from)
 }
 
+/// Read a consensus response with independent raw-frame and decoded-payload bounds.
+pub(crate) async fn read_consensus_response_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame_size: usize,
+) -> Result<SessionConsensusTransportResponse, ProtocolError> {
+    let payload = read_frame_payload(reader, max_frame_size).await?;
+    consensus_decode::response(&payload).map_err(ProtocolError::from)
+}
+
 /// Decode one post-bootstrap operation request through the private v5 DTO.
 pub(crate) async fn read_request_frame<R>(
     reader: &mut R,
@@ -4751,21 +4783,20 @@ where
 /// must arrive by the same deadline; a partial-frame stall remains a timed-out
 /// [`ProtocolError`] so authenticated slowloris behavior is never relabeled as
 /// a normal idle retirement.
-pub(crate) async fn read_authenticated_frame_within<R, T>(
+pub(crate) async fn read_authenticated_frame_within<R>(
     reader: &mut R,
     max_frame_size: usize,
     timeout: std::time::Duration,
-) -> Result<Option<T>, ProtocolError>
+) -> Result<Option<SessionConsensusTransportRequest>, ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
 {
     let payload =
         match read_authenticated_frame_payload_within(reader, max_frame_size, timeout).await? {
             Some(payload) => payload,
             None => return Ok(None),
         };
-    serde_json::from_slice(&payload)
+    consensus_decode::request(&payload)
         .map(Some)
         .map_err(ProtocolError::from)
 }
