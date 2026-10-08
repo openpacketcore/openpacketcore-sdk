@@ -1208,7 +1208,9 @@ Retirement has these invariants:
   for the equivalent state before any Openraft request bytes. Ordinary
   authentication, identity/scope, contract, protocol, and post-bootstrap
   engine rejections remain distinct and are never reclassified as this
-  rotation control;
+  rotation control. Retirement that wins the acknowledgement select before
+  the write future's first poll still emits this control, even after the final
+  synchronous admission check;
 - after acknowledgement, a connection that sends no byte of its next request
   before the listener idle deadline retires with the fixed `idle_timeout`
   lifecycle reason, completes the normal drain/slot-release path, and records a

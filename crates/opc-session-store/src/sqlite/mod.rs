@@ -639,6 +639,9 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
+    pub(crate) consensus_apply_publication_gate:
+        Arc<crate::consensus::snapshot::SnapshotArtifactGate>,
+    #[cfg(test)]
     consensus_snapshot_capture_gate: Arc<consensus::SnapshotCaptureGate>,
     #[cfg(test)]
     consensus_operator_recovery_failure: Arc<AtomicBool>,
@@ -1424,6 +1427,10 @@ impl SqliteSessionBackend {
             consensus_diagnostics: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_apply_publication_gate: Arc::new(
+                crate::consensus::snapshot::SnapshotArtifactGate::new(),
+            ),
             #[cfg(test)]
             consensus_snapshot_capture_gate: Arc::new(consensus::SnapshotCaptureGate::new()),
             #[cfg(test)]

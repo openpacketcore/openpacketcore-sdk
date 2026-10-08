@@ -527,6 +527,11 @@ Normal startup must still establish each capability that consumers require.
 V1 fenced-transition activation and V2 profile activation are independent;
 planned retirement does not manufacture a missing activation certificate.
 A new store incarnation must separately regain consensus admission.
+Activation acknowledgments carry an applied index observed with the exact
+backend certificate. A starting or returning voter waits for that index and
+checks its own certificate before activation succeeds, including when Raft
+metrics publication lags application. Concurrent activation requires no
+operator intervention and retains the existing operation deadline.
 
 After preparation completes and the RPC handler is removed,
 `shutdown()` joins the active consensus engine and every storage owner, drains
@@ -1349,6 +1354,14 @@ started within the original ten-second apply guard, purge still fails closed
 at that absolute deadline. Completion alone never permits deleting unapplied
 history. Fences, lease credentials, application sequence, request outcomes,
 and logical time move together with the authoritative state-machine image.
+
+Snapshot retrieval can admit the published predecessor while a successor is
+captured and verified offline. It excludes publication and predecessor
+retirement until descriptor admission finishes, so Openraft's shared
+snapshot-retrieval/application worker does not wait for the entire build.
+Builds, installation and recovery still retain one exclusive mutation owner;
+cancelled admission workers retain publication exclusion through their last
+read. Snapshot integrity checks and operation deadlines are unchanged.
 
 The pinned Openraft implementation also retains the donor's required log
 suffix while a snapshot transfer owns it. Successful snapshot or log

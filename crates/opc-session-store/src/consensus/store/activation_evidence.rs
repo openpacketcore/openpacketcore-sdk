@@ -85,6 +85,18 @@ tokio::task_local! {
     static FAILURE: Cell<Option<CapabilityActivationFailureForTest>>;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static READ_ADMIT_GATE: std::sync::Arc<crate::consensus::snapshot::SnapshotArtifactGate>;
+}
+
+#[cfg(test)]
+pub(super) async fn after_read_admit() {
+    if let Ok(gate) = READ_ADMIT_GATE.try_with(std::sync::Arc::clone) {
+        gate.block_if_armed().await;
+    }
+}
+
 /// Observe the existing activation future without changing its result.
 /// Concurrent, nested, and subsequent scopes cannot reuse this observation.
 pub async fn observe_capability_activation_for_test(

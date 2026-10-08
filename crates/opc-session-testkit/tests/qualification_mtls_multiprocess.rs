@@ -1764,7 +1764,7 @@ fn assert_lifecycle_delta_bounds_with_expected_outcomes(
                 "connection_failure_transport",
             ),
             0,
-            "transport-failure budget exceeded: node={node_index}"
+            "transport-failure budget exceeded: node={node_index}, before={before:?}, after={after:?}"
         );
         assert_eq!(
             lifecycle_counter_delta(

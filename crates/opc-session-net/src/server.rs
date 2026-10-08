@@ -2061,6 +2061,8 @@ struct PendingServerLifecycle {
     generation: u64,
     #[cfg(test)]
     expire_at_final_ack_boundary: bool,
+    #[cfg(test)]
+    reauthenticate_before_first_ack_poll: bool,
 }
 
 enum PendingServerAdmissionError {
@@ -2079,6 +2081,8 @@ impl PendingServerLifecycle {
             generation,
             #[cfg(test)]
             expire_at_final_ack_boundary: false,
+            #[cfg(test)]
+            reauthenticate_before_first_ack_poll: false,
         }
     }
 
@@ -2273,6 +2277,8 @@ async fn handle_connection(
                 generation,
                 #[cfg(test)]
                 expire_at_final_ack_boundary: false,
+                #[cfg(test)]
+                reauthenticate_before_first_ack_poll: false,
             },
             dispatch_config,
         )
@@ -2319,6 +2325,9 @@ where
     } = dispatch_config;
     #[cfg(test)]
     let expire_at_final_ack_boundary = pending_lifecycle.expire_at_final_ack_boundary;
+    #[cfg(test)]
+    let reauthenticate_before_first_ack_poll =
+        pending_lifecycle.reauthenticate_before_first_ack_poll;
 
     // Start the authentication clock at TLS completion, not after a peer
     // eventually sends Hello. A stalled peer cannot retain a slot past the
@@ -2648,11 +2657,10 @@ where
         server_cancellation.clone(),
         cancellation.clone(),
     );
-    // This is the final zero-Ack-byte boundary. Before the acknowledgement
-    // future exists, a complete retirement frame is an unambiguous proof of
-    // no application admission. Once that future is polled it may have
-    // written a partial frame, so every later retirement branch only closes
-    // the connection and must never append a second bootstrap frame.
+    // A retirement observed before the acknowledgement future is first polled
+    // can still prove no application admission with a complete control frame.
+    // Once polled, that future may have written a partial Ack, so retirement
+    // must only close and never append a second bootstrap frame.
     let pre_ack_material_status = lifecycle_tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::material_status);
@@ -2679,21 +2687,32 @@ where
     if lifecycle.retirement(tokio::time::Instant::now()).is_some() {
         return retire_bootstrap(writer, idle_timeout, &cancellation).await;
     }
-    {
-        let acknowledgement = write_bootstrap_ack(
-            writer,
-            Some(binding.local_replica_id().as_str().to_string()),
-            Some(client_replica_id.as_str().to_string()),
-            Some(binding.cluster_id().as_str().to_string()),
-            Some(binding.configuration_id().to_hex()),
-            Some(binding.configuration_epoch().get()),
-            Some(handshake_nonce),
-            Some(cas_idempotency_epoch),
-            Some(accepted_response_frame_size),
-            Some(server_request_frame_size),
-            idle_timeout,
-            &cancellation,
-        );
+    #[cfg(test)]
+    if reauthenticate_before_first_ack_poll {
+        reauthentication
+            .request_reauthentication()
+            .map_err(|_| ProtocolError::InvalidWireValue)?;
+    }
+    let mut acknowledgement_started = false;
+    let retired = {
+        let acknowledgement = async {
+            acknowledgement_started = true;
+            write_bootstrap_ack(
+                writer,
+                Some(binding.local_replica_id().as_str().to_string()),
+                Some(client_replica_id.as_str().to_string()),
+                Some(binding.cluster_id().as_str().to_string()),
+                Some(binding.configuration_id().to_hex()),
+                Some(binding.configuration_epoch().get()),
+                Some(handshake_nonce),
+                Some(cas_idempotency_epoch),
+                Some(accepted_response_frame_size),
+                Some(server_request_frame_size),
+                idle_timeout,
+                &cancellation,
+            )
+            .await
+        };
         tokio::pin!(acknowledgement);
         loop {
             tokio::select! {
@@ -2702,7 +2721,7 @@ where
                 changed = admission_reauthentication_rx.changed() => {
                     if changed.is_err() || reauthentication.generation() != admitted_generation {
                         lifecycle.record_forced_retirement(RetirementReason::Explicit);
-                        return Ok(());
+                        break true;
                     }
                 }
                 _ = wait_server_material_change(&mut admission_material_rx) => {
@@ -2711,16 +2730,22 @@ where
                         .map(opc_tls::AuthenticatedServerConfig::material_status);
                     if !material_status_matches_admission(admitted_material_epoch, status) {
                         lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
-                        return Ok(());
+                        break true;
                     }
                 }
-                _ = retirement_rx.changed() => return Ok(()),
+                _ = retirement_rx.changed() => break true,
                 result = &mut acknowledgement => {
                     result?;
-                    break;
+                    break false;
                 }
             }
         }
+    };
+    if retired {
+        if acknowledgement_started {
+            return Ok(());
+        }
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
     }
 
     let transport_payload_limit = conservative_payload_budget(max_frame_size)
@@ -4224,6 +4249,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reauthentication_before_first_ack_poll_emits_retirement_control() {
+        let reauthentication = SessionReauthenticationControl::new();
+        let mut pending = PendingServerLifecycle::insecure(reauthentication.generation());
+        pending.reauthenticate_before_first_ack_poll = true;
+        let config = test_dispatch_config(reauthentication);
+        let mut input = valid_bootstrap_hello_bytes().await;
+        let hello_bytes = input.len();
+        write_frame(&mut input, &Request::Capabilities)
+            .await
+            .expect("append queued application request");
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+        dispatch(
+            Arc::new(opc_session_store::fake::FakeSessionBackend::new()),
+            Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            config,
+        )
+        .await
+        .expect("server completes the retired bootstrap");
+        assert_eq!(
+            usize::try_from(reader.position()).expect("reader position"),
+            hello_bytes,
+            "no queued application request may be read"
+        );
+        let emitted_bytes = writer.len();
+        let mut encoded = std::io::Cursor::new(writer);
+        let response =
+            read_frame::<_, BootstrapResponse>(&mut encoded, MAX_HANDSHAKE_FRAME_SIZE).await;
+        assert!(
+            matches!(response, Ok(BootstrapResponse::ConnectionRetiring)),
+            "retirement before the first Ack poll must emit the reserved control: bytes={emitted_bytes}, client_result={response:?}"
+        );
+        assert_eq!(
+            usize::try_from(encoded.position()).expect("writer position"),
+            emitted_bytes,
+            "one complete retirement control and zero Ack bytes must be emitted"
+        );
+    }
+
     #[test]
     fn post_hello_pre_admit_material_change_is_recorded_once_as_material_retirement() {
         let material = crate::test_support::RotatableServerMaterial::new(
@@ -4242,6 +4311,7 @@ mod tests {
             established_at,
             generation: 0,
             expire_at_final_ack_boundary: false,
+            reauthenticate_before_first_ack_poll: false,
         };
         let policy = test_dispatch_config(SessionReauthenticationControl::new()).lifecycle_policy;
         let bootstrap_lifecycle = pending

@@ -261,6 +261,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: serve the published snapshot during offline successor
+  construction so a recovering voter's snapshot request cannot block the
+  leader's committed writes behind that build. Publication, retirement,
+  descriptor integrity and cancelled-worker ownership remain serialized.
+  Part of #1005.
+
+- `opc-session-net`: emit the existing bootstrap retirement control when
+  reauthentication or material retirement wins before the acknowledgement
+  write first starts. Both consensus and legacy direct listeners preserve
+  closure after a possibly partial acknowledgement and their existing
+  deadlines, avoiding a spurious transport failure before request admission.
+  Fixes #1098.
+
+- `opc-session-store`: bind startup capability acknowledgments to the applied
+  index observed with the exact backend certificate. Concurrent voter
+  activation now waits for the certificate even when Raft metrics publication
+  lags application, covering fenced transitions and both protected-roster
+  profiles. Fixes #1111.
+
 - `opc-persist`: admit returning configuration voters with a majority whose
   compatibility is proved on authenticated connections, including the local
   voter. Reverify reconnects and reject incompatible engine traffic before

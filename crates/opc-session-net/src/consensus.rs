@@ -3469,6 +3469,8 @@ struct PendingConsensusLifecycle {
     generation: u64,
     #[cfg(test)]
     expire_at_final_ack_boundary: bool,
+    #[cfg(test)]
+    reauthenticate_before_first_ack_poll: bool,
 }
 
 enum PendingConsensusAdmissionError {
@@ -3488,6 +3490,8 @@ impl PendingConsensusLifecycle {
             generation,
             #[cfg(test)]
             expire_at_final_ack_boundary: false,
+            #[cfg(test)]
+            reauthenticate_before_first_ack_poll: false,
         }
     }
 
@@ -3687,6 +3691,8 @@ async fn handle_consensus_connection(
                 generation,
                 #[cfg(test)]
                 expire_at_final_ack_boundary: false,
+                #[cfg(test)]
+                reauthenticate_before_first_ack_poll: false,
             },
             membership,
             handler,
@@ -3833,6 +3839,9 @@ where
 {
     #[cfg(test)]
     let expire_at_final_ack_boundary = pending_lifecycle.expire_at_final_ack_boundary;
+    #[cfg(test)]
+    let reauthenticate_before_first_ack_poll =
+        pending_lifecycle.reauthenticate_before_first_ack_poll;
     let bootstrap_lifecycle = pending_lifecycle.provisional_lifecycle(lifecycle_policy)?;
     let bootstrap_cancellation =
         Arc::new(AtomicBool::new(global_cancellation.load(Ordering::Acquire)));
@@ -4124,10 +4133,9 @@ where
         accepted_response_frame_size: requested_response_frame_size,
         server_request_frame_size,
     });
-    // This is the final zero-Accepted-byte boundary. Once the write future is
-    // polled it may have emitted a partial Accepted frame, so a subsequent
-    // retirement must conservatively close instead of appending the reserved
-    // bootstrap retirement response.
+    // A retirement observed before the write future is first polled can still
+    // emit the reserved bootstrap control. Once polled, that future may have
+    // written a partial Accepted frame and retirement must only close.
     let pre_ack_material_status = lifecycle_tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::material_status);
@@ -4174,14 +4182,25 @@ where
         )
         .await;
     }
-    {
-        let acknowledgement = write_frame_bounded_until_cancellable(
-            writer,
-            &accepted,
-            MAX_HANDSHAKE_FRAME_SIZE,
-            setup_deadline,
-            connection_cancellation.as_ref(),
-        );
+    #[cfg(test)]
+    if reauthenticate_before_first_ack_poll {
+        reauthentication
+            .request_reauthentication()
+            .map_err(|_| ProtocolError::InvalidWireValue)?;
+    }
+    let mut acknowledgement_started = false;
+    let retired = {
+        let acknowledgement = async {
+            acknowledgement_started = true;
+            write_frame_bounded_until_cancellable(
+                writer,
+                &accepted,
+                MAX_HANDSHAKE_FRAME_SIZE,
+                setup_deadline,
+                connection_cancellation.as_ref(),
+            )
+            .await
+        };
         tokio::pin!(acknowledgement);
         loop {
             tokio::select! {
@@ -4190,7 +4209,7 @@ where
                 changed = admission_reauthentication_rx.changed() => {
                     if changed.is_err() || reauthentication.generation() != admitted_generation {
                         lifecycle.record_forced_retirement(RetirementReason::Explicit);
-                        return Ok(());
+                        break true;
                     }
                 }
                 _ = wait_consensus_material_change(&mut admission_material_rx) => {
@@ -4199,20 +4218,31 @@ where
                         .map(opc_tls::AuthenticatedServerConfig::material_status);
                     if !material_status_matches_admission(admitted_material_epoch, status) {
                         lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
-                        return Ok(());
+                        break true;
                     }
                 }
                 _ = hard_rx.changed() => return Ok(()),
-                _ = retirement_rx.changed() => return Ok(()),
+                _ = retirement_rx.changed() => break true,
                 result = &mut acknowledgement => {
                     result?;
                     if tokio::time::Instant::now() >= setup_deadline {
                         return Err(consensus_setup_timeout_error());
                     }
-                    break;
+                    break false;
                 }
             }
         }
+    };
+    if retired {
+        if acknowledgement_started {
+            return Ok(());
+        }
+        return retire_consensus_bootstrap(
+            writer,
+            setup_deadline,
+            connection_cancellation.as_ref(),
+        )
+        .await;
     }
     drop(bootstrap_membership_lease);
     let connection_cancellation = connection_cancellation.as_ref();
@@ -8032,6 +8062,85 @@ mod tests {
         assert_eq!(handler.0.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn consensus_reauthentication_before_first_ack_poll_emits_retirement_control() {
+        let (server_binding, client_binding) = bindings();
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let reauthentication = SessionReauthenticationControl::new();
+        let mut pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        pending.reauthenticate_before_first_ack_poll = true;
+        let mut input = valid_consensus_hello_bytes(&client_binding).await;
+        let hello_bytes = input.len();
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"must-not-dispatch".to_vec(),
+        )
+        .expect("bounded consensus request");
+        write_frame(
+            &mut input,
+            &SessionConsensusTransportRequest::Call {
+                call_id: uuid::Uuid::nil(),
+                request,
+            },
+        )
+        .await
+        .expect("append queued call");
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            SessionMembershipAdmission::from_current_binding(server_binding),
+            handler.clone(),
+            Arc::new(Semaphore::new(1)),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        )
+        .await
+        .expect("server completes the retired bootstrap");
+        assert_eq!(
+            usize::try_from(reader.position()).expect("reader position"),
+            hello_bytes,
+            "no queued application request may be read"
+        );
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+
+        let emitted_bytes = writer.len();
+        let mut encoded = std::io::Cursor::new(writer);
+        let response = read_frame::<_, SessionConsensusBootstrapResponse>(
+            &mut encoded,
+            MAX_HANDSHAKE_FRAME_SIZE,
+        )
+        .await
+        .map_err(bootstrap_protocol_error_to_peer_error);
+        assert!(
+            matches!(
+                response,
+                Ok(SessionConsensusBootstrapResponse::Rejected(
+                    SessionConsensusPeerError::Rejected
+                ))
+            ),
+            "retirement before the first Ack poll must emit the reserved control, not a client transport failure: bytes={emitted_bytes}, client_result={response:?}"
+        );
+        assert_eq!(
+            usize::try_from(encoded.position()).expect("writer position"),
+            emitted_bytes,
+            "one complete retirement control and zero Accepted bytes must be emitted"
+        );
+    }
+
     #[test]
     fn consensus_post_hello_pre_admit_material_change_is_recorded_once() {
         let material = crate::test_support::RotatableServerMaterial::new(
@@ -8051,6 +8160,7 @@ mod tests {
             established_at,
             generation: 0,
             expire_at_final_ack_boundary: false,
+            reauthenticate_before_first_ack_poll: false,
         };
         let policy = test_consensus_lifecycle_policy();
         let bootstrap_lifecycle = pending
