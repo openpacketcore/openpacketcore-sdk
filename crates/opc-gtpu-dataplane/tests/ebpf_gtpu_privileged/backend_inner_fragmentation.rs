@@ -9,7 +9,7 @@
 //! The contract: the datagram reaches the UE's socket as inner fragments
 //! that the UE reassembles exactly, on the default bearer,
 //! after outer reassembly, with a zero outer UDP checksum, and on a dedicated
-//! bearer through its real ESP Child SA, and the host generates no ICMP
+//! bearer and a default bearer through their real ESP Child SAs, and the host generates no ICMP
 //! anywhere. Datagrams sent straight to the hand-off queue are dropped.
 
 use super::*;
@@ -526,6 +526,65 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "one dedicated-SA ESP packet per inner fragment"
     );
 
+    // The dedicated leg above received only its own SA. Replace that peer
+    // authority after its proof so this leg can receive only the default SA.
+    in_netns(&net.ue_ns, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build default UE downlink XFRM runtime");
+        runtime.block_on(async {
+            let peer_backend = LinuxXfrmBackend::new();
+            peer_backend
+                .remove_policy(RemovePolicyRequest::new(
+                    downlink_selector(),
+                    XfrmDirection::In,
+                ))
+                .await?;
+            peer_backend
+                .remove_sa(RemoveSaRequest::new(
+                    xfrm_ip(UE_SWU_IP),
+                    IPPROTO_ESP,
+                    OUTBOUND_SPI_A,
+                ))
+                .await?;
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: downlink_sa_parameters(OUTBOUND_SPI_DEFAULT, None),
+                })
+                .await?;
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::In,
+                        mark: None,
+                        ..downlink_policy_parameters(OUTBOUND_SPI_DEFAULT, XfrmLookupMark::full(0))
+                    },
+                })
+                .await
+        })
+    })?;
+
+    // 6. Mark zero must select the default Child SA for every fragment,
+    //    and the UE must decrypt and reassemble the complete datagram.
+    let default_esp_case = datagram(0x57, OVERSIZED_PAYLOAD, true);
+    send(&[&frame(LOCAL_TEID, &default_esp_case)]);
+    expect_fragmented(
+        &serve_consumer(port.as_ref(), &mut injector, window),
+        None,
+        &default_esp_case,
+    );
+    assert_eq!(
+        esp_spis(&captured_ipv4(&ue_capture)),
+        [OUTBOUND_SPI_DEFAULT, OUTBOUND_SPI_DEFAULT],
+        "one default-SA ESP packet per inner fragment"
+    );
+    expect_ue_delivery(
+        &ue,
+        &application_payload(0x57, OVERSIZED_PAYLOAD),
+        "default bearer through ESP",
+    );
+
     // No plaintext ICMP crossed the core, and the host generated no
     // Destination Unreachable.
     core_packets.extend(captured_ipv4(&pgw_capture));
@@ -536,8 +595,8 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "the host must not generate its own Fragmentation Needed"
     );
     let counters = port.downlink_counters()?;
-    assert_eq!(counters.inner_fragmented, 5);
-    assert_eq!(counters.inner_fragments, 10);
+    assert_eq!(counters.inner_fragmented, 6);
+    assert_eq!(counters.inner_fragments, 12);
     assert_eq!(counters.state_unavailable, 2);
     assert_eq!(counters.inner_fragment_rate_limited, 1);
     assert_eq!(counters.inner_unfragmentable, 0);
@@ -550,7 +609,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     backend.remove_device(&device).await?;
     drop(net);
     eprintln!(
-        "OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN: IPv4 DF datagram over the session MTU delivered as exact inner fragments (default, outer-reassembled, zero UDP checksum, dedicated via ESP), queue-direct datagrams dropped, no host ICMP"
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN: IPv4 DF datagram over the session MTU delivered as exact inner fragments (default, outer-reassembled, zero UDP checksum, dedicated and default via ESP), queue-direct datagrams dropped, no host ICMP"
     );
     Ok(())
 }
