@@ -1471,11 +1471,54 @@ where
     (addr, backend, handle)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() {
     use opc_session_net::protocol::write_frame;
     use opc_session_net::Request;
 
+    async fn stage<F: std::future::Future>(
+        backend: &CancellableStallBackend,
+        name: &str,
+        future: F,
+    ) -> F::Output {
+        // Keep the existing one-second hang guard on the real clock. In
+        // particular, disconnect cancellation must not pass because the
+        // five-second backend deadline eventually cancels the operation.
+        let (cancel, waiting) = std::sync::mpsc::channel::<()>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut watchdog = tokio::task::spawn_blocking(move || {
+            waiting.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
+        let result = tokio::select! {
+            biased;
+            result = future => Some(result),
+            expired = &mut watchdog => {
+                let _ = expired.expect("backend lifecycle wall guard");
+                None
+            }
+        };
+        drop(cancel);
+        match result {
+            Some(result) => {
+                let _ = watchdog.await.expect("retire backend lifecycle wall guard");
+                result
+            }
+            None => panic!(
+                "{name}: one-second wall guard elapsed; active={}, get_calls={}, delete_calls={}, delete_effects={}",
+                backend.active(),
+                backend.get_calls.load(Ordering::SeqCst),
+                backend.delete_calls.load(Ordering::SeqCst),
+                backend.delete_effects.load(Ordering::SeqCst),
+            ),
+        }
+    }
+
+    // Real TLS I/O and host scheduling must not consume protocol time while
+    // this fixture is arranging a deadline/cancellation boundary. A blocking
+    // receive inhibits Tokio's automatic clock advance; dropping its sender
+    // releases it on both success and panic. Advance only after backend entry.
+    let (release_clock, held_clock) = std::sync::mpsc::channel::<()>();
+    let clock_guard = tokio::task::spawn_blocking(move || held_clock.recv());
     let mtls = mtls_configs();
     let backend = CancellableStallBackend::new();
     let key = test_key_with_stable_id(b"backend-lifetime");
@@ -1498,17 +1541,41 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
         .expect("start bounded server");
     let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1)));
 
-    let read_error = remote
-        .get(&key)
+    let reading = {
+        let remote = remote.clone();
+        let key = key.clone();
+        tokio::spawn(async move { remote.get(&key).await })
+    };
+    stage(
+        &backend,
+        "deadline backend read starts",
+        backend.wait_for_active(|active| *active > 0),
+    )
+    .await;
+    tokio::time::advance(Duration::from_millis(75)).await;
+    let read_error = stage(&backend, "backend read deadline response", reading)
         .await
+        .expect("stalled read task")
         .expect_err("stalled read must reach its backend deadline");
     assert!(matches!(read_error, StoreError::BackendUnavailable(_)));
     assert_eq!(backend.get_calls.load(Ordering::SeqCst), 1);
     assert_eq!(backend.active(), 0);
 
-    let mutation_error = remote
-        .delete_fenced(&lease)
+    let deleting = {
+        let remote = remote.clone();
+        let lease = lease.clone();
+        tokio::spawn(async move { remote.delete_fenced(&lease).await })
+    };
+    stage(
+        &backend,
+        "deadline backend mutation starts",
+        backend.wait_for_active(|active| *active > 0),
+    )
+    .await;
+    tokio::time::advance(Duration::from_millis(75)).await;
+    let mutation_error = stage(&backend, "backend mutation deadline response", deleting)
         .await
+        .expect("stalled mutation task")
         .expect_err("post-effect stall must have an ambiguous outcome");
     assert_eq!(
         mutation_error,
@@ -1517,7 +1584,12 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
     assert_eq!(backend.delete_calls.load(Ordering::SeqCst), 1);
     assert_eq!(backend.delete_effects.load(Ordering::SeqCst), 1);
     assert_eq!(backend.active(), 0);
-    handle.abort_and_wait().await;
+    stage(
+        &backend,
+        "deadline server shutdown",
+        handle.abort_and_wait(),
+    )
+    .await;
 
     let disconnect_server = SessionReplicationServer::new(
         Arc::new(backend.clone()),
@@ -1532,31 +1604,43 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
         .await
         .expect("start disconnect server");
 
-    let mut disconnected = authenticated_raw_stream(
-        &mtls,
-        1,
-        2,
-        disconnect_addr,
-        opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE,
+    let mut disconnected = stage(
+        &backend,
+        "authenticate disconnect client",
+        authenticated_raw_stream(
+            &mtls,
+            1,
+            2,
+            disconnect_addr,
+            opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE,
+        ),
     )
     .await;
-    write_frame(&mut disconnected, &Request::Get { key: key.clone() })
-        .await
-        .expect("write stalled read");
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        backend.wait_for_active(|active| *active > 0),
+    stage(
+        &backend,
+        "write stalled read",
+        write_frame(&mut disconnected, &Request::Get { key: key.clone() }),
     )
     .await
-    .expect("backend read starts");
-    let readiness = remote_backend(
-        &mtls,
-        1,
-        2,
-        disconnect_addr,
-        Some(Duration::from_millis(500)),
+    .expect("write stalled read");
+    stage(
+        &backend,
+        "backend read starts",
+        backend.wait_for_active(|active| *active > 0),
     )
-    .probe_replication_head()
+    .await;
+    let readiness = stage(
+        &backend,
+        "fresh readiness while read capacity is exhausted",
+        remote_backend(
+            &mtls,
+            1,
+            2,
+            disconnect_addr,
+            Some(Duration::from_millis(500)),
+        )
+        .probe_replication_head(),
+    )
     .await;
     assert_eq!(
         readiness,
@@ -1564,35 +1648,48 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
         "fresh readiness must fail closed while the read family is exhausted"
     );
     drop(disconnected);
-    tokio::time::timeout(
-        Duration::from_secs(1),
+    stage(
+        &backend,
+        "peer disconnect cancels and releases backend work",
         backend.wait_for_active(|active| *active == 0),
     )
-    .await
-    .expect("peer disconnect cancels and releases backend work");
+    .await;
 
-    let mut shutdown = authenticated_raw_stream(
-        &mtls,
-        1,
-        2,
-        disconnect_addr,
-        opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE,
+    let mut shutdown = stage(
+        &backend,
+        "authenticate shutdown client",
+        authenticated_raw_stream(
+            &mtls,
+            1,
+            2,
+            disconnect_addr,
+            opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE,
+        ),
     )
     .await;
-    write_frame(&mut shutdown, &Request::Get { key })
-        .await
-        .expect("write shutdown-stalled read");
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        backend.wait_for_active(|active| *active > 0),
+    stage(
+        &backend,
+        "write shutdown-stalled read",
+        write_frame(&mut shutdown, &Request::Get { key }),
     )
     .await
-    .expect("shutdown backend read starts");
-    tokio::time::timeout(Duration::from_secs(1), disconnect_handle.abort_and_wait())
-        .await
-        .expect("shutdown barrier cancels stalled backend work");
+    .expect("write shutdown-stalled read");
+    stage(
+        &backend,
+        "shutdown backend read starts",
+        backend.wait_for_active(|active| *active > 0),
+    )
+    .await;
+    stage(
+        &backend,
+        "shutdown barrier cancels stalled backend work",
+        disconnect_handle.abort_and_wait(),
+    )
+    .await;
     assert_eq!(backend.active(), 0);
     drop(shutdown);
+    drop(release_clock);
+    let _ = clock_guard.await.expect("release paused lifecycle clock");
 }
 
 #[tokio::test]
