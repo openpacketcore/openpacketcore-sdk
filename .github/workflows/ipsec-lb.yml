@@ -10,6 +10,7 @@ on:
       - ".github/workflows/ipsec-lb.yml"
       - "ci/setup-fsverity-tmp.sh"
       - "scripts/build-ipsec-lb-ebpf.sh"
+      - "scripts/check-ebpf-license.sh"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -23,6 +24,7 @@ on:
       - ".github/workflows/ipsec-lb.yml"
       - "ci/setup-fsverity-tmp.sh"
       - "scripts/build-ipsec-lb-ebpf.sh"
+      - "scripts/check-ebpf-license.sh"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -230,6 +232,7 @@ jobs:
         run: |
           set -euo pipefail
           committed="${RUNNER_TEMP}/committed-opc-ipsec-lb-xdp.bpf.o"
+          ./scripts/check-ebpf-license.sh crates/opc-ipsec-lb/bpf/opc-ipsec-lb-xdp.bpf.o
           cp crates/opc-ipsec-lb/bpf/opc-ipsec-lb-xdp.bpf.o "${committed}"
           ./scripts/build-ipsec-lb-ebpf.sh
           rebuilt="crates/opc-ipsec-lb-ebpf/target/bpfel-unknown-none/release/opc-ipsec-lb-xdp"
@@ -248,7 +251,7 @@ jobs:
           for symbol in opc_ipsec_lb_xdp IPSEC_LB_OWNERS IPSEC_LB_CONFIG IPSEC_LB_FENCE IPSEC_LB_KEY_FENCES IPSEC_LB_COUNTERS; do
             grep -q " ${symbol}$" committed.inventory
           done
-          for section in .text xdp maps .BTF .BTF.ext .relxdp .rel.BTF .rel.BTF.ext; do
+          for section in .text xdp maps license .BTF .BTF.ext .relxdp .rel.BTF .rel.BTF.ext; do
             readelf -x "${section}" "${committed}" > committed.hex
             readelf -x "${section}" "${rebuilt}" > rebuilt.hex
             diff -u committed.hex rebuilt.hex

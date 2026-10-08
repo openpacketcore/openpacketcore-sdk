@@ -6,6 +6,11 @@ This crate is excluded from the host workspace and built with
 `scripts/build-ipsec-lb-ebpf.sh` for `bpfel-unknown-none`. The userspace loader
 uses the committed object through `opc-ipsec-lb`.
 
+The object explicitly declares the kernel-readable `Dual MIT/GPL\0` license
+in its `license` ELF section. The build helper and CI use
+`scripts/check-ebpf-license.sh` to verify the exact declaration in both the
+built and committed objects.
+
 ## What the program does
 
 The program executes the same branch-bounded keyless classification decision

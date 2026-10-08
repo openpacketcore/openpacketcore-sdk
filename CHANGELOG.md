@@ -442,6 +442,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of replying `Protocol`. Valid encodings are unchanged; bounded
   configuration profile admission stays closed. Refs #957.
 
+- `opc-gtpu-dataplane-ebpf`: the GTP-U datapath object now declares its
+  kernel license explicitly as `Dual MIT/GPL` in its `license` ELF section,
+  as the repository's other Rust eBPF objects do, instead of relying on the
+  loader's implicit `GPL` default. The build helper and the eBPF object CI job
+  verify the exact declaration in the committed and rebuilt objects. Program
+  and map bytes are unchanged. Fixes #577.
+
+- `opc-ipsec-lb-ebpf`: declare the same explicit `Dual MIT/GPL` kernel
+  license in the XDP object. Its build helper and object CI job use the shared
+  license checker for the built and committed artifacts. Program and map bytes
+  and functional relocations are unchanged. Part of #577.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,

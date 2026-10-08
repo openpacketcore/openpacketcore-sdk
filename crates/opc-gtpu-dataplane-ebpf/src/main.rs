@@ -5171,6 +5171,10 @@ fn authorize_and_decap_legacy_downlink(
     TC_ACT_OK
 }
 
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
+
 #[cfg(test)]
 mod tests {
     use super::*;

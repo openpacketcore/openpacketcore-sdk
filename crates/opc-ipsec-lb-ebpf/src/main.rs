@@ -39,8 +39,8 @@ use aya_ebpf_bindings::helpers::bpf_xdp_load_bytes;
 use opc_ipsec_lb_ebpf_common::{
     classify_transport, decide_owner_verdict_with_keyed_fence, is_ipv6_extension_header_kind,
     ownership_map_key, redirect_outcome, verdict_counter, XdpDatapathConfig, XdpIpAddress,
-    XdpRedirectOutcome, XdpTransportClass, XdpVerdict, CONFIG_KEY, CONFIG_VALUE_LEN,
-    COUNTER_ERROR, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT, COUNTER_SLOTS,
+    XdpRedirectOutcome, XdpTransportClass, XdpVerdict, CONFIG_KEY, CONFIG_VALUE_LEN, COUNTER_ERROR,
+    COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT, COUNTER_SLOTS,
     COUNTER_UNCLASSIFIABLE, ESP_HEADER_PREFIX_LEN, ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6, FENCE_KEY,
     IP_PROTOCOL_ESP, IP_PROTOCOL_UDP, OWNER_KEY_LEN, OWNER_VALUE_LEN, XDP_TRANSPORT_PROBE_LEN,
 };
@@ -259,6 +259,10 @@ fn steer_transport(
         XdpTransportClass::NonSwu => counted_pass(COUNTER_PASS_NON_SWU),
         XdpTransportClass::NatKeepalive => counted_pass(COUNTER_NATT_KEEPALIVE),
         XdpTransportClass::Unclassifiable => counted_pass(COUNTER_UNCLASSIFIABLE),
+        #[expect(
+            clippy::needless_borrows_for_generic_args,
+            reason = "Passing map keys by value changes the frozen BPF instruction stream."
+        )]
         identity => {
             let Some(config_ptr) = IPSEC_LB_CONFIG.get_ptr(&CONFIG_KEY) else {
                 return counted_pass(COUNTER_ERROR);
@@ -357,6 +361,10 @@ fn load<T: Copy>(ctx: &XdpContext, offset: usize) -> Option<T> {
     // reads are required for network headers.
     Some(unsafe { core::ptr::read_unaligned(start as *const T) })
 }
+
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
