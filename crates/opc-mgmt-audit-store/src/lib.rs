@@ -65,6 +65,9 @@ const DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION: Duration = Duration::from_secs(30
 
 static DURABLE_AUDIT_WORKER_DETACHMENTS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+type TimedOutWorkerReply = mpsc::Receiver<Result<WorkerReply, DurableAuditSinkError>>;
+
 /// Workers detached after they could not complete within the shutdown bound.
 pub fn durable_audit_worker_detachments() -> u64 {
     DURABLE_AUDIT_WORKER_DETACHMENTS.load(Ordering::Relaxed)
@@ -78,6 +81,8 @@ pub struct DurableAuditSink {
     retention: ManagementAuditRetention,
     acknowledgement_timeout: Duration,
     shutdown_timeout: Duration,
+    #[cfg(test)]
+    timed_out_reply_observer: Mutex<Option<mpsc::SyncSender<TimedOutWorkerReply>>>,
 }
 
 impl DurableAuditSink {
@@ -154,6 +159,8 @@ impl DurableAuditSink {
             retention,
             acknowledgement_timeout,
             shutdown_timeout,
+            #[cfg(test)]
+            timed_out_reply_observer: Mutex::new(None),
         })
     }
 
@@ -279,7 +286,20 @@ impl DurableAuditSink {
         reply_receiver
             .recv_timeout(self.acknowledgement_timeout)
             .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => DurableAuditSinkError::AcknowledgementTimeout,
+                mpsc::RecvTimeoutError::Timeout => {
+                    // Unit tests can retain the real eventual reply after
+                    // admission times out, without changing the caller's result.
+                    #[cfg(test)]
+                    if let Some(observer) = self
+                        .timed_out_reply_observer
+                        .lock()
+                        .ok()
+                        .and_then(|mut observer| observer.take())
+                    {
+                        let _ = observer.try_send(reply_receiver);
+                    }
+                    DurableAuditSinkError::AcknowledgementTimeout
+                }
                 mpsc::RecvTimeoutError::Disconnected => DurableAuditSinkError::WorkerUnavailable,
             })?
     }
@@ -337,6 +357,18 @@ impl DurableAuditSink {
             }
             () = &mut deadline_wait => Err(DurableAuditSinkError::AcknowledgementTimeout),
         }
+    }
+
+    #[cfg(test)]
+    fn observe_next_timed_out_reply(&self) -> mpsc::Receiver<TimedOutWorkerReply> {
+        let (observer, observation) = mpsc::sync_channel(1);
+        let previous = self
+            .timed_out_reply_observer
+            .lock()
+            .expect("reply observer")
+            .replace(observer);
+        assert!(previous.is_none(), "a reply observer is already armed");
+        observation
     }
 
     #[cfg(test)]
@@ -1591,19 +1623,27 @@ mod tests {
         .await
         .expect("durable sink");
 
+        let held_worker = sink
+            .hold_worker_for_testing(Duration::from_millis(200))
+            .await
+            .expect("observe the held worker before admitting requests");
         let stall_started = std::time::Instant::now();
         assert!(matches!(
-            sink.stall_worker(Duration::from_millis(200)),
+            sink.stall_worker(Duration::ZERO),
             Err(DurableAuditSinkError::AcknowledgementTimeout)
         ));
         assert!(stall_started.elapsed() < Duration::from_millis(150));
 
+        let observation = sink.observe_next_timed_out_reply();
         let record_started = std::time::Instant::now();
         let error = sink
             .record(&event(AuditOperation::Read, AuditOutcome::Success, 7))
             .expect_err("stalled acknowledgement must fail closed");
         assert!(error.detail().contains("outcome is unknown"));
         assert!(record_started.elapsed() < Duration::from_millis(150));
+        let admitted_reply = observation
+            .try_recv()
+            .expect("retain the real reply for the admitted timed-out append");
 
         let detachments_before = durable_audit_worker_detachments();
         let shutdown_started = std::time::Instant::now();
@@ -1611,9 +1651,17 @@ mod tests {
         assert!(shutdown_started.elapsed() < Duration::from_millis(150));
         assert!(durable_audit_worker_detachments() > detachments_before);
 
-        // The timed-out append was already admitted. It is allowed to commit,
-        // but the caller correctly received no success acknowledgement.
-        thread::sleep(Duration::from_millis(250));
+        // Acknowledgement timeout and bounded shutdown do not establish the
+        // admitted append's outcome. Release the worker and observe its real
+        // result within the old readback wait before reopening the database.
+        held_worker.release();
+        assert!(matches!(
+            admitted_reply
+                .recv_timeout(Duration::from_millis(250))
+                .expect("observe the admitted append's final result")
+                .expect("the admitted append must complete successfully"),
+            WorkerReply::Appended
+        ));
         let reopened = open_sink(&path, 0x51, RETAIN_ALL).await;
         assert_eq!(
             reopened
@@ -1621,6 +1669,75 @@ mod tests {
                 .expect("verify admitted timed-out append")
                 .total_count,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_worker_distinguishes_backend_failure_from_late_commit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = database(&tempdir);
+        let retention = ManagementAuditRetention::try_new(RETAIN_ALL).expect("retention");
+        let backend = SqliteBackend::open_with_audit_key(&path, false, 0, key(0x51))
+            .await
+            .expect("durable backend");
+        let short_bound = Duration::from_millis(25);
+        let sink = DurableAuditSink::from_backend_with_timeouts(
+            backend,
+            retention,
+            short_bound,
+            short_bound,
+        )
+        .await
+        .expect("durable sink");
+        let held_worker = sink
+            .hold_worker_for_testing(Duration::from_millis(200))
+            .await
+            .expect("observe the held worker before admitting the failing append");
+        let connection = Connection::open(&path).expect("open failure control");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_test_append BEFORE INSERT ON management_audit_event \
+                 BEGIN SELECT RAISE(ABORT, 'injected append failure'); END;",
+            )
+            .expect("install append failure control");
+        drop(connection);
+
+        let observation = sink.observe_next_timed_out_reply();
+        let error = sink
+            .record(&event(AuditOperation::Read, AuditOutcome::Success, 7))
+            .expect_err("held append must time out before the backend runs");
+        assert!(error.detail().contains("outcome is unknown"));
+        let admitted_reply = observation
+            .try_recv()
+            .expect("retain the real reply for the admitted timed-out append");
+        drop(sink);
+        held_worker.release();
+        match admitted_reply
+            .recv_timeout(Duration::from_millis(250))
+            .expect("observe the admitted append's final failure")
+        {
+            Err(DurableAuditSinkError::Store(ManagementAuditStoreError::Persistence(error))) => {
+                assert!(matches!(
+                    error.kind(),
+                    opc_persist::PersistErrorKind::Sqlite(message)
+                        if message.contains("injected append failure")
+                ));
+            }
+            Err(other) => panic!("unexpected admitted append failure: {other:?}"),
+            Ok(_) => panic!("the injected backend failure unexpectedly succeeded"),
+        }
+
+        Connection::open(&path)
+            .expect("open failure control cleanup")
+            .execute_batch("DROP TRIGGER reject_test_append")
+            .expect("remove the injected failure before authenticated readback");
+        let reopened = open_sink(&path, 0x51, RETAIN_ALL).await;
+        assert_eq!(
+            reopened
+                .verify()
+                .expect("authenticate the failed append's unchanged trail")
+                .total_count,
+            0
         );
     }
 

@@ -426,6 +426,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
+  admitted append's final result before authenticated readback, retaining its
+  acknowledgement, shutdown and completion bounds. A backend-error control
+  distinguishes a failed append from a delayed commit. Fixes #868.
+
 - `opc-gtpu-dataplane`: tolerate BPF program IDs retired during current-graph
   ownership scans, preventing unrelated program removal from refusing device
   cleanup before or after hook detachment. Live foreign references and all
