@@ -226,17 +226,52 @@ async fn consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_
         let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, provider, "void-cursor", journal).unwrap();
         for ordinal in [910, 912] { drop(facade.prepare_fenced_transition(create(request_id(ordinal), ordinal, PAYLOAD), budget(soon())).await.unwrap()); }
         let report = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
-        assert!(!report.interrupted());
-        assert_eq!(report.examined(), 3);
+        assert!(!report.interrupted(), "{report:?}");
+        assert_eq!(report.examined(), 3, "{report:?}");
         assert_eq!(report.voided(), 1, "{report:?}");
-        assert_eq!(report.reclaimed(), 1, "recorded status behind the unavailable first row");
-        assert_eq!(report.retained(), 2);
+        assert_eq!(report.reclaimed(), 1, "recorded status behind the unavailable first row: {report:?}");
+        assert_eq!(report.retained(), 2, "{report:?}");
         let wrapped = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
-        assert_eq!(wrapped.examined(), 0, "finish the cursor page and wrap");
+        assert_eq!(wrapped.examined(), 0, "finish the cursor page and wrap: {wrapped:?}");
+        // Permit the first committed void reply, but hold the second until
+        // this sweep returns. This deterministically spends that attempt's
+        // unchanged 250ms cap, as host scheduling can, without losing its
+        // durable receipt or relying on an arbitrary sleep.
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        for voter in &fixture.voters {
+            *voter.service.fenced_transition_v2_void_response_gate.lock().unwrap() = Some(Arc::clone(&response_gate));
+        }
         for voter in &fixture.voters { voter.service.unavailable_fenced_transition_v2_capability.store(false, Ordering::Release); }
-        let drained = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
-        assert_eq!(drained.voided(), 2, "retry rows on both sides of the prior cursor");
-        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
+        // An unknown void advances the cursor and retains its row; a caller
+        // must sweep again to observe its exact receipt. Keep one original
+        // five-second budget for the entire drain, including every retry.
+        let deadline = soon();
+        let mut reports = Vec::new();
+        let mut voided = 0;
+        let mut reclaimed = 0;
+        let drained = tokio::time::timeout_at(deadline, async {
+            loop {
+                let report = facade.reclaim_resolved_fenced_transitions(3, budget(deadline)).await
+                    .unwrap_or_else(|error| panic!("retry drain failed: {error:?}; reports={reports:?}"));
+                voided += report.voided();
+                reclaimed += report.reclaimed();
+                reports.push(report);
+                if reports.len() == 1 {
+                    assert!(!report.interrupted(), "first retry sweep must complete: {reports:?}");
+                    assert_eq!(report.examined(), 2, "one pass reaches rows on both sides of the prior cursor: {reports:?}");
+                    assert!(report.voided() < 2, "the held reply must force a partial sweep: {report:?}");
+                    response_gate.add_permits(1);
+                }
+                if facade.retained_fenced_transitions().await.unwrap() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        assert!(drained.is_ok(), "retry drain exceeded its unchanged five-second budget: {reports:?}");
+        assert_eq!(voided, 2, "retry rows on both sides of the prior cursor: {reports:?}");
+        assert_eq!(reclaimed, 2, "both retry rows removed exactly once: {reports:?}");
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0, "{reports:?}");
     }).catch_unwind().await;
     fixture.shutdown().await.unwrap();
     if let Err(error) = result {
