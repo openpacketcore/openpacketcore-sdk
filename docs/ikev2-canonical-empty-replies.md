@@ -1,12 +1,14 @@
 # Canonical AES-GCM empty IKEv2 replies
 
-Status: design approved; V1 byte primitive implemented in `opc-proto-ikev2`.
+Status: design approved; V1 byte primitive and zero-write receive handler
+implemented in `opc-proto-ikev2`.
 The [`canonical` module](../crates/opc-proto-ikev2/src/canonical.rs) supplies
 record-derived byte regeneration, without receive-window or transmission authority.
-The current
+The [`empty` handler](../crates/opc-proto-ikev2/src/recovery/empty.rs) composes
+the primitive with receive admission and lifecycle checks. The current
 [recovery restrictions](../crates/opc-proto-ikev2/README.md) still apply,
-including the restriction on peers that send DPD. CBC and fragmented recovery
-are outside this design.
+including deployment refusal when canonical replies cannot be qualified. CBC
+and fragmented recovery are outside this design.
 
 The objective is to regenerate exactly the same authenticated empty
 INFORMATIONAL response after a crash without a durable write per response.
@@ -212,10 +214,13 @@ direction, algorithm, key, salt or V1 marker—only a fresh SA applies. Do not
 repair or replace the binding while retaining its keys. Unknown IV history
 or key provenance likewise cannot be cured by relabelling the record.
 
-Record reconciliation applies only to state that changes legitimately, such
-as an ordinary IV high-water or an uncertain reservation write, while the
-immutable binding and its provenance remain trusted. It does not authorize
-reusing bytes from a discarded or doubted capability.
+Before calling `Window::restore`, record reconciliation applies only to state
+that changes legitimately, such as an ordinary IV high-water or an uncertain
+reservation write, while the immutable binding and its provenance remain
+trusted. Read the window and IV records from one consistent fenced snapshot.
+Every failed window restore now permanently revokes its canonical epoch;
+correcting the records afterward cannot restore that canonical service.
+Reconciliation never authorizes reusing bytes from a discarded or doubted capability.
 
 Key the volatile reply cache by the **capability instance, its full immutable
 binding and Message ID**. Check the binding including SPIs, role, algorithm,
@@ -354,15 +359,15 @@ After three withheld attempts, no further attempt for that epoch/ID is allowed
 while its ledger remains registered. This is volatile accounting, with no
 per-reply durable write. The deleted-record/FIFO residual above is separate.
 
-After the first successful release, the later empty-request handler reuses
+After the first successful release, the empty-request handler reuses
 those immutable bytes in memory for every permitted retransmission. It cannot
 seal that ID again, even if fewer than three attempts were used. Cache eviction,
 capability recreation and mutable-state reconciliation cannot reopen a released
 ID or refresh the attempt budget; an ID whose bytes were discarded gets no
 further response from that ledger. The cache remains bound to the capability
 instance and full binding described above. A new process may regenerate from
-the retained trusted V1 binding. Cache bounds and receive admission remain
-part of the later reconstruction qualification.
+the retained trusted V1 binding. The window-one handler retains one empty
+request identity and compacts canonical IDs below its applicable reply window.
 
 ## Refusals and protocol boundary
 
@@ -379,7 +384,7 @@ nonce. Encoding alone never proves that a request may be answered.
 | Identical `SK_ei` and `SK_er` key/salt material | Reject the epoch, as the existing IV-domain constructor does. Direction flags alone do not separate nonces. |
 | Absent/unknown/mismatching marker, attempted in-place format change, bare or second descriptor | No canonical capability; only the single committed V1 binding or its checked restoration can supply it. |
 | Untrusted/mixed record, unknown prior IV use, or unknown key provenance | Derive or restore no canonical capability, invalidate any existing one, discard the epoch's volatile canonical bytes, and withhold send authority. A doubted binding requires a fresh SA. |
-| Unresolved outcome for legitimately mutable state, with the immutable binding and provenance still trusted | Withhold capability/send authority and reconcile that mutable state through the existing fenced record rules. Never reconcile a changed or doubted binding into continued use of its keys, or reuse discarded cache entries. |
+| Unresolved outcome for legitimately mutable state, with the immutable binding and provenance still trusted | Withhold capability/send authority and reconcile that mutable state through the existing fenced record rules before calling window restore. Read both records from one consistent snapshot; a failed restore is terminal for canonical use. Never reconcile a changed or doubted binding into continued use of its keys, or reuse discarded cache entries. |
 | ID outside `0..=u32::MAX`, exhausted ID state, narrowing cast or arithmetic wrap | Reject; never truncate, wrap or reinterpret exhaustion as zero. |
 | Unauthenticated, wrong-SA, wrong-role, malformed, nonempty or non-INFORMATIONAL incoming packet, including RFC 6311 sync | No canonical-response authorization. A response packet cannot be treated as an empty request. |
 | Failed receive-window admission, quiescence, `AwaitLocalSync`, `OutcomeUncertain` or closure | No bypass through this primitive. Cryptographic reproducibility does not confer lifecycle authority. |
@@ -390,8 +395,8 @@ nonce. Encoding alone never proves that a request may be answered.
 | ID at or below the live ledger's closed floor, or a key with a retained deletion tombstone | Refuse. Compaction never resets the live ledger's budget; the FIFO residual is described above. |
 | New key domain at the process's concurrent live-SA cap | Return `RegistryFull`; live ledgers are never evicted and deletion history does not consume capacity. |
 
-Receive admission and empty-request handling remain separate planned work.
-They must authenticate and classify the complete request before replying:
+Receive admission and empty-request handling are composed by `reply_empty`.
+It authenticates and classifies the complete request before replying:
 Response flag clear, INFORMATIONAL exchange 37, the peer's Initiator flag,
 and one complete `SK` as both first and last outer payload, with no `SKF`.
 After payload-chain validation, reuse `PayloadChain::is_empty()`; Next Payload
@@ -406,7 +411,7 @@ commits the advanced floor with its response and outcome. Reconstruction
 observations must also feed the RFC 6311 peer-request drop floor. None of
 these rules is implemented or weakened by the sealing primitive.
 
-For the later zero-write handler, canonical refusal means **no reply to an
+For the zero-write handler, canonical refusal means **no reply to an
 empty request**. There is no ordinary-IV, committed-window or other fallback.
 A V1 epoch answers an empty request only with V1, or not at all. DPD-sending
 peers are unsupported in a durable deployment whose canonical path cannot
@@ -415,7 +420,7 @@ unqualified module or a failed known-answer check. The consumer must refuse
 that configuration up front, checking the intended algorithms and canonical
 module policy/qualification before accepting such peers. A runtime refusal
 after successful preflight still withholds the reply; it does not enable a
-fallback. These requirements remain when the receive handler is implemented.
+fallback.
 
 Locally generated canonical reply bytes never enter durable committed
 request/response caches, sync history, or IV-floor evidence such as
@@ -633,16 +638,80 @@ Existing ordinary reservation, window, protected-payload and sync suites remain
 part of qualification. Public compile-fail examples pin constructor restrictions,
 non-cloneability and the lack of raw ID or output-variation entry points.
 
-The table's **later window composition** group remains assigned to the separate
-zero-write receive-handler slice: empty at F then nonempty at F+1, reconstruction,
-strict/sync floors and effect/liveness rules require that handler. Current tests
-prove the primitive does not advance floors or grant lifecycle/send authority.
-Deployment refusal is exposed as per-algorithm `preflight`; the consumer owns
-configuration admission and must not enable DPD handling before that later slice.
+The table's **later window composition** group is implemented in
+[`empty_recovery.rs`](../crates/opc-proto-ikev2/tests/empty_recovery.rs): empty
+at F followed by committed nonempty work at F+1, strict/sync floors, lost-prefix
+reconstruction and effect/liveness rules. `reply_empty` checks current module
+admission and window readiness on every call, retains identical bytes, and
+borrows the window exclusively through response use. Enabling empty replies on
+a restored window always selects SDK prefix reconstruction above a trusted floor.
+Restore and enable are separate: a capability-active or pending-sync enable
+refusal leaves the checked runtime and epoch available for retry once the cause
+clears. The first nonempty result commits the repaired floor and ends the mode.
+Restoration reports uncertain freshness
+until a new inbound or sync boundary commits in this runtime. Admission also
+records IDs in the volatile sync drop history, including failed canonical
+evaluations. No endpoint, key, bearer, lifetime or outcome effects are authorized.
+The [README](../crates/opc-proto-ikev2/README.md#zero-write-empty-requests-and-restart-reconstruction)
+maps these choices to RFC 7296 §§1.4, 1.4.1 and 2.1–2.4 and specifies the common
+`window.delete()` hook for every permanent teardown, including RFC 6311 terminal
+cleanup and old-SA deletion after rekey. Every failed window restore revokes
+canonical state. Failures before window restore need `delete_epoch` without a
+runtime.
+Deployment refusal is exposed as per-algorithm `preflight`; the consumer still
+owns configuration admission and must refuse unqualified DPD deployments.
 
-Peer interoperability cannot run locally for this primitive-only slice: the
-composed receive handler is not implemented, and live peer/lab execution is
-not part of this change. Third-party acceptance of padding, reserved
+The older public `canonical_replies` constructors on the allocator and window
+still expose the byte primitive without advancing a window's receive floor.
+A DPD-facing window must use the composed enable/reply path; otherwise its next
+nonempty request can be dropped. The next recovery slice will restrict both
+constructors to crate-private or test-only use after migrating their primitive
+qualification tests. This is an API restriction plan, not a change to the V1
+construction or its release contract; those constructors remain public here.
+
+### Planned in-process readback preservation
+
+Replacing a runtime during fenced in-process readback currently drops its
+canonical capability and cached bytes while retaining released-ID history.
+The replacement refuses the most recent released ID with `AlreadyReleased`.
+If the peer lost that reply, it may stall until synchronization or expiry.
+This fail-closed limit on RFC 7296 §2.3 reply retention is covered by the
+integration tests; it is not solved by permitting another release from a new
+capability. A process restart has a separate ledger lifetime and retains the
+existing V1 regeneration contract.
+
+The next recovery slice will add a mutable readback-in-place API, provisionally
+`window.reconcile(latest_record, iv_record, ...)`, with this contract:
+
+1. Require fencing and resolution of outstanding writes before accepting the
+   latest atomic record. Re-run domain/profile/key, packet, generation, sync and
+   IV high-water validation without recreating the canonical capability. The
+   complete immutable binding must match; mixed, stale or invalid state revokes
+   the epoch and requires teardown. Refactor validation separately from the
+   existing restore wrapper's failure cleanup, preserving that cleanup contract.
+2. Preserve the same canonical capability instance, verified last reply, attempt
+   and release ledger, volatile receive floor, pending identity and observed
+   sync history when no new inbound boundary landed. Outbound-only commits must
+   not discard that prefix or cache. Adopt a newly landed inbound result or sync
+   cutover through the existing boundary rules, without moving a live floor back.
+3. Fence old completion tokens and adopt durable outcomes as history, never as
+   fresh effect permission. Reconciliation alone supplies no fresh liveness.
+   Resume only the lifecycle allowed by the validated committed record; pending
+   or terminal sync cannot be bypassed. The exclusive mutable borrow prevents
+   reconciliation while an SDK reply still borrows the window.
+   Record-trust failures remain terminal; recoverable lifecycle or enable
+   refusals must preserve the trusted epoch for retry.
+4. Add regressions for a lost last DPD reply across cancelled/uncertain outbound
+   commits, both landed and unlanded readback, exact cache reuse with no extra
+   seal, landed inbound/sync boundaries, changed bindings, stale tokens and
+   provider withdrawal. Cover both roles and all supported GCM sizes. Do not
+   reset attempts or release flags, permit a second release after capability
+   recreation, alter the V1 transcript or change crash regeneration.
+
+This API is planned, not implemented. Crypto review of capability retention and
+the existing one-release contract is required before implementing the next slice.
+
+Live peer/lab execution is not part of this change. Third-party acceptance of padding, reserved
 IVs, both directions, ID zero and exact restart repeats remains an explicit
 composed qualification gate. Unit tests and the accepted construction are not
 peer-interoperability evidence.
@@ -650,5 +719,5 @@ peer-interoperability evidence.
 The construction, binding/provider mechanisms, software-module interpretation
 and aggregate limit passed design review. The implementation adds the exact
 key/salt fingerprint ledger, zeroizing withheld-output handling and API migration
-specified above. A cryptography-focused code review and the separate receive
-admission/composition qualification remain required before deployment.
+specified above. Independent review of the receive handler and composed peer
+qualification remain required before deployment.

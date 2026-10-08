@@ -7,10 +7,10 @@
 //!
 //! This initial profile handles complete AES-GCM SK packets, not SKF or CBC
 //! recovery. Sync requires persisted negotiated metadata and fixed event/clock
-//! budgets. Canonical replies and receive-floor reconstruction remain separate.
-//! Empty INFORMATIONAL requests use no durable window write;
-//! until a stateless handler with a volatile receive high-water exists, this
-//! profile must not face peers that send DPD requests.
+//! budgets. The opt-in empty handler answers authenticated INFORMATIONAL requests
+//! with canonical bytes and advances a volatile receive floor without a durable
+//! write. Trusted restart reconstruction repairs a lost stateless prefix; the
+//! first nonempty result commits the repaired floor and ends reconstruction.
 //! Replay probes are old bytes, not fresh liveness or new outcome evidence.
 
 use std::{cell::Cell, error::Error as StdError, fmt, sync::Arc};
@@ -21,6 +21,7 @@ use crate::{
 };
 use bytes::Bytes;
 
+mod empty;
 mod packet;
 mod record;
 mod reservation_retry;
@@ -30,6 +31,7 @@ mod sync_readiness;
 mod sync_record;
 mod sync_recovery_record;
 mod sync_responder;
+pub use empty::{Ikev2EmptyReply, Ikev2EmptyReplyObservation};
 pub use packet::Ikev2AuthenticatedOrdinary;
 pub use record::{
     Ikev2CommittedExchangeRecord, Ikev2CommittedWindowDomain, Ikev2CommittedWindowRecord,
@@ -74,6 +76,10 @@ pub enum Ikev2WindowError {
     Exhausted,
     /// Stateless empty request cannot create durable work or a fresh probe.
     NoDurableWork,
+    /// Enable the qualified canonical handler before admitting empty-request traffic.
+    EmptyRepliesDisabled,
+    /// Canonical policy, ledger or output checks refused; there is no fallback.
+    Canonical(crate::canonical::Ikev2CanonicalError),
     /// Completion belongs to another runtime or an older commit generation.
     StaleCompletion,
     /// Local synchronization remains pending; ordinary traffic is blocked.
@@ -105,6 +111,8 @@ impl fmt::Display for Ikev2WindowError {
             Self::CommitMismatch => "ike_committed_window_commit_mismatch",
             Self::Exhausted => "ike_committed_window_exhausted",
             Self::NoDurableWork => "ike_committed_window_no_durable_work",
+            Self::EmptyRepliesDisabled => "ike_committed_window_empty_replies_disabled",
+            Self::Canonical(_) => "ike_committed_window_canonical_refused",
             Self::StaleCompletion => "ike_committed_window_stale_completion",
             Self::SyncInProgress => "ike_committed_window_sync_in_progress",
             Self::SyncClosed => "ike_committed_window_sync_closed",
@@ -119,12 +127,12 @@ impl fmt::Display for Ikev2WindowError {
 }
 impl StdError for Ikev2WindowError {}
 
-/// Strict admission result, after authentication, for one peer request.
+/// Admission result, after authentication, for one peer request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2OrdinaryRequestDisposition {
-    /// Exactly the expected request ID; plan its outcome without performing effects.
+    /// Expected or reconstructed request ID; plan its outcome without effects.
     New,
-    /// Exact last committed request; replay its response without re-execution.
+    /// Exact applicable committed request; replay its response without re-execution.
     CachedResponse,
 }
 
@@ -145,6 +153,18 @@ impl Ikev2ExactReplay<'_> {
 /// possibly outstanding writes under the fence, read back the latest atomic
 /// record, then replace it with [`Self::restore`]. Never guess whether a write
 /// landed, roll back persisted state or re-execute a historical outcome.
+/// Then enable empty replies with [`Self::enable_empty_replies`] to recover a lost
+/// empty prefix. A retryable enable refusal retains the checked runtime and epoch.
+/// Replacement within one process currently loses the last empty reply's bytes
+/// while retaining its release history: that ID is refused as `AlreadyReleased`.
+/// A lost last reply may therefore stall the peer until synchronization or expiry.
+///
+/// Restore and empty-enable are separate operations so a refused enable retains
+/// the checked runtime for retry:
+/// ```compile_fail
+/// use opc_proto_ikev2::recovery::Ikev2CommittedWindow;
+/// let _ = Ikev2CommittedWindow::restore_reconstructing;
+/// ```
 ///
 /// ```compile_fail
 /// use opc_proto_ikev2::recovery::Ikev2CommittedWindow;
@@ -156,6 +176,7 @@ pub struct Ikev2CommittedWindow {
     instance: Arc<()>,
     quiescent: bool,
     observed_peer_request: Cell<Option<u32>>,
+    receive: empty::ReceiveState,
     sync_live: bool,
     sync_closed: bool,
     sync_last_observed_unix_ms: Option<u64>,
@@ -172,10 +193,14 @@ impl Ikev2CommittedWindow {
     /// unconsumed tail. The cross-check detects inconsistency with retained evidence,
     /// not rollback of both records or forgotten history. Writer fencing and
     /// trustworthy latest records remain caller obligations.
+    /// Read the window and IV records from one consistent fenced snapshot before
+    /// calling this method; a failed restore is terminal for canonical use.
     /// # Errors
     /// Rejects mismatching domains, unauthentic packets, wrong directions/classes,
     /// response correlation failures, counters inconsistent with retained history,
     /// or an IV high-water below the required retained sending-IV end.
+    /// Every failure permanently revokes canonical state for the supplied bindings;
+    /// discard the failed SA, its stored records, keys and copied replies.
     pub fn restore(
         expected: &Ikev2CommittedWindowDomain,
         profile: Ikev2SaInitCryptoProfile,
@@ -184,14 +209,10 @@ impl Ikev2CommittedWindow {
         iv_record: &Ikev2AesGcmIvRecord,
     ) -> Result<Self, Ikev2WindowError> {
         let restored = Self::restore_checked(expected, profile, keys, record, iv_record);
-        if let Err(error) = &restored {
-            if *error == Ikev2WindowError::DomainMismatch {
-                crate::canonical::invalidate_binding(expected.send_iv_domain());
-                crate::canonical::invalidate_binding(iv_record.domain());
-                crate::canonical::invalidate_binding(record.domain.send_iv_domain());
-            } else {
-                crate::canonical::retire_capability(expected.send_iv_domain());
-            }
+        if restored.is_err() {
+            crate::canonical::invalidate_binding(expected.send_iv_domain());
+            crate::canonical::invalidate_binding(iv_record.domain());
+            crate::canonical::invalidate_binding(record.domain.send_iv_domain());
         }
         restored
     }
@@ -256,6 +277,7 @@ impl Ikev2CommittedWindow {
             instance: Arc::new(()),
             quiescent: false,
             observed_peer_request: Cell::new(None),
+            receive: empty::ReceiveState::new(record.next_receive),
             sync_live: false,
             sync_closed: false,
             sync_last_observed_unix_ms: record
@@ -267,8 +289,9 @@ impl Ikev2CommittedWindow {
     /// Derive a canonical recipe from this window's checked persisted IV binding.
     ///
     /// This primitive adds no empty-request admission, receive-floor advancement
-    /// or transmission authority. The consumer must still reject DPD deployments
-    /// until the zero-write handler and its volatile floor are qualified.
+    /// or transmission authority. DPD-facing windows must use
+    /// [`Self::enable_empty_replies`] and [`Self::reply_empty`]: primitive replies
+    /// leave the receive floor behind and can drop the next nonempty request.
     /// Recheck current admission and [`Self::ready`] for every reply, including
     /// cached bytes; a minted capability does not track later lifecycle changes.
     /// # Errors
@@ -337,12 +360,14 @@ impl Ikev2CommittedWindow {
         &mut self,
         record: Ikev2CommittedWindowRecord,
         outcome: Option<Bytes>,
+        receive_boundary: bool,
     ) -> Ikev2PreparedWindow<'_> {
         self.quiescent = true;
         Ikev2PreparedWindow {
             window: self,
             record,
             outcome,
+            receive_boundary,
         }
     }
 
@@ -389,16 +414,21 @@ impl Ikev2CommittedWindow {
         if let Some(sync) = &mut record.sync {
             sync.highest_local_request = Some(id);
         }
-        Ok(self.prepared(record, None))
+        Ok(self.prepared(record, None, false))
     }
 
-    /// Classify an authenticated peer request against the exact window-one floor.
+    /// Classify authenticated nonempty work against the live window-one floor.
     ///
-    /// Returning `New` also retains its ID in the volatile synchronization drop
-    /// floor. It grants no effects and does not advance the ordinary receive floor.
+    /// Returning `New` locks the pending request's exact identity and retains its
+    /// ID in the volatile synchronization drop floor. It grants no effects and
+    /// advances no floor. Both synchronization directions account for this work
+    /// automatically. During restart reconstruction, the first
+    /// nonempty request may skip a lost stateless prefix; its commit ends that mode.
+    /// Older durable responses cease to apply when an empty reply advances the
+    /// live floor or a new nonempty request locks pending work.
     /// # Errors
     /// Drops wrong direction/domain, forward gaps, stale IDs and same-ID changed
-    /// bytes. Stateless empty requests need a separate zero-write handler.
+    /// bytes. Use [`Self::reply_empty`] for stateless empty requests.
     pub fn request_disposition(
         &self,
         request: &Ikev2AuthenticatedOrdinary,
@@ -414,21 +444,29 @@ impl Ikev2CommittedWindow {
             .as_ref()
             .is_some_and(|entry| entry.request == request.wire)
         {
+            if !self.cached_response_applies(request) {
+                return Err(Ikev2WindowError::Drop);
+            }
             return Ok(Ikev2OrdinaryRequestDisposition::CachedResponse);
         }
-        if self.record.next_receive == Some(request.header.message_id) {
-            self.observed_peer_request.set(
-                self.observed_peer_request
-                    .get()
-                    .max(Some(request.header.message_id)),
-            );
-            Ok(Ikev2OrdinaryRequestDisposition::New)
-        } else {
-            Err(Ikev2WindowError::Drop)
+        let mut pending = self.receive.pending.borrow_mut();
+        if pending.as_ref().is_some_and(|wire| wire != &request.wire)
+            || (pending.is_none() && !self.receive.accepts_new(request.header.message_id))
+        {
+            return Err(Ikev2WindowError::Drop);
         }
+        if pending.is_none() {
+            *pending = Some(request.wire.clone());
+        }
+        self.observed_peer_request.set(
+            self.observed_peer_request
+                .get()
+                .max(Some(request.header.message_id)),
+        );
+        Ok(Ikev2OrdinaryRequestDisposition::New)
     }
 
-    /// Prepare the exact reply and outcome to a nonempty, strictly admitted request.
+    /// Prepare the exact reply and outcome to an admitted nonempty request.
     ///
     /// Planning must perform no irreversible effects. Commit outcome and bytes
     /// atomically before replying or publishing any effect, including error replies
@@ -470,7 +508,7 @@ impl Ikev2CommittedWindow {
         if let Some(sync) = &mut record.sync {
             sync.highest_peer_request = Some(request.header.message_id);
         }
-        Ok(self.prepared(record, Some(outcome)))
+        Ok(self.prepared(record, Some(outcome), true))
     }
 
     /// Prepare settlement of the single pending outbound request after semantic checks.
@@ -499,7 +537,7 @@ impl Ikev2CommittedWindow {
         }
         outbound.response = Some(response.wire.clone());
         outbound.outcome = Some(outcome.clone());
-        Ok(self.prepared(record, Some(outcome)))
+        Ok(self.prepared(record, Some(outcome), false))
     }
 
     /// Replay the last committed local request, pending or settled, without new state.
@@ -516,13 +554,20 @@ impl Ikev2CommittedWindow {
     }
 
     /// Replay only the exact response applicable to this authenticated cached duplicate.
+    ///
+    /// This lookup never admits pending work or changes synchronization history.
     /// # Errors
     /// Drops stale/mismatching inputs; refuses unresolved commits.
     pub fn replay_response(
         &self,
         request: &Ikev2AuthenticatedOrdinary,
     ) -> Result<Ikev2ExactReplay<'_>, Ikev2WindowError> {
-        if self.request_disposition(request)? != Ikev2OrdinaryRequestDisposition::CachedResponse {
+        self.ready()?;
+        if request.domain != self.record.domain || request.header.flags.response() {
+            return Err(Ikev2WindowError::Drop);
+        }
+        request.require_work()?;
+        if !self.cached_response_applies(request) {
             return Err(Ikev2WindowError::Drop);
         }
         let bytes = self
@@ -532,6 +577,18 @@ impl Ikev2CommittedWindow {
             .and_then(|entry| entry.response.as_deref())
             .ok_or(Ikev2WindowError::InvalidRecord)?;
         Ok(Ikev2ExactReplay { bytes })
+    }
+
+    fn cached_response_applies(&self, request: &Ikev2AuthenticatedOrdinary) -> bool {
+        request.domain == self.record.domain
+            && !request.header.flags.response()
+            && self
+                .record
+                .inbound
+                .as_ref()
+                .is_some_and(|entry| entry.request == request.wire)
+            && self.receive.next == request.header.message_id.checked_add(1)
+            && self.receive.pending.borrow().is_none()
     }
 
     /// Consume a one-use completion for this runtime and current commit generation.
@@ -561,6 +618,7 @@ pub struct Ikev2PreparedWindow<'a> {
     window: &'a mut Ikev2CommittedWindow,
     record: Ikev2CommittedWindowRecord,
     outcome: Option<Bytes>,
+    receive_boundary: bool,
 }
 impl Ikev2PreparedWindow<'_> {
     /// Exact candidate to persist atomically with SA and consumer outcome.
@@ -583,6 +641,9 @@ impl Ikev2PreparedWindow<'_> {
         }
         self.window.record = self.record;
         self.window.quiescent = false;
+        if self.receive_boundary {
+            self.window.adopt_receive_boundary()?;
+        }
         Ok(Ikev2WindowCommit {
             instance: Arc::clone(&self.window.instance),
             generation: self.window.record.generation,
@@ -620,6 +681,7 @@ redacted_debug!(
     Ikev2PreparedWindow<'_>,
     Ikev2WindowCommit,
     Ikev2ExactReplay<'_>,
+    Ikev2EmptyReply<'_>,
     Ikev2SyncResponderRecord,
     Ikev2AdmittedSyncResponse<'_>,
     Ikev2PreparedSyncResponse<'_>,

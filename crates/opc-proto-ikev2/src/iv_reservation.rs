@@ -298,6 +298,8 @@ impl Ikev2AesGcmIvAllocator {
     ///
     /// Restored allocators must instead use a checked restored window. The
     /// capability authenticates no peer and grants no window/send authority.
+    /// It never advances a receive floor; DPD-facing windows must instead use
+    /// [`crate::recovery::Ikev2CommittedWindow::enable_empty_replies`] and its reply API.
     /// # Errors
     /// Refuses before durable activation, on restored allocators, or when the
     /// immutable format/binding or canonical provider qualification is unavailable.

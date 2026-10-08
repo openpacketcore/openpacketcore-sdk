@@ -321,7 +321,9 @@ impl Ikev2CommittedWindowRecord {
     pub const fn next_send(&self) -> Option<u32> {
         self.next_send
     }
-    /// Exact next peer request ID, or exhausted; ordinary forward gaps are refused.
+    /// Committed peer receive floor, or exhausted. Empty replies advance only the
+    /// runtime's [`super::Ikev2CommittedWindow::next_receive`] until ordinary inbound
+    /// work or synchronization commits a new boundary.
     pub const fn next_receive(&self) -> Option<u32> {
         self.next_receive
     }

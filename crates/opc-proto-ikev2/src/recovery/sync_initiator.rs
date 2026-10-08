@@ -43,7 +43,7 @@ impl Window {
         let state = self.record.sync_state().ok_or(Error::Drop)?;
         let mut counters = Counters::new(
             self.record.next_send.ok_or(Error::SyncClosed)?,
-            self.record.next_receive.ok_or(Error::SyncClosed)?,
+            self.next_receive().ok_or(Error::SyncClosed)?,
         );
         counters.highest_local_request = state.highest_local_request();
         counters.highest_peer_request = state
@@ -113,6 +113,7 @@ impl Window {
         self.ready()?;
         self.sync_open()?;
         if pending_inbound.is_some()
+            || self.receive.pending.borrow().is_some()
             || self
                 .record
                 .outbound
@@ -490,6 +491,7 @@ impl Ikev2PreparedSyncInitiation<'_> {
         self.window.quiescent = false;
         self.window.observed_peer_request.set(None);
         self.window.sync_live = false;
+        self.window.adopt_receive_boundary()?;
         if check_clock {
             self.window
                 .sync_clock(policy.ok_or(Error::InvalidRecord)?, clock)?;
