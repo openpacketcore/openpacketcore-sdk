@@ -1,5 +1,10 @@
 //! [`PeerAddressCache`] — a pure sync cache of resolved peer candidates.
 //!
+//! This is the legacy caller-TTL cache, including its original capacity
+//! eviction policy. DNS consumers needing record-derived freshness, explicit
+//! key lifetime, typed failures and refresh deduplication use
+//! [`DnsCache`](crate::DnsCache). No caller-TTL value is a DNS TTL claim.
+//!
 //! The cache holds the last-known-good [`PeerCandidate`]s for each
 //! [`DiscoveryCacheKey`] together with a TTL, so a product's async driver can
 //! serve resolved peers without re-resolving on every request and can refresh
@@ -111,6 +116,9 @@ impl CacheEntry {
 }
 
 /// Pure sync cache of resolved peer candidates, keyed by [`DiscoveryCacheKey`].
+///
+/// Legacy compatibility API: callers invent the policy lifetime themselves.
+/// Use [`crate::DnsCache`] for record TTLs and explicitly retained keys.
 ///
 /// Bounded to a fixed capacity with deterministic oldest-first (least-recently-
 /// recorded) eviction; see the module docs for the serving vs. refreshing model.

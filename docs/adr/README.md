@@ -42,3 +42,4 @@ accepted.
 | [0027](0027-exclusive-workload-scope-reset.md) | An explicit exclusive workload reset removes incompatible eBPF leftovers across its declared interfaces while preserving writer locks, selector history and loaded-map reference guards. |
 | [0028](0028-strict-exclusive-workload-reset.md) | A never-provisioned exclusive scope can discard selector residue, its named interface's whole tc priority and SDK hooks at any priority, while limiting map-reference authority, releasing scope-pinned links and reporting foreign removals. |
 | [0029](0029-fenced-transition-void.md) | An independently negotiated store profile binds terminal no-effect receipts for exact unbound V2 requests; the first binding wins and caller lifetime gates consumer reclamation. |
+| [0030](0030-dns-discovery-contracts.md) | DNS freshness follows record provenance; consumers retain last-good keys and own asynchronous cache driving. |

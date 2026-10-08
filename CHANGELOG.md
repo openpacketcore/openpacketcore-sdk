@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Consumers must reject configurations that cannot qualify canonical replies.
   Fragmented/CBC and complete restart qualification remain separate.
 
+- `opc-peer-discovery`: add canonical DNS query identities, per-record TTL and
+  provenance contracts, typed DNS failures, SOA-derived negative caching and a
+  consumer-retained last-good cache with jittered retries and deduplicated
+  refreshes. Expose capped positive freshness deadlines, bound configured TTL
+  caps, pace uncacheable successes with an independent refresh interval, and
+  bound retained candidate chains. Add destination address ordering and a
+  TTL-unknown bridge that preserves system resolver order; DNS wire I/O,
+  SRV and S-NAPTR remain follow-ups.
 - `opc-egress-fence-common`: add checked scope clock correlation and absolute
   BOOTTIME deadline arithmetic, with explicit drift, suspend-error and validity
   bounds. This opt-in time model does not authenticate permits or install a

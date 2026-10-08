@@ -1,10 +1,11 @@
 //! Transport-neutral packet-core peer discovery and deterministic selection.
 //!
-//! This crate deliberately does not perform live DNS. Products inject a
-//! resolver that can implement A/AAAA, S-NAPTR, SRV, NRF-backed discovery, or a
-//! deterministic test table. The SDK owns the shared mechanics around static
-//! peers, resolver timeouts, negative caching, priority/weight ordering, and
-//! redaction-safe selection evidence.
+//! Consumers inject resolvers or use the legacy blocking system address
+//! adapter. [`DnsQuery`], [`DnsAnswer`] and [`DnsCache`] provide additive
+//! contracts for record TTL/provenance, typed failures, per-source identity,
+//! bounded retry and indefinite last-good retention. DNS wire I/O, SRV and
+//! S-NAPTR traversal are not implemented here yet. The original selection,
+//! resolver and caller-TTL cache APIs remain available for compatibility.
 
 #![forbid(unsafe_code)]
 
@@ -14,9 +15,19 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 mod cache;
+mod dns;
+mod dns_cache;
 mod resolve;
 
 pub use cache::{CachedPeers, PeerAddressCache};
+pub use dns::{
+    order_dns_addresses, AddressFamilyPolicy, DnsAnswer, DnsCacheKey, DnsCandidate, DnsError,
+    DnsName, DnsQuery, DnsRecord, DnsRecordType, NegativeSoa, ResolverProfileId, SourcePlaneId,
+};
+pub use dns_cache::{
+    DnsCache, DnsCacheError, DnsCacheStatus, DnsCachedResult, DnsRefresh, DnsRefreshToken,
+    DnsRetryPolicy,
+};
 pub use resolve::{AddressLookup, AddressLookupError, AddressPeerResolver, StdAddressLookup};
 
 /// Stable SDK profile label for this discovery contract.
@@ -141,7 +152,7 @@ impl fmt::Debug for DiscoveryTarget {
 }
 
 /// One resolver input selected by product policy.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ServiceDiscoveryInput {
     /// Safe service label such as `s2b-pgwc` or `diameter-s6b`.
     pub service: PeerLabel,
@@ -360,6 +371,11 @@ impl PeerDiscoveryTime {
     /// Construct a timestamp from monotonic milliseconds.
     pub const fn from_millis(value: u64) -> Self {
         Self(value)
+    }
+
+    /// Read the monotonic millisecond value in this clock domain.
+    pub const fn as_millis(self) -> u64 {
+        self.0
     }
 
     fn checked_add(self, ttl: Duration) -> Option<Self> {

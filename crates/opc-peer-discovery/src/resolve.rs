@@ -76,6 +76,10 @@ pub trait AddressLookup {
 
 /// Blocking system-resolver (`getaddrinfo`) lookup.
 ///
+/// Legacy system adapter: supplies no DNS TTL, SOA, CNAME provenance or
+/// reliable DNS error classification. [`AddressPeerResolver::resolve_dns`]
+/// exposes that absence explicitly through the new DNS contracts.
+///
 /// `getaddrinfo` has no cancellation, so `timeout` is not enforced here; callers
 /// MUST run this off the async executor with their own deadline.
 #[derive(Debug, Clone, Copy, Default)]
@@ -121,6 +125,67 @@ impl<L: AddressLookup> AddressPeerResolver<L> {
     #[must_use]
     pub fn new(lookup: L) -> Self {
         Self { lookup }
+    }
+
+    /// Adapt the legacy address lookup to the DNS contracts without inventing
+    /// TTLs or authoritative negative results. Filters by address family before
+    /// the 16-candidate cap and preserves the system resolver's source-aware
+    /// ordering. The original [`PeerResolver`] path retains its existing
+    /// lookup ordering and legacy five-second negative retry.
+    ///
+    /// The default profile/plane denotes the system resolver. It cannot bind
+    /// DNS sockets to a source plane or configure an alternate resolver.
+    /// `StdAddressLookup` remains blocking and cannot enforce cancellation.
+    ///
+    /// # Errors
+    /// Returns typed [`crate::DnsError`] codes. Non-default source planes are
+    /// refused, never silently resolved via another source.
+    pub fn resolve_dns(
+        &mut self,
+        query: &crate::DnsQuery,
+        timeout: Duration,
+    ) -> Result<crate::DnsAnswer, crate::DnsError> {
+        use crate::{DnsAnswer, DnsCandidate, DnsError};
+        if !query.source_plane().as_str().is_empty() {
+            return Err(DnsError::SourceUnavailable);
+        }
+        if !query.resolver_profile().as_str().is_empty()
+            || query.input().mode != ServiceDiscoveryMode::Address
+        {
+            return Err(DnsError::Unavailable);
+        }
+        let input = query.input();
+        let port = input.default_port.ok_or(DnsError::InvalidQuery)?;
+        let mut addresses = self
+            .lookup
+            .lookup(query.name().as_str(), port, timeout)
+            .map_err(|error| match error {
+                AddressLookupError::Timeout => DnsError::Timeout,
+                AddressLookupError::NotFound => DnsError::LegacyNotFound,
+                AddressLookupError::Unavailable => DnsError::Unavailable,
+            })?;
+        addresses.retain(|address| query.address_family().accepts(*address));
+        if addresses.is_empty() {
+            return Err(DnsError::LegacyNotFound);
+        }
+        DnsAnswer::new(
+            addresses
+                .into_iter()
+                .take(MAX_RESOLVED_ADDRESSES)
+                .enumerate()
+                .map(|(index, endpoint)| {
+                    let weight = u16::try_from(index).map_or(0, |index| u16::MAX - index);
+                    DnsCandidate::without_ttl(PeerCandidate::resolved(
+                        input.service.clone(),
+                        endpoint,
+                        input.transport,
+                        input.mode,
+                        0,
+                        weight,
+                    ))
+                })
+                .collect(),
+        )
     }
 }
 
