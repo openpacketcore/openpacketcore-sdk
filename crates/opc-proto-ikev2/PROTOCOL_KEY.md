@@ -127,7 +127,7 @@ unchanged; new custody evidence resides in these executable tests.
 tests lifecycle and stale authority, competing consumers, malformed inputs,
 cancelled futures, poisoning and redaction. `tests/protocol_key.rs` proves
 refusal without module admission in an isolated process.
-`tests/crypto_module_admission.rs` counts real dispatches under concurrent use,
+`src/crypto_module/admission_tests.rs` counts real dispatches under concurrent use,
 malformed inputs, capability withdrawal, malformed provider output and panic.
 Compile-fail documentation and external API probes cover forbidden operations.
 The `protocol_key` fuzz target exercises bounded synthetic imports and lifecycle

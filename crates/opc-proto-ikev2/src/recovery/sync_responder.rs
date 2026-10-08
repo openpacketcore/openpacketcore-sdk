@@ -264,6 +264,8 @@ impl<'a> Ikev2AdmittedSyncResponse<'a> {
         sync.minimum_send_iv_end = sync
             .minimum_send_iv_end
             .max(super::packet::sending_iv_end(&response)?);
+        self.window
+            .remember_prepared(&self.record, super::reconcile::Kind::Sync);
         Ok(Ikev2PreparedSyncResponse {
             window: self.window,
             record: self.record,
@@ -288,8 +290,9 @@ impl Ikev2PreparedSyncResponse<'_> {
 
     /// Acknowledge exact durable cutover; equality alone does not prove persistence.
     ///
-    /// On uncertainty do not call this: settle/fence all older writes and restore
-    /// the latest window and IV records. Restoring a landed cutover never recreates
+    /// On uncertainty do not call this: settle/fence all older writes and reconcile
+    /// the latest window and IV records in place (restore after process restart).
+    /// Reading back a landed cutover never recreates
     /// this response permission, and the duplicate peer request is silently dropped.
     /// # Errors
     /// A mismatching acknowledgement leaves the window quiescent for readback.
@@ -297,6 +300,7 @@ impl Ikev2PreparedSyncResponse<'_> {
         if committed != &self.record {
             return Err(Error::CommitMismatch);
         }
+        self.window.witness = None;
         let disposition = self.record.sync.ok_or(Error::InvalidRecord)?.disposition;
         self.window.record = self.record;
         self.window.observed_peer_request.set(None);

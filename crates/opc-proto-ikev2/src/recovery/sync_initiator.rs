@@ -262,7 +262,7 @@ impl Window {
             .as_ref()
             .ok_or(Error::InvalidRecord)?
             .validate(&record)?;
-        self.quiescent = true;
+        self.remember_prepared(&record, super::reconcile::Kind::Sync);
         self.sync_live = false;
         Ok(Ikev2PreparedSyncInitiation {
             window: self,
@@ -321,7 +321,7 @@ impl Window {
                 .last_observed_unix_ms
                 .max(self.sync_last_observed_unix_ms.unwrap_or(0));
         }
-        self.quiescent = true;
+        self.remember_prepared(&record, super::reconcile::Kind::Sync);
         self.sync_live = false;
         Ok(Ikev2PreparedSyncInitiation {
             window: self,
@@ -444,6 +444,8 @@ impl<'a> Ikev2AdmittedSyncInitiation<'a> {
         sync.validate(&record)?;
         recovery.validate(&record)?;
         record.recovery = Some(recovery);
+        self.window
+            .remember_prepared(&record, super::reconcile::Kind::Sync);
         Ok(Ikev2PreparedSyncInitiation {
             window: self.window,
             record,
@@ -466,8 +468,9 @@ impl Ikev2PreparedSyncInitiation<'_> {
     }
     /// Acknowledge the exact durable record. Equality alone is not storage proof.
     ///
-    /// Uncertainty requires fencing old writes and restoring latest records; no
-    /// callback or old send token survives restoration. SendRequest requires a
+    /// Uncertainty requires fencing old writes and reconciling latest records in
+    /// place (restoring after process restart); no old send token survives either.
+    /// SendRequest requires a
     /// fresh clock sample, not the preparation timestamp. A late/stepped request
     /// acknowledgement adopts the landed record but latches closure and releases
     /// no request; `close_sync` can persist terminal disposition. Retain step/expiry
@@ -485,6 +488,7 @@ impl Ikev2PreparedSyncInitiation<'_> {
         if committed != &self.record {
             return Err(Error::CommitMismatch);
         }
+        self.window.witness = None;
         let policy = self.record.sync_recovery().map(|record| record.policy());
         let check_clock = matches!(self.action, Ikev2SyncInitiatorAction::SendRequest(_));
         self.window.record = self.record;

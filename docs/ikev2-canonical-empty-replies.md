@@ -526,6 +526,8 @@ ordinary/sync recovery follow section 9.1's technique of persisting the IV end
 ahead of use and discarding unused positions on restore. This departure starts
 with the canonical path. It carries **no validated-module claim**, including
 no claim that it is covered by FIPS 140-3 validation.
+In-process readback makes no AEAD sealing call: the existing position remains limited
+to cross-process regeneration and identical-input retries before first release.
 
 Before canonical qualification or sealing, inspect the admitted module's
 `ValidationState`. `DeclaredValidated` must refuse by default, even if ordinary
@@ -622,8 +624,8 @@ requires fresh keys. A seal/open round trip alone is insufficient.
 | Third-party peer interoperability | In composed qualification, verify a third-party peer accepts one-octet plaintext, reserved-range IVs, both directions, ID zero and exact repeats after restart. Retain peer/version and packet evidence. |
 
 The implemented primitive tests are in
-[`canonical_empty_replies.rs`](../crates/opc-proto-ikev2/tests/canonical_empty_replies.rs),
-[`crypto_module_admission.rs`](../crates/opc-proto-ikev2/tests/crypto_module_admission.rs)
+[`qualification_tests.rs`](../crates/opc-proto-ikev2/src/canonical/qualification_tests.rs),
+[`admission_tests.rs`](../crates/opc-proto-ikev2/src/crypto_module/admission_tests.rs)
 and the private [`wire` tests](../crates/opc-proto-ikev2/src/canonical/wire.rs)
 and [`ledger` tests](../crates/opc-proto-ikev2/src/canonical/ledger/tests.rs).
 The ledger tests count retained entries across many keys and IDs, verify closed
@@ -661,15 +663,15 @@ runtime.
 Deployment refusal is exposed as per-algorithm `preflight`; the consumer still
 owns configuration admission and must refuse unqualified DPD deployments.
 
-The older public `canonical_replies` constructors on the allocator and window
-still expose the byte primitive without advancing a window's receive floor.
-A DPD-facing window must use the composed enable/reply path; otherwise its next
-nonempty request can be dropped. The next recovery slice will restrict both
-constructors to crate-private or test-only use after migrating their primitive
-qualification tests. This is an API restriction plan, not a change to the V1
-construction or its release contract; those constructors remain public here.
+The older `canonical_replies` constructors are now restricted: the window
+helper is crate-private and the allocator helper is test-only. Their primitive
+qualifications run inside the crate, including process-isolated provider tests.
+Public callers use checked window restore followed by `enable_empty_replies`
+and `reply_empty`, which couple canonical output to receive admission and floor
+advancement. This API restriction changes neither the V1 construction nor its
+release contract. Public compile-fail callers pin both restrictions.
 
-### Planned in-process readback preservation
+### In-process readback preservation
 
 Replacing a runtime during fenced in-process readback currently drops its
 canonical capability and cached bytes while retaining released-ID history.
@@ -680,15 +682,15 @@ integration tests; it is not solved by permitting another release from a new
 capability. A process restart has a separate ledger lifetime and retains the
 existing V1 regeneration contract.
 
-The next recovery slice will add a mutable readback-in-place API, provisionally
-`window.reconcile(latest_record, iv_record, ...)`, with this contract:
+Use `window.reconcile(profile, keys, &record, &iv_record)` for in-process readback
+with this contract:
 
 1. Require fencing and resolution of outstanding writes before accepting the
    latest atomic record. Re-run domain/profile/key, packet, generation, sync and
    IV high-water validation without recreating the canonical capability. The
    complete immutable binding must match; mixed, stale or invalid state revokes
-   the epoch and requires teardown. Refactor validation separately from the
-   existing restore wrapper's failure cleanup, preserving that cleanup contract.
+   the epoch and requires teardown. Validation is separate from the existing
+   restore wrapper's failure cleanup, preserving that cleanup contract.
 2. Preserve the same canonical capability instance, verified last reply, attempt
    and release ledger, volatile receive floor, pending identity and observed
    sync history when no new inbound boundary landed. Outbound-only commits must
@@ -699,17 +701,151 @@ The next recovery slice will add a mutable readback-in-place API, provisionally
    Resume only the lifecycle allowed by the validated committed record; pending
    or terminal sync cannot be bypassed. The exclusive mutable borrow prevents
    reconciliation while an SDK reply still borrows the window.
-   Record-trust failures remain terminal; recoverable lifecycle or enable
-   refusals must preserve the trusted epoch for retry.
-4. Add regressions for a lost last DPD reply across cancelled/uncertain outbound
+   Record-trust failures remain terminal. A failed provider pre-check preserves
+   the trusted epoch for retry; valid lifecycle states reconcile successfully
+   and remain visible through `ready()`.
+4. Regressions cover a lost last DPD reply across cancelled/uncertain outbound
    commits, both landed and unlanded readback, exact cache reuse with no extra
    seal, landed inbound/sync boundaries, changed bindings, stale tokens and
    provider withdrawal. Cover both roles and all supported GCM sizes. Do not
    reset attempts or release flags, permit a second release after capability
    recreation, alter the V1 transcript or change crash regeneration.
 
-This API is planned, not implemented. Crypto review of capability retention and
-the existing one-release contract is required before implementing the next slice.
+The following reviewed contract governs implementation of the in-place API.
+
+#### Slice 9 design delta: readback invariants
+
+`Ikev2CommittedWindow::reconcile(&mut self, profile, keys, record,
+iv_record) -> Result<(), Ikev2WindowError>` resolves fenced readback on the
+existing runtime. It returns no packet or completion token. This section makes
+the plan above precise, including the design review's D1–D10 requirements.
+
+1. **One checked lineage.** The caller settles or fences every outstanding write
+   and reads both records from one consistent snapshot. Validate packets, keys,
+   profile, counters, sync metadata and IV coverage as restore does, using the
+   runtime's full immutable binding (both SPIs, original role, both directional
+   keys/salts, algorithm and V1 marker). **D4:** only the IV record's
+   `exclusive_end` may rise; its sending domain, receive domain, marker and limits
+   are unchanged. Its required end is the maximum of the last checked end and
+   every IV sealed in the witness, whether landed or not. Validate the witness's
+   cached packets, initiating attempts and `minimum_send_iv_end` using restore's
+   coverage checks. **D5:** keep the live allocator during in-process readback:
+   it retains burned allocations and prepared ranges. Do not restore it from
+   readback. If rebuilding it is unavoidable, use the same fenced snapshot and
+   discard the reserved tail as on process start. No old send permission revives.
+2. **Identify what landed.** Before exposing a prepared record for persistence,
+   retain its exact candidate and transition kind privately in the window.
+   Quiescence permits at most one such unresolved candidate. Readback accepts
+   either the last acknowledged window record or that exact candidate, field
+   for field: even `minimum_send_iv_end` must match. Same-generation changed fields,
+   older records and unexplained successors are refused. Clear the candidate
+   at each acknowledgement's equality check, before any subsequent fallible
+   retirement or clock check, or after successful readback. This bounded volatile witness
+   adds no durable field, write or consumer-selected boundary flag.
+   **D2:** capture at the prepared value's construction, never at admission:
+
+   | Record-exposing constructor | Witness kind | Adopt receive boundary if landed |
+   |---|---|---|
+   | `prepare_request` | outbound | no |
+   | `prepare_completion` | outbound | no |
+   | `prepare_response` | inbound | yes |
+   | `Ikev2AdmittedSyncInitiation::prepare` | sync | yes |
+   | `complete_sync` (`Recovered`) | sync | yes |
+   | `close_sync` (`CloseIkeSa`) | sync | yes |
+   | `Ikev2AdmittedSyncResponse::prepare` | sync | yes |
+
+   The responder witness is captured after `prepare` raises the required IV end
+   for its sealed response. A witness exists only while the runtime is quiescent.
+3. **Preserve the owner.** Successful reconciliation keeps the identical
+   canonical capability instance, full binding, policy and ledger. It never
+   calls acquire, drops/recreates the capability, clears its attempt/release
+   history or changes V1 bytes. Repeated readback of the same record is
+   idempotent for canonical state. At most three evaluations and one new release
+   per sending key/salt/ID still apply; a released ID can only reuse its verified
+   cached bytes. A forgotten/retired reply stays refused in this process.
+4. **Preserve or advance the receive boundary.** An unchanged record or landed
+   outbound request/completion keeps the live receive floor, phase, pending
+   request identity, last empty request/verified reply and observed peer-ID
+   history. Generation growth alone is not an inbound boundary. Only the exact
+   landed inbound-result or sync candidate adopts a boundary: retire superseded
+   replies, clear the pending identity and enter the current phase. **D3:** both
+   commit and readback adopt `max(live, recorded)`, where `None` (exhausted) is
+   the top, including `CloseIkeSa` after a volatile empty prefix. Never lower the
+   live floor or reopen a closed canonical ID. An already acknowledged boundary
+   does not reset receive state again, but retirement is retried as D6 requires.
+5. **Fence effects independently.** Every reconciliation attempt retires the
+   ordinary/sync completion-token identity, including at an unchanged generation;
+   this identity is distinct from the retained canonical owner. Readback creates
+   no effect, send action or fresh liveness observation. Landed outcomes are
+   history for fenced, idempotent consumer restoration. A pending local sync
+   remains blocked and loses response-completion authority until its existing
+   higher-proposal retry path; no cached responder sync reply is recreated.
+   **D10:** even unchanged readback without a witness drops a live proposal's
+   response authority. This conservative rule matches restore: an ensuing retry
+   spends another of the event's at most three attempts with a fresh higher proposal.
+   Preserve observed clock/deadline and terminal-close knowledge. A landed sync
+   boundary absorbs the observed peer floor before retiring its volatile copy;
+   an unlanded attempt cannot erase it or pending ordinary work.
+6. **Failures grant nothing (D1).** There are exactly three outcomes:
+   - Retryable: before validation, check that the module is installed, admitted,
+     ready and serviceable for this epoch's AEAD. Failure returns the distinct
+     `ReconcileUnavailable` error, keeps capability/cache/witness and live state,
+     and leaves quiescence and the new token identity in place. A provider blip
+     at this check never revokes the epoch.
+   - Success: a valid record reconciles even in `AwaitLocalSync`,
+     `OutcomeUncertain`, `CloseIkeSa` or latched closure; `ready()` reports that
+     lifecycle after reconciliation.
+   - Terminal: every other failure, including a packet that fails to open after
+     the pre-check passed, or invalidation/poisoning during retirement. Revoke the
+     runtime's binding and both supplied records' bindings, discard cached bytes,
+     and remain quiescent until `delete()`. Never retry a permanently revoked SA.
+
+   **D6, exact order:** rotate token identity and keep quiescence; run the D1
+   pre-check; validate on scratch state and compute the monotone floor; retire
+   superseded IDs on the held capability; publish the record, IV record and
+   receive state together; clear the witness and quiescence last. Re-run this
+   idempotent retirement on every successful reconcile, even unchanged readback
+   or a previously acknowledged boundary. Retirement through the new floor
+   minus one applies when adopting a boundary. For unchanged/outbound readback,
+   preserve the last empty reply required by item 4: retire only IDs older than
+   that retained request, including its failed-seal history. With no retained
+   request, retire through the floor minus one. `None` closes through MAX.
+   Check the held ledger even when no ID can retire. A retirement failure
+   publishes no partial record/floor/phase and is terminal.
+
+   Every later `reply_empty`, including a cache hit, still checks
+   readiness, admission, exact request identity and current provider policy.
+   Its exclusive borrow excludes simultaneous reconciliation; the consumer's
+   external SA/send fence remains required through transmission.
+
+Qualification will cover both original roles and all GCM sizes: landed/unlanded
+outbound request and completion, cancelled preparation, repeated readback,
+exact lost-DPD retransmission with no new seal/write/IV, preserved failed-seal
+attempts, inbound and both sync boundaries, pending work, MAX exhaustion,
+same-generation mutation/rollback/foreign binding, stale ordinary and both sync
+tokens, provider withdrawal/recovery, and permanent revocation. A subprocess
+restart separately retains the existing V1 regeneration contract. These tests
+implement response retention and exact retransmission in
+[RFC 7296 §§2.1–2.3](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.1),
+without treating replay as liveness (§2.4); sync keeps
+[RFC 6311 §§5.1, 8.3 and 9](https://www.rfc-editor.org/rfc/rfc6311.html#section-5.1).
+
+**D7, additional required regressions:** (a) landed CloseIkeSa after a volatile
+empty prefix on commit and readback; (b) unlanded sealed candidate above the
+readback IV end; (c) changed limits alone or marker alone; (d) another runtime's
+unexplained successor revokes both runtimes; (e) permanent revoke during reconcile
+publishes no partial state and a later enable reports `Invalidated`, not
+`CapabilityActive`; (f) retryable failure fences an old token even after later
+success; (g) reconcile before empty enable acquires nothing and permits subsequent
+enable; (h) the `(K, N) → (A, P)` monitor, canonical seal count and ordinary IV
+position remain unchanged across each readback/retransmission kind; (i) responder
+witness includes the IV end added during `prepare`.
+
+**D8, documented lifecycle:** use reconcile for in-process readback; it acquires
+no capability. Use restore for process start. Restore-replacement in one process
+still discards the last empty reply's bytes while retaining its release history,
+so it retains the F5 limitation and is not the in-process reconciliation path.
+**D9:** reconciliation makes no AEAD sealing call; the SP 800-38D position above is unchanged.
 
 Live peer/lab execution is not part of this change. Third-party acceptance of padding, reserved
 IVs, both directions, ID zero and exact restart repeats remains an explicit

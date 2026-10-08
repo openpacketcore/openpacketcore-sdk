@@ -246,6 +246,14 @@ impl Ikev2AesGcmIvRecord {
 /// same key epoch. Cloning records or restoring twice does not create a second
 /// independent writer. Neither allocation nor sealing commits an exchange.
 ///
+/// Empty replies require the committed window's admission and receive floor:
+/// ```compile_fail
+/// use opc_proto_ikev2::{canonical::Ikev2CanonicalPolicy, Ikev2AesGcmIvAllocator};
+/// fn bypass(allocator: &Ikev2AesGcmIvAllocator, policy: Ikev2CanonicalPolicy) {
+///     let _ = allocator.canonical_replies(policy);
+/// }
+/// ```
+///
 /// ```compile_fail
 /// use opc_proto_ikev2::Ikev2AesGcmIvAllocator;
 /// fn duplicate(allocator: Ikev2AesGcmIvAllocator) { let _ = allocator.clone(); }
@@ -254,7 +262,9 @@ pub struct Ikev2AesGcmIvAllocator {
     domain: Ikev2AesGcmIvDomain,
     receive: Ikev2AesGcmIvDomain,
     canonical_format: Option<u8>,
+    #[cfg(test)]
     initial_epoch: bool,
+    #[cfg(test)]
     committed_binding: bool,
     limits: Ikev2AesGcmIvLimits,
     next: u64,
@@ -281,7 +291,9 @@ impl Ikev2AesGcmIvAllocator {
             domain: record.domain,
             receive: record.receive,
             canonical_format: record.canonical_format,
+            #[cfg(test)]
             initial_epoch: true,
+            #[cfg(test)]
             committed_binding: false,
             limits,
             next: 0,
@@ -303,7 +315,8 @@ impl Ikev2AesGcmIvAllocator {
     /// # Errors
     /// Refuses before durable activation, on restored allocators, or when the
     /// immutable format/binding or canonical provider qualification is unavailable.
-    pub fn canonical_replies(
+    #[cfg(test)]
+    pub(crate) fn canonical_replies(
         &self,
         policy: crate::canonical::Ikev2CanonicalPolicy,
     ) -> Result<crate::canonical::Ikev2CanonicalEmptyReplies, crate::canonical::Ikev2CanonicalError>
@@ -343,7 +356,9 @@ impl Ikev2AesGcmIvAllocator {
             domain: record.domain.clone(),
             receive: record.receive.clone(),
             canonical_format: record.canonical_format,
+            #[cfg(test)]
             initial_epoch: false,
+            #[cfg(test)]
             committed_binding: false,
             limits: record.limits,
             next: record.exclusive_end,
@@ -402,7 +417,10 @@ impl Ikev2AesGcmIvAllocator {
         };
         self.next = end;
         self.end = end;
-        self.committed_binding = false;
+        #[cfg(test)]
+        {
+            self.committed_binding = false;
+        }
         Ok(Ikev2AesGcmPreparedIvReservation {
             allocator: self,
             start,
@@ -463,7 +481,10 @@ impl Ikev2AesGcmPreparedIvReservation<'_> {
             return Err(Ikev2AesGcmIvReservationError::CommitMismatch);
         }
         self.allocator.next = self.start;
-        self.allocator.committed_binding = true;
+        #[cfg(test)]
+        {
+            self.allocator.committed_binding = true;
+        }
         Ok(())
     }
 }

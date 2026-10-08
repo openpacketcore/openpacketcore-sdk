@@ -1,4 +1,5 @@
-//! Frozen V1 wire contract, immutable binding, restart and public refusal tests.
+//! Private primitive qualification: V1 wire contract, binding and restart refusals.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::process::Command;
 
@@ -23,12 +24,11 @@ use opc_proto_ikev2::{
 };
 use sha2::{Digest, Sha256};
 
-#[path = "support/canonical.rs"]
-mod fixtures;
-mod support;
+use crate::canonical_test_fixtures as fixtures;
+use crate::test_support as support;
 use fixtures::*;
 
-const VECTORS: &str = include_str!("../src/canonical/v1.txt");
+const VECTORS: &str = include_str!("v1.txt");
 
 fn independently_open(
     algorithm: usize,
@@ -530,7 +530,7 @@ fn restart_regenerates_identical_bytes_after_every_send_crash_boundary() {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "restart_regenerates_identical_bytes_after_every_send_crash_boundary",
+                "canonical::qualification_tests::restart_regenerates_identical_bytes_after_every_send_crash_boundary",
                 "--nocapture",
             ])
             .env("OPC_CANONICAL_RESTART_STAGE", stage)
