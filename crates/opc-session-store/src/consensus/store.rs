@@ -25776,9 +25776,40 @@ mod membership_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn v2_submit_effect_boundary_retains_an_openraft_accepted_request() {
+        async fn stage<F: std::future::Future>(name: &str, future: F) -> F::Output {
+            let (cancel, waiting) = std::sync::mpsc::channel::<()>();
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut watchdog = tokio::task::spawn_blocking(move || {
+                waiting.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            });
+            let result = tokio::select! {
+                biased;
+                result = future => Some(result),
+                expired = &mut watchdog => {
+                    let _ = expired.expect("V2 effect phase wall guard");
+                    None
+                }
+            };
+            drop(cancel);
+            match result {
+                Some(result) => {
+                    let _ = watchdog.await.expect("retire V2 effect phase wall guard");
+                    result
+                }
+                None => panic!("{name}: one-second V2 effect phase wall guard elapsed"),
+            }
+        }
+
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        // Host scheduling and real disk work must not exhaust the 150ms
+        // protocol deadline before this fixture reaches accepted-but-unapplied
+        // work. This blocking receive inhibits automatic clock advance without
+        // putting setup or cleanup inside a real-time performance bound.
+        // Dropping its sender releases it on both success and panic.
+        let (release_clock, held_clock) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || held_clock.recv());
         let directory = tempfile::tempdir().expect("V2 accepted effect boundary directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("V2 accepted effect boundary SQLite backend");
@@ -25812,48 +25843,69 @@ mod membership_tests {
             .expect("hold V2 accepted effect state-machine apply");
         let submitting_store = store.clone();
         let submitted_request = request.clone();
-        let submission = tokio::spawn(async move {
-            submitting_store
-                .submit_request_effect_before(
-                    fenced_transition_v2_outer_request_id(&submitted_request),
-                    SessionMutationIntent::FencedTransitionV2(Box::new(submitted_request)),
-                    None,
-                    tokio::time::Instant::now() + Duration::from_millis(150),
-                )
-                .await
-        });
-        wait_for_log_index_after(&store, before, "V2 effect-boundary accepted proposal").await;
-        assert!(matches!(
-            submission.await.expect("V2 effect submission task"),
-            ConsensusSubmissionEffect::OutcomeUnknown
-        ));
+        stage("accepting the proposal and observing its deadline", async {
+            let mut submission = tokio::spawn(async move {
+                submitting_store
+                    .submit_request_effect_before(
+                        fenced_transition_v2_outer_request_id(&submitted_request),
+                        SessionMutationIntent::FencedTransitionV2(Box::new(submitted_request)),
+                        None,
+                        tokio::time::Instant::now() + Duration::from_millis(150),
+                    )
+                    .await
+            });
+            // The enclosing wall guard bounds this wait while protocol time is
+            // frozen, including the accepted request's deadline completion.
+            wait_for_log_index_after(&store, before, "V2 effect-boundary accepted proposal").await;
+            tokio::time::advance(Duration::from_millis(149)).await;
+            assert!(
+                matches!(
+                    futures_util::poll!(&mut submission),
+                    std::task::Poll::Pending
+                ),
+                "the accepted request remains pending before its original 150ms deadline"
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(matches!(
+                submission.await.expect("V2 effect submission task"),
+                ConsensusSubmissionEffect::OutcomeUnknown
+            ));
+        })
+        .await;
 
-        drop(held_apply);
-        let permits = tokio::time::timeout(
-            Duration::from_secs(1),
-            Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
-                    .expect("proposal slot count fits u32"),
-            ),
+        stage(
+            "releasing admission and reading the retained receipt",
+            async {
+                drop(held_apply);
+                let permits = Arc::clone(&store.inner.proposal_admission)
+                    .acquire_many_owned(
+                        u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                            .expect("proposal slot count fits u32"),
+                    )
+                    .await
+                    .expect("proposal admission remains open");
+                drop(permits);
+
+                let (authority_identity, _) = store.current_scope().expect("current V2 authority");
+                assert!(matches!(
+                    store
+                        .inner
+                        .backend
+                        .consensus_fenced_transition_v2_status(
+                            store.inner.storage_identity,
+                            authority_identity,
+                            &request,
+                        )
+                        .await,
+                    Ok(FencedTransitionV2Status::Recorded(_))
+                ));
+            },
         )
-        .await
-        .expect("accepted V2 supervisor releases admission")
-        .expect("proposal admission remains open");
-        drop(permits);
-
-        let (authority_identity, _) = store.current_scope().expect("current V2 authority");
-        assert!(matches!(
-            store
-                .inner
-                .backend
-                .consensus_fenced_transition_v2_status(
-                    store.inner.storage_identity,
-                    authority_identity,
-                    &request,
-                )
-                .await,
-            Ok(FencedTransitionV2Status::Recorded(_))
-        ));
+        .await;
+        drop(release_clock);
+        let _ = clock_guard
+            .await
+            .expect("retire V2 effect protocol clock guard");
     }
 
     #[tokio::test]
