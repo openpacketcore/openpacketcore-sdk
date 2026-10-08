@@ -452,6 +452,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: release the held Async writer synchronously before the
+  shutdown fixture's final bounded call, with its rescue thread held until that
+  call returns. Value-free shutdown observations distinguish caller deadlines,
+  coordinator results and physical drain failures (#913).
+
 - `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
   admitted append's final result before authenticated readback, retaining its
   acknowledgement, shutdown and completion bounds. A backend-error control
