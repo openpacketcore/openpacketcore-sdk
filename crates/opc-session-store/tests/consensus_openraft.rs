@@ -6304,7 +6304,15 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
         commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
     })
     .await
-    .expect("predecessor snapshot command batch completes within its aggregate bound");
+    .unwrap_or_else(|error| {
+        // Observe only after failure: sampling inside the command loop can
+        // change the storage/snapshot interleaving we need to diagnose.
+        panic!(
+            "predecessor snapshot command batch exceeded its unchanged {}s aggregate bound: {error:?}; {}",
+            SNAPSHOT_COMMAND_BATCH_TIMEOUT.as_secs(),
+            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+        );
+    });
     let predecessor = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(
@@ -6361,7 +6369,13 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
         commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
     })
     .await
-    .expect("successor snapshot command batch completes within its aggregate bound");
+    .unwrap_or_else(|error| {
+        panic!(
+            "successor snapshot command batch exceeded its unchanged {}s aggregate bound: {error:?}; {}",
+            SNAPSHOT_COMMAND_BATCH_TIMEOUT.as_secs(),
+            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+        );
+    });
     tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(

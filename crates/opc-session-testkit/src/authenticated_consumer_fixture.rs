@@ -1914,6 +1914,8 @@ struct FixtureConsumer {
     unavailable_fenced_transition_v2_capability: AtomicBool,
     #[cfg(test)]
     stall_fenced_transition_v2_void_response: AtomicBool,
+    #[cfg(test)]
+    fenced_transition_v2_void_response_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     voter: usize,
 }
@@ -1950,6 +1952,8 @@ impl FixtureConsumer {
             unavailable_fenced_transition_v2_capability: AtomicBool::new(false),
             #[cfg(test)]
             stall_fenced_transition_v2_void_response: AtomicBool::new(false),
+            #[cfg(test)]
+            fenced_transition_v2_void_response_gate: Mutex::new(None),
             ordinary_cas_fault,
             voter,
         }
@@ -2110,6 +2114,20 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute_v2(authorization, request).await;
+        #[cfg(test)]
+        if matches!(
+            &response,
+            SessionConsumerV2Response::FencedTransitionV2Void { result: Ok(_), .. }
+        ) {
+            let gate = self
+                .fenced_transition_v2_void_response_gate
+                .lock()
+                .unwrap()
+                .clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+        }
         #[cfg(test)]
         if matches!(
             &response,
