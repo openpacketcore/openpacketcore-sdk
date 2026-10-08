@@ -463,6 +463,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pin under a device-ID directory and keep accepting dotted names such as VLAN
   devices. Fixes #1099.
 
+- `opc-gtpu-dataplane`: ordinary and grouped device creation, `resolve_device`
+  and cleanup-only acquisition take the managed-device and traffic-sequence
+  host guards before the runtime attaches or adopts the graph, and only
+  infallible map updates follow the runtime commit. A poisoned host lock now
+  refuses before any runtime effect instead of leaving an attached or fenced
+  graph outside the managed-device index. Fixes #1015.
+
 - `opc-session-store`: serve the published snapshot during offline successor
   construction so a recovering voter's snapshot request cannot block the
   leader's committed writes behind that build. Publication, retirement,
