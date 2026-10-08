@@ -1,3 +1,4 @@
+use super::profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -16,7 +17,7 @@ use crate::{
     Ikev2SaInitCryptoProfile as Profile, Ikev2SaInitKeyMaterial as Keys, PayloadChain,
 };
 
-impl Window {
+impl<P: RecoveryProfile> Window<P> {
     fn sync_open(&self) -> Result<(), Error> {
         if self.quiescent {
             return Err(Error::CommitUncertain);
@@ -108,8 +109,8 @@ impl Window {
         &mut self,
         policy: Policy,
         clock: Clock,
-        pending_inbound: Option<&Ordinary>,
-    ) -> Result<Ikev2AdmittedSyncInitiation<'_>, Error> {
+        pending_inbound: Option<&Ordinary<P>>,
+    ) -> Result<Ikev2AdmittedSyncInitiation<'_, P>, Error> {
         self.ready()?;
         self.sync_open()?;
         if pending_inbound.is_some()
@@ -141,7 +142,10 @@ impl Window {
     /// # Errors
     /// Refuses an early retry, exhausted budget, expired/stepped time or unresolved
     /// storage. Check backoff before reserving a block; never reserve ahead.
-    pub fn retry_sync(&mut self, clock: Clock) -> Result<Ikev2AdmittedSyncInitiation<'_>, Error> {
+    pub fn retry_sync(
+        &mut self,
+        clock: Clock,
+    ) -> Result<Ikev2AdmittedSyncInitiation<'_, P>, Error> {
         self.check_sync_deadline(clock)?;
         let recovery = self.record.sync_recovery().ok_or(Error::Drop)?;
         let last = recovery.attempts().last().ok_or(Error::InvalidRecord)?;
@@ -167,8 +171,8 @@ impl Window {
         &mut self,
         policy: Policy,
         clock: Clock,
-        attempts: Vec<Attempt>,
-    ) -> Result<Ikev2AdmittedSyncInitiation<'_>, Error> {
+        attempts: Vec<Attempt<P>>,
+    ) -> Result<Ikev2AdmittedSyncInitiation<'_, P>, Error> {
         self.record
             .generation
             .checked_add(1)
@@ -211,7 +215,7 @@ impl Window {
         keys: &Keys,
         wire: &[u8],
         clock: Clock,
-    ) -> Result<Ikev2PreparedSyncInitiation<'_>, Error> {
+    ) -> Result<Ikev2PreparedSyncInitiation<'_, P>, Error> {
         self.sync_open()?;
         let Some(recovery) = self.record.sync_recovery() else {
             return Err(Error::Drop);
@@ -223,14 +227,14 @@ impl Window {
         if !self.sync_live {
             return Err(Error::Drop);
         }
-        let (header, first, cleartext) =
+        let opened =
             sync_packet::open_message(&self.record.domain, profile, keys, wire, true, true)?;
         let state = self.record.sync_state().ok_or(Error::Drop)?;
         let next = state
             .agreement()
             .evaluate_response(
-                &header,
-                PayloadChain::new(first, &cleartext),
+                &opened.header,
+                PayloadChain::new(opened.first, &opened.cleartext),
                 self.sync_counters()?,
                 &pending,
             )
@@ -246,7 +250,7 @@ impl Window {
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         record.next_send = Some(next.next_send);
         record.next_receive = Some(next.next_receive);
-        record.retain_local_iv_floor()?;
+        P::retain_local_evidence(self, &mut record)?;
         record.outbound = None;
         record.inbound = None;
         record
@@ -280,7 +284,7 @@ impl Window {
     /// idempotent cleanup history, not a new callback.
     /// # Errors
     /// Refuses uncertain storage, already committed closure or no pending sync/event.
-    pub fn close_sync(&mut self) -> Result<Ikev2PreparedSyncInitiation<'_>, Error> {
+    pub fn close_sync(&mut self) -> Result<Ikev2PreparedSyncInitiation<'_, P>, Error> {
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -308,7 +312,7 @@ impl Window {
             .ok_or(Error::InvalidRecord)?
             .disposition = Disposition::CloseIkeSa;
         // Keep exhausted MAX history for restore; closure forbids all replay.
-        record.retain_local_iv_floor()?;
+        P::retain_local_evidence(self, &mut record)?;
         if record.next_send.is_some() {
             record.outbound = None;
         }
@@ -358,32 +362,21 @@ impl Window {
 
 /// Exclusive local attempt admission; cancellation requires latest fenced readback.
 #[must_use = "prepare and commit the attempt; dropping keeps the window quiescent"]
-pub struct Ikev2AdmittedSyncInitiation<'a> {
-    window: &'a mut Window,
+pub struct Ikev2AdmittedSyncInitiation<'a, P: RecoveryProfile = Gcm> {
+    window: &'a mut Window<P>,
     policy: Policy,
     clock: Clock,
-    attempts: Vec<Attempt>,
+    attempts: Vec<Attempt<P>>,
     proposal: Pending,
     counters: Counters,
 }
-impl<'a> Ikev2AdmittedSyncInitiation<'a> {
-    /// Draw admitted entropy and seal with one committed Ordinary IV allocation.
-    ///
-    /// At most four entropy draws; repeat nonces from this event's bounded history are
-    /// rejected. No caller RNG/nonce fallback exists. If a new block is required,
-    /// use the existing durably charged reservation retry guard for this same
-    /// operation, fixed deadline/clock epoch and at most three fresh blocks.
-    /// Do not reserve ahead. The caller must choose Ordinary; the allocation token
-    /// carries no purpose, so Control would spend rekey/Delete headroom on sync.
-    /// # Errors
-    /// Entropy/provider failure or repeated output emits no request. Sealing burns
-    /// its allocation. Any failure retains quiescence until fenced readback.
-    pub fn prepare(
+impl<'a, P: RecoveryProfile> Ikev2AdmittedSyncInitiation<'a, P> {
+    fn prepare_with(
         mut self,
         profile: Profile,
         keys: &Keys,
-        allocation: Ikev2AesGcmIvAllocation<'_>,
-    ) -> Result<Ikev2PreparedSyncInitiation<'a>, Error> {
+        sealing: P::Sealing<'_>,
+    ) -> Result<Ikev2PreparedSyncInitiation<'a, P>, Error> {
         self.window.record.domain.check(profile, keys)?;
         let mut chosen = None;
         for _ in 0..4 {
@@ -412,16 +405,16 @@ impl<'a> Ikev2AdmittedSyncInitiation<'a> {
             &self.window.record.domain,
             profile,
             keys,
-            allocation,
+            sealing,
             value,
             false,
         )?;
-        self.attempts.push(Attempt::from_persisted(
+        self.attempts.push(Attempt::<P>::from_parts(
             pending,
             self.clock.unix_ms(),
-            request.clone(),
+            request.wire().clone(),
         )?);
-        let recovery = Recovery::from_persisted(
+        let recovery = Recovery::<P>::from_parts(
             self.policy,
             self.clock.unix_ms(),
             self.attempts,
@@ -431,13 +424,11 @@ impl<'a> Ikev2AdmittedSyncInitiation<'a> {
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         record.next_send = Some(value.expected_send_req_message_id());
         record.next_receive = Some(value.expected_recv_req_message_id());
-        record.retain_local_iv_floor()?;
+        P::retain_local_evidence(self.window, &mut record)?;
         record.outbound = None;
         record.inbound = None;
         let sync = record.sync.as_mut().ok_or(Error::InvalidRecord)?;
-        sync.minimum_send_iv_end = sync
-            .minimum_send_iv_end
-            .max(super::packet::sending_iv_end(&request)?);
+        P::retain_sealed(&mut sync.packet_evidence, &request)?;
         sync.highest_local_proposal = Some(value.expected_send_req_message_id());
         sync.highest_peer_request = self.counters.highest_peer_request;
         sync.disposition = Disposition::AwaitLocalSync;
@@ -449,21 +440,21 @@ impl<'a> Ikev2AdmittedSyncInitiation<'a> {
         Ok(Ikev2PreparedSyncInitiation {
             window: self.window,
             record,
-            action: Ikev2SyncInitiatorAction::SendRequest(request),
+            action: Ikev2SyncInitiatorAction::SendRequest(request.into_wire()),
         })
     }
 }
 
 /// Atomic proposal/result/close storage inputs without effect permission.
 #[must_use = "persist the exact record before releasing an action"]
-pub struct Ikev2PreparedSyncInitiation<'a> {
-    window: &'a mut Window,
-    record: Record,
+pub struct Ikev2PreparedSyncInitiation<'a, P: RecoveryProfile = Gcm> {
+    window: &'a mut Window<P>,
+    record: Record<P>,
     action: Ikev2SyncInitiatorAction,
 }
-impl Ikev2PreparedSyncInitiation<'_> {
+impl<P: RecoveryProfile> Ikev2PreparedSyncInitiation<'_, P> {
     /// Persist all fields atomically with the same fenced SA/event/operation state.
-    pub const fn record(&self) -> &Record {
+    pub const fn record(&self) -> &Record<P> {
         &self.record
     }
     /// Acknowledge the exact durable record. Equality alone is not storage proof.
@@ -482,7 +473,7 @@ impl Ikev2PreparedSyncInitiation<'_> {
     /// Mismatch leaves quiescence; an expired request requires scoped closure.
     pub fn commit_after_durable(
         self,
-        committed: &Record,
+        committed: &Record<P>,
         clock: Clock,
     ) -> Result<Ikev2SyncInitiatorCommit, Error> {
         if committed != &self.record {
@@ -530,4 +521,40 @@ pub enum Ikev2SyncInitiatorAction {
     Recovered,
     /// Perform idempotent scoped IKE/Child cleanup; never switch to fallback.
     CloseIkeSa,
+}
+
+impl<'a> Ikev2AdmittedSyncInitiation<'a, Gcm> {
+    /// Draw admitted entropy and seal with one committed Ordinary IV allocation.
+    ///
+    /// At most four entropy draws; repeat nonces from this event's bounded history are
+    /// rejected. No caller RNG/nonce fallback exists. If a new block is required,
+    /// use the existing durably charged reservation retry guard for this same
+    /// operation, fixed deadline/clock epoch and at most three fresh blocks.
+    /// Do not reserve ahead. The caller must choose Ordinary; the allocation token
+    /// carries no purpose, so Control would spend rekey/Delete headroom on sync.
+    /// # Errors
+    /// Entropy/provider failure or repeated output emits no request. Sealing burns
+    /// its allocation. Any failure retains quiescence until fenced readback.
+    pub fn prepare(
+        self,
+        profile: Profile,
+        keys: &Keys,
+        allocation: Ikev2AesGcmIvAllocation<'_>,
+    ) -> Result<Ikev2PreparedSyncInitiation<'a, Gcm>, Error> {
+        self.prepare_with(profile, keys, allocation)
+    }
+}
+
+impl<'a> Ikev2AdmittedSyncInitiation<'a, super::Ikev2CbcRecoveryProfile> {
+    /// Seal using one fresh admitted random CBC IV, without an allocation token.
+    /// Persist the exact candidate before releasing its one-use action.
+    /// # Errors
+    /// Key/profile mismatch or provider failure retains quiescence for fenced readback.
+    pub fn prepare(
+        self,
+        profile: Profile,
+        keys: &Keys,
+    ) -> Result<Ikev2PreparedSyncInitiation<'a, super::Ikev2CbcRecoveryProfile>, Error> {
+        self.prepare_with(profile, keys, ())
+    }
 }

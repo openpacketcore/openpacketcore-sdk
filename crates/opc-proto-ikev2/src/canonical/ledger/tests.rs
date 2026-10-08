@@ -204,7 +204,9 @@ fn compaction_and_deletion_bound_state_over_many_keys_and_ids() -> Result<(), Er
                     Entry {
                         attempts: 1,
                         released: true,
-                        bytes: Some(Zeroizing::new([0; 57])),
+                        bytes: Some(super::super::buffer::CanonicalBytes::from_verified(
+                            &[0; 57],
+                        )?),
                     },
                 );
                 state.retire_through(id);
@@ -319,7 +321,8 @@ fn static_registry_graph_contains_only_fingerprints_and_non_key_metadata() -> Re
     impl KeyFree for usize {}
     impl KeyFree for bool {}
     impl KeyFree for Weak<()> {}
-    impl KeyFree for Zeroizing<[u8; 57]> {} // Verified ciphertext only.
+    impl KeyFree for zeroize::Zeroizing<[u8; 96]> {} // Verified ciphertext only.
+    impl KeyFree for super::super::buffer::CanonicalBytes {}
     impl<T: KeyFree> KeyFree for Option<T> {}
     fn key_free<T: KeyFree>(_: &T) {}
     fn entry_fields(entry: &Entry) {
@@ -331,6 +334,11 @@ fn static_registry_graph_contains_only_fingerprints_and_non_key_metadata() -> Re
         key_free(attempts);
         key_free(released);
         key_free(bytes);
+        if let Some(bytes) = bytes {
+            let super::super::buffer::CanonicalBytes { storage, len } = bytes;
+            key_free(storage);
+            key_free(len);
+        }
     }
     fn ledger_fields(ledger: &Ledger) {
         let Ledger {

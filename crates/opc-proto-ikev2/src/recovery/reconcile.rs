@@ -1,12 +1,10 @@
+use super::profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use std::sync::Arc;
 
 use super::{
     Ikev2CommittedWindow as Window, Ikev2CommittedWindowRecord as Record, Ikev2WindowError as Error,
 };
-use crate::{
-    crypto_module, Ikev2AesGcmIvRecord as IvRecord, Ikev2SaInitCryptoProfile as Profile,
-    Ikev2SaInitKeyMaterial as Keys,
-};
+use crate::{Ikev2SaInitCryptoProfile as Profile, Ikev2SaInitKeyMaterial as Keys};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -16,13 +14,13 @@ pub(super) enum Kind {
 }
 
 // One bounded volatile copy, captured only when a prepared record is exposed.
-pub(super) struct Witness {
-    record: Record,
+pub(super) struct Witness<P: RecoveryProfile = Gcm> {
+    record: Record<P>,
     kind: Kind,
 }
 
-impl Window {
-    pub(super) fn remember_prepared(&mut self, record: &Record, kind: Kind) {
+impl<P: RecoveryProfile> Window<P> {
+    pub(super) fn remember_prepared(&mut self, record: &Record<P>, kind: Kind) {
         self.quiescent = true;
         self.witness = Some(Witness {
             record: record.clone(),
@@ -35,9 +33,10 @@ impl Window {
     /// Settle or fence every outstanding write, then read both records from one
     /// consistent snapshot. The window record must exactly equal the last
     /// acknowledged record or this runtime's one privately witnessed candidate.
-    /// Only the IV record's high-water may increase; its limits and full binding
-    /// must stay unchanged. Coverage includes every sealed witness IV, landed or
-    /// not. Keep the live IV allocator; do not restore it during this operation.
+    /// CBC's complete epoch descriptor must stay identical. For GCM, only the IV
+    /// record's high-water may increase; its limits and full binding stay unchanged.
+    /// GCM coverage includes every sealed witness IV, landed or not. Keep its live
+    /// IV allocator; do not restore it during this operation.
     ///
     /// Unchanged/outbound readback preserves the receive floor, admission phase,
     /// pending identity and last applicable empty reply, including failed-seal
@@ -66,8 +65,8 @@ impl Window {
         &mut self,
         profile: Profile,
         keys: &Keys,
-        record: &Record,
-        iv_record: &IvRecord,
+        record: &Record<P>,
+        epoch: &P::Epoch,
     ) -> Result<(), Error> {
         // This identity fences ordinary and both sync token types; the canonical
         // owner has its own identity and is deliberately retained.
@@ -79,13 +78,12 @@ impl Window {
                 crate::canonical::Ikev2CanonicalError::Invalidated,
             ));
         }
-        crypto_module::check_aead_admission(self.canonical_binding.domain().encryption())
-            .map_err(|_| Error::ReconcileUnavailable)?;
+        P::reconcile_preflight(&self.canonical_binding)?;
 
-        if let Err(error) = self.reconcile_checked(profile, keys, record, iv_record) {
-            crate::canonical::invalidate_binding(self.canonical_binding.domain());
-            crate::canonical::invalidate_binding(record.domain.send_iv_domain());
-            crate::canonical::invalidate_binding(iv_record.domain());
+        if let Err(error) = self.reconcile_checked(profile, keys, record, epoch) {
+            crate::canonical::invalidate_profile(&P::from_epoch(&self.canonical_binding));
+            crate::canonical::invalidate_profile(&record.domain);
+            crate::canonical::invalidate_profile(&P::from_epoch(epoch));
             self.receive.discard_replies();
             self.witness = None;
             self.reconcile_terminal = true;
@@ -98,13 +96,11 @@ impl Window {
         &mut self,
         profile: Profile,
         keys: &Keys,
-        record: &Record,
-        iv_record: &IvRecord,
+        record: &Record<P>,
+        epoch: &P::Epoch,
     ) -> Result<(), Error> {
         // Check immutable binding first, retaining restore's error distinction.
-        if record.domain != self.record.domain
-            || super::Ikev2CommittedWindowDomain::from_iv_record(iv_record) != self.record.domain
-        {
+        if record.domain != self.record.domain || P::from_epoch(epoch) != self.record.domain {
             return Err(Error::DomainMismatch);
         }
         let kind = if record == &self.record {
@@ -117,23 +113,13 @@ impl Window {
         } else {
             return Err(Error::InvalidRecord);
         };
-        if iv_record.limits() != self.canonical_binding.limits()
-            || iv_record.exclusive_end() < self.canonical_binding.exclusive_end()
-        {
-            return Err(Error::InvalidRecord);
-        }
-        Self::validate_record(&self.record.domain, profile, keys, record, iv_record)?;
+        P::check_epoch_transition(&self.canonical_binding, epoch)?;
+        Self::validate_record(&self.record.domain, profile, keys, record, epoch)?;
         // Even a candidate that did not land consumed acknowledged IVs. Its
         // response-only sync IV is represented by minimum_send_iv_end.
         if let Some(witness) = &self.witness {
             if record != &witness.record {
-                Self::validate_record(
-                    &self.record.domain,
-                    profile,
-                    keys,
-                    &witness.record,
-                    iv_record,
-                )?;
+                Self::validate_record(&self.record.domain, profile, keys, &witness.record, epoch)?;
             }
         }
         let boundary = matches!(kind, Some(Kind::Inbound | Kind::Sync));
@@ -146,7 +132,7 @@ impl Window {
         // Retain the applicable last reply for unchanged/outbound readback.
         self.receive.retire_readback(next, boundary)?;
         self.record = record.clone();
-        self.canonical_binding = iv_record.clone();
+        self.canonical_binding = epoch.clone();
         if boundary {
             self.receive.adopt_boundary(next);
         }

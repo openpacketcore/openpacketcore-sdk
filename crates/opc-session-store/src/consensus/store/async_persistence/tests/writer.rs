@@ -549,13 +549,28 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
         // blocked in its join. This external rescue bounds the failing case;
         // a passing run must signal it only after both public deadlines fire.
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
         let writer_gate = Arc::clone(&gate);
         rescue = Some((
             release_sender,
+            resume_sender,
             std::thread::spawn(move || {
-                let signalled = release_receiver.recv_timeout(OPERATION_BOUND * 4).is_ok();
+                let rescue_deadline = std::time::Instant::now() + OPERATION_BOUND * 4;
+                let signalled = release_receiver
+                    .recv_timeout(
+                        rescue_deadline.saturating_duration_since(std::time::Instant::now()),
+                    )
+                    .is_ok();
+                // Keep the rescue thread out of the final caller's progress.
+                // Both waits share the original external watchdog deadline.
+                let resumed = signalled
+                    && resume_receiver
+                        .recv_timeout(
+                            rescue_deadline.saturating_duration_since(std::time::Instant::now()),
+                        )
+                        .is_ok();
                 writer_gate.release();
-                signalled
+                resumed
             }),
         ));
         assert!(
@@ -600,10 +615,37 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
             .0
             .send(())
             .expect("release after both original deadlines");
-        store
-            .shutdown()
-            .await
-            .expect("retry observes the same completed physical drain");
+        // Sending to the rescue thread does not prove it has released the
+        // writer. Release here before starting the next caller's fixed bound.
+        gate.release();
+        let post_release = store.shutdown().await;
+        let coordinator = {
+            let completion = store.inner.shutdown.completion.lock().unwrap();
+            completion
+                .as_ref()
+                .map_or("not_started", |completion| match &*completion.borrow() {
+                    ConsensusShutdownCompletion::Running if completion.has_changed().is_err() => {
+                        "abandoned"
+                    }
+                    ConsensusShutdownCompletion::Running => "running",
+                    ConsensusShutdownCompletion::Finished(Ok(())) => "completed",
+                    ConsensusShutdownCompletion::Finished(Err(_)) => "failed",
+                })
+        };
+        let health = store.persistence_health();
+        // Resume before reopen: the rescue's original bound covers shutdown,
+        // not the later live-quorum reconstruction.
+        let _ = rescue.as_ref().unwrap().1.send(());
+        assert!(
+            post_release.is_ok(),
+            "retry observes the same completed physical drain; coordinator={coordinator} \
+             native={:?} storage_failure={:?} background_failure={:?}",
+            health.storage_state,
+            health.storage_failure,
+            health
+                .asynchronous
+                .and_then(|progress| progress.background_failure),
+        );
         assert_eq!(
             store.persistence_health().storage_state,
             SessionStorageState::Closed
@@ -652,8 +694,9 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
     .catch_unwind()
     .await;
     drop(release);
-    let released_by_caller = if let Some((sender, thread)) = rescue {
+    let released_by_caller = if let Some((sender, resume, thread)) = rescue {
         let _ = sender.send(());
+        let _ = resume.send(());
         tokio::task::spawn_blocking(move || thread.join())
             .await
             .unwrap()

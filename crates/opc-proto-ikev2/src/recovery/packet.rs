@@ -1,32 +1,32 @@
+use super::profile::{DirectionBinding, Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{BorrowDecode, DecodeContext, EncodeContext};
+use std::marker::PhantomData;
 
 use super::{Ikev2CommittedWindowDomain as Domain, Ikev2WindowError as Error};
 use crate::{
-    encode_header, ikev2_aes_gcm_protected_payload_len, open_protected_payloads, Header,
-    Ikev2AesGcmIvAllocation, Ikev2ExchangeKind, Ikev2NotifyPayload, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, Ikev2SaInitProtectedPayloadProvider, Message,
-    PayloadChain, PayloadType, ProtectedPayloadKind, ProtectedPayloadSealContext,
-    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
-    IKEV2_NOTIFY_MESSAGE_ID_SYNC,
+    encode_header, open_protected_payloads, Header, Ikev2ExchangeKind, Ikev2NotifyPayload,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+    Ikev2SaInitProtectedPayloadProvider, Message, PayloadChain, PayloadType, ProtectedPayloadKind,
+    ProtectedPayloadSealContext, IKEV2_NOTIFY_MESSAGE_ID_SYNC,
 };
 
 /// Completely authenticated ordinary SK packet bound to a durable-window domain.
 ///
 /// Created only through the admitted crypto open path; it is not admission to a
 /// receive window and grants no effects. Sync Notify packets are never this type.
-pub struct Ikev2AuthenticatedOrdinary {
-    pub(super) domain: Domain,
+pub struct Ikev2AuthenticatedOrdinary<P: RecoveryProfile = Gcm> {
+    pub(super) domain: Domain<P>,
     pub(super) header: Header,
     pub(super) wire: Bytes,
     first: PayloadType,
     cleartext: Bytes,
 }
 
-impl Ikev2AuthenticatedOrdinary {
+impl<P: RecoveryProfile> Ikev2AuthenticatedOrdinary<P> {
     pub(crate) fn canonical_message_id(
         &self,
-        expected: &Domain,
+        expected: &Domain<P>,
     ) -> Result<u32, crate::canonical::Ikev2CanonicalError> {
         use crate::canonical::Ikev2CanonicalError as CanonicalError;
         if &self.domain != expected {
@@ -52,25 +52,21 @@ impl Ikev2AuthenticatedOrdinary {
     pub(super) fn require_work(&self) -> Result<(), Error> {
         require_work(self.header.exchange_type, self.payloads())
     }
-
-    pub(super) fn require_reserved_iv(&self, exclusive_end: u64) -> Result<(), Error> {
-        if sending_iv_end(&self.wire)? > exclusive_end {
-            return Err(Error::InvalidRecord);
-        }
-        Ok(())
-    }
 }
 
-// Only for complete GCM SK packets already authenticated or sealed in this module.
-// This extracts evidence; it is never authentication or allocation authority.
-pub(super) fn sending_iv_end(wire: &[u8]) -> Result<u64, Error> {
-    let start = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
-    let iv = wire
-        .get(start..start + IKEV2_AES_GCM_EXPLICIT_IV_LEN)
-        .ok_or(Error::InvalidRecord)?;
-    u64::from_be_bytes(iv.try_into().map_err(|_| Error::InvalidRecord)?)
-        .checked_add(1)
-        .ok_or(Error::InvalidRecord)
+// Successful admitted sealing, before ordinary/sync storage consumes the bytes.
+// Only the builders below can construct this profile-typed evidence.
+pub struct SealedPacket<P: RecoveryProfile> {
+    wire: Bytes,
+    profile: PhantomData<P>,
+}
+impl<P: RecoveryProfile> SealedPacket<P> {
+    pub(super) fn wire(&self) -> &Bytes {
+        &self.wire
+    }
+    pub(super) fn into_wire(self) -> Bytes {
+        self.wire
+    }
 }
 
 pub(super) fn require_work(exchange: u8, payloads: PayloadChain<'_>) -> Result<(), Error> {
@@ -99,13 +95,13 @@ fn validate_payloads(payloads: PayloadChain<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn open(
-    domain: &Domain,
+pub(super) fn open<P: RecoveryProfile>(
+    domain: &Domain<P>,
     profile: Ikev2SaInitCryptoProfile,
     keys: &Ikev2SaInitKeyMaterial,
     wire: &[u8],
     peer: bool,
-) -> Result<Ikev2AuthenticatedOrdinary, Error> {
+) -> Result<Ikev2AuthenticatedOrdinary<P>, Error> {
     domain.check(profile, keys)?;
     let (rest, message) =
         Message::decode(wire, DecodeContext::default()).map_err(|_| Error::Drop)?;
@@ -148,14 +144,14 @@ pub(super) fn open(
     })
 }
 
-pub(super) fn seal(
-    domain: &Domain,
+pub(super) fn seal<P: RecoveryProfile>(
+    domain: &Domain<P>,
     profile: Ikev2SaInitCryptoProfile,
     keys: &Ikev2SaInitKeyMaterial,
-    allocation: Ikev2AesGcmIvAllocation<'_>,
-    mut header: Header,
+    sealing: P::Sealing<'_>,
+    header: Header,
     payloads: PayloadChain<'_>,
-) -> Result<Bytes, Error> {
+) -> Result<SealedPacket<P>, Error> {
     domain.check(profile, keys)?;
     if !matches!(
         Ikev2ExchangeKind::from_u8(header.exchange_type),
@@ -168,7 +164,19 @@ pub(super) fn seal(
         return Err(Error::Drop);
     }
     validate_payloads(payloads)?;
-    let length = ikev2_aes_gcm_protected_payload_len(payloads.bytes().len(), 0)
+    seal_frame(domain, profile, keys, sealing, header, payloads)
+}
+
+pub(super) fn seal_frame<P: RecoveryProfile>(
+    domain: &Domain<P>,
+    profile: Ikev2SaInitCryptoProfile,
+    keys: &Ikev2SaInitKeyMaterial,
+    sealing: P::Sealing<'_>,
+    mut header: Header,
+    payloads: PayloadChain<'_>,
+) -> Result<SealedPacket<P>, Error> {
+    domain.check(profile, keys)?;
+    let length = P::payload_len(profile, payloads.bytes().len())
         .and_then(|length| u16::try_from(length).ok())
         .ok_or(Error::Drop)?;
     header.length = 28 + u32::from(length);
@@ -177,18 +185,20 @@ pub(super) fn seal(
     packet.put_u8(payloads.first_payload().as_u8());
     packet.put_u8(0);
     packet.put_u16(length);
-    let body = allocation
-        .seal(
-            profile,
-            keys,
-            ProtectedPayloadSealContext {
-                kind: ProtectedPayloadKind::Encrypted,
-                message_prefix: &packet,
-            },
-            payloads.bytes(),
-            0,
-        )
-        .map_err(Error::Iv)?;
+    let body = P::seal_body(
+        profile,
+        keys,
+        domain.send.direction(),
+        sealing,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: &packet,
+        },
+        payloads.bytes(),
+    )?;
     packet.extend_from_slice(&body);
-    Ok(packet.freeze())
+    Ok(SealedPacket {
+        wire: packet.freeze(),
+        profile: PhantomData,
+    })
 }

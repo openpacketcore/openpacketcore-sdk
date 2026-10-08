@@ -5,8 +5,9 @@
 //! outcomes. A matching record is not proof of a storage acknowledgement. No
 //! effect or new packet may escape preparation before that acknowledgement.
 //!
-//! This initial profile handles complete AES-GCM SK packets, not SKF or CBC
-//! recovery. Sync requires persisted negotiated metadata and fixed event/clock
+//! The sealed GCM and CBC profiles handle complete SK packets, not SKF recovery.
+//! Canonical sending requires current profile qualification. Sync requires
+//! persisted negotiated metadata and fixed event/clock
 //! budgets. The opt-in empty handler answers authenticated INFORMATIONAL requests
 //! with canonical bytes and advances a volatile receive floor without a durable
 //! write. Trusted restart reconstruction repairs a lost stateless prefix; the
@@ -16,13 +17,18 @@
 use std::{cell::Cell, error::Error as StdError, fmt, sync::Arc};
 
 use crate::{
-    Ikev2AesGcmIvAllocation, Ikev2AesGcmIvRecord, Ikev2AesGcmIvReservationError, Ikev2ExchangeKind,
+    Ikev2AesGcmIvAllocation, Ikev2AesGcmIvReservationError, Ikev2ExchangeKind,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, PayloadChain,
 };
 use bytes::Bytes;
 
+mod cbc_epoch;
+#[cfg(test)]
+pub(crate) mod cbc_test_fixtures;
 mod empty;
 mod packet;
+pub(crate) mod profile;
+use profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 mod reconcile;
 mod record;
 mod reservation_retry;
@@ -32,8 +38,10 @@ mod sync_readiness;
 mod sync_record;
 mod sync_recovery_record;
 mod sync_responder;
+pub use cbc_epoch::{Ikev2CbcEpochInputs, Ikev2CbcEpochRecord};
 pub use empty::{Ikev2EmptyReply, Ikev2EmptyReplyObservation};
 pub use packet::Ikev2AuthenticatedOrdinary;
+pub use profile::{Ikev2CbcRecoveryProfile, Ikev2GcmRecoveryProfile};
 pub use record::{
     Ikev2CommittedExchangeRecord, Ikev2CommittedWindowDomain, Ikev2CommittedWindowRecord,
 };
@@ -101,6 +109,8 @@ pub enum Ikev2WindowError {
     SyncRule(crate::Ikev2MessageIdSyncRuleError),
     /// Slice-3 allocation or admitted sealing failed; the supplied IV is burned.
     Iv(Ikev2AesGcmIvReservationError),
+    /// Admitted CBC ordinary/sync encryption or random-IV generation failed.
+    Crypto(crate::Ikev2ProtectedPayloadCryptoError),
 }
 
 impl fmt::Display for Ikev2WindowError {
@@ -126,6 +136,7 @@ impl fmt::Display for Ikev2WindowError {
             Self::OutcomeUncertain => "ike_committed_window_outcome_uncertain",
             Self::SyncRule(_) => "ike_committed_window_sync_rule_failure",
             Self::Iv(_) => "ike_committed_window_iv_failure",
+            Self::Crypto(_) => "ike_committed_window_crypto_failure",
         })
     }
 }
@@ -188,25 +199,57 @@ impl Ikev2ExactReplay<'_> {
 /// use opc_proto_ikev2::recovery::Ikev2CommittedWindow;
 /// fn duplicate(window: Ikev2CommittedWindow) { let _ = window.clone(); }
 /// ```
-pub struct Ikev2CommittedWindow {
-    record: Ikev2CommittedWindowRecord,
-    canonical_binding: Ikev2AesGcmIvRecord,
+///
+/// Profiles cannot exchange epoch records or authenticated packet evidence:
+/// ```compile_fail
+/// use opc_proto_ikev2::{Ikev2AesGcmIvRecord, Ikev2SaInitCryptoProfile,
+///     Ikev2SaInitKeyMaterial, recovery::*};
+/// fn mixed(domain: &Ikev2CommittedWindowDomain<Ikev2CbcRecoveryProfile>,
+///     record: &Ikev2CommittedWindowRecord<Ikev2CbcRecoveryProfile>,
+///     profile: Ikev2SaInitCryptoProfile, keys: &Ikev2SaInitKeyMaterial,
+///     gcm: &Ikev2AesGcmIvRecord) {
+///     let _ = Ikev2CommittedWindow::restore(domain, profile, keys, record, gcm);
+/// }
+/// ```
+/// ```compile_fail
+/// use opc_proto_ikev2::recovery::*;
+/// fn mixed(window: &Ikev2CommittedWindow<Ikev2CbcRecoveryProfile>,
+///     gcm: &Ikev2AuthenticatedOrdinary) {
+///     let _ = window.request_disposition(gcm);
+/// }
+/// ```
+/// CBC preparation accepts no GCM allocation:
+/// ```compile_fail
+/// use opc_proto_ikev2::{Ikev2AesGcmIvAllocation, Ikev2SaInitCryptoProfile,
+///     Ikev2SaInitKeyMaterial, Ikev2ExchangeKind, PayloadChain, recovery::*};
+/// fn mixed(window: &mut Ikev2CommittedWindow<Ikev2CbcRecoveryProfile>,
+///     profile: Ikev2SaInitCryptoProfile, keys: &Ikev2SaInitKeyMaterial,
+///     allocation: Ikev2AesGcmIvAllocation<'_>, payloads: PayloadChain<'_>) {
+///     let _ = window.prepare_request(profile, keys, allocation,
+///         Ikev2ExchangeKind::Informational, payloads);
+/// }
+/// ```
+pub struct Ikev2CommittedWindow<P: RecoveryProfile = Gcm> {
+    record: Ikev2CommittedWindowRecord<P>,
+    canonical_binding: P::Epoch,
     instance: Arc<()>,
     quiescent: bool,
-    witness: Option<reconcile::Witness>,
+    witness: Option<reconcile::Witness<P>>,
     reconcile_terminal: bool,
     observed_peer_request: Cell<Option<u32>>,
-    receive: empty::ReceiveState,
+    receive: empty::ReceiveState<P>,
     sync_live: bool,
     sync_closed: bool,
     sync_last_observed_unix_ms: Option<u64>,
 }
 
-impl Ikev2CommittedWindow {
+impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// Restore a trusted latest record, binding keys and authenticating cached packets.
     ///
     /// This creates no effect token. Stored outcomes are history for idempotent
-    /// restoration by the consumer. Supply the latest fenced sending-IV record;
+    /// restoration by the consumer. Supply the profile's latest fenced epoch record.
+    /// CBC binds the complete immutable descriptor without IV arithmetic.
+    /// For GCM, supply the sending-IV record;
     /// its exclusive end must cover locally sent cached IVs, initiating attempts
     /// and the retained minimum in sync metadata even after caches are retired.
     /// At process start restore the IV allocator from that same record separately, discarding its
@@ -215,7 +258,7 @@ impl Ikev2CommittedWindow {
     /// trustworthy latest records remain caller obligations.
     /// For in-process readback use [`Self::reconcile`] and keep the live allocator
     /// and canonical capability rather than constructing replacements.
-    /// Read the window and IV records from one consistent fenced snapshot before
+    /// Read the window and epoch records from one consistent fenced snapshot before
     /// calling this method; a failed restore is terminal for canonical use.
     /// # Errors
     /// Rejects mismatching domains, unauthentic packets, wrong directions/classes,
@@ -224,32 +267,32 @@ impl Ikev2CommittedWindow {
     /// Every failure permanently revokes canonical state for the supplied bindings;
     /// discard the failed SA, its stored records, keys and copied replies.
     pub fn restore(
-        expected: &Ikev2CommittedWindowDomain,
+        expected: &Ikev2CommittedWindowDomain<P>,
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
-        record: &Ikev2CommittedWindowRecord,
-        iv_record: &Ikev2AesGcmIvRecord,
+        record: &Ikev2CommittedWindowRecord<P>,
+        epoch: &P::Epoch,
     ) -> Result<Self, Ikev2WindowError> {
-        let restored = Self::restore_checked(expected, profile, keys, record, iv_record);
+        let restored = Self::restore_checked(expected, profile, keys, record, epoch);
         if restored.is_err() {
-            crate::canonical::invalidate_binding(expected.send_iv_domain());
-            crate::canonical::invalidate_binding(iv_record.domain());
-            crate::canonical::invalidate_binding(record.domain.send_iv_domain());
+            crate::canonical::invalidate_profile(expected);
+            crate::canonical::invalidate_profile(&P::from_epoch(epoch));
+            crate::canonical::invalidate_profile(&record.domain);
         }
         restored
     }
 
     fn restore_checked(
-        expected: &Ikev2CommittedWindowDomain,
+        expected: &Ikev2CommittedWindowDomain<P>,
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
-        record: &Ikev2CommittedWindowRecord,
-        iv_record: &Ikev2AesGcmIvRecord,
+        record: &Ikev2CommittedWindowRecord<P>,
+        epoch: &P::Epoch,
     ) -> Result<Self, Ikev2WindowError> {
-        Self::validate_record(expected, profile, keys, record, iv_record)?;
+        Self::validate_record(expected, profile, keys, record, epoch)?;
         Ok(Self {
             record: record.clone(),
-            canonical_binding: iv_record.clone(),
+            canonical_binding: epoch.clone(),
             instance: Arc::new(()),
             quiescent: false,
             witness: None,
@@ -265,27 +308,23 @@ impl Ikev2CommittedWindow {
     }
 
     fn validate_record(
-        expected: &Ikev2CommittedWindowDomain,
+        expected: &Ikev2CommittedWindowDomain<P>,
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
-        record: &Ikev2CommittedWindowRecord,
-        iv_record: &Ikev2AesGcmIvRecord,
+        record: &Ikev2CommittedWindowRecord<P>,
+        epoch: &P::Epoch,
     ) -> Result<(), Ikev2WindowError> {
         use Ikev2WindowError as Error;
-        if expected != &record.domain
-            || expected != &Ikev2CommittedWindowDomain::from_iv_record(iv_record)
-        {
+        if expected != &record.domain || expected != &P::from_epoch(epoch) {
             return Err(Error::DomainMismatch);
         }
         expected.check(profile, keys)?;
         if let Some(sync) = record.sync_state() {
             sync.validate(record)?;
-            if iv_record.exclusive_end() < sync.minimum_send_iv_end() {
-                return Err(Error::InvalidRecord);
-            }
+            P::check_sync_evidence(sync, epoch)?;
         }
         if let Some(recovery) = record.sync_recovery() {
-            recovery.validate_packets(record, profile, keys, iv_record.exclusive_end())?;
+            recovery.validate_packets(record, profile, keys, epoch)?;
         }
         for (entry, peer, next) in [
             (&record.outbound, false, record.next_send),
@@ -301,7 +340,7 @@ impl Ikev2CommittedWindow {
                     return Err(Error::InvalidRecord);
                 }
                 if !peer {
-                    request.require_reserved_iv(iv_record.exclusive_end())?;
+                    P::check_local_ordinary(&request, epoch)?;
                 }
                 if let Some(response) = &entry.response {
                     let response = packet::open(expected, profile, keys, response, !peer)
@@ -313,7 +352,7 @@ impl Ikev2CommittedWindow {
                         return Err(Error::InvalidRecord);
                     }
                     if peer {
-                        response.require_reserved_iv(iv_record.exclusive_end())?;
+                        P::check_local_ordinary(&response, epoch)?;
                     }
                 }
             }
@@ -321,7 +360,7 @@ impl Ikev2CommittedWindow {
         Ok(())
     }
 
-    /// Derive a canonical recipe from this window's checked persisted IV binding.
+    /// Derive a canonical recipe from this window's checked persisted epoch binding.
     ///
     /// This primitive adds no empty-request admission, receive-floor advancement
     /// or transmission authority. DPD-facing windows must use
@@ -335,15 +374,20 @@ impl Ikev2CommittedWindow {
     pub(crate) fn canonical_replies(
         &self,
         policy: crate::canonical::Ikev2CanonicalPolicy,
-    ) -> Result<crate::canonical::Ikev2CanonicalEmptyReplies, crate::canonical::Ikev2CanonicalError>
-    {
+    ) -> Result<
+        crate::canonical::Ikev2CanonicalEmptyReplies<P>,
+        crate::canonical::Ikev2CanonicalError,
+    > {
         self.ready()
             .map_err(|_| crate::canonical::Ikev2CanonicalError::LifecycleBlocked)?;
-        crate::canonical::Ikev2CanonicalEmptyReplies::from_record(&self.canonical_binding, policy)
+        crate::canonical::Ikev2CanonicalEmptyReplies::<P>::from_epoch(
+            &self.canonical_binding,
+            policy,
+        )
     }
 
     /// Last acknowledged record; while quiescent it may not be the latest durable state.
-    pub const fn record(&self) -> &Ikev2CommittedWindowRecord {
+    pub const fn record(&self) -> &Ikev2CommittedWindowRecord<P> {
         &self.record
     }
 
@@ -357,7 +401,7 @@ impl Ikev2CommittedWindow {
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
         wire: &[u8],
-    ) -> Result<Ikev2AuthenticatedOrdinary, Ikev2WindowError> {
+    ) -> Result<Ikev2AuthenticatedOrdinary<P>, Ikev2WindowError> {
         packet::open(&self.record.domain, profile, keys, wire, true)
     }
 
@@ -382,7 +426,7 @@ impl Ikev2CommittedWindow {
             Some(Ikev2SyncDisposition::CloseIkeSa) => Err(Ikev2WindowError::SyncClosed),
         }
     }
-    fn next_record(&self) -> Result<Ikev2CommittedWindowRecord, Ikev2WindowError> {
+    fn next_record(&self) -> Result<Ikev2CommittedWindowRecord<P>, Ikev2WindowError> {
         self.ready()?;
         let mut record = self.record.clone();
         record.generation = record
@@ -393,10 +437,10 @@ impl Ikev2CommittedWindow {
     }
     fn prepared(
         &mut self,
-        record: Ikev2CommittedWindowRecord,
+        record: Ikev2CommittedWindowRecord<P>,
         outcome: Option<Bytes>,
         receive_boundary: bool,
-    ) -> Ikev2PreparedWindow<'_> {
+    ) -> Ikev2PreparedWindow<'_, P> {
         self.remember_prepared(
             &record,
             if receive_boundary {
@@ -413,22 +457,14 @@ impl Ikev2CommittedWindow {
         }
     }
 
-    /// Seal and prepare a single new ordinary request without send permission.
-    ///
-    /// The caller reserves IVs only for genuine state-changing work, never liveness.
-    /// A failed call burns its supplied allocation but changes no Message-ID state.
-    /// The last representable ID should be reserved for rekey/closure by policy.
-    /// # Errors
-    /// Rejects pending work, unresolved commits, exhaustion, invalid payloads and
-    /// empty INFORMATIONAL probes. IKE_SA_INIT and sync are outside this path.
-    pub fn prepare_request(
+    fn prepare_request_with(
         &mut self,
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
-        allocation: Ikev2AesGcmIvAllocation<'_>,
+        sealing: P::Sealing<'_>,
         exchange: Ikev2ExchangeKind,
         payloads: PayloadChain<'_>,
-    ) -> Result<Ikev2PreparedWindow<'_>, Ikev2WindowError> {
+    ) -> Result<Ikev2PreparedWindow<'_, P>, Ikev2WindowError> {
         let mut record = self.next_record()?;
         if record
             .outbound
@@ -443,12 +479,12 @@ impl Ikev2CommittedWindow {
             &record.domain,
             profile,
             keys,
-            allocation,
+            sealing,
             record.domain.header(exchange, id, false),
             payloads,
         )?;
         record.outbound = Some(Ikev2CommittedExchangeRecord {
-            request,
+            request: request.into_wire(),
             response: None,
             outcome: None,
         });
@@ -473,7 +509,7 @@ impl Ikev2CommittedWindow {
     /// bytes. Use [`Self::reply_empty`] for stateless empty requests.
     pub fn request_disposition(
         &self,
-        request: &Ikev2AuthenticatedOrdinary,
+        request: &Ikev2AuthenticatedOrdinary<P>,
     ) -> Result<Ikev2OrdinaryRequestDisposition, Ikev2WindowError> {
         self.ready()?;
         if request.domain != self.record.domain || request.header.flags.response() {
@@ -508,23 +544,15 @@ impl Ikev2CommittedWindow {
         Ok(Ikev2OrdinaryRequestDisposition::New)
     }
 
-    /// Prepare the exact reply and outcome to an admitted nonempty request.
-    ///
-    /// Planning must perform no irreversible effects. Commit outcome and bytes
-    /// atomically before replying or publishing any effect, including error replies
-    /// and empty acknowledgements of state-changing requests. Storage failure is
-    /// silence, not permission to create an uncommitted TEMPORARY_FAILURE.
-    /// # Errors
-    /// Rejects stale/duplicate/gapped requests and every ordinary preparation failure.
-    pub fn prepare_response(
+    fn prepare_response_with(
         &mut self,
         profile: Ikev2SaInitCryptoProfile,
         keys: &Ikev2SaInitKeyMaterial,
-        allocation: Ikev2AesGcmIvAllocation<'_>,
-        request: &Ikev2AuthenticatedOrdinary,
+        sealing: P::Sealing<'_>,
+        request: &Ikev2AuthenticatedOrdinary<P>,
         payloads: PayloadChain<'_>,
         outcome: Bytes,
-    ) -> Result<Ikev2PreparedWindow<'_>, Ikev2WindowError> {
+    ) -> Result<Ikev2PreparedWindow<'_, P>, Ikev2WindowError> {
         if self.request_disposition(request)? != Ikev2OrdinaryRequestDisposition::New {
             return Err(Ikev2WindowError::Drop);
         }
@@ -535,7 +563,7 @@ impl Ikev2CommittedWindow {
             &record.domain,
             profile,
             keys,
-            allocation,
+            sealing,
             record
                 .domain
                 .header(exchange, request.header.message_id, true),
@@ -543,7 +571,7 @@ impl Ikev2CommittedWindow {
         )?;
         record.inbound = Some(Ikev2CommittedExchangeRecord {
             request: request.wire.clone(),
-            response: Some(response),
+            response: Some(response.into_wire()),
             outcome: Some(outcome.clone()),
         });
         record.next_receive = request.header.message_id.checked_add(1);
@@ -560,9 +588,9 @@ impl Ikev2CommittedWindow {
     /// responses after settlement. A replay probe therefore cannot create an outcome.
     pub fn prepare_completion(
         &mut self,
-        response: &Ikev2AuthenticatedOrdinary,
+        response: &Ikev2AuthenticatedOrdinary<P>,
         outcome: Bytes,
-    ) -> Result<Ikev2PreparedWindow<'_>, Ikev2WindowError> {
+    ) -> Result<Ikev2PreparedWindow<'_, P>, Ikev2WindowError> {
         let mut record = self.next_record()?;
         let outbound = record.outbound.as_mut().ok_or(Ikev2WindowError::Drop)?;
         // The request header was constructed or authenticated when the record was restored.
@@ -602,7 +630,7 @@ impl Ikev2CommittedWindow {
     /// Drops stale/mismatching inputs; refuses unresolved commits.
     pub fn replay_response(
         &self,
-        request: &Ikev2AuthenticatedOrdinary,
+        request: &Ikev2AuthenticatedOrdinary<P>,
     ) -> Result<Ikev2ExactReplay<'_>, Ikev2WindowError> {
         self.ready()?;
         if request.domain != self.record.domain || request.header.flags.response() {
@@ -621,7 +649,7 @@ impl Ikev2CommittedWindow {
         Ok(Ikev2ExactReplay { bytes })
     }
 
-    fn cached_response_applies(&self, request: &Ikev2AuthenticatedOrdinary) -> bool {
+    fn cached_response_applies(&self, request: &Ikev2AuthenticatedOrdinary<P>) -> bool {
         request.domain == self.record.domain
             && !request.header.flags.response()
             && self
@@ -656,15 +684,15 @@ impl Ikev2CommittedWindow {
 
 /// Exclusive prepared record: storage inputs only, no transmission or effects.
 #[must_use = "commit the exact record before transmission or effects; dropping quiesces the window"]
-pub struct Ikev2PreparedWindow<'a> {
-    window: &'a mut Ikev2CommittedWindow,
-    record: Ikev2CommittedWindowRecord,
+pub struct Ikev2PreparedWindow<'a, P: RecoveryProfile = Gcm> {
+    window: &'a mut Ikev2CommittedWindow<P>,
+    record: Ikev2CommittedWindowRecord<P>,
     outcome: Option<Bytes>,
     receive_boundary: bool,
 }
-impl Ikev2PreparedWindow<'_> {
+impl<P: RecoveryProfile> Ikev2PreparedWindow<'_, P> {
     /// Exact candidate to persist atomically with SA and consumer outcome.
-    pub const fn record(&self) -> &Ikev2CommittedWindowRecord {
+    pub const fn record(&self) -> &Ikev2CommittedWindowRecord<P> {
         &self.record
     }
 
@@ -676,7 +704,7 @@ impl Ikev2PreparedWindow<'_> {
     /// Mismatching acknowledgement leaves the window quiescent for readback.
     pub fn commit_after_durable(
         self,
-        committed: &Ikev2CommittedWindowRecord,
+        committed: &Ikev2CommittedWindowRecord<P>,
     ) -> Result<Ikev2WindowCommit, Ikev2WindowError> {
         if committed != &self.record {
             return Err(Ikev2WindowError::CommitMismatch);
@@ -716,28 +744,117 @@ macro_rules! redacted_debug {
     })* };
 }
 redacted_debug!(
-    Ikev2CommittedWindowDomain,
     Ikev2CommittedExchangeRecord,
-    Ikev2CommittedWindowRecord,
-    Ikev2AuthenticatedOrdinary,
-    Ikev2CommittedWindow,
-    Ikev2PreparedWindow<'_>,
     Ikev2WindowCommit,
     Ikev2ExactReplay<'_>,
-    Ikev2EmptyReply<'_>,
-    Ikev2SyncResponderRecord,
-    Ikev2AdmittedSyncResponse<'_>,
-    Ikev2PreparedSyncResponse<'_>,
     Ikev2SyncCommit,
     Ikev2SyncResponse,
     Ikev2SyncClock,
     Ikev2SyncRecoveryPolicy,
-    Ikev2SyncAttemptRecord,
-    Ikev2SyncRecoveryRecord,
-    Ikev2AdmittedSyncInitiation<'_>,
-    Ikev2PreparedSyncInitiation<'_>,
     Ikev2SyncInitiatorCommit,
     Ikev2SyncInitiatorAction,
+);
+
+macro_rules! profile_redacted_debug {
+    ($($name:ident),* $(,)?) => { $(impl<P: profile::RecoveryProfile> fmt::Debug for $name<P> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct(stringify!($name)).finish_non_exhaustive()
+        }
+    })* };
+}
+profile_redacted_debug!(
+    Ikev2CommittedWindowDomain,
+    Ikev2CommittedWindowRecord,
+    Ikev2SyncResponderRecord,
+    Ikev2SyncAttemptRecord,
+    Ikev2SyncRecoveryRecord,
+    Ikev2AuthenticatedOrdinary,
+    Ikev2CommittedWindow,
     Ikev2SyncReadiness,
     Ikev2RuntimeSyncNegotiation
 );
+macro_rules! profile_lifetime_redacted_debug {
+    ($($name:ident),* $(,)?) => { $(impl<P: RecoveryProfile> fmt::Debug for $name<'_, P> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct(concat!(stringify!($name), "<'_>")).finish_non_exhaustive()
+        }
+    })* };
+}
+profile_lifetime_redacted_debug!(
+    Ikev2PreparedWindow,
+    Ikev2EmptyReply,
+    Ikev2AdmittedSyncResponse,
+    Ikev2PreparedSyncResponse,
+    Ikev2AdmittedSyncInitiation,
+    Ikev2PreparedSyncInitiation
+);
+
+impl Ikev2CommittedWindow<Gcm> {
+    /// Seal and prepare a single new ordinary request without send permission.
+    ///
+    /// The caller reserves IVs only for genuine state-changing work, never liveness.
+    /// A failed call burns its supplied allocation but changes no Message-ID state.
+    /// The last representable ID should be reserved for rekey/closure by policy.
+    /// # Errors
+    /// Rejects pending work, unresolved commits, exhaustion, invalid payloads and
+    /// empty INFORMATIONAL probes. IKE_SA_INIT and sync are outside this path.
+    pub fn prepare_request(
+        &mut self,
+        profile: Ikev2SaInitCryptoProfile,
+        keys: &Ikev2SaInitKeyMaterial,
+        allocation: Ikev2AesGcmIvAllocation<'_>,
+        exchange: Ikev2ExchangeKind,
+        payloads: PayloadChain<'_>,
+    ) -> Result<Ikev2PreparedWindow<'_, Gcm>, Ikev2WindowError> {
+        self.prepare_request_with(profile, keys, allocation, exchange, payloads)
+    }
+    /// Prepare the exact reply and outcome to an admitted nonempty request.
+    ///
+    /// Planning must perform no irreversible effects. Commit outcome and bytes
+    /// atomically before replying or publishing any effect, including error replies
+    /// and empty acknowledgements of state-changing requests. Storage failure is
+    /// silence, not permission to create an uncommitted TEMPORARY_FAILURE.
+    /// # Errors
+    /// Rejects stale/duplicate/gapped requests and every ordinary preparation failure.
+    pub fn prepare_response(
+        &mut self,
+        profile: Ikev2SaInitCryptoProfile,
+        keys: &Ikev2SaInitKeyMaterial,
+        allocation: Ikev2AesGcmIvAllocation<'_>,
+        request: &Ikev2AuthenticatedOrdinary<Gcm>,
+        payloads: PayloadChain<'_>,
+        outcome: Bytes,
+    ) -> Result<Ikev2PreparedWindow<'_, Gcm>, Ikev2WindowError> {
+        self.prepare_response_with(profile, keys, allocation, request, payloads, outcome)
+    }
+}
+
+impl Ikev2CommittedWindow<Ikev2CbcRecoveryProfile> {
+    /// Seal with one fresh admitted random CBC IV; no reservation is used.
+    /// Persist the exact candidate before transmission. Empty probes are refused.
+    /// # Errors
+    /// Refuses unresolved/pending work, exhausted IDs, invalid payloads or sealing failure.
+    pub fn prepare_request(
+        &mut self,
+        profile: Ikev2SaInitCryptoProfile,
+        keys: &Ikev2SaInitKeyMaterial,
+        exchange: Ikev2ExchangeKind,
+        payloads: PayloadChain<'_>,
+    ) -> Result<Ikev2PreparedWindow<'_, Ikev2CbcRecoveryProfile>, Ikev2WindowError> {
+        self.prepare_request_with(profile, keys, (), exchange, payloads)
+    }
+    /// Seal with one fresh admitted random CBC IV; no reservation is used.
+    /// Commit the exact reply and outcome atomically before releasing either.
+    /// # Errors
+    /// Refuses stale/duplicate/gapped requests and ordinary preparation failures.
+    pub fn prepare_response(
+        &mut self,
+        profile: Ikev2SaInitCryptoProfile,
+        keys: &Ikev2SaInitKeyMaterial,
+        request: &Ikev2AuthenticatedOrdinary<Ikev2CbcRecoveryProfile>,
+        payloads: PayloadChain<'_>,
+        outcome: Bytes,
+    ) -> Result<Ikev2PreparedWindow<'_, Ikev2CbcRecoveryProfile>, Ikev2WindowError> {
+        self.prepare_response_with(profile, keys, (), request, payloads, outcome)
+    }
+}

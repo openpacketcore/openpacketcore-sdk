@@ -1,3 +1,7 @@
+use super::profile::{
+    DirectionBinding, GcmSyncEvidence, Ikev2CbcRecoveryProfile as Cbc,
+    Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile,
+};
 use super::{Ikev2CommittedWindowRecord as Record, Ikev2WindowError as Error};
 use crate::{
     decode_header, Ikev2MessageIdSyncAgreement as Agreement, Ikev2MessageIdSyncMode as Mode,
@@ -32,41 +36,36 @@ pub enum Ikev2SyncDisposition {
 /// are not a separate replay-drop floor: a future minimal proposal M1 = P2 remains
 /// admissible unless ordinary or accepted-proposal history independently rejects it.
 /// These fields do not enable advertisement or initiate local synchronization.
+/// Only GCM has retained sending-IV evidence; CBC has no corresponding accessor:
+/// ```compile_fail
+/// use opc_proto_ikev2::recovery::{Ikev2CbcRecoveryProfile, Ikev2SyncResponderRecord};
+/// fn floor(record: Ikev2SyncResponderRecord<Ikev2CbcRecoveryProfile>) {
+///     let _ = record.minimum_send_iv_end();
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Ikev2SyncResponderRecord {
+pub struct Ikev2SyncResponderRecord<P: RecoveryProfile = Gcm> {
     pub(super) agreement: Agreement,
     pub(super) highest_local_request: Option<u32>,
     pub(super) highest_peer_request: Option<u32>,
     pub(super) highest_local_proposal: Option<u32>,
     pub(super) highest_peer_proposal: Option<u32>,
     pub(super) disposition: Ikev2SyncDisposition,
-    pub(super) minimum_send_iv_end: u64,
+    pub(super) packet_evidence: P::SyncEvidence,
 }
 
-impl Ikev2SyncResponderRecord {
-    /// Rebuild trusted latest fields; `None` means no known request or proposal.
-    ///
-    /// Unwritten empty requests answered before a crash cannot be reconstructed
-    /// here. Never manufacture that knowledge from a guessed snapshot. Attach to
-    /// the matching window with `Ikev2CommittedWindowRecord::with_sync_state`.
-    /// Preserve `minimum_send_iv_end` even after packet caches have been retired.
-    /// For generation-zero handshake floors, seed each ordinary history with that
-    /// direction's floor minus one; only a zero floor has no known request.
-    /// # Errors
-    /// Rejects an IV end beyond the allocator's range, exhausted proposals,
-    /// local-sync waiting without a proposal, and sync history or blocking
-    /// dispositions on a fallback-only agreement.
-    pub fn from_persisted(
+impl<P: RecoveryProfile> Ikev2SyncResponderRecord<P> {
+    // Shared arithmetic validation; profile constructors supply typed packet evidence.
+    pub(super) fn from_parts(
         agreement: Agreement,
         highest_local_request: Option<u32>,
         highest_peer_request: Option<u32>,
         highest_local_proposal: Option<u32>,
         highest_peer_proposal: Option<u32>,
         disposition: Ikev2SyncDisposition,
-        minimum_send_iv_end: u64,
+        packet_evidence: P::SyncEvidence,
     ) -> Result<Self, Error> {
-        if minimum_send_iv_end > crate::IKEV2_AES_GCM_MAX_RESERVED_ALLOCATIONS
-            || highest_local_proposal == Some(u32::MAX)
+        if highest_local_proposal == Some(u32::MAX)
             || highest_peer_proposal == Some(u32::MAX)
             || (disposition == Ikev2SyncDisposition::AwaitLocalSync
                 && highest_local_proposal.is_none())
@@ -84,7 +83,7 @@ impl Ikev2SyncResponderRecord {
             highest_local_proposal,
             highest_peer_proposal,
             disposition,
-            minimum_send_iv_end,
+            packet_evidence,
         })
     }
 
@@ -113,14 +112,8 @@ impl Ikev2SyncResponderRecord {
         self.disposition
     }
 
-    /// Smallest permitted sending-IV reservation end, including retired packets.
-    /// Persist this with every cutover; zero means no retained local-IV evidence.
-    pub const fn minimum_send_iv_end(self) -> u64 {
-        self.minimum_send_iv_end
-    }
-
-    pub(super) fn validate(self, record: &Record) -> Result<(), Error> {
-        let domain = record.domain.send_iv_domain();
+    pub(super) fn validate(self, record: &Record<P>) -> Result<(), Error> {
+        let domain = &record.domain.send;
         let role = match domain.direction() {
             Direction::InitiatorToResponder => Role::Initiator,
             Direction::ResponderToInitiator => Role::Responder,
@@ -167,5 +160,74 @@ impl Ikev2SyncResponderRecord {
             }
         }
         Ok(())
+    }
+}
+
+impl Ikev2SyncResponderRecord<Gcm> {
+    /// Rebuild trusted latest fields; `None` means no known request or proposal.
+    ///
+    /// Unwritten empty requests answered before a crash cannot be reconstructed
+    /// here. Never manufacture that knowledge from a guessed snapshot. Attach to
+    /// the matching window with `Ikev2CommittedWindowRecord::with_sync_state`.
+    /// Preserve `minimum_send_iv_end` even after packet caches have been retired.
+    /// For generation-zero handshake floors, seed each ordinary history with that
+    /// direction's floor minus one; only a zero floor has no known request.
+    /// # Errors
+    /// Rejects an IV end beyond the allocator's range, exhausted proposals,
+    /// local-sync waiting without a proposal, and sync history or blocking
+    /// dispositions on a fallback-only agreement.
+    pub fn from_persisted(
+        agreement: Agreement,
+        highest_local_request: Option<u32>,
+        highest_peer_request: Option<u32>,
+        highest_local_proposal: Option<u32>,
+        highest_peer_proposal: Option<u32>,
+        disposition: Ikev2SyncDisposition,
+        minimum_send_iv_end: u64,
+    ) -> Result<Self, Error> {
+        if minimum_send_iv_end > crate::IKEV2_AES_GCM_MAX_RESERVED_ALLOCATIONS {
+            return Err(Error::InvalidRecord);
+        }
+        Self::from_parts(
+            agreement,
+            highest_local_request,
+            highest_peer_request,
+            highest_local_proposal,
+            highest_peer_proposal,
+            disposition,
+            GcmSyncEvidence {
+                minimum_send_iv_end,
+            },
+        )
+    }
+    /// Smallest permitted sending-IV reservation end, including retired packets.
+    /// Persist this with every cutover; zero means no retained local-IV evidence.
+    pub const fn minimum_send_iv_end(self) -> u64 {
+        self.packet_evidence.minimum_send_iv_end
+    }
+}
+
+impl Ikev2SyncResponderRecord<Cbc> {
+    /// Restore CBC sync history from the same immutable epoch and window record.
+    /// This profile has no IV floor, counter, reservation or allocation evidence.
+    /// # Errors
+    /// Rejects exhausted proposals, inconsistent dispositions and fallback history.
+    pub fn from_persisted_cbc(
+        agreement: Agreement,
+        highest_local_request: Option<u32>,
+        highest_peer_request: Option<u32>,
+        highest_local_proposal: Option<u32>,
+        highest_peer_proposal: Option<u32>,
+        disposition: Ikev2SyncDisposition,
+    ) -> Result<Self, Error> {
+        Self::from_parts(
+            agreement,
+            highest_local_request,
+            highest_peer_request,
+            highest_local_proposal,
+            highest_peer_proposal,
+            disposition,
+            super::profile::CbcSyncEvidence,
+        )
     }
 }

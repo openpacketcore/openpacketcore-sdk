@@ -1,3 +1,4 @@
+use super::profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use crate::{
     Ikev2SaInitKeyMaterial as Keys, PayloadChain,
 };
 
-impl Window {
+impl<P: RecoveryProfile> Window<P> {
     /// Retain volatile sync-drop knowledge of an authenticated expected peer request.
     ///
     /// `request_disposition(New)` and `reply_empty` record this automatically,
@@ -27,7 +28,7 @@ impl Window {
     /// # Errors
     /// Requires negotiated sync, a ready window, matching domain, request direction
     /// and exactly the expected ID. It never accepts an authenticated forward gap.
-    pub fn observe_request_for_sync(&mut self, request: &Ordinary) -> Result<(), Error> {
+    pub fn observe_request_for_sync(&mut self, request: &Ordinary<P>) -> Result<(), Error> {
         self.ready()?;
         if self
             .record
@@ -50,7 +51,7 @@ impl Window {
     /// Authenticate and admit a peer sync before allocating an IV or writing state.
     ///
     /// Uses the immutable agreement attached to this window. Valid input is a
-    /// complete peer GCM SK INFORMATIONAL request at ID zero with one sync Notify.
+    /// complete same-profile peer SK INFORMATIONAL request at ID zero with one sync Notify.
     /// `pending` is the current same-SA local proposal from the initiating
     /// lifecycle; these pure values do not themselves authorize its transmission.
     /// If already synchronizing locally, omitting it cannot unblock ordinary work.
@@ -79,8 +80,8 @@ impl Window {
         keys: &Keys,
         wire: &[u8],
         pending: Option<&Pending>,
-        pending_inbound: Option<&Ordinary>,
-    ) -> Result<Ikev2AdmittedSyncResponse<'_>, Error> {
+        pending_inbound: Option<&Ordinary<P>>,
+    ) -> Result<Ikev2AdmittedSyncResponse<'_, P>, Error> {
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -107,8 +108,7 @@ impl Window {
             return Err(Error::Drop);
         }
         let pending = durable_pending.as_ref().or(pending);
-        let (header, first, cleartext) =
-            sync_packet::open_request(&self.record.domain, profile, keys, wire)?;
+        let opened = sync_packet::open_request(&self.record.domain, profile, keys, wire)?;
         let mut counters = Counters::new(
             self.record.next_send.unwrap_or(u32::MAX),
             self.next_receive().unwrap_or(u32::MAX),
@@ -132,8 +132,8 @@ impl Window {
         let (next, response) = state
             .agreement
             .evaluate_request(
-                &header,
-                PayloadChain::new(first, &cleartext),
+                &opened.header,
+                PayloadChain::new(opened.first, &opened.cleartext),
                 counters,
                 pending,
             )
@@ -160,24 +160,21 @@ impl Window {
         };
         let mut record = self.record.clone();
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
-        record.retain_local_iv_floor()?;
+        P::retain_local_evidence(self, &mut record)?;
         record.next_send = Some(next.next_send);
         record.next_receive = Some(next.next_receive);
         // Retired ordinary bytes cannot bypass the declared receive window, act as
         // new probes or cause a historical outcome to be applied again.
         record.outbound = None;
         record.inbound = None;
-        let sync = Ikev2SyncResponderRecord::from_persisted(
+        let sync = Ikev2SyncResponderRecord::<P>::from_parts(
             state.agreement,
             next.highest_local_request,
             next.highest_peer_request,
             next.highest_local_proposal,
             next.highest_peer_proposal,
             disposition,
-            record
-                .sync
-                .ok_or(Error::InvalidRecord)?
-                .minimum_send_iv_end(),
+            record.sync.ok_or(Error::InvalidRecord)?.packet_evidence,
         )?;
         sync.validate(&record)?;
         record.sync = Some(sync);
@@ -225,66 +222,44 @@ impl Window {
 
 /// Exclusive authenticated admission, freezing ordinary work before IV allocation.
 #[must_use = "seal and durably commit this cutover; cancellation requires fenced readback"]
-pub struct Ikev2AdmittedSyncResponse<'a> {
-    window: &'a mut Window,
-    record: Record,
+pub struct Ikev2AdmittedSyncResponse<'a, P: RecoveryProfile = Gcm> {
+    window: &'a mut Window<P>,
+    record: Record<P>,
     response: Sync,
 }
 
-impl<'a> Ikev2AdmittedSyncResponse<'a> {
-    /// Seal a fixed nonce-echoing response with one committed ordinary allocation.
-    ///
-    /// No block is reserved here. If no active IV remains, use the existing bounded
-    /// reservation retry guard for this same genuine peer-recovery operation:
-    /// persist each charge, keep its deadline/backoff across restart and allow at
-    /// most three fresh blocks. Duplicates cannot create or refresh that budget.
-    /// Persist one guard identity per SA key epoch and peer recovery event with
-    /// the enclosing window state; reuse it through every re-admission until a
-    /// cutover lands. A Closed guard means no reply. The caller must supply an
-    /// Ordinary allocation: this token does not carry its purpose, and supplying
-    /// Control would spend the rekey/Delete reserve.
-    /// This API grants no send permission; sealing failure burns the allocation
-    /// and leaves the window quiescent until fenced readback.
-    /// # Errors
-    /// Rejects another SA's allocation or keys and any admitted sealing failure.
-    pub fn prepare(
+impl<'a, P: RecoveryProfile> Ikev2AdmittedSyncResponse<'a, P> {
+    fn prepare_with(
         mut self,
         profile: Profile,
         keys: &Keys,
-        allocation: Ikev2AesGcmIvAllocation<'_>,
-    ) -> Result<Ikev2PreparedSyncResponse<'a>, Error> {
-        let response = sync_packet::seal_response(
-            &self.record.domain,
-            profile,
-            keys,
-            allocation,
-            self.response,
-        )?;
+        sealing: P::Sealing<'_>,
+    ) -> Result<Ikev2PreparedSyncResponse<'a, P>, Error> {
+        let response =
+            sync_packet::seal_response(&self.record.domain, profile, keys, sealing, self.response)?;
         let sync = self.record.sync.as_mut().ok_or(Error::InvalidRecord)?;
-        sync.minimum_send_iv_end = sync
-            .minimum_send_iv_end
-            .max(super::packet::sending_iv_end(&response)?);
+        P::retain_sealed(&mut sync.packet_evidence, &response)?;
         self.window
             .remember_prepared(&self.record, super::reconcile::Kind::Sync);
         Ok(Ikev2PreparedSyncResponse {
             window: self.window,
             record: self.record,
-            response,
+            response: response.into_wire(),
         })
     }
 }
 
 /// Cutover storage inputs without response bytes or effect authority.
 #[must_use = "commit the exact candidate before releasing the sync response or cleanup"]
-pub struct Ikev2PreparedSyncResponse<'a> {
-    window: &'a mut Window,
-    record: Record,
+pub struct Ikev2PreparedSyncResponse<'a, P: RecoveryProfile = Gcm> {
+    window: &'a mut Window<P>,
+    record: Record<P>,
     response: Bytes,
 }
 
-impl Ikev2PreparedSyncResponse<'_> {
+impl<P: RecoveryProfile> Ikev2PreparedSyncResponse<'_, P> {
     /// Candidate floors/history/disposition, atomically persisted with SA and operations.
-    pub const fn record(&self) -> &Record {
+    pub const fn record(&self) -> &Record<P> {
         &self.record
     }
 
@@ -296,7 +271,7 @@ impl Ikev2PreparedSyncResponse<'_> {
     /// this response permission, and the duplicate peer request is silently dropped.
     /// # Errors
     /// A mismatching acknowledgement leaves the window quiescent for readback.
-    pub fn commit_after_durable(self, committed: &Record) -> Result<Ikev2SyncCommit, Error> {
+    pub fn commit_after_durable(self, committed: &Record<P>) -> Result<Ikev2SyncCommit, Error> {
         if committed != &self.record {
             return Err(Error::CommitMismatch);
         }
@@ -340,5 +315,45 @@ impl Ikev2SyncResponse {
     /// retransmit a sync reply in response to a duplicate request.
     pub fn into_parts(self) -> (Bytes, Disposition) {
         (self.bytes, self.disposition)
+    }
+}
+
+impl<'a> Ikev2AdmittedSyncResponse<'a, Gcm> {
+    /// Seal a fixed nonce-echoing response with one committed ordinary allocation.
+    ///
+    /// No block is reserved here. If no active IV remains, use the existing bounded
+    /// reservation retry guard for this same genuine peer-recovery operation:
+    /// persist each charge, keep its deadline/backoff across restart and allow at
+    /// most three fresh blocks. Duplicates cannot create or refresh that budget.
+    /// Persist one guard identity per SA key epoch and peer recovery event with
+    /// the enclosing window state; reuse it through every re-admission until a
+    /// cutover lands. A Closed guard means no reply. The caller must supply an
+    /// Ordinary allocation: this token does not carry its purpose, and supplying
+    /// Control would spend the rekey/Delete reserve.
+    /// This API grants no send permission; sealing failure burns the allocation
+    /// and leaves the window quiescent until fenced readback.
+    /// # Errors
+    /// Rejects another SA's allocation or keys and any admitted sealing failure.
+    pub fn prepare(
+        self,
+        profile: Profile,
+        keys: &Keys,
+        allocation: Ikev2AesGcmIvAllocation<'_>,
+    ) -> Result<Ikev2PreparedSyncResponse<'a, Gcm>, Error> {
+        self.prepare_with(profile, keys, allocation)
+    }
+}
+
+impl<'a> Ikev2AdmittedSyncResponse<'a, super::Ikev2CbcRecoveryProfile> {
+    /// Seal using one fresh admitted random CBC IV, without an allocation token.
+    /// Persist the exact candidate before releasing its one-use action.
+    /// # Errors
+    /// Key/profile mismatch or provider failure retains quiescence for fenced readback.
+    pub fn prepare(
+        self,
+        profile: Profile,
+        keys: &Keys,
+    ) -> Result<Ikev2PreparedSyncResponse<'a, super::Ikev2CbcRecoveryProfile>, Error> {
+        self.prepare_with(profile, keys, ())
     }
 }

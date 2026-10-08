@@ -217,6 +217,68 @@ or FIPS 140-3 claim**. `Ikev2CanonicalPolicy::default()` refuses a module declar
 the dedicated consumer opt-in. It bypasses neither qualification, module policy
 nor packet checks. General module admission is not canonical opt-in.
 
+`Ikev2CanonicalEmptyReplies::preflight_cbc(profile, policy)` separately qualifies
+the frozen CBC byte recipe. All 48 combinations of AES-128/192/256, the four
+supported integrity transforms and the four supported PRFs have independent
+known answers covering both directions and four Message IDs. Qualification
+includes the derived IV key, IV and full packet; failures latch per profile.
+Cached success still checks current cipher, integrity and PRF admission and
+keeps declared-validated opt-in off by default. The release check independently
+inverts the IV and verifies the MAC before decrypting traffic ciphertext.
+This preflight persists nothing and grants no receive or send authority.
+Production CBC canonical replies are available through the checked window's
+`enable_empty_replies`. Before admitting a DPD-sending deployment, run
+`preflight_cbc` for every intended CBC profile and refuse the configuration if
+any preflight fails. Refusal has no ordinary-IV or alternate-provider fallback.
+Current provider qualification, immutable binding and lifecycle checks still
+apply on enablement and every reply, including cached replies.
+The [CBC construction](../../docs/ikev2-canonical-empty-replies.md#cbc-v1-extension)
+records the SP 800-38A interpretation and makes no validation claim. The
+[independent generator](tests/data/canonical_empty_cbc_v1.py) checks published
+AES, HMAC and IKEv2 KDF vectors before reproducing the frozen packets; its
+[qualification record](tests/data/canonical_empty_cbc_v1.provenance.json) records
+the inputs, versions and output digest. Ordinary CBC sealing retains one
+16-octet entropy draw per new packet, with no IV rejection or inverse check.
+
+### Typed CBC recovery
+
+`Ikev2CbcEpochRecord::fresh(Ikev2CbcEpochInputs { ... })` binds a genuinely fresh
+established epoch to CBC-V1. Commit the complete descriptor atomically with its
+keys and window before using it. Its immutable binding includes both nonzero
+SPIs, original sending direction, AES key size, integrity transform, PRF, SK_d,
+both SK_e keys and both SK_a keys. Either equal directional key pair is refused.
+`from_persisted(inputs, marker)` restores the exact stored marker, including an
+absent or unknown marker; never replace either with a fresh marker on an existing
+epoch. Rekey creates a new descriptor from fresh keys. Delete the old canonical
+state only when the old SA is deleted.
+Use `window.delete()` for a live runtime, or
+`Ikev2CanonicalEmptyReplies::<Ikev2CbcRecoveryProfile>::delete_cbc_epoch(&epoch)`
+when teardown has only the stored CBC epoch.
+
+Derive `Ikev2CommittedWindowDomain<Ikev2CbcRecoveryProfile>` with
+`from_cbc_epoch(&epoch)`. The corresponding window, window record, authenticated
+ordinary packet and sync metadata carry that same CBC profile. Their GCM
+counterparts remain the defaults on existing types. Dispatch is sealed: callers
+cannot define another profile or mix authenticated packets and records between
+profiles.
+
+| Recovery operation | GCM | CBC |
+| --- | --- | --- |
+| Epoch evidence passed to `restore` and `reconcile` | Sending `Ikev2AesGcmIvRecord` | Immutable `Ikev2CbcEpochRecord` |
+| Ordinary request/response and sync `prepare` | One committed Ordinary allocation | Profile and keys, with one admitted random 16-octet IV draw |
+| Stored sync constructors | Existing `from_persisted` with IV evidence | `from_persisted_cbc`, with no IV evidence |
+| Readback binding | Only the reserved IV high-water may increase | Every descriptor field must remain identical |
+
+CBC restore authenticates the stored packets without interpreting random IVs as
+counters. It has no allocator, reservation retry state, IV ceiling or persisted
+IV floor. A change to SK_d, PRF or a receive-side key is terminal even if a cached
+locally sent packet still authenticates. The retryable readback pre-check covers
+the admitted cipher, integrity transform and PRF before any record validation.
+Sync readiness covers the cipher, integrity transform and entropy. The shared
+witness equality, token fences, clock and receive-window rules below apply to CBC.
+Canonical reply bytes and the derived IV key remain volatile and zeroizing;
+neither is a persistence field.
+
 ### Constructor migration
 
 | Former public use | Replacement |
@@ -261,32 +323,36 @@ still withholds the reply and never enables a fallback.
 
 ## Committed ordinary windows and exact replay
 
-`recovery::Ikev2CommittedWindow` is an opt-in window-one profile for complete,
-unfragmented AES-GCM `SK` packets. It uses the admitted crypto module, binds both
-sending and receiving keys/salts plus the SPI pair and original role, and works
-with all three supported GCM key sizes. `SKF` and CBC recovery are outside this
-profile. Empty handling is opt-in and includes prefix reconstruction after restore.
+`recovery::Ikev2CommittedWindow` is an opt-in window-one runtime for complete,
+unfragmented GCM or CBC `SK` packets through the admitted crypto module. The
+default GCM profile binds both sending and receiving keys/salts plus the SPI pair
+and original role; the CBC profile uses the complete descriptor above. `SKF`
+recovery remains unsupported. Empty handling is opt-in and includes prefix
+reconstruction after restore and current canonical qualification.
 Existing generic crypto and fragmentation APIs retain their separate contracts.
 
 Commit an initial `Ikev2CommittedWindowRecord` with the new key epoch and correct
 post-handshake floors, then `restore` from the latest trusted fenced record.
 Zero means no prior request; an exhausted direction is explicitly `None`.
-Supply the latest sending `Ikev2AesGcmIvRecord` to `restore` as well. Restore
+Supply the latest sending `Ikev2AesGcmIvRecord` for GCM or the immutable
+`Ikev2CbcEpochRecord` for CBC to `restore` as well. Restore
 validates cached packet authentication, directions, exchange correlation and
-counter consistency, and requires the sending-IV record's `exclusive_end` to
-exceed the IV in every cached outbound request and inbound response. Peer IVs
-belong to the other key and do not constrain this high-water. Restore the IV
+counter consistency. GCM additionally requires the sending-IV record's
+`exclusive_end` to exceed the IV in every cached outbound request and inbound
+response. Peer IVs belong to the other key and do not constrain this high-water.
+Restore the IV
 allocator from that same record, discarding its unused tail. This cross-check
 detects inconsistency visible in the cache; it cannot detect rollback of both
 records or prove the absence of forgotten IV use.
 
 Consumer serialization uses the record accessors and
 `from_persisted` constructors; this module defines no store format. Never seed
-it from a legacy window snapshot or an unknown IV history. The legacy responder
+it from a legacy window snapshot; GCM also requires known IV history. The legacy responder
 window accepts forward gaps and is insufficient for this durable profile.
 
-Prepare a local request with a slice-3 single-use IV allocation. Persist the
-exact candidate record atomically with the SA and operation, then acknowledge
+Prepare a local GCM request with a single-use IV allocation, or a CBC request
+without an allocation argument. Persist the exact candidate record atomically
+with the SA and operation, then acknowledge
 it with `commit_after_durable`. Only then may `replay_request` release the exact
 packet. One outbound request remains pending until an authenticated matching
 response and consumer-validated outcome are committed. Outcomes are opaque
@@ -310,17 +376,18 @@ Any sync Notify is excluded from ordinary state, including ordinary Message ID 0
 Prepared record accessors exist for persistence, not transmission. Equality of
 an acknowledgement checks identity, not durability. Cancellation, failure or an
 uncertain commit leaves the runtime quiescent. Fence/settle all older writes,
-read the window and IV records from one consistent snapshot, and call
-`window.reconcile(profile, keys, &record, &iv_record)` in place. Reconcile accepts
+read the window and epoch records from one consistent snapshot, and call
+`window.reconcile(profile, keys, &record, &epoch_record)` in place. Reconcile accepts
 only the exact last acknowledged record or this runtime's private prepared
 candidate. It retains the same canonical capability, cache, attempts and release
 history without acquiring a capability, sealing a packet or granting effects.
 Unchanged and outbound-only readback retain the live receive floor, phase,
 pending identity and last applicable empty reply. A newly landed inbound or sync
 boundary retires superseded replies and adopts the maximum live/recorded floor,
-including CloseIkeSa and exhaustion. Keep the live IV allocator: prepared IVs
-and ranges remain burned. Only the IV record's high-water may rise; it must
-cover sealed candidates even when their window record did not land.
+including CloseIkeSa and exhaustion. For GCM, keep the live IV allocator:
+prepared IVs and ranges remain burned. Only its IV record's high-water may rise;
+it must cover sealed candidates even when their window record did not land.
+CBC's complete epoch descriptor stays identical and carries no IV high-water.
 
 `ReconcileUnavailable` means the provider pre-check failed before validation:
 retain the quiescent runtime and retry. Every other reconcile error is terminal;
@@ -334,7 +401,7 @@ Use `restore` at process start, followed by `enable_empty_replies` to recover a
 lost zero-write prefix. If replacing a runtime within one process is unavoidable,
 drop or overwrite the old runtime before enabling empty replies on its replacement;
 while the old capability lives, enable returns `Canonical(CapabilityActive)`.
-Read the window and IV records from one consistent fenced snapshot before
+Read the window and epoch records from one consistent fenced snapshot before
 restore. A refused enable preserves the
 checked runtime for retry after a pending sync completes or the old capability
 drops. Restore-replacement in one process still discards the last empty reply's cached
@@ -464,17 +531,18 @@ stored format must require all persisted sync/recovery fields: omitting
 `with_sync_state` can produce a structurally valid ordinary-only record and is
 not detected by these hooks.
 
-Call `begin_sync_response` before allocating an IV or creating reservation work.
-It authenticates complete peer GCM `SK` packets through the admitted provider and
+Call `begin_sync_response` before sealing or, for GCM, allocating an IV or
+creating reservation work. It authenticates complete peer GCM or CBC `SK`
+packets through the admitted provider and
 requires negotiated mode, the matching SA/original direction, INFORMATIONAL
 request at ID zero, and exactly one sync Notify. Bad, unnegotiated and duplicate
 requests drop without freezing the window or allocating an IV. Both original
-roles can respond. `SKF` and CBC recovery remain unsupported.
+roles can respond. `SKF` recovery remains unsupported.
 
-Admission returns an exclusive capability and freezes ordinary work. The caller
-must supply `prepare` a committed single-use **Ordinary** IV allocation to seal
-the fixed nonce-echoing P2/M2 reply; it does not reserve a block. When a new block
-is necessary, use the bounded reservation guard below with the same recovery
+Admission returns an exclusive capability and freezes ordinary work. For GCM,
+the caller must supply `prepare` a committed single-use **Ordinary** IV allocation
+to seal the fixed nonce-echoing P2/M2 reply; it does not reserve a block. When a
+new block is necessary, use the bounded reservation guard below with the same recovery
 operation, fixed deadline/backoff and at most three fresh-block attempts across
 restart. Allocation tokens carry no purpose: supplying **Control** would spend
 the rekey/Delete reserve. Persist one guard identity per SA key epoch and peer
@@ -482,6 +550,8 @@ recovery event with the enclosing window state, and reuse it for every
 re-admission until a cutover lands. A `Closed` guard permits no reply; the peer's
 own recovery budget then decides its SA's fate. A duplicate packet cannot
 manufacture a new operation or replenish that budget.
+CBC `prepare(profile, keys)` instead draws one fresh admitted random IV, with
+no allocation or reservation guard. It echoes the peer's authenticated nonce.
 
 Persist `Ikev2PreparedSyncResponse::record()` and the consumer's operation
 dispositions together, then acknowledge the exact record with
@@ -489,10 +559,11 @@ dispositions together, then acknowledge the exact record with
 before any later commit. Only this releases reply bytes and disposition.
 The cutover commits new floors, the highest accepted peer M1 and a new ordinary
 generation; it retires ordinary replay caches and fences old completion tokens.
-Its `minimum_send_iv_end` retains the largest locally sent cached/attempt/reply
+For GCM, `minimum_send_iv_end` retains the largest locally sent cached/attempt/reply
 IV plus one across successive cutovers. Persist and restore this field even
 when the caches are empty; window restore refuses a lower sending-IV record.
-Rolling back both records together remains undetectable.
+Rolling back both records together remains undetectable. CBC has no corresponding
+IV field; the complete epoch descriptor remains unchanged.
 Below-window, above-window and retired cached requests cannot bypass the newly
 declared receive window. Preserve already committed outcomes as idempotent
 consumer history in the same durable SA state.
@@ -517,8 +588,9 @@ qualification must decide whether to add one narrowly committed Delete using
 Control headroom or keep that local-only policy.
 
 Cancellation, failed sealing or uncertain/mismatching commitment leaves the
-window quiescent. Fence/settle old writes and restore the latest window and IV
-records; discard the unused IV tail. A landed cutover never recreates its reply
+window quiescent. Fence/settle old writes and reconcile the latest window and
+epoch records in place. At process start, restore instead and discard the unused
+GCM IV tail. A landed cutover never recreates its reply
 permission. Sync replies are not cached: M1 at or below known peer ordinary or
 accepted-proposal history drops, even with a different nonce or after restart.
 Lost replies require the peer's higher fresh proposal.
@@ -552,8 +624,9 @@ Fix an `Ikev2SyncRecoveryPolicy` with that identity, original clock sample,
 exclusive deadline, positive retry delay and at most three proposals total.
 Admission freezes ordinary traffic before allocation. Its `prepare` generates a
 four-octet nonce only through the admitted module's entropy service, checks up to
-four draws against every nonce in this event's bounded history, and seals with a
-committed **Ordinary** IV allocation. It accepts no consumer nonce or RNG. Use the
+four draws against every nonce in this event's bounded history. GCM seals with a
+committed **Ordinary** IV allocation; CBC takes a separate admitted 16-octet
+random-IV draw. It accepts no consumer nonce or RNG. For GCM, use the
 same event's bounded reservation guard when another block is needed; failed
 proposal writes never refund fresh-block charges.
 Choosing Ordinary remains the caller's obligation here too; the token carries
@@ -586,7 +659,8 @@ response-completion authority; a higher fresh proposal is required. The responde
 can still merge that persisted pending proposal during simultaneous sync.
 Trusted pending/attempt/recovery constructors validate history and floors;
 window restoration authenticates all stored attempts and checks nonce/packet
-identity, increasing IVs and the sending-IV high-water. Never omit existing
+identity. GCM also checks increasing IVs and the sending-IV high-water; CBC
+random IVs have no ordering or counter-coverage constraint. Never omit existing
 recovery fields or replace the policy on readback.
 
 `Ikev2SyncClock` names UTC milliseconds since the Unix epoch, with CLOCK_REALTIME
@@ -609,18 +683,20 @@ Uncertain writes still require fencing and latest readback before any retry.
 
 ### Runtime readiness for support offers
 
-Before IKE_AUTH, a fresh initial GCM window can mint `Ikev2SyncReadiness` with
-`sync_readiness`. It checks the key domain/profile and current admitted encryption
-and entropy. Consume it with `negotiate`; `local_offer` rechecks admission and
-emits support only under the original-role/EAP offer rules. `observe_peer` takes
+Before IKE_AUTH, a fresh initial GCM or CBC window can mint `Ikev2SyncReadiness`
+with `sync_readiness`. It checks the key domain/profile and current admitted
+encryption and entropy, plus integrity for CBC. Consume it with `negotiate`;
+`local_offer` rechecks admission and emits support only under the
+original-role/EAP offer rules. `observe_peer` takes
 an authenticated same-domain ordinary packet, and `finish` still requires the
 consumer's full IKE_AUTH authentication result. Active/negotiated windows cannot
 mint new handshake readiness. The pure `locally_ready` boolean and generic Notify
 builders do not replace this production path.
 
-This capability covers the two complete-GCM sync handlers. It does not establish
-consumer storage correctness, canonical empty-reply readiness, fragmented/CBC
-recovery or complete restart-recovery qualification.
+This capability covers both complete-SK sync handlers for the selected profile.
+It does not establish consumer storage correctness, canonical empty-reply
+readiness, fragmented recovery or composed peer qualification. Qualify canonical
+CBC replies separately with `preflight_cbc` before enabling them on the window.
 
 ### Bounded IV reservation attempts
 

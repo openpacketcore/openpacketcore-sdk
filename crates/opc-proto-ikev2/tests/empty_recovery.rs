@@ -24,6 +24,195 @@ mod canonical_fixtures;
 mod support;
 use canonical_fixtures::{delete, empty, Fixture, ALGORITHMS, DIRECTIONS};
 
+#[test]
+fn production_cbc_canonical_replies_match_frozen_packets_without_fixture() {
+    // Frozen traffic keys are reused across PRFs. Isolate each PRF and policy in
+    // a real process; the production ledger must refuse a changed key binding.
+    if let Ok(prf) = std::env::var("OPC_CBC_PRODUCTION_PRF") {
+        let policy = match std::env::var("OPC_CBC_PRODUCTION_POLICY").unwrap().as_str() {
+            "default" => Policy::default(),
+            "allow-declared" => Policy::explicitly_allow_declared_validated(),
+            _ => panic!("unknown test policy"),
+        };
+        cbc_production_frozen_packets(prf.parse().unwrap(), policy);
+        return;
+    }
+    for prf in [2, 5, 6, 7] {
+        for policy in ["default", "allow-declared"] {
+            use std::io::Read;
+            use std::process::{Command, Stdio};
+            use std::time::{Duration, Instant};
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "production_cbc_canonical_replies_match_frozen_packets_without_fixture",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("OPC_CBC_PRODUCTION_PRF", prf.to_string())
+                .env("OPC_CBC_PRODUCTION_POLICY", policy)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let out = std::thread::spawn(move || {
+                let mut text = String::new();
+                stdout.read_to_string(&mut text).unwrap();
+                text
+            });
+            let mut stderr = child.stderr.take().unwrap();
+            let err = std::thread::spawn(move || {
+                let mut text = String::new();
+                stderr.read_to_string(&mut text).unwrap();
+                text
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (status, timed_out) = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break (status, false);
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break (child.wait().unwrap(), true);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = out.join().unwrap();
+            let stderr = err.join().unwrap();
+            assert!(
+                !timed_out && status.success(),
+                "PRF {prf}, {policy}: {status}, timed out={timed_out}\n{stdout}\n{stderr}"
+            );
+            assert!(stdout.contains("CBC_PRODUCTION_VECTORS:96"));
+        }
+    }
+}
+
+fn cbc_production_frozen_packets(prf_id: u16, policy: Policy) {
+    use canonical_fixtures::{hex, opposite, SPIS};
+    use opc_proto_ikev2::{
+        recovery::{Ikev2CbcEpochInputs, Ikev2CbcEpochRecord as Epoch},
+        seal_ikev2_sa_init_aes_cbc_protected_payload, Ikev2DhGroup,
+        Ikev2EncryptionAlgorithm as Encryption, Ikev2IntegrityAlgorithm as Integrity,
+        Ikev2PrfAlgorithm as Prf, Ikev2SaInitCryptoProfile as Profile,
+        Ikev2SaInitKeyMaterial as Keys, ProtectedPayloadKind, ProtectedPayloadSealContext,
+    };
+    support::ensure_ike_crypto();
+    assert!([2, 5, 6, 7].contains(&prf_id));
+    // This target links the library without cfg(test), under both default and
+    // all features. Expected bytes come from the independent frozen vectors.
+    let vectors: Vec<Vec<&str>> = include_str!("../src/canonical/cbc_v1.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split_ascii_whitespace().collect())
+        .collect();
+    assert_eq!(vectors.len(), 384);
+    let mut profiles_and_roles = 0;
+    let mut packets = 0;
+    for rows in vectors.as_chunks::<4>().0 {
+        let fields = &rows[0];
+        if fields[2].parse::<u16>().unwrap() != prf_id {
+            continue;
+        }
+        let peer = vectors
+            .iter()
+            .find(|row| row[..3] == fields[..3] && row[3] != fields[3] && row[4] == "00000000")
+            .unwrap();
+        let direction = match fields[3] {
+            "I" => DIRECTIONS[0],
+            "R" => DIRECTIONS[1],
+            _ => panic!("frozen original role"),
+        };
+        let (initiator, responder) = if direction == DIRECTIONS[0] {
+            (fields, peer)
+        } else {
+            (peer, fields)
+        };
+        let encryption = match fields[0] {
+            "128" => Encryption::AesCbc128,
+            "192" => Encryption::AesCbc192,
+            "256" => Encryption::AesCbc256,
+            _ => panic!("frozen AES key size"),
+        };
+        let profile = Profile::new_encrypt_then_mac(
+            Prf::from_transform_id(prf_id).unwrap(),
+            Ikev2DhGroup::Modp2048,
+            encryption,
+            Integrity::from_transform_id(fields[1].parse().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let n = profile.prf().output_len();
+        let keys = Keys::from_established_keys(
+            profile,
+            false,
+            &hex(fields[5]),
+            &hex(initiator[7]),
+            &hex(responder[7]),
+            &hex(initiator[6]),
+            &hex(responder[6]),
+            &vec![0x11; n],
+            &vec![0x22; n],
+        )
+        .unwrap();
+        Canonical::preflight_cbc(profile, policy).unwrap();
+        let epoch = Epoch::fresh(Ikev2CbcEpochInputs {
+            initiator_spi: SPIS.0,
+            responder_spi: SPIS.1,
+            sending_direction: direction,
+            profile,
+            keys: &keys,
+        })
+        .unwrap();
+        let domain = Domain::from_cbc_epoch(&epoch);
+        let record = Record::initial(domain.clone(), 1, 0);
+        let mut window = Window::restore(&domain, profile, &keys, &record, &epoch).unwrap();
+        window.enable_empty_replies(policy).unwrap();
+        assert_eq!(window.ready(), Ok(()));
+        assert_eq!(window.record(), &record);
+        drop(window);
+        let mut window = Window::restore(&domain, profile, &keys, &record, &epoch).unwrap();
+        window.enable_empty_replies(policy).unwrap();
+        for row in rows {
+            let id = u32::from_str_radix(row[4], 16).unwrap();
+            let expected = hex(row[10]);
+            let mut request = expected[..32].to_vec();
+            request[19] = if direction == DIRECTIONS[0] { 0 } else { 8 };
+            let body = seal_ikev2_sa_init_aes_cbc_protected_payload(
+                profile,
+                &keys,
+                opposite(direction),
+                ProtectedPayloadSealContext {
+                    kind: ProtectedPayloadKind::Encrypted,
+                    message_prefix: &request,
+                },
+                &[],
+            )
+            .unwrap();
+            request.extend_from_slice(&body);
+            let request = window.open_peer(profile, &keys, &request).unwrap();
+            let reply = window.reply_empty(&request).unwrap();
+            assert_eq!(reply.observation(), Observation::Uncertain);
+            assert_eq!(reply.bytes(), expected, "frozen CBC packet {row:?}");
+            drop(reply);
+            assert_eq!(window.next_receive(), id.checked_add(1));
+            window.reconcile(profile, &keys, &record, &epoch).unwrap();
+            let replay = window.reply_empty(&request).unwrap();
+            assert_eq!(replay.observation(), Observation::Replayed);
+            assert_eq!(replay.bytes(), expected);
+            drop(replay);
+            assert_eq!(window.record(), &record);
+            packets += 1;
+        }
+        window.delete();
+        profiles_and_roles += 1;
+    }
+    assert_eq!(profiles_and_roles, 24);
+    assert_eq!(packets, 96);
+    println!("CBC_PRODUCTION_VECTORS:{packets}");
+}
+
 fn fixture(tag: u64) -> Fixture {
     support::ensure_ike_crypto();
     Fixture::new(tag, ALGORITHMS[0], DIRECTIONS[0])

@@ -2080,16 +2080,31 @@ async fn shutdown_consensus_session_store(
         let wal = Arc::clone(wal);
         // Joining a disk writer must leave the runtime free to enforce each
         // caller's deadline while this shared coordinator retains the drain.
-        tokio::task::spawn_blocking(move || {
+        let physical_result = tokio::task::spawn_blocking(move || {
             if closed {
                 wal.shutdown_after_consensus()
             } else {
                 wal.shutdown()
             }
         })
-        .await
-        .map_err(|_| consensus_unavailable())?
-        .map_err(|_| consensus_unavailable())?;
+        .await;
+        #[cfg(test)]
+        match &physical_result {
+            Ok(Ok(())) => eprintln!("shutdown_observation physical_wal=completed"),
+            Ok(Err(error)) => eprintln!(
+                "shutdown_observation physical_wal=failed kind={:?} os_error={:?}",
+                error.kind(),
+                error.raw_os_error(),
+            ),
+            Err(error) => eprintln!(
+                "shutdown_observation physical_wal=join_failed cancelled={} panicked={}",
+                error.is_cancelled(),
+                error.is_panic(),
+            ),
+        }
+        physical_result
+            .map_err(|_| consensus_unavailable())?
+            .map_err(|_| consensus_unavailable())?;
         return raft_result;
     }
     inner
@@ -3962,12 +3977,21 @@ impl ConsensusSessionStore {
             .inner
             .shutdown
             .start_or_subscribe(Arc::clone(&self.inner), allow_closed_proof);
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             self.inner.operation_timeout,
             await_consensus_session_store_shutdown(completion),
         )
-        .await
-        .unwrap_or_else(|_| Err(consensus_unavailable()))
+        .await;
+        #[cfg(test)]
+        eprintln!(
+            "shutdown_observation caller_outcome={}",
+            match &result {
+                Err(_) => "deadline",
+                Ok(Ok(())) => "completed",
+                Ok(Err(_)) => "coordinator_error",
+            }
+        );
+        result.unwrap_or_else(|_| Err(consensus_unavailable()))
     }
 
     /// Hold the test-only phase immediately before the real Raft shutdown.
