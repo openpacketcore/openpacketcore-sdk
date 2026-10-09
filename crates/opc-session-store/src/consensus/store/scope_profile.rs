@@ -2,18 +2,18 @@
 
 use super::*;
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
-use crate::scope_lease::{scope_profile_digest, ScopeProfileActivation};
+use crate::scope_authority::{scope_profile_digest, ScopeProfileActivation};
 use crate::scope_storage::{profile_key, ScopeRow};
 use crate::sqlite::consensus::TerminalMembershipOutcome;
 
-const PROBE_DOMAIN: [u8; 8] = *b"opc-sp-3";
-const REPLY_DOMAIN: [u8; 8] = *b"opc-sr-3";
-pub(super) const READ_BARRIER_DOMAIN: [u8; 8] = *b"opc-sb-3";
+const PROBE_DOMAIN: [u8; 8] = *b"opc-sp-4";
+const REPLY_DOMAIN: [u8; 8] = *b"opc-sr-4";
+pub(super) const READ_BARRIER_DOMAIN: [u8; 8] = *b"opc-sb-4";
 
 pub(super) fn is_scope_command(intent: &SessionMutationIntent) -> bool {
     matches!(
         intent,
-        SessionMutationIntent::ScopeLease(_) | SessionMutationIntent::ScopeBatch(_)
+        SessionMutationIntent::ScopeAuthority(_) | SessionMutationIntent::ScopeBatch(_)
     )
 }
 
@@ -33,7 +33,7 @@ pub(super) struct ScopeProfileReply {
 
 pub(super) fn request_id(scope: SessionConsensusIdentity) -> SessionConsensusRequestId {
     let mut hash = Sha256::new();
-    hash.update(b"openpacketcore/scope-profile/activation/3\0");
+    hash.update(b"openpacketcore/scope-profile/activation/4\0");
     hash.update(scope.cluster_id().as_bytes());
     hash.update(scope.configuration_id().as_bytes());
     hash.update(scope.configuration_epoch().get().to_be_bytes());
@@ -174,7 +174,7 @@ impl ConsensusSessionStore {
         .await
     }
 
-    /// Activate the exact scope lease and child-batch profile for the current
+    /// Activate the exact scope authority and child-batch profile for the current
     /// voter configuration. Initial activation requires every voter; later
     /// requests use the durable certificate and ordinary quorum availability
     /// across configuration changes. Membership transitions durably certify
@@ -252,7 +252,7 @@ impl ConsensusSessionStore {
         if self.activated_scope_profile_is_current(deadline).await? {
             return Ok(());
         }
-        self.activate_capability_before(deadline, CapabilityActivationKind::ScopeProfileV3)
+        self.activate_capability_before(deadline, CapabilityActivationKind::ScopeProfileV4)
             .await
     }
 
@@ -281,7 +281,7 @@ impl ConsensusSessionStore {
                 self.inner.storage_identity,
                 expected.0,
                 expected.1.clone(),
-                CapabilityActivationKind::ScopeProfileV3,
+                CapabilityActivationKind::ScopeProfileV4,
             )
             .await?
         {
@@ -346,5 +346,5 @@ impl ConsensusSessionStore {
 }
 
 fn unsupported() -> StoreError {
-    StoreError::CapabilityNotSupported("scope_store_profile_v3".into())
+    StoreError::CapabilityNotSupported("scope_store_profile_v4".into())
 }

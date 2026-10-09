@@ -4510,5 +4510,5 @@ fn take_one(counter: &AtomicUsize) -> bool {
     }
 }
 
-#[path = "dynamic_membership/scope_lease.rs"]
-mod scope_lease;
+#[path = "dynamic_membership/scope_authority.rs"]
+mod scope_authority;

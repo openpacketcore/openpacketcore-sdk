@@ -1,8 +1,8 @@
-//! Live native persistence, compaction and cold reopen with thousands of renewals.
+//! Live native persistence, compaction and cold reopen with thousands of successions.
 
 use super::*;
-use crate::scope_lease::tests::{at, bounds, execution, identity};
-use crate::scope_lease::*;
+use crate::scope_authority::tests::{at, execution, identity};
+use crate::scope_authority::*;
 use std::sync::atomic::AtomicU64;
 
 #[derive(Debug)]
@@ -12,27 +12,46 @@ impl crate::Clock for Clock {
         at(self.0.load(Ordering::SeqCst) as i64)
     }
 }
-impl ScopeLeaseClock for Clock {
-    fn bounds(&self) -> Result<ScopeClockBounds, ScopeLeaseError> {
-        Ok(bounds(self.0.load(Ordering::SeqCst) as i64))
-    }
-}
 pub(super) struct Admission;
 #[async_trait]
-impl ScopeLeaseAdmission for Admission {
+impl ScopeAuthorityAdmission for Admission {
     async fn authorize(
         &self,
         authenticated: &crate::SessionConsumerIdentity,
-        _: &ScopeLeaseId,
+        _: &ScopeId,
         claim: Option<&ScopeExecution>,
-        action: ScopeLeaseAction,
-    ) -> Result<(), ScopeLeaseError> {
-        let permitted = match action {
-            ScopeLeaseAction::Select => authenticated == &identity("controller"),
-            _ => authenticated == &identity("worker-1"),
-        } && claim.is_none_or(|claim| claim == &execution(1));
-        permitted.then_some(()).ok_or(ScopeLeaseError::Unauthorized)
+        _: ScopeAuthorityAction,
+        _: Option<[u8; 32]>,
+    ) -> Result<ScopeAuthorityRole, ScopeAuthorityError> {
+        if authenticated == &identity("controller") {
+            return Ok(ScopeAuthorityRole::ScopeController);
+        }
+        if authenticated == &identity("worker-1")
+            && claim.is_none_or(|value| {
+                value == &execution(1) || value == &boot(value.admission_generation())
+            })
+        {
+            Ok(ScopeAuthorityRole::Worker)
+        } else {
+            Err(ScopeAuthorityError::Unauthorized)
+        }
     }
+    async fn verify_closure(
+        &self,
+        _: &crate::SessionConsumerIdentity,
+        _: &ScopeAuthorityStamp,
+        _: &ScopeClosureEvidence,
+        _: [u8; 32],
+    ) -> Result<(), ScopeAuthorityError> {
+        Ok(())
+    }
+}
+fn boot(generation: u64) -> ScopeExecution {
+    let process = u128::from(generation).to_le_bytes();
+    let mut key = [0; 32];
+    key[..16].copy_from_slice(&process);
+    key[16..].copy_from_slice(&process);
+    ScopeExecution::new(identity("worker-1"), generation, [1; 16], process, key).unwrap()
 }
 
 pub(super) async fn compact(store: &ConsensusSessionStore) -> u64 {
@@ -75,24 +94,24 @@ pub(super) async fn compact(store: &ConsensusSessionStore) -> u64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admission() {
+async fn scope_authority_construction_ignores_owner_contention_but_reads_retain_admission() {
     let snapshots =
         tempfile::tempdir_in(std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").unwrap()).unwrap();
-    let mut fleet = Fleet::new_native("scope_lease_construction");
+    let mut fleet = Fleet::new_native("scope_authority_construction");
     fleet.snapshot_root = Some(snapshots.path().to_path_buf());
     let clock = Arc::new(Clock(AtomicU64::new(0)));
     fleet.clock = Some(clock.clone());
     fleet.open().await;
     let result = AssertUnwindSafe(async {
         let configured = fleet.topologies[0].consensus_identity().unwrap();
-        let scope = ScopeLeaseId::new(
+        let scope = ScopeId::new(
             configured,
             TenantId::from_static("scope-construction"),
             NetworkFunctionKind::smf(),
             [1; 32],
         )
         .unwrap();
-        let other_cluster = ScopeLeaseId::new(
+        let other_cluster = ScopeId::new(
             SessionConsensusIdentity::new(
                 ConsensusClusterId::new("another-scope-cluster").unwrap(),
                 configured.configuration_id(),
@@ -107,7 +126,7 @@ async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admi
             let wal = store.inner.private_wal.as_ref().unwrap();
             let (discovery, constructed, wrong_cluster) = wal
                 .with_native_owner_held_for_test(|| {
-                    let configured_scope = ScopeLeaseId::new(
+                    let configured_scope = ScopeId::new(
                         fleet.topologies[0].consensus_identity().unwrap(),
                         TenantId::from_static("scope-construction"),
                         NetworkFunctionKind::smf(),
@@ -120,16 +139,14 @@ async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admi
                     // to make synchronous authority discovery unavailable.
                     (
                         store.consumer_scope(),
-                        ScopeLeaseStore::new(
+                        ScopeAuthorityStore::new(
                             Arc::new(store.clone()),
                             configured_scope,
-                            clock.clone(),
                             Arc::new(Admission),
                         ),
-                        ScopeLeaseStore::new(
+                        ScopeAuthorityStore::new(
                             Arc::new(store.clone()),
                             other_cluster.clone(),
-                            clock.clone(),
                             Arc::new(Admission),
                         ),
                     )
@@ -138,35 +155,40 @@ async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admi
             assert!(discovery.is_err(), "the real authority reader is busy");
             let authority = constructed
                 .expect("constructing a scope handle must not require an idle authority reader");
-            assert!(matches!(wrong_cluster, Err(ScopeLeaseError::Unauthorized)));
+            assert!(matches!(
+                wrong_cluster,
+                Err(ScopeAuthorityError::Unauthorized)
+            ));
 
             let caller = identity("worker-1");
             let view = authority.current(&caller).await.unwrap();
             assert_eq!(view.revision(), 0);
-            assert!(view.permit().is_none());
+            assert!(view.stamp().is_none());
 
             // A constructed handle is not traffic authority. Revocation must
-            // still prevent both reads and minting a committed permit.
+            // still prevent both reads and minting a committed authority.
             store.inner.admitted.store(false, Ordering::Release);
             let refused_read = authority.current(&caller).await;
             let refused_grant = authority
-                .grant(
+                .admit(
                     &caller,
-                    &ScopeLeaseRequest::new(
+                    &ScopeAuthorityRequest::new(
                         scope.clone(),
                         [1; 16],
                         0,
-                        ScopeLeaseOperation::Acquire {
+                        ScopeAuthorityOperation::AdmitInitial {
                             execution: execution(1),
-                            selection: 1,
                         },
                     )
                     .unwrap(),
                 )
                 .await;
             store.inner.admitted.store(true, Ordering::Release);
-            assert_eq!(refused_read, Err(ScopeLeaseError::Unavailable));
-            assert!(matches!(refused_grant, Err(ScopeLeaseError::Unavailable)));
+            assert_eq!(refused_read, Err(ScopeAuthorityError::Unavailable));
+            assert!(matches!(
+                refused_grant,
+                Err(ScopeAuthorityError::Unavailable)
+            ));
         }
     })
     .catch_unwind()
@@ -176,10 +198,10 @@ async fn scope_lease_construction_ignores_owner_contention_but_reads_retain_admi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots_bounded() {
+async fn scope_authority_four_thousand_successions_keep_native_checkpoint_and_snapshots_bounded() {
     let snapshots =
         tempfile::tempdir_in(std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").unwrap()).unwrap();
-    let mut fleet = Fleet::new_native("scope_lease_bound");
+    let mut fleet = Fleet::new_native("scope_authority_bound");
     fleet.snapshot_root = Some(snapshots.path().to_path_buf());
     // Whole-second logical times make the outer response metadata exactly
     // comparable too; SystemClock's fractional digit count can vary by a byte.
@@ -187,7 +209,7 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
     fleet.clock = Some(clock.clone());
     fleet.open().await;
     let result = AssertUnwindSafe(async {
-        let scope = ScopeLeaseId::new(
+        let scope = ScopeId::new(
             fleet.topologies[0].consensus_identity().unwrap(),
             TenantId::from_static("scope-bound"),
             NetworkFunctionKind::smf(),
@@ -195,17 +217,12 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
         )
         .unwrap();
         let service = |store: &ConsensusSessionStore| {
-            ScopeLeaseStore::new(
-                Arc::new(store.clone()),
-                scope.clone(),
-                clock.clone(),
-                Arc::new(Admission),
-            )
-            .unwrap()
+            ScopeAuthorityStore::new(Arc::new(store.clone()), scope.clone(), Arc::new(Admission))
+                .unwrap()
         };
         let authority = service(&fleet.stores[0]);
         let request = |revision, id: u64, operation| {
-            ScopeLeaseRequest::new(
+            ScopeAuthorityRequest::new(
                 scope.clone(),
                 u128::from(id).to_le_bytes(),
                 revision,
@@ -213,28 +230,14 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
             )
             .unwrap()
         };
-        authority
-            .execute(
-                &identity("controller"),
-                &request(
-                    0,
-                    1,
-                    ScopeLeaseOperation::Select {
-                        execution: execution(1),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
         let mut view = authority
             .execute(
                 &identity("worker-1"),
                 &request(
-                    1,
+                    0,
                     2,
-                    ScopeLeaseOperation::Acquire {
+                    ScopeAuthorityOperation::AdmitInitial {
                         execution: execution(1),
-                        selection: 1,
                     },
                 ),
             )
@@ -249,8 +252,14 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
                     &request(
                         view.revision(),
                         n + 2,
-                        ScopeLeaseOperation::Renew {
-                            permit: view.permit().unwrap().clone(),
+                        ScopeAuthorityOperation::SucceedClosed {
+                            predecessor: view.stamp().unwrap().clone(),
+                            execution: boot(n + 1),
+                            evidence: ScopeClosureEvidence::new(
+                                ScopeClosureKind::FinalTermination,
+                                [1; 32],
+                            )
+                            .unwrap(),
                         },
                     ),
                 )
@@ -279,7 +288,7 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
                     );
                     assert_eq!(
                         counts.4, 1,
-                        "only one cluster activation receipt, no renewal history"
+                        "only one cluster activation receipt, no succession history"
                     );
                     assert_eq!(wal.native_sql_fallback_count().unwrap(), 0);
                     footprint.push(counts.1);
@@ -288,12 +297,12 @@ async fn scope_lease_four_thousand_renewals_keep_native_checkpoint_and_snapshots
                 if let Some((old_rows, old_sizes)) = &first {
                     assert_eq!(
                         &footprint, old_rows,
-                        "renewals retain exactly the same serialized row bytes"
+                        "successions retain exactly the same serialized row bytes"
                     );
                     for (new, old) in sizes.iter().zip(old_sizes) {
                         assert!(
                             new <= &(old + 512),
-                            "compacted snapshots must not grow with renewal history"
+                            "compacted snapshots must not grow with succession history"
                         );
                     }
                 } else {

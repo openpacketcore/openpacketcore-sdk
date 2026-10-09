@@ -48,9 +48,11 @@ pub(in crate::consensus::native) fn ordinary_payload(
 ) -> io::Result<usize> {
     use crate::backend::CompareAndSetResult;
     match &row.response.result {
-        Ok(SessionMutationOutcome::ScopeLease(_) | SessionMutationOutcome::ScopeBatch(_)) => Err(
-            invalid("scope format mismatch: checkpoint in ordinary receipt collection"),
-        ),
+        Ok(SessionMutationOutcome::ScopeAuthority(_) | SessionMutationOutcome::ScopeBatch(_)) => {
+            Err(invalid(
+                "scope format mismatch: checkpoint in ordinary receipt collection",
+            ))
+        }
         Ok(
             SessionMutationOutcome::Unit
             | SessionMutationOutcome::Lease(_)

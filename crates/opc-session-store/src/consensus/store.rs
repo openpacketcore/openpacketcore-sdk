@@ -167,8 +167,8 @@ mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
 mod scheduling;
+mod scope_authority;
 mod scope_batch;
-mod scope_lease;
 mod scope_profile;
 
 use crate::scope_scheduler::{ScopeSchedulerKey, ScopeWorkClass, ScopeWorkPermit};
@@ -1109,7 +1109,7 @@ pub(crate) enum CapabilityActivationKind {
     FencedTransitionV1,
     ProtectedRosterV1,
     ProtectedRosterV2,
-    ScopeProfileV3,
+    ScopeProfileV4,
 }
 
 /// The one local quorum proof that a physical V1 transition or V1 activation
@@ -4113,7 +4113,7 @@ impl ConsensusSessionStore {
     /// transition; this accessor never weakens the exact-scope check at the
     /// consumer service boundary.
     /// This synchronous authority probe can refuse while the WAL owner is
-    /// busy. Construct stable `ScopeLeaseId` values from the configured
+    /// busy. Construct stable `ScopeId` values from the configured
     /// topology's `consensus_identity()`; scope service operations perform
     /// their own bounded, asynchronous authority admission.
     pub fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
@@ -7852,7 +7852,7 @@ impl ConsensusSessionStore {
         let request = ForwardMutationRequest {
             work_class: ForwardWorkClass::Inferred,
             request_id: match activation {
-                CapabilityActivationKind::ScopeProfileV3 => {
+                CapabilityActivationKind::ScopeProfileV4 => {
                     scope_profile::request_id(scope_identity)
                 }
                 CapabilityActivationKind::FencedTransitionV1 => {
@@ -7866,7 +7866,7 @@ impl ConsensusSessionStore {
                 }
             },
             intent: match activation {
-                CapabilityActivationKind::ScopeProfileV3 => {
+                CapabilityActivationKind::ScopeProfileV4 => {
                     SessionMutationIntent::PreflightScopeProfile
                 }
                 CapabilityActivationKind::FencedTransitionV1 => {
@@ -7963,7 +7963,7 @@ impl ConsensusSessionStore {
                     let (scope_identity, voters) =
                         observe_activation_result!(PostApplyScope, deadline, self.current_scope())?;
                     let activated = match activation {
-                        CapabilityActivationKind::ScopeProfileV3 => {
+                        CapabilityActivationKind::ScopeProfileV4 => {
                             self.scope_profile_matches(scope_identity, &voters).await
                         }
                         CapabilityActivationKind::FencedTransitionV1 => {
@@ -8397,7 +8397,7 @@ impl ConsensusSessionStore {
         }
         if matches!(
             &request.intent,
-            SessionMutationIntent::ScopeLease(_) | SessionMutationIntent::ScopeBatch(_)
+            SessionMutationIntent::ScopeAuthority(_) | SessionMutationIntent::ScopeBatch(_)
         ) && !self
             .activated_scope_profile_is_current(deadline)
             .await
@@ -10993,7 +10993,7 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
                 | SessionMutationIntent::RosterTerminalV2(_)
                 | SessionMutationIntent::RosterAdmission(_)
                 | SessionMutationIntent::RosterTerminal(_)
-                | SessionMutationIntent::ScopeLease(_)
+                | SessionMutationIntent::ScopeAuthority(_)
                 | SessionMutationIntent::ScopeBatch(_)
                 | SessionMutationIntent::PreflightScopeProfile
                 | SessionMutationIntent::ActivateScopeProfile(_)
@@ -11081,7 +11081,7 @@ fn committed_response_matches_intent(
         let uses_dedicated_roster_validation = matches!(
             outcome,
             SessionMutationOutcome::ScopeBatch(_)
-                | SessionMutationOutcome::ScopeLease(_)
+                | SessionMutationOutcome::ScopeAuthority(_)
                 | SessionMutationOutcome::RosterAdmission(_)
                 | SessionMutationOutcome::RosterTerminal(_)
                 | SessionMutationOutcome::RosterAdmissionV2(_)
@@ -11102,8 +11102,8 @@ fn committed_response_matches_intent(
             Err(error) => operation.matches_error(error),
         },
         (
-            Ok(SessionMutationOutcome::ScopeLease(result)),
-            SessionMutationIntent::ScopeLease(operation),
+            Ok(SessionMutationOutcome::ScopeAuthority(result)),
+            SessionMutationIntent::ScopeAuthority(operation),
         ) => match result {
             Ok(checkpoint) => operation.matches(checkpoint),
             Err(_) => true,
@@ -11741,7 +11741,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
     }
     match intent {
         SessionMutationIntent::AdvanceLogicalTime
-        | SessionMutationIntent::ScopeLease(_)
+        | SessionMutationIntent::ScopeAuthority(_)
         | SessionMutationIntent::ScopeBatch(_)
         | SessionMutationIntent::PreflightScopeProfile
         | SessionMutationIntent::CertifyScopeProfileContinuation(_)
@@ -12036,7 +12036,7 @@ fn validate_consensus_intent_with_recovery(
             ));
         }
     }
-    if let SessionMutationIntent::ScopeLease(operation) = intent {
+    if let SessionMutationIntent::ScopeAuthority(operation) = intent {
         operation
             .validate()
             .map_err(|_| StoreError::InvalidKey("scope operation invalid".into()))?;
@@ -19314,7 +19314,7 @@ mod membership_tests {
         let mutations = vec![
             SessionMutationIntent::PreflightScopeProfile,
             SessionMutationIntent::ActivateScopeProfile(Box::new(
-                crate::scope_lease::ScopeProfileActivation::new(
+                crate::scope_authority::ScopeProfileActivation::new(
                     singleton_topology().consensus_identity().unwrap(),
                     [0x42; 32],
                 ),
@@ -19617,7 +19617,7 @@ mod membership_tests {
             .expect("initialize activation receiver effect store");
 
         for (label, activation) in [
-            ("scope profile 3", CapabilityActivationKind::ScopeProfileV3),
+            ("scope profile 4", CapabilityActivationKind::ScopeProfileV4),
             (
                 "fenced transition V1",
                 CapabilityActivationKind::FencedTransitionV1,
@@ -19644,7 +19644,7 @@ mod membership_tests {
             let (result, failure) =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
-                        CapabilityActivationKind::ScopeProfileV3 => {
+                        CapabilityActivationKind::ScopeProfileV4 => {
                             store
                                 .ensure_scope_profile_before(
                                     tokio::time::Instant::now() + store.inner.operation_timeout,
@@ -19702,7 +19702,7 @@ mod membership_tests {
             .expect("initialize deadline activation receiver store");
 
         for (label, activation) in [
-            ("scope profile 3", CapabilityActivationKind::ScopeProfileV3),
+            ("scope profile 4", CapabilityActivationKind::ScopeProfileV4),
             (
                 "fenced transition V1",
                 CapabilityActivationKind::FencedTransitionV1,
@@ -19732,7 +19732,7 @@ mod membership_tests {
             let activation_call =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
-                        CapabilityActivationKind::ScopeProfileV3 => {
+                        CapabilityActivationKind::ScopeProfileV4 => {
                             store
                                 .ensure_scope_profile_before(
                                     tokio::time::Instant::now() + store.inner.operation_timeout,
@@ -19785,7 +19785,7 @@ mod membership_tests {
             let (resolved, failure) =
                 activation_evidence::observe_capability_activation_for_test(async {
                     match activation {
-                        CapabilityActivationKind::ScopeProfileV3 => {
+                        CapabilityActivationKind::ScopeProfileV4 => {
                             store
                                 .ensure_scope_profile_before(
                                     tokio::time::Instant::now() + store.inner.operation_timeout,
@@ -22010,11 +22010,11 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    async fn scope_lease_restore_scan_filters_reserved_rows_without_losing_cursor() {
+    async fn scope_authority_restore_scan_filters_reserved_rows_without_losing_cursor() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let (_directory, store, scope, authorization, key, lease) = consumer_boundary_store().await;
         let reserved = SessionKey {
-            key_type: crate::SessionKeyType::other("opc-scope-lease").unwrap(),
+            key_type: crate::SessionKeyType::other("opc-scope-authority").unwrap(),
             stable_id: Bytes::from_static(&[1; 32]).try_into().unwrap(),
             ..key.clone()
         };
@@ -22030,24 +22030,23 @@ mod membership_tests {
                 .unwrap(),
             CompareAndSetResult::Success,
         );
-        let scope_id = crate::scope_lease::ScopeLeaseId::new(
+        let scope_id = crate::scope_authority::ScopeId::new(
             scope.consensus_identity(),
             key.tenant.clone(),
             key.nf_kind.clone(),
             [1; 32],
         )
         .unwrap();
-        let checkpoint = crate::scope_lease::ScopeLeaseCommand {
-            request: crate::scope_lease::ScopeLeaseRequest::new(
+        let checkpoint = crate::scope_authority::ScopeAuthorityCommand {
+            request: crate::scope_authority::ScopeAuthorityRequest::new(
                 scope_id,
                 [0xFA; 16],
                 0,
-                crate::scope_lease::ScopeLeaseOperation::Select {
-                    execution: crate::scope_lease::tests::execution(1),
+                crate::scope_authority::ScopeAuthorityOperation::AdmitInitial {
+                    execution: crate::scope_authority::tests::execution(1),
                 },
             )
             .unwrap(),
-            bounds: crate::scope_lease::tests::bounds(0),
         }
         .apply(None)
         .unwrap();
@@ -22056,6 +22055,14 @@ mod membership_tests {
         let fixture_conn =
             rusqlite::Connection::open(_directory.path().join("store.sqlite")).unwrap();
         crate::sqlite::ops::insert_or_replace_scope_record_sync(&fixture_conn, &row).unwrap();
+        let ledger = crate::scope_storage::ScopeRow::Batch(Box::new(
+            crate::scope_batch::ScopeBatchCheckpoint::empty(
+                checkpoint.state().unwrap().view.scope().clone(),
+            ),
+        ))
+        .to_record()
+        .unwrap();
+        crate::sqlite::ops::insert_or_replace_scope_record_sync(&fixture_conn, &ledger).unwrap();
         let mut scan = RestoreScanRequest::all(1);
         scan.scope.tenant = Some(key.tenant.clone());
         scan.scope.nf_kind = Some(key.nf_kind.clone());
@@ -22088,7 +22095,7 @@ mod membership_tests {
             );
             assert!(n < 3, "bounded scan must terminate");
         }
-        let authority = crate::scope_lease::ScopeLeaseId::new(
+        let authority = crate::scope_authority::ScopeId::new(
             scope.consensus_identity(),
             key.tenant.clone(),
             key.nf_kind.clone(),
@@ -22100,12 +22107,13 @@ mod membership_tests {
         // confused with a deterministic old-format command refusal.
         fixture_conn
             .execute(
-                "UPDATE session_records SET payload=x'00' WHERE key_type='opc-scope-lease'",
+                "UPDATE session_records SET payload=x'00' WHERE key_type='opc-scope-authority'",
                 [],
             )
             .unwrap();
         let corrupt =
-            crate::scope_lease::service::ScopeLeaseBackend::current(&store, &authority).await;
+            crate::scope_authority::service::ScopeAuthorityBackend::current(&store, &authority)
+                .await;
         store.shutdown().await.unwrap();
         assert_eq!(
             records.len(),
@@ -22115,7 +22123,7 @@ mod membership_tests {
         assert_eq!(records[0].key, key);
         assert_eq!(
             corrupt,
-            Err(crate::scope_lease::ScopeLeaseError::Unavailable)
+            Err(crate::scope_authority::ScopeAuthorityError::Unavailable)
         );
     }
 

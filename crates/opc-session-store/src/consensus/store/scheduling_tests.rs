@@ -79,46 +79,18 @@ fn scope_scheduler_forward_class_is_required_bounded_metadata_outside_intent() {
 #[test]
 fn scope_scheduler_leader_refuses_declared_control_on_forwarded_child_batch() {
     use crate::scope_batch::{ScopeBatchCommand, ScopeBatchRequest};
-    use crate::scope_lease::tests::{bounds, execution, request, scope};
-    use crate::scope_lease::{ScopeLeaseOperation, ScopeState};
-
-    let selected = ScopeState::empty(scope())
-        .transition(
-            &request(
-                0,
-                1,
-                ScopeLeaseOperation::Select {
-                    execution: execution(1),
-                },
-            ),
-            bounds(0),
-        )
-        .unwrap();
-    let admitted = selected
-        .transition(
-            &request(
-                1,
-                2,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(1),
-                    selection: 1,
-                },
-            ),
-            bounds(0),
-        )
-        .unwrap();
+    let admitted = crate::scope_authority::tests::admitted();
     let request = ForwardMutationRequest {
         request_id: SessionConsensusRequestId::from_bytes([3; 16]),
         intent: SessionMutationIntent::ScopeBatch(Box::new(ScopeBatchCommand {
             request: ScopeBatchRequest::new(
-                admitted.view.permit().unwrap(),
+                admitted.view.stamp().unwrap(),
                 [3; 16],
                 0,
                 vec![crate::scope_batch::tests::create(1, &[1])],
                 vec![],
             )
             .unwrap(),
-            bounds: bounds(1),
         })),
         required_consumer_scope: ForwardConsumerScope::Internal,
         work_class: ForwardWorkClass::Declared(ScopeWorkClass::SafetyControl),

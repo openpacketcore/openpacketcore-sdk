@@ -1,11 +1,11 @@
 //! Real native quorum, full payload, lost reply, compaction and cold reopen.
 
-use super::scope_lease::{compact, Admission, Clock};
+use super::scope_authority::{compact, Admission, Clock};
 use super::*;
+use crate::scope_authority::tests::{execution, identity};
+use crate::scope_authority::*;
 use crate::scope_batch::tests::{claim, create, key, value};
 use crate::scope_batch::*;
-use crate::scope_lease::tests::{bounds, execution, identity};
-use crate::scope_lease::*;
 use std::sync::atomic::AtomicU64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -24,54 +24,36 @@ async fn scope_batch_native_follower_catches_up_over_eighty_small_batches() {
             .position(|store| store.status().leader_id == Some(store.status().node_id))
             .unwrap();
         let lagging = (leader + 1) % 3;
-        let scope = ScopeLeaseId::new(
+        let scope = ScopeId::new(
             fleet.topologies[0].consensus_identity().unwrap(),
             TenantId::from_static("scope-batch-catchup"),
             NetworkFunctionKind::smf(),
             [1; 32],
         )
         .unwrap();
-        let authority = ScopeLeaseStore::new(
+        let authority = ScopeAuthorityStore::new(
             Arc::new(fleet.stores[leader].clone()),
             scope.clone(),
-            clock.clone(),
             Arc::new(Admission),
         )
         .unwrap();
         let service = |store: &ConsensusSessionStore| {
             ScopeBatchStore::new(
                 Arc::new(store.clone()),
-                scope.clone(),
-                clock.clone(),
+                ScopeNamespace::new(scope.clone(), ScopeIncarnation::new(1).unwrap()).unwrap(),
                 Arc::new(Admission),
             )
             .unwrap()
         };
-        authority
-            .execute(
-                &identity("controller"),
-                &ScopeLeaseRequest::new(
-                    scope.clone(),
-                    [1; 16],
-                    0,
-                    ScopeLeaseOperation::Select {
-                        execution: execution(1),
-                    },
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
         let granted = authority
             .execute(
                 &identity("worker-1"),
-                &ScopeLeaseRequest::new(
+                &ScopeAuthorityRequest::new(
                     scope.clone(),
                     [2; 16],
-                    1,
-                    ScopeLeaseOperation::Acquire {
+                    0,
+                    ScopeAuthorityOperation::AdmitInitial {
                         execution: execution(1),
-                        selection: 1,
                     },
                 )
                 .unwrap(),
@@ -94,7 +76,7 @@ async fn scope_batch_native_follower_catches_up_over_eighty_small_batches() {
         let batches = service(&fleet.stores[leader]);
         for n in 1..=80u8 {
             let request = ScopeBatchRequest::new(
-                granted.permit().unwrap(),
+                granted.stamp().unwrap(),
                 [n + 2; 16],
                 u64::from(n - 1),
                 vec![create(n, &[n])],
@@ -187,50 +169,36 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
             .position(|store| store.status().leader_id == Some(store.status().node_id))
             .unwrap();
         let minority = (leader + 1) % 3;
-        let scope = ScopeLeaseId::new(
+        let scope = ScopeId::new(
             fleet.topologies[0].consensus_identity().unwrap(),
             TenantId::from_static("scope-batch-full"),
             NetworkFunctionKind::smf(),
             [1; 32],
         )
         .unwrap();
-        let lease_service = |store: &ConsensusSessionStore| {
-            ScopeLeaseStore::new(
-                Arc::new(store.clone()),
-                scope.clone(),
-                clock.clone(),
-                Arc::new(Admission),
-            )
-            .unwrap()
+        let authority_service = |store: &ConsensusSessionStore| {
+            ScopeAuthorityStore::new(Arc::new(store.clone()), scope.clone(), Arc::new(Admission))
+                .unwrap()
         };
         let batch_service = |store: &ConsensusSessionStore| {
             ScopeBatchStore::new(
                 Arc::new(store.clone()),
-                scope.clone(),
-                clock.clone(),
+                ScopeNamespace::new(scope.clone(), ScopeIncarnation::new(1).unwrap()).unwrap(),
                 Arc::new(Admission),
             )
             .unwrap()
         };
         let request = |id, revision, operation| {
-            ScopeLeaseRequest::new(scope.clone(), [id; 16], revision, operation).unwrap()
+            ScopeAuthorityRequest::new(scope.clone(), [id; 16], revision, operation).unwrap()
         };
-        let selected = request(
+        let initial = request(
             1,
             0,
-            ScopeLeaseOperation::Select {
+            ScopeAuthorityOperation::AdmitInitial {
                 execution: execution(1),
             },
         );
-        let acquire = request(
-            2,
-            1,
-            ScopeLeaseOperation::Acquire {
-                execution: execution(1),
-                selection: 1,
-            },
-        );
-        let authority = lease_service(&fleet.stores[leader]);
+        let authority = authority_service(&fleet.stores[leader]);
         let service = batch_service(&fleet.stores[leader]);
         fleet.stores[minority]
             .inner
@@ -238,17 +206,15 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
             .store(false, Ordering::Release);
         let before = fleet.stores[leader].status().applied_index;
         assert_eq!(
-            authority.execute(&identity("controller"), &selected).await,
-            Err(ScopeLeaseError::ProfileNotActivated),
+            authority.execute(&identity("worker-1"), &initial).await,
+            Err(ScopeAuthorityError::ProfileNotActivated),
             "a supporting majority cannot activate without the remaining voter"
         );
         let model = ScopeState::empty(scope.clone())
-            .transition(&selected, bounds(0))
-            .unwrap()
-            .transition(&acquire, bounds(0))
+            .transition(&initial)
             .unwrap();
         let uncommitted = ScopeBatchRequest::new(
-            model.view.permit().unwrap(),
+            model.view.stamp().unwrap(),
             [3; 16],
             0,
             vec![create(1, &[1])],
@@ -257,7 +223,8 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
         .unwrap();
         assert_eq!(
             service.execute(&identity("worker-1"), &uncommitted).await,
-            Err(ScopeBatchError::Scope(ScopeLeaseError::ProfileNotActivated))
+            Err(ScopeBatchError::FormatMismatch),
+            "an uncommitted stamp has no required ledger; a batch cannot synthesize one"
         );
         assert_eq!(
             fleet.stores[leader].status().applied_index,
@@ -268,15 +235,11 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
             .inner
             .scope_profile_supported
             .store(true, Ordering::Release);
-        authority
-            .execute(&identity("controller"), &selected)
-            .await
-            .unwrap();
         let granted = authority
-            .execute(&identity("worker-1"), &acquire)
+            .execute(&identity("worker-1"), &initial)
             .await
             .unwrap();
-        let permit = granted.permit().unwrap();
+        let permit = granted.stamp().unwrap();
 
         let mut envelope = opc_crypto::CryptoEnvelopeV1::decode(value(1).envelope()).unwrap();
         let overhead = envelope.encode().unwrap().len() - envelope.ciphertext_and_tag.len();
@@ -301,7 +264,7 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
         assert!(serde_json::to_vec(&full).unwrap().len() < MAX_SCOPE_BATCH_COMMAND_BYTES);
         assert_eq!(
             service.execute(&identity("intruder"), &full).await,
-            Err(ScopeBatchError::Scope(ScopeLeaseError::Unauthorized))
+            Err(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized))
         );
         // The durable unanimous certificate now permits ordinary quorum use.
         let muted = fleet.peers[minority].handler.write().await.take();
@@ -460,7 +423,7 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
                 key: key(1),
                 expected: replaced.rows()[0],
             }],
-            vec![ScopeCounterMutation::new(0, 64, 63).unwrap()],
+            vec![ScopeCounterMutation::new(0, 64, 64).unwrap()],
         )
         .unwrap();
         service
@@ -473,6 +436,15 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
             .unwrap()
             .is_none());
         assert_eq!(
+            service
+                .current(&identity("worker-1"))
+                .await
+                .unwrap()
+                .counters()[0],
+            64,
+            "deleting a child cannot lower the stable counter floor"
+        );
+        assert_eq!(
             service.execute(&identity("worker-1"), &full).await,
             Err(ScopeBatchError::RevisionConflict)
         );
@@ -481,7 +453,7 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
             [7; 16],
             3,
             vec![create(1, &[1])],
-            vec![ScopeCounterMutation::new(0, 63, 64).unwrap()],
+            vec![ScopeCounterMutation::new(0, 64, 65).unwrap()],
         )
         .unwrap();
         let recreated = service
@@ -489,6 +461,14 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
             .await
             .unwrap();
         assert_eq!(recreated.rows()[0].birth(), 65);
+        assert_eq!(
+            service
+                .current(&identity("worker-1"))
+                .await
+                .unwrap()
+                .counters()[0],
+            65
+        );
         let stale = ScopeBatchRequest::new(
             permit,
             [8; 16],

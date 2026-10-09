@@ -89,6 +89,14 @@ jobs:
             git diff --check
           fi
 
+      - name: Check untimed scope authority
+        run: |
+          if ! command -v rg > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes ripgrep
+          fi
+          bash scripts/check-scope-authority-untimed.sh
+
       - name: Run management-plane policy gates
         run: |
           python3 scripts/check-management-plane-policy.py --self-test

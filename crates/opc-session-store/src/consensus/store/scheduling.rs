@@ -28,7 +28,7 @@ impl ForwardMutationRequest {
             (ForwardWorkClass::Inferred, intent) => inferred_class(intent),
         };
         let key = match &self.intent {
-            SessionMutationIntent::ScopeLease(command) => scope_key(command.request.scope()),
+            SessionMutationIntent::ScopeAuthority(command) => scope_key(command.request.scope()),
             SessionMutationIntent::ScopeBatch(command) => scope_key(command.request.scope()),
             // Non-scope legacy traffic is an aggregate, not one tenant. It
             // shares the full class budget without a per-scope reduction.
@@ -41,7 +41,7 @@ impl ForwardMutationRequest {
 
 fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
     match intent {
-        SessionMutationIntent::ScopeLease(_)
+        SessionMutationIntent::ScopeAuthority(_)
         | SessionMutationIntent::PreflightScopeProfile
         | SessionMutationIntent::ActivateScopeProfile(_)
         | SessionMutationIntent::CertifyScopeProfileContinuation(_)
@@ -92,7 +92,7 @@ fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
     }
 }
 
-fn scope_key(scope: &crate::scope_lease::ScopeLeaseId) -> ScopeSchedulerKey {
+fn scope_key(scope: &crate::scope_authority::ScopeId) -> ScopeSchedulerKey {
     let mut hash = Sha256::new();
     hash.update(b"openpacketcore/scope-scheduling-key/v1\0");
     hash.update(scope.store().as_bytes());

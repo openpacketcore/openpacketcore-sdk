@@ -1,8 +1,8 @@
 //! One detached atomic child/claim/counter transition, with no ordinary receipt.
 
 use super::*;
-use crate::scope_batch::{ScopeBatchCheckpoint, ScopeBatchCommand, ScopeBatchError};
-use crate::scope_lease::{ScopeLeaseCheckpoint, ScopeLeaseError};
+use crate::scope_authority::{ScopeAuthorityCheckpoint, ScopeAuthorityError};
+use crate::scope_batch::{ScopeBatchCommand, ScopeBatchError};
 use crate::scope_storage::{self, ScopeRow};
 
 #[cfg(test)]
@@ -38,6 +38,23 @@ pub(super) fn validate_links<'a>(
     key: &SessionKey,
     read: impl Fn(&SessionKey) -> Option<&'a NativeKeyState>,
 ) -> io::Result<()> {
+    if crate::scope_authority::is_scope_authority_key(key) {
+        let record = read(key)
+            .and_then(|row| row.record.as_ref())
+            .ok_or_else(|| invalid("scope authority absent"))?;
+        let authority = ScopeAuthorityCheckpoint::from_record(record)
+            .and_then(|checkpoint| checkpoint.state())
+            .map_err(|_| invalid("scope authority invalid"))?;
+        let ledger_key = scope_storage::batch_key(authority.view.scope())
+            .map_err(|_| invalid("scope ledger key invalid"))?;
+        let ledger = read(&ledger_key)
+            .and_then(|row| row.record.as_ref())
+            .ok_or_else(|| invalid("scope required ledger absent"))?;
+        return match ScopeRow::from_record(ledger) {
+            Ok(ScopeRow::Batch(row)) if &row.scope == authority.view.scope() => Ok(()),
+            _ => Err(invalid("scope required ledger invalid")),
+        };
+    }
     if !scope_storage::is_batch_record_key(key) {
         return Ok(());
     }
@@ -57,7 +74,7 @@ pub(super) fn validate_links<'a>(
         let authority = read(&authority_key)
             .and_then(|row| row.record.as_ref())
             .ok_or_else(|| invalid("scope batch authority absent"))?;
-        let authority = ScopeLeaseCheckpoint::from_record(authority)
+        let authority = ScopeAuthorityCheckpoint::from_record(authority)
             .and_then(|row| row.state())
             .map_err(|_| invalid("scope batch authority invalid"))?;
         if authority.view.scope() != scope {
@@ -89,11 +106,11 @@ pub(super) fn validate_changed_links<'a>(
         Some(ScopeRow::Child(child)) => child
             .claims
             .iter()
-            .map(|claim| scope_storage::claim_key(&child.scope, *claim))
+            .map(|claim| scope_storage::claim_key(&child.namespace, *claim))
             .collect::<Result<Vec<_>, _>>(),
         Some(ScopeRow::Claim(claim)) => claim
             .owner
-            .map(|owner| scope_storage::child_key(&claim.scope, owner.child))
+            .map(|owner| scope_storage::child_key(&claim.namespace, owner.child))
             .transpose()
             .map(|key| key.into_iter().collect()),
         _ => Ok(Vec::new()),
@@ -153,17 +170,17 @@ impl NativeDelta<'_> {
     ) -> io::Result<SessionConsensusResponse> {
         let scope = operation.request.scope();
         let result = if scope.store() != self.base.identity.cluster_id() {
-            Err(ScopeLeaseError::Unauthorized.into())
+            Err(ScopeAuthorityError::Unauthorized.into())
         } else if !authorized {
-            Err(crate::sqlite::consensus::scope_lease::authority_error(
+            Err(crate::sqlite::consensus::scope_authority::authority_error(
                 command,
                 self.base.identity.configuration_epoch(),
             )
             .into())
         } else if !self.scope_profile_active()? {
-            Err(ScopeLeaseError::ProfileNotActivated.into())
+            Err(ScopeAuthorityError::ProfileNotActivated.into())
         } else {
-            self.prepare_scope_batch(operation, now)
+            self.prepare_scope_batch(operation)
         };
         let outcome = match result {
             Ok(plan) => {
@@ -212,7 +229,6 @@ impl NativeDelta<'_> {
     fn prepare_scope_batch(
         &self,
         operation: &ScopeBatchCommand,
-        now: Timestamp,
     ) -> Result<crate::scope_batch::state::ScopeBatchPlan, ScopeBatchError> {
         let scope = operation.request.scope();
         if self.request_receipt(&scope.checkpoint_id()?).is_some() {
@@ -222,15 +238,14 @@ impl NativeDelta<'_> {
         let authority = self
             .physical_key(&authority_key)
             .record
-            .ok_or(ScopeLeaseError::StalePermit)?;
-        let authority = ScopeLeaseCheckpoint::from_record(&authority)?.state()?;
+            .ok_or(ScopeAuthorityError::StaleAuthority)?;
+        let authority = ScopeAuthorityCheckpoint::from_record(&authority)?.state()?;
         let row = decode(&self.physical_key(&scope_storage::batch_key(scope)?))?;
         let checkpoint = match row {
             Some(ScopeRow::Batch(row)) if row.scope == *scope => *row,
-            None => ScopeBatchCheckpoint::empty(scope.clone()),
             _ => return Err(ScopeBatchError::FormatMismatch),
         };
-        operation.plan(&authority, &checkpoint, now, |key| {
+        operation.plan(&authority, &checkpoint, |key| {
             decode(&self.physical_key(key))
         })
     }

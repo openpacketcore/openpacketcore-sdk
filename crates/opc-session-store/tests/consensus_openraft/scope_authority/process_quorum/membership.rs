@@ -261,7 +261,7 @@ pub(super) enum ControlReply {
     Evidence {
         probes: usize,
         rejected_probes: usize,
-        lost_lease: usize,
+        lost_authority: usize,
         lost_batch: usize,
         certificates: u64,
         certificate_index: Option<u64>,
@@ -277,9 +277,9 @@ pub(super) struct Controls {
     reject: AtomicBool,
     probes: AtomicUsize,
     rejected_probes: AtomicUsize,
-    lose_lease: AtomicBool,
+    lose_authority: AtomicBool,
     lose_batch: AtomicBool,
-    lost_lease: AtomicUsize,
+    lost_authority: AtomicUsize,
     lost_batch: AtomicUsize,
     snapshot_requests: AtomicUsize,
     lost_certificate: AtomicUsize,
@@ -312,10 +312,10 @@ impl Controls {
         }
         reject
     }
-    pub(super) fn lose_lease_reply(&self) -> bool {
-        let lose = self.lose_lease.swap(false, Ordering::SeqCst);
+    pub(super) fn lose_authority_reply(&self) -> bool {
+        let lose = self.lose_authority.swap(false, Ordering::SeqCst);
         if lose {
-            self.lost_lease.fetch_add(1, Ordering::SeqCst);
+            self.lost_authority.fetch_add(1, Ordering::SeqCst);
         }
         lose
     }
@@ -342,7 +342,7 @@ impl Controls {
                 ControlReply::Done
             }
             Control::LoseReplies => {
-                self.lose_lease.store(true, Ordering::SeqCst);
+                self.lose_authority.store(true, Ordering::SeqCst);
                 self.lose_batch.store(true, Ordering::SeqCst);
                 ControlReply::Done
             }
@@ -386,7 +386,7 @@ impl Controls {
                 ControlReply::Evidence {
                     probes: self.probes.load(Ordering::SeqCst),
                     rejected_probes: self.rejected_probes.load(Ordering::SeqCst),
-                    lost_lease: self.lost_lease.load(Ordering::SeqCst),
+                    lost_authority: self.lost_authority.load(Ordering::SeqCst),
                     lost_batch: self.lost_batch.load(Ordering::SeqCst),
                     certificates,
                     certificate_index,
@@ -699,37 +699,24 @@ impl Processes {
     }
 }
 
-fn now(start: Instant) -> u64 {
-    start.elapsed().as_secs() + 1
-}
-fn bounds(second: u64) -> ScopeClockBounds {
-    let clock = BoundedClock(AtomicU64::new(second));
-    clock.bounds().unwrap()
-}
-
 struct Progress {
-    view: ScopeLeaseView,
+    view: ScopeAuthorityView,
     outcome: Option<ScopeBatchOutcome>,
     last_batch: Option<ScopeBatchRequest>,
     rounds: usize,
     closed_replies: usize,
     connection_failures: usize,
     other_io_failures: usize,
-    last_renewal: Instant,
+    last_progress: Instant,
     phase: &'static str,
     campaign_active: bool,
     campaign_gap_pending: bool,
     gaps: BTreeMap<&'static str, (Duration, Duration)>,
 }
 
-// Learner catch-up and coordinator resumption must not suspend renewals.
-// The process fixture allows 2 s between successful renewals
-// including local scheduling and durable SQLite I/O. Only a confirmed leader
-// loss followed by the real campaign hook has the larger budget: the pinned
-// 8 s leader lease plus 4 s for the granted campaign and first exact retry.
-const RENEWAL_GAP_BUDGET: Duration = Duration::from_secs(2);
-const CAMPAIGN_GAP_BUDGET: Duration = Duration::from_secs(12);
-
+// Recovery gaps are diagnostic scheduling and I/O measurements. Untimed
+// authority has no lease-based latency contract. The scenario asserts exact
+// recovery and continued rounds; its outer deadline detects hangs.
 impl Progress {
     fn record_io_failure(&mut self, error: std::io::Error) {
         match error.kind() {
@@ -739,33 +726,24 @@ impl Progress {
         }
     }
 
-    fn renewed(&mut self) {
+    fn recovered(&mut self) {
         let now = Instant::now();
-        let gap = now.duration_since(self.last_renewal);
-        self.last_renewal = now;
+        let gap = now.duration_since(self.last_progress);
+        self.last_progress = now;
         let campaign = self.campaign_active || self.campaign_gap_pending;
         if !self.campaign_active {
             self.campaign_gap_pending = false;
         }
         let (normal, election) = self.gaps.entry(self.phase).or_default();
-        let (longest, budget) = if campaign {
-            (election, CAMPAIGN_GAP_BUDGET)
-        } else {
-            (normal, RENEWAL_GAP_BUDGET)
-        };
+        let longest = if campaign { election } else { normal };
         *longest = (*longest).max(gap);
-        assert!(
-            gap <= budget,
-            "{} renewal gap {gap:?} exceeds {budget:?}; campaign={campaign}",
-            self.phase
-        );
     }
 
-    fn report_gaps(&self, injected_lease: usize, injected_batch: usize) {
+    fn report_gaps(&self, injected_authority: usize, injected_batch: usize) {
         for (phase, (normal, campaign)) in &self.gaps {
-            eprintln!("scope_membership_renewal_gap phase={phase} longest_ms={} normal_ms={} campaign_ms={} normal_budget_ms={} campaign_budget_ms={}", normal.max(campaign).as_millis(), normal.as_millis(), campaign.as_millis(), RENEWAL_GAP_BUDGET.as_millis(), CAMPAIGN_GAP_BUDGET.as_millis());
+            eprintln!("scope_membership_recovery_gap phase={phase} longest_ms={} normal_ms={} campaign_ms={}", normal.max(campaign).as_millis(), normal.as_millis(), campaign.as_millis());
         }
-        eprintln!("scope_membership_reply_loss injected_lease={injected_lease} injected_batch={injected_batch} closed_replies={} connection_failures={} other_io_failures={}", self.closed_replies, self.connection_failures, self.other_io_failures);
+        eprintln!("scope_membership_reply_loss injected_authority={injected_authority} injected_batch={injected_batch} closed_replies={} connection_failures={} other_io_failures={}", self.closed_replies, self.connection_failures, self.other_io_failures);
     }
 }
 
@@ -774,7 +752,6 @@ async fn pump(
     preferred: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     progress: Arc<StdMutex<Progress>>,
-    start: Instant,
 ) {
     let mut serial = 0_u128;
     loop {
@@ -783,26 +760,20 @@ async fn pump(
         }
         serial += 1;
         let view = progress.lock().unwrap().view.clone();
-        let lease = ScopeLeaseRequest::new(
-            view.scope().clone(),
-            (0x5000 + serial).to_be_bytes(),
-            view.revision(),
-            ScopeLeaseOperation::Renew {
-                permit: view.permit().unwrap().clone(),
+        let authority_request = request(
+            view.scope(),
+            0,
+            2,
+            ScopeAuthorityOperation::AdmitInitial {
+                execution: execution(1),
             },
-        )
-        .unwrap();
-        let renewed = loop {
-            assert!(
-                view.permit().unwrap().is_live_at(bounds(now(start))),
-                "membership must never exhaust the prior permit"
-            );
+        );
+        let recovered = loop {
             let reply = call(
                 addresses[preferred.load(Ordering::SeqCst)],
                 Request::Execute {
-                    at: now(start),
                     actor: "worker-1".into(),
-                    request: Box::new(lease.clone()),
+                    request: Box::new(authority_request.clone()),
                     crash_after_commit: false,
                 },
             )
@@ -811,11 +782,11 @@ async fn pump(
                 Ok(Reply::Scope(result)) => match *result {
                     Ok(view) => break view,
                     Err(
-                        ScopeLeaseError::Unavailable
-                        | ScopeLeaseError::OutcomeUnknown
-                        | ScopeLeaseError::ProfileNotActivated,
+                        ScopeAuthorityError::Unavailable
+                        | ScopeAuthorityError::OutcomeUnknown
+                        | ScopeAuthorityError::ProfileNotActivated,
                     ) => (),
-                    Err(error) => panic!("renewal was violated: {error:?}"),
+                    Err(error) => panic!("exact authority recovery was violated: {error:?}"),
                 },
                 Err(error) => {
                     progress.lock().unwrap().record_io_failure(error);
@@ -824,11 +795,11 @@ async fn pump(
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         };
-        progress.lock().unwrap().renewed();
-        assert_eq!(renewed.grant_floor(), 1);
+        progress.lock().unwrap().recovered();
+        assert_eq!(recovered.admission_generation_floor(), 1);
         assert_eq!(
-            renewed.permit().unwrap().execution(),
-            view.permit().unwrap().execution()
+            recovered.stamp().unwrap().execution(),
+            view.stamp().unwrap().execution()
         );
         let previous = progress.lock().unwrap().outcome.clone();
         let revision = previous.as_ref().map_or(0, ScopeBatchOutcome::revision);
@@ -842,7 +813,7 @@ async fn pump(
             },
         );
         let batch = ScopeBatchRequest::new(
-            renewed.permit().unwrap(),
+            recovered.stamp().unwrap(),
             (0x6000 + serial).to_be_bytes(),
             revision,
             vec![mutation],
@@ -850,14 +821,9 @@ async fn pump(
         )
         .unwrap();
         let outcome = loop {
-            assert!(
-                renewed.permit().unwrap().is_live_at(bounds(now(start))),
-                "batch retries must remain covered by a live permit"
-            );
             match call(
                 addresses[preferred.load(Ordering::SeqCst)],
                 Request::ExecuteBatch {
-                    at: now(start),
                     actor: "worker-1".into(),
                     request: Box::new(batch.clone()),
                     crash_after_commit: false,
@@ -871,9 +837,9 @@ async fn pump(
                         ScopeBatchError::Unavailable
                         | ScopeBatchError::OutcomeUnknown
                         | ScopeBatchError::Scope(
-                            ScopeLeaseError::Unavailable
-                            | ScopeLeaseError::OutcomeUnknown
-                            | ScopeLeaseError::ProfileNotActivated,
+                            ScopeAuthorityError::Unavailable
+                            | ScopeAuthorityError::OutcomeUnknown
+                            | ScopeAuthorityError::ProfileNotActivated,
                         ),
                     ) => (),
                     Err(error) => panic!("batch was violated: {error:?}"),
@@ -890,7 +856,7 @@ async fn pump(
         assert_eq!(outcome.rows()[0].generation(), revision + 1);
         {
             let mut state = progress.lock().unwrap();
-            state.view = renewed;
+            state.view = recovered;
             state.outcome = Some(outcome);
             state.last_batch = Some(batch);
             state.rounds += 1;
@@ -906,7 +872,7 @@ async fn progressed(progress: &StdMutex<Progress>, rounds: usize) {
         }
     })
     .await
-    .expect("renewals and batches resume before permit expiry");
+    .expect("exact recovery and batches regain progress within the test bound");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -920,34 +886,16 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
     // leader without a new vote exchange; automatic elections are disabled.
     let (leader, term) = fleet.ready(&[0, 1, 2], None).await;
     let scope = fleet.current(leader).await.scope().clone();
-    fleet
-        .execute(
-            leader,
-            0,
-            "controller",
-            request(
-                &scope,
-                0,
-                1,
-                ScopeLeaseOperation::Select {
-                    execution: execution(1),
-                },
-            ),
-        )
-        .await
-        .unwrap();
     let view = fleet
         .execute(
             leader,
-            0,
             "worker-1",
             request(
                 &scope,
-                1,
+                0,
                 2,
-                ScopeLeaseOperation::Acquire {
+                ScopeAuthorityOperation::AdmitInitial {
                     execution: execution(1),
-                    selection: 1,
                 },
             ),
         )
@@ -964,7 +912,7 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
         closed_replies: 0,
         connection_failures: 0,
         other_io_failures: 0,
-        last_renewal: start,
+        last_progress: start,
         phase: "initial",
         campaign_active: false,
         campaign_gap_pending: false,
@@ -975,20 +923,19 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
         preferred.clone(),
         stopped.clone(),
         progress.clone(),
-        start,
     ));
     fleet.membership_control(leader, Control::LoseReplies).await;
     progressed(&progress, 2).await;
-    let (mut injected_lease, mut injected_batch) =
+    let (mut injected_authority, mut injected_batch) =
         match fleet.membership_control(leader, Control::Evidence).await {
             ControlReply::Evidence {
-                lost_lease,
+                lost_authority,
                 lost_batch,
                 ..
-            } => (lost_lease, lost_batch),
+            } => (lost_authority, lost_batch),
             _ => panic!("leader reply-loss evidence expected"),
         };
-    assert_eq!((injected_lease, injected_batch), (1, 1));
+    assert_eq!((injected_authority, injected_batch), (1, 1));
 
     let anchor = match fleet.membership_control(leader, Control::Anchor).await {
         ControlReply::Anchor(anchor) => anchor,
@@ -1260,22 +1207,22 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
         .membership_control(successor, Control::LoseReplies)
         .await;
     progressed(&progress, before + 2).await;
-    let (successor_lost_lease, successor_lost_batch) =
+    let (successor_lost_authority, successor_lost_batch) =
         match fleet.membership_control(successor, Control::Evidence).await {
             ControlReply::Evidence {
-                lost_lease,
+                lost_authority,
                 lost_batch,
                 lost_certificate: 1,
                 ..
-            } => (lost_lease, lost_batch),
+            } => (lost_authority, lost_batch),
             _ => panic!("successor reply-loss and certificate evidence expected"),
         };
     assert_eq!(
-        (successor_lost_lease, successor_lost_batch),
+        (successor_lost_authority, successor_lost_batch),
         (1, 1),
         "the successor must actually inject both contraction reply losses"
     );
-    injected_lease += successor_lost_lease;
+    injected_authority += successor_lost_authority;
     injected_batch += successor_lost_batch;
 
     // Removed processes are fenced, but Raft no longer replicates to them and
@@ -1297,12 +1244,12 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
     work.await.unwrap();
     let (view, last_batch, outcome) = {
         let state = progress.lock().unwrap();
-        assert_eq!(state.view.grant_floor(), 1);
-        assert!(state.view.permit().unwrap().is_live_at(bounds(now(start))));
+        assert_eq!(state.view.admission_generation_floor(), 1);
+        assert!(state.view.is_active());
         assert!(state.closed_replies >= 4);
         // Exact injected-loss counts were read from the responsible process
         // after each phase. Connection failures cannot satisfy those checks.
-        state.report_gaps(injected_lease, injected_batch);
+        state.report_gaps(injected_authority, injected_batch);
         (
             state.view.clone(),
             state.last_batch.clone().unwrap(),
@@ -1312,15 +1259,13 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
     assert!(fleet
         .execute(
             successor,
-            now(start),
             "worker-2",
             request(
                 &scope,
                 view.revision(),
                 9,
-                ScopeLeaseOperation::Acquire {
+                ScopeAuthorityOperation::AdmitInitial {
                     execution: execution(2),
-                    selection: 1
                 }
             )
         )
@@ -1329,7 +1274,7 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
     assert_eq!(
         fleet.current(successor).await,
         view,
-        "remote acquire cannot interrupt the live grant"
+        "an unproven admission cannot interrupt current authority"
     );
 
     // Compact and restart the surviving quorum. The third voter stays down:
@@ -1344,7 +1289,7 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
         ));
         assert_eq!(
             fleet
-                .batch(*index, now(start), "worker-1", last_batch.clone())
+                .batch(*index, "worker-1", last_batch.clone())
                 .await
                 .unwrap(),
             outcome
@@ -1375,34 +1320,34 @@ async fn scope_profile_processes_carry_activation_through_membership_and_leader_
     }
     let restarted = fleet.campaign(&retained[..2], successor_term).await;
     fleet.ready(&retained[..2], None).await;
-    let renewed = fleet
+    let recovered = fleet
         .execute(
             restarted,
-            now(start),
             "worker-1",
             request(
                 &scope,
-                view.revision(),
-                10,
-                ScopeLeaseOperation::Renew {
-                    permit: view.permit().unwrap().clone(),
+                0,
+                2,
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: execution(1),
                 },
             ),
         )
         .await
         .unwrap();
-    assert_eq!(renewed.grant_floor(), 1);
+    assert_eq!(recovered, view);
+    assert_eq!(recovered.admission_generation_floor(), 1);
     {
         let mut state = progress.lock().unwrap();
-        state.renewed();
-        state.report_gaps(injected_lease, injected_batch);
+        state.recovered();
+        state.report_gaps(injected_authority, injected_batch);
     }
     assert_eq!(
         fleet
-            .batch(restarted, now(start), "worker-1", last_batch)
+            .batch(restarted, "worker-1", last_batch)
             .await
             .unwrap(),
         outcome
     );
-    eprintln!("membership continuity: one grant; live permits; lease/batch replies lost and resolved; durable certificate recovered with one voter down");
+    eprintln!("membership continuity: one untimed admission; exact authority/batch replies lost and resolved; durable certificate recovered with one voter down");
 }

@@ -10,7 +10,7 @@ mod roster;
 #[test]
 fn native_previous_scope_format_cold_admission_requires_fresh_installation() {
     let (storage, _, _) = fixture();
-    let certificate = crate::scope_lease::ScopeProfileActivation::new(
+    let certificate = crate::scope_authority::ScopeProfileActivation::new(
         storage.business.identity,
         fenced_transition_voter_set_digest(storage.business.identity, &storage.business.members),
     );
@@ -33,20 +33,19 @@ fn native_previous_scope_format_cold_admission_requires_fresh_installation() {
 }
 
 #[test]
-fn scope_lease_cold_checkpoint_preflight_validates_dedicated_rows_and_refuses_old_receipts() {
-    use crate::scope_lease::tests::{bounds, execution, request, scope};
-    use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseOperation};
+fn scope_authority_cold_checkpoint_preflight_validates_dedicated_rows_and_refuses_old_receipts() {
+    use crate::scope_authority::tests::{execution, request, scope};
+    use crate::scope_authority::{ScopeAuthorityCommand, ScopeAuthorityOperation};
     let (mut storage, _, _) = fixture();
     apply(&mut storage, &[clock(2, time(2))]);
-    let checkpoint = ScopeLeaseCommand {
+    let checkpoint = ScopeAuthorityCommand {
         request: request(
             0,
             1,
-            ScopeLeaseOperation::Select {
+            ScopeAuthorityOperation::AdmitInitial {
                 execution: execution(1),
             },
         ),
-        bounds: bounds(0),
     }
     .apply(None)
     .unwrap();
@@ -65,7 +64,7 @@ fn scope_lease_cold_checkpoint_preflight_validates_dedicated_rows_and_refuses_ol
         unreachable!()
     };
     receipt.payload_digest = checkpoint.digest().unwrap();
-    receipt.response.result = Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint)));
+    receipt.response.result = Ok(SessionMutationOutcome::ScopeAuthority(Ok(checkpoint)));
     let bytes = postcard::to_allocvec(&(scope().checkpoint_id().unwrap(), Some(&legacy))).unwrap();
     assert!(generic_scratch(&bytes).is_err());
     assert!(verify_generic(&bytes, &storage.business.frontiers, &|| Ok(())).is_err());
@@ -73,16 +72,18 @@ fn scope_lease_cold_checkpoint_preflight_validates_dedicated_rows_and_refuses_ol
 
 #[test]
 fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
+    use crate::scope_authority::tests::execution;
+    use crate::scope_authority::{
+        ScopeAuthorityOperation, ScopeAuthorityRequest, ScopeId, ScopeState,
+    };
     use crate::scope_batch::tests::{claim, key, value};
     use crate::scope_batch::{
         ScopeBatchCommand, ScopeBatchRequest, ScopeChildMutation, ScopeSealedValue,
     };
-    use crate::scope_lease::tests::{bounds, execution};
-    use crate::scope_lease::{ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest, ScopeState};
     use opc_types::{NetworkFunctionKind, TenantId};
 
     let (storage, _, _) = fixture();
-    let scope = ScopeLeaseId::new(
+    let scope = ScopeId::new(
         storage.business.identity,
         TenantId::from_static("batch-memory"),
         NetworkFunctionKind::smf(),
@@ -91,33 +92,18 @@ fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
     .unwrap();
     let selected = ScopeState::empty(scope.clone())
         .transition(
-            &ScopeLeaseRequest::new(
+            &ScopeAuthorityRequest::new(
                 scope.clone(),
                 [1; 16],
                 0,
-                ScopeLeaseOperation::Select {
+                ScopeAuthorityOperation::AdmitInitial {
                     execution: execution(1),
                 },
             )
             .unwrap(),
-            bounds(0),
         )
         .unwrap();
-    let authority = selected
-        .transition(
-            &ScopeLeaseRequest::new(
-                scope,
-                [2; 16],
-                1,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(1),
-                    selection: 1,
-                },
-            )
-            .unwrap(),
-            bounds(0),
-        )
-        .unwrap();
+    let authority = selected;
     for (count, maximum_value) in [(1, false), (64, false), (1, true)] {
         let mut value = value(1);
         if maximum_value {
@@ -136,14 +122,13 @@ fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
             .collect();
         let batch = ScopeBatchCommand {
             request: ScopeBatchRequest::new(
-                authority.view.permit().unwrap(),
+                authority.view.stamp().unwrap(),
                 [3; 16],
                 0,
                 operations,
                 vec![],
             )
             .unwrap(),
-            bounds: bounds(1),
         };
         let mut entry = clock(2, time(2));
         let EntryPayload::Normal(command) = &mut entry.payload else {
@@ -156,6 +141,24 @@ fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
             mutation: Box::new(SessionMutationIntent::ScopeBatch(Box::new(batch))),
         };
         let bytes = serde_json::to_vec(&entry).unwrap();
+        if count == 1 && !maximum_value {
+            for legacy_permit in [false, true] {
+                let mut legacy = serde_json::to_value(&entry).unwrap();
+                let body = legacy
+                    .pointer_mut("/payload/Normal/intent/Authorized/mutation/ScopeBatch")
+                    .unwrap();
+                if legacy_permit {
+                    let request = body["request"].as_object_mut().unwrap();
+                    let stamp = request.remove("stamp").unwrap();
+                    request.insert("permit".into(), stamp);
+                } else {
+                    body.as_object_mut()
+                        .unwrap()
+                        .insert("bounds".into(), serde_json::json!({}));
+                }
+                assert!(json::log_scratch(&serde_json::to_vec(&legacy).unwrap()).is_err());
+            }
+        }
         let temporary = json::log_scratch(&bytes).unwrap();
         if count == 1 && !maximum_value {
             assert!(
@@ -263,7 +266,12 @@ fn native_generation_cold_key_preflight_bounds_scope_child_metadata_separately()
     envelope.ciphertext_and_tag =
         vec![0; crate::scope_batch::MAX_SCOPE_CHILD_VALUE_BYTES - overhead];
     let record = ScopeRow::Child(ScopeChildRecord {
-        scope: crate::scope_lease::tests::scope(),
+        namespace: crate::scope_authority::tests::admitted()
+            .view
+            .stamp()
+            .unwrap()
+            .namespace()
+            .clone(),
         key: key(1),
         revision: ScopeChildRevision::new(1, 1).unwrap(),
         batch_revision: 1,

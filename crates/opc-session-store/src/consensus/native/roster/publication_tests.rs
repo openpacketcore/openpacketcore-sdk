@@ -651,9 +651,9 @@ fn native_roster_publication_normal_command_maintains_and_captures_retirement() 
 }
 
 #[test]
-fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
-    use crate::scope_lease::{
-        ScopeClockBounds, ScopeLeaseCommand, ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest,
+fn scope_authority_commands_do_not_trigger_unrelated_roster_maintenance() {
+    use crate::scope_authority::{
+        ScopeAuthorityCommand, ScopeAuthorityOperation, ScopeAuthorityRequest, ScopeId,
     };
     use crate::sqlite::consensus::native_roster_apply_fixture;
     let signed = crate::consensus::types::roster_v2_persistence_fixture();
@@ -677,7 +677,7 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
         3,
         SessionConsensusRequestId::from_bytes([0xD2; 16]),
         SessionMutationIntent::ActivateScopeProfile(Box::new(
-            crate::scope_lease::ScopeProfileActivation::new(
+            crate::scope_authority::ScopeProfileActivation::new(
                 signed.identity,
                 fenced_transition_voter_set_digest(signed.identity, &state.members),
             ),
@@ -691,7 +691,7 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
         .add_seconds(1 + 24 * 60 * 60)
         .unwrap();
     let id = SessionConsensusRequestId::from_bytes([0xD3; 16]);
-    let scope = ScopeLeaseId::new(
+    let scope = ScopeId::new(
         signed.identity,
         signed.authority.key().tenant.clone(),
         signed.authority.key().nf_kind.clone(),
@@ -702,17 +702,16 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
         &signed,
         4,
         id,
-        SessionMutationIntent::ScopeLease(Box::new(ScopeLeaseCommand {
-            request: ScopeLeaseRequest::new(
+        SessionMutationIntent::ScopeAuthority(Box::new(ScopeAuthorityCommand {
+            request: ScopeAuthorityRequest::new(
                 scope,
                 *id.as_bytes(),
                 0,
-                ScopeLeaseOperation::Select {
-                    execution: crate::scope_lease::tests::execution(1),
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: crate::scope_authority::tests::execution(1),
                 },
             )
             .unwrap(),
-            bounds: ScopeClockBounds::new(due, due).unwrap(),
         })),
     );
     let EntryPayload::Normal(command) = &mut scoped.payload else {
@@ -724,7 +723,7 @@ fn scope_lease_commands_do_not_trigger_unrelated_roster_maintenance() {
     assert_eq!(native.responses[0].result, sqlite.responses[0].result);
     assert!(matches!(
         native.responses[0].result,
-        Ok(SessionMutationOutcome::ScopeLease(Ok(_)))
+        Ok(SessionMutationOutcome::ScopeAuthority(Ok(_)))
     ));
     assert_eq!(sql_row(&sql, binding), before);
     assert!(

@@ -4195,7 +4195,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_lease_records_are_reserved_from_ordinary_and_roster_consumers() {
+    fn scope_authority_records_are_reserved_from_ordinary_and_roster_consumers() {
         let (authorization, ordinary) = authorization_fixture();
         assert!(authorization
             .authorize_operation(&SessionConsumerOperation::Get {

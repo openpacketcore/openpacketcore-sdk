@@ -48,36 +48,32 @@ evidence.
   admission check.
 - `StoredSessionRecord` carries key, generation, owner, fence, state class/type,
   expiry, and encrypted payload bytes.
-- `scope_lease::ScopeLeaseStore` provides authenticated stable-scope selection,
-  acquire/renew, same-execution resume and gate-closed graceful release over
-  strictly durable consensus. Immutable permits fix the one-second renewal
-  cadence, 77-second permit grace and conservative exclusion deadline. The grace
-  budgets sixty seconds of forwarding under RFC 022's clock and transport bounds.
-  A trusted admission policy and clock with explicit uncertainty bounds are
-  required. Each operation is one native command replacing a fixed authority
-  checkpoint, with no per-renewal receipt history. Stable cluster scopes survive
-  membership changes; apply can inspect their selection and grant floors. Each
-  joining voter must prove the exact lease and batch profile before replication.
-  A committed transition certificate carries activation through voter changes,
-  so renewals retain quorum availability after cutover without unanimous
-  reactivation. Initial activation still requires every voter.
-  Active scopes continue through Prepare and learner cleanup after a durable
-  Abort. Permits cannot be extended while no leader is available, or from the
-  Fence entry until successor admission. If either window exhausts the remaining
-  budget, permits lapse `h + G` after their last issuance.
-  Unsupported scope profiles are refused. Crossing a scope-record format change
-  requires a fresh installation; profile 3 is incompatible with profile 2.
-  Reopening profile-2 storage returns the typed `FreshInstallationRequired` reason.
-  See [RFC 022](../../docs/rfc/022-scope-leases.md)
-  for cancellation, lost replies, emergency-session holds and the separate
-  packet-gate/consumer-transport composition boundary.
-- `scope_batch::ScopeBatchStore` atomically creates, replaces or deletes up to
-  64 sealed child records under a live scope grant, with exact births and
-  generations, unique per-scope claims and sixteen bounded accounting counters.
-  Each batch is one consensus command after initial profile activation.
-  This initial profile requires one unresolved batch per scope and exact retry
-  after an unknown outcome. Child/claim links and birth floors survive durable
-  snapshots; physical reclamation and independent replay lanes are later work.
+- `scope_authority::ScopeAuthorityStore` provides strictly durable, untimed
+  admission, verified same-incarnation succession and permanent Close. Every
+  new child mutation compares the committed incarnation, retirement floor and
+  exact execution/generation at apply. Ownership never expires. Trusted policy
+  verifies the boot key, scope role and predecessor closure; installed
+  forwarding is excluded from closure. Controllers can submit succession, but
+  only the authenticated successor's exact retry issues `CommittedScopeAuthority`.
+  Stable scopes use the existing name-derived cluster ID and survive voter
+  changes. Initial activation requires every voter; committed continuation
+  carries it through cutover, restart and abort with quorum availability.
+  Profile 4 remains unadvertised, with a provisional activation digest until
+  independent lanes and namespace scans land and pass joint qualification.
+  Profile 4 requires a fresh installation across prior scope formats, with a
+  typed `FreshInstallationRequired` refusal and no compatibility reader.
+  Lost-worker retirement is a later slice; until it arrives an unconfirmed lost
+  execution cannot be replaced in its existing slot. See
+  [RFC 022](../../docs/rfc/022-scope-leases.md) for the contract and its lab limit.
+- `scope_batch::ScopeBatchStore` binds an explicit incarnation and atomically
+  creates, replaces or deletes up to 64 sealed children, with exact birth and
+  generation comparisons and unique claims. All 16 counters, the birth floor
+  and replay sequence floors remain per stable scope across incarnations.
+  Counters can only rise. One unresolved batch per scope and exact retries are
+  required. Read-only predecessor outcome resolution distinguishes retained
+  success, positively not applied and pruned/unknown results. Snapshot validation
+  preserves all floors; physical reclamation, independent lanes and coherent
+  scans remain separate slices.
   `execute_classified` accepts the authenticated worker's own-scope Emergency,
   EmergencyClassification, Normal or Maintenance declaration outside the request
   digest. Typed authority operations alone use SafetyControl.

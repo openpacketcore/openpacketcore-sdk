@@ -1,13 +1,13 @@
 //! Native three-voter proposal and forwarding isolation, with real commits.
-use super::scope_lease::{Admission, Clock};
+use super::scope_authority::{Admission, Clock};
 use super::*;
 use crate::consensus::store::{
     AcceptedClientWriteReceiverHoldForTest, AcceptedClientWriteReceiverTestOutcome,
 };
+use crate::scope_authority::tests::{execution, identity};
+use crate::scope_authority::*;
 use crate::scope_batch::tests::create;
 use crate::scope_batch::*;
-use crate::scope_lease::tests::{execution, identity};
-use crate::scope_lease::*;
 use crate::scope_scheduler::{ScopeSchedulerKey, ScopeWorkClass};
 use std::sync::atomic::AtomicU64;
 
@@ -35,45 +35,28 @@ async fn scope_scheduler_three_voters_forward_control_and_emergency_past_saturat
         let mut scopes = Vec::new();
         let mut requests = Vec::new();
         for n in 1..=10 {
-            let scope = ScopeLeaseId::new(
+            let scope = ScopeId::new(
                 fleet.topologies[0].consensus_identity().unwrap(),
                 TenantId::from_static("scheduler-test"),
                 NetworkFunctionKind::smf(),
                 [n; 32],
             )
             .unwrap();
-            let authority = ScopeLeaseStore::new(
+            let authority = ScopeAuthorityStore::new(
                 Arc::new(fleet.stores[leader].clone()),
                 scope.clone(),
-                clock.clone(),
                 Arc::new(Admission),
             )
             .unwrap();
-            authority
-                .execute(
-                    &identity("controller"),
-                    &ScopeLeaseRequest::new(
+            let grant = authority
+                .admit(
+                    &identity("worker-1"),
+                    &ScopeAuthorityRequest::new(
                         scope.clone(),
                         [n; 16],
                         0,
-                        ScopeLeaseOperation::Select {
+                        ScopeAuthorityOperation::AdmitInitial {
                             execution: execution(1),
-                        },
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            let grant = authority
-                .execute(
-                    &identity("worker-1"),
-                    &ScopeLeaseRequest::new(
-                        scope.clone(),
-                        [n + 10; 16],
-                        1,
-                        ScopeLeaseOperation::Acquire {
-                            execution: execution(1),
-                            selection: 1,
                         },
                     )
                     .unwrap(),
@@ -81,21 +64,20 @@ async fn scope_scheduler_three_voters_forward_control_and_emergency_past_saturat
                 .await
                 .unwrap();
             let request = ScopeBatchRequest::new(
-                grant.permit().unwrap(),
+                grant.stamp(),
                 [n + 20; 16],
                 0,
                 vec![create(n, &[n])],
                 vec![],
             )
             .unwrap();
-            scopes.push(scope);
+            scopes.push(grant.stamp().namespace().clone());
             requests.push(request);
         }
-        let batch_service = |voter: usize, scope: &ScopeLeaseId| {
+        let batch_service = |voter: usize, namespace: &ScopeNamespace| {
             ScopeBatchStore::new(
                 Arc::new(fleet.stores[voter].clone()),
-                scope.clone(),
-                clock.clone(),
+                namespace.clone(),
                 Arc::new(Admission),
             )
             .unwrap()
@@ -193,7 +175,7 @@ async fn scope_scheduler_three_voters_forward_control_and_emergency_past_saturat
                     ScopeWorkClass::SafetyControl
                 )
                 .await,
-            Err(ScopeLeaseError::Unauthorized.into()),
+            Err(ScopeAuthorityError::Unauthorized.into()),
             "a worker cannot declare control even on a replay"
         );
         assert_eq!(
@@ -204,32 +186,31 @@ async fn scope_scheduler_three_voters_forward_control_and_emergency_past_saturat
                     ScopeWorkClass::Emergency
                 )
                 .await,
-            Err(ScopeLeaseError::Unauthorized.into()),
+            Err(ScopeAuthorityError::Unauthorized.into()),
             "declaration never substitutes for own-scope execution authentication"
         );
-        let control_scope = ScopeLeaseId::new(
+        let control_scope = ScopeId::new(
             fleet.topologies[0].consensus_identity().unwrap(),
             TenantId::from_static("scheduler-test"),
             NetworkFunctionKind::smf(),
             [11; 32],
         )
         .unwrap();
-        let control = ScopeLeaseStore::new(
+        let control = ScopeAuthorityStore::new(
             Arc::new(fleet.stores[controller_voter].clone()),
             control_scope.clone(),
-            clock.clone(),
             Arc::new(Admission),
         )
         .unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
             control.execute(
-                &identity("controller"),
-                &ScopeLeaseRequest::new(
+                &identity("worker-1"),
+                &ScopeAuthorityRequest::new(
                     control_scope,
                     [99; 16],
                     0,
-                    ScopeLeaseOperation::Select {
+                    ScopeAuthorityOperation::AdmitInitial {
                         execution: execution(1),
                     },
                 )

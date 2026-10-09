@@ -1,5 +1,5 @@
 use super::*;
-use crate::scope_lease::{ScopeProfileActivation, ScopeProfileContinuation};
+use crate::scope_authority::{ScopeProfileActivation, ScopeProfileContinuation};
 use crate::scope_storage::{self as rows, ContinuationRow, ScopeRow};
 
 fn certificate(seed: u8) -> ScopeProfileContinuation {
@@ -173,11 +173,11 @@ fn scope_profile_previous_format_reopen_requires_fresh_installation() {
     assert_eq!(payload, legacy.payload.as_bytes());
 
     let mut corrupt = legacy;
-    corrupt.state_type = crate::StateType::from_static("opc-scope-state-v3");
-    corrupt.payload = EncryptedSessionPayload::new(b"OPSC\x03invalid");
+    corrupt.state_type = crate::StateType::from_static("opc-scope-state-v4");
+    corrupt.payload = EncryptedSessionPayload::new(b"OPSC\x04invalid");
     conn.execute(
         "UPDATE session_records SET payload = ?1, state_type = ?2 WHERE key_type = 'opc-scope-profile'",
-        params![corrupt.payload.as_bytes(), "opc-scope-state-v3"],
+        params![corrupt.payload.as_bytes(), "opc-scope-state-v4"],
     )
     .unwrap();
     assert_eq!(
@@ -606,30 +606,28 @@ fn scope_profile_continuity_unreadable_proof_still_aborts_fence_apply() {
 }
 
 #[test]
-fn scope_profile_continuity_fence_drains_old_stamps_and_preserves_issued_permits() {
+fn scope_profile_continuity_fence_drains_old_configurations_and_preserves_authority() {
+    use crate::scope_authority::{
+        ScopeAuthorityCommand, ScopeAuthorityError, ScopeAuthorityOperation, ScopeAuthorityRequest,
+        ScopeClosureEvidence, ScopeClosureKind, ScopeId,
+    };
     use crate::scope_batch::{
         ScopeBatchCommand, ScopeBatchError, ScopeBatchRequest, ScopeCounterMutation,
-    };
-    use crate::scope_lease::{
-        ScopeClockBounds, ScopeLeaseCommand, ScopeLeaseError, ScopeLeaseId, ScopeLeaseOperation,
-        ScopeLeaseRequest,
     };
     let backend = SqliteSessionBackend::in_memory().unwrap();
     let conn = backend.conn.blocking_lock();
     prepared(&conn, &backend.caps, true);
-    let scope = ScopeLeaseId::new(
+    let scope = ScopeId::new(
         identity(),
         opc_types::TenantId::from_static("scope-drain"),
         opc_types::NetworkFunctionKind::smf(),
         [1; 32],
     )
     .unwrap();
-    let execution = crate::scope_lease::tests::execution(1);
-    let bounds = ScopeClockBounds::new(timestamp(5), timestamp(5)).unwrap();
-    let lease = |id, revision, operation| {
-        SessionMutationIntent::ScopeLease(Box::new(ScopeLeaseCommand {
-            request: ScopeLeaseRequest::new(scope.clone(), [id; 16], revision, operation).unwrap(),
-            bounds,
+    let authority_request = |id, revision, operation| {
+        SessionMutationIntent::ScopeAuthority(Box::new(ScopeAuthorityCommand {
+            request: ScopeAuthorityRequest::new(scope.clone(), [id; 16], revision, operation)
+                .unwrap(),
         }))
     };
     let apply = |index, id, authority, mutation| {
@@ -651,102 +649,75 @@ fn scope_profile_continuity_fence_drains_old_stamps_and_preserves_issued_permits
             .result
             .unwrap()
     };
-    apply(
+    let SessionMutationOutcome::ScopeAuthority(Ok(admitted)) = apply(
         6,
         6,
         identity(),
-        lease(
+        authority_request(
             6,
             0,
-            ScopeLeaseOperation::Select {
-                execution: execution.clone(),
-            },
-        ),
-    );
-    let SessionMutationOutcome::ScopeLease(Ok(acquired)) = apply(
-        7,
-        7,
-        identity(),
-        lease(
-            7,
-            1,
-            ScopeLeaseOperation::Acquire {
-                execution,
-                selection: 1,
+            ScopeAuthorityOperation::AdmitInitial {
+                execution: crate::scope_authority::tests::execution(1),
             },
         ),
     ) else {
-        panic!("acquire under the pending predecessor");
+        panic!("initial admission under pending configuration");
     };
-    let acquired = acquired.state().unwrap().view;
-    let batch = |id, revision, permit: &crate::scope_lease::ScopePermit| {
+    let admitted = admitted.state().unwrap().view;
+    let batch = |id, revision| {
         SessionMutationIntent::ScopeBatch(Box::new(ScopeBatchCommand {
             request: ScopeBatchRequest::new(
-                permit,
+                admitted.stamp().unwrap(),
                 [id; 16],
                 revision,
                 vec![],
                 vec![ScopeCounterMutation::new(0, revision, revision + 1).unwrap()],
             )
             .unwrap(),
-            bounds,
         }))
     };
     assert!(matches!(
-        apply(8, 8, identity(), batch(8, 0, acquired.permit().unwrap())),
+        apply(7, 7, identity(), batch(7, 0)),
         SessionMutationOutcome::ScopeBatch(Ok(_))
     ));
-    let SessionMutationOutcome::ScopeLease(Ok(renewed)) = apply(
-        9,
-        9,
-        identity(),
-        lease(
-            9,
-            acquired.revision(),
-            ScopeLeaseOperation::Renew {
-                permit: acquired.permit().unwrap().clone(),
-            },
-        ),
-    ) else {
-        panic!("renew under the pending predecessor");
-    };
-    let renewed = renewed.state().unwrap().view;
-    let before_lease = super::super::scope_lease::read(&conn, identity(), &scope).unwrap();
+    let before_authority = super::super::scope_authority::read(&conn, identity(), &scope).unwrap();
     let before_batch =
         super::super::scope_batch::read(&conn, &rows::batch_key(&scope).unwrap()).unwrap();
     commit(
         &conn,
         &backend.caps,
         topology_entry_at(
-            10,
-            10,
+            8,
+            8,
             SessionMutationIntent::FenceTopologyAuthority {
                 transition_id: [0; 16],
                 request_digest: [0; 32],
             },
         ),
     );
-    let delayed_lease = lease(
-        11,
-        renewed.revision(),
-        ScopeLeaseOperation::Renew {
-            permit: renewed.permit().unwrap().clone(),
+    let delayed_authority = authority_request(
+        9,
+        admitted.revision(),
+        ScopeAuthorityOperation::Close {
+            current: admitted.stamp().unwrap().clone(),
+            evidence: ScopeClosureEvidence::new(ScopeClosureKind::LocalQuiescence, [9; 32])
+                .unwrap(),
         },
     );
-    let delayed_batch = batch(12, 1, renewed.permit().unwrap());
+    let delayed_batch = batch(10, 1);
     assert!(matches!(
-        apply(11, 11, identity(), delayed_lease.clone()),
-        SessionMutationOutcome::ScopeLease(Err(ScopeLeaseError::Unavailable))
+        apply(9, 9, identity(), delayed_authority.clone()),
+        SessionMutationOutcome::ScopeAuthority(Err(ScopeAuthorityError::Unavailable))
     ));
     assert!(matches!(
-        apply(12, 12, identity(), delayed_batch.clone()),
+        apply(10, 10, identity(), delayed_batch.clone()),
         SessionMutationOutcome::ScopeBatch(Err(ScopeBatchError::Scope(
-            ScopeLeaseError::Unavailable
+            ScopeAuthorityError::Unavailable
         )))
     ));
     assert_eq!(
-        super::super::scope_lease::read(&conn, identity(), &scope).unwrap(),
-        before_lease
+        super::super::scope_authority::read(&conn, identity(), &scope).unwrap(),
+        before_authority
     );
     assert_eq!(
         super::super::scope_batch::read(&conn, &rows::batch_key(&scope).unwrap()).unwrap(),
@@ -756,7 +727,7 @@ fn scope_profile_continuity_fence_drains_old_stamps_and_preserves_issued_permits
         &conn,
         &backend.caps,
         membership_entry_at(
-            13,
+            11,
             vec![members(&[7, 8, 9]), members(&[7, 8, 10])],
             members(&[7, 8, 9, 10]),
         ),
@@ -764,23 +735,25 @@ fn scope_profile_continuity_fence_drains_old_stamps_and_preserves_issued_permits
     commit(
         &conn,
         &backend.caps,
-        membership_entry_at(14, vec![members(&[7, 8, 10])], members(&[7, 8, 10])),
+        membership_entry_at(12, vec![members(&[7, 8, 10])], members(&[7, 8, 10])),
     );
-    // The exact client requests and the pre-Fence permit are still valid;
-    // only the proposal's authority stamp follows the new configuration.
+    // Retry identical immutable requests through current configuration metadata.
+    // The admitted execution does not need replacement at voter cutover.
     let successor = certificate(0).successor.identity;
-    let SessionMutationOutcome::ScopeLease(Ok(retried)) = apply(15, 11, successor, delayed_lease)
-    else {
-        panic!("an issued permit survives cutover without a new grant");
-    };
-    assert_eq!(
-        retried.state().unwrap().view.grant_floor(),
-        renewed.grant_floor()
-    );
     assert!(matches!(
-        apply(16, 12, successor, delayed_batch),
+        apply(13, 10, successor, delayed_batch),
         SessionMutationOutcome::ScopeBatch(Ok(_))
     ));
+    let SessionMutationOutcome::ScopeAuthority(Ok(retried)) =
+        apply(14, 9, successor, delayed_authority)
+    else {
+        panic!("exact authority request survives cutover");
+    };
+    assert_eq!(
+        retried.state().unwrap().view.admission_generation_floor(),
+        admitted.admission_generation_floor()
+    );
+    assert!(!retried.state().unwrap().view.is_active());
 }
 
 #[test]
@@ -1112,4 +1085,70 @@ fn scope_profile_continuity_cutover_and_activation_are_one_transaction() {
         assert_eq!(after.current_identity, certificate(0).successor.identity);
         assert!(super::super::scope_batch::active(&conn, &after).unwrap());
     }
+}
+
+#[test]
+fn scope_profile_three_reopen_returns_fresh_installation_before_authority_is_exposed() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("profile-three.sqlite");
+    let current = members(&[7, 8, 9]);
+    let legacy = rows::previous_timed_profile_record_for_test(certificate(0).predecessor);
+    {
+        let backend = SqliteSessionBackend::open(&database).unwrap();
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &current).unwrap();
+        let record = ScopeRow::Activation(certificate(0).predecessor)
+            .to_record()
+            .unwrap();
+        ops::insert_or_replace_scope_record_sync(&conn, &record).unwrap();
+        conn.execute("UPDATE session_records SET payload=?1,state_type=?2 WHERE key_type='opc-scope-profile'", params![legacy.payload.as_bytes(), legacy.state_type.as_str()]).unwrap();
+    }
+    let backend = SqliteSessionBackend::open(&database).unwrap();
+    let conn = backend.conn.blocking_lock();
+    assert_eq!(
+        initialize_schema(&conn, identity(), &current).unwrap_err(),
+        SessionConsensusStorageError::FreshInstallationRequired
+    );
+    let retained: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM session_records WHERE key_type='opc-scope-profile'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        legacy.payload.as_bytes(),
+        "no migration on refusal"
+    );
+}
+
+#[test]
+fn scope_profile_three_log_replay_refuses_the_old_activation_digest() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    let current = members(&[7, 8, 9]);
+    initialize_schema(&conn, identity(), &current).unwrap();
+    commit(
+        &conn,
+        &backend.caps,
+        membership_entry_at(0, vec![current.clone()], current),
+    );
+    let old = rows::previous_timed_profile_record_for_test(certificate(0).predecessor);
+    let ScopeRow::Activation(old_certificate) =
+        postcard::from_bytes(&old.payload.as_bytes()[5..]).unwrap()
+    else {
+        unreachable!()
+    };
+    let entry = topology_entry_at(
+        1,
+        1,
+        SessionMutationIntent::ActivateScopeProfile(Box::new(old_certificate)),
+    );
+    let error = append_logs_sync(&conn, identity(), &[entry]).unwrap_err();
+    assert!(
+        error.to_string().contains("fresh installation required"),
+        "{error}"
+    );
+    assert_eq!(last_log_sync(&conn, identity()).unwrap(), Some(log_id(0)));
 }

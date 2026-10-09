@@ -72,11 +72,11 @@ impl ConsumerReceiptStore for ConsumerReceipts<'_> {
 }
 
 impl NativeState {
-    pub(crate) fn scope_lease_checkpoint(
+    pub(crate) fn scope_authority_checkpoint(
         &self,
         identity: SessionConsensusIdentity,
-        scope: &crate::scope_lease::ScopeLeaseId,
-    ) -> Result<crate::sqlite::consensus::scope_lease::StoredCheckpoint, StoreError> {
+        scope: &crate::scope_authority::ScopeId,
+    ) -> Result<crate::sqlite::consensus::scope_authority::StoredCheckpoint, StoreError> {
         let receipts = self.consumer_receipts()?;
         let slot = scope.checkpoint_id().map_err(|_| unavailable())?;
         let key = scope.key().map_err(|_| unavailable())?;
@@ -86,10 +86,17 @@ impl NativeState {
             .get(&key)
             .and_then(|row| row.record.as_ref())
             .map(|record| {
-                crate::scope_lease::ScopeLeaseCheckpoint::from_record(record)
+                crate::scope_authority::ScopeAuthorityCheckpoint::from_record(record)
                     .and_then(|checkpoint| checkpoint.stored())
             })
             .transpose();
+        if current
+            .as_ref()
+            .is_ok_and(|checkpoint| checkpoint.is_some())
+        {
+            scope_batch::validate_links(&key, |key| self.keys.get(key).map(|row| &**row))
+                .map_err(|_| unavailable())?;
+        }
         Ok((legacy || current.is_err(), current.unwrap_or(None)))
     }
 

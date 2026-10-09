@@ -2,14 +2,14 @@
 //! receipt pruning cannot remove scope selection, grant, or replay floors.
 
 use super::*;
-use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseError, ScopeLeaseId};
+use crate::scope_authority::{ScopeAuthorityCommand, ScopeAuthorityError, ScopeId};
 
 pub(crate) type StoredCheckpoint = (bool, Option<([u8; 32], SessionConsensusResponse)>);
 
 pub(crate) fn read(
     conn: &Connection,
     identity: SessionConsensusIdentity,
-    scope: &ScopeLeaseId,
+    scope: &ScopeId,
 ) -> Result<StoredCheckpoint, StoreError> {
     let slot = scope
         .checkpoint_id()
@@ -30,7 +30,9 @@ pub(crate) fn read(
             .is_some();
     let current = ops::get_raw_sync(conn, &key)?
         .map(|record| {
-            crate::scope_lease::ScopeLeaseCheckpoint::from_record(&record)
+            super::scope_batch::validate_links(conn, &record)
+                .map_err(|_| ScopeAuthorityError::FormatMismatch)?;
+            crate::scope_authority::ScopeAuthorityCheckpoint::from_record(&record)
                 .and_then(|checkpoint| checkpoint.stored())
         })
         .transpose()
@@ -38,15 +40,49 @@ pub(crate) fn read(
     Ok((legacy, current))
 }
 
+fn has_scope_rows(conn: &Connection, scope: &ScopeId) -> io::Result<bool> {
+    let mut statement = conn.prepare("SELECT key_type,stable_id FROM session_records WHERE tenant=?1 AND nf_kind=?2 AND key_type IN ('opc-scope-lease','opc-scope-batch','opc-scope-child','opc-scope-claim')").map_err(db_error)?;
+    let mut rows = statement
+        .query(params![scope.tenant().as_str(), scope.nf_kind().as_str()])
+        .map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let kind: String = row.get(0).map_err(db_error)?;
+        let bytes: Vec<u8> = row.get(1).map_err(db_error)?;
+        if kind == "opc-scope-lease" && bytes.as_slice() == scope.slot() {
+            return Ok(true);
+        }
+        if kind == "opc-scope-lease" {
+            continue;
+        }
+        let key = crate::SessionKey {
+            tenant: scope.tenant().clone(),
+            nf_kind: scope.nf_kind().clone(),
+            key_type: crate::SessionKeyType::other(kind)
+                .map_err(|_| invalid_data("scope orphan key invalid"))?,
+            stable_id: crate::StableId::new(bytes::Bytes::from(bytes))
+                .map_err(|_| invalid_data("scope orphan key invalid"))?,
+        };
+        let record = ops::get_raw_sync(conn, &key)
+            .map_err(|_| invalid_data("scope orphan read failed"))?
+            .ok_or_else(|| invalid_data("scope orphan row absent"))?;
+        let row = crate::scope_storage::ScopeRow::from_record(&record)
+            .map_err(|_| invalid_data("scope orphan row invalid"))?;
+        if row.scope() == Some(scope) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn state_machine_intent_error() -> StoreError {
     StoreError::BackendUnavailable("scope checkpoint read failed".into())
 }
 
-pub(crate) fn operation(intent: &SessionMutationIntent) -> Option<&ScopeLeaseCommand> {
+pub(crate) fn operation(intent: &SessionMutationIntent) -> Option<&ScopeAuthorityCommand> {
     match intent {
-        SessionMutationIntent::ScopeLease(operation) => Some(operation),
+        SessionMutationIntent::ScopeAuthority(operation) => Some(operation),
         SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
-            SessionMutationIntent::ScopeLease(operation) => Some(operation),
+            SessionMutationIntent::ScopeAuthority(operation) => Some(operation),
             _ => None,
         },
         _ => None,
@@ -56,7 +92,7 @@ pub(crate) fn operation(intent: &SessionMutationIntent) -> Option<&ScopeLeaseCom
 pub(crate) fn authority_error(
     command: &SessionConsensusCommand,
     current_epoch: SessionConsensusConfigurationEpoch,
-) -> ScopeLeaseError {
+) -> ScopeAuthorityError {
     if matches!(
         &command.intent,
         SessionMutationIntent::Authorized { authority_identity, .. }
@@ -66,9 +102,9 @@ pub(crate) fn authority_error(
         // The authenticated operation may have crossed a durable authority
         // switch after proposal. It has no effect; retry the exact request
         // through current admission instead of reporting a caller refusal.
-        ScopeLeaseError::Unavailable
+        ScopeAuthorityError::Unavailable
     } else {
-        ScopeLeaseError::Unauthorized
+        ScopeAuthorityError::Unauthorized
     }
 }
 
@@ -93,16 +129,17 @@ pub(super) fn apply(
     };
     let (legacy, current) =
         read(conn, identity, target).map_err(|_| invalid_data("scope checkpoint unavailable"))?;
+    let initialize_ledger = current.is_none();
     let result = if target.store() != identity.cluster_id() {
-        Err(ScopeLeaseError::Unauthorized)
+        Err(ScopeAuthorityError::Unauthorized)
     } else if !authorized {
         Err(authority_error(command, scope.application_authority_epoch))
     } else if !super::scope_batch::active(conn, scope)
         .map_err(|_| invalid_data("scope activation unavailable"))?
     {
-        Err(ScopeLeaseError::ProfileNotActivated)
-    } else if legacy {
-        Err(ScopeLeaseError::FormatMismatch)
+        Err(ScopeAuthorityError::ProfileNotActivated)
+    } else if legacy || (current.is_none() && has_scope_rows(conn, target)?) {
+        Err(ScopeAuthorityError::FormatMismatch)
     } else {
         operation.apply(current)
     };
@@ -118,13 +155,22 @@ pub(super) fn apply(
         .calculate_applied_digest(sequence, machine.1, now)
         .map_err(|_| invalid_data("scope digest invalid"))?;
     let response = SessionConsensusResponse {
-        result: Ok(SessionMutationOutcome::ScopeLease(result.clone())),
+        result: Ok(SessionMutationOutcome::ScopeAuthority(result.clone())),
         sequence,
         digest: Some(digest),
         logical_time: Some(now),
         raft_log_index: index,
     };
     if let Ok(checkpoint) = result {
+        if initialize_ledger {
+            let ledger = crate::scope_storage::ScopeRow::Batch(Box::new(
+                crate::scope_batch::ScopeBatchCheckpoint::empty(target.clone()),
+            ))
+            .to_record()
+            .map_err(|_| invalid_data("scope initial ledger invalid"))?;
+            ops::insert_or_replace_scope_record_sync(conn, &ledger)
+                .map_err(|_| invalid_data("scope initial ledger write failed"))?;
+        }
         let record = checkpoint
             .to_record()
             .map_err(|_| invalid_data("scope checkpoint invalid"))?;
