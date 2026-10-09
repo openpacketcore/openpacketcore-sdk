@@ -452,6 +452,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: wait for IPv6 address and gateway-neighbour readiness
+  in all privileged datapath fixtures before packet assertions. Readiness
+  failures now include the `ip` command's exit status, stdout and stderr.
+
 - `opc-session-testkit`: run authenticated response-loss and stalled-voter
   fixtures' client calls and transport actors on an isolated frozen clock,
   bounded by a 30-second test-only wall watchdog. Voter services and SQLite
@@ -487,6 +491,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   V2 accepted-effect regression keeps setup on real time and freezes only
   acceptance, preserving its 150 ms request deadline and both one-second phase
   guards. Fixes #1179.
+
+- `opc-gtpu-dataplane`: tolerate programs retired between kernel ID enumeration
+  and reopen in historical, generation, hook-identity and workload cleanup
+  scans. Only `ENOENT` from reopening the program ID is treated as absence;
+  live foreign references, missing required targets and all other inspection
+  errors still refuse ownership or cleanup. (#1180)
 
 - `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
   admitted append's final result before authenticated readback, retaining its

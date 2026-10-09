@@ -17678,8 +17678,21 @@ mod aya_runtime {
     type CurrentProgramScanTestHook = Box<dyn FnMut(&ProgramInfo)>;
 
     #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProgramScanStage {
+        Enumeration,
+        MapIds,
+    }
+
+    #[cfg(test)]
+    type ProgramScanTestHook =
+        Box<dyn FnMut(ProgramScanStage, &ProgramInfo) -> Result<(), ProgramError>>;
+
+    #[cfg(test)]
     std::thread_local! {
         static CURRENT_PROGRAM_SCAN_TEST_HOOK: std::cell::RefCell<Option<CurrentProgramScanTestHook>> =
+            const { std::cell::RefCell::new(None) };
+        static PROGRAM_SCAN_TEST_HOOK: std::cell::RefCell<Option<ProgramScanTestHook>> =
             const { std::cell::RefCell::new(None) };
         static HISTORICAL_25_TEST_CRASH_AFTER_QUALIFIED_PROOF: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
@@ -31677,7 +31690,7 @@ mod aya_runtime {
                 // derivation or global program-listing permissions.
                 return Ok(Vec::new());
             }
-            let loaded = loaded_programs()
+            let loaded = programs_during_scan()
                 .map(|result| result.map_err(|_| state_indeterminate("ebpf_generation_identity")))
                 .collect::<Result<Vec<_>, _>>()?;
             let loaded_tags = loaded
@@ -36094,15 +36107,17 @@ mod aya_runtime {
             map_ids: &[u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
         ) -> Result<bool, GtpuError> {
             let graph_ids = map_ids.iter().copied().collect::<HashSet<_>>();
-            for result in loaded_programs() {
+            for result in programs_during_scan() {
                 let info = result
                     .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?;
-                let references_graph = info
-                    .map_ids()
-                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?
-                    .ok_or_else(|| state_indeterminate("ebpf_historical_25_program_scan"))?
-                    .iter()
-                    .any(|id| graph_ids.contains(id));
+                let referenced = match program_map_ids_during_scan(&info) {
+                    Err(error) if program_id_disappeared_during_scan(&error) => continue,
+                    result => result.map_err(|error| {
+                        program_error("ebpf_historical_25_program_scan", &error)
+                    })?,
+                }
+                .ok_or_else(|| state_indeterminate("ebpf_historical_25_program_scan"))?;
+                let references_graph = referenced.iter().any(|id| graph_ids.contains(id));
                 if references_graph {
                     return Ok(false);
                 }
@@ -38312,7 +38327,7 @@ mod aya_runtime {
         if owner.name != program_name {
             return Ok(false);
         }
-        let occupant = loaded_programs()
+        let occupant = programs_during_scan()
             .find_map(|result| match result {
                 Ok(info) if info.id() == program_id => Some(Ok(info)),
                 Ok(_) => None,
@@ -38361,7 +38376,7 @@ mod aya_runtime {
         if owner.name != program_name || owner.program_id != Some(expected_program_id) {
             return Ok(false);
         }
-        let occupant = loaded_programs()
+        let occupant = programs_during_scan()
             .find_map(|result| match result {
                 Ok(info) if info.id() == expected_program_id => Some(Ok(info)),
                 Ok(_) => None,
@@ -38394,7 +38409,7 @@ mod aya_runtime {
         if owner.name != program_name {
             return Ok(None);
         }
-        let occupant = loaded_programs()
+        let occupant = programs_during_scan()
             .find_map(|result| match result {
                 Ok(info) if info.id() == program_id => Some(Ok(info)),
                 Ok(_) => None,
@@ -49442,6 +49457,39 @@ mod aya_runtime {
                 if error.call == "bpf_prog_get_fd_by_id"
                     && error.io_error.raw_os_error() == Some(rustix::io::Errno::NOENT.raw_os_error())
         )
+    }
+
+    #[cfg(test)]
+    fn program_scan_test_hook(
+        stage: ProgramScanStage,
+        info: &ProgramInfo,
+    ) -> Result<(), ProgramError> {
+        PROGRAM_SCAN_TEST_HOOK.with(|hook| match hook.borrow_mut().as_mut() {
+            Some(hook) => hook(stage, info),
+            None => Ok(()),
+        })
+    }
+
+    fn programs_during_scan() -> impl Iterator<Item = Result<ProgramInfo, ProgramError>> {
+        let programs = loaded_programs();
+        #[cfg(test)]
+        let programs = programs.map(|result| {
+            let info = result?;
+            program_scan_test_hook(ProgramScanStage::Enumeration, &info)?;
+            Ok(info)
+        });
+        // Aya enumerates IDs and reopens each one separately. A retired ID
+        // retains no map graph; all other inspection failures must remain
+        // visible. Callers still require every expected owned ID to be present.
+        programs.filter(
+            |result| !matches!(result, Err(error) if program_id_disappeared_during_scan(error)),
+        )
+    }
+
+    fn program_map_ids_during_scan(info: &ProgramInfo) -> Result<Option<Vec<u32>>, ProgramError> {
+        #[cfg(test)]
+        program_scan_test_hook(ProgramScanStage::MapIds, info)?;
+        info.map_ids()
     }
 
     /// Map aya program errors to redaction-safe errors. Program-load

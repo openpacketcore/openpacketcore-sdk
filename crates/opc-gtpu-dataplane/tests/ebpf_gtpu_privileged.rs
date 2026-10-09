@@ -606,14 +606,22 @@ fn resolve_s2bu_ipv6_gateway_neighbour() {
             .args(["-6", "addr", "show", "dev", "s2bu", "tentative"])
             .output()
             .expect("read s2bu tentative IPv6 addresses");
-        assert!(output.status.success(), "ip -6 addr show dev s2bu failed");
+        assert!(
+            output.status.success(),
+            "ip -6 addr show dev s2bu tentative failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         if output.stdout.is_empty() {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "s2bu IPv6 DAD did not complete: {}",
-            String::from_utf8_lossy(&output.stdout)
+            "s2bu IPv6 DAD did not complete: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -10253,7 +10261,7 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     // netns and its uniquely named UE peer netns; TestNet's RAII teardown
     // destroys both namespaces and every remaining XFRM object with them.
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
-    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    resolve_s2bu_ipv6_gateway_neighbour();
     let pgw = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind proof PGW socket")
     });
@@ -10863,7 +10871,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     // Resolve outer neighbours before opening capture sockets so every
     // subsequent single send is an exact one-packet counter assertion.
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
-    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    resolve_s2bu_ipv6_gateway_neighbour();
 
     let pgw_v4 = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind initial PGW IPv4 GTP-U socket")
@@ -14132,7 +14140,7 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         .install_pdp_context(session_context(device.ifindex))
         .await?;
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
-    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    resolve_s2bu_ipv6_gateway_neighbour();
     let control = backend.open_gtpu_control_port(&device).await?;
     let control_v6 = UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?;
     control_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -14558,7 +14566,7 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
             net.pin_root.join("s2bu")
         };
         run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
-        run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+        resolve_s2bu_ipv6_gateway_neighbour();
         run("ip", &["addr", "add", "192.0.2.90/24", "dev", "s2bu"]);
         run(
             "ip",

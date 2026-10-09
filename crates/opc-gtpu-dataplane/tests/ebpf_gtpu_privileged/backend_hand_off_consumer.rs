@@ -623,7 +623,7 @@ async fn grouped_attachment_over_ipv6() -> Result<u64, Box<dyn std::error::Error
     let pin_dir = grouped_pin_directory(&net.pin_root, grouped_device_id());
     let pgw_capture = packet_capture_socket(&net.pgw_ns);
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
-    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    resolve_s2bu_ipv6_gateway_neighbour();
     let destination_mac = main_link_address("s2bu");
     let source_mac = net.pgw_link_address("s2bup");
     let frame_v6 = |gpdu: &[u8]| {

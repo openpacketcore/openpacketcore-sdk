@@ -241,7 +241,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
             .is_err());
         assert_eq!(group_bytes(&net), before);
         run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
-        run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+        resolve_s2bu_ipv6_gateway_neighbour();
         let pgw4 = in_netns(&net.pgw_ns, || {
             UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
         });
