@@ -452,6 +452,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-ipsec-lb`: end the retirement fixture's first runtime before reopening
+  SQLite, so detached lease cleanup cannot race the new adapter. A
+  `test-control`-only lease-release hook reproduces the refusal; retirement
+  replay still requires the original tombstone and unchanged retention
+  deadline. Fixture synchronization uses a separate hang watchdog and reports
+  expiry without poisoning its release mutex (#863).
+
 - Go operators: update `golang.org/x/net` to v0.60.0 and require Go 1.26.9 in
   `operator-sdk-go` and `sdk-reference-operator` to address GO-2026-6617 and
   the related standard-library vulnerabilities.

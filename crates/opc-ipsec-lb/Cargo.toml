@@ -44,6 +44,7 @@ aya = { version = "0.14" }
 nix = { workspace = true, features = ["net", "sched", "socket"] }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 proptest = "1.9"
 rcgen = { workspace = true }
