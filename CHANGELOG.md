@@ -477,6 +477,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call returns. Value-free shutdown observations distinguish caller deadlines,
   coordinator results and physical drain failures (#913).
 
+- `opc-session-store`, `opc-persist`: run short-deadline functional fixture
+  formation on a frozen protocol clock, bounded only by a 30-second test-only
+  wall watchdog. Setup no longer has to finish within the 150 ms to 1 s
+  real-time operation budgets. This includes the recovered 750 ms campaigns
+  and the 150 ms config singleton. Preserve the original operation timers,
+  admission checks and real Raft tasks; finalization, cold recovery and direct
+  initialization-deadline tests retain their original clocks and bounds. The
+  V2 accepted-effect regression keeps setup on real time and freezes only
+  acceptance, preserving its 150 ms request deadline and both one-second phase
+  guards. Fixes #1179.
+
 - `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
   admitted append's final result before authenticated readback, retaining its
   acknowledgement, shutdown and completion bounds. A backend-error control

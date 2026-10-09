@@ -9224,9 +9224,20 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
     for ((_, target), path) in &paths {
         path.install(stores[*target].rpc_handler()).await;
     }
-    for result in
-        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster))
-            .await
+    assert!(stores.iter().all(|store| matches!(
+        store.persistence_health().recovery,
+        None | Some(crate::SessionAsyncRecoveryState::Active)
+    )));
+    let forming = stores.clone();
+    for result in crate::formation_clock::run(async move {
+        futures_util::future::join_all(
+            forming
+                .iter()
+                .map(ConsensusSessionStore::initialize_cluster),
+        )
+        .await
+    })
+    .await
     {
         result.expect("initialize recovered campaign membership");
     }
@@ -9936,9 +9947,20 @@ async fn terminal_proof_without_a_consumed_voter_keeps_pending_suffix_strict() {
     for ((_, target), path) in &paths {
         path.install(stores[*target].rpc_handler()).await;
     }
-    for result in
-        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster))
-            .await
+    assert!(stores.iter().all(|store| matches!(
+        store.persistence_health().recovery,
+        None | Some(crate::SessionAsyncRecoveryState::Active)
+    )));
+    let forming = stores.clone();
+    for result in crate::formation_clock::run(async move {
+        futures_util::future::join_all(
+            forming
+                .iter()
+                .map(ConsensusSessionStore::initialize_cluster),
+        )
+        .await
+    })
+    .await
     {
         result.expect("initialize strict-terminal campaign membership");
     }

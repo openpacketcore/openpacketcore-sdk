@@ -110,6 +110,10 @@ pub mod break_glass;
 mod consensus;
 mod consumer_checkpoint;
 mod error;
+// Share the workspace's private fixture clock without a production dependency.
+#[cfg(test)]
+#[path = "../../opc-session-store/tests/support/formation_clock.rs"]
+mod formation_clock;
 mod json_text;
 mod local_sqlite;
 pub use consumer_checkpoint::{

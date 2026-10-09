@@ -375,12 +375,16 @@ impl Fleet {
     }
 
     async fn form(&self) {
-        let results = join_all(
-            self.stores
+        let stores = self.stores.iter().flatten().cloned().collect::<Vec<_>>();
+        assert!(
+            stores
                 .iter()
-                .flatten()
-                .map(ConsensusSessionStore::initialize_cluster),
-        )
+                .all(|store| store.inner.persistence_protocol.is_active()),
+            "cold recovery must use the ordinary initialization deadline"
+        );
+        let results = crate::formation_clock::run(async move {
+            join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster)).await
+        })
         .await;
         assert!(
             results.iter().all(Result::is_ok),
