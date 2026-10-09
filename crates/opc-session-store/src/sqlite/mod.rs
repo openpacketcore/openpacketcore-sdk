@@ -60,6 +60,20 @@ pub mod test_support {
         ProtectedRosterTerminalApplyTimings,
         ProtectedRosterV2TerminalStatusValidationStagesForTest,
     };
+
+    /// Observe a standalone lease release while its real write transaction is held.
+    ///
+    /// The callback runs after the lease update and before commit. It can only
+    /// control test scheduling; the ordinary transaction and worker bounds remain.
+    pub fn set_standalone_release_before_commit_for_test(
+        backend: &super::SqliteSessionBackend,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *backend
+            .standalone_release_before_commit_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(hook));
+    }
 }
 
 pub(crate) mod lease;
@@ -645,6 +659,8 @@ pub struct SqliteSessionBackend {
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
     operation_workers: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "test-control")]
+    standalone_release_before_commit_for_test: Arc<StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     consensus_diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
@@ -1434,6 +1450,8 @@ impl SqliteSessionBackend {
             operation_workers: Arc::new(tokio::sync::Semaphore::new(
                 SQLITE_OPERATION_BLOCKING_WORKERS,
             )),
+            #[cfg(feature = "test-control")]
+            standalone_release_before_commit_for_test: Arc::new(StdMutex::new(None)),
             consensus_diagnostics: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -4860,9 +4878,19 @@ impl SessionLeaseManager for SqliteSessionBackend {
 
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
         let now = self.clock.now_utc();
+        #[cfg(feature = "test-control")]
+        let before_commit = self
+            .standalone_release_before_commit_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         self.run_lease_sqlite_task(move |conn| {
             let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
             lease::release_sync(&tx, lease, now)?;
+            #[cfg(feature = "test-control")]
+            if let Some(hook) = before_commit {
+                hook();
+            }
             tx.commit()
                 .map_err(|_| LeaseError::OperationOutcomeUnavailable)?;
             Ok(())

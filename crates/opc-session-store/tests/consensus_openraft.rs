@@ -1,3 +1,6 @@
+#[path = "support/formation_clock.rs"]
+mod formation_clock;
+
 #[path = "consensus_openraft/late_acquire.rs"]
 mod late_acquire;
 
@@ -976,12 +979,16 @@ impl TestCluster {
             path.install(cluster.stores[*target].rpc_handler());
         }
 
-        let initialize = cluster
-            .stores
-            .iter()
-            .map(ConsensusSessionStore::initialize_cluster)
-            .collect::<Vec<_>>();
-        let results = futures_util::future::join_all(initialize).await;
+        // Stores and their Raft tasks already run on the caller's runtime.
+        // Only this functional setup call uses controlled protocol time.
+        let stores = cluster.stores.clone();
+        let results = formation_clock::run(async move {
+            futures_util::future::join_all(
+                stores.iter().map(ConsensusSessionStore::initialize_cluster),
+            )
+            .await
+        })
+        .await;
         for result in results {
             result.expect("initialize identical membership concurrently");
         }

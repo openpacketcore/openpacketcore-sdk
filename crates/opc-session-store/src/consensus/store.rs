@@ -16390,6 +16390,65 @@ mod membership_tests {
         counters.iter().copied().sum()
     }
 
+    async fn initialize_fixture(
+        store: &ConsensusSessionStore,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
+        assert!(store.inner.persistence_protocol.is_active());
+        let store = store.clone();
+        crate::formation_clock::run(async move { store.initialize_cluster().await }).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixture_formation_preserves_the_original_initialization_deadline() {
+        let directory = tempfile::tempdir().expect("formation deadline directory");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+                .expect("formation deadline backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("open formation deadline store");
+        let initializing_store = store.clone();
+        let attempt = crate::formation_clock::run(async move {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let initializing = initialization_evidence::observe(
+                &initializing_store,
+                initialization_evidence::ProbeControl::Pause {
+                    entered: Arc::clone(&entered),
+                    release,
+                },
+            );
+            tokio::pin!(initializing);
+            tokio::select! {
+                biased;
+                result = &mut initializing => panic!("probe did not remain pending: {result:?}"),
+                () = entered.notified() => {}
+            }
+            tokio::time::advance(Duration::from_millis(149)).await;
+            assert!(initializing.as_mut().now_or_never().is_none());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            initializing.await
+        })
+        .await;
+        assert!(matches!(
+            attempt.result,
+            Err(ConsensusSessionStoreOpenError::ClusterFormationRejected)
+        ));
+        assert_eq!(
+            attempt.expired_stage(),
+            Some(initialization_evidence::DeadlineStage::InitializedProbe)
+        );
+        assert!(attempt.probe_was_active_and_unadmitted());
+        assert!(!store.status().admitted);
+        assert_eq!(store.inner.operation_timeout, Duration::from_millis(150));
+    }
+
     async fn wait_for_log_index_after(
         store: &ConsensusSessionStore,
         before: u64,
@@ -19255,8 +19314,7 @@ mod membership_tests {
             )
             .await
             .unwrap_or_else(|_| panic!("open {label} accepted receiver effect store"));
-            store
-                .initialize_cluster()
+            initialize_fixture(&store)
                 .await
                 .unwrap_or_else(|_| panic!("initialize {label} accepted receiver effect store"));
             (directory, store)
@@ -19338,8 +19396,7 @@ mod membership_tests {
         )
         .await
         .expect("open accepted V1 transition store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize accepted V1 transition store");
 
@@ -19422,8 +19479,7 @@ mod membership_tests {
         )
         .await
         .expect("open activation receiver effect store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize activation receiver effect store");
 
@@ -19508,8 +19564,7 @@ mod membership_tests {
         )
         .await
         .expect("open deadline activation receiver store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize deadline activation receiver store");
 
@@ -19646,8 +19701,7 @@ mod membership_tests {
             )
             .await
             .unwrap_or_else(|_| panic!("open {label} fresh activation effect store"));
-            store
-                .initialize_cluster()
+            initialize_fixture(&store)
                 .await
                 .unwrap_or_else(|_| panic!("initialize {label} fresh activation effect store"));
             (directory, store)
@@ -19725,8 +19779,7 @@ mod membership_tests {
             )
             .await
             .unwrap_or_else(|_| panic!("open {label} cold conflict batch store"));
-            store
-                .initialize_cluster()
+            initialize_fixture(&store)
                 .await
                 .unwrap_or_else(|_| panic!("initialize {label} cold conflict batch store"));
             (directory, store)
@@ -19851,8 +19904,7 @@ mod membership_tests {
         )
         .await
         .expect("open cold epoch batch store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize cold epoch batch store");
         assert_eq!(
@@ -22024,8 +22076,7 @@ mod membership_tests {
         )
         .await
         .expect("open roster ingress store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize roster ingress store");
 
@@ -22911,8 +22962,7 @@ mod membership_tests {
         )
         .await
         .expect("open successor store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize successor store");
         store
@@ -25414,8 +25464,7 @@ mod membership_tests {
         )
         .await
         .expect("open expiry floor store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize expiry floor store");
         let key = SessionKey {
@@ -25501,8 +25550,7 @@ mod membership_tests {
         )
         .await
         .expect("open watch commit gate store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize watch commit gate store");
         let mut watch = store.watch(1).await.expect("register applied watch");
@@ -25574,8 +25622,7 @@ mod membership_tests {
         )
         .await
         .expect("open padding receipt store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize padding receipt store");
 
@@ -25677,8 +25724,7 @@ mod membership_tests {
         )
         .await
         .expect("open proposal supervision store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize proposal supervision store");
 
@@ -25862,8 +25908,7 @@ mod membership_tests {
         )
         .await
         .expect("open V2 reply-loss store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize V2 reply-loss store");
         let mut watch = store.watch(1).await.expect("register applied watch");
@@ -26066,7 +26111,7 @@ mod membership_tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn v2_submit_effect_boundary_retains_an_openraft_accepted_request() {
         async fn stage<F: std::future::Future>(name: &str, future: F) -> F::Output {
             let (cancel, waiting) = std::sync::mpsc::channel::<()>();
@@ -26093,13 +26138,6 @@ mod membership_tests {
         }
 
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
-        // Host scheduling and real disk work must not exhaust the 150ms
-        // protocol deadline before this fixture reaches accepted-but-unapplied
-        // work. This blocking receive inhibits automatic clock advance without
-        // putting setup or cleanup inside a real-time performance bound.
-        // Dropping its sender releases it on both success and panic.
-        let (release_clock, held_clock) = std::sync::mpsc::channel::<()>();
-        let clock_guard = tokio::task::spawn_blocking(move || held_clock.recv());
         let directory = tempfile::tempdir().expect("V2 accepted effect boundary directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("V2 accepted effect boundary SQLite backend");
@@ -26114,8 +26152,7 @@ mod membership_tests {
         )
         .await
         .expect("open V2 accepted effect boundary store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize V2 accepted effect boundary store");
 
@@ -26133,14 +26170,23 @@ mod membership_tests {
             .expect("hold V2 accepted effect state-machine apply");
         let submitting_store = store.clone();
         let submitted_request = request.clone();
+        // Keep setup on real time: SQLite converts its work deadlines to
+        // std::Instant, so freezing before setup can make fresh work expired.
+        // Freeze only this one-second acceptance phase, preserving its 150ms
+        // protocol deadline. The blocking receive inhibits automatic advance;
+        // dropping its sender releases it on both success and panic.
+        let (release_clock, held_clock) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || held_clock.recv());
+        tokio::time::pause();
         stage("accepting the proposal and observing its deadline", async {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
             let mut submission = tokio::spawn(async move {
                 submitting_store
                     .submit_request_effect_before(
                         fenced_transition_v2_outer_request_id(&submitted_request),
                         SessionMutationIntent::FencedTransitionV2(Box::new(submitted_request)),
                         None,
-                        tokio::time::Instant::now() + Duration::from_millis(150),
+                        deadline,
                     )
                     .await
             });
@@ -26148,6 +26194,10 @@ mod membership_tests {
             // frozen, including the accepted request's deadline completion.
             wait_for_log_index_after(&store, before, "V2 effect-boundary accepted proposal").await;
             tokio::time::advance(Duration::from_millis(149)).await;
+            assert_eq!(
+                deadline - tokio::time::Instant::now(),
+                Duration::from_millis(1)
+            );
             assert!(
                 matches!(
                     futures_util::poll!(&mut submission),
@@ -26156,12 +26206,21 @@ mod membership_tests {
                 "the accepted request remains pending before its original 150ms deadline"
             );
             tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            // Tokio rounds deadlines up to a millisecond. Deliver the next
+            // timer tick after reaching the unchanged 150ms request deadline.
+            tokio::time::advance(Duration::from_millis(1)).await;
             assert!(matches!(
                 submission.await.expect("V2 effect submission task"),
                 ConsensusSubmissionEffect::OutcomeUnknown
             ));
         })
         .await;
+        tokio::time::resume();
+        drop(release_clock);
+        let _ = clock_guard
+            .await
+            .expect("retire V2 effect protocol clock guard");
 
         stage(
             "releasing admission and reading the retained receipt",
@@ -26192,10 +26251,6 @@ mod membership_tests {
             },
         )
         .await;
-        drop(release_clock);
-        let _ = clock_guard
-            .await
-            .expect("retire V2 effect protocol clock guard");
     }
 
     #[tokio::test]
@@ -26214,8 +26269,7 @@ mod membership_tests {
         )
         .await
         .expect("open logical-read cohort store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize logical-read cohort store");
 
@@ -26349,8 +26403,7 @@ mod membership_tests {
         )
         .await
         .expect("open logical-read pruning store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize logical-read pruning store");
         let before = store
@@ -26452,8 +26505,7 @@ mod membership_tests {
         )
         .await
         .expect("open V2 status ticket cohort store");
-        store
-            .initialize_cluster()
+        initialize_fixture(&store)
             .await
             .expect("initialize V2 status ticket cohort store");
 

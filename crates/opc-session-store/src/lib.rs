@@ -137,6 +137,10 @@ mod protected_fenced_transition_v2_recovery_tests;
 #[cfg(test)]
 mod test_process;
 
+#[cfg(test)]
+#[path = "../tests/support/formation_clock.rs"]
+mod formation_clock;
+
 pub use backend::{
     next_replication_sequence, record_expiry_preflights, validate_record_expiry_preflights_at,
     validate_record_expiry_preflights_profile, validate_replication_log_page,

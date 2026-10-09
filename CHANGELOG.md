@@ -452,6 +452,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-testkit`: run authenticated response-loss and stalled-voter
+  fixtures' client calls and transport actors on an isolated frozen clock,
+  bounded by a 30-second test-only wall watchdog. Voter services and SQLite
+  retain real time, so fresh database work cannot inherit an expired deadline
+  from a paused server clock. Advance client time only at the observed fault;
+  preserve the original request and attempt deadlines, exact receipt and
+  no-replay assertions, and checks immediately before attempt expiry.
+  Fixes #1178.
+
+- `opc-ipsec-lb`: end the retirement fixture's first runtime before reopening
+  SQLite, so detached lease cleanup cannot race the new adapter. A
+  `test-control`-only lease-release hook reproduces the refusal; retirement
+  replay still requires the original tombstone and unchanged retention
+  deadline. Fixture synchronization uses a separate hang watchdog and reports
+  expiry without poisoning its release mutex (#863).
+
 - Go operators: update `golang.org/x/net` to v0.60.0 and require Go 1.26.9 in
   `operator-sdk-go` and `sdk-reference-operator` to address GO-2026-6617 and
   the related standard-library vulnerabilities.
@@ -460,6 +476,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shutdown fixture's final bounded call, with its rescue thread held until that
   call returns. Value-free shutdown observations distinguish caller deadlines,
   coordinator results and physical drain failures (#913).
+
+- `opc-session-store`, `opc-persist`: run short-deadline functional fixture
+  formation on a frozen protocol clock, bounded only by a 30-second test-only
+  wall watchdog. Setup no longer has to finish within the 150 ms to 1 s
+  real-time operation budgets. This includes the recovered 750 ms campaigns
+  and the 150 ms config singleton. Preserve the original operation timers,
+  admission checks and real Raft tasks; finalization, cold recovery and direct
+  initialization-deadline tests retain their original clocks and bounds. The
+  V2 accepted-effect regression keeps setup on real time and freezes only
+  acceptance, preserving its 150 ms request deadline and both one-second phase
+  guards. Fixes #1179.
 
 - `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
   admitted append's final result before authenticated readback, retaining its

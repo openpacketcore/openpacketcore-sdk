@@ -771,37 +771,65 @@ async fn fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
         .await
         .expect("start authenticated three-voter fixture");
-    let provider = CountingProvider::new();
-    let facade = fixture
-        .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-sweep-stalled")
-        .await
-        .expect("open protected V2 facade");
-    let mut prepared = Vec::new();
-    for ordinal in 40..44 {
-        let request = create(request_id(ordinal), ordinal, PAYLOAD);
-        let deadline = soon();
-        let mut handle = facade
-            .prepare_fenced_transition(request.clone(), budget(deadline))
+    let fixture = with_fixture_protocol_clock("reclaim past a stalled voter", async move {
+        let provider = CountingProvider::new();
+        let facade = fixture
+            .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-sweep-stalled")
             .await
-            .expect("prepare");
-        committed_v2(&mut handle, &request, deadline).await;
-        prepared.push(handle);
-    }
-    // A fresh sweep reads its first row's status on canonical voter 1.
-    fixture.stall_fenced_transition_v2_status_on_canonical_voter(1);
-    let report = facade
-        .reclaim_resolved_fenced_transitions(16, budget(soon()))
-        .await
-        .expect("bounded sweep");
-    assert!(
-        !report.interrupted(),
-        "a stalled voter is skipped, not a sweep-wide unavailability"
-    );
-    assert_eq!(report.examined(), 4);
-    assert_eq!(report.retained(), 4, "Recorded rows are retained");
-    assert_eq!(report.reclaimed(), 0);
-    drop(prepared);
-    drop(facade);
+            .expect("open protected V2 facade");
+        let mut prepared = Vec::new();
+        for ordinal in 40..44 {
+            let request = create(request_id(ordinal), ordinal, PAYLOAD);
+            let deadline = soon();
+            let mut handle = facade
+                .prepare_fenced_transition(request.clone(), budget(deadline))
+                .await
+                .expect("prepare");
+            committed_v2(&mut handle, &request, deadline).await;
+            prepared.push(handle);
+        }
+        let stalled = fixture.stall_fenced_transition_v2_status_on_canonical_voter(1);
+        let started = tokio::time::Instant::now();
+        let sweep_budget = budget(soon());
+        let sweep = facade.reclaim_resolved_fenced_transitions(16, sweep_budget);
+        tokio::pin!(sweep);
+        let mut stalled_attempts = 0;
+        let report = loop {
+            tokio::select! {
+                result = &mut sweep => break result.expect("bounded sweep"),
+                () = stalled.notified() => {
+                    stalled_attempts += 1;
+                    // Prove the stalled RPC's original cap, then drive past
+                    // timer-wheel rounding without spending host scheduling time.
+                    tokio::time::advance(sweep_budget.physical_attempt_timeout() - FIXTURE_TIMER_TICK).await;
+                    assert!(
+                        futures_util::poll!(&mut sweep).is_pending(),
+                        "the stalled voter remains pending before its physical deadline"
+                    );
+                    tokio::time::advance(FIXTURE_TIMER_TICK * 2).await;
+                }
+            }
+        };
+        assert!(
+            !report.interrupted(),
+            "a stalled voter is skipped, not a sweep-wide unavailability: {report:?}"
+        );
+        assert_eq!(report.examined(), 4);
+        assert_eq!(report.retained(), 4, "Recorded rows are retained");
+        assert_eq!(report.reclaimed(), 0);
+        assert_eq!(
+            stalled_attempts, 2,
+            "both visits reach the actual stalled voter"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            (sweep_budget.physical_attempt_timeout() + FIXTURE_TIMER_TICK) * stalled_attempts,
+            "only the stalled voter consumes the original sweep deadline"
+        );
+        drop(prepared);
+        fixture
+    })
+    .await;
     fixture.shutdown().await.expect("shut down fixture");
 }
 

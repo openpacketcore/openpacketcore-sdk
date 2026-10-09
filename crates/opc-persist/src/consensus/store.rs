@@ -2154,10 +2154,26 @@ mod tests {
     }
 
     async fn singleton_store() -> (ConsensusConfigStore, tempfile::TempDir) {
-        singleton_store_with_timeout(Duration::from_secs(3)).await
+        let (store, snapshots) = open_singleton_store(Duration::from_secs(3)).await;
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize cluster");
+        (store, snapshots)
     }
 
     async fn singleton_store_with_timeout(
+        operation_timeout: Duration,
+    ) -> (ConsensusConfigStore, tempfile::TempDir) {
+        let (store, snapshots) = open_singleton_store(operation_timeout).await;
+        let forming = store.clone();
+        crate::formation_clock::run(async move { forming.initialize_cluster().await })
+            .await
+            .expect("initialize cluster");
+        (store, snapshots)
+    }
+
+    async fn open_singleton_store(
         operation_timeout: Duration,
     ) -> (ConsensusConfigStore, tempfile::TempDir) {
         let topology = topology();
@@ -2174,10 +2190,6 @@ mod tests {
         )
         .await
         .expect("config store");
-        store
-            .initialize_cluster()
-            .await
-            .expect("initialize cluster");
         (store, snapshots)
     }
 

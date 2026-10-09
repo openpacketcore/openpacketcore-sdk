@@ -7762,25 +7762,134 @@ mod tests {
         assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
     }
 
-    #[tokio::test]
-    async fn encrypted_sqlite_retirement_survives_adapter_restart() {
+    #[test]
+    fn encrypted_sqlite_retirement_survives_adapter_restart() {
         let directory = TestDirectory::new("encrypted-retirement-restart");
         let database_path = directory.path().join("session-store.sqlite");
         let provider = encryption_provider();
-        let encrypted = EncryptingSessionBackend::new(
-            Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
-            Arc::clone(&provider),
-            "session-repin-retirement-sqlite",
+        let plan = plan_with(0x33, 77, 900, 3);
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (retired, old_backend) = first_runtime.block_on(async {
+            let encrypted = EncryptingSessionBackend::new(
+                Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
+                Arc::clone(&provider),
+                "session-repin-retirement-sqlite",
+            );
+            let journal = SessionStoreRePinJournal::new(encrypted, tenant(), nf_kind());
+            complete_journal_plan(&journal, &plan, 2).await;
+            let retired = journal
+                .retire(plan.session_id(), plan.identity())
+                .await
+                .unwrap();
+            let old_backend = Arc::downgrade(&journal.backend);
+            drop(journal);
+            (retired, old_backend)
+        });
+        // Lease cleanup can outlive the journal. End its runtime as a real
+        // restart would: cancel pending tasks and join any blocking SQL work
+        // before a new connection can contend with the old writer.
+        drop(first_runtime);
+        assert_eq!(
+            old_backend.strong_count(),
+            0,
+            "a restart must not overlap the old journal's detached lease cleanup"
         );
-        let journal = SessionStoreRePinJournal::new(encrypted, tenant(), nf_kind());
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let restarted = SessionStoreRePinJournal::new(
+                    EncryptingSessionBackend::new(
+                        Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
+                        provider,
+                        "session-repin-retirement-sqlite",
+                    ),
+                    tenant(),
+                    nf_kind(),
+                );
+                let replayed = restarted
+                    .retire(plan.session_id(), plan.identity())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    replayed.disposition(),
+                    SessionRePinRetirementDisposition::AlreadyRetired
+                );
+                assert_eq!(replayed.retained_until(), retired.retained_until());
+                assert_eq!(restarted.load(plan.session_id()).await.unwrap(), None);
+            });
+    }
+
+    #[tokio::test]
+    async fn encrypted_sqlite_retirement_replay_refuses_a_live_predecessor_writer() {
+        use opc_session_store::sqlite::test_support::set_standalone_release_before_commit_for_test;
+        use std::sync::{Condvar, Mutex};
+
+        // These waits synchronize the fixture, not a product operation. The
+        // drop guard releases the hold even on panic; this only bounds a hang.
+        const SYNC_WATCHDOG: Duration = Duration::from_secs(30);
+
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let (released, wake) = &*self.0;
+                *released.lock().unwrap() = true;
+                wake.notify_all();
+            }
+        }
+
+        let directory = TestDirectory::new("encrypted-retirement-live-writer");
+        let database_path = directory.path().join("session-store.sqlite");
+        let provider = encryption_provider();
+        let backend = Arc::new(SqliteSessionBackend::open(&database_path).unwrap());
+        let armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let hold_timed_out = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        set_standalone_release_before_commit_for_test(&backend, {
+            let armed = Arc::clone(&armed);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let hold_timed_out = Arc::clone(&hold_timed_out);
+            move || {
+                if armed.swap(false, Ordering::SeqCst) {
+                    entered.notify_one();
+                    let (released, wake) = &*release;
+                    let (released, timeout) = wake
+                        .wait_timeout_while(released.lock().unwrap(), SYNC_WATCHDOG, |released| {
+                            !*released
+                        })
+                        .unwrap();
+                    // Report on the test thread, without poisoning the mutex
+                    // that its drop guard must acquire to clean up.
+                    hold_timed_out.store(timeout.timed_out() && !*released, Ordering::Release);
+                }
+            }
+        });
+        let journal = SessionStoreRePinJournal::new(
+            EncryptingSessionBackend::new(
+                Arc::clone(&backend),
+                Arc::clone(&provider),
+                "session-repin-retirement-sqlite",
+            ),
+            tenant(),
+            nf_kind(),
+        );
         let plan = plan_with(0x33, 77, 900, 3);
         complete_journal_plan(&journal, &plan, 2).await;
         let retired = journal
             .retire(plan.session_id(), plan.identity())
             .await
             .unwrap();
-        drop(journal);
-
+        // Open before the pending release starts, as the original same-runtime
+        // restart fixture could do. Only that release's transaction is held.
         let restarted = SessionStoreRePinJournal::new(
             EncryptingSessionBackend::new(
                 Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
@@ -7790,6 +7899,34 @@ mod tests {
             tenant(),
             nf_kind(),
         );
+        armed.store(true, Ordering::SeqCst);
+        drop(journal);
+        tokio::time::timeout(SYNC_WATCHDOG, entered.notified())
+            .await
+            .expect("old cleanup entered its real SQLite write transaction");
+        let refused = restarted.retire(plan.session_id(), plan.identity()).await;
+        drop(release_guard);
+        assert!(
+            !hold_timed_out.load(Ordering::Acquire),
+            "test synchronization watchdog expired before the release hold was joined"
+        );
+        assert_eq!(
+            refused,
+            Err(IpsecLbError::io(
+                "session_repin_journal",
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "session store unavailable"
+                ),
+            )),
+            "a live predecessor can refuse replay at SQLite transaction admission"
+        );
+        // Joining a real operation on the old connection observes its worker's
+        // completion before checking that the durable tombstone is unchanged.
+        backend
+            .get(&restarted.key(plan.session_id()).unwrap())
+            .await
+            .unwrap();
         let replayed = restarted
             .retire(plan.session_id(), plan.identity())
             .await
