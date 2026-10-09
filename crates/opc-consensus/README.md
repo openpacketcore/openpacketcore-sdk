@@ -29,8 +29,10 @@ mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
 idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
 contained inside the selected family deadline, never added to it.
 
-`DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes both durable adapters at
-eight concurrent proposal paths. Admission is obtained inside the original
+`DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes the ordinary proposal baseline
+at eight concurrent paths. The scope-aware session adapter adds five independent
+class-reserved credits above that pool, for thirteen concurrent proposals in
+total; other adapters retain the shared baseline. Admission is obtained inside the original
 operation deadline. Once `client_write_ff` returns an accepted-result
 receiver, a detached supervisor retains that permit until Openraft resolves
 the exact proposal, even if the caller disconnects, times out, or is cancelled.

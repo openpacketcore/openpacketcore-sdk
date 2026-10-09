@@ -2204,9 +2204,8 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_logical_time,
             fenced_transition_v2_status_batch,
             fenced_transition_profile_admission: Mutex::new(None),
-            proposal_admission: Arc::new(tokio::sync::Semaphore::new(
-                DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
-            )),
+            proposal_admission: Arc::new(StoreWorkAdmission::new()),
+            forward_admission: Arc::new(StoreWorkAdmission::new()),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),

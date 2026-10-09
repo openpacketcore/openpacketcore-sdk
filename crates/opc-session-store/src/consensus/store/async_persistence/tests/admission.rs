@@ -393,7 +393,17 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
         let (authority_identity, _) = old.current_scope().unwrap();
         let deadline = tokio::time::Instant::now() + OPERATION_BOUND;
         let mut completions = Vec::new();
-        for _ in 0..DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS {
+        // This fixture deliberately fills the complete proposal budget with
+        // raw engine calls, including every reserved class pool.
+        let permits = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&old.inner.proposal_admission)
+                .acquire_many_owned(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for permit in permits {
             let command = SessionConsensusCommand {
                 schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
                 identity: old.inner.storage_identity,
@@ -406,13 +416,6 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
                 },
             };
             validate_consensus_command_preproposal(&command).unwrap();
-            let permit = tokio::time::timeout_at(
-                deadline,
-                Arc::clone(&old.inner.proposal_admission).acquire_owned(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
             let response =
                 tokio::time::timeout_at(deadline, old.inner.raft.client_write_ff(command))
                     .await
@@ -424,7 +427,7 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
                 result
             }));
         }
-        let suffix_end = retained.index + DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS as u64;
+        let suffix_end = retained.index + SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS as u64;
         until(
             || old.inner.raft.metrics().borrow().last_log_index == Some(suffix_end),
             "the isolated real leader appends the full bounded incompatible suffix",

@@ -320,6 +320,7 @@ impl ConsensusSessionStore {
         let reply = self
             .apply_on_local_leader_observed(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: request.nonce,
                     intent: intent.clone(),
                     required_consumer_scope: ForwardConsumerScope::Internal,

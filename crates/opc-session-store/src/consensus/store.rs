@@ -20,12 +20,15 @@ use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
+#[cfg(test)]
+const SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS: usize =
+    opc_consensus::DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS + 5;
 use opc_consensus::{
     decode_bounded, decode_roster_bounded, durable_openraft_config, encode_bounded,
     encode_roster_bounded, DurableOpenraftDomain, EnsureLinearizableOutcome,
     EnsureLinearizableSupervisor, LinearizableReadAdmit, LinearizableReadBarrier,
     LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -163,9 +166,13 @@ mod async_persistence;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
+mod scheduling;
 mod scope_batch;
 mod scope_lease;
 mod scope_profile;
+
+use crate::scope_scheduler::{ScopeSchedulerKey, ScopeWorkClass, ScopeWorkPermit};
+use scheduling::{ForwardWorkClass, ProposalAdmission, StoreWorkAdmission};
 
 use planned_shutdown::ConsensusRetirementCoordinator;
 
@@ -582,6 +589,9 @@ struct ForwardMutationRequest {
     /// The exact consumer scope whose check must remain valid through leader
     /// admission. Ordinary in-process store callers carry no consumer scope.
     required_consumer_scope: ForwardConsumerScope,
+    /// Authenticated scheduling metadata, outside the canonical mutation.
+    /// This required field is a fresh-install forwarding wire boundary.
+    work_class: ForwardWorkClass,
 }
 
 impl fmt::Debug for ForwardMutationRequest {
@@ -755,11 +765,19 @@ struct FencedTransitionActivationReply {
 #[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum FrozenV711ForwardRequest {
-    Mutation(ForwardMutationRequest),
+    Mutation(FrozenV711ForwardMutationRequest),
     RecordExpiryPreflight {
         preflights: BoundedRecordExpiryPreflights,
         required_consumer_scope: ForwardConsumerScope,
     },
+}
+
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FrozenV711ForwardMutationRequest {
+    request_id: SessionConsensusRequestId,
+    intent: SessionMutationIntent,
+    required_consumer_scope: ForwardConsumerScope,
 }
 
 #[cfg(test)]
@@ -866,7 +884,7 @@ struct LocalProposalAuthority {
 /// freeze marker is used exclusively by the leader-owned V2 status ticket
 /// cohort and is set immediately before Openraft accepts the command.
 struct LocalProposalExecution {
-    proposal_permit: tokio::sync::OwnedSemaphorePermit,
+    proposal_permit: ScopeWorkPermit,
     operation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     persistence_submission: Option<persistence_protocol::EngineAdmission>,
     cohort_freeze: Option<Arc<AtomicBool>>,
@@ -1973,7 +1991,8 @@ struct ConsensusSessionStoreInner {
         FencedTransitionV2StatusLogicalTimeIngressSupervisor,
     fenced_transition_v2_status_logical_time: FencedTransitionV2StatusLogicalTimeSupervisor,
     fenced_transition_v2_status_batch: FencedTransitionV2StatusBatchSupervisor,
-    proposal_admission: Arc<tokio::sync::Semaphore>,
+    proposal_admission: Arc<StoreWorkAdmission>,
+    forward_admission: Arc<StoreWorkAdmission>,
     // The created profile cannot change during this process's exact voter
     // scope. A later command persists a fresh unanimous admission certificate;
     // a certificate read from storage also seeds this readiness proof cache.
@@ -3681,9 +3700,8 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_logical_time,
             fenced_transition_v2_status_batch,
             fenced_transition_profile_admission: Mutex::new(None),
-            proposal_admission: Arc::new(tokio::sync::Semaphore::new(
-                DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
-            )),
+            proposal_admission: Arc::new(StoreWorkAdmission::new()),
+            forward_admission: Arc::new(StoreWorkAdmission::new()),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
@@ -3913,9 +3931,8 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_logical_time,
             fenced_transition_v2_status_batch,
             fenced_transition_profile_admission: Mutex::new(None),
-            proposal_admission: Arc::new(tokio::sync::Semaphore::new(
-                DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
-            )),
+            proposal_admission: Arc::new(StoreWorkAdmission::new()),
+            forward_admission: Arc::new(StoreWorkAdmission::new()),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
@@ -5958,6 +5975,7 @@ impl ConsensusSessionStore {
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::MaintainFencedTransitionV2History {
                         expected_generation: expected_state.generation(),
@@ -7555,6 +7573,24 @@ impl ConsensusSessionStore {
         required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> ConsensusSubmissionEffect {
+        self.submit_request_effect_classified_before(
+            request_id,
+            intent,
+            required_consumer_scope,
+            deadline,
+            ForwardWorkClass::Inferred,
+        )
+        .await
+    }
+
+    async fn submit_request_effect_classified_before(
+        &self,
+        request_id: SessionConsensusRequestId,
+        intent: SessionMutationIntent,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
+        deadline: tokio::time::Instant,
+        work_class: ForwardWorkClass,
+    ) -> ConsensusSubmissionEffect {
         if let Err(error) = validate_consensus_intent(&intent) {
             return ConsensusSubmissionEffect::NotTransmitted(error);
         }
@@ -7573,11 +7609,14 @@ impl ConsensusSessionStore {
             }
         }
         let request = ForwardMutationRequest {
+            work_class,
             request_id,
             intent,
             required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
         };
-        let roster_mutation = is_roster_mutation_intent(&request.intent);
+        if let Err(error) = request.scheduling() {
+            return ConsensusSubmissionEffect::NotTransmitted(error);
+        }
         let mut preferred = None;
         let mut outcome_may_be_unavailable = false;
 
@@ -7618,18 +7657,10 @@ impl ConsensusSessionStore {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
                     .await
             } else {
-                match if roster_mutation {
-                    self.call_roster_mutation_peer(leader, &request, deadline)
-                        .await
-                } else {
-                    self.call_peer::<_, ForwardMutationReply>(
-                        leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &BorrowedForwardRequest::Mutation(&request),
-                        deadline,
-                    )
+                match self
+                    .forward_mutation_before(leader, &request, deadline)
                     .await
-                } {
+                {
                     Ok(reply) => reply,
                     Err(ConsensusPeerCallFailure::AfterTransmission)
                     | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
@@ -7767,6 +7798,7 @@ impl ConsensusSessionStore {
         let (scope_identity, _) =
             observe_activation_result!(InitialScope, deadline, self.current_scope())?;
         let request = ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
             request_id: match activation {
                 CapabilityActivationKind::ScopeProfileV3 => {
                     scope_profile::request_id(scope_identity)
@@ -7830,12 +7862,7 @@ impl ConsensusSessionStore {
                     .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
-                        leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &BorrowedForwardRequest::Mutation(&request),
-                        deadline,
-                    )
+                    .forward_mutation_before(leader, &request, deadline)
                     .await
                 {
                     Ok(reply) => reply,
@@ -8024,6 +8051,17 @@ impl ConsensusSessionStore {
                 )
                 .await
             } else {
+                let _forward_permit = tokio::time::timeout_at(
+                    deadline,
+                    self.inner
+                        .forward_admission
+                        .acquire_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Maintenance),
+                )
+                .await
+                .map_err(|_| consensus_unavailable())?
+                .map_err(|_| consensus_unavailable())?;
+                self.require_application_traffic_authority_before(deadline)
+                    .await?;
                 match self
                     .call_peer::<_, ForwardMutationReply>(
                         leader,
@@ -8104,6 +8142,7 @@ impl ConsensusSessionStore {
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::AdvanceLogicalTime,
                     required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(
@@ -8178,6 +8217,60 @@ impl ConsensusSessionStore {
                 error,
             )));
         }
+        let (scheduling_key, scheduling_class) = match request.scheduling() {
+            Ok(value) => value,
+            Err(error) => {
+                return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                    error,
+                )))
+            }
+        };
+        // Known immutable receipts remain reachable without a proposal slot.
+        // Its short authority guard is released before a missing receipt waits
+        // for capacity, so queued ordinary requests cannot pin the drain gate.
+        if let Some(reply) = self
+            .known_binding_before_proposal(&request, deadline, allow_operator_recovery)
+            .await
+        {
+            return reply;
+        }
+        let proposal_reservation = match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .proposal_admission
+                .reserve_for(scheduling_key, scheduling_class),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                self.inner
+                    .diagnostics
+                    .proposal_permit_deadline
+                    .fetch_add(1, Ordering::Relaxed);
+                return ForwardMutationReply::Unavailable;
+            }
+        };
+        // Activation preflights can return an already committed certificate.
+        // Bound their resident state, but do not monopolize the control
+        // execution credit while awaiting a read/capability prerequisite.
+        let proposal_admission = if matches!(
+            &request.intent,
+            SessionMutationIntent::PreflightFencedTransitionCapability
+                | SessionMutationIntent::PreflightProtectedRosterProfile
+                | SessionMutationIntent::PreflightProtectedRosterProfileV2
+                | SessionMutationIntent::PreflightScopeProfile
+        ) {
+            ProposalAdmission::ActivationRead(proposal_reservation)
+        } else {
+            match self
+                .start_proposal_before(proposal_reservation, deadline)
+                .await
+            {
+                Ok(permit) => ProposalAdmission::Running(permit),
+                Err(reply) => return reply,
+            }
+        };
         let scope_traffic = scope_profile::is_scope_command(&request.intent);
         // Membership changes take the exclusive side of this gate. Holding a
         // shared guard through the definitive proposal result lets the
@@ -8290,56 +8383,6 @@ impl ConsensusSessionStore {
                 StoreError::TopologyAuthorityRevoked,
             )));
         }
-        // The outcome ledger is append-only, so an already-recorded binding
-        // can be returned before acquiring the mutation proposal permit. A
-        // match or conflict is absorbing; only a missing binding proceeds to
-        // the normal linearized mutation path, where a concurrent first bind
-        // is still resolved by consensus. This keeps changed v2 authority
-        // context from appending a no-effect conflict proposal.
-        if let SessionMutationIntent::BindConsumerRequest { request_commitment } = &request.intent {
-            let (authority_identity, _) = match self.current_scope() {
-                Ok(scope) => scope,
-                Err(_) => return ForwardMutationReply::Unavailable,
-            };
-            match self
-                .inner
-                .backend
-                .consensus_consumer_request_binding_lookup(
-                    self.inner.storage_identity,
-                    authority_identity,
-                    request.request_id,
-                    *request_commitment,
-                )
-                .await
-            {
-                Ok(crate::sqlite::consensus::ConsumerRequestBindingLookup::Matched(response)) => {
-                    return ForwardMutationReply::Applied(response);
-                }
-                Ok(crate::sqlite::consensus::ConsumerRequestBindingLookup::Conflict) => {
-                    return ForwardMutationReply::Applied(Box::new(
-                        SessionConsensusResponse::rejected(StoreError::CasIdempotencyConflict),
-                    ));
-                }
-                Ok(crate::sqlite::consensus::ConsumerRequestBindingLookup::Missing) => {}
-                Err(_) => return ForwardMutationReply::Unavailable,
-            }
-        }
-        let proposal_permit = match tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&self.inner.proposal_admission).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                self.inner
-                    .diagnostics
-                    .proposal_permit_deadline
-                    .fetch_add(1, Ordering::Relaxed);
-                return ForwardMutationReply::Unavailable;
-            }
-        };
-
         // A physical V1 transition and the state-voter-only V1 activation
         // preflight carry this one typed admission through the capability
         // probe and final proposal. Consumer writes are linearized by the
@@ -8694,6 +8737,37 @@ impl ConsensusSessionStore {
             Some(admission)
         } else {
             None
+        };
+        // Release the shared topology gate before a cold activation waits for
+        // its execution credit. Reacquire it afterwards; the existing exact
+        // activation-scope and typed-admission checks below cover the wait.
+        let (proposal_permit, operation_guard) = match proposal_admission {
+            ProposalAdmission::Running(permit) => (permit, operation_guard),
+            ProposalAdmission::ActivationRead(reservation) => {
+                let held_gate = operation_guard.is_some();
+                drop(operation_guard);
+                let permit = match self.start_proposal_before(reservation, deadline).await {
+                    Ok(permit) => permit,
+                    Err(reply) => return reply,
+                };
+                let guard = if held_gate {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        self.inner
+                            .topology_coordinator
+                            .operation_gate()
+                            .read_owned(),
+                    )
+                    .await
+                    {
+                        Ok(guard) => Some(guard),
+                        Err(_) => return ForwardMutationReply::Unavailable,
+                    }
+                } else {
+                    None
+                };
+                (permit, guard)
+            }
         };
         if matches!(
             &request.intent,
@@ -9193,6 +9267,23 @@ impl ConsensusSessionStore {
         if let Err(error) = validate_record_expiry_preflights_profile(&preflights) {
             return ForwardMutationReply::RecordExpiryPreflight(Err(error));
         }
+        let proposal_permit = match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .proposal_admission
+                .acquire_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Maintenance),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                self.inner
+                    .diagnostics
+                    .proposal_permit_deadline
+                    .fetch_add(1, Ordering::Relaxed);
+                return ForwardMutationReply::Unavailable;
+            }
+        };
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let operation_guard =
             match tokio::time::timeout_at(deadline, operation_gate.read_owned()).await {
@@ -9217,21 +9308,6 @@ impl ConsensusSessionStore {
                 StoreError::TopologyAuthorityRevoked,
             ));
         }
-        let proposal_permit = match tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&self.inner.proposal_admission).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                self.inner
-                    .diagnostics
-                    .proposal_permit_deadline
-                    .fetch_add(1, Ordering::Relaxed);
-                return ForwardMutationReply::Unavailable;
-            }
-        };
         match self
             .inner
             .linearizability
@@ -9314,6 +9390,7 @@ impl ConsensusSessionStore {
         let reply = self
             .propose_on_local_leader(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: SessionConsensusRequestId::new(),
                     intent: intent.clone(),
                     required_consumer_scope,
@@ -9364,6 +9441,7 @@ impl ConsensusSessionStore {
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: request.request_id,
                     intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
                         request.intent,
@@ -18050,24 +18128,25 @@ mod membership_tests {
         ));
 
         let mutation = ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
             request_id: SessionConsensusRequestId::from_bytes([0xA5; 16]),
             intent: SessionMutationIntent::AdvanceLogicalTime,
             required_consumer_scope: ForwardConsumerScope::Internal,
         };
         let current_mutation =
             encode_bounded(&ForwardRequest::Mutation(mutation.clone())).expect("encode mutation");
-        let frozen_mutation = encode_bounded(&FrozenV711ForwardRequest::Mutation(mutation))
-            .expect("encode frozen mutation");
+        let frozen_mutation = encode_bounded(&FrozenV711ForwardRequest::Mutation(
+            FrozenV711ForwardMutationRequest {
+                request_id: mutation.request_id,
+                intent: mutation.intent,
+                required_consumer_scope: mutation.required_consumer_scope,
+            },
+        ))
+        .expect("encode frozen mutation");
         assert_eq!(current_mutation.first(), Some(&0x00));
-        assert_eq!(current_mutation, frozen_mutation);
-        assert!(matches!(
-            decode_bounded::<FrozenV711ForwardRequest>(&current_mutation),
-            Ok(FrozenV711ForwardRequest::Mutation(_))
-        ));
-        assert!(matches!(
-            decode_bounded::<ForwardRequest>(&frozen_mutation),
-            Ok(ForwardRequest::Mutation(_))
-        ));
+        assert_ne!(current_mutation, frozen_mutation);
+        assert!(decode_bounded::<FrozenV711ForwardRequest>(&current_mutation).is_err());
+        assert!(decode_bounded::<ForwardRequest>(&frozen_mutation).is_err());
 
         let applied = SessionConsensusResponse::rejected(consensus_unavailable());
         let current_applied =
@@ -19215,6 +19294,7 @@ mod membership_tests {
 
         for intent in mutations {
             let request = ForwardMutationRequest {
+                work_class: ForwardWorkClass::Inferred,
                 request_id: SessionConsensusRequestId::new(),
                 intent,
                 required_consumer_scope: ForwardConsumerScope::Internal,
@@ -19246,6 +19326,7 @@ mod membership_tests {
             .consensus_identity()
             .expect("generic receiver routing identity");
         let request = ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
             request_id: SessionConsensusRequestId::new(),
             intent: SessionMutationIntent::AdvanceLogicalTime,
             required_consumer_scope: ForwardConsumerScope::Internal,
@@ -20596,6 +20677,7 @@ mod membership_tests {
         let reply = store
             .propose_on_local_leader(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: fenced_transition_v2_outer_request_id(&request),
                     intent: SessionMutationIntent::FencedTransitionV2(Box::new(request)),
                     required_consumer_scope: ForwardConsumerScope::Internal,
@@ -23892,6 +23974,7 @@ mod membership_tests {
         let (_directory, store, _scope, _authorization, key, lease) =
             consumer_boundary_store().await;
         let request = ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
             request_id: SessionConsensusRequestId::new(),
             intent: SessionMutationIntent::CompareAndSet(Arc::new(CompareAndSet {
                 key: key.clone(),
@@ -24191,6 +24274,7 @@ mod membership_tests {
         let forwarded = store
             .apply_on_local_leader(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::AdvanceLogicalTime,
                     required_consumer_scope: ForwardConsumerScope::Internal,
@@ -24203,6 +24287,7 @@ mod membership_tests {
         let invalid_internal_authority = store
             .apply_on_local_leader(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::Authorized {
                         origin: store.inner.local_node_id,
@@ -24685,6 +24770,7 @@ mod membership_tests {
         let response = store
             .apply_on_local_leader(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::AdvanceLogicalTime,
                     required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(stale_scope)),
@@ -24743,6 +24829,7 @@ mod membership_tests {
         let response = store
             .propose_on_local_leader(
                 ForwardMutationRequest {
+                    work_class: ForwardWorkClass::Inferred,
                     request_id: fenced_transition_v2_outer_request_id(&request),
                     intent: SessionMutationIntent::FencedTransitionV2(Box::new(request)),
                     required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(stale_scope)),
@@ -25223,6 +25310,7 @@ mod membership_tests {
             let reply = store
                 .apply_on_local_leader(
                     ForwardMutationRequest {
+                        work_class: ForwardWorkClass::Inferred,
                         request_id: SessionConsensusRequestId::new(),
                         intent: SessionMutationIntent::ActivateFencedTransitionCapability {
                             schema_version: FENCED_TRANSITION_SCHEMA_V1,
@@ -25356,6 +25444,7 @@ mod membership_tests {
             0
         );
         let payload = encode_bounded(&ForwardRequest::Mutation(ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
             request_id: SessionConsensusRequestId::new(),
             intent: forged_operator_recovery_intent(0xB2),
             required_consumer_scope: ForwardConsumerScope::Internal,
@@ -25420,6 +25509,7 @@ mod membership_tests {
 
         let before_log = store.inner.raft.metrics().borrow().last_log_index;
         let payload = encode_roster_bounded(&ForwardRequest::Mutation(ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
             request_id: SessionConsensusRequestId::new(),
             intent: SessionMutationIntent::AdvanceLogicalTime,
             required_consumer_scope: ForwardConsumerScope::Internal,
@@ -25698,7 +25788,7 @@ mod membership_tests {
         let permits = tokio::time::timeout(
             Duration::from_secs(1),
             Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
                     .expect("proposal slot count fits u32"),
             ),
         )
@@ -25732,7 +25822,7 @@ mod membership_tests {
             let permits = tokio::time::timeout(
                 Duration::from_secs(1),
                 Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
-                    u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                    u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
                         .expect("proposal slot count fits u32"),
                 ),
             )
@@ -25765,20 +25855,20 @@ mod membership_tests {
         wait_for_log_index_after(&store, before, "first supervised proposal").await;
         assert_eq!(
             store.inner.proposal_admission.available_permits(),
-            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1,
             "the accepted proposal owns one bounded admission slot"
         );
         cancelled.abort();
         let _ = cancelled.await;
         assert_eq!(
             store.inner.proposal_admission.available_permits(),
-            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1,
             "accepted proposal admission must outlive its cancelled caller"
         );
 
         let held_saturation = Arc::clone(&store.inner.proposal_admission)
             .acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1)
+                u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1)
                     .expect("remaining proposal slots fit u32"),
             )
             .await
@@ -25809,7 +25899,7 @@ mod membership_tests {
         drop(held_saturation);
         assert_eq!(
             store.inner.proposal_admission.available_permits(),
-            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1,
             "the cancelled accepted proposal still owns its slot"
         );
         drop(held_apply);
@@ -25842,7 +25932,7 @@ mod membership_tests {
         );
         assert_eq!(
             store.inner.proposal_admission.available_permits(),
-            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1
         );
         drop(held_apply);
         wait_for_all_supervisors(store.clone()).await;
@@ -25885,7 +25975,7 @@ mod membership_tests {
         );
         assert_eq!(
             store.inner.proposal_admission.available_permits(),
-            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1
         );
         drop(held_apply);
         wait_for_all_supervisors(store).await;
@@ -25984,7 +26074,7 @@ mod membership_tests {
         );
         assert_eq!(
             store.inner.proposal_admission.available_permits(),
-            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS - 1,
             "the detached accepted V2 proposal retains one bounded admission slot"
         );
         assert!(
@@ -25996,7 +26086,7 @@ mod membership_tests {
         let permits = tokio::time::timeout(
             Duration::from_secs(1),
             Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
                     .expect("proposal slot count fits u32"),
             ),
         )
@@ -26228,7 +26318,7 @@ mod membership_tests {
                 drop(held_apply);
                 let permits = Arc::clone(&store.inner.proposal_admission)
                     .acquire_many_owned(
-                        u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                        u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
                             .expect("proposal slot count fits u32"),
                     )
                     .await
@@ -26415,7 +26505,7 @@ mod membership_tests {
             .unwrap_or(0);
         let held_proposals = Arc::clone(&store.inner.proposal_admission)
             .acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
                     .expect("proposal capacity fits u32"),
             )
             .await
@@ -26526,7 +26616,7 @@ mod membership_tests {
             .expect("hold V2 status ticket apply");
         let held_proposal = Arc::clone(&store.inner.proposal_admission)
             .acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
                     .expect("proposal capacity fits u32"),
             )
             .await
@@ -27059,7 +27149,117 @@ mod membership_tests {
             "a distinct epoch never crosses into another logical-read cohort"
         );
     }
+
+    #[tokio::test]
+    async fn scope_scheduler_known_binding_is_reachable_while_all_proposal_slots_are_held() {
+        let _timing = crate::acquire_consensus_timing_test_permit().await;
+        let (_directory, store, _scope, _authorization, _key, _lease) =
+            consumer_boundary_store().await;
+        let request_id = SessionConsensusRequestId::new();
+        let intent = SessionMutationIntent::BindConsumerRequest {
+            request_commitment: [0x59; 32],
+        };
+        let scope = store.current_scope().unwrap().0;
+        let recorded = store
+            .submit_request_with_consumer_scope(request_id, intent.clone(), Some(scope))
+            .await
+            .unwrap();
+        let held = Arc::clone(&store.inner.proposal_admission)
+            .acquire_many_owned(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS as u32)
+            .await
+            .unwrap();
+        let replay = tokio::time::timeout(
+            store.inner.operation_timeout + Duration::from_secs(5),
+            store.submit_request_with_consumer_scope(request_id, intent, Some(scope)),
+        )
+        .await
+        .expect("an immutable receipt does not wait for a proposal slot")
+        .unwrap();
+        assert_eq!(replay, recorded);
+        drop(held);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_scheduler_read_fences_progress_while_maintenance_is_saturated() {
+        let _timing = crate::acquire_consensus_timing_test_permit().await;
+        let (_directory, store, _scope, _authorization, key, _lease) =
+            consumer_boundary_store().await;
+        let guard = store.inner.operation_timeout + Duration::from_secs(5);
+        let expected = tokio::time::timeout(guard, SessionBackend::get(&store, &key))
+            .await
+            .expect("warm read completes")
+            .unwrap();
+        // An accepted record-expiry/history operation holds the complete
+        // Maintenance pool. Neither the session read nor its fence uses it.
+        let held = store
+            .inner
+            .proposal_admission
+            .acquire_for(
+                ScopeSchedulerKey::from_bytes([0x42; 32]),
+                ScopeWorkClass::Maintenance,
+            )
+            .await
+            .unwrap();
+        let (read, logical) = tokio::join!(
+            tokio::time::timeout(guard, SessionBackend::get(&store, &key)),
+            tokio::time::timeout(guard, store.logical_read_time()),
+        );
+        drop(held);
+        store.shutdown().await.unwrap();
+        assert_eq!(read.expect("read hang guard").unwrap(), expected);
+        assert!(logical.expect("logical fence hang guard").is_ok());
+    }
+
+    #[tokio::test]
+    async fn scope_scheduler_internal_ordinary_traffic_retains_eight_running_credits() {
+        use futures_util::FutureExt;
+
+        let admission = StoreWorkAdmission::new();
+        let legacy = ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
+            request_id: SessionConsensusRequestId::from_bytes([7; 16]),
+            intent: SessionMutationIntent::BindConsumerRequest {
+                request_commitment: [9; 32],
+            },
+            required_consumer_scope: ForwardConsumerScope::Internal,
+        };
+        let (key, class) = legacy.scheduling().unwrap();
+        assert_eq!(class, ScopeWorkClass::Normal);
+        let mut held = Vec::new();
+        for index in 0..8 {
+            held.push(
+                admission
+                    .acquire_for(key, class)
+                    .now_or_never()
+                    .unwrap_or_else(|| panic!("ordinary proposal {index} retains its capacity"))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(admission.snapshot().class(class).running, 8);
+        let mut ninth = Box::pin(admission.acquire_for(key, class));
+        assert!(futures_util::poll!(&mut ninth).is_pending());
+        // Protected work uses additional credits, not one of the ordinary eight.
+        for protected in [
+            ScopeWorkClass::SafetyControl,
+            ScopeWorkClass::Emergency,
+            ScopeWorkClass::EmergencyClassification,
+            ScopeWorkClass::Maintenance,
+        ] {
+            let reserved = admission
+                .acquire_for(key, protected)
+                .now_or_never()
+                .expect("reserved capacity is independent")
+                .unwrap();
+            drop(reserved);
+        }
+        drop(held.pop());
+        assert!(futures_util::poll!(&mut ninth).is_ready());
+    }
 }
+
+#[cfg(test)]
+mod scheduling_tests;
 
 #[cfg(test)]
 mod encryption_tests;

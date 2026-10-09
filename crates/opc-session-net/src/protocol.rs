@@ -102,13 +102,14 @@ pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 pub(crate) const CONSENSUS_COMPATIBILITY_ALPN: &[u8] = b"opc-session-consensus/2+compatibility/1";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
 ///
-/// Revision 5 adds an exact application-semantics gate for outcome-digest v2.
+/// Revision 6 requires explicit scheduling metadata on forwarded mutations.
+/// Revision 5 added an exact application-semantics gate for outcome-digest v2.
 /// A peer that computes the former digest must never join a voter set that
 /// persists v2 receipts: equal Raft entries could otherwise produce different
 /// durable idempotency evidence on different voters.  The dedicated consensus
 /// bootstrap rejects the older revision before it can exchange Vote,
 /// AppendEntries, snapshot, or forwarded-mutation traffic.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 5;
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 6;
 
 /// Exact state-machine receipt and command-outcome semantics required for
 /// consensus application.
@@ -5443,13 +5444,13 @@ mod tests {
             6
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
-        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 5);
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 6);
         assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 4);
         assert_eq!(
             serde_json::to_value(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE)
                 .expect("consensus contract serializes"),
             serde_json::json!({
-                "wire_schema_revision": 5,
+                "wire_schema_revision": 6,
                 "application_revision": 4,
                 "error_set_revision": 6,
                 "max_rpc_payload_bytes": SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
@@ -5457,7 +5458,7 @@ mod tests {
                 "min_frame_size": MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 "max_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
             }),
-            "the bootstrap golden binds v2 outcome-digest, protected-roster established-transition, and the Postcard tag-27 recovery incompatibility separately from consumer wire"
+            "the bootstrap golden binds required scheduling metadata, v2 outcome-digest, protected-roster established-transition, and the Postcard tag-27 recovery incompatibility separately from consumer wire"
         );
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision =
@@ -5475,6 +5476,16 @@ mod tests {
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size,
             MIN_SESSION_CONSENSUS_FRAME_SIZE as u32
+        );
+    }
+
+    #[test]
+    fn consensus_pre_scheduler_profile_cannot_bootstrap() {
+        let mut preceding = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
+        preceding.wire_schema_revision = 5;
+        assert!(
+            !preceding.is_current(),
+            "the previous forwarding shape has no required scheduling class"
         );
     }
 

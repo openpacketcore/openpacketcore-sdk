@@ -172,8 +172,10 @@ pub const DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL: Duration = Duratio
 /// Maximum number of log entries admitted to one durable AppendEntries batch.
 pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
 
-/// Maximum number of accepted application proposals supervised concurrently
-/// by each durable Openraft adapter.
+/// Baseline number of ordinary application proposals supervised concurrently
+/// by a durable Openraft adapter. The scope-aware session adapter adds five
+/// independent class-reserved credits above this unchanged ordinary pool,
+/// for thirteen concurrent proposals in total.
 ///
 /// A permit remains owned until Openraft resolves the accepted proposal, even
 /// when the originating caller is cancelled or its operation deadline elapses.

@@ -121,6 +121,7 @@ mod replication_watch;
 pub mod restore;
 pub mod scope_batch;
 pub mod scope_lease;
+pub mod scope_scheduler;
 mod scope_storage;
 pub mod sqlite;
 pub mod store;

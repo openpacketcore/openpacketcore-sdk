@@ -1,10 +1,12 @@
 use super::*;
+use opc_session_store::scope_scheduler::ScopeWorkClass;
 use opc_session_store::{
     SessionConsensusIdentity, SessionConsensusRequestId, SessionMutationIntent,
 };
 
-// Read-only mirror of the mutation envelope. Only the typed acquire intent is
-// inspected; original request bytes remain confined to this synthetic fixture.
+// Read-only mirror of the current mutation envelope, including its required
+// scheduling metadata. Only the typed acquire intent is inspected; original
+// request bytes remain confined to this synthetic fixture.
 #[derive(Deserialize)]
 enum ForwardObservation {
     Mutation(MutationObservation),
@@ -17,6 +19,8 @@ struct MutationObservation {
     intent: SessionMutationIntent,
     #[serde(rename = "required_consumer_scope")]
     _required_consumer_scope: ForwardScopeObservation,
+    #[serde(rename = "work_class")]
+    _work_class: ForwardWorkClassObservation,
 }
 
 // Postcard is not self-describing, so IgnoredAny cannot skip these fields.
@@ -24,6 +28,12 @@ struct MutationObservation {
 enum ForwardScopeObservation {
     Internal,
     Consumer(#[allow(dead_code)] Box<SessionConsensusIdentity>),
+}
+
+#[derive(Deserialize)]
+enum ForwardWorkClassObservation {
+    Inferred,
+    Declared(#[allow(dead_code)] ScopeWorkClass),
 }
 
 struct AcquireArrivalCapture {
