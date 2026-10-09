@@ -10,7 +10,7 @@ Linux builds and tests; macOS and FreeBSD are outside the supported platform set
 ### Required toolchain
 
 - **Rust** ≥ 1.89 (install via [rustup](https://rustup.rs/))
-- **Go** ≥ 1.26.6
+- **Go** ≥ 1.26.9
 - **kubectl**
 - **kustomize**
 - **helm** ≥ 3
