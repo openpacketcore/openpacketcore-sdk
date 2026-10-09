@@ -3662,7 +3662,7 @@ mod tests {
     #[derive(Default)]
     struct SupervisedLateMutationBackend {
         compare_and_set_calls: AtomicUsize,
-        compare_and_set_completed: Arc<AtomicUsize>,
+        compare_and_set_completed: tokio::sync::watch::Sender<usize>,
         compare_and_set_started: tokio::sync::Notify,
         compare_and_set_release: Arc<tokio::sync::Notify>,
         committed_record: Arc<StdMutex<Option<StoredSessionRecord>>>,
@@ -3780,7 +3780,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(operation.new_record);
-                completed.fetch_add(1, Ordering::SeqCst);
+                completed.send_modify(|count| *count += 1);
                 CompareAndSetResult::Success
             })
             .await
@@ -4349,7 +4349,7 @@ mod tests {
         ));
         assert_eq!(supervised.compare_and_set_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            supervised.compare_and_set_completed.load(Ordering::SeqCst),
+            *supervised.compare_and_set_completed.borrow(),
             0,
             "transport completion must not pretend the supervised mutation rolled back"
         );
@@ -4367,17 +4367,15 @@ mod tests {
         );
 
         supervised.compare_and_set_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while supervised.compare_and_set_completed.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut completed = supervised.compare_and_set_completed.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            completed.wait_for(|count| *count != 0),
+        )
         .await
-        .expect("bounded supervised mutation may finish after transport retirement");
-        assert_eq!(
-            supervised.compare_and_set_completed.load(Ordering::SeqCst),
-            1
-        );
+        .expect("bounded supervised mutation may finish after transport retirement")
+        .expect("test retains its supervised mutation publisher");
+        assert_eq!(*supervised.compare_and_set_completed.borrow(), 1);
         assert_eq!(supervised.compare_and_set_calls.load(Ordering::SeqCst), 1);
         assert!(client
             .get(&committed_key)

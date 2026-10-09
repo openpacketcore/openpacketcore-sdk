@@ -195,13 +195,16 @@ async fn void_readiness_loads_a_slow_activation_once_outside_the_probe_budget() 
             .fenced_transition_v2_activation_lookup_count
             .load(Ordering::SeqCst);
         let lookup_delay = async {
-            while backend
-                .fenced_transition_v2_activation_lookup_count
-                .load(Ordering::SeqCst)
-                == lookups
-            {
-                tokio::task::yield_now().await;
-            }
+            let mut progress = backend.test_progress.subscribe();
+            progress
+                .wait_for(|()| {
+                    backend
+                        .fenced_transition_v2_activation_lookup_count
+                        .load(Ordering::SeqCst)
+                        != lookups
+                })
+                .await
+                .expect("test retains its backend publisher");
             tokio::time::sleep(Duration::from_millis(350)).await;
             drop(held);
         };

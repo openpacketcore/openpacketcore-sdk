@@ -828,6 +828,7 @@ mod tests {
 
     struct ScriptedWatchBackend {
         max_sequence: AtomicU64,
+        max_sequence_read: tokio::sync::watch::Sender<bool>,
         watch_rx: Mutex<Option<mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>>>,
         yielded_tx: mpsc::UnboundedSender<()>,
         watch_calls: AtomicU64,
@@ -887,7 +888,9 @@ mod tests {
         }
 
         async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
-            Ok(self.max_sequence.load(Ordering::Acquire))
+            let sequence = self.max_sequence.load(Ordering::Acquire);
+            self.max_sequence_read.send_replace(true);
+            Ok(sequence)
         }
 
         async fn get_replication_log(
@@ -947,6 +950,7 @@ mod tests {
         let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();
         Arc::new(ScriptedWatchBackend {
             max_sequence: AtomicU64::new(max_sequence),
+            max_sequence_read: tokio::sync::watch::Sender::default(),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
@@ -1246,6 +1250,7 @@ mod tests {
         let (yielded_tx, mut yielded_rx) = mpsc::unbounded_channel();
         let backend = Arc::new(ScriptedWatchBackend {
             max_sequence: AtomicU64::new(0),
+            max_sequence_read: tokio::sync::watch::Sender::default(),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
@@ -1314,13 +1319,16 @@ mod tests {
         let backend = idle_scripted_backend(u64::MAX);
         let cache = SessionCache::new(backend.clone());
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while cache.watch_error_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.max_sequence_read.subscribe().wait_for(|read| *read),
+        )
         .await
-        .expect("sequence exhaustion must be observed without killing the watch task");
+        .expect("sequence exhaustion must be observed without killing the watch task")
+        .expect("backend remains live");
+        // This current-thread fixture returns the sequence and records the
+        // exhaustion error in the same poll, before the observer can resume.
+        assert!(cache.watch_error_count() > 0);
 
         assert_eq!(cache.last_sequence(), u64::MAX);
         assert!(!cache.is_watch_ready());
@@ -1539,6 +1547,7 @@ mod tests {
         let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();
         let watch_backend = Arc::new(ScriptedWatchBackend {
             max_sequence: AtomicU64::new(0),
+            max_sequence_read: tokio::sync::watch::Sender::default(),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
@@ -1579,6 +1588,7 @@ mod tests {
         let (yielded_tx, mut yielded_rx) = mpsc::unbounded_channel();
         let backend = Arc::new(ScriptedWatchBackend {
             max_sequence: AtomicU64::new(0),
+            max_sequence_read: tokio::sync::watch::Sender::default(),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
@@ -1606,13 +1616,12 @@ mod tests {
             .send(Ok(over_depth_entry(1, key.clone())))
             .expect("send over-depth watch entry");
         yielded_rx.recv().await.expect("watch entry yielded");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while watch_error_count.load(Ordering::Acquire) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("operation limit must be observed before waiting for the cache write lock");
+        // The current-thread watcher validates the yielded entry in the same
+        // poll, before it can park on the held cache write lock.
+        assert!(
+            watch_error_count.load(Ordering::Acquire) > 0,
+            "operation limit must be observed before waiting for the cache write lock"
+        );
 
         assert_eq!(last_sequence.load(Ordering::Acquire), 0);
         assert_eq!(read_guard.get(&key), Some(&record));
@@ -1644,6 +1653,7 @@ mod tests {
         let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();
         let watch_backend = Arc::new(ScriptedWatchBackend {
             max_sequence: AtomicU64::new(0),
+            max_sequence_read: tokio::sync::watch::Sender::default(),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
@@ -1683,6 +1693,7 @@ mod tests {
         let (yielded_tx, mut yielded_rx) = mpsc::unbounded_channel();
         let backend = Arc::new(ScriptedWatchBackend {
             max_sequence: AtomicU64::new(0),
+            max_sequence_read: tokio::sync::watch::Sender::default(),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
@@ -1710,13 +1721,12 @@ mod tests {
             .send(Ok(invalid_ttl_entry(1, key.clone())))
             .expect("send invalid watch entry");
         yielded_rx.recv().await.expect("watch entry yielded");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while watch_error_count.load(Ordering::Acquire) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("invalid TTL must be observed before waiting for the cache write lock");
+        // The current-thread watcher validates the yielded entry in the same
+        // poll, before it can park on the held cache write lock.
+        assert!(
+            watch_error_count.load(Ordering::Acquire) > 0,
+            "invalid TTL must be observed before waiting for the cache write lock"
+        );
 
         assert_eq!(last_sequence.load(Ordering::Acquire), 0);
         assert_eq!(read_guard.get(&key), Some(&record));

@@ -478,16 +478,7 @@ async fn generic_rotation_and_explicit_withdrawal_retire_exact_admitted_epoch() 
             })
             .expect("publish material change");
         let deadline = Instant::now() + Duration::from_secs(5);
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                if client.readback().err() == Some(Error::Retired) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("bounded retirement");
+        assert_eq!(client.readback().err(), Some(Error::Retired));
         if withdraw {
             assert_eq!(
                 material.client_controller.status().reason(),
@@ -910,19 +901,10 @@ async fn generic_kernel_terminal_carrier_revokes_readback_before_queued_delivery
     // The independent receive task must observe peer termination even while
     // the application never calls receive. This tests abort, not SCTP restart
     // or multihoming path recovery.
-    tokio::time::timeout_at(deadline, async {
-        loop {
-            match client.readback() {
-                Ok(_) => tokio::task::yield_now().await,
-                Err(error) => {
-                    assert_eq!(error, Error::ConnectionClosed);
-                    break;
-                }
-            }
-        }
-    })
-    .await
-    .expect("terminal signal bound");
+    tokio::time::timeout_at(deadline, client.wait_for_carrier_terminal_for_test())
+        .await
+        .expect("terminal signal bound");
+    assert_eq!(client.readback().err(), Some(Error::ConnectionClosed));
     assert_eq!(
         client.receive(deadline).await.err(),
         Some(Error::ConnectionClosed)

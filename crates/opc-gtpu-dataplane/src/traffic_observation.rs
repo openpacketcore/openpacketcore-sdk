@@ -584,6 +584,8 @@ pub struct GtpuTrafficProofAuthorityStore {
     current: Arc<RwLock<GtpuTrafficProofAuthorityStoreCurrent>>,
     replacement_active: Arc<AtomicBool>,
     identity: GtpuTrafficProofAuthorityStoreIdentity,
+    #[cfg(test)]
+    pub(crate) rebind_progress: tokio::sync::watch::Sender<()>,
 }
 
 impl GtpuTrafficProofAuthorityStore {
@@ -598,6 +600,8 @@ impl GtpuTrafficProofAuthorityStore {
             ))),
             replacement_active: Arc::new(AtomicBool::new(false)),
             identity,
+            #[cfg(test)]
+            rebind_progress: tokio::sync::watch::Sender::default(),
         }
     }
 
@@ -808,7 +812,11 @@ impl GtpuTrafficProofAuthorityStoreRebindReady {
         }
         self.guard.dispatch_authority.revoke();
         *self.guard = GtpuTrafficProofAuthorityStoreCurrent::new(replacement);
-        Ok(self.transaction.store.clone())
+        let store = self.transaction.store.clone();
+        drop(self);
+        #[cfg(test)]
+        store.rebind_progress.send_replace(());
+        Ok(store)
     }
 }
 

@@ -2597,9 +2597,9 @@ mod tests {
 
     use opc_session_store::{
         Clock, FakeSessionBackend, FencedOwnershipCacheConfig, FencedOwnershipCacheSeed,
-        FencedOwnershipError, FencedOwnershipKey, FencedOwnershipMetadata,
-        FencedOwnershipMutationId, FencedOwnershipNamespace, FencedOwnershipRecord,
-        FencedOwnershipStore, OwnerId, TokioVirtualClock,
+        FencedOwnershipKey, FencedOwnershipMetadata, FencedOwnershipMutationId,
+        FencedOwnershipNamespace, FencedOwnershipRecord, FencedOwnershipStore, OwnerId,
+        TokioVirtualClock,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -2858,8 +2858,11 @@ mod tests {
                 .unwrap_or_else(|error| panic!("valid NF kind: {error}")),
         );
         let clock = TokioVirtualClock::new();
-        let store =
-            FencedOwnershipStore::new(FakeSessionBackend::new(), namespace.clone(), clock.clone());
+        let backend = FakeSessionBackend::new();
+        let mut history = opc_session_store::SessionBackend::watch(&backend, 1)
+            .await
+            .unwrap_or_else(|error| panic!("observe ownership lease release: {error}"));
+        let store = FencedOwnershipStore::new(backend, namespace.clone(), clock.clone());
         let key = FencedOwnershipKey::new(ownership_key().to_canonical_bytes())
             .unwrap_or_else(|error| panic!("valid ownership key: {error}"));
         let first = store
@@ -2875,20 +2878,29 @@ mod tests {
             .into_inner();
         let token = first.fence_token();
         let second = tokio::time::timeout(Duration::from_secs(1), async {
+            // This backend serves only this ownership key. Its release entry
+            // proves the claim's detached cleanup has relinquished the lease.
             loop {
-                match store
-                    .renew(
-                        FencedOwnershipMutationId::from_bytes([9; 16]),
-                        &token,
-                        Duration::from_secs(60),
-                    )
+                let entry = std::future::poll_fn(|context| history.as_mut().poll_next(context))
                     .await
-                {
-                    Ok(record) => break record.into_inner(),
-                    Err(FencedOwnershipError::Contended) => tokio::task::yield_now().await,
-                    Err(error) => panic!("renew ownership generation: {error}"),
+                    .expect("ownership history remains live")
+                    .unwrap_or_else(|error| panic!("ownership history: {error}"));
+                if matches!(
+                    entry.op,
+                    opc_session_store::ReplicationOp::ReleaseLease { .. }
+                ) {
+                    break;
                 }
             }
+            store
+                .renew(
+                    FencedOwnershipMutationId::from_bytes([9; 16]),
+                    &token,
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("renew ownership generation: {error}"))
+                .into_inner()
         })
         .await
         .unwrap_or_else(|_| panic!("ownership generation renewal completed"));

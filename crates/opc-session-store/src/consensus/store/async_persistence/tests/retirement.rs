@@ -182,6 +182,11 @@ async fn planned_native_handoff_preserves_an_accepted_mutations_original_complet
             .await
             .unwrap();
         races::until(
+            fleet
+                .stores
+                .iter()
+                .flatten()
+                .map(|store| store.inner.raft.metrics()),
             || {
                 fleet.stores.iter().flatten().all(|store| {
                     store

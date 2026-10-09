@@ -515,6 +515,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live foreign references, missing required targets and all other inspection
   errors still refuse ownership or cleanup. (#1180)
 
+- Workspace tests await retained progress notifications, task completion, or
+  exact fixture deadlines instead of repeatedly yielding while waiting for
+  another task. Existing operation bounds and state assertions are preserved;
+  a regression checks that a pending fixture waiter parks without waking itself.
+  Fixes #578.
+
 - `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
   admitted append's final result before authenticated readback, retaining its
   acknowledgement, shutdown and completion bounds. A backend-error control

@@ -705,6 +705,7 @@ async fn exercise_activation_retry_survives_a_new_real_leader(protected: bool) {
             .await
             .unwrap();
         races::until(
+            [fleet.store(successor).inner.raft.metrics()],
             || {
                 let current = fleet.store(successor).inner.raft.metrics().borrow().clone();
                 current.current_leader == Some(fleet.peers[successor].node)

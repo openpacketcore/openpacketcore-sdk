@@ -153,7 +153,7 @@ struct ControlledConsumer {
     watch_setup_calls: AtomicUsize,
     block: AtomicBool,
     blocked_remaining: AtomicUsize,
-    entered: Notify,
+    entered: tokio::sync::watch::Sender<()>,
     released: Notify,
     request_order: Mutex<Vec<opc_session_store::SessionConsumerRequestId>>,
 }
@@ -177,9 +177,20 @@ impl ControlledConsumer {
     }
 
     async fn wait_until_entered(&self, expected: usize) {
-        while self.calls.load(Ordering::SeqCst) < expected {
-            tokio::task::yield_now().await;
-        }
+        self.entered
+            .subscribe()
+            .wait_for(|()| self.calls.load(Ordering::SeqCst) >= expected)
+            .await
+            .expect("fixture retains its dispatch publisher");
+    }
+
+    fn record_call(&self, request_id: SessionConsumerRequestId) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.request_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request_id);
+        self.entered.send_replace(());
     }
 
     async fn wait_until_no_active_execute(&self) {
@@ -211,6 +222,53 @@ impl ControlledConsumer {
     }
 }
 
+#[test]
+fn fixture_dispatch_wait_parks_without_self_waking() {
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let service = ControlledConsumer::default();
+    let wakes = Arc::new(WakeCount::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut waiting = Box::pin(service.wait_until_entered(1));
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        0,
+        "an unchanged fixture must park its waiter instead of making it runnable again"
+    );
+    service.record_call(SessionConsumerRequestId::from_bytes([1; 16]));
+    assert_eq!(wakes.0.swap(0, Ordering::SeqCst), 1);
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_ready());
+    drop(waiting);
+
+    let mut late = Box::pin(service.wait_until_entered(1));
+    assert!(std::future::Future::poll(late.as_mut(), &mut context).is_ready());
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    drop(late);
+
+    let mut cancelled = Box::pin(service.wait_until_entered(2));
+    assert!(std::future::Future::poll(cancelled.as_mut(), &mut context).is_pending());
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    drop(cancelled);
+    service.record_call(SessionConsumerRequestId::from_bytes([2; 16]));
+    let mut replacement = Box::pin(service.wait_until_entered(2));
+    assert!(std::future::Future::poll(replacement.as_mut(), &mut context).is_ready());
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 2);
+}
+
 #[async_trait]
 impl SessionQuorumConsumer for ControlledConsumer {
     async fn execute(
@@ -223,12 +281,7 @@ impl SessionQuorumConsumer for ControlledConsumer {
             active: &self.active_executes,
             changed: &self.active_executes_changed,
         };
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.request_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(request.request_id());
-        self.entered.notify_waiters();
+        self.record_call(request.request_id());
         if take_one(&self.blocked_remaining) {
             while self.block.load(Ordering::SeqCst) {
                 self.released.notified().await;
@@ -1688,21 +1741,19 @@ async fn one_lane_dispatches_twelve_bounded_waiters_in_admission_order() {
     let mut queued = Vec::with_capacity(WAITERS);
     for (index, request_id) in request_ids.iter().copied().skip(1).enumerate() {
         let queued_client = client.clone();
-        queued.push(tokio::spawn(async move {
+        let mut caller = Box::pin(async move {
             let request = SessionConsumerRequest::new(
                 scope,
                 request_id,
                 SessionConsumerOperation::Capabilities,
             );
             queued_client.execute(&request).await
-        }));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while client.diagnostics().await.queued < (index + 1) as u64 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("caller reaches the bounded fair lane queue");
+        });
+        // Poll through cooperative scheduling to the real occupied lane.
+        // The caller is then in the FIFO before the next caller is created.
+        assert!(futures_util::poll!(tokio::task::unconstrained(caller.as_mut())).is_pending());
+        assert_eq!(client.diagnostics().await.queued, (index + 1) as u64);
+        queued.push(tokio::spawn(caller));
     }
 
     service.release();
@@ -1764,9 +1815,9 @@ async fn queued_lane_waiter_cannot_be_overtaken_by_late_callers() {
         })
     };
     service.wait_until_entered(1).await;
-    let queued = {
+    let mut queued = {
         let client = client.clone();
-        tokio::spawn(async move {
+        Box::pin(async move {
             client
                 .execute(&SessionConsumerRequest::new(
                     scope,
@@ -1776,13 +1827,9 @@ async fn queued_lane_waiter_cannot_be_overtaken_by_late_callers() {
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while client.diagnostics().await.queued != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the first late-sensitive caller reaches the FIFO lane queue");
+    assert!(futures_util::poll!(tokio::task::unconstrained(queued.as_mut())).is_pending());
+    assert_eq!(client.diagnostics().await.queued, 1);
+    let queued = tokio::spawn(queued);
 
     let late = (0..LATE_CALLERS)
         .map(|index| {
@@ -2249,17 +2296,13 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_call_la
         !client.readiness().await.ready,
         "readiness must not count the checked-out lane as idle"
     );
-    let queued = {
+    let mut queued = {
         let client = client.clone();
-        tokio::spawn(async move { client.capabilities().await })
+        Box::pin(async move { client.capabilities().await })
     };
-    tokio::time::timeout(Duration::from_millis(200), async {
-        while client.diagnostics().await.queued != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("second caller must occupy the bounded queue");
+    assert!(futures_util::poll!(tokio::task::unconstrained(queued.as_mut())).is_pending());
+    assert_eq!(client.diagnostics().await.queued, 1);
+    let queued = tokio::spawn(queued);
     let started = tokio::time::Instant::now();
     assert_eq!(
         client.capabilities().await,
@@ -2272,14 +2315,11 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_call_la
     let before_queued_cancellation = client.diagnostics().await;
     queued.abort();
     assert!(queued.await.is_err(), "queued cancellation completes");
-    tokio::time::timeout(Duration::from_millis(200), async {
-        while client.diagnostics().await.queued != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("queued cancellation releases its FIFO admission record");
     let after_queued_cancellation = client.diagnostics().await;
+    assert_eq!(
+        after_queued_cancellation.queued, 0,
+        "joining the cancelled caller includes dropping its FIFO admission record"
+    );
     assert_eq!(
         after_queued_cancellation.failures,
         before_queued_cancellation.failures + 1,
@@ -2302,13 +2342,12 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_call_la
     )
     .await
     .expect("peer EOF promptly cancels the bounded server execute future");
-    tokio::time::timeout(Duration::from_millis(200), async {
-        while client.diagnostics().await.queued != 0 || client.diagnostics().await.active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("caller cancellation releases admission and active bounds");
+    let after_active_cancellation = client.diagnostics().await;
+    assert_eq!(after_active_cancellation.queued, 0);
+    assert_eq!(
+        after_active_cancellation.active, 0,
+        "joining the cancelled caller includes dropping its checked-out connection"
+    );
     first_service.release();
     assert_eq!(
         client.capabilities().await,

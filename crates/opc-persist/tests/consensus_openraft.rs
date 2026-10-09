@@ -2579,21 +2579,23 @@ async fn follower_committed_history_is_served_from_local_applied_state() {
         .await
         .expect("first quorum commit");
 
-    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-        loop {
-            if cluster.stores[follower]
-                .load_committed_latest()
-                .await
-                .expect("follower-local head")
-                .is_some_and(|record| record.record.version == ConfigVersion::new(1))
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        CLUSTER_TRANSITION_TIMEOUT,
+        cluster.stores[follower].wait_for_committed_change(ConfigVersion::INITIAL),
+    )
     .await
-    .expect("first commit applied on follower");
+    .expect("first commit applied on follower")
+    .expect("follower remains admitted");
+    assert_eq!(
+        cluster.stores[follower]
+            .load_committed_latest()
+            .await
+            .expect("follower-local head")
+            .expect("first committed record")
+            .record
+            .version,
+        ConfigVersion::new(1)
+    );
 
     let wait_store = cluster.stores[follower].clone();
     let wait = tokio::spawn(async move {
@@ -2720,21 +2722,26 @@ async fn leader_change_never_exposes_a_fenced_committed_tail() {
         .await
         .expect("caught-up survivor starts a normal Openraft campaign");
     tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-        loop {
+        let agreement = || {
             let statuses = survivors
                 .iter()
                 .map(|node| cluster.stores[*node].status())
                 .collect::<Vec<_>>();
-            if statuses.iter().all(|status| {
+            statuses.iter().all(|status| {
                 status
                     .leader_id
                     .is_some_and(|leader| leader != old_leader_id)
                     && status.term > old_term
                     && status.leader_id == statuses[0].leader_id
-            }) {
-                break;
+            })
+        };
+        tokio::select! {
+            result = cluster.stores[survivors[0]].wait_for_raft_status_for_test(|_| agreement()) => {
+                result.expect("first survivor engine remains live");
             }
-            tokio::task::yield_now().await;
+            result = cluster.stores[survivors[1]].wait_for_raft_status_for_test(|_| agreement()) => {
+                result.expect("second survivor engine remains live");
+            }
         }
     })
     .await
@@ -2762,21 +2769,23 @@ async fn leader_change_never_exposes_a_fenced_committed_tail() {
         .expect("publish-safe waiter task")
         .expect("publish-safe waiter succeeds");
     for survivor in &survivors {
-        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-            loop {
-                if cluster.stores[*survivor]
-                    .load_committed_latest()
-                    .await
-                    .expect("survivor publish-safe head")
-                    .is_some_and(|record| record.record.tx_id == fenced_id)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            CLUSTER_TRANSITION_TIMEOUT,
+            cluster.stores[*survivor].wait_for_committed_change(ConfigVersion::new(1)),
+        )
         .await
-        .expect("cleared tail applies on survivor");
+        .expect("cleared tail applies on survivor")
+        .expect("survivor remains admitted");
+        assert_eq!(
+            cluster.stores[*survivor]
+                .load_committed_latest()
+                .await
+                .expect("survivor publish-safe head")
+                .expect("cleared survivor tail")
+                .record
+                .tx_id,
+            fenced_id
+        );
     }
 
     cluster.heal(old_leader);

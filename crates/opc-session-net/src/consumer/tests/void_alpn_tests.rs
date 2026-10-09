@@ -664,11 +664,10 @@ async fn void_alpn_first_positive_proof_retires_a_cancelled_competing_lane() {
         ))
     ));
     drop(probes);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while client.v2_diagnostics().active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_v2_actors_to_retire(&client),
+    )
     .await
     .expect("cancelled physical actor must retire");
     service.response.store(0, Ordering::Release);
