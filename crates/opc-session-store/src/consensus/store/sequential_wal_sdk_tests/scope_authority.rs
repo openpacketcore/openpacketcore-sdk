@@ -55,29 +55,35 @@ fn boot(generation: u64) -> ScopeExecution {
 }
 
 pub(super) async fn compact(store: &ConsensusSessionStore) -> u64 {
-    use crate::consensus::test_support::{
-        consensus_local_durable_progress_for_test, trigger_consensus_log_purge_through_for_test,
-        trigger_consensus_snapshot_for_test,
-    };
     let applied = store.status().applied_index.unwrap();
-    trigger_consensus_snapshot_for_test(store).await.unwrap();
+    // This internal unit fixture is available with default features too. Use
+    // the same engine operations without the public test-control adapter.
+    let metrics = store.inner.raft.metrics();
+    store.inner.raft.trigger().snapshot().await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
-        while consensus_local_durable_progress_for_test(store)
-            .snapshot_index
-            .is_none_or(|cut| cut < applied)
+        while metrics
+            .borrow()
+            .snapshot
+            .as_ref()
+            .is_none_or(|cut| cut.index < applied)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    trigger_consensus_log_purge_through_for_test(store, applied)
-        .await
-        .unwrap();
+    assert!(metrics
+        .borrow()
+        .snapshot
+        .as_ref()
+        .is_some_and(|cut| cut.index >= applied));
+    store.inner.raft.trigger().purge_log(applied).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
-        while consensus_local_durable_progress_for_test(store)
-            .purged_index
-            .is_none_or(|cut| cut < applied)
+        while metrics
+            .borrow()
+            .purged
+            .as_ref()
+            .is_none_or(|cut| cut.index < applied)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

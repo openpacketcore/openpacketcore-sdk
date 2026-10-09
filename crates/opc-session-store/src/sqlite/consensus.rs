@@ -22264,12 +22264,21 @@ pub(crate) fn validate_command_for_log(
             return Err(invalid_data("scope operation requires current authority"));
         }
     }
-    if let SessionMutationIntent::ScopeBatch(operation) = semantic_intent {
+    if let Some(operation) = scope_batch::operation(semantic_intent) {
         operation
             .validate()
             .map_err(|_| invalid_data("scope batch invalid"))?;
         if !matches!(command.intent, SessionMutationIntent::Authorized { .. }) {
             return Err(invalid_data("scope batch requires current authority"));
+        }
+        if let crate::scope_batch::ScopeBatchOperation::Cancel(cancel) = operation {
+            if cancel
+                .proposal_id()
+                .map(SessionConsensusRequestId::from_bytes)
+                != Ok(command.request_id)
+            {
+                return Err(invalid_data("scope cancellation proposal identity invalid"));
+            }
         }
         if serde_json::to_vec(command)
             .map_err(|_| invalid_data("scope batch encoding invalid"))?
@@ -23815,6 +23824,7 @@ impl MembershipLogProjection {
             }
             SessionMutationIntent::CertifyScopeProfileContinuation(_)
             | SessionMutationIntent::ScopeBatch(_)
+            | SessionMutationIntent::ScopeBatchCancel(_)
             | SessionMutationIntent::ActivateScopeProfile(_)
             | SessionMutationIntent::PreflightScopeProfile
             | SessionMutationIntent::ScopeAuthority(_)
@@ -30855,11 +30865,11 @@ pub(crate) fn validate_consensus_outcome_records(
     outcome: &SessionMutationOutcome,
 ) -> Result<(), StoreError> {
     match outcome {
-        SessionMutationOutcome::ScopeBatch(_) | SessionMutationOutcome::ScopeAuthority(_) => {
-            Err(StoreError::Serialization(
-                "scope format mismatch: checkpoint in ordinary receipt collection".into(),
-            ))
-        }
+        SessionMutationOutcome::ScopeBatch(_)
+        | SessionMutationOutcome::ScopeBatchCancel(_)
+        | SessionMutationOutcome::ScopeAuthority(_) => Err(StoreError::Serialization(
+            "scope format mismatch: checkpoint in ordinary receipt collection".into(),
+        )),
         SessionMutationOutcome::ConsumerRecord(Some(record))
         | SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
             current: Some(record),
@@ -31050,9 +31060,11 @@ fn execute_application_intent_sync(
         SessionMutationIntent::PreflightScopeProfile => Err(StoreError::CapabilityNotSupported(
             "scope activation preflight reached apply".into(),
         )),
-        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeAuthority(_) => Err(
-            StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
-        ),
+        SessionMutationIntent::ScopeBatch(_)
+        | SessionMutationIntent::ScopeBatchCancel(_)
+        | SessionMutationIntent::ScopeAuthority(_) => Err(StoreError::BackendUnavailable(
+            "scope command reached ordinary apply".into(),
+        )),
 
         SessionMutationIntent::AdvanceLogicalTime
         | SessionMutationIntent::BindConsumerRequest { .. }
@@ -31394,9 +31406,11 @@ fn execute_intent_sync(
                 .map_err(membership_mutation_store_error)
                 .map(|_| (SessionMutationOutcome::Unit, None))
         }
-        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeAuthority(_) => Err(
-            StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
-        ),
+        SessionMutationIntent::ScopeBatch(_)
+        | SessionMutationIntent::ScopeBatchCancel(_)
+        | SessionMutationIntent::ScopeAuthority(_) => Err(StoreError::BackendUnavailable(
+            "scope command reached ordinary apply".into(),
+        )),
 
         SessionMutationIntent::PrepareTopologyTransition {
             transition_id,

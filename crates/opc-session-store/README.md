@@ -69,11 +69,14 @@ evidence.
   creates, replaces or deletes up to 64 sealed children, with exact birth and
   generation comparisons and unique claims. All 16 counters, the birth floor
   and replay sequence floors remain per stable scope across incarnations.
-  Counters can only rise. One unresolved batch per scope and exact retries are
-  required. Read-only predecessor outcome resolution distinguishes retained
-  success, positively not applied and pruned/unknown results. Snapshot validation
-  preserves all floors; physical reclamation, independent lanes and coherent
-  scans remain separate slices.
+  Counters can only rise. Eight independent replay lanes retain exact terminal
+  receipts, with lane 7 reserved for established Emergency. Read conditions compare
+  every child and claim dependency atomically; exact cancellation prevents a lost
+  response from releasing a still-eligible attempt. Same-cut lookup and reopen
+  distinguish retained results, positive no-application, eligible absence and
+  pruned history. Compaction and snapshot installation preserve every lane,
+  counter and birth floor; physical reclamation and coherent paged scans remain
+  separate contracts.
   `execute_classified` accepts the authenticated worker's own-scope Emergency,
   EmergencyClassification, Normal or Maintenance declaration outside the request
   digest. Typed authority operations alone use SafetyControl.
@@ -158,6 +161,60 @@ evidence.
   production traffic uses `probe_production_durable_readiness`, which first
   requires still-fresh `AuthenticatedPlatform` topology evidence.
 
+### Independent scope batches
+
+`ScopeBatchCoordinator` shares eight durable replay lanes across every handle
+for one committed execution. Open it with authenticated `ScopeBatchStore`
+access and the shared scheduler, or use `open_port` with a trusted
+`ScopeBatchPort`. The port carries the effective class through reconnects,
+lookups and cancellation without reserving a second lane or resident credit.
+It must authenticate responses and preserve independent transport capacity.
+
+Reserve before reading dependencies or building a request. The coordinator
+obtains the class's resident credit before taking a shared lane, so budget
+waiters cannot hold shared lanes against admitted work. Established Emergency
+takes exclusive lane 7 before its resident credit, leaving Emergency capacity
+for healthy scopes when one scope stalls. Other data classes use lanes 0–6.
+The bounded builder receives fresh same-cut authority, counters and next lane
+sequence. Use `in_lane` for
+explicit independent requests; `new` is a serial lane-0 convenience and must
+not derive lane sequences from the whole-scope revision after other lanes run.
+Supply exact child birth/generation and claim revision/owner conditions for
+all read dependencies. Compare-and-set validates them together with all writes,
+unique claims and rise-only counter comparisons in one committed command.
+Every rebuilt attempt needs a fresh request ID, including a rebuild after
+cancellation or a revision conflict. Only an exact retry of unchanged bytes
+reuses its ID. The coordinator refuses an ID found in the build cut's retained
+receipts, any occupied local slot, or the last observed stored receipt ID per
+lane before sending or consuming a sequence. Local acknowledgement preserves
+those eight IDs, including completions observed while a builder awaits.
+
+A submitted handle is an observer. Dropping it leaves the supervisor's exact
+request and lane intact. Unknown responses retain the original resident
+entitlement and retry with the highest trusted waiting class. `cancel` races
+for the same immutable terminal sequence; an Applied winner remains Applied.
+The completion stream redelivers terminal results until the reconciler calls
+`ack` with the exact attempt. Acknowledgement is local and adds no command.
+`lane_status` exposes the age and latest failure of unresolved work and the
+first-observation age of each unacknowledged result. Ages never expire results
+or authorize lane reuse. Reconcile durable state and acknowledge a terminal
+result before awaiting another batch on its lane.
+
+`lookup` and `reopen` read authority and ledger from one snapshot after a full
+current-configuration barrier. Eligible absence is `NotRecorded`; a consumed
+sequence or permanently fenced execution can prove `NotApplied`. Discarded
+history stays `Pruned`. Canonical request, attempt, outcome, receipt, lookup and
+reopen codecs reject malformed or inconsistent data; decoded claims alone grant
+no effect capability. A permanent same-lane ID collision also produces a
+supervised `NotApplied` completion with its refusal; a cross-lane collision or
+future sequence gap stays unresolved until fresh evidence settles it. Startup
+reconciles retained results before reusing lanes.
+
+The optional whole-scope guard is for rare operations. `execute_guarded` waits
+for exact reconciliation between retries, backs off from 25 ms to 1 s, and
+returns `ScopeGuardStalled` after sixteen resolved revision conflicts. Ordinary
+handoffs use selective read conditions. See [RFC 027](../../docs/rfc/027-scope-batch-lanes.md).
+
 ### Scope scheduling and backpressure
 
 Create one `ScopeSchedulerOwner` per shared dispatch pool and clone its producer
@@ -172,8 +229,10 @@ reserved credits, for a total bound of thirteen per proposal/outbound pool. Conf
 named budgets with `ScopeSchedulerBudgets::with_budget`; zero capacity, resident
 below running and capacities exceeding Tokio's semaphore limit are invalid.
 
-Acquire any `ScopeLane` before `reserve`, read the current revision and build
-the request only after the lane grant, then `start_in_lane` for a bounded attempt.
+Obtain the class's resident credit with `reserve` before acquiring a shared
+`ScopeLane`; exclusive Emergency lane 7 takes the lane first. After both grants,
+use `start_in_lane`, read the current revision and build
+the request under the bounded running credit.
 The oldest lane waiter receives a grant after at most eight bypasses. An unresolved
 holder inherits its highest trusted waiter's class. Its supervisor retains the
 lane and exact bytes; `finish_unknown()` releases only the running credit and

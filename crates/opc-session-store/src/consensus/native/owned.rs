@@ -116,6 +116,12 @@ fn intent(
                 .map_err(|_| invalid("scope batch invalid"))?;
             SessionMutationIntent::ScopeBatch(operation.clone())
         }
+        SessionMutationIntent::ScopeBatchCancel(operation) => {
+            operation
+                .validate()
+                .map_err(|_| invalid("scope cancel invalid"))?;
+            SessionMutationIntent::ScopeBatchCancel(operation.clone())
+        }
         SessionMutationIntent::ActivateScopeProfile(certificate) => {
             crate::scope_storage::require_current_profile_format(certificate)?;
             certificate
@@ -477,6 +483,14 @@ pub(super) fn ordinary_response(
         Ok(SessionMutationOutcome::Unit) => Ok(SessionMutationOutcome::Unit),
         Ok(SessionMutationOutcome::ScopeBatch(result)) => {
             Ok(SessionMutationOutcome::ScopeBatch(result.clone()))
+        }
+        Ok(SessionMutationOutcome::ScopeBatchCancel(result)) => {
+            if let Ok(receipt) = result {
+                receipt
+                    .validate()
+                    .map_err(|_| invalid("scope receipt invalid"))?;
+            }
+            Ok(SessionMutationOutcome::ScopeBatchCancel(result.clone()))
         }
         Ok(SessionMutationOutcome::ScopeAuthority(result)) => {
             if let Ok(checkpoint) = result {

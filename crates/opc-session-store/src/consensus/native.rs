@@ -1456,9 +1456,20 @@ impl NativeDelta<'_> {
                 prior.max(command.logical_time)
             });
         match intent {
-            SessionMutationIntent::ScopeBatch(operation) => {
-                self.scope_batch(command, operation, authorized, now, index)
-            }
+            SessionMutationIntent::ScopeBatch(operation) => self.scope_batch(
+                command,
+                crate::scope_batch::ScopeBatchOperation::Apply(operation),
+                authorized,
+                now,
+                index,
+            ),
+            SessionMutationIntent::ScopeBatchCancel(operation) => self.scope_batch(
+                command,
+                crate::scope_batch::ScopeBatchOperation::Cancel(operation),
+                authorized,
+                now,
+                index,
+            ),
             SessionMutationIntent::ScopeAuthority(operation) => {
                 self.scope_authority(command, operation, authorized, now, index)
             }

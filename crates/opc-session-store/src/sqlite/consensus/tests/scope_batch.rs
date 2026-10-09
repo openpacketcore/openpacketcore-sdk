@@ -8,6 +8,9 @@ use crate::scope_batch::tests::{claim, create, key, value};
 use crate::scope_batch::*;
 use crate::scope_storage::{self as rows, ScopeRow};
 
+#[path = "scope_batch_cancel.rs"]
+mod cancel;
+
 struct Both {
     sql: SqliteSessionBackend,
     #[cfg(target_os = "linux")]
@@ -67,6 +70,7 @@ impl Both {
         let request_id = match &mutation {
             SessionMutationIntent::ScopeAuthority(command) => *command.request.request_id(),
             SessionMutationIntent::ScopeBatch(command) => *command.request.request_id(),
+            SessionMutationIntent::ScopeBatchCancel(command) => command.proposal_id().unwrap(),
             _ => (0x1000 + u128::from(self.index)).to_be_bytes(),
         };
         let entry = Entry {
@@ -587,8 +591,24 @@ fn scope_batch_snapshot_higher_revision_cannot_lower_any_counter_or_birth_floor(
     future["Batch"]["revision"] = 3.into();
     future["Batch"]["lanes"][0]["sequence"] = 3.into();
     future["Batch"]["lanes"][0]["floor"] = 2.into();
-    future["Batch"]["lanes"][0]["outcome"]["sequence"] = 3.into();
-    future["Batch"]["lanes"][0]["outcome"]["revision"] = 3.into();
+    let future_attempt = both
+        .command(
+            &stamp,
+            3,
+            2,
+            vec![],
+            vec![ScopeCounterMutation::new(0, 10, 10).unwrap()],
+        )
+        .request
+        .attempt()
+        .unwrap();
+    future["Batch"]["lanes"][0]["receipt"]["attempt"] =
+        serde_json::to_value(&future_attempt).unwrap();
+    future["Batch"]["lanes"][0]["receipt"]["revision"] = 3.into();
+    future["Batch"]["lanes"][0]["receipt"]["terminal"]["Applied"]["sequence"] = 3.into();
+    future["Batch"]["lanes"][0]["receipt"]["terminal"]["Applied"]["revision"] = 3.into();
+    future["Batch"]["lanes"][0]["receipt"]["terminal"]["Applied"]["request_digest"] =
+        serde_json::to_value(future_attempt.request_digest()).unwrap();
     let conn = both.sql.conn.blocking_lock();
     conn.execute("ATTACH DATABASE ':memory:' AS consensus_incoming", [])
         .unwrap();
@@ -614,7 +634,8 @@ fn scope_batch_snapshot_higher_revision_cannot_lower_any_counter_or_birth_floor(
     for index in 0..SCOPE_COUNTERS {
         let mut rollback = future.clone();
         rollback["Batch"]["counters"][index] = (9 + index as u64).into();
-        rollback["Batch"]["lanes"][0]["outcome"]["counters"][index] = (9 + index as u64).into();
+        rollback["Batch"]["lanes"][0]["receipt"]["terminal"]["Applied"]["counters"][index] =
+            (9 + index as u64).into();
         replace_incoming(rollback);
         assert!(validate().is_err(), "counter {index} is a protected floor");
     }

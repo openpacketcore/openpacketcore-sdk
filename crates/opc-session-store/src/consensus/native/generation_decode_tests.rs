@@ -104,7 +104,13 @@ fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
         )
         .unwrap();
     let authority = selected;
-    for (count, maximum_value) in [(1, false), (64, false), (1, true)] {
+    for (count, maximum_value, cancel) in [
+        (1, false, false),
+        (64, false, false),
+        (1, true, false),
+        (0, false, false),
+        (1, false, true),
+    ] {
         let mut value = value(1);
         if maximum_value {
             let mut envelope = opc_crypto::CryptoEnvelopeV1::decode(value.envelope()).unwrap();
@@ -120,28 +126,80 @@ fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
                 claims: vec![claim(n)],
             })
             .collect();
-        let batch = ScopeBatchCommand {
+        let mut batch = ScopeBatchCommand {
             request: ScopeBatchRequest::new(
                 authority.view.stamp().unwrap(),
                 [3; 16],
                 0,
                 operations,
-                vec![],
+                if count == 0 {
+                    vec![crate::scope_batch::ScopeCounterMutation::new(0, 0, 0).unwrap()]
+                } else {
+                    vec![]
+                },
             )
             .unwrap(),
         };
+        if count == 0 {
+            use crate::scope_batch::{
+                ScopeChildCondition, ScopeChildRevision, ScopeClaimCondition, ScopeClaimKey,
+                ScopeClaimOwner,
+            };
+            batch.request = batch
+                .request
+                .with_read_conditions(
+                    (1..=64)
+                        .map(|n| {
+                            ScopeChildCondition::new(
+                                key(n),
+                                ScopeChildRevision::new(u64::from(n), 1).unwrap(),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                    (1_u16..=512)
+                        .map(|n| {
+                            let mut bytes = [0; 32];
+                            bytes[..2].copy_from_slice(&n.to_be_bytes());
+                            ScopeClaimCondition::new(
+                                ScopeClaimKey::new(bytes).unwrap(),
+                                1,
+                                Some(ScopeClaimOwner::new(key(1), 1).unwrap()),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap();
+        }
         let mut entry = clock(2, time(2));
         let EntryPayload::Normal(command) = &mut entry.payload else {
             unreachable!()
         };
-        command.request_id = SessionConsensusRequestId::from_bytes([3; 16]);
+        let (request_id, mutation) = if cancel {
+            let mut wire = serde_json::to_value(&batch.request).unwrap();
+            wire["stamp"]["execution"]["identity"] = "x".repeat(253).into();
+            wire["stamp"]["namespace"]["scope"]["tenant"] = "t".repeat(128).into();
+            wire["stamp"]["namespace"]["scope"]["nf_kind"] = "n".repeat(64).into();
+            let request: ScopeBatchRequest = serde_json::from_value(wire).unwrap();
+            let cancel = crate::scope_batch::ScopeBatchCancelCommand {
+                attempt: request.attempt().unwrap(),
+            };
+            (
+                cancel.proposal_id().unwrap(),
+                SessionMutationIntent::ScopeBatchCancel(Box::new(cancel)),
+            )
+        } else {
+            ([3; 16], SessionMutationIntent::ScopeBatch(Box::new(batch)))
+        };
+        command.request_id = SessionConsensusRequestId::from_bytes(request_id);
         command.intent = SessionMutationIntent::Authorized {
             origin: *storage.business.members.first().unwrap(),
             authority_identity: storage.business.identity,
-            mutation: Box::new(SessionMutationIntent::ScopeBatch(Box::new(batch))),
+            mutation: Box::new(mutation),
         };
         let bytes = serde_json::to_vec(&entry).unwrap();
-        if count == 1 && !maximum_value {
+        if count == 1 && !maximum_value && !cancel {
             for legacy_permit in [false, true] {
                 let mut legacy = serde_json::to_value(&entry).unwrap();
                 let body = legacy
@@ -159,7 +217,8 @@ fn native_generation_cold_scope_batch_charges_actual_children_and_values() {
                 assert!(json::log_scratch(&serde_json::to_vec(&legacy).unwrap()).is_err());
             }
         }
-        let temporary = json::log_scratch(&bytes).unwrap();
+        let temporary = json::log_scratch(&bytes)
+            .expect("the maximum complete read predicates fit the native preflight");
         if count == 1 && !maximum_value {
             assert!(
                 temporary < 256 * 1024,

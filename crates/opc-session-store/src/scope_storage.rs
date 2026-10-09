@@ -21,7 +21,8 @@ use crate::scope_authority::{
 };
 use crate::scope_batch::{
     ScopeBatchCheckpoint, ScopeBatchError, ScopeChildKey, ScopeChildRecord, ScopeClaimKey,
-    MAX_SCOPE_CHILD_CLAIMS, MAX_SCOPE_CHILD_VALUE_BYTES, SCOPE_COUNTERS,
+    MAX_SCOPE_BATCH_LEDGER_BYTES, MAX_SCOPE_CHILD_CLAIMS, MAX_SCOPE_CHILD_VALUE_BYTES,
+    SCOPE_BATCH_LANES, SCOPE_COUNTERS,
 };
 use crate::{
     EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
@@ -249,6 +250,7 @@ pub(crate) struct Facts {
     birth: u64,
     generation: u64,
     counters: [u64; SCOPE_COUNTERS],
+    lanes: [(u64, u64, [u8; 32]); SCOPE_BATCH_LANES],
 }
 impl Facts {
     pub(crate) fn can_replace(self, before: Self) -> bool {
@@ -257,6 +259,11 @@ impl Facts {
                 self.body == before.body
             } else {
                 self.revision > before.revision
+                    && self.lanes.iter().zip(before.lanes).all(|(next, previous)| {
+                        next.0 >= previous.0
+                            && next.1 >= previous.1
+                            && (next.0 != previous.0 || next.2 == previous.2)
+                    })
                     && self
                         .counters
                         .iter()
@@ -345,10 +352,10 @@ impl ScopeRow {
         self.validate()?;
         let mut bytes = MAGIC.to_vec();
         bytes.extend(postcard::to_allocvec(self).map_err(|_| ScopeBatchError::FormatMismatch)?);
-        let limit = if matches!(self, Self::Child(_)) {
-            MAX_SCOPE_ROW_BYTES
-        } else {
-            MAX_METADATA_BYTES
+        let limit = match self {
+            Self::Child(_) => MAX_SCOPE_ROW_BYTES,
+            Self::Batch(_) => MAX_SCOPE_BATCH_LEDGER_BYTES,
+            _ => MAX_METADATA_BYTES,
         };
         if bytes.len() > limit {
             return Err(ScopeBatchError::FormatMismatch);
@@ -402,6 +409,10 @@ impl ScopeRow {
             counters: match self {
                 Self::Batch(row) => row.counters,
                 _ => [0; SCOPE_COUNTERS],
+            },
+            lanes: match self {
+                Self::Batch(row) => row.lane_floors()?,
+                _ => [(0, 0, [0; 32]); SCOPE_BATCH_LANES],
             },
         })
     }

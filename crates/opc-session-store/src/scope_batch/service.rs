@@ -1,7 +1,6 @@
 //! Authenticated durable batch service.
 
 use super::*;
-use crate::scope_authority::service::ScopeAuthorityBackend;
 use crate::scope_authority::{ScopeAuthorityAction, ScopeAuthorityAdmission, ScopeAuthorityRole};
 use crate::scope_scheduler::ScopeWorkClass;
 use crate::{
@@ -9,6 +8,16 @@ use crate::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use std::sync::Arc;
+
+pub(crate) fn require_data_lane_class(
+    lane: u8,
+    class: ScopeWorkClass,
+) -> Result<(), ScopeBatchError> {
+    if class == ScopeWorkClass::SafetyControl || (lane == 7 && class != ScopeWorkClass::Emergency) {
+        return Err(ScopeAuthorityError::Unauthorized.into());
+    }
+    Ok(())
+}
 
 /// Strictly durable child records under an admitted scope incarnation. Construction
 /// binds immutable configuration; each request independently validates current
@@ -26,6 +35,23 @@ impl fmt::Debug for ScopeBatchStore {
 }
 
 impl ScopeBatchStore {
+    /// Exact namespace bound to this authenticated service handle.
+    pub const fn namespace(&self) -> &ScopeNamespace {
+        &self.namespace
+    }
+
+    pub(super) async fn resolution_cut(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+    ) -> Result<ScopeBatchReadCut, ScopeBatchError> {
+        tokio::time::timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, async {
+            self.authorize_read(authenticated).await?;
+            self.store.scope_batch_cut(self.namespace.scope()).await
+        })
+        .await
+        .map_err(|_| ScopeBatchError::Unavailable)?
+    }
+
     /// Bind a configuration-derived stable scope to strictly durable consensus.
     /// The same platform admission policy used for the scope authority also binds
     /// each child mutation to its authenticated execution.
@@ -75,6 +101,53 @@ impl ScopeBatchStore {
         })
         .await
         .map_err(|_| ScopeBatchError::Unavailable)?
+    }
+
+    /// Read exact historical status from one authority/ledger cut after a full
+    /// current-configuration barrier. Absence while eligible is NotRecorded.
+    pub async fn lookup(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        attempt: &ScopeBatchAttempt,
+    ) -> Result<ScopeBatchLookup, ScopeBatchError> {
+        attempt.validate()?;
+        if attempt.stamp().scope() != self.namespace.scope() {
+            return Err(ScopeAuthorityError::Unauthorized.into());
+        }
+        tokio::time::timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, async {
+            self.authorize_read(authenticated).await?;
+            self.store
+                .scope_batch_cut(self.namespace.scope())
+                .await?
+                .lookup(attempt)
+        })
+        .await
+        .map_err(|_| ScopeBatchError::Unavailable)?
+    }
+
+    /// Reconstruct volatile lane coordination from one committed observation.
+    /// Returned authority claims and receipts never issue an effect capability.
+    pub async fn reopen(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+    ) -> Result<ScopeBatchReopen, ScopeBatchError> {
+        Ok(self.resolution_cut(authenticated).await?.reopen())
+    }
+
+    async fn authorize_read(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+    ) -> Result<(), ScopeBatchError> {
+        self.admission
+            .authorize(
+                authenticated,
+                self.namespace.scope(),
+                None,
+                ScopeAuthorityAction::Read,
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Read one live child through a linearizable barrier. Deleted rows read
@@ -133,13 +206,64 @@ impl ScopeBatchStore {
         request: &ScopeBatchRequest,
         class: ScopeWorkClass,
     ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
-        if class == ScopeWorkClass::SafetyControl {
-            return Err(ScopeAuthorityError::Unauthorized.into());
-        }
+        require_data_lane_class(request.lane(), class)?;
         tokio::time::timeout(
             DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
             self.execute_inner(authenticated, request, class),
         )
+        .await
+        .map_err(|_| ScopeBatchError::OutcomeUnknown)?
+    }
+
+    /// Race cancellation against apply for this exact immutable attempt. A
+    /// retained apply winner is returned unchanged; cancellation never erases it.
+    pub async fn cancel(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        attempt: &ScopeBatchAttempt,
+    ) -> Result<ScopeBatchReceipt, ScopeBatchError> {
+        self.cancel_classified(authenticated, attempt, ScopeWorkClass::Normal)
+            .await
+    }
+
+    /// Cancel under the trusted own-scope data classification. SafetyControl
+    /// remains independent of data lanes and cannot be declared by this API.
+    pub async fn cancel_classified(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        attempt: &ScopeBatchAttempt,
+        class: ScopeWorkClass,
+    ) -> Result<ScopeBatchReceipt, ScopeBatchError> {
+        require_data_lane_class(attempt.lane(), class)?;
+        tokio::time::timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, async {
+            attempt.validate()?;
+            if attempt.stamp().namespace() != &self.namespace
+                || attempt.stamp().execution().identity() != authenticated
+            {
+                return Err(ScopeAuthorityError::Unauthorized.into());
+            }
+            let role = self
+                .admission
+                .authorize(
+                    authenticated,
+                    self.namespace.scope(),
+                    Some(attempt.stamp().execution()),
+                    ScopeAuthorityAction::Mutate,
+                    Some(attempt.cancellation_digest()?),
+                )
+                .await?;
+            if role != ScopeAuthorityRole::Worker {
+                return Err(ScopeAuthorityError::Unauthorized.into());
+            }
+            self.store
+                .commit_scope_batch_cancel(
+                    ScopeBatchCancelCommand {
+                        attempt: attempt.clone(),
+                    },
+                    class,
+                )
+                .await
+        })
         .await
         .map_err(|_| ScopeBatchError::OutcomeUnknown)?
     }
@@ -171,18 +295,21 @@ impl ScopeBatchStore {
                     None,
                 )
                 .await?;
-            let authority =
-                ScopeAuthorityBackend::current(self.store.as_ref(), self.namespace.scope()).await?;
+            let cut = self.store.scope_batch_cut(self.namespace.scope()).await?;
+            let ScopeBatchReadCut::Initialized {
+                authority,
+                checkpoint,
+            } = cut
+            else {
+                return Err(ScopeBatchError::FormatMismatch);
+            };
             authority.check_stamp(current)?;
             if predecessor_request.stamp.revision() >= current.revision()
                 || predecessor_request.stamp.incarnation() > current.incarnation()
             {
                 return Err(ScopeBatchError::InvalidRequest);
             }
-            self.store
-                .scope_batch_checkpoint(self.namespace.scope())
-                .await?
-                .resolve(predecessor_request)
+            checkpoint.resolve(predecessor_request)
         })
         .await
         .map_err(|_| ScopeBatchError::Unavailable)?

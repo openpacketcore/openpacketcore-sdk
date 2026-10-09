@@ -2,18 +2,11 @@
 
 use super::*;
 use crate::scope_authority::{ScopeAuthorityError, ScopeProfileActivation};
-use crate::scope_batch::{ScopeBatchCommand, ScopeBatchError};
+use crate::scope_batch::{ScopeBatchError, ScopeBatchOperation};
 use crate::scope_storage::{self, ScopeRow};
 
-pub(crate) fn operation(intent: &SessionMutationIntent) -> Option<&ScopeBatchCommand> {
-    match intent {
-        SessionMutationIntent::ScopeBatch(operation) => Some(operation),
-        SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
-            SessionMutationIntent::ScopeBatch(operation) => Some(operation),
-            _ => None,
-        },
-        _ => None,
-    }
+pub(crate) fn operation(intent: &SessionMutationIntent) -> Option<ScopeBatchOperation<'_>> {
+    ScopeBatchOperation::from_intent(intent)
 }
 
 pub(crate) fn read(
@@ -27,6 +20,21 @@ pub(crate) fn read(
         .map_err(|_| StoreError::BackendUnavailable("scope record invalid".into()))
 }
 
+/// The caller supplies one read transaction (or the enclosing apply transaction).
+pub(crate) fn read_cut(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    scope: &crate::scope_authority::ScopeId,
+) -> Result<Result<crate::scope_batch::ScopeBatchReadCut, ScopeBatchError>, StoreError> {
+    let (legacy, authority) = super::scope_authority::read(conn, identity, scope)?;
+    let key = scope_storage::batch_key(scope)
+        .map_err(|_| StoreError::BackendUnavailable("scope ledger key invalid".into()))?;
+    let row = read(conn, &key)?;
+    Ok(crate::scope_batch::ScopeBatchReadCut::from_records(
+        scope, legacy, authority, row,
+    ))
+}
+
 pub(super) fn validate_links(
     conn: &Connection,
     record: &crate::StoredSessionRecord,
@@ -38,7 +46,9 @@ pub(super) fn validate_links(
         let key = scope_storage::batch_key(authority.view.scope())
             .map_err(|_| invalid_data("scope ledger key invalid"))?;
         return match read(conn, &key).map_err(|_| invalid_data("scope ledger read failed"))? {
-            Some(ScopeRow::Batch(row)) if &row.scope == authority.view.scope() => Ok(()),
+            Some(ScopeRow::Batch(row)) if &row.scope == authority.view.scope() => row
+                .validate_authority(&authority)
+                .map_err(|_| invalid_data("scope authority/ledger cut invalid")),
             _ => Err(invalid_data("scope required ledger absent or invalid")),
         };
     }
@@ -55,6 +65,11 @@ pub(super) fn validate_links(
             .map_err(|_| invalid_data("scope batch authority invalid"))?;
         if authority.view.scope() != scope {
             return Err(invalid_data("scope batch authority differs"));
+        }
+        if let ScopeRow::Batch(checkpoint) = &row {
+            checkpoint
+                .validate_authority(&authority)
+                .map_err(|_| invalid_data("scope authority/ledger cut invalid"))?;
         }
     }
     row.validate_links(&|key| read(conn, key).map_err(|_| ScopeBatchError::FormatMismatch))
@@ -182,9 +197,9 @@ pub(super) fn activate(
 fn plan(
     conn: &Connection,
     identity: SessionConsensusIdentity,
-    operation: &ScopeBatchCommand,
+    operation: ScopeBatchOperation<'_>,
 ) -> io::Result<Result<crate::scope_batch::state::ScopeBatchPlan, ScopeBatchError>> {
-    let scope = operation.request.scope();
+    let scope = operation.scope();
     let (legacy, current) = super::scope_authority::read(conn, identity, scope)
         .map_err(|_| invalid_data("scope batch authority read failed"))?;
     if legacy {
@@ -240,7 +255,7 @@ pub(super) fn apply(
     let now = machine
         .2
         .map_or(command.logical_time, |time| time.max(command.logical_time));
-    let result = if operation.request.scope().store() != identity.cluster_id() {
+    let result = if operation.scope().store() != identity.cluster_id() {
         Err(ScopeAuthorityError::Unauthorized.into())
     } else if !authorized {
         Err(
@@ -254,19 +269,17 @@ pub(super) fn apply(
     };
     let outcome = match result {
         Ok(plan) => {
-            let outcome = plan
-                .checkpoint
-                .outcome(operation.request.lane())
-                .cloned()
-                .ok_or_else(|| invalid_data("scope outcome absent"))?;
+            let outcome = operation
+                .success(&plan.checkpoint)
+                .map_err(|_| invalid_data("scope batch receipt invalid"))?;
             let records: Result<Vec<_>, _> = plan.rows.values().map(ScopeRow::to_record).collect();
             for record in records.map_err(|_| invalid_data("scope batch record invalid"))? {
                 ops::insert_or_replace_scope_record_sync(conn, &record)
                     .map_err(|_| invalid_data("scope batch write failed"))?;
             }
-            Ok(outcome)
+            outcome
         }
-        Err(error) => Err(error),
+        Err(error) => operation.failure(error),
     };
     let sequence = machine
         .0
@@ -287,7 +300,7 @@ pub(super) fn apply(
     machine.1 = digest;
     machine.2 = Some(now);
     Ok(SessionConsensusResponse {
-        result: Ok(SessionMutationOutcome::ScopeBatch(outcome)),
+        result: Ok(outcome),
         sequence,
         digest: Some(digest),
         logical_time: Some(now),

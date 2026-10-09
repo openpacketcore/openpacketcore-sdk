@@ -177,6 +177,7 @@ impl NativeLog {
             if !matches!(
                 intent,
                 SessionMutationIntent::ScopeBatch(_)
+                    | SessionMutationIntent::ScopeBatchCancel(_)
                     | SessionMutationIntent::ActivateScopeProfile(_)
                     | SessionMutationIntent::ScopeAuthority(_)
                     | SessionMutationIntent::AdvanceLogicalTime

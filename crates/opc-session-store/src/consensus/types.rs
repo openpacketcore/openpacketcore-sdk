@@ -2201,6 +2201,9 @@ pub enum SessionMutationIntent {
     /// Durable, transition-bound evidence of exact joining-voter profile checks.
     #[doc(hidden)]
     CertifyScopeProfileContinuation(Box<crate::scope_authority::ScopeProfileContinuation>),
+    /// Cancellation competing for one exact batch lane terminal receipt.
+    #[doc(hidden)]
+    ScopeBatchCancel(Box<crate::scope_batch::ScopeBatchCancelCommand>),
 }
 
 /// Exact, self-contained precondition and effect request for the appended
@@ -2737,6 +2740,11 @@ pub enum SessionMutationOutcome {
     /// Atomic child-batch outcome; never an ordinary per-request receipt.
     #[doc(hidden)]
     ScopeBatch(Result<crate::scope_batch::ScopeBatchOutcome, crate::scope_batch::ScopeBatchError>),
+    /// Immutable apply/cancel winner; never an ordinary per-request receipt.
+    #[doc(hidden)]
+    ScopeBatchCancel(
+        Result<crate::scope_batch::ScopeBatchReceipt, crate::scope_batch::ScopeBatchError>,
+    ),
 }
 
 impl fmt::Debug for SessionMutationOutcome {

@@ -3412,6 +3412,32 @@ impl SqliteSessionBackend {
         .await
     }
 
+    pub(crate) async fn consensus_scope_batch_cut(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        scope: crate::scope_authority::ScopeId,
+    ) -> Result<
+        Result<crate::scope_batch::ScopeBatchReadCut, crate::scope_batch::ScopeBatchError>,
+        StoreError,
+    > {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _| state.scope_batch_cut(identity, &scope))
+                .await;
+        }
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("scope cut unavailable".into()))?;
+            let result = consensus::scope_batch::read_cut(&tx, identity, &scope)?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("scope cut unavailable".into()))?;
+            Ok(result)
+        })
+        .await
+    }
+
     pub(crate) async fn consensus_scope_record(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,

@@ -62,11 +62,17 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
             intent => intent,
         };
         match intent {
+            SessionMutationIntent::ScopeBatchCancel(operation) => {
+                operation
+                    .validate()
+                    .map_err(|_| invalid("scope cancel invalid"))?;
+                count = 1;
+            }
             SessionMutationIntent::ScopeBatch(operation) => {
                 operation
                     .validate()
                     .map_err(|_| invalid("scope batch invalid"))?;
-                count = operation.request.operations().len().max(1);
+                count = operation.metadata_request_count();
                 largest_payload = operation.largest_value_bytes();
             }
             SessionMutationIntent::ActivateScopeProfile(_) => {
@@ -228,6 +234,13 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
     }
     fn intent(value: &SessionMutationIntent, allow_authorized: bool) -> io::Result<usize> {
         match value {
+            SessionMutationIntent::ScopeBatchCancel(operation) => {
+                operation
+                    .validate()
+                    .map_err(|_| invalid("scope cancel invalid"))?;
+                Ok(size_of::<crate::scope_batch::ScopeBatchCancelCommand>()
+                    + crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES)
+            }
             SessionMutationIntent::ScopeBatch(operation) => {
                 operation
                     .validate()

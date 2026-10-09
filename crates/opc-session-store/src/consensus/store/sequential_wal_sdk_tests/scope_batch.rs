@@ -493,6 +493,111 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
                 .revision(),
             recreated.rows()[0]
         );
+
+        let cancelled_request = ScopeBatchRequest::in_lane(
+            permit,
+            [201; 16],
+            7,
+            1,
+            vec![create(201, &[])],
+            vec![ScopeCounterMutation::new(0, 65, 66).unwrap()],
+        )
+        .unwrap();
+        let cancelled_attempt = cancelled_request.attempt().unwrap();
+        let cancelled = service
+            .cancel_classified(
+                &identity("worker-1"),
+                &cancelled_attempt,
+                crate::scope_scheduler::ScopeWorkClass::Emergency,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancelled.terminal(),
+            ScopeBatchTerminal::Cancelled
+        ));
+        for store in &fleet.stores {
+            let service = batch_service(store);
+            assert_eq!(
+                service
+                    .lookup(&identity("worker-1"), &cancelled_attempt)
+                    .await
+                    .unwrap(),
+                ScopeBatchLookup::Cancelled
+            );
+            assert!(service
+                .read(&identity("worker-1"), key(201))
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                service
+                    .current(&identity("worker-1"))
+                    .await
+                    .unwrap()
+                    .counters()[0],
+                65
+            );
+            compact(store).await;
+        }
+        drop(service);
+        fleet.close().await;
+        fleet.open().await;
+        for store in &fleet.stores {
+            let service = batch_service(store);
+            assert_eq!(
+                service
+                    .lookup(&identity("worker-1"), &cancelled_attempt)
+                    .await
+                    .unwrap(),
+                ScopeBatchLookup::Cancelled
+            );
+            assert_eq!(
+                service
+                    .cancel_classified(
+                        &identity("worker-1"),
+                        &cancelled_attempt,
+                        crate::scope_scheduler::ScopeWorkClass::Emergency
+                    )
+                    .await
+                    .unwrap(),
+                cancelled
+            );
+            assert_eq!(
+                service
+                    .execute_classified(
+                        &identity("worker-1"),
+                        &cancelled_request,
+                        crate::scope_scheduler::ScopeWorkClass::Emergency
+                    )
+                    .await,
+                Err(ScopeBatchError::Cancelled)
+            );
+            assert_eq!(
+                service
+                    .lookup(&identity("worker-1"), &full.attempt().unwrap())
+                    .await
+                    .unwrap(),
+                ScopeBatchLookup::Pruned
+            );
+            assert_eq!(
+                service
+                    .current(&identity("worker-1"))
+                    .await
+                    .unwrap()
+                    .counters()[0],
+                65
+            );
+            let ScopeBatchReopen::Initialized(reopened) =
+                service.reopen(&identity("worker-1")).await.unwrap()
+            else {
+                panic!("committed authority and ledger disappeared");
+            };
+            assert_eq!(reopened.lanes()[7].sequence(), 1);
+            assert_eq!(reopened.lanes()[7].receipt(), Some(&cancelled));
+            assert_eq!(reopened.lanes()[0].sequence(), 4);
+            assert_eq!(reopened.lanes()[0].discarded_through(), 3);
+        }
     })
     .catch_unwind()
     .await;
