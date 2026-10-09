@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store`: add scope-fair backpressure with separate SafetyControl,
+  established Emergency, EmergencyClassification, Normal and Maintenance budgets.
+  Shared lanes have class ordering, an eight-bypass bound and dynamic priority
+  inheritance. Unknown work retains its resident entitlement; owner-only quiescence
+  leaves control open. Durable proposal and outbound mutation admission preserve
+  class metadata outside canonical request bytes.
+  Authenticated connection/accept isolation remains a transport integration gate;
+  see RFC 024.
+
 - `opc-proto-ikev2`: add typed CBC recovery epochs, committed ordinary windows,
   exact replay, fenced readback and both RFC 6311 sync handlers for all 48
   encryption/integrity/PRF combinations. Fresh immutable descriptors bind SK_d,
@@ -280,6 +289,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Changed
+
+- `opc-session-store` / `opc-session-net`: consensus transport/wire revision 6
+  requires scheduling metadata and rejects older peers. Upgrade every member
+  through a coordinated fresh installation; mixed-profile operation is refused.
+  Ordinary proposal concurrency remains eight, with five additional reserved
+  running credits (thirteen total per proposal/outbound pool). Aggregate internal
+  traffic is exempt from tenant scope caps. Read fences default to Normal;
+  explicit record-expiry floors and history maintenance retain Maintenance.
 
 - CI: run the root-cgroup egress-fence qualification when fence inputs or its
   resolved dependency versions, sources, features or path dependencies change.

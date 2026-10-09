@@ -83,6 +83,7 @@ impl ConsensusSessionStore {
     pub(crate) async fn commit_scope_batch(
         &self,
         operation: ScopeBatchCommand,
+        class: ScopeWorkClass,
     ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         self.ensure_scope_profile_before(deadline)
@@ -98,10 +99,11 @@ impl ConsensusSessionStore {
             return Err(ScopeLeaseError::Unauthorized.into());
         }
         let response = self
-            .submit_request_with_consumer_scope(
+            .submit_classified_scope_batch(
                 SessionConsensusRequestId::from_bytes(*operation.request.request_id()),
                 SessionMutationIntent::ScopeBatch(Box::new(operation)),
-                Some(current),
+                current,
+                class,
             )
             .await
             .map_err(|_| ScopeBatchError::OutcomeUnknown)?;

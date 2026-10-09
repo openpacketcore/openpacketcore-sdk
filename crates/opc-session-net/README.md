@@ -216,9 +216,13 @@ cap of 128 rather than that planning estimate.
 
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
-The exact consensus contract is transport/wire-schema revision 5, application
-revision 4, and error-set revision 6. The revision-5 transport profile retains
-the explicit forwarded consumer scope, so a peer cannot silently downgrade a
+The exact consensus contract is transport/wire-schema revision 6, application
+revision 4, and error-set revision 6. Revision 6 requires scheduling metadata on
+forwarded mutations, outside canonical commands and their digests. The previous
+forwarding shape fails decoding and bootstrap; this boundary requires a fresh
+installation. Class metadata alone does not partition this transport's shared
+connection pool; RFC 024 records the separate transport integration requirement.
+The profile also retains the explicit forwarded consumer scope, so a peer cannot silently downgrade a
 consumer-scoped operation to an internal call; application revision 4 also
 fences the former 728bc5 application-revision-3 Postcard tag-27
 `FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster

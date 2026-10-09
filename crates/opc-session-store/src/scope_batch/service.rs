@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::scope_lease::{ScopeLeaseAction, ScopeLeaseAdmission, ScopeLeaseClock};
+use crate::scope_scheduler::ScopeWorkClass;
 use crate::{
     ConsensusSessionStore, SessionConsumerIdentity, SessionPersistenceMode,
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
@@ -99,9 +100,31 @@ impl ScopeBatchStore {
         authenticated: &SessionConsumerIdentity,
         request: &ScopeBatchRequest,
     ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
+        self.execute_classified(authenticated, request, ScopeWorkClass::Normal)
+            .await
+    }
+
+    /// Submit an authenticated own-scope worker declaration outside the request
+    /// digest. Every emergency-session procedure uses `Emergency`; unknown or
+    /// unverified work uses `EmergencyClassification`. The voter cannot inspect
+    /// sealed values. SafetyControl is reserved for typed authority operations
+    /// and cannot be declared on a child batch. Admission and apply fencing are
+    /// identical to [`Self::execute`]. Transport adapters must authenticate the
+    /// header/class and provide per-class ingress/proof capacity before reading
+    /// the body. Queue congestion is retried through normal backpressure;
+    /// network/store deadlines still bound each dispatched attempt.
+    pub async fn execute_classified(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        request: &ScopeBatchRequest,
+        class: ScopeWorkClass,
+    ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
+        if class == ScopeWorkClass::SafetyControl {
+            return Err(ScopeLeaseError::Unauthorized.into());
+        }
         tokio::time::timeout(
             DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-            self.execute_inner(authenticated, request),
+            self.execute_inner(authenticated, request, class),
         )
         .await
         .map_err(|_| ScopeBatchError::OutcomeUnknown)?
@@ -132,6 +155,7 @@ impl ScopeBatchStore {
         &self,
         authenticated: &SessionConsumerIdentity,
         request: &ScopeBatchRequest,
+        class: ScopeWorkClass,
     ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
         self.authorize(authenticated, request).await?;
         let current = self.store.scope_batch_checkpoint(&self.scope).await?;
@@ -146,7 +170,7 @@ impl ScopeBatchStore {
             request: request.clone(),
             bounds: self.clock.bounds()?,
         };
-        match self.store.commit_scope_batch(command).await {
+        match self.store.commit_scope_batch(command, class).await {
             Ok(outcome) => Ok(outcome),
             Err(
                 ScopeBatchError::OutcomeUnknown

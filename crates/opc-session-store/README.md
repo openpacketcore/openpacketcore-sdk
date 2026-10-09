@@ -78,6 +78,15 @@ evidence.
   This initial profile requires one unresolved batch per scope and exact retry
   after an unknown outcome. Child/claim links and birth floors survive durable
   snapshots; physical reclamation and independent replay lanes are later work.
+  `execute_classified` accepts the authenticated worker's own-scope Emergency,
+  EmergencyClassification, Normal or Maintenance declaration outside the request
+  digest. Typed authority operations alone use SafetyControl.
+- `scope_scheduler` supplies independent resident/running budgets, scope fairness,
+  retained retry entitlements and class-ordered shared-lane arbitration. Full
+  capacity waits; it never creates an attach quota. The store preserves eight
+  ordinary running credits and adds five reserved credits, for thirteen total
+  per proposal or outbound mutation pool. Every current read uses Normal for
+  its read fence.
 - `FencedOwnershipStore` composes the existing backend lease, CAS, TTL, and
   committed-watch surfaces into key-agnostic logical ownership leases. Opaque
   keys contain 1 through 64 bytes, opaque metadata is capped at 64 KiB, every
@@ -152,6 +161,58 @@ evidence.
   quorum evidence. Descriptor-only labs may use that engine-only probe;
   production traffic uses `probe_production_durable_readiness`, which first
   requires still-fresh `AuthenticatedPlatform` topology evidence.
+
+### Scope scheduling and backpressure
+
+Create one `ScopeSchedulerOwner` per shared dispatch pool and clone its producer
+with `owner.scheduler()`. Use a stable authenticated scope key. The default
+resident/running budgets are SafetyControl 8/1, established Emergency 16/2,
+EmergencyClassification 8/1, Normal 24/8 and Maintenance 8/1. Each scope can hold
+at most half a class budget, rounded up; FIFO scope/global acquisition keeps one
+busy scope from occupying all capacity when the budget exceeds one. The store's
+private aggregate non-scope key is exempt from this reduction; public keys cannot
+claim that exemption. Ordinary proposals retain eight running credits, plus five
+reserved credits, for a total bound of thirteen per proposal/outbound pool. Configure
+named budgets with `ScopeSchedulerBudgets::with_budget`; zero capacity, resident
+below running and capacities exceeding Tokio's semaphore limit are invalid.
+
+Acquire any `ScopeLane` before `reserve`, read the current revision and build
+the request only after the lane grant, then `start_in_lane` for a bounded attempt.
+The oldest lane waiter receives a grant after at most eight bypasses. An unresolved
+holder inherits its highest trusted waiter's class. Its supervisor retains the
+lane and exact bytes; `finish_unknown()` releases only the running credit and
+returns the same resident reservation for retry. Bound producer tasks upstream
+before buffering bodies. Every resident descriptor, including unknown outcomes,
+counts against the memory budget. `ScopeLane::acquire` returns a typed
+`SafetyControlOnDataLane` error before any control work joins the lane. Its guard's
+`effective_class(reservation_class)` combines that original class with live waiters
+only; the guard's acquisition class cannot boost unrelated work. Both `start` and
+`start_in_lane` return the original reservation inside `ScopeWorkStartError` on
+failure. Recover it with `into_reservation()` before continuing exact outcome
+resolution; a scope mismatch or scheduler close does not discard it.
+
+Only the owner may `quiesce()` or `close()`. Quiescence stops new ordinary work
+while retaining retries and SafetyControl for the final authority `Close`.
+Final close wakes undispatched waiters without cancelling accepted effects.
+The consumer's emergency hold still governs voluntary shutdown. Emergency is
+a whole-session property; unverified claims and classification use their separate
+budget. Missing/corrupt classification results are final. MPS remains explicitly
+deferred in [RFC 024](../../docs/rfc/024-scope-priority-scheduler.md).
+
+`scope_proposal_scheduling_snapshot` and `scope_forward_scheduling_snapshot`
+report fixed-cardinality resident, running and waiting counts, without identities
+or payloads. Scheduling grants no authority and changes no canonical digest.
+Existing store/network deadlines bound each dispatched attempt, including its
+downstream waits; adapters retain the exact work and retry after transient
+congestion. The scheduler's own queue has no implicit timeout.
+
+The store's real three-voter isolation test uses in-process peers. Authenticated
+transport adapters must independently reserve connection, accept, proof, body and
+reply capacity through the voter-to-leader forwarding hop; the existing shared
+`RemoteSessionConsensusPeer` pool does not yet supply that isolation. This is an
+integration requirement, not a transport qualification claim. Required forwarding
+class metadata advances consensus transport/wire revision to 6; revision 5 fails
+bootstrap. Upgrade all members with a fresh installation across that boundary.
 
 ### Fixed durable-quorum consumer recipe
 
@@ -955,13 +1016,12 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses transport/wire-schema revision 4 and
-error-set revision 6. Revision 4 makes the forwarded consumer scope explicit,
-so a peer cannot silently downgrade a consumer-scoped operation to an internal
-call; error revision 6 binds that semantic boundary into the exact profile.
-Revision 3/error revision 5 or older fails before dispatch. Drain traffic and
-writers, then stop and upgrade every consensus member together; mixed-profile
-rolling operation is unsupported.
+The exact consensus contract uses transport/wire-schema revision 6, application
+revision 4 and error-set revision 6. The forwarding envelope requires scheduling
+metadata and an explicit consumer scope, so a peer cannot silently drop the class
+or downgrade a consumer-scoped operation to an internal call. Older profiles fail
+before dispatch. Upgrade all consensus members with a coordinated fresh
+installation across this boundary; mixed-profile rolling operation is unsupported.
 
 Both durable domains use the shared 10-second operation default. Transport
 families use 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
@@ -1174,9 +1234,14 @@ transitions, snapshots, and restart; reuse of the transition ID with another
 digest fails closed. Reaching the historical bound rejects another transition
 as compaction-required rather than silently evicting idempotency evidence.
 
-Each node uses the shared fixed eight-slot proposal admission pool. Normal
-mutations and finite-expiry logical-time-floor proposals acquire from that same
-pool within the operation's existing absolute deadline. After
+Each node preserves eight Normal proposal-admission slots and adds reserved
+SafetyControl (1), Emergency (2), EmergencyClassification (1) and Maintenance (1)
+slots, for thirteen total. Existing non-scope mutations can use all eight Normal
+slots. All current read entry points are unclassified, so every read fence uses
+Normal, including session reads, status lookups and scans. Explicit finite-expiry
+floor proposals and history maintenance use Maintenance. Waiting
+at this downstream stage remains within the dispatched operation's existing
+absolute deadline; scope adapters retain exact work for automatic retry. After
 `client_write_ff` accepts a command, a supervisor—not the caller future—owns
 the permit until the accepted result resolves. Caller cancellation therefore
 cannot create an unbounded detached Openraft queue. A finite-expiry preflight

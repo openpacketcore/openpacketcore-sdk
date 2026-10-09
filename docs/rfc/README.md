@@ -34,6 +34,7 @@ engineers.
 | :--- | :--- | :--- |
 | [020](020-online-audit-recipient-verification.md) | Authority-owned online audit recipient verification | Acceptance is recorded by maintainer-approved merge of #979; implementation qualification remains separate. Online recipient custody, authenticated application boundary and checkpoint/report semantics for #959. |
 | [022](022-scope-leases.md) | Scope leases, profile 2 | Experimental durable scope authority and timed permits; packet enforcement and child-record batches are separate slices. |
+| [024](024-scope-priority-scheduler.md) | Scope work priorities and backpressure | Implemented class isolation, shared-lane arbitration and class-aware proposal admission; composed lane and authenticated transport qualification remain separate. |
 
 ## Recommended Reading Order
 

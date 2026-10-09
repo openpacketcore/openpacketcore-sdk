@@ -41,6 +41,7 @@ fn activation_request(
         ),
     };
     ForwardMutationRequest {
+        work_class: ForwardWorkClass::Inferred,
         request_id,
         intent,
         required_consumer_scope: ForwardConsumerScope::Internal,
