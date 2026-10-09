@@ -452,6 +452,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-testkit`: run authenticated response-loss and stalled-voter
+  fixtures' client calls and transport actors on an isolated frozen clock,
+  bounded by a 30-second test-only wall watchdog. Voter services and SQLite
+  retain real time, so fresh database work cannot inherit an expired deadline
+  from a paused server clock. Advance client time only at the observed fault;
+  preserve the original request and attempt deadlines, exact receipt and
+  no-replay assertions, and checks immediately before attempt expiry.
+  Fixes #1178.
+
 - `opc-ipsec-lb`: end the retirement fixture's first runtime before reopening
   SQLite, so detached lease cleanup cannot race the new adapter. A
   `test-control`-only lease-release hook reproduces the refusal; retirement

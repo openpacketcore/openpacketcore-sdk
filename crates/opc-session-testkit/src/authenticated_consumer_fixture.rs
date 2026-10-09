@@ -1672,19 +1672,44 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             .store(FIXTURE_VOTER_COUNT, Ordering::Release);
     }
 
-    /// Stall every `/2` receipt lookup on the voter at `canonical_index` in
-    /// node-ordinal order, the order the protected facades route by.
+    /// Stall every `/2` receipt lookup on the voter at the zero-based
+    /// `canonical_index` in node-ordinal order and report each entered hold.
     #[cfg(test)]
     pub(crate) fn stall_fenced_transition_v2_status_on_canonical_voter(
         &self,
         canonical_index: usize,
-    ) {
+    ) -> Arc<tokio::sync::Notify> {
         let mut canonical = self.voters.iter().collect::<Vec<_>>();
         canonical.sort_unstable_by_key(|voter| voter.authority.node_id());
         canonical[canonical_index]
             .service
             .stall_fenced_transition_v2_status
             .store(true, Ordering::Release);
+        Arc::clone(
+            &canonical[canonical_index]
+                .service
+                .fenced_transition_v2_status_stalled,
+        )
+    }
+
+    #[cfg(test)]
+    async fn wait_for_successful_fenced_transition_response_loss(&self) {
+        let (_, voter, _) = futures_util::future::select_all(self.voters.iter().map(|voter| {
+            Box::pin(
+                voter
+                    .service
+                    .fenced_transition_response_suppressed
+                    .notified(),
+            )
+        }))
+        .await;
+        assert!(
+            self.voters[voter]
+                .service
+                .suppressed_fenced_transition_succeeded
+                .load(Ordering::Acquire),
+            "the real transition must commit before advancing its response-loss deadline"
+        );
     }
 
     /// Return redacted aggregate transport activity for no-replay assertions.
@@ -1907,6 +1932,12 @@ struct FixtureConsumer {
     #[cfg(test)]
     stall_fenced_transition_v2_status: AtomicBool,
     #[cfg(test)]
+    fenced_transition_v2_status_stalled: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    fenced_transition_response_suppressed: tokio::sync::Notify,
+    #[cfg(test)]
+    suppressed_fenced_transition_succeeded: AtomicBool,
+    #[cfg(test)]
     stall_fenced_transition_v2_mutation: AtomicBool,
     #[cfg(test)]
     legacy_fenced_transition_v2_capability: AtomicBool,
@@ -1944,6 +1975,12 @@ impl FixtureConsumer {
             last_fenced_transition_v2_request: Mutex::new(None),
             #[cfg(test)]
             stall_fenced_transition_v2_status: AtomicBool::new(false),
+            #[cfg(test)]
+            fenced_transition_v2_status_stalled: Arc::default(),
+            #[cfg(test)]
+            fenced_transition_response_suppressed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            suppressed_fenced_transition_succeeded: AtomicBool::new(false),
             #[cfg(test)]
             stall_fenced_transition_v2_mutation: AtomicBool::new(false),
             #[cfg(test)]
@@ -2031,6 +2068,14 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            #[cfg(test)]
+            {
+                self.suppressed_fenced_transition_succeeded.store(
+                    matches!(&response, SessionConsumerResponse::FencedTransition(Ok(_))),
+                    Ordering::Release,
+                );
+                self.fenced_transition_response_suppressed.notify_one();
+            }
             std::future::pending::<SessionConsumerResponse>().await;
         }
         response
@@ -2103,6 +2148,7 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .stall_fenced_transition_v2_status
                 .load(Ordering::Acquire)
             {
+                self.fenced_transition_v2_status_stalled.notify_one();
                 std::future::pending::<()>().await;
             }
         }
@@ -2232,6 +2278,59 @@ impl FixturePki {
 #[cfg(test)]
 mod v2_facade_tests;
 
+// Tokio rounds timer deadlines up to a millisecond. Advance one additional
+// tick to observe expiry; the deadline passed to the product remains unchanged.
+#[cfg(test)]
+const FIXTURE_TIMER_TICK: Duration = Duration::from_millis(1);
+
+/// Keep client deadlines independent of host scheduling and disk work.
+///
+/// Start the voter fixture on the caller's runtime, then open and exercise the
+/// client inside `work`. Its transport actors must use the same frozen clock
+/// as its caller. Voter services keep real time, including SQLite's blocking
+/// work limits. Tests advance client time only at an observed service fault.
+#[cfg(test)]
+async fn with_fixture_protocol_clock<F>(name: &'static str, work: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (lifetime, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("fixture client runtime");
+        runtime.block_on(async move {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            // This live blocking task inhibits automatic client-clock advance.
+            // Dropping the sender releases it on completion, panic or cancellation.
+            let mut watchdog = tokio::task::spawn_blocking(move || {
+                held.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            });
+            let (result, watchdog_finished) = tokio::select! {
+                biased;
+                _ = cancelled => (Err("fixture client caller was cancelled"), false),
+                result = work => (Ok(result), false),
+                expired = &mut watchdog => {
+                    let _ = expired.expect("fixture client watchdog task");
+                    (Err("fixture client wall-clock watchdog expired"), true)
+                }
+            };
+            drop(release);
+            if !watchdog_finished {
+                let _ = watchdog.await.expect("retire fixture client watchdog");
+            }
+            result
+        })
+    });
+    let result = task.await.expect("fixture client task");
+    drop(lifetime);
+    result.unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2246,6 +2345,64 @@ mod tests {
         SessionKeyType, StateClass, StateType, StoredSessionRecord,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
+
+    #[tokio::test]
+    async fn fixture_protocol_clock_does_not_pause_voter_runtime() {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(with_fixture_protocol_clock("clock isolation", async move {
+            let before = tokio::time::Instant::now();
+            entered.send(()).unwrap();
+            held.await.unwrap();
+            assert_eq!(tokio::time::Instant::now(), before);
+        }));
+        tokio::time::timeout(Duration::from_secs(30), started)
+            .await
+            .expect("client starts before the test watchdog")
+            .unwrap();
+
+        // This would panic if the client had paused the voter runtime. Move
+        // the voter clock independently while the client retains its instant.
+        tokio::time::pause();
+        let before = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(before.elapsed(), Duration::from_secs(3));
+        release.send(()).unwrap();
+        client.await.unwrap();
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn cancelling_fixture_protocol_clock_drops_client_work() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (dropped, finished) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(with_fixture_protocol_clock(
+            "caller cancellation",
+            async move {
+                let _dropped = Dropped(Some(dropped));
+                entered.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(30), started)
+            .await
+            .expect("client starts before the test watchdog")
+            .unwrap();
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(30), finished)
+            .await
+            .expect("cancelled client releases its resources")
+            .unwrap();
+    }
 
     fn fixture_tenant() -> TenantId {
         TenantId::new("prepared-fenced-fixture").expect("fixture tenant")
@@ -2652,96 +2809,132 @@ mod tests {
             AuthenticatedPreparedFencedTransitionFixture::start([fixture_scope(tenant.clone())])
                 .await
                 .expect("start authenticated three-voter fixture");
-        let facade = fixture
-            .open_local_aead(fixture_provider(tenant.clone()), "fixture-fresh")
-            .await
-            .expect("open opaque local-AEAD facade");
-        let request_id = FencedTransitionRequestId::from_bytes([0x31; 16]);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let request = fixture_request(request_id, tenant);
-        let expected_record = request.mutation().record().expect("create request").clone();
-        let mut prepared = facade
-            .prepare_fenced_transition(request.clone(), fixture_budget(deadline))
-            .await
-            .expect("prepare through the production facade");
+        let exercise = async move {
+            let facade = fixture
+                .open_local_aead(fixture_provider(tenant.clone()), "fixture-fresh")
+                .await
+                .expect("open opaque local-AEAD facade");
+            let request_id = FencedTransitionRequestId::from_bytes([0x31; 16]);
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_secs(3);
+            let request = fixture_request(request_id, tenant);
+            let expected_record = request.mutation().record().expect("create request").clone();
+            let mut prepared = facade
+                .prepare_fenced_transition(request.clone(), fixture_budget(deadline))
+                .await
+                .expect("prepare through the production facade");
 
-        if lose_response {
-            fixture.lose_next_fenced_transition_response();
-        }
-        let execution = prepared.execute_once().await;
-        let ambiguous = matches!(
-            &execution,
-            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
-        );
-        if lose_response {
-            assert!(
-                matches!(&execution, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: observed }) if *observed == request_id),
-                "withholding the real response must expose this exact request's unknown outcome"
-            );
-            assert!(
-                !fixture
-                    .lose_next_fenced_transition_response
-                    .load(Ordering::Acquire),
-                "the response-loss hook must run after the real service returns"
-            );
-        }
-        let outcome = match execution {
-            Ok(outcome) => outcome,
-            Err(FencedTransitionExecuteError::OutcomeUnknown {
-                request_id: observed,
-            }) => {
-                assert!(
-                    observed == request_id,
-                    "only the exact retained request may recover"
-                );
-                // A capped physical attempt may commit without delivering its
-                // response. This same handle can only read its exact receipt
-                // under the original deadline; it cannot dispatch again.
-                let receipt = prepared.status_until_terminal(deadline).await.expect(
-                    "the exact transition receipt must resolve before its original deadline",
-                );
-                let FencedTransitionStatus::Recorded(result) = receipt else {
-                    panic!("only a successful authoritative receipt proves the transition: {receipt:?}");
-                };
-                (*result).expect("one real authenticated transition commits")
+            if lose_response {
+                fixture.lose_next_fenced_transition_response();
             }
-            Err(error) => panic!("fresh fixture dispatch failed before exact recovery: {error:?}"),
-        };
-        assert!(
-            outcome.matches_request(&request),
-            "the committed outcome must match the complete request"
-        );
-        if ambiguous {
-            assert!(
-                fixture.diagnostics().fenced_transition_status_calls() > 0,
-                "unknown completion must be proved with authoritative receipt reads"
+            let execution = if lose_response {
+                let attempt_timeout = fixture_budget(deadline).physical_attempt_timeout();
+                let execution = prepared.execute_once();
+                tokio::pin!(execution);
+                tokio::select! {
+                    _ = &mut execution => panic!("the lost response must remain pending before its physical deadline"),
+                    () = fixture.wait_for_successful_fenced_transition_response_loss() => {}
+                }
+                // Prove the original cap, then drive past timer-wheel rounding.
+                tokio::time::advance(attempt_timeout - FIXTURE_TIMER_TICK).await;
+                assert!(
+                    futures_util::poll!(&mut execution).is_pending(),
+                    "response loss remains pending before its original physical deadline"
+                );
+                tokio::time::advance(FIXTURE_TIMER_TICK * 2).await;
+                execution.await
+            } else {
+                prepared.execute_once().await
+            };
+            let ambiguous = matches!(
+                &execution,
+                Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
             );
-        }
-        assert_eq!(
-            fixture.diagnostics().fenced_transition_calls(),
-            1,
-            "the fresh affine handle dispatches exactly one physical mutation"
-        );
+            if lose_response {
+                assert!(
+                    matches!(&execution, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: observed }) if *observed == request_id),
+                    "withholding the real response must expose this exact request's unknown outcome"
+                );
+                assert!(
+                    !fixture
+                        .lose_next_fenced_transition_response
+                        .load(Ordering::Acquire),
+                    "the response-loss hook must run after the real service returns"
+                );
+            }
+            let outcome = match execution {
+                Ok(outcome) => outcome,
+                Err(FencedTransitionExecuteError::OutcomeUnknown {
+                    request_id: observed,
+                }) => {
+                    assert!(
+                        observed == request_id,
+                        "only the exact retained request may recover"
+                    );
+                    // A capped physical attempt may commit without delivering its
+                    // response. This same handle can only read its exact receipt
+                    // under the original deadline; it cannot dispatch again.
+                    let receipt = prepared.status_until_terminal(deadline).await.expect(
+                        "the exact transition receipt must resolve before its original deadline",
+                    );
+                    let FencedTransitionStatus::Recorded(result) = receipt else {
+                        panic!("only a successful authoritative receipt proves the transition: {receipt:?}");
+                    };
+                    (*result).expect("one real authenticated transition commits")
+                }
+                Err(error) => {
+                    panic!("fresh fixture dispatch failed before exact recovery: {error:?}")
+                }
+            };
+            assert!(
+                outcome.matches_request(&request),
+                "the committed outcome must match the complete request"
+            );
+            if ambiguous {
+                assert!(
+                    fixture.diagnostics().fenced_transition_status_calls() > 0,
+                    "unknown completion must be proved with authoritative receipt reads"
+                );
+            }
+            assert_eq!(
+                fixture.diagnostics().fenced_transition_calls(),
+                1,
+                "the fresh affine handle dispatches exactly one physical mutation"
+            );
 
-        let observed = tokio::time::timeout_at(
-            deadline,
-            facade.observe_fenced_transition(&expected_record.key),
-        )
-        .await
-        .expect("authoritative readback must finish before the original deadline")
-        .expect("read the record through the same authenticated protected facade");
-        assert_eq!(observed.record(), Some(&expected_record));
-        assert_eq!(observed.current_fence(), outcome.lease().fence());
-        assert_eq!(
-            fixture.diagnostics().fenced_transition_calls(),
-            1,
-            "receipt recovery and readback never replay the mutation"
-        );
-        assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
-        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
+            let observed = tokio::time::timeout_at(
+                deadline,
+                facade.observe_fenced_transition(&expected_record.key),
+            )
+            .await
+            .expect("authoritative readback must finish before the original deadline")
+            .expect("read the record through the same authenticated protected facade");
+            assert_eq!(observed.record(), Some(&expected_record));
+            assert_eq!(observed.current_fence(), outcome.lease().fence());
+            assert_eq!(
+                fixture.diagnostics().fenced_transition_calls(),
+                1,
+                "receipt recovery and readback never replay the mutation"
+            );
+            assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
+            assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
 
-        drop(prepared);
-        drop(facade);
+            if lose_response {
+                assert_eq!(
+                    tokio::time::Instant::now() - started,
+                    fixture_budget(deadline).physical_attempt_timeout() + FIXTURE_TIMER_TICK,
+                    "only the injected response loss advances the original request clock"
+                );
+            }
+            drop(prepared);
+            drop(facade);
+            fixture
+        };
+        let fixture = if lose_response {
+            with_fixture_protocol_clock("fresh transition response loss", exercise).await
+        } else {
+            exercise.await
+        };
         fixture.shutdown().await.expect("shut down fixture");
     }
 
