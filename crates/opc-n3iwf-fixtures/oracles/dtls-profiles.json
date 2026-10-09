@@ -1629,7 +1629,7 @@
       "kind": "authored-runtime-test-obligations",
       "reference": {
         "path": "crates/opc-diameter-transport/src/dtls_tests/generic/restart.rs",
-        "sha256": "9c0c8d95612550b06ce6017e3c998d465a7afb42f477b9a9f8441215007e342c",
+        "sha256": "80dc6079f8b7e329e61504d5a8d31c0cbc020e1a5457c9755fdd5e5ebb1ff2a9",
         "functions": [
           "generic_kernel_process_restart_requires_fresh_mutual_authentication"
         ]
