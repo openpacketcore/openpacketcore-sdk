@@ -452,6 +452,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Go operators: update `golang.org/x/net` to v0.60.0 and require Go 1.26.9 in
+  `operator-sdk-go` and `sdk-reference-operator` to address GO-2026-6617 and
+  the related standard-library vulnerabilities.
+
 - `opc-session-store`: release the held Async writer synchronously before the
   shutdown fixture's final bounded call, with its rescue thread held until that
   call returns. Value-free shutdown observations distinguish caller deadlines,
