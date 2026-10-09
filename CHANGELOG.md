@@ -452,6 +452,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: wait for IPv6 address and gateway-neighbour readiness
+  in all privileged datapath fixtures before packet assertions. Readiness
+  failures now include the `ip` command's exit status, stdout and stderr.
+
 - `opc-session-testkit`: run authenticated response-loss and stalled-voter
   fixtures' client calls and transport actors on an isolated frozen clock,
   bounded by a 30-second test-only wall watchdog. Voter services and SQLite
