@@ -7734,19 +7734,6 @@ mod tests {
             .await;
     }
 
-    async fn wait_for_drain_completion(
-        minimum: u64,
-        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
-    ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while snapshot_metrics().drain_completed < minimum {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("aborted consensus lifecycle task must release its draining metric");
-    }
-
     async fn dispatch_after_authentication(
         trailing_frame_bytes: &[u8],
     ) -> (Result<(), ProtocolError>, Vec<u8>) {
@@ -7787,11 +7774,21 @@ mod tests {
     async fn assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
         snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
     ) {
+        // The isolated child still asserts the production counters below;
+        // scoped accounting supplies only the lifecycle completion signal.
+        let accounting =
+            crate::test_support::current_connection_outcome_test_accounting().unwrap_or_default();
+        let completed_drains = accounting.snapshot().drain_completed;
         let before_idle = snapshot_metrics();
-        let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
+        let (idle_result, acknowledgement) =
+            crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+                .scope(Arc::clone(&accounting), dispatch_after_authentication(&[]))
+                .await;
         record_consensus_server_connection_outcome(&idle_result);
         idle_result.expect("byte-idle authenticated consensus connection is a policy retirement");
-        wait_for_drain_completion(before_idle.drain_completed + 1, snapshot_metrics).await;
+        accounting
+            .wait_for_drain_completion(completed_drains + 1)
+            .await;
         let after_idle = snapshot_metrics();
         assert_eq!(
             after_idle.idle_retirements,
@@ -10292,14 +10289,14 @@ mod tests {
         let inspection = pool.primary.connection.lock().await;
 
         let primary_pool = Arc::clone(&pool);
-        let primary = tokio::spawn(async move { primary_pool.acquire().await.lane });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while pool.primary.in_flight.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first caller reserves the inspected primary lane");
+        let mut primary = Box::pin(async move { primary_pool.acquire().await.lane });
+        assert!(futures_util::poll!(tokio::task::unconstrained(primary.as_mut())).is_pending());
+        assert_eq!(
+            pool.primary.in_flight.available_permits(),
+            0,
+            "the pending caller reserves the inspected primary lane"
+        );
+        let primary = tokio::spawn(primary);
 
         let overflow_pool = Arc::clone(&pool);
         let overflow = tokio::spawn(async move { overflow_pool.acquire().await.lane });

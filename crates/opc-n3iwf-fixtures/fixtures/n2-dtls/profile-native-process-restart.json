@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/dtls-profiles.json",
-      "sha256": "6d5dc50a0cf8e6a797ee878f1398475ec818ddf70dfea2ba6af2fcf82ae7fe3f",
+      "sha256": "b651d8dc071ecde2fc3c35879d3eb0db59f8035ba7a580466c5a3c11e335e9c9",
       "case": "native-process-restart"
     },
     "cases": 6,
@@ -55,7 +55,7 @@
   ],
   "wire": {
     "path": "wire/profile-native-process-restart.hex",
-    "digest_sha256": "8ce310a56805b485020b43a0dc9b18c2e08adb3f845207cf889437b9380c8b82"
+    "digest_sha256": "141617acbf94927c05a91245a1102142debb7e660cc4e882ed978fef3534c63e"
   },
   "semantic_assertions": [
     "family=native-process-restart",

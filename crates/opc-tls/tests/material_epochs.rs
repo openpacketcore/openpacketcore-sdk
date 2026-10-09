@@ -849,7 +849,7 @@ async fn concurrent_handshake_operations_are_bounded_and_drop_cancellable() {
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
         .expect("client config");
-    let entered = Arc::new(AtomicUsize::new(0));
+    let entered = watch::Sender::new(0_usize);
     let mut tasks = Vec::new();
     for _ in 0..MAX_TLS_CONCURRENT_HANDSHAKES {
         let config = config.clone();
@@ -857,35 +857,33 @@ async fn concurrent_handshake_operations_are_bounded_and_drop_cancellable() {
         tasks.push(tokio::spawn(async move {
             let _ = config
                 .run_handshake(|_attempt| {
-                    entered.fetch_add(1, Ordering::SeqCst);
+                    entered.send_modify(|count| *count += 1);
                     std::future::pending::<Result<(), ()>>()
                 })
                 .await;
         }));
     }
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while entered.load(Ordering::SeqCst) != MAX_TLS_CONCURRENT_HANDSHAKES {
-            tokio::task::yield_now().await;
-        }
-    })
+    let mut progress = entered.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        progress.wait_for(|count| *count == MAX_TLS_CONCURRENT_HANDSHAKES),
+    )
     .await
-    .expect("fill handshake gate");
+    .expect("fill handshake gate")
+    .expect("test retains its handshake-entry publisher");
 
     let extra_config = config.clone();
     let extra_entered = entered.clone();
     let extra = tokio::spawn(async move {
         let _ = extra_config
             .run_handshake(|_attempt| {
-                extra_entered.fetch_add(1, Ordering::SeqCst);
+                extra_entered.send_modify(|count| *count += 1);
                 std::future::pending::<Result<(), ()>>()
             })
             .await;
     });
     tokio::time::sleep(Duration::from_millis(25)).await;
-    assert_eq!(
-        entered.load(Ordering::SeqCst),
-        MAX_TLS_CONCURRENT_HANDSHAKES
-    );
+    assert_eq!(*entered.borrow(), MAX_TLS_CONCURRENT_HANDSHAKES);
 
     for task in &tasks {
         task.abort();

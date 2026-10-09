@@ -18701,6 +18701,8 @@ struct ConsumerServerAdmission {
     waits: AtomicU64,
     rejections: AtomicU64,
     samples: AtomicU64,
+    #[cfg(test)]
+    changed: watch::Sender<()>,
 }
 
 impl ConsumerServerAdmission {
@@ -18714,6 +18716,8 @@ impl ConsumerServerAdmission {
             // Binding a listener is itself the first process-local
             // observation, so an available listener always reports >= 1.
             samples: AtomicU64::new(1),
+            #[cfg(test)]
+            changed: watch::Sender::default(),
         })
     }
 
@@ -18730,6 +18734,8 @@ impl ConsumerServerAdmission {
                 Err(observed) => current = observed,
             }
         }
+        #[cfg(test)]
+        self.changed.send_replace(());
     }
 
     fn admit(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> ConsumerServerAdmissionLease {
@@ -18747,6 +18753,8 @@ impl ConsumerServerAdmission {
                 Err(observed) => current = observed,
             }
         }
+        #[cfg(test)]
+        self.changed.send_replace(());
         ConsumerServerAdmissionLease {
             admission: Arc::clone(self),
             _permit: permit,
@@ -18764,6 +18772,15 @@ impl ConsumerServerAdmission {
             listener_available,
         }
     }
+
+    #[cfg(test)]
+    async fn wait_for(&self, predicate: impl Fn() -> bool) {
+        self.changed
+            .subscribe()
+            .wait_for(|()| predicate())
+            .await
+            .expect("admission retains its test publisher");
+    }
 }
 
 /// Owns a server connection permit and its exactly corresponding active count.
@@ -18775,6 +18792,8 @@ struct ConsumerServerAdmissionLease {
 impl Drop for ConsumerServerAdmissionLease {
     fn drop(&mut self) {
         self.admission.active.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(test)]
+        self.admission.changed.send_replace(());
     }
 }
 
@@ -31244,11 +31263,12 @@ mod tests {
         let second = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect overloaded socket");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while server.admission_snapshot().admission_rejections != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .admission
+                .wait_for(|| server.admission_snapshot().admission_rejections == 1),
+        )
         .await
         .expect("accepted overloaded socket is rejected promptly");
         drop(second);
@@ -31261,11 +31281,12 @@ mod tests {
 
         drop(first);
         hooks.continue_after_accept.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while server.admission_snapshot().active_connections != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .admission
+                .wait_for(|| server.admission_snapshot().active_connections == 0),
+        )
         .await
         .expect("closing admitted socket reclaims its permit");
 
@@ -31343,11 +31364,12 @@ mod tests {
         let rejected = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect bounded overload socket");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while server.admission_snapshot().admission_rejections != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .admission
+                .wait_for(|| server.admission_snapshot().admission_rejections == 1),
+        )
         .await
         .expect("twenty-first accepted socket is rejected");
         drop(rejected);
@@ -31358,11 +31380,12 @@ mod tests {
         // EOF and drop exactly their RAII admission permits.
         sockets.drain(16..).for_each(drop);
         hooks.continue_after_accept.notify_waiters();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while server.admission_snapshot().active_connections != 16 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .admission
+                .wait_for(|| server.admission_snapshot().active_connections == 16),
+        )
         .await
         .expect("only explicit transient closes reclaim capacity");
         let retained = server.admission_snapshot();
@@ -31370,11 +31393,12 @@ mod tests {
         assert_eq!(retained.samples, initial.samples + 20);
 
         sockets.clear();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while server.admission_snapshot().active_connections != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .admission
+                .wait_for(|| server.admission_snapshot().active_connections == 0),
+        )
         .await
         .expect("all admitted sockets eventually release their permits");
         server.abort_and_wait().await;
@@ -32737,6 +32761,13 @@ mod tests {
         material.rotate();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                let retired = persistent.v2_pool.drained_notify.notified();
+                let reaped = persistent.v2_pool.idle_reaper_processed.notified();
+                tokio::pin!(retired, reaped);
+                // Actor retirement and removal of its idle handle may occur
+                // separately. Arm both existing signals before inspecting.
+                retired.as_mut().enable();
+                reaped.as_mut().enable();
                 if persistent.v2_diagnostics().active == 0
                     && persistent.pool.physical_lanes.available_permits() == 1
                     && persistent
@@ -32748,7 +32779,10 @@ mod tests {
                 {
                     return;
                 }
-                tokio::task::yield_now().await;
+                tokio::select! {
+                    _ = retired => {}
+                    _ = reaped => {}
+                }
             }
         })
         .await
@@ -33978,14 +34012,10 @@ mod tests {
             ),
             "a persistent per-item {identity_suffix} response preserves the exact batch recovery vector"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if persistent.v2_diagnostics().active == 0 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_v2_actors_to_retire(&persistent),
+        )
         .await
         .expect("ambiguous batch item retires its persistent V2 actor");
         assert_eq!(persistent.v2_diagnostics().idle, 0);
@@ -35997,11 +36027,13 @@ mod tests {
             .register_watch(watch_permit)
             .expect("register a quiet unpolled watch");
 
+        let mut shutdown_phase = client.pool.shutdown_tx.subscribe();
         let shutdown_client = client.clone();
         let caller = tokio::spawn(async move { shutdown_client.shutdown().await });
-        while client.pool.phase() == PersistentShutdownPhase::Running {
-            tokio::task::yield_now().await;
-        }
+        shutdown_phase
+            .wait_for(|phase| *phase != PersistentShutdownPhase::Running)
+            .await
+            .expect("pool retains its shutdown publisher");
         assert_eq!(client.pool.phase(), PersistentShutdownPhase::Draining);
         caller.abort();
         let _ = caller.await;
@@ -36022,6 +36054,20 @@ mod tests {
             client.pool.watches.available_permits(),
             client.pool.config.watch_connections
         );
+    }
+
+    async fn wait_for_v2_actors_to_retire(client: &PersistentSessionConsumerClient) {
+        loop {
+            let drained = client.v2_pool.drained_notify.notified();
+            tokio::pin!(drained);
+            // This is the pool's existing edge signal: arm before inspecting
+            // the retained actor count so retirement cannot be missed.
+            drained.as_mut().enable();
+            if client.v2_diagnostics().active == 0 {
+                return;
+            }
+            drained.await;
+        }
     }
 
     #[tokio::test]
@@ -36625,13 +36671,13 @@ mod tests {
             .expect("join resolver observer")
             .expect("observe actual resolver poll");
 
+        let mut shutdown_phase = persistent.pool.shutdown_tx.subscribe();
         let shutdown = tokio::spawn({
             let persistent = persistent.clone();
             async move { persistent.shutdown().await }
         });
-        while !persistent.pool.shutdown_io.is_forced() {
-            tokio::task::yield_now().await;
-        }
+        wait_for_forced_shutdown(&mut shutdown_phase, &persistent.pool.shutdown_phase).await;
+        assert!(persistent.pool.shutdown_io.is_forced());
         assert!(
             !shutdown.is_finished(),
             "shutdown completion waits for the resolver poll already executing under the barrier"

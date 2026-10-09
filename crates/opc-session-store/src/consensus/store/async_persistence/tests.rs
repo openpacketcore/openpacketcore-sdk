@@ -49,6 +49,7 @@ struct Peer {
     engine_calls: Mutex<BTreeMap<SessionConsensusNodeId, u64>>,
     successful_appends: AtomicU64,
     last_cut: Mutex<Option<ColdQuorumCut>>,
+    changed: tokio::sync::watch::Sender<()>,
     blocked_senders: Mutex<BTreeSet<SessionConsensusNodeId>>,
     blocked_votes: AtomicBool,
     blocked_append_above: Mutex<Option<(SessionConsensusNodeId, u64)>>,
@@ -148,10 +149,12 @@ impl SessionConsensusPeer for Peer {
                     Ok(Ok(AppendEntriesResponse::Success))
                 ) {
                     self.successful_appends.fetch_add(1, Ordering::AcqRel);
+                    self.changed.send_replace(());
                 }
                 if family == SessionConsensusRpcFamily::ReadBarrier {
                     if let Ok(cut) = decode_bounded::<ColdQuorumCut>(payload) {
                         *self.last_cut.lock().unwrap() = Some(cut);
+                        self.changed.send_replace(());
                     }
                 }
             }
@@ -230,6 +233,7 @@ impl Fleet {
                     engine_calls: Mutex::new(BTreeMap::new()),
                     successful_appends: AtomicU64::new(0),
                     last_cut: Mutex::new(None),
+                    changed: tokio::sync::watch::Sender::default(),
                     blocked_senders: Mutex::new(BTreeSet::new()),
                     blocked_votes: AtomicBool::new(false),
                     blocked_append_above: Mutex::new(None),
@@ -609,6 +613,7 @@ async fn wait_for_restored_cold_metrics(cold: &ConsensusSessionStore) {
     assert!(restored_logs.last_log_id.is_some());
     assert!(restored_applied.is_some());
     races::until(
+        [cold.inner.raft.metrics()],
         || {
             let metrics = cold.inner.raft.metrics();
             let current = metrics.borrow();
@@ -728,21 +733,20 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
             let cold = cold.clone();
             tokio::spawn(async move { cold.initialize_cluster().await })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if cold.persistence_health().recovery == Some(SessionAsyncRecoveryState::CatchingUp)
+        races::until_catchup(
+            &cold,
+            [fleet.peers[follower].as_ref()],
+            Duration::from_secs(2),
+            || {
+                cold.persistence_health().recovery == Some(SessionAsyncRecoveryState::CatchingUp)
                     && fleet.peers[follower]
                         .successful_appends
                         .load(Ordering::Acquire)
                         > appends
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("real matching append while application is held");
+            },
+            "real matching append while application is held",
+        )
+        .await;
         assert!(!cold.inner.persistence_protocol.is_active());
         assert!(!cold.status().admitted);
         assert!(!cold

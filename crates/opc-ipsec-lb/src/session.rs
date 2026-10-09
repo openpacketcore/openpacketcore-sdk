@@ -1827,7 +1827,6 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1840,7 +1839,7 @@ mod tests {
         SessionOp, SessionOpResult, SessionStore, StateType, StoredSessionRecord,
     };
     use opc_session_testkit::ConsensusTestCluster;
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::{watch, Barrier, Notify};
 
     use super::*;
     use crate::failover::{
@@ -2157,10 +2156,11 @@ mod tests {
         release_fails: bool,
         release_hangs: bool,
         acquire_waits_after_apply: bool,
-        releases: Arc<AtomicUsize>,
-        acquire_applied: Arc<AtomicUsize>,
+        releases: watch::Sender<usize>,
+        released_fences: watch::Sender<Vec<FenceToken>>,
+        acquire_applied: watch::Sender<usize>,
         acquire_continue: Arc<Notify>,
-        cas_attempts: Arc<AtomicUsize>,
+        cas_attempts: watch::Sender<usize>,
     }
 
     impl<B> InstrumentedBackend<B> {
@@ -2173,10 +2173,11 @@ mod tests {
                 release_fails: false,
                 release_hangs: false,
                 acquire_waits_after_apply: false,
-                releases: Arc::new(AtomicUsize::new(0)),
-                acquire_applied: Arc::new(AtomicUsize::new(0)),
+                releases: watch::Sender::new(0),
+                released_fences: watch::Sender::new(Vec::new()),
+                acquire_applied: watch::Sender::new(0),
                 acquire_continue: Arc::new(Notify::new()),
-                cas_attempts: Arc::new(AtomicUsize::new(0)),
+                cas_attempts: watch::Sender::new(0),
             }
         }
     }
@@ -2194,10 +2195,11 @@ mod tests {
                 release_fails: false,
                 release_hangs: false,
                 acquire_waits_after_apply: false,
-                releases: Arc::new(AtomicUsize::new(0)),
-                acquire_applied: Arc::new(AtomicUsize::new(0)),
+                releases: watch::Sender::new(0),
+                released_fences: watch::Sender::new(Vec::new()),
+                acquire_applied: watch::Sender::new(0),
                 acquire_continue: Arc::new(Notify::new()),
-                cas_attempts: Arc::new(AtomicUsize::new(0)),
+                cas_attempts: watch::Sender::new(0),
             }
         }
 
@@ -2210,10 +2212,11 @@ mod tests {
                 release_fails: true,
                 release_hangs: false,
                 acquire_waits_after_apply: false,
-                releases: Arc::new(AtomicUsize::new(0)),
-                acquire_applied: Arc::new(AtomicUsize::new(0)),
+                releases: watch::Sender::new(0),
+                released_fences: watch::Sender::new(Vec::new()),
+                acquire_applied: watch::Sender::new(0),
                 acquire_continue: Arc::new(Notify::new()),
-                cas_attempts: Arc::new(AtomicUsize::new(0)),
+                cas_attempts: watch::Sender::new(0),
             }
         }
 
@@ -2226,10 +2229,11 @@ mod tests {
                 release_fails: false,
                 release_hangs: true,
                 acquire_waits_after_apply: false,
-                releases: Arc::new(AtomicUsize::new(0)),
-                acquire_applied: Arc::new(AtomicUsize::new(0)),
+                releases: watch::Sender::new(0),
+                released_fences: watch::Sender::new(Vec::new()),
+                acquire_applied: watch::Sender::new(0),
                 acquire_continue: Arc::new(Notify::new()),
-                cas_attempts: Arc::new(AtomicUsize::new(0)),
+                cas_attempts: watch::Sender::new(0),
             }
         }
 
@@ -2242,10 +2246,11 @@ mod tests {
                 release_fails: false,
                 release_hangs: false,
                 acquire_waits_after_apply: true,
-                releases: Arc::new(AtomicUsize::new(0)),
-                acquire_applied: Arc::new(AtomicUsize::new(0)),
+                releases: watch::Sender::new(0),
+                released_fences: watch::Sender::new(Vec::new()),
+                acquire_applied: watch::Sender::new(0),
                 acquire_continue: Arc::new(Notify::new()),
-                cas_attempts: Arc::new(AtomicUsize::new(0)),
+                cas_attempts: watch::Sender::new(0),
             }
         }
 
@@ -2281,7 +2286,7 @@ mod tests {
             if let Some(barrier) = &self.read_barrier {
                 barrier.wait().await;
             }
-            if self.cas_attempts.load(Ordering::SeqCst) > 0 {
+            if *self.cas_attempts.borrow() > 0 {
                 match self.post_cas_read {
                     PostCasReadBehavior::Delegate => {}
                     PostCasReadBehavior::Missing => return Ok(None),
@@ -2299,7 +2304,7 @@ mod tests {
             &self,
             op: CompareAndSet,
         ) -> Result<CompareAndSetResult, StoreError> {
-            self.cas_attempts.fetch_add(1, Ordering::SeqCst);
+            self.cas_attempts.send_modify(|count| *count += 1);
             match self.cas_behavior {
                 CasBehavior::Delegate => self.inner.compare_and_set(op).await,
                 CasBehavior::Conflict => Ok(CompareAndSetResult::Conflict { current: None }),
@@ -2346,7 +2351,7 @@ mod tests {
         ) -> Result<LeaseGuard, LeaseError> {
             let lease = self.inner.acquire(key, owner, ttl).await?;
             if self.acquire_waits_after_apply {
-                self.acquire_applied.fetch_add(1, Ordering::SeqCst);
+                self.acquire_applied.send_modify(|count| *count += 1);
                 self.acquire_continue.notified().await;
             }
             Ok(lease)
@@ -2357,16 +2362,28 @@ mod tests {
         }
 
         async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
-            self.releases.fetch_add(1, Ordering::SeqCst);
+            self.releases.send_modify(|count| *count += 1);
             if self.release_hangs {
                 return std::future::pending().await;
             }
             if self.release_fails {
                 Err(LeaseError::Backend("injected release failure".into()))
             } else {
-                self.inner.release(lease).await
+                let fence = lease.fence();
+                self.inner.release(lease).await?;
+                self.released_fences
+                    .send_modify(|fences| fences.push(fence));
+                Ok(())
             }
         }
+    }
+
+    async fn wait_for_backend_call(calls: &watch::Sender<usize>) {
+        let mut progress = calls.subscribe();
+        progress
+            .wait_for(|count| *count > 0)
+            .await
+            .expect("test retains its backend-call publisher");
     }
 
     #[tokio::test]
@@ -2437,7 +2454,9 @@ mod tests {
             StateClass::AuthoritativeSession,
         )
         .await;
-        let authority = SessionStoreOwnershipFencer::new(store.clone(), keyspace);
+        let backend = InstrumentedBackend::with_cas_behavior(store.clone(), CasBehavior::Delegate);
+        let released_fences = backend.released_fences.clone();
+        let authority = SessionStoreOwnershipFencer::new(backend, keyspace);
         let activation = authority
             .fence_sa_owner(OwnershipFenceRequest {
                 sa: retirement.sa(),
@@ -2471,16 +2490,19 @@ mod tests {
 
         let next_owner = OwnerId::new("next-owner").expect("valid owner");
         let next = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match store
-                    .acquire(&key, next_owner.clone(), Duration::from_secs(60))
-                    .await
-                {
-                    Ok(lease) => break lease,
-                    Err(LeaseError::AlreadyHeld) => tokio::task::yield_now().await,
-                    Err(error) => panic!("unexpected lease-acquisition error: {error:?}"),
-                }
-            }
+            let mut releases = released_fences.subscribe();
+            releases
+                .wait_for(|fences| {
+                    fences
+                        .iter()
+                        .any(|fence| fence.get() > retirement_fence.get())
+                })
+                .await
+                .expect("test retains its completed-release publisher");
+            store
+                .acquire(&key, next_owner, Duration::from_secs(60))
+                .await
+                .expect("next lease is available after finalization releases its guard")
         })
         .await
         .expect("detached lease release completes within its bounded timeout");
@@ -3133,7 +3155,7 @@ mod tests {
                 IpsecLbError::OwnershipConflict { .. }
             ));
             tokio::task::yield_now().await;
-            assert_eq!(release_counter.load(Ordering::SeqCst), 1);
+            assert_eq!(*release_counter.borrow(), 1);
         }
     }
 
@@ -3228,11 +3250,10 @@ mod tests {
         let committed = store.get(&key).await.unwrap().unwrap();
         assert_eq!(committed.owner.as_str(), "worker-b");
         assert_eq!(recovered.fence.get(), committed.fence.get());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while release_attempts.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backend_call(&release_attempts),
+        )
         .await
         .expect("timed-out CAS must trigger detached lease cleanup");
     }
@@ -3270,11 +3291,10 @@ mod tests {
             let request = request.clone();
             tokio::spawn(async move { fencer.fence_sa_owner(request).await })
         };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while acquire_applied.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backend_call(&acquire_applied),
+        )
         .await
         .expect("test backend must apply the lease before acknowledging it");
         pending.abort();
@@ -3284,11 +3304,10 @@ mod tests {
         // return the already-applied guard; its abandoned cleanup value must
         // release immediately rather than wait for the lease TTL.
         acquire_continue.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while release_attempts.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backend_call(&release_attempts),
+        )
         .await
         .expect("cancelled acquisition must release its returned lease guard");
 
@@ -3329,11 +3348,10 @@ mod tests {
             let request = request.clone();
             tokio::spawn(async move { fencer.fence_sa_owner(request).await })
         };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while acquire_applied.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backend_call(&acquire_applied),
+        )
         .await
         .expect("test backend must enter its hung acquire acknowledgement");
         pending.abort();
@@ -3352,15 +3370,10 @@ mod tests {
         // bounded fallback. A fresh writer can proceed after that same TTL.
         let replay = SessionStoreOwnershipFencer::new(store, keyspace);
         let grant = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match replay.fence_sa_owner(request.clone()).await {
-                    Ok(grant) => break grant,
-                    Err(IpsecLbError::OwnershipConflict { .. }) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => panic!("unexpected replay failure: {error:?}"),
-                }
-            }
+            replay
+                .fence_sa_owner(request)
+                .await
+                .expect("replay succeeds after expiry")
         })
         .await
         .expect("lease expiry must permit retry after a hung acquisition");
@@ -3383,6 +3396,7 @@ mod tests {
         let backend = InstrumentedBackend::with_cas_behavior(store.clone(), CasBehavior::Pending);
         let cas_attempts = backend.cas_attempts.clone();
         let release_attempts = backend.releases.clone();
+        let released_fences = backend.released_fences.clone();
         let fencer = SessionStoreOwnershipFencer::new(backend, keyspace.clone());
         let request = OwnershipFenceRequest {
             sa,
@@ -3399,34 +3413,29 @@ mod tests {
             let request = request.clone();
             tokio::spawn(async move { fencer.fence_sa_owner(request).await })
         };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while cas_attempts.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("test fencer must reach the pending CAS");
+        tokio::time::timeout(Duration::from_secs(1), wait_for_backend_call(&cas_attempts))
+            .await
+            .expect("test fencer must reach the pending CAS");
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while release_attempts.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backend_call(&release_attempts),
+        )
         .await
         .expect("cancelling CAS must trigger bounded lease cleanup");
 
         let replay = SessionStoreOwnershipFencer::new(store, keyspace);
         let grant = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match replay.fence_sa_owner(request.clone()).await {
-                    Ok(grant) => break grant,
-                    Err(IpsecLbError::OwnershipConflict { .. }) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => panic!("unexpected replay failure: {error:?}"),
-                }
-            }
+            let mut releases = released_fences.subscribe();
+            releases
+                .wait_for(|fences| !fences.is_empty())
+                .await
+                .expect("test retains its completed-release publisher");
+            replay
+                .fence_sa_owner(request)
+                .await
+                .expect("replay succeeds")
         })
         .await
         .expect("lease cleanup must allow replay without waiting for the 10s TTL");
@@ -3467,7 +3476,7 @@ mod tests {
         // The grant is returned before the detached release task is polled.
         // Even a release failure therefore cannot strand committed ownership.
         tokio::task::yield_now().await;
-        assert_eq!(release_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(*release_counter.borrow(), 1);
         let committed = store.get(&key).await.unwrap().unwrap();
         assert_eq!(committed.owner.as_str(), grant.owner.as_str());
         assert_eq!(committed.fence.get(), grant.fence.get());
@@ -3508,7 +3517,7 @@ mod tests {
         .unwrap();
 
         tokio::task::yield_now().await;
-        assert_eq!(release_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(*release_counter.borrow(), 1);
         assert_eq!(Arc::strong_count(&fencer.backend), 2);
         tokio::time::timeout(Duration::from_secs(2), async {
             while Arc::strong_count(&fencer.backend) != 1 {
@@ -4364,11 +4373,10 @@ mod tests {
         let replacement =
             write_pending_activation_birth(&store, keyspace, &replacement_request).await;
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.acquire_applied.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backend_call(&backend.acquire_applied),
+        )
         .await
         .expect("stale activation acquired its lease");
         backend.acquire_continue.notify_one();
@@ -4378,7 +4386,7 @@ mod tests {
             stale.await.expect("stale activation task"),
             Err(IpsecLbError::OwnershipConflict { .. })
         ));
-        assert_eq!(backend.cas_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(*backend.cas_attempts.borrow(), 0);
         assert_eq!(store.get(&key).await.expect("read"), Some(replacement));
     }
 

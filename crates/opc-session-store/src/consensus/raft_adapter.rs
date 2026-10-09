@@ -168,6 +168,8 @@ pub(crate) struct SessionRaftPeerDirectory {
     local_node_id: SessionConsensusNodeId,
     state: Arc<RwLock<SessionRaftPeerDirectoryState>>,
     membership_apply_fence: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    membership_apply_queued: tokio::sync::watch::Sender<()>,
 }
 
 impl SessionRaftPeerDirectory {
@@ -196,6 +198,8 @@ impl SessionRaftPeerDirectory {
                 engine_admission_suspended: false,
             })),
             membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            membership_apply_queued: tokio::sync::watch::Sender::default(),
         })
     }
 
@@ -220,6 +224,8 @@ impl SessionRaftPeerDirectory {
                 engine_admission_suspended: false,
             })),
             membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            membership_apply_queued: tokio::sync::watch::Sender::default(),
         })
     }
 
@@ -640,7 +646,20 @@ impl SessionRaftPeerDirectory {
     /// before releasing the guard, so every engine RPC is ordered either before
     /// the durable cutover or after predecessor revocation.
     pub(crate) async fn begin_membership_apply(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
-        Arc::clone(&self.membership_apply_fence).write_owned().await
+        let acquiring = Arc::clone(&self.membership_apply_fence).write_owned();
+        tokio::pin!(acquiring);
+        #[cfg(test)]
+        {
+            // Cooperative exhaustion is not writer admission. Reach the lock
+            // before publishing that a membership writer has queued.
+            match futures_util::poll!(tokio::task::unconstrained(&mut acquiring)) {
+                std::task::Poll::Ready(guard) => return guard,
+                std::task::Poll::Pending => {
+                    self.membership_apply_queued.send_replace(());
+                }
+            }
+        }
+        acquiring.await
     }
 
     async fn begin_engine_rpc(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
@@ -2148,19 +2167,63 @@ mod tests {
     }
 
     async fn wait_for_membership_writer(directory: &SessionRaftPeerDirectory) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            match tokio::time::timeout(Duration::from_millis(5), directory.begin_engine_rpc()).await
-            {
-                Ok(probe) => drop(probe),
-                Err(_) => return,
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            directory
+                .membership_apply_queued
+                .subscribe()
+                .wait_for(|()| directory.membership_apply_fence.try_read().is_err()),
+        )
+        .await
+        .expect("membership apply writer did not queue behind predecessor RPC")
+        .expect("membership directory remains live");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), directory.begin_engine_rpc())
+                .await
+                .is_err(),
+            "queued membership writer fences subsequent engine RPCs"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_apply_progress_requires_queued_writer_after_cooperative_exhaustion() {
+        let scope = identity(1);
+        let local = node_id(1);
+        let members = BTreeSet::from([local, node_id(2), node_id(3)]);
+        let directory = SessionRaftPeerDirectory::try_new(
+            scope,
+            local,
+            members.clone(),
+            scope_peers(local, &members, scope),
+        )
+        .expect("valid peer directory");
+        let predecessor = directory.begin_engine_rpc().await;
+
+        tokio::spawn(async move {
+            let progress = directory.membership_apply_queued.subscribe();
+            let mut writer = Box::pin(directory.begin_membership_apply());
+            // A spawned task owns a cooperative budget. Consume this poll's
+            // remaining budget without yielding before the admission probe.
+            while tokio::task::coop::has_budget_remaining() {
+                tokio::task::consume_budget().await;
             }
+            assert!(futures_util::poll!(&mut writer).is_pending());
+            assert!(progress.has_changed().expect("directory retains publisher"));
             assert!(
-                tokio::time::Instant::now() < deadline,
-                "membership apply writer did not queue behind predecessor RPC"
+                directory.membership_apply_fence.try_read().is_err(),
+                "progress must follow actual writer admission, even with no cooperative budget"
             );
-            tokio::task::yield_now().await;
-        }
+
+            drop(predecessor);
+            let admitted = tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .expect("queued writer proceeds after predecessor release");
+            assert!(directory.membership_apply_fence.try_read().is_err());
+            drop(admitted);
+            assert!(directory.membership_apply_fence.try_read().is_ok());
+        })
+        .await
+        .expect("cooperative admission regression task");
     }
 
     #[tokio::test]

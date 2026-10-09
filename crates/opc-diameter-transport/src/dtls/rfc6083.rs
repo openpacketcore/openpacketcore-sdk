@@ -1073,6 +1073,15 @@ impl Connection {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn wait_for_carrier_terminal_for_test(&self) {
+        self.close
+            .terminal_changes_for_test()
+            .wait_for(|()| self.close.is_closed())
+            .await
+            .expect("retained carrier remains observable");
+    }
+
     fn ensure_active(&self) -> Result<(), Error> {
         self.ensure_authentication_current()?;
         if self.close.is_closed() {

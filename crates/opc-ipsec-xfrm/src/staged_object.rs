@@ -564,6 +564,8 @@ struct JournalState {
     committed: bool,
     uncertainty: Option<XfrmCompositeOperation>,
     generation: Arc<()>,
+    #[cfg(test)]
+    changed: tokio::sync::watch::Sender<()>,
 }
 
 impl JournalState {
@@ -581,11 +583,15 @@ impl JournalState {
             committed: false,
             uncertainty: None,
             generation: Arc::new(()),
+            #[cfg(test)]
+            changed: tokio::sync::watch::Sender::default(),
         }
     }
 
     fn touch(&mut self) {
         self.generation = Arc::new(());
+        #[cfg(test)]
+        self.changed.send_replace(());
     }
 
     fn mark_indeterminate(&mut self, operation: XfrmCompositeOperation) {
@@ -1439,6 +1445,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct SpawnBlockingBackend {
         state: Arc<(Mutex<SpawnBlockingState>, Condvar)>,
+        changed: tokio::sync::watch::Sender<()>,
     }
 
     impl SpawnBlockingBackend {
@@ -1449,17 +1456,24 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
 
-        async fn wait_until_started(&self) {
+        async fn wait_for(&self, predicate: impl Fn(&SpawnBlockingState) -> bool) {
+            let mut changed = self.changed.subscribe();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    if self.lock().started {
+                    // Release the watch guard before taking the fixture lock.
+                    drop(changed.borrow_and_update());
+                    if predicate(&self.lock()) {
                         return;
                     }
-                    tokio::task::yield_now().await;
+                    changed.changed().await.expect("test retains its publisher");
                 }
             })
             .await
-            .expect("spawn_blocking mutation starts");
+            .expect("spawn_blocking mutation reaches the expected state");
+        }
+
+        async fn wait_until_started(&self) {
+            self.wait_for(|state| state.started).await;
         }
 
         fn release(&self) {
@@ -1489,10 +1503,12 @@ mod tests {
 
         async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
             let state = self.state.clone();
+            let progress = self.changed.clone();
             let worker = tokio::task::spawn_blocking(move || {
                 let (lock, changed) = &*state;
                 let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.started = true;
+                progress.send_replace(());
                 changed.notify_all();
                 while !state.released {
                     state = changed
@@ -1500,6 +1516,7 @@ mod tests {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
                 state.sa_present = true;
+                progress.send_replace(());
             });
             worker.await.map_err(|_| XfrmError::StateIndeterminate {
                 operation: "test_spawn_blocking_install_sa",
@@ -1519,6 +1536,7 @@ mod tests {
             state.remove_calls += 1;
             if state.sa_present {
                 state.sa_present = false;
+                self.changed.send_replace(());
                 Ok(())
             } else {
                 Err(XfrmError::NotFound)
@@ -1558,6 +1576,7 @@ mod tests {
     #[derive(Debug)]
     struct TerminatingBlockingBackend {
         state: Arc<(Mutex<TerminatingBlockingState>, Condvar)>,
+        changed: tokio::sync::watch::Sender<()>,
         panic_install_worker: bool,
         panic_remove_worker: bool,
     }
@@ -1566,6 +1585,7 @@ mod tests {
         fn panics_during_install() -> Self {
             Self {
                 state: Arc::default(),
+                changed: tokio::sync::watch::Sender::default(),
                 panic_install_worker: true,
                 panic_remove_worker: false,
             }
@@ -1574,6 +1594,7 @@ mod tests {
         fn panics_during_remove() -> Self {
             Self {
                 state: Arc::default(),
+                changed: tokio::sync::watch::Sender::default(),
                 panic_install_worker: false,
                 panic_remove_worker: true,
             }
@@ -1587,12 +1608,15 @@ mod tests {
         }
 
         async fn wait_for(&self, predicate: impl Fn(&TerminatingBlockingState) -> bool) {
+            let mut changed = self.changed.subscribe();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
+                    // Release the watch guard before taking the fixture lock.
+                    drop(changed.borrow_and_update());
                     if predicate(&self.lock()) {
                         return;
                     }
-                    tokio::task::yield_now().await;
+                    changed.changed().await.expect("test retains its publisher");
                 }
             })
             .await
@@ -1642,10 +1666,12 @@ mod tests {
         async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
             if self.panic_install_worker {
                 let state = self.state.clone();
+                let progress = self.changed.clone();
                 let worker = tokio::task::spawn_blocking(move || {
                     let (lock, changed) = &*state;
                     let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.install_started = true;
+                    progress.send_replace(());
                     changed.notify_all();
                     while !state.install_released {
                         state = changed
@@ -1653,12 +1679,14 @@ mod tests {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                     }
                     state.sa_present = true;
+                    progress.send_replace(());
                 });
                 self.wait_until_install_started().await;
                 drop(worker);
                 panic!("test-only supervised install worker failure");
             }
             self.lock().sa_present = true;
+            self.changed.send_replace(());
             Ok(())
         }
 
@@ -1675,6 +1703,7 @@ mod tests {
             let mut state = self.lock();
             if state.sa_present {
                 state.sa_present = false;
+                self.changed.send_replace(());
                 Ok(())
             } else {
                 Err(XfrmError::NotFound)
@@ -1683,6 +1712,7 @@ mod tests {
 
         async fn install_policy(&self, _request: InstallPolicyRequest) -> Result<(), XfrmError> {
             self.lock().policy_present = true;
+            self.changed.send_replace(());
             Ok(())
         }
 
@@ -1694,10 +1724,12 @@ mod tests {
             self.lock().remove_calls += 1;
             if self.panic_remove_worker {
                 let state = self.state.clone();
+                let progress = self.changed.clone();
                 let worker = tokio::task::spawn_blocking(move || {
                     let (lock, changed) = &*state;
                     let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.remove_started = true;
+                    progress.send_replace(());
                     changed.notify_all();
                     while !state.remove_released {
                         state = changed
@@ -1705,6 +1737,7 @@ mod tests {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                     }
                     state.policy_present = false;
+                    progress.send_replace(());
                 });
                 self.wait_until_remove_started().await;
                 drop(worker);
@@ -1713,6 +1746,7 @@ mod tests {
             let mut state = self.lock();
             if state.policy_present {
                 state.policy_present = false;
+                self.changed.send_replace(());
                 Ok(())
             } else {
                 Err(XfrmError::NotFound)
@@ -1825,12 +1859,17 @@ mod tests {
         journal: &XfrmObjectInstallJournal,
         expected: XfrmObjectInstallOwnership,
     ) {
+        let mut changed = journal.state().changed.subscribe();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
+                drop(changed.borrow_and_update());
                 if journal.ownership() == expected {
                     return;
                 }
-                tokio::task::yield_now().await;
+                changed
+                    .changed()
+                    .await
+                    .expect("journal retains its publisher");
             }
         })
         .await
@@ -2903,13 +2942,8 @@ mod tests {
         assert_eq!(backend.remove_calls(), 0);
 
         backend.release();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !backend.sa_present() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached blocking mutation eventually completes");
+        backend.wait_for(|state| state.sa_present).await;
+        assert!(backend.sa_present(), "detached blocking mutation completed");
 
         let plan = journal.recovery_plan();
         let error = journal

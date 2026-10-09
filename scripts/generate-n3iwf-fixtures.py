@@ -3621,7 +3621,7 @@ def n2_dtls_lifecycle(subset_dir: Path) -> list[dict]:
 
 def n2_dtls_profiles(subset_dir: Path) -> list[dict]:
     source = "crates/opc-n3iwf-fixtures/oracles/dtls-profiles.json"
-    digest = "6d5dc50a0cf8e6a797ee878f1398475ec818ddf70dfea2ba6af2fcf82ae7fe3f"
+    digest = "b651d8dc071ecde2fc3c35879d3eb0db59f8035ba7a580466c5a3c11e335e9c9"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_dtls_profile_digest")

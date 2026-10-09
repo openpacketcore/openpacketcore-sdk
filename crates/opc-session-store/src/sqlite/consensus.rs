@@ -2822,6 +2822,8 @@ struct SnapshotBuildStatus {
 #[derive(Default)]
 pub(crate) struct SnapshotBuildObservation {
     status: Mutex<SnapshotBuildStatus>,
+    #[cfg(test)]
+    changed: tokio::sync::watch::Sender<()>,
     #[cfg(feature = "test-control")]
     phase_for_test: Mutex<&'static str>,
 }
@@ -2853,6 +2855,13 @@ impl SnapshotBuildObservation {
         status.peak_wal_bytes = status.peak_wal_bytes.max(captured_wal_peak);
         status.last_duration_millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         status.completed_snapshot_count = status.completed_snapshot_count.saturating_add(1);
+        #[cfg(test)]
+        self.changed.send_replace(());
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn progress_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
@@ -3924,6 +3933,7 @@ struct ConsensusLogPruneTurnGate {
     entered: Condvar,
     released: Condvar,
     completed: tokio::sync::Notify,
+    changed: tokio::sync::watch::Sender<()>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4037,6 +4047,7 @@ impl ConsensusLogPruneTurnGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.preempted = true;
+        self.changed.send_replace(());
         self.released.notify_all();
     }
 
@@ -4046,6 +4057,7 @@ impl ConsensusLogPruneTurnGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.progress_preempted = true;
+        self.changed.send_replace(());
         self.entered.notify_all();
         while state.hold_progress_preemption && !state.progress_preemption_released {
             state = self
@@ -4244,6 +4256,7 @@ impl ConsensusLogPruneTurnGateForTest {
             entered: Condvar::new(),
             released: Condvar::new(),
             completed: tokio::sync::Notify::new(),
+            changed: tokio::sync::watch::Sender::default(),
         });
         consensus_log_prune_turn_gates()
             .lock()
@@ -4270,6 +4283,29 @@ impl ConsensusLogPruneTurnGateForTest {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .preempted
+    }
+
+    async fn wait_for_change(&self, ready: impl Fn() -> bool) {
+        let mut changed = self.gate.changed.subscribe();
+        loop {
+            // Publishers hold the gate mutex, so release the watch guard first.
+            drop(changed.borrow_and_update());
+            if ready() {
+                return;
+            }
+            changed
+                .changed()
+                .await
+                .expect("prune gate retains its publisher");
+        }
+    }
+
+    pub(crate) async fn wait_for_preemption(&self) {
+        self.wait_for_change(|| self.preemption_requested()).await;
+    }
+
+    pub(crate) async fn wait_for_progress_preemption(&self) {
+        self.wait_for_change(|| self.progress_preempted()).await;
     }
 
     pub(crate) fn progress_steps_seen(&self) -> usize {
@@ -9069,6 +9105,8 @@ impl SqliteSessionBackend {
         #[cfg(test)]
         self.fixed_quorum_durable_check_count
             .fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        self.test_progress.send_replace(());
         #[cfg(all(test, target_os = "linux"))]
         use crate::consensus::store::scoped_read_diagnostics::{self as diagnostic, Phase, Span};
         #[cfg(all(test, target_os = "linux"))]
@@ -50283,17 +50321,18 @@ mod tests {
 
         if point == ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt {
             gate.release();
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                diagnostics.wait_for_maintenance_for_test(|| {
                     let snapshot = diagnostics.snapshot();
                     if snapshot.consensus_log_prune_drained_turns == 1
                         || snapshot.consensus_log_prune_degraded
                     {
-                        break;
+                        return true;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                    false
+                }),
+            )
             .await
             .expect("interrupted BEGIN cleanup either drains or reports its terminal state");
             let snapshot = diagnostics.snapshot();
@@ -50333,25 +50372,17 @@ mod tests {
         let primary_lane = Arc::clone(&lane);
         let primary_guard =
             tokio::spawn(async move { primary_lane.request_primary_preemption().await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !gate.preemption_requested() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("primary priority interrupts the gated prune turn before handoff");
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_for_preemption())
+            .await
+            .expect("primary priority interrupts the gated prune turn before handoff");
         if cancel_primary_before_handoff {
             // Enter a real authority-read VDBE while the primary claim is
             // retained. Its interval-one progress callback records the exact
             // turn-local preemption and parks before returning SQLITE_INTERRUPT.
             gate.release();
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !gate.progress_preempted() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("authority-read VDBE observes the waiting primary");
+            tokio::time::timeout(Duration::from_secs(1), gate.wait_for_progress_preemption())
+                .await
+                .expect("authority-read VDBE observes the waiting primary");
             primary_guard.abort();
             let primary_cancelled = match primary_guard.await {
                 Err(error) => error.is_cancelled(),
@@ -50367,17 +50398,18 @@ mod tests {
                 "cancelling the waiting primary releases its priority claim"
             );
             gate.gate.release_progress_preemption();
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                diagnostics.wait_for_maintenance_for_test(|| {
                     let snapshot = diagnostics.snapshot();
                     if snapshot.consensus_log_prune_drained_turns == 1
                         || snapshot.consensus_log_prune_degraded
                     {
-                        break;
+                        return true;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                    false
+                }),
+            )
             .await
             .expect("cancelled primary preemption retries and drains the intact prune backlog");
             let snapshot = diagnostics.snapshot();
@@ -50402,14 +50434,15 @@ mod tests {
         }
         gate.release();
         let primary_guard = primary_guard.await.expect("join primary prune handoff");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 if diagnostics.snapshot().consensus_log_prune_busy_retries == 1 {
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("production progress callback preempts the parked prune turn");
         assert!(
@@ -50469,14 +50502,15 @@ mod tests {
 
         drop(primary_guard);
         lane.signal();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 if diagnostics.snapshot().consensus_log_prune_drained_turns == 1 {
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("prune backlog drains after the retained primary guard releases");
         assert_eq!(
@@ -52560,17 +52594,18 @@ mod tests {
             .consensus_log_prune_lane()
             .expect("fixed durable core owns a startup prune lane");
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 let snapshot = diagnostics.snapshot();
                 if snapshot.consensus_log_prune_attempts >= 1
                     && diagnostics.consensus_log_prune_gauges_for_test().0 == 0
                 {
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("startup recovery reaches a quiescent empty turn");
         // Let every ready coalesced signal run before sampling the final
@@ -52680,8 +52715,9 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("start prune lane");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 let snapshot = diagnostics.snapshot();
                 if snapshot.consensus_log_prune_permanent_failures == 1
                     && diagnostics.consensus_log_prune_gauges_for_test() == (0, 0)
@@ -52691,11 +52727,11 @@ mod tests {
                     assert_eq!(snapshot.consensus_log_prune_attempts, 1);
                     assert!(snapshot.consensus_log_prune_degraded);
                     assert!(lane.is_degraded());
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("tampered authority permanently stops the original worker");
         primary
@@ -52726,8 +52762,9 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("reopen prune lane after permanent failure");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 let snapshot = diagnostics.snapshot();
                 if snapshot.consensus_log_prune_drained_turns == 1 {
                     assert_eq!(snapshot.consensus_log_prune_signals, 3);
@@ -52739,11 +52776,11 @@ mod tests {
                     assert_eq!(snapshot.consensus_log_prune_queue_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("reopen startup signal drains retained logical-purge backlog");
         reopened.shutdown().await;
@@ -52840,18 +52877,19 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("start corrupt-prune lane");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 let snapshot = diagnostics.snapshot();
                 if snapshot.consensus_log_prune_permanent_failures == 1 {
                     assert!(lane.is_degraded());
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
                     assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("missing exact floor permanently stops worker");
         assert!(
@@ -52989,19 +53027,20 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("start internal-hole prune lane");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 let snapshot = diagnostics.snapshot();
                 if snapshot.consensus_log_prune_permanent_failures == 1 {
                     assert!(lane.is_degraded());
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
                     assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
                     assert_eq!(snapshot.consensus_log_prune_attempts, 1);
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("internal retained hole permanently stops worker");
         assert!(
@@ -53187,13 +53226,15 @@ mod tests {
         let mut shutdown = tokio::spawn(async move {
             shutdown_lane.shutdown().await;
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !lane.stopping.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut stopping = lane.stop.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stopping.wait_for(|stopping| *stopping),
+        )
         .await
-        .expect("shutdown publishes stop before joining the active worker");
+        .expect("shutdown publishes stop before joining the active worker")
+        .expect("test retains its prune lane");
+        assert!(lane.stopping.load(Ordering::Acquire));
 
         let primary_preemption = with_waiting_primary.then(|| {
             let primary_lane = Arc::clone(&lane);
@@ -53276,8 +53317,9 @@ mod tests {
         )
         .expect("reopen prune lane after shutdown cancellation");
         reopened.signal();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 let snapshot = diagnostics.snapshot();
                 if snapshot.consensus_log_prune_drained_turns == 1 {
                     assert_eq!(snapshot.consensus_log_prune_permanent_failures, 0);
@@ -53285,11 +53327,11 @@ mod tests {
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 130);
                     assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
-                    break;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("reopened lane drains the retained backlog with its single worker");
         reopened.shutdown().await;

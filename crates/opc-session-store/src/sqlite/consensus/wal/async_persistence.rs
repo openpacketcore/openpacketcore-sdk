@@ -119,6 +119,8 @@ pub(super) fn admit(
     // This completes storage admission only. Openraft still performs actual
     // quorum replication and state-machine application before public success.
     completion.finish(Ok(sequence));
+    #[cfg(test)]
+    wal.shared.async_progress.send_replace(());
     wal.shared.ready.notify_all();
     Ok(())
 }
@@ -344,6 +346,8 @@ pub(super) fn write_loop(
                 }
             }
         }
+        #[cfg(test)]
+        shared.async_progress.send_replace(());
         shared.ready.notify_all();
     }
 }

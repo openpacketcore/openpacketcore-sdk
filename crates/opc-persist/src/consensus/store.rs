@@ -342,6 +342,28 @@ impl ConsensusConfigStore {
             .map_err(|_| consensus_unavailable())
     }
 
+    /// Wait for a test status predicate, waking on Openraft metrics changes.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn wait_for_raft_status_for_test(
+        &self,
+        mut predicate: impl FnMut(&ConfigConsensusStatus) -> bool,
+    ) -> Result<(), PersistError> {
+        let mut metrics = self.inner.raft.metrics();
+        loop {
+            // Status also reads metrics. Do not retain a watch read guard
+            // across that read or across a predicate inspecting another node.
+            drop(metrics.borrow_and_update());
+            if predicate(&self.status()) {
+                return Ok(());
+            }
+            metrics
+                .changed()
+                .await
+                .map_err(|_| consensus_unavailable())?;
+        }
+    }
+
     /// Start a durable node. Install [`Self::rpc_handler`] on an authenticated
     /// shared consensus listener before calling [`Self::initialize_cluster`].
     pub async fn open(
@@ -2739,37 +2761,15 @@ mod tests {
             .unwrap_or(0);
 
         let wait_for_log = |store: ConsensusConfigStore, minimum: u64| async move {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if store
-                        .inner
-                        .raft
-                        .metrics()
-                        .borrow()
-                        .last_log_index
-                        .is_some_and(|index| index >= minimum)
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                store.inner.raft.metrics().wait_for(|metrics| {
+                    metrics.last_log_index.is_some_and(|index| index >= minimum)
+                }),
+            )
             .await
-            .expect("accepted proposal reaches the real Openraft log");
-        };
-        let wait_for_available = |store: ConsensusConfigStore,
-                                  expected: usize,
-                                  context: &'static str| async move {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if store.inner.proposal_admission.available_permits() == expected {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("proposal admission did not reach {expected}: {context}"));
+            .expect("accepted proposal reaches the real Openraft log")
+            .expect("proposal engine remains live");
         };
 
         let cancelled_store = store.clone();
@@ -2780,12 +2780,13 @@ mod tests {
                 .await
         });
         wait_for_log(store.clone(), before + 1).await;
-        wait_for_available(
-            store.clone(),
+        // The logged proposal already owns admission, and held apply prevents
+        // its supervisor from releasing the slot.
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
             DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
             "first accepted config proposal",
-        )
-        .await;
+        );
         cancelled.abort();
         let _ = cancelled.await;
         tokio::task::yield_now().await;

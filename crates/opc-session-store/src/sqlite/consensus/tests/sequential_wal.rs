@@ -5763,15 +5763,11 @@ fn actual_openraft_cancelled_append_keeps_callback_and_ordered_vote_with_writer(
         pause.entered();
         appending.abort();
         assert!(appending.await.unwrap_err().is_cancelled());
-        let voting =
-            tokio::spawn(async move { later.save_vote(&Vote::new_committed(2, node_id())).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while wal.vote().unwrap().is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        let mut voting =
+            Box::pin(async move { later.save_vote(&Vote::new_committed(2, node_id())).await });
+        assert!(futures_util::poll!(tokio::task::unconstrained(voting.as_mut())).is_pending());
+        assert_eq!(wal.vote().unwrap(), Some(Vote::new_committed(2, node_id())));
+        let voting = tokio::spawn(voting);
         assert!(
             !voting.is_finished(),
             "a later metadata request cannot pass the unflushed append"

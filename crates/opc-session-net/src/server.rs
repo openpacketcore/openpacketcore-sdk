@@ -3980,19 +3980,6 @@ mod tests {
             .expect("connection outcome accounting scope")
     }
 
-    async fn wait_for_drain_completion(
-        minimum: u64,
-        snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
-    ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while snapshot_metrics().drain_completed < minimum {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("aborted lifecycle task must release its draining metric");
-    }
-
     async fn dispatch_after_authentication(
         trailing_frame_bytes: &[u8],
     ) -> (Result<(), ProtocolError>, Vec<u8>) {
@@ -4024,11 +4011,21 @@ mod tests {
     async fn assert_generic_server_distinguishes_authenticated_idle_from_active_frame_timeout(
         snapshot_metrics: fn() -> crate::test_support::ConnectionOutcomeMetricSnapshot,
     ) {
+        // The isolated child still asserts the production counters below;
+        // scoped accounting supplies only the lifecycle completion signal.
+        let accounting =
+            crate::test_support::current_connection_outcome_test_accounting().unwrap_or_default();
+        let completed_drains = accounting.snapshot().drain_completed;
         let before_idle = snapshot_metrics();
-        let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
+        let (idle_result, acknowledgement) =
+            crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+                .scope(Arc::clone(&accounting), dispatch_after_authentication(&[]))
+                .await;
         record_server_connection_outcome(&idle_result);
         idle_result.expect("byte-idle authenticated connection is a policy retirement");
-        wait_for_drain_completion(before_idle.drain_completed + 1, snapshot_metrics).await;
+        accounting
+            .wait_for_drain_completion(completed_drains + 1)
+            .await;
         let after_idle = snapshot_metrics();
         assert_eq!(
             after_idle.idle_retirements,
@@ -4522,7 +4519,7 @@ mod tests {
     }
 
     struct SlowCooperativeFrame {
-        started: Arc<AtomicBool>,
+        started: tokio::sync::watch::Sender<bool>,
     }
 
     impl serde::Serialize for SlowCooperativeFrame {
@@ -4532,7 +4529,7 @@ mod tests {
         {
             let mut sequence = serializer.serialize_seq(Some(1_001))?;
             serde::ser::SerializeSeq::serialize_element(&mut sequence, &0_u8)?;
-            self.started.store(true, Ordering::Release);
+            self.started.send_replace(true);
             for value in 1_u16..=1_000 {
                 let until = std::time::Instant::now() + std::time::Duration::from_millis(2);
                 while std::time::Instant::now() < until {
@@ -4606,7 +4603,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_and_wait_cooperatively_interrupts_synchronous_frame_encoding() {
         let cancellation = Arc::new(ServerCancellation::default());
-        let started = Arc::new(AtomicBool::new(false));
+        let (started, mut started_rx) = tokio::sync::watch::channel(false);
         let observed_interruption = Arc::new(AtomicBool::new(false));
         let task_cancellation = cancellation.clone();
         let task_started = started.clone();
@@ -4635,13 +4632,13 @@ mod tests {
             }
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !started.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            started_rx.wait_for(|started| *started),
+        )
         .await
-        .expect("test encoder must start");
+        .expect("test encoder must start")
+        .expect("test retains its encoder publisher");
 
         let accept_handle = tokio::spawn(std::future::pending());
         let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);

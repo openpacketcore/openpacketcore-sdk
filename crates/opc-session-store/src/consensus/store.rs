@@ -1372,6 +1372,8 @@ pub struct ProtectedRosterConsensusDiagnosticSnapshot {
 
 #[derive(Default)]
 pub(crate) struct ConsensusStoreDiagnosticCounters {
+    #[cfg(test)]
+    maintenance_changed: tokio::sync::watch::Sender<()>,
     sqlite_worker_permit_deadline: AtomicU64,
     sqlite_connection_lock_deadline: AtomicU64,
     sqlite_execution_deadline: AtomicU64,
@@ -1463,6 +1465,15 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
 }
 
 impl ConsensusStoreDiagnosticCounters {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn wait_for_maintenance_for_test(&self, mut ready: impl FnMut() -> bool) {
+        let mut changed = self.maintenance_changed.subscribe();
+        changed
+            .wait_for(|()| ready())
+            .await
+            .expect("diagnostic counters retain their maintenance publisher");
+    }
+
     fn saturating_add(counter: &AtomicU64, value: u64) {
         let mut current = counter.load(Ordering::Relaxed);
         loop {
@@ -1512,6 +1523,8 @@ impl ConsensusStoreDiagnosticCounters {
     pub(crate) fn observe_proactive_checkpoint_signal(&self) {
         self.proactive_checkpoint_queue_high_water
             .fetch_max(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn begin_proactive_checkpoint(&self) {
@@ -1523,6 +1536,8 @@ impl ConsensusStoreDiagnosticCounters {
             .saturating_add(1);
         self.proactive_checkpoint_worker_high_water
             .fetch_max(active, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn complete_proactive_checkpoint(&self, incomplete: bool, elapsed: Duration) {
@@ -1536,6 +1551,8 @@ impl ConsensusStoreDiagnosticCounters {
             self.proactive_checkpoint_completed
                 .fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn fail_proactive_checkpoint(&self, elapsed: Duration) {
@@ -1544,6 +1561,8 @@ impl ConsensusStoreDiagnosticCounters {
         Self::record_latency(&self.background_checkpoint_latency_millis, elapsed);
         self.proactive_checkpoint_failures
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn observe_protected_roster_proposal_to_applied_response(
@@ -1651,6 +1670,8 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_add(1, Ordering::Relaxed);
         self.consensus_log_prune_queue_high_water
             .fetch_max(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn begin_consensus_log_prune_worker(&self) {
@@ -1660,11 +1681,15 @@ impl ConsensusStoreDiagnosticCounters {
             .saturating_add(1);
         self.consensus_log_prune_worker_high_water
             .fetch_max(active, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn end_consensus_log_prune_worker(&self) {
         self.consensus_log_prune_workers_active
             .fetch_sub(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn begin_consensus_log_prune_turn(&self) {
@@ -1676,6 +1701,8 @@ impl ConsensusStoreDiagnosticCounters {
             .saturating_add(1);
         self.consensus_log_prune_active_high_water
             .fetch_max(active, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn complete_consensus_log_prune_turn(
@@ -1701,6 +1728,8 @@ impl ConsensusStoreDiagnosticCounters {
             self.consensus_log_prune_drained_turns
                 .fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn retry_consensus_log_prune_turn(&self) {
@@ -1708,6 +1737,8 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_sub(1, Ordering::Relaxed);
         self.consensus_log_prune_busy_retries
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn fail_consensus_log_prune_turn(&self) {
@@ -1717,11 +1748,15 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_add(1, Ordering::Relaxed);
         self.consensus_log_prune_degraded
             .store(true, Ordering::Release);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     pub(crate) fn clear_consensus_log_prune_degraded(&self) {
         self.consensus_log_prune_degraded
             .store(false, Ordering::Release);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     /// End an active physical-prune turn cancelled by store shutdown. This is
@@ -1729,6 +1764,8 @@ impl ConsensusStoreDiagnosticCounters {
     pub(crate) fn cancel_consensus_log_prune_turn(&self) {
         self.consensus_log_prune_active
             .fetch_sub(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.maintenance_changed.send_replace(());
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -6323,6 +6360,21 @@ impl ConsensusSessionStore {
             applied_index,
             admitted,
             completed_snapshot_count,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_status_for_test(
+        &self,
+        mut predicate: impl FnMut(&SessionConsensusStatus) -> bool,
+    ) {
+        let mut metrics = self.inner.raft.metrics();
+        loop {
+            drop(metrics.borrow_and_update());
+            if predicate(&self.status()) {
+                return;
+            }
+            metrics.changed().await.expect("status engine remains live");
         }
     }
 
@@ -24626,22 +24678,23 @@ mod membership_tests {
                 .expect("fixed store owns a physical-prune lane"),
         );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let diagnostics = store.inner.diagnostics.snapshot();
-                if diagnostics.consensus_log_prune_attempts >= 1
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.inner.diagnostics.wait_for_maintenance_for_test(|| {
+                store
+                    .inner
+                    .diagnostics
+                    .snapshot()
+                    .consensus_log_prune_attempts
+                    >= 1
                     && store
                         .inner
                         .diagnostics
                         .consensus_log_prune_gauges_for_test()
                         .0
                         == 0
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+            }),
+        )
         .await
         .expect("startup prune recovery becomes quiescent");
 
@@ -24679,17 +24732,19 @@ mod membership_tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while inspection_backend
-                .fixed_quorum_durable_check_count
-                .load(Ordering::SeqCst)
-                == checks_before
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut progress = inspection_backend.test_progress.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            progress.wait_for(|()| {
+                inspection_backend
+                    .fixed_quorum_durable_check_count
+                    .load(Ordering::SeqCst)
+                    != checks_before
+            }),
+        )
         .await
-        .expect("fixed readiness blocks inside its durable scope read");
+        .expect("fixed readiness blocks inside its durable scope read")
+        .expect("test retains its backend publisher");
 
         primary
             .execute(
@@ -24698,11 +24753,13 @@ mod membership_tests {
             )
             .expect("tamper fixed prune authority inside the observation window");
         lane.signal();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !lane.is_degraded() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store
+                .inner
+                .diagnostics
+                .wait_for_maintenance_for_test(|| lane.is_degraded()),
+        )
         .await
         .expect("prune authority failure permanently degrades the lane");
         primary
@@ -26511,21 +26568,21 @@ mod membership_tests {
             .await
             .expect("hold every proposal before client_write_ff");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut dead_callers = (0..2)
-            .map(|_| {
-                let store = store.clone();
-                tokio::spawn(async move { store.logical_read_time_before(None, deadline).await })
-            })
-            .collect::<Vec<_>>();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while store.inner.logical_read_time.admission.available_permits()
-                > DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY - dead_callers.len()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("dead cohort reaches bounded supervisor admission");
+        let mut dead_callers = Vec::new();
+        for _ in 0..2 {
+            let caller_store = store.clone();
+            let mut caller =
+                Box::pin(
+                    async move { caller_store.logical_read_time_before(None, deadline).await },
+                );
+            assert!(futures_util::poll!(tokio::task::unconstrained(caller.as_mut())).is_pending());
+            dead_callers.push(tokio::spawn(caller));
+        }
+        assert_eq!(
+            store.inner.logical_read_time.admission.available_permits(),
+            DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY - dead_callers.len(),
+            "dead cohort reaches bounded supervisor admission"
+        );
         for caller in &dead_callers {
             caller.abort();
         }
@@ -26550,20 +26607,20 @@ mod membership_tests {
         drop(dead_permits);
 
         let dead_store = store.clone();
-        let dead =
-            tokio::spawn(async move { dead_store.logical_read_time_before(None, deadline).await });
+        let mut dead =
+            Box::pin(async move { dead_store.logical_read_time_before(None, deadline).await });
+        assert!(futures_util::poll!(tokio::task::unconstrained(dead.as_mut())).is_pending());
+        let dead = tokio::spawn(dead);
         let live_store = store.clone();
-        let live =
-            tokio::spawn(async move { live_store.logical_read_time_before(None, deadline).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while store.inner.logical_read_time.admission.available_permits()
-                > DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY - 2
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("mixed cohort reaches bounded supervisor admission");
+        let mut live =
+            Box::pin(async move { live_store.logical_read_time_before(None, deadline).await });
+        assert!(futures_util::poll!(tokio::task::unconstrained(live.as_mut())).is_pending());
+        let live = tokio::spawn(live);
+        assert_eq!(
+            store.inner.logical_read_time.admission.available_permits(),
+            DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY - 2,
+            "mixed cohort reaches bounded supervisor admission"
+        );
         dead.abort();
         let _ = dead.await;
         drop(held_proposals);

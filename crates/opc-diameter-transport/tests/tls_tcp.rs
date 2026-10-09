@@ -3134,16 +3134,10 @@ async fn credential_retirement_remains_authoritative_after_runtime_conversion() 
     let (_server_handle, mut server_incoming) = server.into_parts();
 
     material._client_source.send_replace(None);
-    let client_error = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match client_handle.readiness().await {
-                Ok(_) => tokio::task::yield_now().await,
-                Err(error) => break error,
-            }
-        }
-    })
-    .await
-    .expect("runtime must observe credential retirement");
+    let client_error = tokio::time::timeout(Duration::from_secs(1), client_handle.readiness())
+        .await
+        .expect("runtime must observe credential retirement")
+        .expect_err("readiness reconciles the withdrawn credential epoch");
     assert_eq!(
         client_error,
         DiameterPeerRuntimeError::Transport(opc_diameter_transport::DiameterTlsError::Retired)
@@ -3445,16 +3439,29 @@ async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
     raw_server.flush().await.expect("flush exact late DWA");
 
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = observed_handle
-                .peer_session_snapshot()
+        // The reader commits each control frame before reading the next one.
+        // Delivery of this following frame therefore observes the exact DWA.
+        let barrier = application_request();
+        raw_server
+            .write_all(&encode_message(&barrier))
+            .await
+            .expect("write frame after exact DWA");
+        raw_server
+            .flush()
+            .await
+            .expect("flush DWA observation frame");
+        assert_eq!(
+            client_incoming
+                .receive()
                 .await
-                .expect("late DWA must retain the runtime");
-            if snapshot.watchdog_answers_observed == 1 {
-                break snapshot;
-            }
-            tokio::task::yield_now().await;
-        }
+                .expect("following frame is admitted")
+                .into_message(),
+            barrier
+        );
+        observed_handle
+            .peer_session_snapshot()
+            .await
+            .expect("late DWA must retain the runtime")
     })
     .await
     .expect("late exact DWA must recover before the second interval");
@@ -3672,18 +3679,23 @@ async fn local_disconnect_supersedes_an_unanswered_watchdog_after_dpr_emission()
         PeerProcedure::DeviceWatchdog.command_code().get()
     );
     tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if disconnect_handle
+        // Writer commands finish in order. A subsequent write completion
+        // proves the DWR state update is committed; outbound application
+        // traffic neither answers nor postpones the pending watchdog.
+        let barrier = application_request();
+        disconnect_handle
+            .send_application(barrier.clone(), Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("write after DWR emission");
+        assert_eq!(read_diameter_frame(&mut raw_server).await, barrier);
+        assert!(
+            disconnect_handle
                 .activity()
                 .await
                 .expect("runtime activity after DWR")
                 .sequence()
                 > 0
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        );
     })
     .await
     .expect("runtime must commit DWR emission before disconnect");
@@ -3767,7 +3779,7 @@ async fn local_disconnect_returns_exact_dpa_after_terminal_is_observable() {
     let client = client
         .into_peer_runtime(runtime_config(10))
         .expect("start client runtime");
-    let (client_handle, _client_incoming) = client.into_parts();
+    let (client_handle, mut client_incoming) = client.into_parts();
     let observed_handle = client_handle.clone();
     let (polling, mut polling_rx) = watch::channel(true);
     let (paused, paused_rx) = oneshot::channel();
@@ -3833,16 +3845,11 @@ async fn local_disconnect_returns_exact_dpa_after_terminal_is_observable() {
         .expect("write exact DPA");
     raw_server.flush().await.expect("flush exact DPA");
 
-    let terminal = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match observed_handle.readiness().await {
-                Ok(_) => tokio::task::yield_now().await,
-                Err(error) => break error,
-            }
-        }
-    })
-    .await
-    .expect("exact DPA must make local disconnect terminal observable");
+    let terminal = tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+        .await
+        .expect("exact DPA must make local disconnect terminal observable")
+        .expect_err("disconnect terminal does not deliver an application frame");
+    assert_eq!(observed_handle.readiness().await, Err(terminal));
     assert_eq!(
         terminal,
         DiameterPeerRuntimeError::PeerDisconnected { peer_cause: None }

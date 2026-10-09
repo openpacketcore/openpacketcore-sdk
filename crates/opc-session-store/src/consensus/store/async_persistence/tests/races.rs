@@ -43,7 +43,7 @@ pub(super) struct ReplyHold {
     captured: Mutex<Option<CapturedRequest>>,
     entered: tokio::sync::Notify,
     release: tokio::sync::watch::Sender<bool>,
-    delivered: std::sync::atomic::AtomicBool,
+    delivered: tokio::sync::watch::Sender<bool>,
 }
 
 struct ReplyRelease(Arc<ReplyHold>);
@@ -65,7 +65,7 @@ impl ReplyRelease {
             captured: Mutex::new(None),
             entered: tokio::sync::Notify::new(),
             release,
-            delivered: std::sync::atomic::AtomicBool::new(false),
+            delivered: tokio::sync::watch::Sender::new(false),
         });
         assert!(peer
             .held_reply
@@ -168,7 +168,7 @@ impl ReplyHold {
         while !*release.borrow_and_update() {
             release.changed().await.unwrap();
         }
-        self.delivered.store(true, Ordering::Release);
+        self.delivered.send_replace(true);
     }
 }
 
@@ -203,10 +203,73 @@ pub(super) fn append_last(
         .or(append.prev_log_id)
 }
 
-pub(super) async fn until(mut check: impl FnMut() -> bool, message: &str) {
-    tokio::time::timeout(OPERATION_BOUND, async {
-        while !check() {
-            tokio::task::yield_now().await;
+pub(super) async fn until<T>(
+    progress: impl IntoIterator<Item = tokio::sync::watch::Receiver<T>>,
+    check: impl FnMut() -> bool,
+    message: &str,
+) {
+    tokio::time::timeout(OPERATION_BOUND, wait_for(progress, check))
+        .await
+        .unwrap_or_else(|_| panic!("{message}"));
+}
+
+pub(super) async fn wait_for<T>(
+    progress: impl IntoIterator<Item = tokio::sync::watch::Receiver<T>>,
+    mut check: impl FnMut() -> bool,
+) {
+    let mut progress = progress.into_iter().collect::<Vec<_>>();
+    assert!(
+        !progress.is_empty(),
+        "a condition wait needs its publishers"
+    );
+    loop {
+        // Consume versions before checking the real state. In particular,
+        // never hold a watch read guard while locking the native writer.
+        for observed in &mut progress {
+            drop(observed.borrow_and_update());
+        }
+        if check() {
+            return;
+        }
+        futures_util::future::select_all(
+            progress
+                .iter_mut()
+                .map(|observed| Box::pin(observed.changed())),
+        )
+        .await
+        .0
+        .expect("condition progress publisher remains alive");
+    }
+}
+
+pub(super) async fn until_catchup<'a>(
+    store: &ConsensusSessionStore,
+    peers: impl IntoIterator<Item = &'a Peer>,
+    bound: Duration,
+    mut check: impl FnMut() -> bool,
+    message: &str,
+) {
+    let mut metrics = store.inner.raft.metrics();
+    let mut progress = peers
+        .into_iter()
+        .map(|peer| peer.changed.subscribe())
+        .collect::<Vec<_>>();
+    assert!(!progress.is_empty());
+    tokio::time::timeout(bound, async {
+        loop {
+            drop(metrics.borrow_and_update());
+            for observed in &mut progress {
+                drop(observed.borrow_and_update());
+            }
+            if check() {
+                return;
+            }
+            tokio::select! {
+                result = metrics.changed() => result.expect("live catch-up metrics"),
+                result = futures_util::future::select_all(
+                    progress.iter_mut().map(|observed| Box::pin(observed.changed()))
+                ) => result.0.expect("live catch-up peer observation"),
+            }
         }
     })
     .await
@@ -231,107 +294,116 @@ pub(super) async fn wait_for_lease_expiry(store: &ConsensusSessionStore) {
 async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new(3);
-    let result = AssertUnwindSafe(async {
-        fleet.start().await;
-        let old = fleet.leader();
-        let recovering = (old + 1) % 3;
-        let next = (old + 2) % 3;
-        let provider = provider();
-        let first = create_request(fleet.store(old), 1, &provider).await;
-        let outcome = create(fleet.store(old), &first).await;
-        fleet
-            .store(old)
-            .activate_fenced_transition_capability()
-            .await
-            .unwrap();
-        for store in fleet.stores.iter().flatten() {
-            assert_recorded(store, &first, &outcome).await;
-            store.drain_async_persistence().await.unwrap();
-        }
-        fleet.close(recovering).await;
-        fleet
-            .open(recovering, SessionPersistenceMode::Async)
-            .await
-            .unwrap();
-        let cold = fleet.store(recovering).clone();
-        let old_store = fleet.store(old).clone();
-        let next_store = fleet.store(next).clone();
-        let vote = old_store.inner.raft.metrics().borrow().vote;
-        wait_for_lease_expiry(&old_store).await;
-        assert_eq!(old_store.inner.raft.metrics().borrow().vote, vote);
-        let request = cold
-            .inner
-            .persistence_protocol
-            .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
-            .await
-            .unwrap();
-        let before = old_store
-            .inner
-            .raft
-            .metrics()
-            .borrow()
-            .last_log_index
-            .unwrap();
-        let hold = CompletionHold::new(&old_store);
-        let started = tokio::time::Instant::now();
-        let pending = {
-            let cold = cold.clone();
-            let leader = fleet.peers[old].node;
-            tokio::spawn(async move {
-                cold.call_peer::<_, ColdQuorumCut>(
-                    leader,
-                    SessionConsensusRpcFamily::ReadBarrier,
-                    &request,
-                    started + OPERATION_BOUND,
-                )
+    let result =
+        AssertUnwindSafe(async {
+            fleet.start().await;
+            let old = fleet.leader();
+            let recovering = (old + 1) % 3;
+            let next = (old + 2) % 3;
+            let provider = provider();
+            let first = create_request(fleet.store(old), 1, &provider).await;
+            let outcome = create(fleet.store(old), &first).await;
+            fleet
+                .store(old)
+                .activate_fenced_transition_capability()
                 .await
-            })
-        };
-        tokio::time::timeout(OPERATION_BOUND, hold.0.entered.notified())
-            .await
-            .unwrap();
-        until(
-            || {
-                let first = old_store.inner.raft.metrics().borrow().last_applied;
-                first.is_some_and(|log| log.index > before)
-                    && first == next_store.inner.raft.metrics().borrow().last_applied
-            },
-            "the held recovery proposal really applies through the surviving quorum",
-        )
-        .await;
-        let old_applied = old_store
-            .inner
-            .raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .unwrap();
-        assert_eq!(
-            old_applied.leader_id,
-            CommittedLeaderId::new(vote.leader_id.term, fleet.peers[old].node)
-        );
-        next_store.inner.raft.trigger().elect().await.unwrap();
-        until(
-            || {
-                let new_vote = next_store.inner.raft.metrics().borrow().vote;
-                new_vote.is_committed()
-                    && new_vote.leader_id.term > vote.leader_id.term
-                    && new_vote.leader_id.voted_for() == Some(fleet.peers[next].node)
-                    && old_store.inner.raft.metrics().borrow().vote == new_vote
-            },
-            "a real higher-term leader is elected before the old completion is released",
-        )
-        .await;
-        hold.release();
-        assert!(matches!(
-            pending.await.unwrap(),
-            Err(ConsensusPeerCallFailure::AuthenticatedRejection(
-                SessionConsensusPeerError::Rejected
-            ))
-        ));
-        assert!(started.elapsed() < OPERATION_BOUND);
-        assert!(!cold.inner.persistence_protocol.is_active());
-        until(
+                .unwrap();
+            for store in fleet.stores.iter().flatten() {
+                assert_recorded(store, &first, &outcome).await;
+                store.drain_async_persistence().await.unwrap();
+            }
+            fleet.close(recovering).await;
+            fleet
+                .open(recovering, SessionPersistenceMode::Async)
+                .await
+                .unwrap();
+            let cold = fleet.store(recovering).clone();
+            let old_store = fleet.store(old).clone();
+            let next_store = fleet.store(next).clone();
+            let vote = old_store.inner.raft.metrics().borrow().vote;
+            wait_for_lease_expiry(&old_store).await;
+            assert_eq!(old_store.inner.raft.metrics().borrow().vote, vote);
+            let request = cold
+                .inner
+                .persistence_protocol
+                .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
+                .await
+                .unwrap();
+            let before = old_store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                .unwrap();
+            let hold = CompletionHold::new(&old_store);
+            let started = tokio::time::Instant::now();
+            let pending = {
+                let cold = cold.clone();
+                let leader = fleet.peers[old].node;
+                tokio::spawn(async move {
+                    cold.call_peer::<_, ColdQuorumCut>(
+                        leader,
+                        SessionConsensusRpcFamily::ReadBarrier,
+                        &request,
+                        started + OPERATION_BOUND,
+                    )
+                    .await
+                })
+            };
+            tokio::time::timeout(OPERATION_BOUND, hold.0.entered.notified())
+                .await
+                .unwrap();
+            until(
+                [
+                    old_store.inner.raft.metrics(),
+                    next_store.inner.raft.metrics(),
+                ],
+                || {
+                    let first = old_store.inner.raft.metrics().borrow().last_applied;
+                    first.is_some_and(|log| log.index > before)
+                        && first == next_store.inner.raft.metrics().borrow().last_applied
+                },
+                "the held recovery proposal really applies through the surviving quorum",
+            )
+            .await;
+            let old_applied = old_store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .unwrap();
+            assert_eq!(
+                old_applied.leader_id,
+                CommittedLeaderId::new(vote.leader_id.term, fleet.peers[old].node)
+            );
+            next_store.inner.raft.trigger().elect().await.unwrap();
+            until(
+                [
+                    old_store.inner.raft.metrics(),
+                    next_store.inner.raft.metrics(),
+                ],
+                || {
+                    let new_vote = next_store.inner.raft.metrics().borrow().vote;
+                    new_vote.is_committed()
+                        && new_vote.leader_id.term > vote.leader_id.term
+                        && new_vote.leader_id.voted_for() == Some(fleet.peers[next].node)
+                        && old_store.inner.raft.metrics().borrow().vote == new_vote
+                },
+                "a real higher-term leader is elected before the old completion is released",
+            )
+            .await;
+            hold.release();
+            assert!(matches!(
+                pending.await.unwrap(),
+                Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                    SessionConsensusPeerError::Rejected
+                ))
+            ));
+            assert!(started.elapsed() < OPERATION_BOUND);
+            assert!(!cold.inner.persistence_protocol.is_active());
+            until([old_store.inner.raft.metrics(), next_store.inner.raft.metrics()],
             || {
                 let applied = next_store.inner.raft.metrics().borrow().last_applied;
                 applied.is_some_and(|log| log.leader_id.term > vote.leader_id.term)
@@ -340,57 +412,57 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
             "the new leader's ordinary entry applies before checking the old leader's rejection",
         )
         .await;
-        // A former leader cannot issue a lower-vote certificate after the
-        // actual higher-vote quorum has elected its successor.
-        let before_rejected = old_store.inner.raft.metrics().borrow().last_log_index;
-        assert!(matches!(
-            cold.call_peer::<_, ColdQuorumCut>(
-                fleet.peers[old].node,
-                SessionConsensusRpcFamily::ReadBarrier,
-                &request,
-                tokio::time::Instant::now() + OPERATION_BOUND
-            )
-            .await,
-            Err(ConsensusPeerCallFailure::AuthenticatedRejection(
-                SessionConsensusPeerError::Rejected
-            ))
-        ));
-        assert_eq!(
-            old_store.inner.raft.metrics().borrow().last_log_index,
-            before_rejected
-        );
-        let initialized = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(initialized.elapsed() < OPERATION_BOUND);
-        let cut = fleet.peers[next].last_cut.lock().unwrap().unwrap();
-        assert!(cut.vote.leader_id.term > vote.leader_id.term);
-        assert!(cut.barrier.index > old_applied.index);
-        assert_ne!(cut.request.nonce, request.nonce);
-        // A duplicate purpose/nonce has a real cached application result.
-        // It must not be relabeled as the newly appended certificate entry.
-        assert!(matches!(
-            cold.call_peer::<_, ColdQuorumCut>(
-                fleet.peers[next].node,
-                SessionConsensusRpcFamily::ReadBarrier,
-                &cut.request,
-                tokio::time::Instant::now() + OPERATION_BOUND
-            )
-            .await,
-            Err(ConsensusPeerCallFailure::AuthenticatedRejection(
-                SessionConsensusPeerError::Rejected
-            ))
-        ));
-        for store in fleet.stores.iter().flatten() {
-            assert_recorded(store, &first, &outcome).await;
-        }
-        let second = create_request(&next_store, 2, &provider).await;
-        let second_outcome = create(&next_store, &second).await;
-        for store in fleet.stores.iter().flatten() {
-            assert_recorded(store, &second, &second_outcome).await;
-        }
-    })
-    .catch_unwind()
-    .await;
+            // A former leader cannot issue a lower-vote certificate after the
+            // actual higher-vote quorum has elected its successor.
+            let before_rejected = old_store.inner.raft.metrics().borrow().last_log_index;
+            assert!(matches!(
+                cold.call_peer::<_, ColdQuorumCut>(
+                    fleet.peers[old].node,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &request,
+                    tokio::time::Instant::now() + OPERATION_BOUND
+                )
+                .await,
+                Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                    SessionConsensusPeerError::Rejected
+                ))
+            ));
+            assert_eq!(
+                old_store.inner.raft.metrics().borrow().last_log_index,
+                before_rejected
+            );
+            let initialized = tokio::time::Instant::now();
+            cold.initialize_cluster().await.unwrap();
+            assert!(initialized.elapsed() < OPERATION_BOUND);
+            let cut = fleet.peers[next].last_cut.lock().unwrap().unwrap();
+            assert!(cut.vote.leader_id.term > vote.leader_id.term);
+            assert!(cut.barrier.index > old_applied.index);
+            assert_ne!(cut.request.nonce, request.nonce);
+            // A duplicate purpose/nonce has a real cached application result.
+            // It must not be relabeled as the newly appended certificate entry.
+            assert!(matches!(
+                cold.call_peer::<_, ColdQuorumCut>(
+                    fleet.peers[next].node,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &cut.request,
+                    tokio::time::Instant::now() + OPERATION_BOUND
+                )
+                .await,
+                Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                    SessionConsensusPeerError::Rejected
+                ))
+            ));
+            for store in fleet.stores.iter().flatten() {
+                assert_recorded(store, &first, &outcome).await;
+            }
+            let second = create_request(&next_store, 2, &provider).await;
+            let second_outcome = create(&next_store, &second).await;
+            for store in fleet.stores.iter().flatten() {
+                assert_recorded(store, &second, &second_outcome).await;
+            }
+        })
+        .catch_unwind()
+        .await;
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
@@ -422,7 +494,7 @@ async fn async_persistence_cached_append_success_cannot_commit_a_fresh_cold_barr
         let cached = request.entries.last().map(|entry| entry.log_id).or(request.prev_log_id).unwrap();
         assert!(cached.index >= minimum);
         assert_eq!(request.vote, live.inner.raft.metrics().borrow().vote);
-        assert!(!hold.0.delivered.load(Ordering::Acquire));
+        assert!(!*hold.0.delivered.borrow());
         fleet.close(recovering).await;
         fleet.open(recovering, SessionPersistenceMode::Async).await.unwrap();
         let cold = fleet.store(recovering).clone();
@@ -437,13 +509,13 @@ async fn async_persistence_cached_append_success_cannot_commit_a_fresh_cold_barr
         tokio::pin!(initialization);
         tokio::select! {
             result = &mut initialization => panic!("cold initialization completed before its new barrier: {result:?}"),
-            () = until(|| live.inner.raft.metrics().borrow().last_log_index.is_some_and(|index| index > before), "leader must append a new cold barrier without a live majority") => {}
+            () = until([live.inner.raft.metrics()], || live.inner.raft.metrics().borrow().last_log_index.is_some_and(|index| index > before), "leader must append a new cold barrier without a live majority") => {}
         }
         let new_index = live.inner.raft.metrics().borrow().last_log_index.unwrap();
         assert!(new_index > cached.index);
         hold.release();
-        until(|| hold.0.delivered.load(Ordering::Acquire), "the actual pre-crash success is delivered").await;
-        until(|| live.inner.raft.metrics().borrow().replication.as_ref()
+        until([hold.0.delivered.subscribe()], || *hold.0.delivered.borrow(), "the actual pre-crash success is delivered").await;
+        until([live.inner.raft.metrics()], || live.inner.raft.metrics().borrow().replication.as_ref()
             .and_then(|replication| replication.get(&fleet.peers[recovering].node)).copied().flatten() == Some(cached),
             "pinned Raft accounts the cached response only to its exact original range").await;
         assert!(live.inner.raft.metrics().borrow().last_applied.unwrap().index < new_index);
@@ -506,6 +578,11 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         let retained_vote = live.inner.raft.metrics().borrow().vote;
         assert!(retained_vote.is_committed());
         until(
+            fleet
+                .stores
+                .iter()
+                .flatten()
+                .map(|store| store.inner.raft.metrics()),
             || {
                 fleet.stores.iter().flatten().all(|store| {
                     let metrics = store.inner.raft.metrics();
@@ -522,6 +599,14 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             store.drain_async_persistence().await.unwrap();
         }
         until(
+            fleet.stores.iter().flatten().map(|store| {
+                store
+                    .inner
+                    .private_wal
+                    .as_ref()
+                    .unwrap()
+                    .async_progress_for_test()
+            }),
             || {
                 fleet.stores.iter().flatten().all(|store| {
                     let progress = store.persistence_health().asynchronous.unwrap();
@@ -571,6 +656,10 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         // Keep that real response held while both engines publish the vote;
         // the previous snapshot is not evidence that either forgot this vote.
         until(
+            [
+                contender.inner.raft.metrics(),
+                fleet.store(forgotten).inner.raft.metrics(),
+            ],
             || {
                 contender.inner.raft.metrics().borrow().vote == campaign.vote
                     && fleet.store(forgotten).inner.raft.metrics().borrow().vote == campaign.vote
@@ -583,22 +672,36 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             fleet.store(forgotten).inner.raft.metrics().borrow().vote,
             campaign.vote
         );
-        assert!(!hold.0.delivered.load(Ordering::Acquire));
+        assert!(!*hold.0.delivered.borrow());
         tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Some(failure) = fleet
+            wait_for(
+                [fleet
                     .store(forgotten)
-                    .persistence_health()
-                    .asynchronous
+                    .inner
+                    .private_wal
+                    .as_ref()
                     .unwrap()
-                    .background_failure
-                {
-                    assert_eq!(failure.os_error, Some(libc::ENOSPC));
-                    assert_eq!(failure.kind, crate::SessionStorageFailureKind::StorageFull);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+                    .async_progress_for_test()],
+                || {
+                    fleet
+                        .store(forgotten)
+                        .persistence_health()
+                        .asynchronous
+                        .unwrap()
+                        .background_failure
+                        .is_some()
+                },
+            )
+            .await;
+            let failure = fleet
+                .store(forgotten)
+                .persistence_health()
+                .asynchronous
+                .unwrap()
+                .background_failure
+                .unwrap();
+            assert_eq!(failure.os_error, Some(libc::ENOSPC));
+            assert_eq!(failure.kind, crate::SessionStorageFailureKind::StorageFull);
         })
         .await
         .expect("the real generation write containing A's new vote fails");
@@ -634,6 +737,7 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         );
         drop(restored_log);
         until(
+            [cold.inner.raft.metrics()],
             || cold.inner.raft.metrics().borrow().vote == retained_vote,
             "startup publishes the independently restored committed vote",
         )
@@ -658,6 +762,9 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         assert!(cold.inner.persistence_protocol.is_active() && cold.status().admitted);
         assert_eq!(cold.inner.raft.metrics().borrow().vote, retained_vote);
         until(
+            survivors
+                .iter()
+                .map(|index| fleet.store(*index).inner.raft.metrics()),
             || {
                 survivors.iter().all(|index| {
                     fleet
@@ -675,7 +782,8 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         .await;
         hold.release();
         until(
-            || hold.0.delivered.load(Ordering::Acquire),
+            [hold.0.delivered.subscribe()],
+            || *hold.0.delivered.borrow(),
             "deliver A's original actual grant to B after A's cold rejoin",
         )
         .await;
@@ -761,6 +869,9 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         let next = fleet.store(successor).clone();
         next.inner.raft.trigger().elect().await.unwrap();
         until(
+            survivors
+                .iter()
+                .map(|index| fleet.store(*index).inner.raft.metrics()),
             || {
                 let vote = next.inner.raft.metrics().borrow().vote;
                 vote.is_committed()
@@ -780,6 +891,11 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             }
         }
         until(
+            fleet
+                .stores
+                .iter()
+                .flatten()
+                .map(|store| store.inner.raft.metrics()),
             || {
                 fleet
                     .stores

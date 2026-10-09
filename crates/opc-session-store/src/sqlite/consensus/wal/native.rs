@@ -1584,6 +1584,8 @@ impl Wal {
         state.native_snapshot_pending = Some(candidate.clone());
         state.checkpoint_requested = true;
         async_persistence::dirty(&mut state);
+        #[cfg(test)]
+        self.shared.async_progress.send_replace(());
         self.shared.ready.notify_all();
         while state
             .native

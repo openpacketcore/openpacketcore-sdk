@@ -592,6 +592,8 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     ready: Condvar,
+    #[cfg(test)]
+    async_progress: tokio::sync::watch::Sender<()>,
 }
 
 pub(crate) struct Wal {
@@ -957,6 +959,8 @@ impl Wal {
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             ready: Condvar::new(),
+            #[cfg(test)]
+            async_progress: tokio::sync::watch::Sender::default(),
         });
         let writer_shared = Arc::clone(&shared);
         let caller_control = control.clone();
@@ -985,6 +989,11 @@ impl Wal {
     #[cfg(test)]
     pub(super) fn binding(&self) -> Binding {
         self.binding
+    }
+
+    #[cfg(test)]
+    pub(crate) fn async_progress_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.shared.async_progress.subscribe()
     }
 
     pub(crate) fn storage_health(
@@ -1348,6 +1357,8 @@ impl Wal {
             if state.status == Status::Running {
                 state.consensus_closed = consensus_closed;
                 state.status = Status::Closing;
+                #[cfg(test)]
+                self.shared.async_progress.send_replace(());
             }
             self.shared.ready.notify_all();
         }

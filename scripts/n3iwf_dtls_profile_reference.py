@@ -43,7 +43,7 @@ LIFECYCLES = {
     "native-path-loss": ("paths.rs", "ced2020f9bb5748cd32ed54be61d4174cfaddd8db1aa1747a1e1cd70f14d05ea", [
         "generic_kernel_multihoming_preserves_protection_and_bounds_total_path_loss",
     ]),
-    "native-process-restart": ("restart.rs", "9c0c8d95612550b06ce6017e3c998d465a7afb42f477b9a9f8441215007e342c", [
+    "native-process-restart": ("restart.rs", "80dc6079f8b7e329e61504d5a8d31c0cbc020e1a5457c9755fdd5e5ebb1ff2a9", [
         "generic_kernel_process_restart_requires_fresh_mutual_authentication",
     ]),
 }

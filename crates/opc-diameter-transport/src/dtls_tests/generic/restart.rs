@@ -424,11 +424,10 @@ async fn generic_kernel_process_restart_requires_fresh_mutual_authentication() {
         );
         initial.expect("queued").await;
         initial.kill();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while old.readback().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            old.wait_for_carrier_terminal_for_test(),
+        )
         .await
         .expect("bounded process-death observation without application reads");
         assert_eq!(old.readback().err(), Some(Error::ConnectionClosed));
