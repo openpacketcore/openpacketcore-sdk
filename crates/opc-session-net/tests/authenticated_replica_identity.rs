@@ -999,9 +999,15 @@ struct RotationTrafficOutcome {
     batch: AtomicUsize,
     watch: AtomicUsize,
     failures: StdMutex<Vec<&'static str>>,
+    progress: tokio::sync::watch::Sender<()>,
 }
 
 impl RotationTrafficOutcome {
+    fn record_success(&self, counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::SeqCst);
+        self.progress.send_replace(());
+    }
+
     fn snapshot(&self) -> [usize; 5] {
         [
             self.get.load(Ordering::SeqCst),
@@ -1017,6 +1023,7 @@ impl RotationTrafficOutcome {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(family);
+        self.progress.send_replace(());
     }
 
     fn assert_no_failures(&self) {
@@ -1032,22 +1039,21 @@ impl RotationTrafficOutcome {
 }
 
 async fn wait_for_rotation_traffic_after(outcome: &RotationTrafficOutcome, baseline: [usize; 5]) {
-    tokio::time::timeout(ROTATION_OPERATION_DEADLINE, async {
-        loop {
+    let mut progress = outcome.progress.subscribe();
+    tokio::time::timeout(
+        ROTATION_OPERATION_DEADLINE,
+        progress.wait_for(|()| {
             outcome.assert_no_failures();
             let current = outcome.snapshot();
-            if current
+            current
                 .iter()
                 .zip(baseline)
                 .all(|(current, baseline)| *current > baseline)
-            {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+        }),
+    )
     .await
-    .expect("every exercised operation family and watch must progress after rotation");
+    .expect("every exercised operation family and watch must progress after rotation")
+    .expect("traffic fixture retains its progress publisher");
 }
 
 struct RotationMaterialHarness<'a> {
@@ -1168,7 +1174,7 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
                     outcome.fail("get");
                     return;
                 }
-                outcome.get.fetch_add(1, Ordering::SeqCst);
+                outcome.record_success(&outcome.get);
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
@@ -1195,7 +1201,7 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
                     outcome.fail("compare_and_set");
                     return;
                 }
-                outcome.compare_and_set.fetch_add(1, Ordering::SeqCst);
+                outcome.record_success(&outcome.compare_and_set);
                 expected_generation = Some(Generation::new(generation));
                 generation = generation.checked_add(1).expect("bounded CAS generation");
                 tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1224,7 +1230,7 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
                     outcome.fail("release");
                     return;
                 }
-                outcome.lease_cycle.fetch_add(1, Ordering::SeqCst);
+                outcome.record_success(&outcome.lease_cycle);
                 index = index.checked_add(1).expect("bounded lease index");
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -1257,7 +1263,7 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
                     outcome.fail("batch");
                     return;
                 }
-                outcome.batch.fetch_add(1, Ordering::SeqCst);
+                outcome.record_success(&outcome.batch);
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
@@ -1291,7 +1297,7 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
                             return sequences;
                         }
                         sequences.push(entry.sequence);
-                        outcome.watch.fetch_add(1, Ordering::SeqCst);
+                        outcome.record_success(&outcome.watch);
                         expected = expected.checked_add(1).expect("bounded watch sequence");
                     }
                 }
@@ -1487,7 +1493,7 @@ impl ActiveRotationTraffic {
                         outcome.fail("get");
                         return;
                     }
-                    outcome.get.fetch_add(1, Ordering::SeqCst);
+                    outcome.record_success(&outcome.get);
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             }
@@ -1514,7 +1520,7 @@ impl ActiveRotationTraffic {
                         outcome.fail("compare_and_set");
                         return;
                     }
-                    outcome.compare_and_set.fetch_add(1, Ordering::SeqCst);
+                    outcome.record_success(&outcome.compare_and_set);
                     expected_generation = Some(Generation::new(generation));
                     generation = generation.checked_add(1).expect("bounded CAS generation");
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1544,7 +1550,7 @@ impl ActiveRotationTraffic {
                         outcome.fail("release");
                         return;
                     }
-                    outcome.lease_cycle.fetch_add(1, Ordering::SeqCst);
+                    outcome.record_success(&outcome.lease_cycle);
                     index = index.checked_add(1).expect("bounded lease index");
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
@@ -1577,7 +1583,7 @@ impl ActiveRotationTraffic {
                         outcome.fail("batch");
                         return;
                     }
-                    outcome.batch.fetch_add(1, Ordering::SeqCst);
+                    outcome.record_success(&outcome.batch);
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             }
@@ -1611,7 +1617,7 @@ impl ActiveRotationTraffic {
                                 return sequences;
                             }
                             sequences.push(entry.sequence);
-                            outcome.watch.fetch_add(1, Ordering::SeqCst);
+                            outcome.record_success(&outcome.watch);
                             expected = expected.checked_add(1).expect("bounded watch sequence");
                         }
                     }

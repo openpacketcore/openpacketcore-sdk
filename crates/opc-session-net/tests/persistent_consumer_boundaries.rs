@@ -140,6 +140,7 @@ impl TestPki {
 #[derive(Default)]
 struct RecordingConsumer {
     calls: AtomicUsize,
+    calls_changed: watch::Sender<()>,
     committed: AtomicUsize,
     block_after_commit: AtomicBool,
     requests: Mutex<Vec<SessionConsumerRequest>>,
@@ -147,13 +148,14 @@ struct RecordingConsumer {
 
 impl RecordingConsumer {
     async fn wait_for_calls(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while self.calls.load(Ordering::SeqCst) < expected {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut calls = self.calls_changed.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            calls.wait_for(|()| self.calls.load(Ordering::SeqCst) >= expected),
+        )
         .await
-        .expect("consumer dispatch reaches the bounded fixture deadline");
+        .expect("consumer dispatch reaches the bounded fixture deadline")
+        .expect("fixture retains its dispatch publisher");
     }
 
     fn requests(&self) -> Vec<SessionConsumerRequest> {
@@ -184,6 +186,7 @@ impl SessionQuorumConsumer for RecordingConsumer {
             // before intentionally withholding a response below.
             self.committed.fetch_add(1, Ordering::SeqCst);
         }
+        self.calls_changed.send_replace(());
         if self.block_after_commit.load(Ordering::SeqCst) {
             std::future::pending().await
         }
@@ -734,28 +737,29 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
             })
         })
     };
+    let idle_timeout = Duration::from_millis(20);
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
         voter_authority,
         pki.client_config(&client_spiffe),
     )
-    .with_idle_timeout(Duration::from_millis(20))
+    .with_idle_timeout(idle_timeout)
     .with_operation_timeout(Duration::from_secs(2));
     let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1))
         .expect("persistent client");
     client.prewarm().await.expect("prewarm one lane");
     // The listener retains its normal bounded idle deadline. This fixture
-    // waits for the client's already-published lane to be reaped at its own
-    // 20 ms idle contract, so it tests local idle replacement rather than a
-    // race between cross-target TLS setup and a peer EOF.
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while client.diagnostics().await.idle != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("client idle reaper retires the prewarmed lane");
+    // advances exactly the client's 20 ms idle contract after real TLS setup.
+    // As before, diagnostics prunes expired lanes before reporting the count.
+    tokio::time::pause();
+    tokio::time::advance(idle_timeout).await;
+    assert_eq!(
+        client.diagnostics().await.idle,
+        0,
+        "the prewarmed lane expires at its configured idle deadline"
+    );
+    tokio::time::resume();
     assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     let diagnostics = client.diagnostics().await;
     assert_eq!(resolutions.load(Ordering::SeqCst), 2);

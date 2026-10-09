@@ -136,6 +136,10 @@ async fn async_persistence_resumed_catch_up_recertifies_a_new_committed_leader()
         wait_for_lease_expiry(next).await;
         next.inner.raft.trigger().elect().await.unwrap();
         until(
+            [
+                next.inner.raft.metrics(),
+                fleet.store(leader).inner.raft.metrics(),
+            ],
             || {
                 let vote = next.inner.raft.metrics().borrow().vote;
                 vote.is_committed()
@@ -372,6 +376,11 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
         let retained = old.inner.raft.metrics().borrow().last_applied.unwrap();
         let retained_vote = old.inner.raft.metrics().borrow().vote;
         until(
+            fleet
+                .stores
+                .iter()
+                .flatten()
+                .map(|store| store.inner.raft.metrics()),
             || {
                 fleet.stores.iter().flatten().all(|store| {
                     let metrics = store.inner.raft.metrics();
@@ -429,6 +438,7 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
         }
         let suffix_end = retained.index + SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS as u64;
         until(
+            [old.inner.raft.metrics()],
             || old.inner.raft.metrics().borrow().last_log_index == Some(suffix_end),
             "the isolated real leader appends the full bounded incompatible suffix",
         )
@@ -454,6 +464,10 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
         let next = fleet.store(successor).clone();
         next.inner.raft.trigger().elect().await.unwrap();
         until(
+            [
+                next.inner.raft.metrics(),
+                fleet.store(other).inner.raft.metrics(),
+            ],
             || {
                 let vote = next.inner.raft.metrics().borrow().vote;
                 vote.is_committed()
@@ -472,6 +486,7 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
         // Raft::new returns after spawning the core. Its watch initially
         // contains a zero vote until startup publishes the restored state.
         until(
+            [cold.inner.raft.metrics()],
             || cold.inner.raft.metrics().borrow().vote == retained_vote,
             "startup publishes the exact retained committed vote",
         )
@@ -503,7 +518,13 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
             let cold = cold.clone();
             tokio::spawn(async move { cold.initialize_cluster().await })
         };
-        until(
+        races::until_catchup(
+            &cold,
+            [
+                fleet.peers[old_leader].as_ref(),
+                fleet.peers[successor].as_ref(),
+            ],
+            OPERATION_BOUND,
             || {
                 cold.persistence_health().recovery == Some(SessionAsyncRecoveryState::CatchingUp)
                     && fleet.peers[old_leader]

@@ -12530,17 +12530,13 @@ mod tests {
         .await;
         let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
         let recovery_consumer = log.live_terminal_recovery_handoff_consumer();
-        let purge = tokio::spawn(async move {
+        let mut purge = Box::pin(async move {
             let result = log.purge(log_id(2)).await;
             (log, result)
         });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while machine.core.applied_progress.receiver_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(futures_util::poll!(tokio::task::unconstrained(purge.as_mut())).is_pending());
+        assert!(machine.core.applied_progress.receiver_count() > 0);
+        let purge = tokio::spawn(purge);
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
         let gate_guard = SnapshotInstallAppliedProgressGateGuard::install(
@@ -14433,18 +14429,17 @@ mod tests {
         }
 
         async fn queue_and_cancel(&self, mut log: SqliteConsensusLogStore) {
-            let write = tokio::spawn(async move { log.save_committed(Some(log_id(1))).await });
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while self.shutdown.0.active_owners.load(Ordering::Acquire) != 2 {
-                    assert!(
-                        !write.is_finished(),
-                        "the held pool cannot finish this write"
-                    );
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the job owns admission and all storage guards before cancellation");
+            let mut write = Box::pin(async move { log.save_committed(Some(log_id(1))).await });
+            assert!(
+                futures_util::poll!(tokio::task::unconstrained(write.as_mut())).is_pending(),
+                "the held pool cannot finish this write"
+            );
+            assert_eq!(
+                self.shutdown.0.active_owners.load(Ordering::Acquire),
+                2,
+                "the job owns admission and all storage guards before cancellation"
+            );
+            let write = tokio::spawn(write);
             write.abort();
             assert!(write.await.unwrap_err().is_cancelled());
             self.assert_owned();
@@ -14576,13 +14571,21 @@ mod tests {
         // owner before returning the last admission field, so join that final
         // release after draining every owner instead of counting per pool.
         runtimes[0].block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while OWNED_COMMITTED_WRITES.available_permits() != MAX_OWNED_COMMITTED_WRITES {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("completed jobs return process-wide admission");
+            drop(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    OWNED_COMMITTED_WRITES.acquire_many(
+                        u32::try_from(MAX_OWNED_COMMITTED_WRITES).expect("capacity fits u32"),
+                    ),
+                )
+                .await
+                .expect("completed jobs return process-wide admission")
+                .expect("process-wide admission remains open"),
+            );
+            assert_eq!(
+                OWNED_COMMITTED_WRITES.available_permits(),
+                MAX_OWNED_COMMITTED_WRITES
+            );
         });
         drop(runtimes);
         let replacement = tokio::runtime::Builder::new_current_thread()
@@ -14839,14 +14842,15 @@ mod tests {
             .consensus_log_prune_lane()
             .expect("fixed store installs one physical prune lane");
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 if diagnostics.snapshot().consensus_log_prune_completed_turns == 1 {
-                    return;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("startup prune recovery completes its read-only preflight");
         let snapshot = diagnostics.snapshot();
@@ -14894,13 +14898,9 @@ mod tests {
 
         let append =
             tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !gate.preemption_requested() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("later primary append publishes deterministic prune preemption");
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_for_preemption())
+            .await
+            .expect("later primary append publishes deterministic prune preemption");
         tokio::time::timeout(Duration::from_secs(1), append)
             .await
             .expect("preempted prune returns its local writer turn")
@@ -15024,13 +15024,9 @@ mod tests {
             let result = state_machine.apply([blank_entry(130)]).await;
             (state_machine, result)
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !gate.preemption_requested() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("state-machine apply publishes deterministic prune preemption");
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_for_preemption())
+            .await
+            .expect("state-machine apply publishes deterministic prune preemption");
         assert!(
             gate.preemption_requested(),
             "the active physical prune observes the state-machine writer's preemption"
@@ -15065,28 +15061,30 @@ mod tests {
         for _ in 1..64 {
             checkpoint_lane.signal();
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 if diagnostics.snapshot().proactive_checkpoint_busy == 1 {
-                    return;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("reader-pinned PASSIVE checkpoint reports incomplete progress");
         consensus::release_snapshot_read_sync(&reader).expect("release deferred snapshot reader");
         for _ in 0..64 {
             checkpoint_lane.signal();
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            diagnostics.wait_for_maintenance_for_test(|| {
                 if diagnostics.snapshot().proactive_checkpoint_completed == 1 {
-                    return;
+                    return true;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+                false
+            }),
+        )
         .await
         .expect("PASSIVE checkpoint drains after the deferred reader releases");
 
@@ -15187,20 +15185,19 @@ mod tests {
         );
 
         let waiting_lane = Arc::clone(&lane);
-        let waiting_primary = tokio::spawn(async move {
+        let mut waiting_primary = Box::pin(async move {
             let _preemption = waiting_lane.request_primary_preemption().await;
             std::future::pending::<()>().await;
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if lane.primary_writers_for_test() == 1 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("waiting primary publishes priority before cancellation");
+        assert!(
+            futures_util::poll!(tokio::task::unconstrained(waiting_primary.as_mut())).is_pending()
+        );
+        assert_eq!(
+            lane.primary_writers_for_test(),
+            1,
+            "waiting primary publishes priority before cancellation"
+        );
+        let waiting_primary = tokio::spawn(waiting_primary);
         waiting_primary.abort();
         assert!(matches!(waiting_primary.await, Err(error) if error.is_cancelled()));
         assert_eq!(
@@ -18406,14 +18403,13 @@ mod tests {
         // Model OpenRaft's command ordering: its core invokes PurgeLog while
         // InstallFullSnapshot is still executing on the independent
         // state-machine worker.
-        let purge = tokio::spawn(async move { log_store.purge(log_id(1)).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while target.core.applied_progress.receiver_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("concurrent purge subscribes before snapshot publication");
+        let mut purge = Box::pin(async move { log_store.purge(log_id(1)).await });
+        assert!(futures_util::poll!(tokio::task::unconstrained(purge.as_mut())).is_pending());
+        assert!(
+            target.core.applied_progress.receiver_count() > 0,
+            "concurrent purge subscribes before snapshot publication"
+        );
+        let purge = tokio::spawn(purge);
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
         let _gate_guard = SnapshotInstallAppliedProgressGateGuard::install(
@@ -18509,14 +18505,13 @@ mod tests {
         // core is already awaiting PurgeLog(1) while the independent
         // state-machine worker installs the snapshot that establishes applied
         // coverage for that exact LogId.
-        let purge = tokio::spawn(async move { log_store.purge(log_id(1)).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while target.core.applied_progress.receiver_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fixed concurrent purge subscribes before snapshot publication");
+        let mut purge = Box::pin(async move { log_store.purge(log_id(1)).await });
+        assert!(futures_util::poll!(tokio::task::unconstrained(purge.as_mut())).is_pending());
+        assert!(
+            target.core.applied_progress.receiver_count() > 0,
+            "fixed concurrent purge subscribes before snapshot publication"
+        );
+        let purge = tokio::spawn(purge);
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
         let _gate_guard = SnapshotInstallAppliedProgressGateGuard::install(

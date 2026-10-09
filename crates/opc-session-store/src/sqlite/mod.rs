@@ -674,6 +674,8 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     fixed_quorum_v2_mutation_snapshot_cut: Arc<AtomicBool>,
     #[cfg(test)]
+    pub(crate) test_progress: tokio::sync::watch::Sender<()>,
+    #[cfg(test)]
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(crate) fenced_transition_v2_activation_lookup_gate: Arc<tokio::sync::Semaphore>,
@@ -1466,6 +1468,8 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             fixed_quorum_v2_mutation_snapshot_cut: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
+            test_progress: tokio::sync::watch::Sender::default(),
+            #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             fenced_transition_v2_activation_lookup_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2226,6 +2230,8 @@ impl SqliteSessionBackend {
         #[cfg(test)]
         self.fixed_quorum_durable_check_count
             .fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        self.test_progress.send_replace(());
         #[cfg(target_os = "linux")]
         while let Some(result) = self.native_read(|wal| {
             wal.native_fixed_try_read(
@@ -3145,6 +3151,8 @@ impl SqliteSessionBackend {
         self.fenced_transition_v2_activation_lookup_count
             .fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
+        self.test_progress.send_replace(());
+        #[cfg(test)]
         let _lookup_gate = self
             .fenced_transition_v2_activation_lookup_gate
             .acquire()
@@ -4049,6 +4057,8 @@ impl SqliteSessionBackend {
     #[cfg(test)]
     async fn pause_after_watch_backlog_capture(&self) -> Result<(), StoreError> {
         self.watch_backlog_captured.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        self.test_progress.send_replace(());
         let permit = Arc::clone(&self.watch_registration_gate)
             .acquire_owned()
             .await
@@ -4754,6 +4764,8 @@ impl SessionBackend for SqliteSessionBackend {
             })
             .await?;
 
+        #[cfg(test)]
+        self.test_progress.send_replace(());
         if should_notify {
             let mut watchers = self.watchers.lock().await;
             watchers.retain_mut(|watcher| watcher.notify(&entry));
@@ -5590,15 +5602,10 @@ mod operation_lifetime_tests {
             .expect("hold SQLite write reservation");
 
         let worker_backend = backend.clone();
-        let task = tokio::spawn(async move { worker_backend.compare_and_set(operation).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.operation_workers.available_permits() == SQLITE_OPERATION_BLOCKING_WORKERS
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("blocking worker starts");
+        let mut operation =
+            Box::pin(async move { worker_backend.compare_and_set(operation).await });
+        assert!(futures_util::poll!(tokio::task::unconstrained(operation.as_mut())).is_pending());
+        let task = tokio::spawn(operation);
         assert_eq!(
             backend.operation_workers.available_permits(),
             0,
@@ -5606,13 +5613,12 @@ mod operation_lifetime_tests {
         );
         task.abort();
         assert!(task.await.expect_err("cancel task").is_cancelled());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.operation_workers.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("interrupted blocking worker exits within the SQLite busy bound");
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), backend.operation_workers.acquire())
+                .await
+                .expect("interrupted blocking worker exits within the SQLite busy bound")
+                .expect("operation admission remains open"),
+        );
 
         blocker.execute_batch("ROLLBACK").expect("release blocker");
         assert_eq!(backend.get(&key).await.expect("read after unblock"), None);
@@ -5643,33 +5649,26 @@ mod operation_lifetime_tests {
 
             let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
             let ordinary_backend = backend.clone();
-            let ordinary = tokio::spawn(async move {
+            let mut ordinary = Box::pin(async move {
                 ordinary_backend
                     .run_sqlite_task(|_| Ok::<(), StoreError>(()))
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while backend.operation_workers.available_permits()
-                    == SQLITE_OPERATION_BLOCKING_WORKERS
-                {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("ordinary SQLite job queues behind saturated pool");
+            assert!(
+                futures_util::poll!(tokio::task::unconstrained(ordinary.as_mut())).is_pending()
+            );
+            assert_eq!(backend.operation_workers.available_permits(), 0);
+            let ordinary = tokio::spawn(ordinary);
             ordinary.abort();
             let _ = ordinary.await;
-            let ordinary_released = tokio::time::timeout(Duration::from_secs(1), async {
-                while backend.operation_workers.available_permits() == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .is_ok();
+            let ordinary_released =
+                tokio::time::timeout(Duration::from_secs(1), backend.operation_workers.acquire())
+                    .await
+                    .is_ok_and(|permit| permit.is_ok());
             let ordinary_connection_released = backend.conn.try_lock().is_ok();
 
             let restore_backend = backend.clone();
-            let restore = tokio::spawn(async move {
+            let mut restore = Box::pin(async move {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 restore_backend
                     .run_restore_scan(
@@ -5680,24 +5679,17 @@ mod operation_lifetime_tests {
                     )
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while backend.restore_scan_workers.available_permits()
-                    == RESTORE_SCAN_BLOCKING_WORKERS
-                {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("restore SQLite job queues behind saturated pool");
+            assert!(futures_util::poll!(tokio::task::unconstrained(restore.as_mut())).is_pending());
+            assert_eq!(backend.restore_scan_workers.available_permits(), 0);
+            let restore = tokio::spawn(restore);
             restore.abort();
             let _ = restore.await;
-            let restore_released = tokio::time::timeout(Duration::from_secs(1), async {
-                while backend.restore_scan_workers.available_permits() == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
+            let restore_released = tokio::time::timeout(
+                Duration::from_secs(1),
+                backend.restore_scan_workers.acquire(),
+            )
             .await
-            .is_ok();
+            .is_ok_and(|permit| permit.is_ok());
             let restore_connection_released = backend.conn.try_lock().is_ok();
 
             let _ = release_tx.send(());
@@ -5797,18 +5789,15 @@ mod consensus_readiness_deadline_tests {
         let status_before = store.status();
         let mutation_store = store.clone();
         let mutation = tokio::spawn(async move { mutation_store.max_replication_sequence().await });
-        tokio::time::timeout(OPERATION_TIMEOUT, async {
-            loop {
-                let status = store.status();
-                if status.last_log_index.is_some_and(|last| {
+        tokio::time::timeout(
+            OPERATION_TIMEOUT,
+            store.wait_for_status_for_test(|status| {
+                status.last_log_index.is_some_and(|last| {
                     last > status_before.last_log_index.unwrap_or_default()
                         && status.applied_index.is_none_or(|applied| applied < last)
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+                })
+            }),
+        )
         .await
         .expect("mutation reaches the log while apply is held");
 
@@ -5915,20 +5904,17 @@ mod restore_cancellation_tests {
         let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
         let held_connection = backend.conn.lock().await;
         let first_backend = backend.clone();
-        let mut scans = vec![tokio::spawn(async move {
+        let mut first = Box::pin(async move {
             first_backend
                 .scan_restore_records(RestoreScanRequest::all(1))
                 .await
-        })];
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.restore_scan_workers.available_permits()
-                != RESTORE_SCAN_BLOCKING_WORKERS - 1
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first restore worker acquires the sole admission permit");
+        });
+        assert!(futures_util::poll!(tokio::task::unconstrained(first.as_mut())).is_pending());
+        assert_eq!(
+            backend.restore_scan_workers.available_permits(),
+            RESTORE_SCAN_BLOCKING_WORKERS - 1
+        );
+        let mut scans = vec![tokio::spawn(first)];
 
         for _ in 0..64 {
             let cancelled_backend = backend.clone();
@@ -6019,19 +6005,21 @@ mod watcher_lifetime_tests {
             .expect("hold registration failpoint");
         let watch_backend = backend.clone();
         let watch = tokio::spawn(async move { watch_backend.watch(1).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !backend.watch_backlog_captured.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut progress = backend.test_progress.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            progress.wait_for(|()| backend.watch_backlog_captured.load(Ordering::SeqCst)),
+        )
         .await
-        .expect("watch captures backlog before registration");
+        .expect("watch captures backlog before registration")
+        .expect("test retains its backend publisher");
 
         let append_backend = backend.clone();
         let append =
             tokio::spawn(async move { append_backend.replicate_entry(watch_entry(2)).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                drop(progress.borrow_and_update());
                 if backend
                     .max_replication_sequence()
                     .await
@@ -6040,7 +6028,10 @@ mod watcher_lifetime_tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                progress
+                    .changed()
+                    .await
+                    .expect("test retains its backend publisher");
             }
         })
         .await

@@ -3842,6 +3842,8 @@ struct EbpfGtpuDataplaneBackendInner {
     /// ordinary graph creation consumes them under `operation_lock`.
     terminal_admissions: Mutex<HashMap<PathBuf, PendingCurrentTerminalAdmission>>,
     traffic_observations: Mutex<HashMap<u64, EbpfTrafficProofAttempt>>,
+    #[cfg(test)]
+    traffic_cleanup_progress: tokio::sync::watch::Sender<()>,
     traffic_authority_stores: Mutex<HashMap<[u8; 16], GtpuTrafficProofAuthorityStore>>,
     traffic_observation_sequences: Mutex<HashMap<u32, TrafficObservationSequenceWindow>>,
     #[cfg(test)]
@@ -4355,6 +4357,8 @@ impl EbpfGtpuDataplaneBackend {
                 devices: Mutex::new(HashMap::new()),
                 terminal_admissions: Mutex::new(HashMap::new()),
                 traffic_observations: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                traffic_cleanup_progress: tokio::sync::watch::Sender::default(),
                 traffic_authority_stores: Mutex::new(HashMap::new()),
                 traffic_observation_sequences: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -13016,6 +13020,8 @@ impl EbpfGtpuDataplaneBackend {
                 }
                 if retire_record {
                     attempts.remove(&attempt_id);
+                    #[cfg(test)]
+                    self.inner.traffic_cleanup_progress.send_replace(());
                 }
                 Ok(())
             }
@@ -86952,6 +86958,30 @@ mod tests {
         backend.close_gtpu_traffic_proof(session).await.unwrap();
     }
 
+    async fn wait_for_traffic_cleanup(
+        inner: std::sync::Weak<EbpfGtpuDataplaneBackendInner>,
+        mut progress: tokio::sync::watch::Receiver<()>,
+    ) {
+        loop {
+            // Release the watch guard before acquiring the attempts mutex:
+            // cleanup publishes its notification while holding that mutex.
+            drop(progress.borrow_and_update());
+            if inner
+                .upgrade()
+                .is_none_or(|inner| inner.traffic_observations.lock().unwrap().is_empty())
+            {
+                return;
+            }
+            if progress.changed().await.is_err() {
+                assert!(
+                    inner.upgrade().is_none(),
+                    "cleanup owner remains observable"
+                );
+                return;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn foreign_backend_close_fails_and_preserves_owner_cleanup_authority() {
         let (owner, runtime, _group, authority) = traffic_proof_fixture(0x58).await;
@@ -86966,14 +86996,13 @@ mod tests {
             foreign.close_gtpu_traffic_proof(session).await,
             Err(GtpuError::NotFound)
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if owner.traffic_attempts().unwrap().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_traffic_cleanup(
+                Arc::downgrade(&owner.inner),
+                owner.inner.traffic_cleanup_progress.subscribe(),
+            ),
+        )
         .await
         .expect("the still-armed owner revoker must finish bounded cleanup");
         assert!(runtime.state().traffic_observation_registrations.is_empty());
@@ -87293,14 +87322,19 @@ mod tests {
         drop(rebind);
         drop(held_lease);
 
+        let mut rebind_progress = store.rebind_progress.subscribe();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
+                drop(rebind_progress.borrow_and_update());
                 if store.try_exactly_matches(&replacement) == Some(true)
                     && store.lease().await.is_live()
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                rebind_progress
+                    .changed()
+                    .await
+                    .expect("authority store remains live");
             }
         })
         .await
@@ -88228,11 +88262,13 @@ mod tests {
         drop(predecessor);
         // The public Drop contract schedules map I/O off the executor. Use
         // the same bounded completion window as the existing Drop tests.
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !backend.traffic_attempts().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_traffic_cleanup(
+                Arc::downgrade(&backend.inner),
+                backend.inner.traffic_cleanup_progress.subscribe(),
+            ),
+        )
         .await
         .expect("abandoned renewal cleanup must finish within the bounded worker window");
         assert!(runtime.state().traffic_observation_registrations.is_empty());
@@ -89229,16 +89265,15 @@ mod tests {
             .traffic_observation_registrations
             .contains_key(&(S2BU_IFINDEX, group.id().to_bytes())));
         drop(abandoned);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                // Host-attempt removal is the terminal cleanup step, after
-                // both pinned registration and redirect removal/readback.
-                if backend.traffic_attempts().unwrap().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        // Host-attempt removal is the terminal cleanup step, after both
+        // pinned registration and redirect removal/readback.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_traffic_cleanup(
+                Arc::downgrade(&backend.inner),
+                backend.inner.traffic_cleanup_progress.subscribe(),
+            ),
+        )
         .await
         .expect("abandoned proof cleanup must finish within its bounded worker window");
         assert!(!runtime
@@ -89262,20 +89297,13 @@ mod tests {
             .traffic_observation_registrations
             .contains_key(&(S2BU_IFINDEX, group.id().to_bytes())));
         let retained_inner = Arc::downgrade(&backend.inner);
+        let cleanup_progress = backend.inner.traffic_cleanup_progress.subscribe();
         drop(backend);
         drop(session);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                let cleanup_finished = match retained_inner.upgrade() {
-                    Some(inner) => inner.traffic_observations.lock().unwrap().is_empty(),
-                    None => true,
-                };
-                if cleanup_finished {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_traffic_cleanup(retained_inner.clone(), cleanup_progress),
+        )
         .await
         .expect("retained proof cleanup must finish within its bounded worker window");
         assert!(!runtime

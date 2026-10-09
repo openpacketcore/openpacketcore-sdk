@@ -158,9 +158,7 @@ fn cancelled_private_cache_read_reconciles_before_releasing_its_owner() {
             assert!(conn.is_autocommit());
             drop(conn);
             tokio::time::timeout(Duration::from_secs(5), async {
-                while backend.operation_workers.available_permits() == 0 {
-                    tokio::task::yield_now().await;
-                }
+                drop(backend.operation_workers.acquire().await.unwrap());
             })
             .await
             .unwrap();
@@ -220,7 +218,7 @@ fn queued_private_cache_read_cancellation_releases_admission_without_execution()
         started_rx.await.unwrap();
         let backend = fixture.backend.clone();
         let called = Arc::clone(&executed);
-        let caller = tokio::spawn(async move {
+        let mut caller = Box::pin(async move {
             backend
                 .run_store_sqlite_task(SqliteStoreWorkKind::Read, move |_| {
                     called.store(true, Ordering::Release);
@@ -228,22 +226,17 @@ fn queued_private_cache_read_cancellation_releases_admission_without_execution()
                 })
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while fixture.backend.operation_workers.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(futures_util::poll!(tokio::task::unconstrained(caller.as_mut())).is_pending());
+        assert_eq!(fixture.backend.operation_workers.available_permits(), 0);
+        let caller = tokio::spawn(caller);
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        let released = tokio::time::timeout(Duration::from_secs(1), async {
-            while fixture.backend.operation_workers.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let released = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.backend.operation_workers.acquire(),
+        )
         .await
-        .is_ok();
+        .is_ok_and(|permit| permit.is_ok());
         let connection_released = fixture.backend.conn.try_lock().is_ok();
         release_tx.send(()).unwrap();
         saturator.await.unwrap();
@@ -408,10 +401,9 @@ fn ordinary_and_acceptance_reads_remain_interruptible_and_reuse_clean_connection
                 (&backend.operation_workers, crate::sqlite::SQLITE_OPERATION_BLOCKING_WORKERS)
             };
             tokio::time::timeout(Duration::from_secs(1), async {
-                while workers.available_permits() != expected {
-                    tokio::task::yield_now().await;
-                }
+                drop(workers.acquire_many(u32::try_from(expected).unwrap()).await.unwrap());
             }).await.unwrap();
+            assert_eq!(workers.available_permits(), expected);
             // Cycle every acceptance lane, including the one just cancelled.
             for _ in 0..expected {
                 let read = |conn: &Connection| conn.query_row("SELECT 17", [], |row| row.get::<_, i64>(0))

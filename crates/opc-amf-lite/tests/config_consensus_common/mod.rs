@@ -636,22 +636,15 @@ impl ConfigCluster {
                 ));
             }
         };
-        if tokio::time::timeout(cluster_transition_timeout(), async {
-            loop {
-                let status = reopened.status();
-                if status.applied_index == expected_applied_index
+        if !tokio::time::timeout(
+            cluster_transition_timeout(),
+            reopened.wait_for_raft_status_for_test(|status| {
+                status.applied_index == expected_applied_index
                     && status.committed_index == expected_committed_index
-                {
-                    break;
-                }
-                // `Raft::new` publishes its restored durable state through a
-                // watch channel after construction. Yield to that engine task
-                // before treating this test lifecycle operation as complete.
-                tokio::task::yield_now().await;
-            }
-        })
+            }),
+        )
         .await
-        .is_err()
+        .is_ok_and(|result| result.is_ok())
         {
             match tokio::time::timeout(cluster_transition_timeout(), reopened.shutdown()).await {
                 Ok(Ok(())) => {

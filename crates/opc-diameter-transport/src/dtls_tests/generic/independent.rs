@@ -338,13 +338,7 @@ async fn independent_ngap_dtls_lifecycle_schedules_match_public_contract() {
                 source
                     .send(replacement)
                     .expect("publish read-only material input");
-                tokio::time::timeout_at(deadline, async {
-                    while local.readback().err() != Some(Error::Retired) {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("bounded epoch retirement");
+                assert_eq!(local.readback().err(), Some(Error::Retired));
                 if argument != "withdrawal" {
                     assert_ne!(controller.status().epoch(), admitted);
                 }

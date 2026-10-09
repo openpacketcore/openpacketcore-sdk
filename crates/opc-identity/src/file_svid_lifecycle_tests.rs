@@ -7,20 +7,18 @@ use tokio::time::timeout;
 
 const HANG_GUARD: Duration = Duration::from_secs(5);
 
-struct Retired(Option<oneshot::Sender<()>>);
+struct Retired(tokio::sync::watch::Sender<bool>);
 
 impl Drop for Retired {
     fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
-        }
+        self.0.send_replace(true);
     }
 }
 
 struct TaskProbe {
     started: oneshot::Receiver<()>,
     release: Option<oneshot::Sender<()>>,
-    retired: oneshot::Receiver<()>,
+    retired: tokio::sync::watch::Receiver<bool>,
     ran_after_release: Arc<AtomicBool>,
     abort: AbortHandle,
 }
@@ -42,8 +40,8 @@ impl Drop for TaskProbe {
 fn gated_task(panic_after_release: bool) -> (JoinHandle<()>, TaskProbe) {
     let (started_tx, started) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
-    let (retired_tx, retired) = oneshot::channel();
-    let guard = Retired(Some(retired_tx));
+    let (retired_tx, retired) = tokio::sync::watch::channel(false);
+    let guard = Retired(retired_tx);
     let ran_after_release = Arc::new(AtomicBool::new(false));
     let ran = ran_after_release.clone();
     let handle = tokio::spawn(async move {
@@ -99,7 +97,10 @@ async fn started(poller: &mut TaskProbe, expiry: &mut TaskProbe) -> bool {
 async fn retired(poller: &mut TaskProbe, expiry: &mut TaskProbe) -> bool {
     matches!(
         timeout(HANG_GUARD, async {
-            let (a, b) = tokio::join!(&mut poller.retired, &mut expiry.retired);
+            let (a, b) = tokio::join!(
+                poller.retired.wait_for(|retired| *retired),
+                expiry.retired.wait_for(|retired| *retired)
+            );
             a.is_ok() && b.is_ok()
         })
         .await,
@@ -110,15 +111,22 @@ async fn retired(poller: &mut TaskProbe, expiry: &mut TaskProbe) -> bool {
 async fn finish_detached(poller: &TaskProbe, expiry: &TaskProbe) -> bool {
     poller.abort.abort();
     expiry.abort.abort();
-    // Completion observation, not a latency assertion. The release gates have
-    // already allowed both the original and fixed implementations to retire.
-    timeout(HANG_GUARD, async {
-        while !poller.abort.is_finished() || !expiry.abort.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .is_ok()
+    let mut poller_retired = poller.retired.clone();
+    let mut expiry_retired = expiry.retired.clone();
+    // On this current-thread runtime, a task finishes its final poll before
+    // the retirement notification can resume the observer.
+    matches!(
+        timeout(HANG_GUARD, async {
+            let (a, b) = tokio::join!(
+                poller_retired.wait_for(|retired| *retired),
+                expiry_retired.wait_for(|retired| *retired)
+            );
+            a.is_ok() && b.is_ok()
+        })
+        .await,
+        Ok(true)
+    ) && poller.abort.is_finished()
+        && expiry.abort.is_finished()
 }
 
 #[tokio::test]
@@ -373,7 +381,9 @@ async fn file_source_shutdown_retry_preserves_first_failure_and_joins_second_tas
     let mut source = controlled_source(poller_task, expiry_task).await;
     let both_started = started(&mut poller, &mut expiry).await;
     poller.release();
-    let poller_retired = matches!(timeout(HANG_GUARD, &mut poller.retired).await, Ok(Ok(())));
+    let poller_retired = timeout(HANG_GUARD, poller.retired.wait_for(|retired| *retired))
+        .await
+        .is_ok_and(|result| result.is_ok());
     tokio::task::yield_now().await;
 
     let mut shutdown = Box::pin(source.shutdown());
@@ -387,7 +397,9 @@ async fn file_source_shutdown_retry_preserves_first_failure_and_joins_second_tas
     let second_finished_before_cleanup = expiry.abort.is_finished();
     let repeated = timeout(HANG_GUARD, source.shutdown()).await;
     cleanup_owned(&mut source).await;
-    let expiry_retired = matches!(timeout(HANG_GUARD, &mut expiry.retired).await, Ok(Ok(())));
+    let expiry_retired = timeout(HANG_GUARD, expiry.retired.wait_for(|retired| *retired))
+        .await
+        .is_ok_and(|result| result.is_ok());
 
     assert!(
         both_started && poller_retired && expiry_retired,

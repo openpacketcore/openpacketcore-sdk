@@ -2300,15 +2300,17 @@ mod tests {
             .expect("control request enqueues");
         started_wait.await;
         drop(receiver);
+        let published = bus.subscribe(SubscriberLagPolicy::ForceResync, 1);
         release.notify_one();
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while bus.version() != ConfigVersion::new(1) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("worker finishes publication after its caller is cancelled");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), published.recv())
+            .await
+            .expect("worker finishes publication after its caller is cancelled")
+            .expect("publication retains its subscriber");
+        assert!(matches!(
+            event,
+            ConfigEvent::ResyncRequired { latest_version } if latest_version == ConfigVersion::new(1)
+        ));
 
         assert_eq!(bus.version(), ConfigVersion::new(1));
         assert_eq!(bus.projection_head().tx_id(), Some(tx_id));

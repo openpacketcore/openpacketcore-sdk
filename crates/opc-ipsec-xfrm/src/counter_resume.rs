@@ -1161,7 +1161,7 @@ mod tests {
     struct BlockingReadbackTransport {
         responses: Arc<Mutex<VecDeque<ReadbackResponse>>>,
         calls: Arc<AtomicUsize>,
-        readback_blocked: Arc<AtomicBool>,
+        readback_blocked: tokio::sync::watch::Sender<bool>,
         release: Arc<(Mutex<bool>, Condvar)>,
     }
 
@@ -1170,7 +1170,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses.into_iter().collect())),
                 calls: Arc::new(AtomicUsize::new(0)),
-                readback_blocked: Arc::new(AtomicBool::new(false)),
+                readback_blocked: tokio::sync::watch::Sender::new(false),
                 release: Arc::new((Mutex::new(false), Condvar::new())),
             }
         }
@@ -1199,7 +1199,7 @@ mod tests {
         ) -> ReadbackResponse {
             let call = self.calls.fetch_add(1, Ordering::AcqRel);
             if call == 1 {
-                self.readback_blocked.store(true, Ordering::Release);
+                self.readback_blocked.send_replace(true);
                 let (lock, wake) = &*self.release;
                 let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 while !*released {
@@ -1499,13 +1499,14 @@ mod tests {
             }
         });
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !capture.readback_blocked.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut readback = capture.readback_blocked.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            readback.wait_for(|blocked| *blocked),
+        )
         .await
-        .expect("validation reaches the blocked final readback");
+        .expect("validation reaches the blocked final readback")
+        .expect("test retains its readback publisher");
         expired.store(true, Ordering::Release);
         capture.release_readback();
 

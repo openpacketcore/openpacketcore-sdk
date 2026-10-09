@@ -819,6 +819,8 @@ struct QualificationTrafficObservation {
     watch_reconciliations: AtomicU64,
     watch_reconciled_sequence: AtomicU64,
     watch_traffic_generations: Vec<AtomicU64>,
+    #[cfg(test)]
+    watch_progress: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -947,6 +949,8 @@ impl QualificationTrafficObservation {
             watch_reconciliations: AtomicU64::new(0),
             watch_reconciled_sequence: AtomicU64::new(0),
             watch_traffic_generations: (0..member_count).map(|_| AtomicU64::new(0)).collect(),
+            #[cfg(test)]
+            watch_progress: tokio::sync::watch::Sender::default(),
         }
     }
 
@@ -2529,6 +2533,9 @@ impl QualificationNode {
             .watch_reconciled_sequence
             .store(reconciliation.head, Ordering::Release);
         increment(&observation.watch_reconciliations);
+
+        #[cfg(test)]
+        observation.watch_progress.send_replace(());
 
         let (watch_cancel, watch_cancel_rx) = oneshot::channel();
         let watch_task = tokio::spawn(run_traffic_watch_task(
@@ -5307,6 +5314,8 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                         observation.record_authoritative_replication_head(head);
                         observation.watch_reconciled_sequence.store(head, Ordering::Release);
                         increment(&observation.watch_reconciliations);
+                        #[cfg(test)]
+                        observation.watch_progress.send_replace(());
                         continue;
                     }
                     Some(Err(error)) => {
@@ -5347,6 +5356,8 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                 if applied_records != 0 {
                     add_counter(&observation.watch_applied_records, applied_records);
                 }
+                #[cfg(test)]
+                observation.watch_progress.send_replace(());
                 let Some(next_sequence) = expected_sequence.checked_add(1) else {
                     let failure = QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
@@ -8526,13 +8537,16 @@ mod tests {
     }
 
     async fn wait_for_traffic_watch_reconciliation(observation: &QualificationTrafficObservation) {
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while observation.watch_reconciliations.load(Ordering::Acquire) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            observation
+                .watch_progress
+                .subscribe()
+                .wait_for(|()| observation.watch_reconciliations.load(Ordering::Acquire) != 0),
+        )
         .await
-        .expect("traffic watch recovery installs a replacement stream");
+        .expect("traffic watch recovery installs a replacement stream")
+        .expect("traffic observation remains live");
     }
 
     #[tokio::test(start_paused = true)]
@@ -8727,13 +8741,16 @@ mod tests {
             Arc::clone(&observation),
         ));
 
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while observation.watch_sequence.load(Ordering::Acquire) != 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            observation
+                .watch_progress
+                .subscribe()
+                .wait_for(|()| observation.watch_sequence.load(Ordering::Acquire) == 2),
+        )
         .await
-        .expect("live successor is observed after exact replay");
+        .expect("live successor is observed after exact replay")
+        .expect("traffic observation remains live");
         assert_eq!(observation.failure(), None);
         assert_eq!(
             observation
@@ -9114,10 +9131,10 @@ mod tests {
         assert!(gate.arm());
         assert!(gate.take_armed_response());
         let waiter_gate = Arc::clone(&gate);
-        let waiter = tokio::spawn(async move { waiter_gate.hold_response().await });
-        while gate.status().1 != 1 {
-            tokio::task::yield_now().await;
-        }
+        let mut held_response = Box::pin(async move { waiter_gate.hold_response().await });
+        assert!(futures_util::poll!(&mut held_response).is_pending());
+        assert_eq!(gate.status().1, 1);
+        let waiter = tokio::spawn(held_response);
         assert!(gate.release());
         tokio::time::timeout(Duration::from_millis(100), waiter)
             .await
@@ -9128,10 +9145,10 @@ mod tests {
         assert!(gate.arm());
         assert!(gate.take_armed_response());
         let waiter_gate = Arc::clone(&gate);
-        let waiter = tokio::spawn(async move { waiter_gate.hold_response().await });
-        while gate.status().1 != 1 {
-            tokio::task::yield_now().await;
-        }
+        let mut held_response = Box::pin(async move { waiter_gate.hold_response().await });
+        assert!(futures_util::poll!(&mut held_response).is_pending());
+        assert_eq!(gate.status().1, 1);
+        let waiter = tokio::spawn(held_response);
         assert!(gate.release());
         tokio::time::timeout(Duration::from_millis(100), waiter)
             .await

@@ -353,16 +353,25 @@ async fn scope_batch_requires_every_voter_then_commits_one_command_and_recovers_
         let ambiguous = service.execute(&identity("worker-1"), &replacement).await;
         assert!(ambiguous.is_ok() || ambiguous == Err(ScopeBatchError::OutcomeUnknown));
         tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if service
+            fleet.stores[leader]
+                .inner
+                .raft
+                .metrics()
+                .wait_for(|metrics| {
+                    metrics
+                        .last_applied
+                        .is_some_and(|applied| applied.index > before)
+                })
+                .await
+                .expect("accepted batch engine remains live");
+            assert_eq!(
+                service
                     .current(&identity("worker-1"))
                     .await
-                    .is_ok_and(|view| view.revision() == 2)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+                    .expect("applied accepted batch is readable")
+                    .revision(),
+                2
+            );
         })
         .await
         .unwrap();

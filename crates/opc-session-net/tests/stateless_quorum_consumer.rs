@@ -463,7 +463,7 @@ struct GatedReadBarrierPeer {
     delay: Duration,
     calls: Arc<AtomicUsize>,
     delay_prewrite_empty_append_entries: Arc<AtomicBool>,
-    nonempty_append_entries_seen: Arc<AtomicBool>,
+    nonempty_append_entries_seen: tokio::sync::watch::Sender<bool>,
     prewrite_empty_append_entries_calls: Arc<AtomicUsize>,
     append_entries_decoded: Arc<AtomicUsize>,
     append_entries_decode_failures: Arc<AtomicUsize>,
@@ -593,14 +593,13 @@ impl GatedReadBarrierPeer {
                         .delay_prewrite_empty_append_entries
                         .load(Ordering::Acquire)
                         && append.entries.is_empty()
-                        && !self.nonempty_append_entries_seen.load(Ordering::Acquire)
+                        && !*self.nonempty_append_entries_seen.borrow()
                     {
                         self.prewrite_empty_append_entries_calls
                             .fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(self.delay).await;
                     } else if !append.entries.is_empty() {
-                        self.nonempty_append_entries_seen
-                            .store(true, Ordering::Release);
+                        self.nonempty_append_entries_seen.send_replace(true);
                     }
                 }
                 Err(_) => {
@@ -775,7 +774,7 @@ struct ThreeVoterConsumerFleet {
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
     read_barrier_calls: Arc<AtomicUsize>,
     delay_prewrite_empty_append_entries: Arc<AtomicBool>,
-    nonempty_append_entries_seen: Arc<AtomicBool>,
+    nonempty_append_entries_seen: tokio::sync::watch::Sender<bool>,
     prewrite_empty_append_entries_calls: Arc<AtomicUsize>,
     append_entries_decoded: Arc<AtomicUsize>,
     append_entries_decode_failures: Arc<AtomicUsize>,
@@ -970,7 +969,7 @@ impl ThreeVoterConsumerFleet {
         let mut path_enabled = BTreeMap::new();
         let read_barrier_calls = Arc::new(AtomicUsize::new(0));
         let delay_prewrite_empty_append_entries = Arc::new(AtomicBool::new(false));
-        let nonempty_append_entries_seen = Arc::new(AtomicBool::new(false));
+        let nonempty_append_entries_seen = tokio::sync::watch::Sender::new(false);
         let prewrite_empty_append_entries_calls = Arc::new(AtomicUsize::new(0));
         let append_entries_decoded = Arc::new(AtomicUsize::new(0));
         let append_entries_decode_failures = Arc::new(AtomicUsize::new(0));
@@ -1037,7 +1036,7 @@ impl ThreeVoterConsumerFleet {
                         delay_prewrite_empty_append_entries: Arc::clone(
                             &delay_prewrite_empty_append_entries,
                         ),
-                        nonempty_append_entries_seen: Arc::clone(&nonempty_append_entries_seen),
+                        nonempty_append_entries_seen: nonempty_append_entries_seen.clone(),
                         prewrite_empty_append_entries_calls: Arc::clone(
                             &prewrite_empty_append_entries_calls,
                         ),
@@ -1190,8 +1189,7 @@ impl ThreeVoterConsumerFleet {
         if enabled {
             self.prewrite_empty_append_entries_calls
                 .store(0, Ordering::SeqCst);
-            self.nonempty_append_entries_seen
-                .store(false, Ordering::Release);
+            self.nonempty_append_entries_seen.send_replace(false);
             self.append_entries_decoded.store(0, Ordering::SeqCst);
             self.append_entries_decode_failures
                 .store(0, Ordering::SeqCst);
@@ -1211,7 +1209,7 @@ impl ThreeVoterConsumerFleet {
         (
             self.append_entries_decoded.load(Ordering::SeqCst),
             self.append_entries_decode_failures.load(Ordering::SeqCst),
-            self.nonempty_append_entries_seen.load(Ordering::Acquire),
+            *self.nonempty_append_entries_seen.borrow(),
         )
     }
 
@@ -2775,6 +2773,7 @@ impl SessionQuorumRosterIngress for HandshakeOnlySessionQuorumRosterIngress {
 #[derive(Default)]
 struct HangingConsumer {
     calls: AtomicUsize,
+    calls_changed: tokio::sync::watch::Sender<()>,
 }
 
 #[async_trait]
@@ -2785,6 +2784,7 @@ impl SessionQuorumConsumer for HangingConsumer {
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.calls_changed.send_replace(());
         if matches!(request.operation(), SessionConsumerOperation::Watch { .. }) {
             SessionConsumerResponse::WatchOpened
         } else {
@@ -3583,13 +3583,14 @@ async fn counting_tcp_proxy(
 }
 
 async fn wait_for_dispatches(service: &HangingConsumer, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while service.calls.load(Ordering::SeqCst) < expected {
-            tokio::task::yield_now().await;
-        }
-    })
+    let mut calls = service.calls_changed.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        calls.wait_for(|()| service.calls.load(Ordering::SeqCst) >= expected),
+    )
     .await
-    .expect("bounded fixture observes authenticated dispatches");
+    .expect("bounded fixture observes authenticated dispatches")
+    .expect("fixture retains its dispatch publisher");
 }
 
 #[test]
@@ -5566,10 +5567,14 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     };
     let mutation_elapsed = started.elapsed();
     fleet.set_prewrite_empty_append_entries_delay(false);
-    let observation_deadline = Instant::now() + Duration::from_secs(1);
-    while !fleet.append_entries_observation().2 && Instant::now() < observation_deadline {
-        tokio::task::yield_now().await;
-    }
+    let mut append_progress = fleet.nonempty_append_entries_seen.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        append_progress.wait_for(|nonempty_seen| *nonempty_seen),
+    )
+    .await
+    .expect("the fixture observes the actual Raft write within its original bound")
+    .expect("fleet retains its AppendEntries publisher");
     assert!(
         mutation_elapsed < operation_budget,
         "ordinary consumer write exceeded its complete operation budget"

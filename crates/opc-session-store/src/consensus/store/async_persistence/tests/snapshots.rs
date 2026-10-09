@@ -169,9 +169,10 @@ async fn prepare(fleet: &mut Fleet) -> Story {
         .purge_log(cut.barrier.index)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if fleet
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        races::wait_for([fleet.store(leader).inner.raft.metrics()], || {
+            fleet
                 .store(leader)
                 .inner
                 .raft
@@ -179,12 +180,8 @@ async fn prepare(fleet: &mut Fleet) -> Story {
                 .borrow()
                 .purged
                 .is_some_and(|purged| purged.index >= cut.barrier.index)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+        }),
+    )
     .await
     .expect("actual leader log purge covers the certified barrier");
     cold.inner
@@ -424,17 +421,22 @@ async fn install_base(cold: &ConsensusSessionStore, sender: SessionConsensusNode
     // The real install dispatches a separate log purge. Let that legitimate
     // background generation finish before byte-exact rejection assertions.
     cold.drain_async_persistence().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let progress = cold.persistence_health().asynchronous.unwrap();
-            if progress.completed_generation == progress.resident_generation
-                && progress.captured_generation.is_none()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        races::wait_for(
+            [cold
+                .inner
+                .private_wal
+                .as_ref()
+                .unwrap()
+                .async_progress_for_test()],
+            || {
+                let progress = cold.persistence_health().asynchronous.unwrap();
+                progress.completed_generation == progress.resident_generation
+                    && progress.captured_generation.is_none()
+            },
+        ),
+    )
     .await
     .expect("pre-barrier base and its real purge have completed persistence");
 }
@@ -561,15 +563,14 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
         assert_eq!(new_request.incarnation, story.cut.request.incarnation);
         assert_eq!(new_request.attempt, story.cut.request.attempt + 1);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while cold
+            let permits = cold
                 .inner
                 .persistence_protocol
                 .cold_rpc_admission
-                .available_permits()
-                != 16
-            {
-                tokio::task::yield_now().await;
-            }
+                .acquire_many(16)
+                .await
+                .expect("cold RPC admission remains open while accepted work drains");
+            drop(permits);
         })
         .await
         .unwrap();
@@ -705,15 +706,14 @@ async fn async_persistence_failed_final_snapshot_keeps_cold_admission_and_select
         assert_eq!(cold.inner.raft.metrics().borrow().running_state, Err(fatal));
         assert!(!cold.persistence_health().engine_running);
         tokio::time::timeout(OPERATION_BOUND, async {
-            while cold
+            let permits = cold
                 .inner
                 .persistence_protocol
                 .cold_rpc_admission
-                .available_permits()
-                != 16
-            {
-                tokio::task::yield_now().await;
-            }
+                .acquire_many(16)
+                .await
+                .expect("cold RPC admission remains open while accepted work drains");
+            drop(permits);
         })
         .await
         .expect("failed snapshot's real engine work and admission guard drain");

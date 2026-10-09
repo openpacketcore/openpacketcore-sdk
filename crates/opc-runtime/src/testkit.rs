@@ -584,7 +584,8 @@ mod tests {
     /// 3. This happens BEFORE tasks are stopped
     #[tokio::test]
     async fn test_drain_ordering_readiness_before_stop() {
-        let task_state = Arc::new(std::sync::atomic::AtomicU32::new(0)); // 0: NotStarted, 1: Running, 2: Stopped
+        // 0: NotStarted, 1: Running, 2: Stopped.
+        let task_state = tokio::sync::watch::Sender::new(0_u32);
         let task_started_notify = Arc::new(tokio::sync::Notify::new());
         let task_stop_notify = Arc::new(tokio::sync::Notify::new());
         let readiness_drained_notify = Arc::new(tokio::sync::Notify::new());
@@ -634,13 +635,13 @@ mod tests {
                                 let task_started_notify_inner = task_started_notify_inner.clone();
                                 let task_stop_notify_inner = task_stop_notify_inner.clone();
                                 Box::pin(async move {
-                                    task_state_inner.store(1, Ordering::SeqCst);
+                                    task_state_inner.send_replace(1);
                                     task_started_notify_inner.notify_one();
 
                                     // Wait explicitly for permission to exit
                                     task_stop_notify_inner.notified().await;
 
-                                    task_state_inner.store(2, Ordering::SeqCst);
+                                    task_state_inner.send_replace(2);
                                     Ok(())
                                 })
                             },
@@ -670,7 +671,7 @@ mod tests {
         // Readiness has transitioned to Draining/NotReady
         // Verify the task is still in Running state when Draining begins
         assert_eq!(
-            task_state.load(Ordering::SeqCst),
+            *task_state.borrow(),
             1,
             "Task must be in Running state when Draining begins"
         );
@@ -678,17 +679,14 @@ mod tests {
         // Permit the task to stop now
         task_stop_notify.notify_one();
 
-        // Wait/poll until the task reaches state 2
-        let start = std::time::Instant::now();
-        while task_state.load(Ordering::SeqCst) != 2 {
-            if start.elapsed() > Duration::from_secs(2) {
-                panic!("Timeout waiting for task to transition to Stopped (state 2)");
-            }
-            tokio::task::yield_now().await;
-        }
+        let mut states = task_state.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), states.wait_for(|state| *state == 2))
+            .await
+            .expect("Timeout waiting for task to transition to Stopped (state 2)")
+            .expect("test retains its task-state publisher");
 
         assert_eq!(
-            task_state.load(Ordering::SeqCst),
+            *task_state.borrow(),
             2,
             "Task must have transitioned to Stopped (state 2)"
         );

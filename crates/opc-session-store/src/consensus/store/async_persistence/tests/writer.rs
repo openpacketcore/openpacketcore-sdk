@@ -87,22 +87,30 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
         for voter in fleet.stores.iter().flatten() {
             voter.inner.raft.trigger().snapshot().await.unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if fleet.stores.iter().flatten().all(|voter| {
-                    voter
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            races::wait_for(
+                fleet.stores.iter().flatten().map(|store| {
+                    store
                         .inner
                         .private_wal
                         .as_ref()
                         .unwrap()
-                        .native_snapshot_publication_pending_for_test()
-                        .unwrap()
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+                        .async_progress_for_test()
+                }),
+                || {
+                    fleet.stores.iter().flatten().all(|voter| {
+                        voter
+                            .inner
+                            .private_wal
+                            .as_ref()
+                            .unwrap()
+                            .native_snapshot_publication_pending_for_test()
+                            .unwrap()
+                    })
+                },
+            ),
+        )
         .await
         .expect("actual verified snapshots await the held persistence publication");
         let drain = {
@@ -153,22 +161,28 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
         for gate in &gates {
             gate.release();
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if fleet
-                    .stores
-                    .iter()
-                    .flatten()
-                    .enumerate()
-                    .all(|(index, voter)| {
-                        voter.status().completed_snapshot_count > snapshots[index]
-                    })
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            races::wait_for(
+                fleet.stores.iter().flatten().map(|voter| {
+                    voter
+                        .inner
+                        .backend
+                        .snapshot_observation()
+                        .progress_for_test()
+                }),
+                || {
+                    fleet
+                        .stores
+                        .iter()
+                        .flatten()
+                        .enumerate()
+                        .all(|(index, voter)| {
+                            voter.status().completed_snapshot_count > snapshots[index]
+                        })
+                },
+            ),
+        )
         .await
         .expect("all verified snapshot publications complete after writer release");
         for voter in fleet.stores.iter().flatten() {
@@ -262,18 +276,10 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
         for store in fleet.stores.iter().flatten() {
             store.drain_async_persistence().await.unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if fleet.stores.iter().flatten().all(|store| {
-                    let progress = store.persistence_health().asynchronous.unwrap();
-                    progress.captured_generation.is_none()
-                        && progress.completed_generation == progress.resident_generation
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(Duration::from_secs(3), races::wait_for(fleet.stores.iter().flatten().map(|store| store.inner.private_wal.as_ref().unwrap().async_progress_for_test()), || fleet.stores.iter().flatten().all(|store| {
+ let progress = store.persistence_health().asynchronous.unwrap();
+ progress.captured_generation.is_none() && progress.completed_generation == progress.resident_generation
+})))
         .await
         .expect("ordinary writers have completed all prior work");
         let selected = fleet.selector(follower);
@@ -286,19 +292,9 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
         faults[follower].store(true, Ordering::Release);
         let second_outcome = create(fleet.store(leader), &second).await;
         let failure = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Some(failure) = fleet
-                    .store(follower)
-                    .persistence_health()
-                    .asynchronous
-                    .unwrap()
-                    .background_failure
-                {
-                    break failure;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+ races::wait_for([fleet.store(follower).inner.private_wal.as_ref().unwrap().async_progress_for_test()], || fleet.store(follower).persistence_health().asynchronous.unwrap().background_failure.is_some()).await;
+ fleet.store(follower).persistence_health().asynchronous.unwrap().background_failure.unwrap()
+})
         .await
         .expect("the ordinary background writer reports its real ENOSPC");
         assert_eq!(
@@ -577,11 +573,18 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
             store.shutdown().now_or_never().is_none(),
             "cancel one caller after starting the clone-wide background drain"
         );
-        tokio::time::timeout(OPERATION_BOUND, async {
-            while store.persistence_health().storage_state != SessionStorageState::Draining {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            OPERATION_BOUND,
+            races::wait_for(
+                [store
+                    .inner
+                    .private_wal
+                    .as_ref()
+                    .unwrap()
+                    .async_progress_for_test()],
+                || store.persistence_health().storage_state == SessionStorageState::Draining,
+            ),
+        )
         .await
         .expect("the runtime must observe the held native drain before its deadline");
         let lock =

@@ -82,6 +82,14 @@ async fn exercise_lost_authority(
     // Wait for the existing writer to finish its accepted responsibility
     // before injecting failure into the next ordinary generation.
     races::until(
+        fleet.stores.iter().flatten().map(|store| {
+            store
+                .inner
+                .private_wal
+                .as_ref()
+                .unwrap()
+                .async_progress_for_test()
+        }),
         || {
             fleet.stores.iter().flatten().all(|store| {
                 let progress = store.persistence_health().asynchronous.unwrap();
@@ -109,6 +117,9 @@ async fn exercise_lost_authority(
         .await
         .unwrap();
     races::until(
+        majority
+            .iter()
+            .map(|index| fleet.store(*index).inner.raft.metrics()),
         || {
             majority.iter().all(|index| {
                 fleet
@@ -129,6 +140,15 @@ async fn exercise_lost_authority(
         fleet.store(index).drain_async_persistence().await.unwrap();
     }
     races::until(
+        majority.iter().map(|index| {
+            fleet
+                .store(*index)
+                .inner
+                .private_wal
+                .as_ref()
+                .unwrap()
+                .async_progress_for_test()
+        }),
         || {
             majority.iter().all(|index| {
                 let progress = fleet
@@ -169,6 +189,15 @@ async fn exercise_lost_authority(
         "the acknowledged majority already revoked this predecessor credential"
     );
     races::until(
+        majority.iter().map(|index| {
+            fleet
+                .store(*index)
+                .inner
+                .private_wal
+                .as_ref()
+                .unwrap()
+                .async_progress_for_test()
+        }),
         || {
             majority.iter().all(|index| {
                 fleet

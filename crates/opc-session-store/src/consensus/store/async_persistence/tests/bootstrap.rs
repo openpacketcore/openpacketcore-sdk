@@ -179,21 +179,29 @@ async fn async_persistence_public_reopen_before_first_generation_requires_live_q
             assert_recorded(store, &request, &outcome).await;
             assert!(store.inner.raft.metrics().borrow().last_applied.is_some());
         }
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if fleet.stores.iter().flatten().all(|store| {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            races::wait_for(
+                fleet.stores.iter().flatten().map(|store| {
                     store
-                        .persistence_health()
-                        .asynchronous
+                        .inner
+                        .private_wal
+                        .as_ref()
                         .unwrap()
-                        .background_failure
-                        .is_some()
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+                        .async_progress_for_test()
+                }),
+                || {
+                    fleet.stores.iter().flatten().all(|store| {
+                        store
+                            .persistence_health()
+                            .asynchronous
+                            .unwrap()
+                            .background_failure
+                            .is_some()
+                    })
+                },
+            ),
+        )
         .await
         .expect("every first ordinary background generation fails before selection");
         for (index, store) in fleet.stores.iter().flatten().enumerate() {

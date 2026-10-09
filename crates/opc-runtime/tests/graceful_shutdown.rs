@@ -31,19 +31,19 @@ enum SigtermObservation {
 }
 
 struct SimpleHook {
-    called: Arc<AtomicBool>,
+    called: tokio::sync::watch::Sender<bool>,
 }
 
 #[async_trait::async_trait]
 impl DrainHook for SimpleHook {
     async fn on_drain(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.called.store(true, Ordering::SeqCst);
+        self.called.send_replace(true);
         Ok(())
     }
 }
 
 struct DelayedHook {
-    called: Arc<AtomicBool>,
+    called: tokio::sync::watch::Sender<bool>,
     clock: Arc<FakeClock>,
     delay: Duration,
     entered_sleep: Option<Arc<tokio::sync::Notify>>,
@@ -56,32 +56,32 @@ impl DrainHook for DelayedHook {
             notify.notify_one();
         }
         self.clock.sleep(self.delay).await;
-        self.called.store(true, Ordering::SeqCst);
+        self.called.send_replace(true);
         Ok(())
     }
 }
 
 struct FailingHook {
-    called: Arc<AtomicBool>,
+    called: tokio::sync::watch::Sender<bool>,
 }
 
 #[async_trait::async_trait]
 impl DrainHook for FailingHook {
     async fn on_drain(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.called.store(true, Ordering::SeqCst);
+        self.called.send_replace(true);
         Err(std::io::Error::other("failing hook error").into())
     }
 }
 
 struct ConfigurableFailingHook {
-    called: Arc<AtomicBool>,
+    called: tokio::sync::watch::Sender<bool>,
     error_msg: String,
 }
 
 #[async_trait::async_trait]
 impl DrainHook for ConfigurableFailingHook {
     async fn on_drain(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.called.store(true, Ordering::SeqCst);
+        self.called.send_replace(true);
         Err(std::io::Error::other(self.error_msg.clone()).into())
     }
 }
@@ -257,14 +257,12 @@ async fn observe_sigterm_with_runtime_handle(
     observe_sigterm(RuntimeObservation::Handle(handle), control_sigterm).await
 }
 
-async fn wait_until_hook_called(called: &AtomicBool) {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !called.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("drain hook should be called");
+async fn wait_until_hook_called(called: &tokio::sync::watch::Sender<bool>) {
+    let mut calls = called.subscribe();
+    tokio::time::timeout(Duration::from_secs(1), calls.wait_for(|called| *called))
+        .await
+        .expect("drain hook should be called")
+        .expect("test retains its drain-hook publisher");
 }
 
 async fn advance_fake_clock_until_stopped(
@@ -307,7 +305,7 @@ async fn test_drain_hook_is_called_on_shutdown_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(SimpleHook {
         called: called.clone(),
     });
@@ -318,14 +316,11 @@ async fn test_drain_hook_is_called_on_shutdown_impl() {
         .await
         .unwrap();
 
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     handle.shutdown().await;
 
-    assert!(
-        called.load(Ordering::SeqCst),
-        "Drain hook must be called on shutdown"
-    );
+    assert!(*called.borrow(), "Drain hook must be called on shutdown");
 }
 
 async fn test_drain_hook_timeout_respects_fake_clock_impl() {
@@ -338,7 +333,7 @@ async fn test_drain_hook_timeout_respects_fake_clock_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let entered_sleep = Arc::new(tokio::sync::Notify::new());
     let hook = Arc::new(DelayedHook {
         called: called.clone(),
@@ -354,7 +349,7 @@ async fn test_drain_hook_timeout_respects_fake_clock_impl() {
         .await
         .unwrap();
 
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     // Spawn shutdown in a separate task since it will block on clock.sleep
     let handle_clone = handle.clone();
@@ -372,7 +367,7 @@ async fn test_drain_hook_timeout_respects_fake_clock_impl() {
 
     // The hook should have timed out and therefore not set called to true
     assert!(
-        !called.load(Ordering::SeqCst),
+        !*called.borrow(),
         "Drain hook must time out and not complete successfully"
     );
 }
@@ -387,7 +382,7 @@ async fn test_drain_hook_completes_when_fake_clock_advanced_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let entered_sleep = Arc::new(tokio::sync::Notify::new());
     let hook = Arc::new(DelayedHook {
         called: called.clone(),
@@ -403,7 +398,7 @@ async fn test_drain_hook_completes_when_fake_clock_advanced_impl() {
         .await
         .unwrap();
 
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     // Spawn shutdown in a separate task
     let handle_clone = handle.clone();
@@ -421,7 +416,7 @@ async fn test_drain_hook_completes_when_fake_clock_advanced_impl() {
 
     // The hook should have successfully completed
     assert!(
-        called.load(Ordering::SeqCst),
+        *called.borrow(),
         "Drain hook must complete successfully when advanced"
     );
 }
@@ -434,7 +429,7 @@ async fn test_failing_drain_hook_does_not_abort_shutdown_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(FailingHook {
         called: called.clone(),
     });
@@ -445,13 +440,13 @@ async fn test_failing_drain_hook_does_not_abort_shutdown_impl() {
         .await
         .unwrap();
 
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     // Shutdown should proceed and complete successfully even if the hook returns Err
     handle.shutdown().await;
 
     assert!(
-        called.load(Ordering::SeqCst),
+        *called.borrow(),
         "Failing drain hook must still be called on shutdown"
     );
 }
@@ -466,7 +461,7 @@ async fn test_sigterm_triggers_graceful_shutdown_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(SimpleHook {
         called: called.clone(),
     });
@@ -495,7 +490,7 @@ async fn test_sigterm_triggers_graceful_shutdown_impl() {
         .await
         .unwrap();
 
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     let mut start_instant = std::time::Instant::now();
 
@@ -536,7 +531,7 @@ async fn test_sigterm_triggers_graceful_shutdown_impl() {
         "{trigger} must trigger full graceful shutdown to Stopped phase within 5 seconds"
     );
     assert!(
-        called.load(Ordering::SeqCst),
+        *called.borrow(),
         "{trigger} must trigger the drain hook execution"
     );
 
@@ -557,7 +552,7 @@ async fn test_sigterm_conformance_requests_shutdown_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(SimpleHook {
         called: called.clone(),
     });
@@ -578,7 +573,7 @@ async fn test_sigterm_conformance_requests_shutdown_impl() {
                 "Conformance-mode SIGTERM must request shutdown"
             );
             assert!(
-                !called.load(Ordering::SeqCst),
+                !*called.borrow(),
                 "Conformance-mode signal delivery only requests shutdown; handle.shutdown() drives drain hooks"
             );
             assert!(
@@ -605,7 +600,7 @@ async fn test_sigterm_conformance_requests_shutdown_impl() {
         "explicit Conformance-mode shutdown must complete the full drain sequence"
     );
     assert!(
-        called.load(Ordering::SeqCst),
+        *called.borrow(),
         "explicit Conformance-mode shutdown must run drain hooks"
     );
 }
@@ -766,7 +761,7 @@ async fn test_run_executes_hooks_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(SimpleHook {
         called: called.clone(),
     });
@@ -801,7 +796,7 @@ async fn test_run_executes_hooks_impl() {
     }
 
     let token = token.unwrap();
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     // Request graceful shutdown
     token.request_shutdown();
@@ -811,7 +806,7 @@ async fn test_run_executes_hooks_impl() {
 
     // The registered hook must have been executed successfully
     assert!(
-        called.load(Ordering::SeqCst),
+        *called.borrow(),
         "run must execute the registered drain hooks"
     );
 }
@@ -1370,7 +1365,7 @@ async fn test_delayed_hook_shutdown_uses_observation_window_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let entered_sleep = Arc::new(tokio::sync::Notify::new());
     let hook = Arc::new(DelayedHook {
         called: called.clone(),
@@ -1418,7 +1413,7 @@ async fn test_immediate_hook_shutdown_ignores_large_grace_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(SimpleHook {
         called: called.clone(),
     });
@@ -1457,7 +1452,7 @@ async fn test_mistuned_budgets_starvation_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(SimpleHook {
         called: called.clone(),
     });
@@ -1583,7 +1578,7 @@ async fn test_failing_drain_hook_raises_alarm_impl() {
         ..Default::default()
     };
 
-    let called = Arc::new(AtomicBool::new(false));
+    let called = tokio::sync::watch::Sender::new(false);
     let hook = Arc::new(FailingHook {
         called: called.clone(),
     });
@@ -1595,12 +1590,12 @@ async fn test_failing_drain_hook_raises_alarm_impl() {
         .await
         .unwrap();
 
-    assert!(!called.load(Ordering::SeqCst));
+    assert!(!*called.borrow());
 
     handle.shutdown().await;
 
     assert!(
-        called.load(Ordering::SeqCst),
+        *called.borrow(),
         "Failing drain hook must still be called on shutdown"
     );
 
@@ -1626,13 +1621,13 @@ async fn test_multiple_failing_drain_hooks_aggregated_alarm_impl() {
         ..Default::default()
     };
 
-    let called1 = Arc::new(AtomicBool::new(false));
+    let called1 = tokio::sync::watch::Sender::new(false);
     let hook1 = Arc::new(ConfigurableFailingHook {
         called: called1.clone(),
         error_msg: "first hook failure".to_string(),
     });
 
-    let called2 = Arc::new(AtomicBool::new(false));
+    let called2 = tokio::sync::watch::Sender::new(false);
     let hook2 = Arc::new(ConfigurableFailingHook {
         called: called2.clone(),
         error_msg: "second hook failure".to_string(),
@@ -1646,17 +1641,17 @@ async fn test_multiple_failing_drain_hooks_aggregated_alarm_impl() {
         .await
         .unwrap();
 
-    assert!(!called1.load(Ordering::SeqCst));
-    assert!(!called2.load(Ordering::SeqCst));
+    assert!(!*called1.borrow());
+    assert!(!*called2.borrow());
 
     handle.shutdown().await;
 
     assert!(
-        called1.load(Ordering::SeqCst),
+        *called1.borrow(),
         "First failing drain hook must be called on shutdown"
     );
     assert!(
-        called2.load(Ordering::SeqCst),
+        *called2.borrow(),
         "Second failing drain hook must be called on shutdown"
     );
 
@@ -1698,12 +1693,12 @@ async fn test_mixed_drain_hooks_executes_all_and_raises_alarm_impl() {
         ..Default::default()
     };
 
-    let called_success = Arc::new(AtomicBool::new(false));
+    let called_success = tokio::sync::watch::Sender::new(false);
     let hook_success = Arc::new(SimpleHook {
         called: called_success.clone(),
     });
 
-    let called_fail = Arc::new(AtomicBool::new(false));
+    let called_fail = tokio::sync::watch::Sender::new(false);
     let hook_fail = Arc::new(ConfigurableFailingHook {
         called: called_fail.clone(),
         error_msg: "failed hook in mixed setup".to_string(),
@@ -1717,18 +1712,18 @@ async fn test_mixed_drain_hooks_executes_all_and_raises_alarm_impl() {
         .await
         .unwrap();
 
-    assert!(!called_success.load(Ordering::SeqCst));
-    assert!(!called_fail.load(Ordering::SeqCst));
+    assert!(!*called_success.borrow());
+    assert!(!*called_fail.borrow());
 
     handle.shutdown().await;
 
     // A mix of succeeding and failing drain hooks executes all hooks
     assert!(
-        called_success.load(Ordering::SeqCst),
+        *called_success.borrow(),
         "Succeeding drain hook must still be called on shutdown"
     );
     assert!(
-        called_fail.load(Ordering::SeqCst),
+        *called_fail.borrow(),
         "Failing drain hook must still be called on shutdown"
     );
 

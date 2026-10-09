@@ -255,6 +255,9 @@ pub(crate) trait SctpTransportClose: Send + Sync {
 
     /// Whether the sealed carrier has observed a terminal transition.
     fn is_closed(&self) -> bool;
+
+    #[cfg(test)]
+    fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()>;
 }
 
 /// Message-oriented SCTP seam between the DTLS association and a transport.
@@ -514,6 +517,7 @@ impl fmt::Debug for SctpWireLog {
 #[cfg(test)]
 struct InMemoryShared {
     closed: AtomicBool,
+    terminal_changed: tokio::sync::watch::Sender<()>,
     block_a_to_b_dtls: AtomicBool,
     block_b_to_a_dtls: AtomicBool,
     next_a_to_b_metadata: Mutex<Option<SctpUserMessage>>,
@@ -537,11 +541,16 @@ enum PreviousAuthKey {
 impl SctpTransportClose for InMemoryClose {
     fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
+        self.shared.terminal_changed.send_replace(());
         self.shared.notify.notify_waiters();
     }
 
     fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
+    }
+
+    fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.shared.terminal_changed.subscribe()
     }
 }
 
@@ -921,6 +930,7 @@ pub fn in_memory_sctp_link(
     let (b_tx, a_rx) = mpsc::channel(capacity.max(1));
     let shared = Arc::new(InMemoryShared {
         closed: AtomicBool::new(false),
+        terminal_changed: tokio::sync::watch::Sender::default(),
         block_a_to_b_dtls: AtomicBool::new(false),
         block_b_to_a_dtls: AtomicBool::new(false),
         next_a_to_b_metadata: Mutex::new(None),
@@ -964,16 +974,25 @@ pub fn in_memory_sctp_link(
 struct KernelSctpClose {
     abort: SctpAssociationAbortHandle,
     terminal: Arc<AtomicBool>,
+    #[cfg(test)]
+    terminal_changed: tokio::sync::watch::Sender<()>,
 }
 
 impl SctpTransportClose for KernelSctpClose {
     fn close(&self) {
         self.terminal.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.terminal_changed.send_replace(());
         self.abort.abort();
     }
 
     fn is_closed(&self) -> bool {
         self.terminal.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.terminal_changed.subscribe()
     }
 }
 
@@ -987,6 +1006,8 @@ impl SctpTransportClose for KernelSctpClose {
 pub struct KernelSctpMessageIo {
     protected_ppid: u32,
     terminal: Arc<AtomicBool>,
+    #[cfg(test)]
+    terminal_changed: tokio::sync::watch::Sender<()>,
     send: SctpAssociationSendHalf,
     inbound: mpsc::Receiver<Result<SctpUserMessage, DiameterTlsError>>,
     abort: SctpAssociationAbortHandle,
@@ -1039,6 +1060,10 @@ impl KernelSctpMessageIo {
         let task_abort = abort.clone();
         let terminal = Arc::new(AtomicBool::new(false));
         let task_terminal = Arc::clone(&terminal);
+        #[cfg(test)]
+        let terminal_changed = tokio::sync::watch::Sender::default();
+        #[cfg(test)]
+        let task_terminal_changed = terminal_changed.clone();
         let receive_task = runtime.spawn(async move {
             let result: Result<(), DiameterTlsError> = async {
                 loop {
@@ -1080,6 +1105,8 @@ impl KernelSctpMessageIo {
                 let _ = inbound_tx.try_send(Err(error));
             }
             task_terminal.store(true, Ordering::Release);
+            #[cfg(test)]
+            task_terminal_changed.send_replace(());
             task_abort.abort();
         });
         Ok(Self {
@@ -1093,6 +1120,8 @@ impl KernelSctpMessageIo {
             phase: SctpIoPhase::Fresh,
             protected_ppid,
             terminal,
+            #[cfg(test)]
+            terminal_changed,
         })
     }
 
@@ -1379,6 +1408,8 @@ impl SctpMessageIo for KernelSctpMessageIo {
         Arc::new(KernelSctpClose {
             abort: self.abort.clone(),
             terminal: Arc::clone(&self.terminal),
+            #[cfg(test)]
+            terminal_changed: self.terminal_changed.clone(),
         })
     }
 }
@@ -1386,6 +1417,8 @@ impl SctpMessageIo for KernelSctpMessageIo {
 impl Drop for KernelSctpMessageIo {
     fn drop(&mut self) {
         self.terminal.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.terminal_changed.send_replace(());
         self.abort.abort();
         self.receive_task.abort();
     }

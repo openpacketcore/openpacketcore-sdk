@@ -47,7 +47,7 @@ pub(crate) struct ConnectionOutcomeTestAccounting {
     timeout_failures: AtomicU64,
     successes: AtomicU64,
     drain_started: AtomicU64,
-    drain_completed: AtomicU64,
+    drain_completed: tokio::sync::watch::Sender<u64>,
 }
 
 impl ConnectionOutcomeTestAccounting {
@@ -57,7 +57,7 @@ impl ConnectionOutcomeTestAccounting {
             timeout_failures: self.timeout_failures.load(Ordering::Relaxed),
             successes: self.successes.load(Ordering::Relaxed),
             drain_started: self.drain_started.load(Ordering::Relaxed),
-            drain_completed: self.drain_completed.load(Ordering::Relaxed),
+            drain_completed: *self.drain_completed.borrow(),
         }
     }
 
@@ -72,7 +72,19 @@ impl ConnectionOutcomeTestAccounting {
     }
 
     pub(crate) fn record_drain_completed(&self) {
-        self.drain_completed.fetch_add(1, Ordering::Relaxed);
+        self.drain_completed
+            .send_modify(|completed| *completed += 1);
+    }
+
+    pub(crate) async fn wait_for_drain_completion(&self, minimum: u64) {
+        let mut completed = self.drain_completed.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            completed.wait_for(|completed| *completed >= minimum),
+        )
+        .await
+        .expect("aborted lifecycle task must release its draining metric")
+        .expect("test accounting retains its drain publisher");
     }
 }
 

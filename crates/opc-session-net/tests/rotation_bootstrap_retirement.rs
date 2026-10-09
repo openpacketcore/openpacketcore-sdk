@@ -314,11 +314,25 @@ fn load(counter: &AtomicU64) -> u64 {
     counter.load(Ordering::Relaxed)
 }
 
-async fn wait_for_success_count(expected: u64) {
+async fn wait_for_retired_connection(
+    tls: &mut (impl tokio::io::AsyncRead + Unpin),
+    finish: impl std::future::Future<Output = ()>,
+    expected: u64,
+) {
     tokio::time::timeout(Duration::from_secs(2), async {
-        while load(&METRICS.session_net_connection_successes) < expected {
-            tokio::task::yield_now().await;
+        let mut trailing = [0_u8; 1];
+        match tokio::io::AsyncReadExt::read(tls, &mut trailing).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            outcome => {
+                panic!("retirement must close the connection without another frame: {outcome:?}")
+            }
         }
+        // The server records the outcome in the same final poll that drops
+        // its transport. Join after observing closure to include that metric
+        // publication without interrupting a live authenticated connection.
+        finish.await;
+        assert!(load(&METRICS.session_net_connection_successes) >= expected);
     })
     .await
     .expect("connection outcome metric must publish");
@@ -865,7 +879,7 @@ async fn assert_generic_server_pre_hello_rotation(
         .expect("read generic retirement control"),
         Response::ConnectionRetiring
     ));
-    wait_for_success_count(before.successes + 1).await;
+    wait_for_retired_connection(&mut tls, handle.abort_and_wait(), before.successes + 1).await;
     let delta = MetricSnapshot::capture().since(before);
     assert_eq!((delta.attempts, delta.successes), (1, 1));
     assert_eq!((delta.reconnect_attempts, delta.reconnect_failures), (0, 0));
@@ -885,7 +899,6 @@ async fn assert_generic_server_pre_hello_rotation(
     }
     delta.assert_no_failures();
     drop(tls);
-    handle.abort_and_wait().await;
 }
 
 #[derive(Debug)]
@@ -947,7 +960,7 @@ async fn assert_consensus_server_pre_hello_rotation(
     .expect("consensus retirement control timeout")
     .expect("read consensus retirement control");
     assert_eq!(control, serde_json::json!({"Rejected": "Rejected"}));
-    wait_for_success_count(before.successes + 1).await;
+    wait_for_retired_connection(&mut tls, handle.abort_and_wait(), before.successes + 1).await;
     let delta = MetricSnapshot::capture().since(before);
     assert_eq!((delta.attempts, delta.successes), (1, 1));
     assert_eq!((delta.reconnect_attempts, delta.reconnect_failures), (0, 0));
@@ -968,7 +981,6 @@ async fn assert_consensus_server_pre_hello_rotation(
     delta.assert_no_failures();
     assert_eq!(handler.0.load(Ordering::Relaxed), 0);
     drop(tls);
-    handle.abort_and_wait().await;
 }
 
 #[test]
