@@ -6,6 +6,9 @@ use crate::ebpf::workload_scope::{cleanup, CleanupInventory, WorkloadCleanup};
 
 const OPERATION: &str = "ebpf_workload_cleanup";
 
+#[cfg(test)]
+mod program_scan_tests;
+
 pub(super) fn reset(
     runtime: &AyaGtpuRuntime,
     ifindex: Option<u32>,
@@ -80,12 +83,13 @@ impl KernelCleanup {
         } else {
             HashSet::new()
         };
-        for result in loaded_programs() {
+        for result in programs_during_scan() {
             let info = result.map_err(|error| program_error(OPERATION, &error))?;
-            let referenced = info
-                .map_ids()
-                .map_err(|error| program_error(OPERATION, &error))?
-                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let referenced = match program_map_ids_during_scan(&info) {
+                Err(error) if program_id_disappeared_during_scan(&error) => continue,
+                result => result.map_err(|error| program_error(OPERATION, &error))?,
+            }
+            .ok_or_else(|| state_indeterminate(OPERATION))?;
             if referenced.iter().any(|id| ids.contains(id)) && !allowed.contains(&info.id()) {
                 return Err(GtpuError::RetryRequired {
                     operation: "ebpf_workload_cleanup_program_references",

@@ -492,6 +492,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acceptance, preserving its 150 ms request deadline and both one-second phase
   guards. Fixes #1179.
 
+- `opc-gtpu-dataplane`: tolerate programs retired between kernel ID enumeration
+  and reopen in historical, generation, hook-identity and workload cleanup
+  scans. Only `ENOENT` from reopening the program ID is treated as absence;
+  live foreign references, missing required targets and all other inspection
+  errors still refuse ownership or cleanup. (#1180)
+
 - `opc-mgmt-audit-store`: synchronize the stalled-worker regression with the
   admitted append's final result before authenticated readback, retaining its
   acknowledgement, shutdown and completion bounds. A backend-error control
