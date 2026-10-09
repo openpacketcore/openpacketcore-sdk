@@ -1,7 +1,7 @@
 use super::*;
 
 const ACTIVATIONS: [CapabilityActivationKind; 4] = [
-    CapabilityActivationKind::ScopeProfileV3,
+    CapabilityActivationKind::ScopeProfileV4,
     CapabilityActivationKind::FencedTransitionV1,
     CapabilityActivationKind::ProtectedRosterV1,
     CapabilityActivationKind::ProtectedRosterV2,
@@ -9,8 +9,8 @@ const ACTIVATIONS: [CapabilityActivationKind; 4] = [
 
 fn marker(activation: CapabilityActivationKind) -> Entry<SessionRaftTypeConfig> {
     let intent = match activation {
-        CapabilityActivationKind::ScopeProfileV3 => SessionMutationIntent::ActivateScopeProfile(
-            Box::new(crate::scope_lease::ScopeProfileActivation::new(
+        CapabilityActivationKind::ScopeProfileV4 => SessionMutationIntent::ActivateScopeProfile(
+            Box::new(crate::scope_authority::ScopeProfileActivation::new(
                 identity(),
                 fenced_transition_voter_set_digest(identity(), &expected_members()),
             )),

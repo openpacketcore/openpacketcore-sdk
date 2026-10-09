@@ -587,7 +587,7 @@ impl BusinessChanges {
         })?;
         for (key, change) in &self.keys {
             check()?;
-            scope_lease::validate_replacement(
+            scope_authority::validate_replacement(
                 key,
                 change.before.as_deref().map(|row| &**row),
                 change.after.as_deref().map(|row| &**row),
@@ -980,7 +980,7 @@ impl Publication {
         let memory = Arc::new(memory);
         for (key, row) in &keys {
             validation::validate_key(key, row, &frontiers)?;
-            scope_lease::validate_replacement(
+            scope_authority::validate_replacement(
                 key,
                 base.keys.get(key).map(|row| &**row),
                 Some(row),

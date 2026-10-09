@@ -10,7 +10,7 @@ pub(crate) struct ScopeBatchPlan {
 }
 
 impl ScopeBatchCheckpoint {
-    pub(crate) fn empty(scope: ScopeLeaseId) -> Self {
+    pub(crate) fn empty(scope: ScopeId) -> Self {
         Self {
             scope,
             revision: 0,
@@ -25,6 +25,15 @@ impl ScopeBatchCheckpoint {
     }
 
     pub(crate) fn validate_stored(&self) -> Result<(), ScopeBatchError> {
+        if self.revision == 0 {
+            // AdmitInitial commits this canonical header with authority. Its
+            // presence distinguishes an unused ledger from missing floors.
+            return if *self == Self::empty(self.scope.clone()) {
+                Ok(())
+            } else {
+                Err(ScopeBatchError::FormatMismatch)
+            };
+        }
         let lane = &self.lanes[0];
         let outcome = lane
             .outcome
@@ -56,9 +65,37 @@ impl ScopeBatchCheckpoint {
         Ok(())
     }
 
+    /// The caller must first establish through a full-round authority read
+    /// that the old stamp has been superseded. This function only reads receipts.
+    pub(crate) fn resolve(
+        &self,
+        request: &ScopeBatchRequest,
+    ) -> Result<ScopeBatchResolution, ScopeBatchError> {
+        request.validate()?;
+        if request.scope() != &self.scope {
+            return Err(ScopeAuthorityError::Unauthorized.into());
+        }
+        let lane = &self.lanes[usize::from(request.lane)];
+        if request.sequence <= lane.floor {
+            return Ok(ScopeBatchResolution::Unknown);
+        }
+        if request.request_id == lane.last_request_id {
+            if request.digest()? != lane.last_digest {
+                return Err(ScopeBatchError::IdempotencyConflict);
+            }
+            return lane
+                .outcome
+                .clone()
+                .map(Box::new)
+                .map(ScopeBatchResolution::Applied)
+                .ok_or(ScopeBatchError::FormatMismatch);
+        }
+        Ok(ScopeBatchResolution::NotApplied)
+    }
+
     pub(crate) fn replay(&self, request: &ScopeBatchRequest) -> Result<bool, ScopeBatchError> {
         if request.scope() != &self.scope {
-            return Err(ScopeLeaseError::Unauthorized.into());
+            return Err(ScopeAuthorityError::Unauthorized.into());
         }
         let lane = self
             .lanes
@@ -84,7 +121,6 @@ impl ScopeBatchCommand {
         &self,
         authority: &ScopeState,
         checkpoint: &ScopeBatchCheckpoint,
-        apply_time: opc_types::Timestamp,
         read: impl Fn(&SessionKey) -> Result<Option<ScopeRow>, ScopeBatchError>,
     ) -> Result<ScopeBatchPlan, ScopeBatchError> {
         self.validate()?;
@@ -96,34 +132,18 @@ impl ScopeBatchCommand {
         }
         let scope = self.request.scope();
         if authority.view.scope() != scope {
-            return Err(ScopeLeaseError::Unauthorized.into());
+            return Err(ScopeAuthorityError::Unauthorized.into());
         }
-        let current = authority
-            .view
-            .permit()
-            .ok_or(ScopeLeaseError::StalePermit)?;
-        let supplied = &self.request.permit;
-        if current.scope() != supplied.scope()
-            || current.execution() != supplied.execution()
-            || current.selection() != supplied.selection()
-            || current.grant_epoch() != supplied.grant_epoch()
-            || authority.view.selection() != supplied.selection()
-            || authority.view.selected() != Some(supplied.execution())
-        {
-            return Err(ScopeLeaseError::StalePermit.into());
-        }
-        // The trusted interval alone can only be made more conservative by
-        // the replicated application clock. A command delayed past the stop
-        // deadline cannot acquire authority from its old preparation time.
-        if self.bounds.latest().max(apply_time) >= current.stop_at() {
-            return Err(ScopeLeaseError::Expired.into());
-        }
+        authority.check_stamp(&self.request.stamp)?;
+        let namespace = self.request.namespace();
         let revision = next(checkpoint.revision)?;
         let mut conflicts = ScopeBatchConflicts::default();
         let mut predecessors = Vec::with_capacity(self.request.operations.len());
         for op in &self.request.operations {
-            let predecessor = match read(&child_key(scope, op.key())?)? {
-                Some(ScopeRow::Child(row)) if row.scope == *scope && row.key == op.key() => {
+            let predecessor = match read(&child_key(namespace, op.key())?)? {
+                Some(ScopeRow::Child(row))
+                    if row.namespace == *namespace && row.key == op.key() =>
+                {
                     Some(row)
                 }
                 None => None,
@@ -153,11 +173,11 @@ impl ScopeBatchCommand {
             .filter(|row| row.value.is_some())
         {
             for claim in &predecessor.claims {
-                let key = claim_key(scope, *claim)?;
+                let key = claim_key(namespace, *claim)?;
                 let Some(ScopeRow::Claim(mut row)) = read(&key)? else {
                     return Err(ScopeBatchError::FormatMismatch);
                 };
-                if row.scope != *scope
+                if row.namespace != *namespace
                     || row.owner
                         != Some(ClaimOwner {
                             child: predecessor.key,
@@ -186,13 +206,15 @@ impl ScopeBatchCommand {
                 birth: version.birth,
             };
             for claim in op.claims() {
-                let key = claim_key(scope, *claim)?;
+                let key = claim_key(namespace, *claim)?;
                 let current = match rows.get(&key) {
                     Some(row) => Some(row.clone()),
                     None => read(&key)?,
                 };
                 let occupied = match current {
-                    Some(ScopeRow::Claim(row)) if row.scope == *scope && row.key == *claim => {
+                    Some(ScopeRow::Claim(row))
+                        if row.namespace == *namespace && row.key == *claim =>
+                    {
                         row.owner.is_some()
                     }
                     None => false,
@@ -207,7 +229,7 @@ impl ScopeBatchCommand {
                 rows.insert(
                     key,
                     ScopeRow::Claim(ClaimRow {
-                        scope: scope.clone(),
+                        namespace: namespace.clone(),
                         key: *claim,
                         revision,
                         owner: Some(owner),
@@ -220,9 +242,9 @@ impl ScopeBatchCommand {
                 ScopeChildMutation::Delete { .. } => None,
             };
             rows.insert(
-                child_key(scope, op.key())?,
+                child_key(namespace, op.key())?,
                 ScopeRow::Child(ScopeChildRecord {
-                    scope: scope.clone(),
+                    namespace: namespace.clone(),
                     key: op.key(),
                     revision: version,
                     batch_revision: revision,

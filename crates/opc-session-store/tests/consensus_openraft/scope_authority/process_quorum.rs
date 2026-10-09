@@ -1,5 +1,5 @@
 //! Each voter owns its own process, SQLite root, listener and Raft runtime.
-//! The local test control channel injects trusted admission/time fixtures; it
+//! The local test control channel injects trusted admission/closure fixtures; it
 //! is not a production consumer transport or an authentication implementation.
 
 use super::*;
@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 mod membership;
 
 const NODE_ENV: &str = "OPC_SCOPE_PROCESS_NODE";
-const TEST_NAME: &str = "scope_lease::process_quorum::scope_quorum_processes_fail_over_race_and_recover_compacted_authority";
+const TEST_NAME: &str = "scope_authority::process_quorum::scope_quorum_processes_fail_over_race_and_recover_compacted_authority";
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -39,13 +39,11 @@ enum Request {
     },
     Current,
     Execute {
-        at: u64,
         actor: String,
-        request: Box<ScopeLeaseRequest>,
+        request: Box<ScopeAuthorityRequest>,
         crash_after_commit: bool,
     },
     ExecuteBatch {
-        at: u64,
         actor: String,
         request: Box<ScopeBatchRequest>,
         crash_after_commit: bool,
@@ -79,7 +77,7 @@ enum Reply {
         admitted: bool,
         health: String,
     },
-    Scope(Box<Result<ScopeLeaseView, ScopeLeaseError>>),
+    Scope(Box<Result<ScopeAuthorityView, ScopeAuthorityError>>),
     Batch(Box<Result<ScopeBatchOutcome, ScopeBatchError>>),
     BatchState(Box<BatchState>),
     Snapshot {
@@ -289,7 +287,7 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
         .unwrap()
     };
     let controls = Arc::new(membership::Controls::default());
-    let scope = ScopeLeaseId::new(
+    let scope = ScopeId::new(
         identity,
         TenantId::new("scope-quorum-test").unwrap(),
         NetworkFunctionKind::new("test").unwrap(),
@@ -297,10 +295,8 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
     )
     .unwrap();
     let initializing = store.clone();
-    let clock = Arc::new(BoundedClock(AtomicU64::new(0)));
     let authority = Arc::new(tokio::sync::OnceCell::new());
     let initialized = authority.clone();
-    let initial_clock = clock.clone();
     let initial_scope = scope.clone();
     tokio::spawn(async move {
         if initialize {
@@ -308,10 +304,9 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
         }
         initialized
             .set(
-                ScopeLeaseStore::new(
+                ScopeAuthorityStore::new(
                     Arc::new(initializing),
                     initial_scope.clone(),
-                    initial_clock,
                     Arc::new(Admission(initial_scope)),
                 )
                 .unwrap(),
@@ -322,7 +317,6 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
         let (mut socket, _) = listener.accept().await.unwrap();
         let store = store.clone();
         let authority = authority.clone();
-        let clock = clock.clone();
         let database = database.clone();
         let votes = votes.clone();
         let controls = controls.clone();
@@ -392,18 +386,16 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                 }
                 Request::Current => Reply::Scope(Box::new(match authority.get() {
                     Some(authority) => authority.current(&principal("worker-1")).await,
-                    None => Err(ScopeLeaseError::Unavailable),
+                    None => Err(ScopeAuthorityError::Unavailable),
                 })),
                 Request::Execute {
-                    at,
                     actor,
                     request,
                     crash_after_commit,
                 } => {
-                    clock.0.store(at, Ordering::SeqCst);
                     let result = match authority.get() {
                         Some(authority) => authority.execute(&principal(&actor), &request).await,
-                        None => Err(ScopeLeaseError::Unavailable),
+                        None => Err(ScopeAuthorityError::Unavailable),
                     };
                     if crash_after_commit {
                         assert!(
@@ -414,19 +406,17 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                         // two voter processes still running and serving Raft.
                         std::process::exit(77);
                     }
-                    if result.is_ok() && controls.lose_lease_reply() {
+                    if result.is_ok() && controls.lose_authority_reply() {
                         return;
                     }
                     Reply::Scope(Box::new(result))
                 }
                 Request::ExecuteBatch {
-                    at,
                     actor,
                     request,
                     crash_after_commit,
                 } => {
-                    clock.0.store(at, Ordering::SeqCst);
-                    let batch = batch_service(&store, clock, &scope);
+                    let batch = batch_service(&store, &scope);
                     let result = batch.execute(&principal(&actor), &request).await;
                     if crash_after_commit {
                         assert!(
@@ -441,7 +431,7 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                     Reply::Batch(Box::new(result))
                 }
                 Request::ReadBatch { keys } => {
-                    let batch = batch_service(&store, clock, &scope);
+                    let batch = batch_service(&store, &scope);
                     let view = batch.current(&principal("worker-1")).await.unwrap();
                     let mut rows = Vec::new();
                     for key in keys {
@@ -833,7 +823,7 @@ impl Processes {
         .expect("restore automatic elections within the unchanged failover deadline");
         elected
     }
-    async fn current(&self, index: usize) -> ScopeLeaseView {
+    async fn current(&self, index: usize) -> ScopeAuthorityView {
         match call(self.addresses[index], Request::Current).await.unwrap() {
             Reply::Scope(result) => (*result).unwrap(),
             _ => panic!("scope reply expected"),
@@ -842,14 +832,13 @@ impl Processes {
     async fn execute(
         &self,
         index: usize,
-        at: u64,
+
         actor: &str,
-        request: ScopeLeaseRequest,
-    ) -> Result<ScopeLeaseView, ScopeLeaseError> {
+        request: ScopeAuthorityRequest,
+    ) -> Result<ScopeAuthorityView, ScopeAuthorityError> {
         match call(
             self.addresses[index],
             Request::Execute {
-                at,
                 actor: actor.into(),
                 request: Box::new(request),
                 crash_after_commit: false,
@@ -866,14 +855,13 @@ impl Processes {
     async fn batch(
         &self,
         index: usize,
-        at: u64,
+
         actor: &str,
         request: ScopeBatchRequest,
     ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
         match call(
             self.addresses[index],
             Request::ExecuteBatch {
-                at,
                 actor: actor.into(),
                 request: Box::new(request),
                 crash_after_commit: false,
@@ -920,15 +908,10 @@ impl Drop for Processes {
     }
 }
 
-fn batch_service(
-    store: &ConsensusSessionStore,
-    clock: Arc<BoundedClock>,
-    scope: &ScopeLeaseId,
-) -> ScopeBatchStore {
+fn batch_service(store: &ConsensusSessionStore, scope: &ScopeId) -> ScopeBatchStore {
     ScopeBatchStore::new(
         Arc::new(store.clone()),
-        scope.clone(),
-        clock,
+        ScopeNamespace::new(scope.clone(), ScopeIncarnation::new(1).unwrap()).unwrap(),
         Arc::new(Admission(scope.clone())),
     )
     .unwrap()
@@ -974,40 +957,22 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     let mut fleet = Processes::start(root.path(), snapshots.path());
     let (leader, term) = fleet.ready(&[0, 1, 2], None).await;
     let scope = fleet.current(leader).await.scope().clone();
-    fleet
-        .execute(
-            leader,
-            0,
-            "controller",
-            request(
-                &scope,
-                0,
-                1,
-                ScopeLeaseOperation::Select {
-                    execution: execution(1),
-                },
-            ),
-        )
-        .await
-        .unwrap();
     let view = fleet
         .execute(
             leader,
-            0,
             "worker-1",
             request(
                 &scope,
-                1,
+                0,
                 2,
-                ScopeLeaseOperation::Acquire {
+                ScopeAuthorityOperation::AdmitInitial {
                     execution: execution(1),
-                    selection: 1,
                 },
             ),
         )
         .await
         .unwrap();
-    let displaced = view.permit().unwrap().clone();
+    let displaced = view.stamp().unwrap().clone();
     let first = ScopeBatchRequest::new(
         &displaced,
         [3; 16],
@@ -1020,7 +985,6 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     assert!(call(
         fleet.addresses[leader],
         Request::ExecuteBatch {
-            at: 1,
             actor: "worker-1".into(),
             request: Box::new(first.clone()),
             crash_after_commit: true,
@@ -1045,7 +1009,7 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     assert_ne!(successor, leader);
     assert!(successor_term > term);
     let before_replay = fleet.applied(successor).await;
-    let first_outcome = fleet.batch(successor, 2, "worker-1", first).await.unwrap();
+    let first_outcome = fleet.batch(successor, "worker-1", first).await.unwrap();
     assert_eq!(
         fleet.applied(successor).await,
         before_replay,
@@ -1077,58 +1041,30 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
         vec![ScopeCounterMutation::new(0, 2, 3).unwrap()],
     )
     .unwrap();
-    assert_eq!(
-        fleet.batch(successor, 78, "worker-1", stale.clone()).await,
-        Err(ScopeBatchError::Scope(ScopeLeaseError::Expired))
-    );
-    assert_eq!(fleet.batch_state(successor).await, first_state);
-    let handover = (displaced
-        .excluded_until()
-        .as_offset_datetime()
-        .unix_timestamp()
-        - 1_800_000_000) as u64;
-    let selected = fleet
+    let granted = fleet
         .execute(
             successor,
-            handover,
             "controller",
             request(
                 &scope,
                 view.revision(),
                 5,
-                ScopeLeaseOperation::Select {
+                ScopeAuthorityOperation::SucceedClosed {
+                    predecessor: displaced.clone(),
                     execution: execution(2),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    let granted = fleet
-        .execute(
-            successor,
-            handover,
-            "worker-2",
-            request(
-                &scope,
-                selected.revision(),
-                6,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(2),
-                    selection: 2,
+                    evidence: termination_proof(2),
                 },
             ),
         )
         .await
         .unwrap();
     assert_eq!(
-        fleet
-            .batch(successor, handover + 1, "worker-1", stale)
-            .await,
-        Err(ScopeBatchError::Scope(ScopeLeaseError::StalePermit))
+        fleet.batch(successor, "worker-1", stale).await,
+        Err(ScopeBatchError::Scope(ScopeAuthorityError::StaleAuthority))
     );
     assert_eq!(fleet.batch_state(successor).await, first_state);
     let second = ScopeBatchRequest::new(
-        granted.permit().unwrap(),
+        granted.stamp().unwrap(),
         [7; 16],
         1,
         vec![
@@ -1148,7 +1084,7 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     )
     .unwrap();
     let outcome = fleet
-        .batch(successor, handover + 1, "worker-2", second.clone())
+        .batch(successor, "worker-2", second.clone())
         .await
         .unwrap();
     let expected = fleet.batch_state(successor).await;
@@ -1200,7 +1136,7 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     let before_replay = fleet.applied(restarted_leader).await;
     assert_eq!(
         fleet
-            .batch(restarted_leader, handover + 2, "worker-2", second)
+            .batch(restarted_leader, "worker-2", second)
             .await
             .unwrap(),
         outcome,
@@ -1208,7 +1144,7 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     );
     assert_eq!(fleet.applied(restarted_leader).await, before_replay);
     let conflict = ScopeBatchRequest::new(
-        granted.permit().unwrap(),
+        granted.stamp().unwrap(),
         [8; 16],
         2,
         vec![create_child(2, 2)],
@@ -1217,7 +1153,7 @@ async fn scope_batch_processes_fail_over_fence_and_recover_compacted_children() 
     .unwrap();
     assert!(
         matches!(
-            fleet.batch(restarted_leader, handover + 2, "worker-2", conflict).await,
+            fleet.batch(restarted_leader, "worker-2", conflict).await,
             Err(ScopeBatchError::Conflict(conflicts)) if conflicts.claims == vec![child_claim(2)]
         ),
         "recovered claim ownership must still reject a competing birth"
@@ -1248,38 +1184,20 @@ async fn scope_quorum_processes_fail_over_race_and_recover_compacted_authority()
     let (leader, term) = fleet.ready(&[0, 1, 2], None).await;
     let initial = fleet.current(leader).await;
     let scope = initial.scope().clone();
-    fleet
-        .execute(
-            leader,
-            0,
-            "controller",
-            request(
-                &scope,
-                0,
-                1,
-                ScopeLeaseOperation::Select {
-                    execution: execution(1),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    let acquire = request(
+    let initial_request = request(
         &scope,
+        0,
         1,
-        2,
-        ScopeLeaseOperation::Acquire {
+        ScopeAuthorityOperation::AdmitInitial {
             execution: execution(1),
-            selection: 1,
         },
     );
     fleet.prepare_survivor_split(leader).await;
     assert!(call(
         fleet.addresses[leader],
         Request::Execute {
-            at: 0,
             actor: "worker-1".into(),
-            request: Box::new(acquire.clone()),
+            request: Box::new(initial_request.clone()),
             crash_after_commit: true
         }
     )
@@ -1289,7 +1207,7 @@ async fn scope_quorum_processes_fail_over_race_and_recover_compacted_authority()
     assert_eq!(
         status.code(),
         Some(77),
-        "leader dies between durable grant and its reply"
+        "leader dies between durable admission and its reply"
     );
     fleet.children[leader] = None;
     let alive = (0..MEMBER_COUNT)
@@ -1298,151 +1216,73 @@ async fn scope_quorum_processes_fail_over_race_and_recover_compacted_authority()
     let (new_leader, new_term) = fleet.ready_after_split(&alive, term).await;
     assert_ne!(leader, new_leader);
     assert!(new_term > term);
-    let mut view = fleet
-        .execute(alive[0], 50, "worker-1", acquire)
+    let view = fleet
+        .execute(alive[0], "worker-1", initial_request.clone())
         .await
         .unwrap();
-    assert_eq!(
-        view.permit().unwrap().issued_at(),
-        BoundedClock(AtomicU64::new(0)).bounds().unwrap().latest()
-    );
-    view = fleet
-        .execute(
-            alive[1],
-            51,
-            "worker-1",
-            request(
-                &scope,
-                view.revision(),
-                3,
-                ScopeLeaseOperation::Renew {
-                    permit: view.permit().unwrap().clone(),
-                },
-            ),
+    assert_eq!(view.revision(), 1);
+    assert_eq!(view.admission_generation_floor(), 1);
+    let displaced = view.stamp().unwrap().clone();
+    let candidate = |id| {
+        request(
+            &scope,
+            view.revision(),
+            id,
+            ScopeAuthorityOperation::SucceedClosed {
+                predecessor: displaced.clone(),
+                execution: execution(2),
+                evidence: termination_proof(2),
+            },
         )
-        .await
-        .unwrap();
-    let latest_pre_race = view.permit().unwrap().clone();
-    let renewal = request(
-        &scope,
-        view.revision(),
-        4,
-        ScopeLeaseOperation::Renew {
-            permit: latest_pre_race,
-        },
-    );
-    let selection = request(
-        &scope,
-        view.revision(),
-        5,
-        ScopeLeaseOperation::Select {
-            execution: execution(2),
-        },
-    );
+    };
     let (a, b) = tokio::join!(
-        fleet.execute(alive[0], 128, "worker-1", renewal),
-        fleet.execute(alive[1], 129, "controller", selection)
+        fleet.execute(alive[0], "worker-2", candidate(2)),
+        fleet.execute(alive[1], "controller", candidate(3))
     );
     assert_eq!(
         usize::from(a.is_ok()) + usize::from(b.is_ok()),
         1,
-        "Renew and Select cannot both win the same predecessor"
+        "two exact requests cannot win one predecessor"
     );
     assert_eq!(
         a.as_ref().err().or(b.as_ref().err()),
-        Some(&ScopeLeaseError::Conflict)
+        Some(&ScopeAuthorityError::Conflict)
     );
-    view = a.or(b).unwrap();
-    // Capture the CURRENT old permit after any successful renewal, then let
-    // another execution acquire with NO release. This assertion is sensitive
-    // to the intervening-grant guard, unlike a pre-renewal permit fixture.
-    let displaced = view.permit().unwrap().clone();
-    assert_eq!(fleet.current(alive[0]).await.permit(), Some(&displaced));
-    let expiry = (displaced
-        .excluded_until()
-        .as_offset_datetime()
-        .unix_timestamp()
-        - 1_800_000_000) as u64;
-    if view.selection() == 1 {
-        view = fleet
-            .execute(
-                alive[0],
-                expiry,
-                "controller",
-                request(
-                    &scope,
-                    view.revision(),
-                    6,
-                    ScopeLeaseOperation::Select {
-                        execution: execution(2),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
-    }
-    view = fleet
-        .execute(
-            alive[1],
-            expiry,
-            "worker-2",
-            request(
-                &scope,
-                view.revision(),
-                7,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(2),
-                    selection: 2,
-                },
-            ),
-        )
+    let view = a.or(b).unwrap();
+    assert_eq!(view.admission_generation_floor(), 2);
+    assert!(fleet
+        .execute(alive[0], "worker-1", initial_request)
         .await
-        .unwrap();
-    assert_eq!(view.grant_floor(), 2);
+        .is_err());
     assert_eq!(
         fleet
             .execute(
                 alive[0],
-                expiry + 1,
                 "worker-1",
                 request(
                     &scope,
                     view.revision(),
-                    8,
-                    ScopeLeaseOperation::ResumeSameExecution { permit: displaced }
-                )
-            )
-            .await,
-        Err(ScopeLeaseError::StalePermit)
-    );
-    assert_eq!(
-        fleet
-            .execute(
-                alive[1],
-                expiry + 1,
-                "controller",
-                request(
-                    &scope,
-                    view.revision(),
-                    9,
-                    ScopeLeaseOperation::Select {
-                        execution: execution(1)
+                    4,
+                    ScopeAuthorityOperation::Close {
+                        current: displaced,
+                        evidence: closed_proof(4)
                     }
                 )
             )
             .await,
-        Err(ScopeLeaseError::Superseded)
+        Err(ScopeAuthorityError::StaleAuthority)
     );
     let release = request(
         &scope,
         view.revision(),
-        10,
-        ScopeLeaseOperation::Release {
-            closed: ScopeGateClosed::after_gate_closed(view.permit().unwrap().clone()),
+        5,
+        ScopeAuthorityOperation::Close {
+            current: view.stamp().unwrap().clone(),
+            evidence: closed_proof(5),
         },
     );
     let released = fleet
-        .execute(alive[0], expiry + 1, "worker-2", release.clone())
+        .execute(alive[0], "worker-2", release.clone())
         .await
         .unwrap();
     fleet.spawn(leader);
@@ -1473,11 +1313,8 @@ async fn scope_quorum_processes_fail_over_race_and_recover_compacted_authority()
     }
     fleet.ready(&[0, 1, 2], None).await;
     assert_eq!(
-        fleet
-            .execute(0, expiry + 2, "worker-2", release)
-            .await
-            .unwrap(),
+        fleet.execute(0, "worker-2", release).await.unwrap(),
         released,
-        "release replay survives independent process loss and log compaction"
+        "Close replay survives independent process loss and log compaction"
     );
 }

@@ -15,9 +15,9 @@ pub(crate) mod roster_reads;
 pub(crate) mod roster_rows;
 #[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
+pub(crate) mod scope_authority;
 pub(crate) mod scope_batch;
 mod scope_continuity;
-pub(crate) mod scope_lease;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -17122,7 +17122,7 @@ impl SqliteSessionBackend {
                     return Err(invalid_data("native activation storage identity differs"));
                 }
                 let activated = match activation {
-                    CapabilityActivationKind::ScopeProfileV3 => {
+                    CapabilityActivationKind::ScopeProfileV4 => {
                         let key = crate::scope_storage::profile_key(scope_identity.cluster_id())
                             .map_err(|_| invalid_data("scope profile key invalid"))?;
                         let row = state
@@ -17218,7 +17218,7 @@ fn capability_activation_applied_index_sync(
 ) -> io::Result<Option<u64>> {
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     let activated = match activation {
-        CapabilityActivationKind::ScopeProfileV3 => {
+        CapabilityActivationKind::ScopeProfileV4 => {
             if read_storage_identity_sync(&tx)
                 .map_err(|_| invalid_data("scope activation storage identity is invalid"))?
                 != storage_identity
@@ -22256,7 +22256,7 @@ pub(crate) fn validate_command_for_log(
             "session fenced transition V2 maintenance logical time is outside the profiled range",
         ));
     }
-    if let SessionMutationIntent::ScopeLease(operation) = semantic_intent {
+    if let SessionMutationIntent::ScopeAuthority(operation) = semantic_intent {
         operation
             .validate()
             .map_err(|_| invalid_data("scope operation invalid"))?;
@@ -23817,7 +23817,7 @@ impl MembershipLogProjection {
             | SessionMutationIntent::ScopeBatch(_)
             | SessionMutationIntent::ActivateScopeProfile(_)
             | SessionMutationIntent::PreflightScopeProfile
-            | SessionMutationIntent::ScopeLease(_)
+            | SessionMutationIntent::ScopeAuthority(_)
             | SessionMutationIntent::AdvanceLogicalTime
             | SessionMutationIntent::BindConsumerRequest { .. }
             | SessionMutationIntent::ReadConsumerRecord { .. }
@@ -30855,7 +30855,7 @@ pub(crate) fn validate_consensus_outcome_records(
     outcome: &SessionMutationOutcome,
 ) -> Result<(), StoreError> {
     match outcome {
-        SessionMutationOutcome::ScopeBatch(_) | SessionMutationOutcome::ScopeLease(_) => {
+        SessionMutationOutcome::ScopeBatch(_) | SessionMutationOutcome::ScopeAuthority(_) => {
             Err(StoreError::Serialization(
                 "scope format mismatch: checkpoint in ordinary receipt collection".into(),
             ))
@@ -31050,7 +31050,7 @@ fn execute_application_intent_sync(
         SessionMutationIntent::PreflightScopeProfile => Err(StoreError::CapabilityNotSupported(
             "scope activation preflight reached apply".into(),
         )),
-        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeLease(_) => Err(
+        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeAuthority(_) => Err(
             StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
         ),
 
@@ -31394,7 +31394,7 @@ fn execute_intent_sync(
                 .map_err(membership_mutation_store_error)
                 .map(|_| (SessionMutationOutcome::Unit, None))
         }
-        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeLease(_) => Err(
+        SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeAuthority(_) => Err(
             StoreError::BackendUnavailable("scope command reached ordinary apply".into()),
         ),
 
@@ -32056,8 +32056,8 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                 responses.push(response);
                 continue;
             }
-            if scope_lease::operation(&command.intent).is_some() {
-                let response = scope_lease::apply(
+            if scope_authority::operation(&command.intent).is_some() {
+                let response = scope_authority::apply(
                     &tx,
                     identity,
                     &scope,
@@ -34214,7 +34214,7 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
             }
             _ => invalid_data("session consensus snapshot envelope is invalid"),
         })?;
-        if crate::scope_storage::is_batch_record_key(&record.key) {
+        if crate::scope_storage::is_scope_record_key(&record.key) {
             scope_batch::validate_links(conn, &record)?;
         }
     }
@@ -34684,7 +34684,7 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                  AND fence.key_type = record.key_type
                  AND fence.stable_id = record.stable_id
                 WHERE (fence.fence IS NULL OR fence.fence < record.fence)
-                  AND NOT (record.fence = 0 AND record.key_type IN (?1, ?2, ?3, ?4, ?5, ?6))
+                  AND NOT (record.fence = 0 AND record.key_type IN (?1, ?2, ?3, ?4, ?5, ?6, ?7))
                 UNION ALL
                 SELECT 1
                 FROM leases AS lease
@@ -40645,12 +40645,12 @@ pub(crate) mod historical_snapshot_fixture;
 #[cfg(test)]
 mod tests {
     mod activation_ack;
+    #[path = "scope_authority.rs"]
+    mod scope_authority_tests;
     #[path = "scope_batch.rs"]
     mod scope_batch_tests;
     #[path = "scope_continuity.rs"]
     mod scope_continuity_tests;
-    #[path = "scope_lease.rs"]
-    mod scope_lease_tests;
     #[cfg(target_os = "linux")]
     use crate::test_process::CommandExt as _;
     #[cfg(target_os = "linux")]
@@ -74944,14 +74944,14 @@ BEGIN IMMEDIATE;
         let desired_members = members(&[8, 9, 10]);
         let intents = [
             SessionMutationIntent::CertifyScopeProfileContinuation(Box::new(
-                crate::scope_lease::ScopeProfileContinuation {
+                crate::scope_authority::ScopeProfileContinuation {
                     transition_id,
                     transition_digest: request_digest,
-                    predecessor: crate::scope_lease::ScopeProfileActivation::new(
+                    predecessor: crate::scope_authority::ScopeProfileActivation::new(
                         identity(),
                         fenced_transition_voter_set_digest(identity(), &members(&[7, 8, 9])),
                     ),
-                    successor: crate::scope_lease::ScopeProfileActivation::new(
+                    successor: crate::scope_authority::ScopeProfileActivation::new(
                         identity_at(2, 0x86),
                         fenced_transition_voter_set_digest(identity_at(2, 0x86), &desired_members),
                     ),

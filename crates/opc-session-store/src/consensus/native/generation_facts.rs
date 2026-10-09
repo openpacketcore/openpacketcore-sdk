@@ -41,7 +41,7 @@ pub(in crate::consensus::native) struct Key {
     pub(in crate::consensus::native) commitment: [u8; 32],
     pub(in crate::consensus::native) reserved: bool,
     pub(in crate::consensus::native) business: Business,
-    pub(in crate::consensus::native) scope: Option<crate::scope_lease::ScopeCheckpointFacts>,
+    pub(in crate::consensus::native) scope: Option<crate::scope_authority::ScopeCheckpointFacts>,
     pub(in crate::consensus::native) batch: Option<crate::scope_storage::Facts>,
 }
 
@@ -85,11 +85,11 @@ impl Key {
             commitment: crate::fenced_mutation_roster::session_key_commitment(key),
             reserved: row.reserved,
             business,
-            scope: if crate::scope_lease::is_scope_lease_key(key) {
+            scope: if crate::scope_authority::is_scope_authority_key(key) {
                 row.record
                     .as_ref()
                     .map(|record| {
-                        crate::scope_lease::ScopeLeaseCheckpoint::from_record(record)
+                        crate::scope_authority::ScopeAuthorityCheckpoint::from_record(record)
                             .and_then(|checkpoint| checkpoint.facts())
                             .map_err(|_| invalid("scope catalog checkpoint invalid"))
                     })

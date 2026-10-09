@@ -1,10 +1,10 @@
 //! Scope operations replace one checkpoint without ordinary receipt history.
 
 use super::*;
-use crate::scope_lease::{ScopeLeaseCommand, ScopeLeaseError};
+use crate::scope_authority::{ScopeAuthorityCommand, ScopeAuthorityError};
 
 #[cfg(test)]
-#[path = "scope_lease_tests.rs"]
+#[path = "scope_authority_tests.rs"]
 mod tests;
 
 pub(super) fn validate_replacement(
@@ -12,18 +12,18 @@ pub(super) fn validate_replacement(
     before: Option<&NativeKeyState>,
     after: Option<&NativeKeyState>,
 ) -> io::Result<()> {
-    if !crate::scope_lease::is_scope_lease_key(key) {
+    if !crate::scope_authority::is_scope_authority_key(key) {
         return Ok(());
     }
     let Some(old) = before.and_then(|row| row.record.as_ref()) else {
         return Ok(());
     };
-    let previous = crate::scope_lease::ScopeLeaseCheckpoint::from_record(old)
+    let previous = crate::scope_authority::ScopeAuthorityCheckpoint::from_record(old)
         .map_err(|_| invalid("scope checkpoint predecessor invalid"))?;
     let next = after
         .and_then(|row| row.record.as_ref())
         .ok_or_else(|| invalid("scope checkpoint cannot be pruned"))?;
-    let next = crate::scope_lease::ScopeLeaseCheckpoint::from_record(next)
+    let next = crate::scope_authority::ScopeAuthorityCheckpoint::from_record(next)
         .map_err(|_| invalid("scope checkpoint successor invalid"))?;
     if !next.can_replace(&previous) {
         return Err(invalid("scope checkpoint floors regressed"));
@@ -39,7 +39,7 @@ impl NativeState {
         let checkpoints: Vec<_> = self
             .keys
             .iter()
-            .filter(|(key, _)| crate::scope_lease::is_scope_lease_key(key))
+            .filter(|(key, _)| crate::scope_authority::is_scope_authority_key(key))
             .collect();
         let bytes: usize = self
             .keys
@@ -65,10 +65,45 @@ impl NativeState {
 }
 
 impl NativeDelta<'_> {
-    pub(super) fn scope_lease(
+    fn has_scope_rows(&self, scope: &crate::scope_authority::ScopeId) -> io::Result<bool> {
+        for key in self
+            .base
+            .keys
+            .iter()
+            .map(|(key, _)| key)
+            .chain(self.keys.keys())
+        {
+            if key.tenant != *scope.tenant()
+                || key.nf_kind != *scope.nf_kind()
+                || !crate::scope_storage::is_scope_record_key(key)
+            {
+                continue;
+            }
+            if key.key_type.as_str() == "opc-scope-lease"
+                && key.stable_id.as_bytes() == scope.slot()
+            {
+                return Ok(true);
+            }
+            if !crate::scope_storage::is_batch_record_key(key) {
+                continue;
+            }
+            let physical = self.physical_key(key);
+            let Some(record) = physical.record.as_ref() else {
+                return Err(invalid("scope orphan row has no record"));
+            };
+            let row = crate::scope_storage::ScopeRow::from_record(record)
+                .map_err(|_| invalid("scope orphan row invalid"))?;
+            if row.scope() == Some(scope) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn scope_authority(
         &mut self,
         command: &SessionConsensusCommand,
-        operation: &ScopeLeaseCommand,
+        operation: &ScopeAuthorityCommand,
         authorized: bool,
         now: Timestamp,
         index: u64,
@@ -82,24 +117,31 @@ impl NativeDelta<'_> {
         let current = row
             .record
             .as_ref()
-            .map(crate::scope_lease::ScopeLeaseCheckpoint::from_record)
+            .map(crate::scope_authority::ScopeAuthorityCheckpoint::from_record)
             .transpose();
+        let initialize_ledger = current.as_ref().is_ok_and(|value| value.is_none());
         let result = if scope.store() != self.base.identity.cluster_id() {
-            Err(ScopeLeaseError::Unauthorized)
+            Err(ScopeAuthorityError::Unauthorized)
         } else if !authorized {
-            Err(crate::sqlite::consensus::scope_lease::authority_error(
+            Err(crate::sqlite::consensus::scope_authority::authority_error(
                 command,
                 self.base.identity.configuration_epoch(),
             ))
         } else if !self.scope_profile_active()? {
-            Err(ScopeLeaseError::ProfileNotActivated)
+            Err(ScopeAuthorityError::ProfileNotActivated)
         } else if self.request_receipt(&slot).is_some() || current.is_err() {
             // Previous stored profiles cannot be forgotten or migrated.
-            Err(ScopeLeaseError::FormatMismatch)
+            Err(ScopeAuthorityError::FormatMismatch)
+        } else if current.as_ref().is_ok_and(|value| value.is_none())
+            && self.has_scope_rows(scope)?
+        {
+            // No authority row is not proof of an unused domain. Orphaned
+            // children, claims and stable floors must never be adopted/reset.
+            Err(ScopeAuthorityError::FormatMismatch)
         } else {
             operation.apply(
                 current
-                    .unwrap()
+                    .map_err(|_| invalid("scope checkpoint invalid"))?
                     .map(|checkpoint| checkpoint.stored())
                     .transpose()
                     .map_err(|_| invalid("scope checkpoint invalid"))?,
@@ -119,9 +161,23 @@ impl NativeDelta<'_> {
         self.frontiers.logical_time = Some(now);
         let response = self.response(
             index,
-            Ok(SessionMutationOutcome::ScopeLease(result.clone())),
+            Ok(SessionMutationOutcome::ScopeAuthority(result.clone())),
         );
         if let Ok(checkpoint) = result {
+            if initialize_ledger {
+                let ledger = crate::scope_storage::ScopeRow::Batch(Box::new(
+                    crate::scope_batch::ScopeBatchCheckpoint::empty(scope.clone()),
+                ))
+                .to_record()
+                .map_err(|_| invalid("scope initial ledger invalid"))?;
+                self.keys.insert(
+                    ledger.key.clone(),
+                    NativeKeyState {
+                        record: Some(ledger),
+                        ..NativeKeyState::default()
+                    },
+                );
+            }
             self.keys.insert(
                 key,
                 NativeKeyState {

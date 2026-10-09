@@ -1,8 +1,8 @@
 //! SQLite parity for the native reserved scope-row collection.
 
 use super::*;
-use crate::scope_batch::{ScopeBatchCheckpoint, ScopeBatchCommand, ScopeBatchError};
-use crate::scope_lease::{ScopeLeaseError, ScopeProfileActivation};
+use crate::scope_authority::{ScopeAuthorityError, ScopeProfileActivation};
+use crate::scope_batch::{ScopeBatchCommand, ScopeBatchError};
 use crate::scope_storage::{self, ScopeRow};
 
 pub(crate) fn operation(intent: &SessionMutationIntent) -> Option<&ScopeBatchCommand> {
@@ -31,6 +31,17 @@ pub(super) fn validate_links(
     conn: &Connection,
     record: &crate::StoredSessionRecord,
 ) -> io::Result<()> {
+    if crate::scope_authority::is_scope_authority_key(&record.key) {
+        let authority = crate::scope_authority::ScopeAuthorityCheckpoint::from_record(record)
+            .and_then(|checkpoint| checkpoint.state())
+            .map_err(|_| invalid_data("scope authority invalid"))?;
+        let key = scope_storage::batch_key(authority.view.scope())
+            .map_err(|_| invalid_data("scope ledger key invalid"))?;
+        return match read(conn, &key).map_err(|_| invalid_data("scope ledger read failed"))? {
+            Some(ScopeRow::Batch(row)) if &row.scope == authority.view.scope() => Ok(()),
+            _ => Err(invalid_data("scope required ledger absent or invalid")),
+        };
+    }
     let row = ScopeRow::from_record(record).map_err(|_| invalid_data("scope record invalid"))?;
     if let Some(scope) = row.scope() {
         let key = scope
@@ -39,7 +50,7 @@ pub(super) fn validate_links(
         let authority = ops::get_raw_sync(conn, &key)
             .map_err(|_| invalid_data("scope authority read failed"))?
             .ok_or_else(|| invalid_data("scope batch authority absent"))?;
-        let authority = crate::scope_lease::ScopeLeaseCheckpoint::from_record(&authority)
+        let authority = crate::scope_authority::ScopeAuthorityCheckpoint::from_record(&authority)
             .and_then(|row| row.state())
             .map_err(|_| invalid_data("scope batch authority invalid"))?;
         if authority.view.scope() != scope {
@@ -75,7 +86,7 @@ pub(super) fn validate_snapshot_preserves_scopes(conn: &Connection) -> io::Resul
                 new.tenant,new.nf_kind,new.key_type,new.stable_id,new.generation,new.owner,new.fence,new.state_class,new.state_type,new.expires_at,new.payload,new.encoding \
          FROM main.session_records old LEFT JOIN consensus_incoming.session_records new \
          ON new.tenant=old.tenant AND new.nf_kind=old.nf_kind AND new.key_type=old.key_type AND new.stable_id=old.stable_id \
-         WHERE old.key_type IN (?1,?2,?3,?4,?5,?6)"
+         WHERE old.key_type IN (?1,?2,?3,?4,?5,?6,?7)"
     ).map_err(db_error)?;
     let mut rows = statement
         .query(scope_storage::RESERVED_KEY_TYPES)
@@ -89,10 +100,10 @@ pub(super) fn validate_snapshot_preserves_scopes(conn: &Connection) -> io::Resul
         }
         let old = decode(row, 0)?;
         let new = decode(row, 12)?;
-        let preserved = if crate::scope_lease::is_scope_lease_key(&old.key) {
-            let old = crate::scope_lease::ScopeLeaseCheckpoint::from_record(&old)
+        let preserved = if crate::scope_authority::is_scope_authority_key(&old.key) {
+            let old = crate::scope_authority::ScopeAuthorityCheckpoint::from_record(&old)
                 .map_err(|_| invalid_data("scope snapshot authority invalid"))?;
-            let new = crate::scope_lease::ScopeLeaseCheckpoint::from_record(&new)
+            let new = crate::scope_authority::ScopeAuthorityCheckpoint::from_record(&new)
                 .map_err(|_| invalid_data("scope snapshot authority invalid"))?;
             new.can_replace(&old)
         } else {
@@ -159,7 +170,7 @@ pub(super) fn activate(
     }
     if !certificate_matches(&scope, certificate) {
         return Err(StoreError::CapabilityNotSupported(
-            "scope_store_profile_v3".into(),
+            "scope_store_profile_v4".into(),
         ));
     }
     let record = ScopeRow::Activation(certificate.clone())
@@ -172,15 +183,22 @@ fn plan(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     operation: &ScopeBatchCommand,
-    now: Timestamp,
 ) -> io::Result<Result<crate::scope_batch::state::ScopeBatchPlan, ScopeBatchError>> {
     let scope = operation.request.scope();
-    let (legacy, current) = super::scope_lease::read(conn, identity, scope)
+    let (legacy, current) = super::scope_authority::read(conn, identity, scope)
         .map_err(|_| invalid_data("scope batch authority read failed"))?;
     if legacy {
         return Ok(Err(ScopeBatchError::FormatMismatch));
     }
-    let authority = match crate::scope_lease::checkpoint_state(scope, current) {
+    // Before initial admission there is no authority or stable checkpoint.
+    // Match native apply before inspecting the checkpoint, whose absence is
+    // corruption only after authority has been admitted.
+    if current.is_none() {
+        return Ok(Err(
+            crate::scope_authority::ScopeAuthorityError::StaleAuthority.into(),
+        ));
+    }
+    let authority = match crate::scope_authority::checkpoint_state(scope, current) {
         Ok(authority) => authority,
         Err(error) => return Ok(Err(error.into())),
     };
@@ -190,14 +208,13 @@ fn plan(
         .map_err(|_| invalid_data("scope batch checkpoint read failed"))?
     {
         Some(ScopeRow::Batch(row)) if row.scope == *scope => *row,
-        None => ScopeBatchCheckpoint::empty(scope.clone()),
         _ => return Ok(Err(ScopeBatchError::FormatMismatch)),
     };
     // The shared planner reports deterministic command refusals. A local
     // database/decode fault must escape that result and abort the transaction,
     // including its machine row and applied pointer, on this replica.
     let read_fault = std::cell::RefCell::new(None);
-    let result = operation.plan(&authority, &checkpoint, now, |key| {
+    let result = operation.plan(&authority, &checkpoint, |key| {
         read(conn, key).map_err(|error| {
             read_fault.borrow_mut().get_or_insert(error);
             ScopeBatchError::Unavailable
@@ -224,13 +241,16 @@ pub(super) fn apply(
         .2
         .map_or(command.logical_time, |time| time.max(command.logical_time));
     let result = if operation.request.scope().store() != identity.cluster_id() {
-        Err(ScopeLeaseError::Unauthorized.into())
+        Err(ScopeAuthorityError::Unauthorized.into())
     } else if !authorized {
-        Err(super::scope_lease::authority_error(command, scope.application_authority_epoch).into())
+        Err(
+            super::scope_authority::authority_error(command, scope.application_authority_epoch)
+                .into(),
+        )
     } else if !active(conn, scope).map_err(|_| invalid_data("scope profile read failed"))? {
-        Err(ScopeLeaseError::ProfileNotActivated.into())
+        Err(ScopeAuthorityError::ProfileNotActivated.into())
     } else {
-        plan(conn, identity, operation, now)?
+        plan(conn, identity, operation)?
     };
     let outcome = match result {
         Ok(plan) => {

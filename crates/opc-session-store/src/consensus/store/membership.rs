@@ -2866,9 +2866,11 @@ impl ConsensusSessionStore {
         &self,
         request: &SessionTopologyTransitionRequest,
         durable: &DurableTransitionState,
-    ) -> Result<Option<crate::scope_lease::ScopeProfileContinuation>, SessionTopologyTransitionError>
-    {
-        use crate::scope_lease::{ScopeProfileActivation, ScopeProfileContinuation};
+    ) -> Result<
+        Option<crate::scope_authority::ScopeProfileContinuation>,
+        SessionTopologyTransitionError,
+    > {
+        use crate::scope_authority::{ScopeProfileActivation, ScopeProfileContinuation};
         let key = crate::scope_storage::profile_key(self.inner.storage_identity.cluster_id())
             .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
         let row = self
@@ -2911,7 +2913,7 @@ impl ConsensusSessionStore {
 
     async fn scope_profile_continuation_is_committed(
         &self,
-        certificate: &crate::scope_lease::ScopeProfileContinuation,
+        certificate: &crate::scope_authority::ScopeProfileContinuation,
         durable: &DurableTransitionState,
     ) -> Result<bool, SessionTopologyTransitionError> {
         let pending = durable
@@ -5227,7 +5229,7 @@ mod scope_refresh_tests {
                         && profile_digest == profile.digest()
                 }
                 TopologyAdmissionBarrierAction::ConfirmScopeProfile { profile_digest } => {
-                    profile_digest == crate::scope_lease::scope_profile_digest()
+                    profile_digest == crate::scope_authority::scope_profile_digest()
                 }
                 _ => return Err(SessionConsensusPeerError::Protocol),
             };
@@ -5749,13 +5751,13 @@ mod scope_refresh_tests {
         for (supported, digest, expected) in [
             (
                 false,
-                crate::scope_lease::scope_profile_digest(),
+                crate::scope_authority::scope_profile_digest(),
                 TopologyAdmissionBarrierReply::NotReady,
             ),
             (true, [0; 32], TopologyAdmissionBarrierReply::NotReady),
             (
                 true,
-                crate::scope_lease::scope_profile_digest(),
+                crate::scope_authority::scope_profile_digest(),
                 TopologyAdmissionBarrierReply::Ready,
             ),
         ] {

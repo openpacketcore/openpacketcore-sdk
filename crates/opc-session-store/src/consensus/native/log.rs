@@ -178,7 +178,7 @@ impl NativeLog {
                 intent,
                 SessionMutationIntent::ScopeBatch(_)
                     | SessionMutationIntent::ActivateScopeProfile(_)
-                    | SessionMutationIntent::ScopeLease(_)
+                    | SessionMutationIntent::ScopeAuthority(_)
                     | SessionMutationIntent::AdvanceLogicalTime
                     | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
                     | SessionMutationIntent::VoidFencedTransitionV2(_)

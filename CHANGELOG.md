@@ -175,47 +175,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter recovery or persistence; ESP replay-counter synchronization is out of
   scope.
 
-- `opc-session-store`: carry scope lease/batch activation across voter changes.
-  A replicated certificate binds exact joining-voter profile checks to the
-  transition and both voter configurations; uniform cutover preserves activation
-  atomically, so subsequent renewals and batches need only a quorum. The one
-  bounded `opc-scope-continuation` row per cluster survives receipt pruning,
-  abort, restart and snapshot compaction. Its key type is reserved and excluded
-  from consumer/roster access and restore scans. Profile 3 changes the scope
-  row format and requires a fresh installation, without migration or downgrade.
-  Incompatible storage returns the public
-  `SessionConsensusStorageError::FreshInstallationRequired` and
-  `ConsensusSessionStoreOpenError::FreshInstallationRequired` variants.
-  Pending transitions freeze initial activation; missing continuation proof
-  commits a retryable refusal without wedging apply. Active scopes continue
-  through learner catch-up until the replicated authority Fence, and resume
-  after a durable Abort decision while learner cleanup finishes.
-  Grace, stop and exclusion remain 77, 78 and 79 seconds. Refs #1134.
-
-- `opc-session-store`: add atomic scope child batches with typed create, CAS
-  and delete, exact births/generations, per-scope unique claims and sixteen
-  bounded counters. Up to 64 children commit in one command under the current
-  live grant, with sealed values and no partial effects on conflict. Scope
-  checkpoints now live outside ordinary request receipts; an activation gate
-  requires every voter to support the exact lease/batch profile before use.
-  The custom key types `opc-scope-batch`, `opc-scope-child`, `opc-scope-claim`
-  and `opc-scope-profile` are now reserved: consumer and roster access is
-  denied, and consumer restore scans filter them. Requests and checkpoints
-  reserve lane/sequence fields and eight replay slots; only lane zero is active.
-  Raise scope permit grace to 77 seconds to budget sixty seconds at a packet
-  gate under the qualified clock and transport bounds, including issuance
-  excess and phase corrections; remote exclusion becomes 79 seconds
-  after issuance. The exact profile digest includes these timing constants.
-  This stored-format change requires a fresh installation. Refs #1134.
-
-- `opc-session-store`: add experimental quorum-side scope leases with
-  authenticated execution selection, acquire/renew, same-execution resume,
-  graceful release and immutable timed permits. Each operation is one native
-  command replacing a bounded scope checkpoint, with no receipt history per
-  renewal. Stable cluster scopes survive membership changes. Profile 2 requires
-  a fresh scope installation. Refs #1134.
-  The custom key type `opc-scope-lease` is now reserved: consumer and roster
-  access is denied and consumer restore scans filter it.
+- `opc-session-store`: add experimental untimed scope authority and atomic
+  child batches (profile 4), replacing the earlier timed scope API. Verified
+  admission and predecessor closure bind a boot key and exact execution to a
+  stable scope incarnation. Every new batch checks the committed authority at
+  apply. Worker, observer and scope-controller permissions are explicit;
+  controller-submitted succession is recovered by the authenticated successor.
+  Installed forwarding is excluded from closure. Counters, birth and sequence
+  floors never reset across incarnations, and snapshots cannot lower them.
+  Exact predecessor outcome reads distinguish applied, not applied and unknown.
+  Child/claim namespaces include the incarnation; batch checkpoints remain
+  under the stable scope. Reserved rows live outside ordinary request receipts.
+  Every voter must support the initial profile, while committed continuation
+  carries activation through voter changes, abort, restart and compaction.
+  Profile 4 remains unadvertised, with its activation digest provisional until
+  independent lanes and namespace scans pass joint qualification.
+  Prior timed storage requires a fresh installation, with the public
+  `FreshInstallationRequired` reason and no compatibility reader.
+  Lost-worker retirement requires a later profile; current authority is limited to
+  lab stages that do not need that replacement. Refs #1134.
 
 - `opc-consensus`: add optional connection compatibility through
   `ConsensusCompatibility`, `ConsensusCallResponse`,
@@ -297,6 +275,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running credits (thirteen total per proposal/outbound pool). Aggregate internal
   traffic is exempt from tenant scope caps. Read fences default to Normal;
   explicit record-expiry floors and history maintenance retain Maintenance.
+
+- `opc-egress-fence-common`: remove the unused experimental `scope_time` API
+  from the retired timed packet-gate proposal.
 
 - CI: run the root-cgroup egress-fence qualification when fence inputs or its
   resolved dependency versions, sources, features or path dependencies change.

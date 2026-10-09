@@ -123,11 +123,11 @@ fn intent(
                 .map_err(|_| invalid("scope activation invalid"))?;
             SessionMutationIntent::ActivateScopeProfile(certificate.clone())
         }
-        SessionMutationIntent::ScopeLease(operation) => {
+        SessionMutationIntent::ScopeAuthority(operation) => {
             operation
                 .validate()
                 .map_err(|_| invalid("scope operation invalid"))?;
-            SessionMutationIntent::ScopeLease(operation.clone())
+            SessionMutationIntent::ScopeAuthority(operation.clone())
         }
         SessionMutationIntent::MaintainFencedTransitionV2History {
             expected_generation,
@@ -478,13 +478,13 @@ pub(super) fn ordinary_response(
         Ok(SessionMutationOutcome::ScopeBatch(result)) => {
             Ok(SessionMutationOutcome::ScopeBatch(result.clone()))
         }
-        Ok(SessionMutationOutcome::ScopeLease(result)) => {
+        Ok(SessionMutationOutcome::ScopeAuthority(result)) => {
             if let Ok(checkpoint) = result {
                 checkpoint
                     .state()
                     .map_err(|_| invalid("scope checkpoint invalid"))?;
             }
-            Ok(SessionMutationOutcome::ScopeLease(result.clone()))
+            Ok(SessionMutationOutcome::ScopeAuthority(result.clone()))
         }
         Ok(SessionMutationOutcome::Lease(value)) => {
             Ok(SessionMutationOutcome::Lease(lease(value)?))

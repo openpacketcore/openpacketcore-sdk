@@ -1,6 +1,14 @@
 //! Reserved scope rows, outside every ordinary request-receipt collection.
 //! The existing keyed durable row codec carries these explicitly discriminated
 //! metadata records. Child secrets remain inside their sealed envelopes.
+//!
+//! This module owns the only child/claim key encoding. All scope writers,
+//! lane readers and coherent scans use [`namespace_prefix`], [`namespace_key`]
+//! or the typed [`child_key`]/[`claim_key`] wrappers; no slice derives its own.
+
+#[cfg(test)]
+#[path = "scope_storage_tests.rs"]
+mod tests;
 
 use std::{collections::HashSet, fmt};
 
@@ -8,24 +16,27 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::scope_authority::{
+    ScopeId, ScopeNamespace, ScopeProfileActivation, ScopeProfileContinuation,
+};
 use crate::scope_batch::{
     ScopeBatchCheckpoint, ScopeBatchError, ScopeChildKey, ScopeChildRecord, ScopeClaimKey,
-    MAX_SCOPE_CHILD_CLAIMS, MAX_SCOPE_CHILD_VALUE_BYTES,
+    MAX_SCOPE_CHILD_CLAIMS, MAX_SCOPE_CHILD_VALUE_BYTES, SCOPE_COUNTERS,
 };
-use crate::scope_lease::{ScopeLeaseId, ScopeProfileActivation, ScopeProfileContinuation};
 use crate::{
     EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
     SessionKey, SessionKeyType, SessionPayloadEncoding, StableId, StateClass, StateType,
     StoredSessionRecord,
 };
 
-const MAGIC: &[u8; 5] = b"OPSC\x03";
+const MAGIC: &[u8; 5] = b"OPSC\x04";
 const BATCH: &str = "opc-scope-batch";
 const CHILD: &str = "opc-scope-child";
 const CLAIM: &str = "opc-scope-claim";
 const PROFILE: &str = "opc-scope-profile";
 const CONTINUATION: &str = "opc-scope-continuation";
-pub(crate) const RESERVED_KEY_TYPES: [&str; 6] = [
+pub(crate) const RESERVED_KEY_TYPES: [&str; 7] = [
+    "opc-scope-authority",
     "opc-scope-lease",
     BATCH,
     CHILD,
@@ -39,10 +50,12 @@ const MAX_METADATA_BYTES: usize = 16 * 1024;
 /// Recognize the declared fresh-install boundary without decoding or migrating
 /// a previous row. Unknown or malformed current formats remain corruption.
 pub(crate) fn require_current_record_format(record: &StoredSessionRecord) -> std::io::Result<()> {
-    if is_batch_record_key(&record.key)
-        && record.payload.encoding() == SessionPayloadEncoding::Plaintext
-        && record.state_type == StateType::from_static("opc-scope-state-v2")
-        && record.payload.as_bytes().starts_with(b"OPSC\x02")
+    if record.key.key_type.as_str() == "opc-scope-lease"
+        || (is_scope_record_key(&record.key)
+            && record.payload.encoding() == SessionPayloadEncoding::Plaintext
+            && (record.payload.as_bytes().starts_with(b"OPSC\x02")
+                || record.payload.as_bytes().starts_with(b"OPSC\x03")
+                || record.state_type.as_str() == "opc-scope-authority-v2"))
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -62,7 +75,12 @@ pub(crate) fn require_current_profile_format(
         0xd0, 0xc9, 0x7e, 0xdc, 0x99, 0x9e, 0xf5, 0x8f, 0x92, 0x1b, 0x17, 0x40, 0x14, 0x7b, 0x4f,
         0x97, 0x15,
     ];
-    if certificate.profile == PREVIOUS {
+    const PREVIOUS_TIMED: [u8; 32] = [
+        0x2a, 0x80, 0xba, 0xa7, 0x04, 0x49, 0xad, 0xc6, 0x13, 0x87, 0x14, 0x7e, 0x04, 0xa2, 0x8d,
+        0x99, 0xa7, 0x05, 0xc4, 0xba, 0x53, 0x04, 0xdf, 0xe0, 0xd1, 0x26, 0xa2, 0xd0, 0x3f, 0xa7,
+        0x93, 0x2a,
+    ];
+    if certificate.profile == PREVIOUS || certificate.profile == PREVIOUS_TIMED {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             crate::consensus::storage::SessionConsensusStorageError::FreshInstallationRequired,
@@ -99,11 +117,7 @@ pub(crate) fn is_batch_record_key(key: &SessionKey) -> bool {
     matches!(&key.key_type, SessionKeyType::Other(name) if matches!(name.as_str(), BATCH | CHILD | CLAIM | PROFILE | CONTINUATION))
 }
 
-fn scoped_key(
-    scope: &ScopeLeaseId,
-    kind: &str,
-    suffix: &[u8],
-) -> Result<SessionKey, ScopeBatchError> {
+fn scoped_key(scope: &ScopeId, kind: &str, suffix: &[u8]) -> Result<SessionKey, ScopeBatchError> {
     let mut bytes = scope.slot().to_vec();
     bytes.extend_from_slice(suffix);
     Ok(SessionKey {
@@ -114,20 +128,50 @@ fn scoped_key(
             .map_err(|_| ScopeBatchError::FormatMismatch)?,
     })
 }
-pub(crate) fn batch_key(scope: &ScopeLeaseId) -> Result<SessionKey, ScopeBatchError> {
+pub(crate) fn batch_key(scope: &ScopeId) -> Result<SessionKey, ScopeBatchError> {
     scoped_key(scope, BATCH, &[])
 }
+/// Canonical A64 namespace commitment for child/claim scan prefixes.
+///
+/// Exactly SHA-256(`openpacketcore/scope-namespace/key/v4\0` followed by the
+/// Postcard encoding of the complete namespace). Obtain the predecessor's
+/// incarnation from stable authority and scan that exact namespace. Initial
+/// admission's broader orphan scan still decodes rows across incarnations.
+pub(crate) fn namespace_prefix(namespace: &ScopeNamespace) -> Result<[u8; 32], ScopeBatchError> {
+    let mut hash = Sha256::new();
+    hash.update(b"openpacketcore/scope-namespace/key/v4\0");
+    hash.update(postcard::to_allocvec(namespace).map_err(|_| ScopeBatchError::FormatMismatch)?);
+    Ok(hash.finalize().into())
+}
+
+/// Sole full-key codec: the canonical 32-byte namespace commitment followed
+/// by the unchanged 32-byte logical key. Prefer the typed child/claim wrappers
+/// below; range adapters may use this shared helper with the corresponding kind.
+pub(crate) fn namespace_key(
+    namespace: &ScopeNamespace,
+    kind: &str,
+    suffix: &[u8; 32],
+) -> Result<SessionKey, ScopeBatchError> {
+    let mut bytes = namespace_prefix(namespace)?.to_vec();
+    bytes.extend_from_slice(suffix);
+    let mut key = scoped_key(namespace.scope(), kind, &[])?;
+    key.stable_id =
+        StableId::new(Bytes::from(bytes)).map_err(|_| ScopeBatchError::FormatMismatch)?;
+    Ok(key)
+}
+/// Canonical child key; delegates to the shared A64 codec.
 pub(crate) fn child_key(
-    scope: &ScopeLeaseId,
+    namespace: &ScopeNamespace,
     key: ScopeChildKey,
 ) -> Result<SessionKey, ScopeBatchError> {
-    scoped_key(scope, CHILD, key.as_bytes())
+    namespace_key(namespace, CHILD, key.as_bytes())
 }
+/// Canonical claim key; delegates to the shared A64 codec.
 pub(crate) fn claim_key(
-    scope: &ScopeLeaseId,
+    namespace: &ScopeNamespace,
     key: ScopeClaimKey,
 ) -> Result<SessionKey, ScopeBatchError> {
-    scoped_key(scope, CLAIM, key.as_bytes())
+    namespace_key(namespace, CLAIM, key.as_bytes())
 }
 
 pub(crate) fn profile_key(
@@ -173,7 +217,7 @@ pub(crate) struct ClaimOwner {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClaimRow {
-    pub(crate) scope: ScopeLeaseId,
+    pub(crate) namespace: ScopeNamespace,
     pub(crate) key: ScopeClaimKey,
     pub(crate) revision: u64,
     pub(crate) owner: Option<ClaimOwner>,
@@ -204,6 +248,7 @@ pub(crate) struct Facts {
     revision: u64,
     birth: u64,
     generation: u64,
+    counters: [u64; SCOPE_COUNTERS],
 }
 impl Facts {
     pub(crate) fn can_replace(self, before: Self) -> bool {
@@ -212,6 +257,11 @@ impl Facts {
                 self.body == before.body
             } else {
                 self.revision > before.revision
+                    && self
+                        .counters
+                        .iter()
+                        .zip(before.counters)
+                        .all(|(next, previous)| *next >= previous)
                     && self.birth >= before.birth
                     && (self.birth > before.birth
                         || (before.generation == 0 && self.generation == 0)
@@ -224,8 +274,8 @@ impl ScopeRow {
     pub(crate) fn key(&self) -> Result<SessionKey, ScopeBatchError> {
         match self {
             Self::Batch(row) => batch_key(&row.scope),
-            Self::Child(row) => child_key(&row.scope, row.key),
-            Self::Claim(row) => claim_key(&row.scope, row.key),
+            Self::Child(row) => child_key(&row.namespace, row.key),
+            Self::Claim(row) => claim_key(&row.namespace, row.key),
             Self::Activation(row) => profile_key(row.identity.cluster_id()),
             Self::Continuation(row) => {
                 continuation_key(row.certificate.predecessor.identity.cluster_id())
@@ -241,16 +291,17 @@ impl ScopeRow {
             Self::Continuation(row) => row.log_index,
         }
     }
-    pub(crate) fn scope(&self) -> Option<&ScopeLeaseId> {
+    pub(crate) fn scope(&self) -> Option<&ScopeId> {
         match self {
             Self::Batch(row) => Some(&row.scope),
-            Self::Child(row) => Some(&row.scope),
-            Self::Claim(row) => Some(&row.scope),
+            Self::Child(row) => Some(row.namespace.scope()),
+            Self::Claim(row) => Some(row.namespace.scope()),
             Self::Activation(_) | Self::Continuation(_) => None,
         }
     }
     pub(crate) fn validate(&self) -> Result<(), ScopeBatchError> {
-        if !(1..=i64::MAX as u64).contains(&self.revision())
+        if self.revision() > i64::MAX as u64
+            || (self.revision() == 0 && !matches!(self, Self::Batch(_)))
             || self.scope().is_some_and(|scope| scope.slot() == &[0; 32])
         {
             return Err(ScopeBatchError::FormatMismatch);
@@ -311,7 +362,7 @@ impl ScopeRow {
             owner: OwnerId::new("scope-state").map_err(|_| ScopeBatchError::FormatMismatch)?,
             fence: FenceToken::new(0),
             state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::from_static("opc-scope-state-v3"),
+            state_type: StateType::from_static("opc-scope-state-v4"),
             expires_at: None,
             payload: EncryptedSessionPayload::new_zeroizing(zeroize::Zeroizing::new(self.body()?)),
         })
@@ -348,6 +399,10 @@ impl ScopeRow {
             revision: self.revision(),
             birth,
             generation,
+            counters: match self {
+                Self::Batch(row) => row.counters,
+                _ => [0; SCOPE_COUNTERS],
+            },
         })
     }
 
@@ -374,9 +429,9 @@ impl ScopeRow {
                     return Err(ScopeBatchError::FormatMismatch);
                 }
                 for claim in &child.claims {
-                    match read(&claim_key(scope, *claim)?)? {
+                    match read(&claim_key(&child.namespace, *claim)?)? {
                         Some(Self::Claim(row))
-                            if row.scope == *scope
+                            if row.namespace == child.namespace
                                 && row.owner
                                     == Some(ClaimOwner {
                                         child: child.key,
@@ -388,9 +443,9 @@ impl ScopeRow {
             }
             Self::Claim(claim) => {
                 if let Some(owner) = claim.owner {
-                    match read(&child_key(scope, owner.child)?)? {
+                    match read(&child_key(&claim.namespace, owner.child)?)? {
                         Some(Self::Child(row))
-                            if row.scope == *scope
+                            if row.namespace == claim.namespace
                                 && row.value.is_some()
                                 && row.revision.birth() == owner.birth
                                 && row.claims.contains(&claim.key) => {}
@@ -402,4 +457,25 @@ impl ScopeRow {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn previous_timed_profile_record_for_test(
+    mut certificate: ScopeProfileActivation,
+) -> StoredSessionRecord {
+    let mut record = ScopeRow::Activation(certificate.clone())
+        .to_record()
+        .unwrap();
+    // Frozen timed profile 3. Activation's structural payload
+    // did not change; this is a fixture, never a compatibility decoder.
+    certificate.profile =
+        hex::decode("2a80baa70449adc61387147e04a28d99a705c4ba5304dfe0d126a2d03fa7932a")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let mut bytes = b"OPSC\x03".to_vec();
+    bytes.extend(postcard::to_allocvec(&ScopeRow::Activation(certificate)).unwrap());
+    record.state_type = StateType::from_static("opc-scope-state-v3");
+    record.payload = EncryptedSessionPayload::new(bytes);
+    record
 }

@@ -1,9 +1,9 @@
-//! Atomic child records under one strictly durable scope grant.
+//! Atomic child records under strictly durable, untimed scope authority.
 //!
 //! A batch contains at most 64 child mutations and 16 counter comparisons.
-//! Claims are unique within the scope and are changed with their child rows.
-//! The apply fence is the stable grant, selection and execution, independent
-//! of lease renewal revisions. The current retained permit must still be live.
+//! Claims are unique within one incarnation and change with their child rows.
+//! Apply compares the exact current Active authority stamp and retirement floor.
+//! Stable counters, birth and sequence floors never reset across incarnations.
 //!
 //! Retain the complete request and allow one unresolved batch per scope. This
 //! initial profile uses lane zero, an exact scope batch revision and one retained
@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::scope_lease::{
-    ScopeClockBounds, ScopeLeaseError, ScopeLeaseId, ScopePermit, ScopeState,
+use crate::scope_authority::{
+    ScopeAuthorityError, ScopeAuthorityStamp, ScopeId, ScopeNamespace, ScopeState,
 };
 use crate::SessionKey;
 
@@ -223,7 +223,7 @@ impl ScopeChildMutation {
 }
 
 /// Exact compare-and-set of one fixed counter. Values are bounded by i64::MAX;
-/// this is accounting, not a default session quota or allocation policy.
+/// these are monotonic stable-scope floors, not quotas or allocation policy.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeCounterMutation {
@@ -234,7 +234,11 @@ pub struct ScopeCounterMutation {
 impl ScopeCounterMutation {
     /// Compare and replace one of the scope's sixteen counters.
     pub fn new(counter: u8, expected: u64, next: u64) -> Result<Self, ScopeBatchError> {
-        if usize::from(counter) >= SCOPE_COUNTERS || expected > COUNTER_MAX || next > COUNTER_MAX {
+        if usize::from(counter) >= SCOPE_COUNTERS
+            || expected > COUNTER_MAX
+            || next > COUNTER_MAX
+            || next < expected
+        {
             return Err(ScopeBatchError::InvalidRequest);
         }
         Ok(Self {
@@ -257,13 +261,11 @@ impl ScopeCounterMutation {
     }
 }
 
-/// Complete exact request, retained until its outcome is known. Only the grant,
-/// selection and execution in `permit` form the batch fence; renewal timestamps
-/// do not. Apply checks the currently retained permit's absolute expiry.
+/// Complete immutable batch request, bound to its exact admitted authority.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeBatchRequest {
-    permit: ScopePermit,
+    stamp: ScopeAuthorityStamp,
     request_id: [u8; 16],
     lane: u8,
     sequence: u64,
@@ -275,14 +277,14 @@ impl ScopeBatchRequest {
     /// Build one bounded batch in lane zero, with sequence `expected_revision + 1`.
     /// Counter-only batches are permitted; other lanes are reserved.
     pub fn new(
-        permit: &ScopePermit,
+        stamp: &ScopeAuthorityStamp,
         request_id: [u8; 16],
         expected_revision: u64,
         operations: Vec<ScopeChildMutation>,
         counters: Vec<ScopeCounterMutation>,
     ) -> Result<Self, ScopeBatchError> {
         let value = Self {
-            permit: permit.clone(),
+            stamp: stamp.clone(),
             request_id,
             lane: 0,
             sequence: expected_revision
@@ -296,8 +298,16 @@ impl ScopeBatchRequest {
         Ok(value)
     }
     /// Stable scope of this batch.
-    pub const fn scope(&self) -> &ScopeLeaseId {
-        self.permit.scope()
+    pub const fn scope(&self) -> &ScopeId {
+        self.stamp.scope()
+    }
+    /// Exact incarnation named by the immutable request.
+    pub const fn namespace(&self) -> &ScopeNamespace {
+        self.stamp.namespace()
+    }
+    /// Complete apply fence, never an effect capability.
+    pub const fn stamp(&self) -> &ScopeAuthorityStamp {
+        &self.stamp
     }
     /// Original operation identity.
     pub const fn request_id(&self) -> &[u8; 16] {
@@ -335,6 +345,7 @@ impl ScopeBatchRequest {
         {
             return Err(ScopeBatchError::InvalidRequest);
         }
+        self.stamp.validate()?;
         let mut keys = HashSet::new();
         for op in &self.operations {
             if op.key().0 == [0; 32]
@@ -366,7 +377,7 @@ impl ScopeBatchRequest {
     fn digest(&self) -> Result<[u8; 32], ScopeBatchError> {
         self.validate()?;
         let mut hash = Sha256::new();
-        hash.update(b"openpacketcore/scope-batch/request/v1\0");
+        hash.update(b"openpacketcore/scope-batch/request/v4\0");
         hash.update(postcard::to_allocvec(self).map_err(|_| ScopeBatchError::InvalidRequest)?);
         Ok(hash.finalize().into())
     }
@@ -396,7 +407,7 @@ pub enum ScopeBatchError {
     /// `ProfileNotActivated` is a no-effect, retryable result; retry the exact
     /// request so the service can activate the current configuration.
     #[error("scope_batch_authority: {0}")]
-    Scope(ScopeLeaseError),
+    Scope(ScopeAuthorityError),
     /// No effect occurred; reread and regroup these comparisons.
     #[error("scope_batch_conflict")]
     Conflict(ScopeBatchConflicts),
@@ -416,8 +427,8 @@ pub enum ScopeBatchError {
     #[error("scope_batch_unavailable")]
     Unavailable,
 }
-impl From<ScopeLeaseError> for ScopeBatchError {
-    fn from(value: ScopeLeaseError) -> Self {
+impl From<ScopeAuthorityError> for ScopeBatchError {
+    fn from(value: ScopeAuthorityError) -> Self {
         Self::Scope(value)
     }
 }
@@ -433,6 +444,18 @@ pub struct ScopeBatchOutcome {
     revision: u64,
     rows: Vec<ScopeChildRevision>,
     counters: [u64; SCOPE_COUNTERS],
+}
+
+/// Read-only resolution after the predecessor has been durably superseded.
+/// This result never authorizes resubmission of a predecessor's request.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeBatchResolution {
+    /// Exact retained receipt proves application.
+    Applied(Box<ScopeBatchOutcome>),
+    /// The sequence cannot have applied and its old authority can never apply now.
+    NotApplied,
+    /// The receipt was pruned; absence cannot prove a negative outcome.
+    Unknown,
 }
 
 /// Current batch revision and fixed counters, observed through a linearizable
@@ -479,7 +502,7 @@ impl ScopeBatchOutcome {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeChildRecord {
-    pub(crate) scope: ScopeLeaseId,
+    pub(crate) namespace: ScopeNamespace,
     pub(crate) key: ScopeChildKey,
     pub(crate) revision: ScopeChildRevision,
     pub(crate) batch_revision: u64,
@@ -487,6 +510,10 @@ pub struct ScopeChildRecord {
     pub(crate) claims: Vec<ScopeClaimKey>,
 }
 impl ScopeChildRecord {
+    /// Exact incarnation containing this row.
+    pub const fn namespace(&self) -> &ScopeNamespace {
+        &self.namespace
+    }
     /// Exact opaque child identity.
     pub const fn key(&self) -> ScopeChildKey {
         self.key
@@ -512,7 +539,6 @@ impl ScopeChildRecord {
 #[serde(deny_unknown_fields)]
 pub struct ScopeBatchCommand {
     pub(crate) request: ScopeBatchRequest,
-    pub(crate) bounds: ScopeClockBounds,
 }
 impl ScopeBatchCommand {
     #[cfg(target_os = "linux")]
@@ -521,7 +547,7 @@ impl ScopeBatchCommand {
         // The fixed authority allowance covers the bounded scope and execution
         // identifiers. Child values and every Vec use their actual capacities.
         let mut bytes = size_of::<Self>()
-            .checked_add(crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES)?
+            .checked_add(crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES)?
             .checked_add(
                 self.request
                     .operations
@@ -602,7 +628,6 @@ impl ScopeBatchCommand {
     }
     pub(crate) fn validate(&self) -> Result<(), ScopeBatchError> {
         self.request.validate()?;
-        ScopeClockBounds::new(self.bounds.earliest(), self.bounds.latest())?;
         Ok(())
     }
     pub(crate) fn matches(&self, outcome: &ScopeBatchOutcome) -> bool {
@@ -636,7 +661,7 @@ impl ScopeBatchCommand {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScopeBatchCheckpoint {
-    pub(crate) scope: ScopeLeaseId,
+    pub(crate) scope: ScopeId,
     pub(crate) revision: u64,
     pub(crate) birth_floor: u64,
     pub(crate) counters: [u64; SCOPE_COUNTERS],
@@ -673,6 +698,7 @@ redacted_debug!(
     ScopeBatchConflicts,
     ScopeBatchError,
     ScopeBatchOutcome,
+    ScopeBatchResolution,
     ScopeBatchView,
     ScopeChildRecord,
     ScopeBatchCommand,

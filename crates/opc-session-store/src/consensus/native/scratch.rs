@@ -72,12 +72,12 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
             SessionMutationIntent::ActivateScopeProfile(_) => {
                 count = 1;
             }
-            SessionMutationIntent::ScopeLease(operation) => {
+            SessionMutationIntent::ScopeAuthority(operation) => {
                 operation
                     .validate()
                     .map_err(|_| invalid("scope operation invalid"))?;
                 count = 1;
-                largest_payload = crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2;
+                largest_payload = crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES * 2;
             }
             SessionMutationIntent::AdvanceLogicalTime => {}
             SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
@@ -237,12 +237,12 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
                     .ok_or_else(|| invalid("native owned scope batch allocation overflow"))
             }
             SessionMutationIntent::ActivateScopeProfile(_) => Ok(CONTEXT_METADATA),
-            SessionMutationIntent::ScopeLease(operation) => {
+            SessionMutationIntent::ScopeAuthority(operation) => {
                 operation
                     .validate()
                     .map_err(|_| invalid("scope operation invalid"))?;
-                Ok(size_of::<crate::scope_lease::ScopeLeaseCommand>()
-                    + crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES)
+                Ok(size_of::<crate::scope_authority::ScopeAuthorityCommand>()
+                    + crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES)
             }
             SessionMutationIntent::AdvanceLogicalTime => Ok(0),
             SessionMutationIntent::MaintainFencedTransitionV2History { .. } if allow_authorized => {

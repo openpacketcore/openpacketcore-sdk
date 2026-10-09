@@ -1,6 +1,6 @@
 use super::*;
-use crate::scope_lease::tests::{bounds, execution, request, scope};
-use crate::scope_lease::{ScopeGateClosed, ScopeLeaseOperation, ScopeState};
+use crate::scope_authority::tests::{admitted, close, retired_fixture, scope, successor};
+use crate::scope_authority::ScopeState;
 use std::collections::HashMap;
 
 pub(crate) fn key(n: u8) -> ScopeChildKey {
@@ -29,31 +29,7 @@ pub(crate) fn value(n: u8) -> ScopeSealedValue {
 }
 
 fn authority() -> ScopeState {
-    let selected = ScopeState::empty(scope())
-        .transition(
-            &request(
-                0,
-                1,
-                ScopeLeaseOperation::Select {
-                    execution: execution(1),
-                },
-            ),
-            bounds(0),
-        )
-        .unwrap();
-    selected
-        .transition(
-            &request(
-                1,
-                2,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(1),
-                    selection: 1,
-                },
-            ),
-            bounds(0),
-        )
-        .unwrap()
+    admitted()
 }
 
 struct State {
@@ -74,24 +50,20 @@ impl State {
     fn command(&self, n: u8, operations: Vec<ScopeChildMutation>) -> ScopeBatchCommand {
         ScopeBatchCommand {
             request: ScopeBatchRequest::new(
-                self.authority.view.permit().unwrap(),
+                self.authority.view.stamp().unwrap(),
                 [n; 16],
                 self.checkpoint.revision,
                 operations,
                 vec![],
             )
             .unwrap(),
-            bounds: bounds(1),
         }
     }
 
     fn apply(&mut self, command: &ScopeBatchCommand) -> Result<ScopeBatchOutcome, ScopeBatchError> {
-        let plan = command.plan(
-            &self.authority,
-            &self.checkpoint,
-            command.bounds.latest(),
-            |key| Ok(self.rows.get(key).cloned()),
-        )?;
+        let plan = command.plan(&self.authority, &self.checkpoint, |key| {
+            Ok(self.rows.get(key).cloned())
+        })?;
         self.rows.extend(plan.rows);
         self.checkpoint = plan.checkpoint;
         Ok(self
@@ -102,9 +74,13 @@ impl State {
     }
 
     fn child(&self, n: u8) -> Option<&ScopeChildRecord> {
-        let row = self
-            .rows
-            .get(&crate::scope_storage::child_key(&scope(), key(n)).unwrap())?;
+        let row = self.rows.get(
+            &crate::scope_storage::child_key(
+                self.authority.view.stamp().unwrap().namespace(),
+                key(n),
+            )
+            .unwrap(),
+        )?;
         match row {
             crate::scope_storage::ScopeRow::Child(record) if record.value.is_some() => Some(record),
             _ => None,
@@ -128,6 +104,59 @@ pub(crate) fn create(n: u8, claims: &[u8]) -> ScopeChildMutation {
         value: value(n),
         claims: claims.iter().copied().map(claim).collect(),
     }
+}
+
+#[test]
+fn current_execution_needs_no_time_input() {
+    let state = State::new();
+    let command = state.command(3, vec![create(1, &[1])]);
+    let result = command.plan(&state.authority, &state.checkpoint, |key| {
+        Ok(state.rows.get(key).cloned())
+    });
+    assert!(
+        result.is_ok(),
+        "an unchanged admitted execution must remain authorized after elapsed time: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn counter_floors_cannot_decrease() {
+    assert!(matches!(
+        ScopeCounterMutation::new(0, 7, 6),
+        Err(ScopeBatchError::InvalidRequest)
+    ));
+}
+
+#[test]
+fn scope_batch_apply_rejects_decoded_counter_decrease_without_mutation() {
+    let mut state = State::new();
+    let mut initial = state.command(1, vec![create(1, &[1])]);
+    initial.request.counters = vec![ScopeCounterMutation::new(0, 0, 7).unwrap()];
+    state.apply(&initial).unwrap();
+    let mut compare = state.command(2, vec![create(2, &[2])]);
+    compare.request.counters = vec![ScopeCounterMutation::new(0, 7, 7).unwrap()];
+    let before = state.bytes();
+
+    // A replicated decode bypasses the public constructor. Apply must repeat
+    // its validation before publishing any child, claim, receipt or floor.
+    let mut encoded = serde_json::to_value(&compare).unwrap();
+    encoded["request"]["counters"][0]["next"] = 6.into();
+    let decoded: ScopeBatchCommand = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.request.counters[0].next(), 6);
+    assert_eq!(state.apply(&decoded), Err(ScopeBatchError::InvalidRequest));
+    assert_eq!(
+        state.bytes(),
+        before,
+        "decoded decreases have no row effects"
+    );
+
+    let outcome = state.apply(&compare).unwrap();
+    assert_eq!(
+        outcome.counters()[0],
+        7,
+        "equal-value compares remain valid"
+    );
 }
 
 #[test]
@@ -343,98 +372,160 @@ fn scope_batch_exact_birth_and_generation_fence_delete_and_replacement() {
 }
 
 #[test]
-fn scope_batch_fence_survives_renewal_but_rejects_release_expiry_and_intervening_grant() {
+fn scope_batch_ordered_after_closure_succession_or_retirement_has_no_effect() {
+    for transition in 0..3 {
+        let mut state = State::new();
+        let pending = state.command(3, vec![create(1, &[1])]);
+        let before = state.bytes();
+        state.authority = match transition {
+            0 => state
+                .authority
+                .transition(&close(&state.authority, 2))
+                .unwrap(),
+            1 => state
+                .authority
+                .transition(&successor(&state.authority, 2))
+                .unwrap(),
+            _ => retired_fixture(&state.authority, 2),
+        };
+        assert!(matches!(
+            state.apply(&pending),
+            Err(ScopeBatchError::Scope(_))
+        ));
+        assert_eq!(state.bytes(), before);
+    }
+}
+
+#[test]
+fn incarnation_change_keeps_all_counters_birth_and_sequence_floors() {
     let mut state = State::new();
-    let pending = state.command(3, vec![create(1, &[])]);
-    let old_permit = state.authority.view.permit().unwrap().clone();
-    state.authority = state
-        .authority
-        .transition(
-            &request(
-                2,
-                4,
-                ScopeLeaseOperation::Renew {
-                    permit: old_permit.clone(),
-                },
-            ),
-            bounds(1),
-        )
+    let mut first = state.command(3, vec![create(1, &[1])]);
+    first.request.counters = (0..16)
+        .map(|n| ScopeCounterMutation::new(n, 0, u64::from(n) + 5).unwrap())
+        .collect();
+    state.apply(&first).unwrap();
+    let old_namespace = state.authority.view.stamp().unwrap().namespace().clone();
+    let old_key = crate::scope_storage::child_key(&old_namespace, key(1)).unwrap();
+    state.authority = retired_fixture(&state.authority, 2);
+    let current = state.command(4, vec![create(1, &[1])]);
+    assert_ne!(
+        crate::scope_storage::child_key(current.request.namespace(), key(1)).unwrap(),
+        old_key
+    );
+    let after = state.apply(&current).unwrap();
+    assert_eq!(after.rows()[0].birth(), 2);
+    assert_eq!(after.revision(), 2);
+    assert_eq!(after.sequence(), 2);
+    assert_eq!(after.counters(), &std::array::from_fn(|n| n as u64 + 5));
+    assert!(state.rows.contains_key(&old_key));
+    let encoded = crate::scope_storage::ScopeRow::Batch(Box::new(state.checkpoint.clone()))
+        .to_record()
+        .unwrap();
+    let roundtrip = crate::scope_storage::ScopeRow::from_record(&encoded).unwrap();
+    assert_eq!(
+        postcard::to_allocvec(&roundtrip).unwrap(),
+        postcard::to_allocvec(&crate::scope_storage::ScopeRow::Batch(Box::new(
+            state.checkpoint.clone()
+        )))
+        .unwrap()
+    );
+}
+
+#[test]
+fn required_zero_ledger_encoding_is_canonical() {
+    let row = crate::scope_storage::ScopeRow::Batch(Box::new(ScopeBatchCheckpoint::empty(scope())));
+    let record = row.to_record().unwrap();
+    assert_eq!(record.generation.get(), 0);
+    assert_eq!(
+        crate::scope_storage::ScopeRow::from_record(&record).unwrap(),
+        row
+    );
+    for field in 0..19 {
+        let mut wire = serde_json::to_value(&row).unwrap();
+        match field {
+            0..=15 => wire["Batch"]["counters"][field] = 1.into(),
+            16 => wire["Batch"]["birth_floor"] = 1.into(),
+            17 => wire["Batch"]["lanes"][0]["floor"] = 1.into(),
+            _ => {
+                wire["Batch"]["lanes"][7]["last_request_id"] =
+                    serde_json::to_value([1; 16]).unwrap()
+            }
+        }
+        let forged: crate::scope_storage::ScopeRow = serde_json::from_value(wire).unwrap();
+        assert!(
+            forged.to_record().is_err(),
+            "nonzero field {field} at revision zero"
+        );
+    }
+}
+
+#[test]
+fn snapshot_may_not_lower_any_stable_counter_or_birth_floor() {
+    let mut state = State::new();
+    let mut first = state.command(3, vec![create(1, &[1])]);
+    first.request.counters = (0..16)
+        .map(|n| ScopeCounterMutation::new(n, 0, 8).unwrap())
+        .collect();
+    state.apply(&first).unwrap();
+    let before = crate::scope_storage::ScopeRow::Batch(Box::new(state.checkpoint.clone()))
+        .facts()
         .unwrap();
     state
-        .apply(&pending)
-        .expect("renewal revisions are not batch fences");
-    let pending = state.command(5, vec![create(2, &[])]);
-    let permit = state.authority.view.permit().unwrap().clone();
-    let live = state.authority.clone();
-    let before = state.bytes();
-    state.authority = live
-        .transition(
-            &request(
-                3,
-                6,
-                ScopeLeaseOperation::Release {
-                    closed: ScopeGateClosed::after_gate_closed(permit),
-                },
-            ),
-            bounds(2),
-        )
+        .apply(&state.command(4, vec![create(2, &[2])]))
         .unwrap();
-    assert!(matches!(
-        state.apply(&pending),
-        Err(ScopeBatchError::Scope(ScopeLeaseError::StalePermit))
-    ));
-    assert_eq!(state.bytes(), before);
-    state.authority = live;
-    let mut expired = pending.clone();
-    expired.bounds = bounds(79);
-    assert!(matches!(
-        state.apply(&expired),
-        Err(ScopeBatchError::Scope(ScopeLeaseError::Expired))
-    ));
-    assert!(
-        matches!(
-            pending.plan(
-                &state.authority,
-                &state.checkpoint,
-                crate::scope_lease::tests::at(79),
-                |key| { Ok(state.rows.get(key).cloned()) }
-            ),
-            Err(ScopeBatchError::Scope(ScopeLeaseError::Expired))
-        ),
-        "application delay cannot reuse preparation time"
+    for n in 0..17 {
+        let mut lower = state.checkpoint.clone();
+        if n == 16 {
+            lower.birth_floor = 0;
+            lower.lanes[0].outcome.as_mut().unwrap().rows.clear();
+        } else {
+            lower.counters[n] = 7;
+            lower.lanes[0].outcome.as_mut().unwrap().counters[n] = 7;
+        }
+        let after = crate::scope_storage::ScopeRow::Batch(Box::new(lower))
+            .facts()
+            .unwrap();
+        assert!(!after.can_replace(before), "floor {n} cannot decrease");
+    }
+}
+
+#[test]
+fn predecessor_outcomes_distinguish_applied_not_applied_and_pruned() {
+    let mut state = State::new();
+    let first = state.command(3, vec![create(1, &[1])]);
+    let pending = state.command(4, vec![create(2, &[2])]);
+    assert_eq!(
+        state.checkpoint.resolve(&first.request).unwrap(),
+        ScopeBatchResolution::NotApplied
+    );
+    let outcome = state.apply(&first).unwrap();
+    assert_eq!(
+        state.checkpoint.resolve(&first.request).unwrap(),
+        ScopeBatchResolution::Applied(Box::new(outcome.clone()))
+    );
+    assert_eq!(
+        state.checkpoint.resolve(&pending.request).unwrap(),
+        ScopeBatchResolution::NotApplied
     );
     state.authority = state
         .authority
-        .transition(
-            &request(
-                3,
-                7,
-                ScopeLeaseOperation::Select {
-                    execution: execution(2),
-                },
-            ),
-            bounds(100),
-        )
+        .transition(&successor(&state.authority, 2))
         .unwrap();
-    state.authority = state
-        .authority
-        .transition(
-            &request(
-                4,
-                8,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(2),
-                    selection: 2,
-                },
-            ),
-            bounds(100),
-        )
-        .unwrap();
-    assert!(matches!(
-        state.apply(&pending),
-        Err(ScopeBatchError::Scope(ScopeLeaseError::StalePermit))
-    ));
-    assert_eq!(state.bytes(), before);
+    assert_eq!(
+        state.apply(&first).unwrap(),
+        outcome,
+        "an exact receipt replay has no effects"
+    );
+    assert!(
+        state.apply(&pending).is_err(),
+        "predecessor writes can never first apply after succession"
+    );
+    let next = state.command(5, vec![create(2, &[2])]);
+    state.apply(&next).unwrap();
+    assert_eq!(
+        state.checkpoint.resolve(&first.request).unwrap(),
+        ScopeBatchResolution::Unknown
+    );
 }
 
 #[test]
@@ -472,7 +563,7 @@ fn scope_batch_replay_is_exact_and_counter_conflicts_are_atomic() {
 #[test]
 fn scope_batch_rejects_duplicate_rows_claims_counts_and_encoded_byte_overflow() {
     let state = State::new();
-    let permit = state.authority.view.permit().unwrap();
+    let permit = state.authority.view.stamp().unwrap();
     let make = |operations| ScopeBatchRequest::new(permit, [3; 16], 0, operations, vec![]);
     assert!(make(vec![create(1, &[]), create(1, &[])]).is_err());
     assert!(make(vec![create(1, &[1, 1])]).is_err());
@@ -495,10 +586,7 @@ fn scope_batch_rejects_duplicate_rows_claims_counts_and_encoded_byte_overflow() 
         claims: (1..=8).map(claim).collect(),
     };
     let one = make(vec![mutation]).expect("a maximum sealed child plus every index fits");
-    let command = ScopeBatchCommand {
-        request: one,
-        bounds: bounds(1),
-    };
+    let command = ScopeBatchCommand { request: one };
     assert!(serde_json::to_vec(&command).unwrap().len() < MAX_SCOPE_BATCH_COMMAND_BYTES);
     assert!(make(vec![
         ScopeChildMutation::Create {
@@ -513,4 +601,98 @@ fn scope_batch_rejects_duplicate_rows_claims_counts_and_encoded_byte_overflow() 
         },
     ])
     .is_err());
+}
+
+#[test]
+fn current_batch_revision_cannot_hide_any_forged_authority_field() {
+    let mut state = State::new();
+    let original = state.command(7, vec![create(1, &[1])]);
+    let before = state.bytes();
+    for field in 0..7 {
+        let mut wire = serde_json::to_value(&original).unwrap();
+        let stamp = &mut wire["request"]["stamp"];
+        match field {
+            0 => stamp["namespace"]["incarnation"] = 2.into(),
+            1 => stamp["revision"] = 2.into(),
+            2 => stamp["execution"]["admission_generation"] = 2.into(),
+            3 => stamp["execution"]["workload"] = serde_json::to_value([8; 16]).unwrap(),
+            4 => stamp["execution"]["process"] = serde_json::to_value([8; 16]).unwrap(),
+            5 => stamp["execution"]["boot_key"] = serde_json::to_value([8; 32]).unwrap(),
+            _ => stamp["execution"]["identity"] = "spiffe://scope.test/worker-2".into(),
+        }
+        let forged: ScopeBatchCommand = serde_json::from_value(wire).unwrap();
+        assert!(
+            matches!(state.apply(&forged), Err(ScopeBatchError::Scope(_))),
+            "field {field}"
+        );
+        assert_eq!(state.bytes(), before);
+    }
+    assert!(state.apply(&original).is_ok());
+}
+
+#[test]
+fn a_current_closed_stamp_cannot_authorize_a_new_batch() {
+    let mut state = State::new();
+    state.authority = state
+        .authority
+        .transition(&close(&state.authority, 2))
+        .unwrap();
+    let pending = state.command(3, vec![create(1, &[1])]);
+    let before = state.bytes();
+    assert!(matches!(
+        state.apply(&pending),
+        Err(ScopeBatchError::Scope(ScopeAuthorityError::StaleAuthority))
+    ));
+    assert_eq!(state.bytes(), before);
+}
+
+/// Independently well-formed rows, deliberately detached from authority. The
+/// initial-admission tests insert each one alone to simulate orphaned storage.
+pub(crate) fn orphan_rows(scope: ScopeId) -> Vec<crate::scope_storage::ScopeRow> {
+    use crate::scope_authority::{
+        ScopeAuthorityOperation, ScopeAuthorityRequest, ScopeIncarnation, ScopeNamespace,
+    };
+    use crate::scope_storage::ScopeRow;
+    let authority = ScopeState::empty(scope.clone())
+        .transition(
+            &ScopeAuthorityRequest::new(
+                scope.clone(),
+                [1; 16],
+                0,
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: crate::scope_authority::tests::execution(1),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let command = ScopeBatchCommand {
+        request: ScopeBatchRequest::new(
+            authority.view.stamp().unwrap(),
+            [2; 16],
+            0,
+            vec![create(1, &[1])],
+            vec![ScopeCounterMutation::new(0, 0, 9).unwrap()],
+        )
+        .unwrap(),
+    };
+    let plan = command
+        .plan(
+            &authority,
+            &ScopeBatchCheckpoint::empty(scope.clone()),
+            |_| Ok(None),
+        )
+        .unwrap();
+    let mut rows: Vec<_> = plan.rows.into_values().collect();
+    let next_namespace = ScopeNamespace::new(scope, ScopeIncarnation::new(2).unwrap()).unwrap();
+    for mut row in rows.clone() {
+        match &mut row {
+            ScopeRow::Child(child) => child.namespace = next_namespace.clone(),
+            ScopeRow::Claim(claim) => claim.namespace = next_namespace.clone(),
+            _ => continue,
+        }
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 5);
+    rows
 }

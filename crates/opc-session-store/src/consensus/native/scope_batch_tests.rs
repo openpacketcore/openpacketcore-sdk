@@ -1,11 +1,12 @@
 use super::*;
 use crate::consensus::native::changes::tests::{apply, clock, fixture};
+use crate::scope_authority::tests::{at, execution};
+use crate::scope_authority::{
+    ScopeAuthorityCommand, ScopeAuthorityOperation, ScopeAuthorityRequest, ScopeId,
+    ScopeProfileActivation,
+};
 use crate::scope_batch::tests::{claim, create, key, value};
 use crate::scope_batch::{ScopeBatchRequest, ScopeChildMutation, ScopeChildRevision};
-use crate::scope_lease::tests::{at, bounds, execution};
-use crate::scope_lease::{
-    ScopeLeaseCommand, ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest, ScopeProfileActivation,
-};
 
 fn entry(
     storage: &NativeStorage,
@@ -17,7 +18,7 @@ fn entry(
         unreachable!()
     };
     command.request_id = SessionConsensusRequestId::from_bytes(match &intent {
-        SessionMutationIntent::ScopeLease(operation) => *operation.request.request_id(),
+        SessionMutationIntent::ScopeAuthority(operation) => *operation.request.request_id(),
         SessionMutationIntent::ScopeBatch(operation) => *operation.request.request_id(),
         _ => (0x1000 + u128::from(index)).to_be_bytes(),
     });
@@ -27,6 +28,67 @@ fn entry(
         mutation: Box::new(intent),
     };
     entry
+}
+
+#[test]
+fn required_native_ledger_is_atomic_and_cannot_be_omitted_on_reopen() {
+    let (mut storage, _, _) = fixture();
+    let identity = storage.business.identity;
+    let scope = ScopeId::new(
+        identity,
+        opc_types::TenantId::from_static("required-ledger"),
+        opc_types::NetworkFunctionKind::smf(),
+        [1; 32],
+    )
+    .unwrap();
+    let activate = entry(
+        &storage,
+        2,
+        SessionMutationIntent::ActivateScopeProfile(Box::new(ScopeProfileActivation::new(
+            identity,
+            fenced_transition_voter_set_digest(identity, &storage.business.members),
+        ))),
+    );
+    apply(&mut storage, &[activate]);
+    let initial = entry(
+        &storage,
+        3,
+        SessionMutationIntent::ScopeAuthority(Box::new(ScopeAuthorityCommand {
+            request: ScopeAuthorityRequest::new(
+                scope.clone(),
+                [3; 16],
+                0,
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: execution(1),
+                },
+            )
+            .unwrap(),
+        })),
+    );
+    let key = scope_storage::batch_key(&scope).unwrap();
+    let complete = storage
+        .business
+        .prepare(std::slice::from_ref(&initial))
+        .unwrap();
+    assert!(
+        complete.keys.contains_key(&key),
+        "admission includes the zero ledger"
+    );
+    changes::Publication::prepare(complete).unwrap();
+    let mut incomplete = storage
+        .business
+        .prepare(std::slice::from_ref(&initial))
+        .unwrap();
+    incomplete.keys.remove(&key);
+    assert!(changes::Publication::prepare(incomplete).is_err());
+    apply(&mut storage, &[initial]);
+    storage.business.validate_full_business_rows().unwrap();
+    let mut damaged = storage.business.clone();
+    damaged.keys.remove(&key).unwrap();
+    assert!(
+        damaged.validate_full_business_rows().is_err(),
+        "cold admission cannot synthesize missing stable floors"
+    );
 }
 
 #[test]
@@ -68,7 +130,7 @@ fn native_previous_scope_format_log_admission_requires_fresh_installation() {
 fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_generation() {
     let (mut storage, _, _) = fixture();
     let identity = storage.business.identity;
-    let scope = ScopeLeaseId::new(
+    let scope = ScopeId::new(
         identity,
         opc_types::TenantId::from_static("scope-links"),
         opc_types::NetworkFunctionKind::smf(),
@@ -84,53 +146,33 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
         ))),
     );
     apply(&mut storage, &[activate]);
-    let mut permit = None;
-    for (index, revision, operation) in [
-        (
-            3,
-            0,
-            ScopeLeaseOperation::Select {
-                execution: execution(1),
-            },
-        ),
-        (
-            4,
-            1,
-            ScopeLeaseOperation::Acquire {
-                execution: execution(1),
-                selection: 1,
-            },
-        ),
-    ] {
-        let operation = entry(
-            &storage,
-            index,
-            SessionMutationIntent::ScopeLease(Box::new(ScopeLeaseCommand {
-                request: ScopeLeaseRequest::new(
-                    scope.clone(),
-                    (0x2000 + u128::from(index)).to_be_bytes(),
-                    revision,
-                    operation,
-                )
-                .unwrap(),
-                bounds: bounds(0),
-            })),
-        );
-        let applied = apply(&mut storage, &[operation]);
-        let Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) = &applied.responses[0].result
-        else {
-            panic!("scope grant")
-        };
-        permit = checkpoint.state().unwrap().view.permit().cloned();
-    }
-    let permit = permit.unwrap();
+    let operation = entry(
+        &storage,
+        3,
+        SessionMutationIntent::ScopeAuthority(Box::new(ScopeAuthorityCommand {
+            request: ScopeAuthorityRequest::new(
+                scope.clone(),
+                [3; 16],
+                0,
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: execution(1),
+                },
+            )
+            .unwrap(),
+        })),
+    );
+    let applied = apply(&mut storage, &[operation]);
+    let Ok(SessionMutationOutcome::ScopeAuthority(Ok(checkpoint))) = &applied.responses[0].result
+    else {
+        panic!("scope admission")
+    };
+    let permit = checkpoint.state().unwrap().view.stamp().cloned().unwrap();
     let create = entry(
         &storage,
-        5,
+        4,
         SessionMutationIntent::ScopeBatch(Box::new(ScopeBatchCommand {
             request: ScopeBatchRequest::new(&permit, [1; 16], 0, vec![create(1, &[1])], vec![])
                 .unwrap(),
-            bounds: bounds(0),
         })),
     );
     let applied = apply(&mut storage, &[create]);
@@ -140,7 +182,7 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
     let version = outcome.rows()[0];
     let update = entry(
         &storage,
-        6,
+        5,
         SessionMutationIntent::ScopeBatch(Box::new(ScopeBatchCommand {
             request: ScopeBatchRequest::new(
                 &permit,
@@ -155,7 +197,6 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
                 vec![],
             )
             .unwrap(),
-            bounds: bounds(0),
         })),
     );
     let valid = storage
@@ -174,7 +215,7 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
             0 => {
                 delta
                     .keys
-                    .remove(&scope_storage::claim_key(&scope, claim(1)).unwrap());
+                    .remove(&scope_storage::claim_key(permit.namespace(), claim(1)).unwrap());
             }
             1 => {
                 delta
@@ -184,7 +225,7 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
             2 => {
                 let row = delta
                     .keys
-                    .get_mut(&scope_storage::claim_key(&scope, claim(2)).unwrap())
+                    .get_mut(&scope_storage::claim_key(permit.namespace(), claim(2)).unwrap())
                     .unwrap();
                 let Some(ScopeRow::Claim(mut claim)) = decode(row).unwrap() else {
                     unreachable!()
@@ -195,7 +236,7 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
             _ => {
                 let row = delta
                     .keys
-                    .get_mut(&scope_storage::child_key(&scope, key(1)).unwrap())
+                    .get_mut(&scope_storage::child_key(permit.namespace(), key(1)).unwrap())
                     .unwrap();
                 let Some(ScopeRow::Child(mut child)) = decode(row).unwrap() else {
                     unreachable!()
@@ -210,5 +251,39 @@ fn native_scope_batch_publication_rejects_omitted_links_and_unchanged_child_gene
             "fault {fault} cannot mint a business proof"
         );
         assert_eq!(storage.business.business_digest_for_test().unwrap(), before);
+    }
+}
+
+#[test]
+fn native_profile_three_rows_and_log_activation_require_fresh_installation() {
+    let (storage, _, _) = fixture();
+    let record =
+        crate::scope_storage::previous_timed_profile_record_for_test(ScopeProfileActivation::new(
+            storage.business.identity,
+            fenced_transition_voter_set_digest(
+                storage.business.identity,
+                &storage.business.members,
+            ),
+        ));
+    let error = crate::scope_storage::require_current_record_format(&record).unwrap_err();
+    assert!(error.to_string().contains("fresh installation required"));
+    let ScopeRow::Activation(certificate) =
+        postcard::from_bytes(&record.payload.as_bytes()[5..]).unwrap()
+    else {
+        unreachable!()
+    };
+    let old = entry(
+        &storage,
+        2,
+        SessionMutationIntent::ActivateScopeProfile(Box::new(certificate)),
+    );
+    for error in [
+        log::NativeLog::validate_entry(&old, &storage.business).unwrap_err(),
+        owned::entry(&old).err().unwrap(),
+    ] {
+        assert_eq!(
+            crate::consensus::storage::SessionConsensusStorageError::from_validation_error(error),
+            crate::consensus::storage::SessionConsensusStorageError::FreshInstallationRequired
+        );
     }
 }

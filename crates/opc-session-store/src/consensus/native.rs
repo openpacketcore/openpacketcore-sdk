@@ -27,8 +27,8 @@ mod memory_tests;
 mod ordinary;
 pub(crate) mod roster;
 mod row_map;
+mod scope_authority;
 mod scope_batch;
-mod scope_lease;
 mod shared;
 use row_map::RowMap;
 mod v1;
@@ -1399,7 +1399,7 @@ impl NativeDelta<'_> {
         };
         if let EntryPayload::Normal(command) = &entry.payload {
             if !crate::sqlite::consensus::contains_protected_roster_command(&command.intent)
-                && crate::sqlite::consensus::scope_lease::operation(&command.intent).is_none()
+                && crate::sqlite::consensus::scope_authority::operation(&command.intent).is_none()
                 && crate::sqlite::consensus::scope_batch::operation(&command.intent).is_none()
             {
                 if let Some(now) = response.logical_time {
@@ -1459,8 +1459,8 @@ impl NativeDelta<'_> {
             SessionMutationIntent::ScopeBatch(operation) => {
                 self.scope_batch(command, operation, authorized, now, index)
             }
-            SessionMutationIntent::ScopeLease(operation) => {
-                self.scope_lease(command, operation, authorized, now, index)
+            SessionMutationIntent::ScopeAuthority(operation) => {
+                self.scope_authority(command, operation, authorized, now, index)
             }
             SessionMutationIntent::FencedTransition(request) => {
                 self.fenced_v1(command, request, None, authorized, now, index)

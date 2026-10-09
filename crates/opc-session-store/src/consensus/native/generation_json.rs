@@ -211,8 +211,8 @@ impl<'de> Deserialize<'de> for ScopeChildren {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeRequest {
-    #[serde(rename = "permit")]
-    _permit: Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>,
+    #[serde(rename = "stamp")]
+    _stamp: Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>,
     #[serde(rename = "request_id")]
     _request_id: Request,
     #[serde(rename = "lane")]
@@ -230,8 +230,6 @@ struct ScopeRequest {
 #[serde(deny_unknown_fields)]
 struct ScopeBatch {
     request: ScopeRequest,
-    #[serde(rename = "bounds")]
-    _bounds: Request,
 }
 
 struct Batch(Shape);
@@ -276,7 +274,7 @@ impl<'de> Deserialize<'de> for Batch {
 enum InnerIntent {
     ScopeBatch(ScopeBatch),
     ActivateScopeProfile(Request),
-    ScopeLease(Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>),
+    ScopeAuthority(Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>),
     AdvanceLogicalTime,
     CompareAndSet(Request),
     DeleteFenced(Request),
@@ -308,9 +306,9 @@ impl InnerIntent {
                 payload: value.request.operations.0.payload,
             },
             Self::ActivateScopeProfile(value) => value.0,
-            Self::ScopeLease(value) => Shape {
+            Self::ScopeAuthority(value) => Shape {
                 requests: value.0.requests,
-                payload: crate::scope_lease::MAX_SCOPE_LEASE_RECORD_BYTES * 2,
+                payload: crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES * 2,
             },
             Self::AdvanceLogicalTime => Shape::default(),
             Self::CompareAndSet(value)

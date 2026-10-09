@@ -1,11 +1,11 @@
 //! Current-configuration point reads and one-command atomic batch submissions.
 
 use super::*;
+use crate::scope_authority::{ScopeAuthorityError, ScopeId, ScopeNamespace};
 use crate::scope_batch::{
     ScopeBatchCheckpoint, ScopeBatchCommand, ScopeBatchError, ScopeBatchOutcome, ScopeChildKey,
     ScopeChildRecord,
 };
-use crate::scope_lease::{ScopeLeaseError, ScopeLeaseId};
 use crate::scope_storage::{self, ScopeRow};
 
 fn unavailable(_: impl fmt::Debug) -> ScopeBatchError {
@@ -15,12 +15,12 @@ fn unavailable(_: impl fmt::Debug) -> ScopeBatchError {
 impl ConsensusSessionStore {
     async fn scope_row(
         &self,
-        scope: &ScopeLeaseId,
+        scope: &ScopeId,
         key: SessionKey,
     ) -> Result<Option<ScopeRow>, ScopeBatchError> {
         let (identity, _) = self.current_scope().map_err(unavailable)?;
         if identity.cluster_id() != scope.store() {
-            return Err(ScopeLeaseError::Unauthorized.into());
+            return Err(ScopeAuthorityError::Unauthorized.into());
         }
         let current = SessionConsumerScope::new(identity);
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
@@ -53,28 +53,29 @@ impl ConsensusSessionStore {
 
     pub(crate) async fn scope_batch_checkpoint(
         &self,
-        scope: &ScopeLeaseId,
+        scope: &ScopeId,
     ) -> Result<ScopeBatchCheckpoint, ScopeBatchError> {
         match self
             .scope_row(scope, scope_storage::batch_key(scope)?)
             .await?
         {
             Some(ScopeRow::Batch(row)) => Ok(*row),
-            None => Ok(ScopeBatchCheckpoint::empty(scope.clone())),
             _ => Err(ScopeBatchError::FormatMismatch),
         }
     }
 
     pub(crate) async fn scope_batch_child(
         &self,
-        scope: &ScopeLeaseId,
+        namespace: &ScopeNamespace,
         key: ScopeChildKey,
     ) -> Result<Option<ScopeChildRecord>, ScopeBatchError> {
         match self
-            .scope_row(scope, scope_storage::child_key(scope, key)?)
+            .scope_row(namespace.scope(), scope_storage::child_key(namespace, key)?)
             .await?
         {
-            Some(ScopeRow::Child(row)) => Ok(row.value.is_some().then_some(row)),
+            Some(ScopeRow::Child(row)) if row.namespace == *namespace => {
+                Ok(row.value.is_some().then_some(row))
+            }
             None => Ok(None),
             _ => Err(ScopeBatchError::FormatMismatch),
         }
@@ -90,13 +91,13 @@ impl ConsensusSessionStore {
             .await
             .map_err(|error| match error {
                 StoreError::CapabilityNotSupported(_) => {
-                    ScopeBatchError::Scope(ScopeLeaseError::ProfileNotActivated)
+                    ScopeBatchError::Scope(ScopeAuthorityError::ProfileNotActivated)
                 }
                 _ => ScopeBatchError::Unavailable,
             })?;
         let (current, _) = self.current_scope().map_err(unavailable)?;
         if current.cluster_id() != operation.request.scope().store() {
-            return Err(ScopeLeaseError::Unauthorized.into());
+            return Err(ScopeAuthorityError::Unauthorized.into());
         }
         let response = self
             .submit_classified_scope_batch(

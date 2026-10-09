@@ -11,8 +11,8 @@ mod stepdown;
 mod planned_shutdown;
 
 #[cfg(all(target_os = "linux", feature = "test-control"))]
-#[path = "consensus_openraft/scope_lease.rs"]
-mod scope_lease;
+#[path = "consensus_openraft/scope_authority.rs"]
+mod scope_authority;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

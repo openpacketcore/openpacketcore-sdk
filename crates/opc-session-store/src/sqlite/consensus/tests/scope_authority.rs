@@ -1,16 +1,16 @@
 use super::*;
-use crate::scope_lease::{
-    ScopeClockBounds, ScopeLeaseCommand, ScopeLeaseError, ScopeLeaseId, ScopeLeaseOperation,
-    ScopeLeaseRequest,
+use crate::scope_authority::{
+    ScopeAuthorityCommand, ScopeAuthorityError, ScopeAuthorityOperation, ScopeAuthorityRequest,
+    ScopeId,
 };
-use crate::sqlite::consensus::scope_lease as scope_storage;
+use crate::sqlite::consensus::scope_authority as scope_storage;
 
 fn scoped_entry(
     storage: SessionConsensusIdentity,
     authority: SessionConsensusIdentity,
     index: u64,
 ) -> Entry<SessionRaftTypeConfig> {
-    let scope = ScopeLeaseId::new(
+    let scope = ScopeId::new(
         storage,
         TenantId::from_static("scope-cutover"),
         NetworkFunctionKind::smf(),
@@ -28,18 +28,17 @@ fn scoped_entry(
             intent: SessionMutationIntent::Authorized {
                 origin: member(7),
                 authority_identity: authority,
-                mutation: Box::new(SessionMutationIntent::ScopeLease(Box::new(
-                    ScopeLeaseCommand {
-                        request: ScopeLeaseRequest::new(
+                mutation: Box::new(SessionMutationIntent::ScopeAuthority(Box::new(
+                    ScopeAuthorityCommand {
+                        request: ScopeAuthorityRequest::new(
                             scope,
                             *request_id.as_bytes(),
                             0,
-                            ScopeLeaseOperation::Select {
-                                execution: crate::scope_lease::tests::execution(1),
+                            ScopeAuthorityOperation::AdmitInitial {
+                                execution: crate::scope_authority::tests::execution(1),
                             },
                         )
                         .unwrap(),
-                        bounds: ScopeClockBounds::new(timestamp(4), timestamp(4)).unwrap(),
                     },
                 ))),
             },
@@ -63,7 +62,7 @@ fn activation_entry(
         origin: member(7),
         authority_identity: authority,
         mutation: Box::new(SessionMutationIntent::ActivateScopeProfile(Box::new(
-            crate::scope_lease::ScopeProfileActivation::new(
+            crate::scope_authority::ScopeProfileActivation::new(
                 authority,
                 fenced_transition_voter_set_digest(authority, voters),
             ),
@@ -101,7 +100,7 @@ fn scope_checkpoint_survives_ordinary_request_receipt_pruning() {
     .unwrap();
     assert!(matches!(
         applied.responses.last().unwrap().result,
-        Ok(SessionMutationOutcome::ScopeLease(Ok(_)))
+        Ok(SessionMutationOutcome::ScopeAuthority(Ok(_)))
     ));
     let before = scope_storage::read(&conn, identity, &target).unwrap();
     assert!(before.1.is_some());
@@ -119,7 +118,7 @@ fn scope_checkpoint_survives_ordinary_request_receipt_pruning() {
 }
 
 #[test]
-fn scope_lease_refuses_mutation_before_scope_profile_activation() {
+fn scope_authority_refuses_mutation_before_scope_profile_activation() {
     let backend = SqliteSessionBackend::in_memory().unwrap();
     let conn = backend.conn.blocking_lock();
     let identity = identity();
@@ -138,14 +137,14 @@ fn scope_lease_refuses_mutation_before_scope_profile_activation() {
     assert!(
         !matches!(
             applied.responses.last().unwrap().result,
-            Ok(SessionMutationOutcome::ScopeLease(Ok(_)))
+            Ok(SessionMutationOutcome::ScopeAuthority(Ok(_)))
         ),
         "scope profile 3 cannot be used before every voter supports it"
     );
 }
 
 #[test]
-fn scope_lease_retries_after_sqlite_authority_cutover_without_changing_the_checkpoint() {
+fn scope_authority_retries_after_sqlite_authority_cutover_without_changing_the_checkpoint() {
     let backend = SqliteSessionBackend::in_memory().unwrap();
     let conn = backend.conn.blocking_lock();
     let before = identity();
@@ -211,8 +210,8 @@ fn scope_lease_retries_after_sqlite_authority_cutover_without_changing_the_check
     let rejected = apply_entries_sync(&conn, before, &backend.caps, vec![delayed]).unwrap();
     assert_eq!(
         rejected.responses[0].result,
-        Ok(SessionMutationOutcome::ScopeLease(Err(
-            ScopeLeaseError::Unavailable
+        Ok(SessionMutationOutcome::ScopeAuthority(Err(
+            ScopeAuthorityError::Unavailable
         ))),
         "a delayed configuration stamp must be retryable, not an admission refusal"
     );
@@ -231,7 +230,8 @@ fn scope_lease_retries_after_sqlite_authority_cutover_without_changing_the_check
         ],
     )
     .unwrap();
-    let Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) = &retry.responses[1].result else {
+    let Ok(SessionMutationOutcome::ScopeAuthority(Ok(checkpoint))) = &retry.responses[1].result
+    else {
         panic!("the exact request must succeed under the successor stamp")
     };
     assert_eq!(checkpoint.state().unwrap().view.revision(), 1);
@@ -263,8 +263,8 @@ fn scope_lease_retries_after_sqlite_authority_cutover_without_changing_the_check
         let rejected = apply_entries_sync(&conn, before, &backend.caps, vec![invalid]).unwrap();
         assert_eq!(
             rejected.responses[0].result,
-            Ok(SessionMutationOutcome::ScopeLease(Err(
-                ScopeLeaseError::Unauthorized
+            Ok(SessionMutationOutcome::ScopeAuthority(Err(
+                ScopeAuthorityError::Unauthorized
             )))
         );
     }
@@ -272,7 +272,7 @@ fn scope_lease_retries_after_sqlite_authority_cutover_without_changing_the_check
 
 #[cfg(target_os = "linux")]
 #[test]
-fn scope_lease_retries_after_native_stale_authority_stamp_without_changing_the_checkpoint() {
+fn scope_authority_retries_after_native_stale_authority_stamp_without_changing_the_checkpoint() {
     let before = identity();
     let after = identity_at(2, 0xE7);
     let voters = members(&[7, 8, 9]);
@@ -287,14 +287,68 @@ fn scope_lease_retries_after_native_stale_authority_stamp_without_changing_the_c
     let rejected = native.apply(&[scoped_entry(after, before, 2)]).unwrap();
     assert_eq!(
         rejected.responses[0].result,
-        Ok(SessionMutationOutcome::ScopeLease(Err(
-            ScopeLeaseError::Unavailable
+        Ok(SessionMutationOutcome::ScopeAuthority(Err(
+            ScopeAuthorityError::Unavailable
         )))
     );
     assert_eq!(native.scope_checkpoint_footprint_for_test(), footprint);
     let retry = native.apply(&[scoped_entry(after, after, 3)]).unwrap();
-    let Ok(SessionMutationOutcome::ScopeLease(Ok(checkpoint))) = &retry.responses[0].result else {
+    let Ok(SessionMutationOutcome::ScopeAuthority(Ok(checkpoint))) = &retry.responses[0].result
+    else {
         panic!("the exact request must succeed under the current stamp")
     };
     assert_eq!(checkpoint.state().unwrap().view.revision(), 1);
+}
+
+#[test]
+fn sqlite_initial_admission_refuses_orphan_rows_in_every_incarnation() {
+    let target_entry = scoped_entry(identity(), identity(), 2);
+    let EntryPayload::Normal(command) = &target_entry.payload else {
+        unreachable!()
+    };
+    let target = scope_storage::operation(&command.intent)
+        .unwrap()
+        .request
+        .scope()
+        .clone();
+    for orphan in crate::scope_batch::tests::orphan_rows(target.clone()) {
+        let backend = SqliteSessionBackend::in_memory().unwrap();
+        let conn = backend.conn.blocking_lock();
+        let voters = members(&[7, 8, 9]);
+        initialize_schema(&conn, identity(), &voters).unwrap();
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry_at(0, vec![voters.clone()], voters.clone()),
+                activation_entry(identity(), identity(), &voters, 1),
+            ],
+        )
+        .unwrap();
+        let record = orphan.to_record().unwrap();
+        ops::insert_or_replace_scope_record_sync(&conn, &record).unwrap();
+        let count: u64 = conn
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .unwrap();
+        let applied =
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![target_entry.clone()])
+                .unwrap();
+        assert!(matches!(
+            applied.responses[0].result,
+            Ok(SessionMutationOutcome::ScopeAuthority(Err(
+                ScopeAuthorityError::FormatMismatch
+            )))
+        ));
+        assert!(ops::get_raw_sync(&conn, &target.key().unwrap())
+            .unwrap()
+            .is_none());
+        assert_eq!(ops::get_raw_sync(&conn, &record.key).unwrap(), Some(record));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            count
+        );
+    }
 }

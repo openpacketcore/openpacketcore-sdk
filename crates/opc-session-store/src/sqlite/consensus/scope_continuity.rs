@@ -1,7 +1,7 @@
 //! The profile certificate and membership cutover share one transaction.
 
 use super::*;
-use crate::scope_lease::{ScopeProfileActivation, ScopeProfileContinuation};
+use crate::scope_authority::{ScopeProfileActivation, ScopeProfileContinuation};
 use crate::scope_storage::{self, ContinuationRow, ScopeRow};
 
 fn expected(

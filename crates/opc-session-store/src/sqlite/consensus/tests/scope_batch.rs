@@ -1,18 +1,18 @@
 use super::*;
+use crate::scope_authority::tests::execution;
+use crate::scope_authority::{
+    ScopeAuthorityCommand, ScopeAuthorityOperation, ScopeAuthorityRequest, ScopeAuthorityStamp,
+    ScopeAuthorityView, ScopeId, ScopeProfileActivation, ScopeProfileContinuation,
+};
 use crate::scope_batch::tests::{claim, create, key, value};
 use crate::scope_batch::*;
-use crate::scope_lease::tests::execution;
-use crate::scope_lease::{
-    ScopeClockBounds, ScopeLeaseCommand, ScopeLeaseId, ScopeLeaseOperation, ScopeLeaseRequest,
-    ScopeLeaseView, ScopePermit, ScopeProfileActivation, ScopeProfileContinuation,
-};
 use crate::scope_storage::{self as rows, ScopeRow};
 
 struct Both {
     sql: SqliteSessionBackend,
     #[cfg(target_os = "linux")]
     native: crate::consensus::native::NativeState,
-    scope: ScopeLeaseId,
+    scope: ScopeId,
     index: u64,
 }
 
@@ -40,7 +40,7 @@ impl Both {
             sql,
             #[cfg(target_os = "linux")]
             native,
-            scope: ScopeLeaseId::new(
+            scope: ScopeId::new(
                 identity(),
                 TenantId::from_static("batch-parity"),
                 NetworkFunctionKind::smf(),
@@ -65,7 +65,7 @@ impl Both {
     fn apply(&mut self, mutation: SessionMutationIntent, now: Timestamp) -> SessionMutationOutcome {
         self.index += 1;
         let request_id = match &mutation {
-            SessionMutationIntent::ScopeLease(command) => *command.request.request_id(),
+            SessionMutationIntent::ScopeAuthority(command) => *command.request.request_id(),
             SessionMutationIntent::ScopeBatch(command) => *command.request.request_id(),
             _ => (0x1000 + u128::from(self.index)).to_be_bytes(),
         };
@@ -101,56 +101,56 @@ impl Both {
         sql.responses.into_iter().next().unwrap().result.unwrap()
     }
 
-    fn lease(
+    fn authority(
         &mut self,
         revision: u64,
-        operation: ScopeLeaseOperation,
+        operation: ScopeAuthorityOperation,
         second: i64,
-    ) -> ScopeLeaseView {
+    ) -> ScopeAuthorityView {
         let now = timestamp(0).add_seconds(second).unwrap();
         let result = self.apply(
-            SessionMutationIntent::ScopeLease(Box::new(ScopeLeaseCommand {
-                request: ScopeLeaseRequest::new(
+            SessionMutationIntent::ScopeAuthority(Box::new(ScopeAuthorityCommand {
+                request: ScopeAuthorityRequest::new(
                     self.scope.clone(),
                     (0x2000 + u128::from(self.index)).to_be_bytes(),
                     revision,
                     operation,
                 )
                 .unwrap(),
-                bounds: ScopeClockBounds::new(now, now).unwrap(),
             })),
             now,
         );
         match result {
-            SessionMutationOutcome::ScopeLease(Ok(checkpoint)) => checkpoint.state().unwrap().view,
+            SessionMutationOutcome::ScopeAuthority(Ok(checkpoint)) => {
+                checkpoint.state().unwrap().view
+            }
             other => panic!("scope lease must succeed: {other:?}"),
         }
     }
 
-    fn acquire(&mut self) -> ScopePermit {
-        self.lease(
+    fn namespace(&self) -> crate::scope_authority::ScopeNamespace {
+        crate::scope_authority::ScopeNamespace::new(
+            self.scope.clone(),
+            crate::scope_authority::ScopeIncarnation::new(1).unwrap(),
+        )
+        .unwrap()
+    }
+    fn admit(&mut self) -> ScopeAuthorityStamp {
+        self.authority(
             0,
-            ScopeLeaseOperation::Select {
+            ScopeAuthorityOperation::AdmitInitial {
                 execution: execution(1),
-            },
-            4,
-        );
-        self.lease(
-            1,
-            ScopeLeaseOperation::Acquire {
-                execution: execution(1),
-                selection: 1,
             },
             4,
         )
-        .permit()
+        .stamp()
         .unwrap()
         .clone()
     }
 
     fn command(
         &self,
-        permit: &ScopePermit,
+        permit: &ScopeAuthorityStamp,
         id: u8,
         revision: u64,
         operations: Vec<ScopeChildMutation>,
@@ -159,7 +159,6 @@ impl Both {
         ScopeBatchCommand {
             request: ScopeBatchRequest::new(permit, [id; 16], revision, operations, counters)
                 .unwrap(),
-            bounds: ScopeClockBounds::new(timestamp(4), timestamp(4)).unwrap(),
         }
     }
 
@@ -190,8 +189,8 @@ impl Both {
         validate_sealed_state_sync(&self.sql.conn.blocking_lock()).unwrap();
         self.row(&rows::batch_key(&self.scope).unwrap());
         for n in 1..=70 {
-            self.row(&rows::child_key(&self.scope, key(n)).unwrap());
-            self.row(&rows::claim_key(&self.scope, claim(n)).unwrap());
+            self.row(&rows::child_key(&self.namespace(), key(n)).unwrap());
+            self.row(&rows::claim_key(&self.namespace(), claim(n)).unwrap());
         }
         let receipts: u64 = self
             .sql
@@ -226,7 +225,7 @@ impl Both {
 fn scope_batch_sqlite_local_decode_fault_aborts_apply_without_advancing_state() {
     for kind in 0..4 {
         let mut both = Both::new(true);
-        let permit = both.acquire();
+        let permit = both.admit();
         let first = both
             .batch(
                 &both.command(
@@ -252,8 +251,8 @@ fn scope_batch_sqlite_local_decode_fault_aborts_apply_without_advancing_state() 
             vec![ScopeCounterMutation::new(0, 1, 2).unwrap()],
         );
         let damaged = match kind {
-            0 => rows::child_key(&both.scope, key(1)).unwrap(),
-            1 => rows::claim_key(&both.scope, claim(1)).unwrap(),
+            0 => rows::child_key(&both.namespace(), key(1)).unwrap(),
+            1 => rows::claim_key(&both.namespace(), claim(1)).unwrap(),
             2 => rows::batch_key(&both.scope).unwrap(),
             _ => both.scope.key().unwrap(),
         };
@@ -306,7 +305,7 @@ fn scope_batch_sqlite_local_decode_fault_aborts_apply_without_advancing_state() 
 #[test]
 fn scope_batch_native_sqlite_atomic_children_claims_counters_and_exact_births() {
     let mut both = Both::new(true);
-    let permit = both.acquire();
+    let permit = both.admit();
     let first_command = both.command(
         &permit,
         1,
@@ -412,93 +411,59 @@ fn scope_batch_native_sqlite_atomic_children_claims_counters_and_exact_births() 
 }
 
 #[test]
-fn scope_batch_native_sqlite_checks_current_grant_and_replicated_apply_time() {
+fn scope_batch_native_sqlite_current_authority_survives_elapsed_application_time() {
     let mut both = Both::new(true);
-    let permit = both.acquire();
-    let pending = both.command(&permit, 1, 0, vec![create(1, &[1])], vec![]);
-    let renewed = both.lease(
-        2,
-        ScopeLeaseOperation::Renew {
-            permit: permit.clone(),
-        },
-        5,
-    );
-    both.batch(&pending, 5)
-        .expect("stable grant remains valid across renewal");
-    let pending = both.command(&permit, 2, 1, vec![create(2, &[2])], vec![]);
-    let before = both.bytes();
-    assert!(matches!(
-        both.batch(&pending, 83),
-        Err(ScopeBatchError::Scope(
-            crate::scope_lease::ScopeLeaseError::Expired
-        ))
-    ));
-    assert_eq!(
-        both.bytes(),
-        before,
-        "preparation time cannot authorize apply after the retained permit expires"
-    );
-    both.lease(
-        3,
-        ScopeLeaseOperation::Select {
+    let stamp = both.admit();
+    let first = both.command(&stamp, 1, 0, vec![create(1, &[1])], vec![]);
+    both.batch(&first, 86400).unwrap();
+    let pending = both.command(&stamp, 2, 1, vec![create(2, &[2])], vec![]);
+    both.authority(
+        1,
+        ScopeAuthorityOperation::SucceedClosed {
+            predecessor: stamp,
             execution: execution(2),
+            evidence: crate::scope_authority::ScopeClosureEvidence::new(
+                crate::scope_authority::ScopeClosureKind::FinalTermination,
+                [2; 32],
+            )
+            .unwrap(),
         },
-        100,
-    );
-    both.lease(
-        4,
-        ScopeLeaseOperation::Acquire {
-            execution: execution(2),
-            selection: 2,
-        },
-        100,
+        86401,
     );
     let before = both.bytes();
     assert!(matches!(
-        both.batch(&pending, 100),
+        both.batch(&pending, 86402),
         Err(ScopeBatchError::Scope(
-            crate::scope_lease::ScopeLeaseError::StalePermit
+            crate::scope_authority::ScopeAuthorityError::StaleAuthority
         ))
     ));
     assert_eq!(both.bytes(), before);
-    assert!(renewed.permit().unwrap().stop_at() > permit.stop_at());
+    assert!(
+        both.batch(&first, 86403).is_ok(),
+        "exact receipt replay has no effects"
+    );
+    assert_eq!(both.bytes(), before);
 }
 
 #[test]
 fn scope_batch_native_sqlite_refuses_before_profile_activation() {
     let mut both = Both::new(false);
-    let state = crate::scope_lease::ScopeState::empty(both.scope.clone());
+    let state = crate::scope_authority::ScopeState::empty(both.scope.clone());
     let state = state
         .transition(
-            &ScopeLeaseRequest::new(
+            &ScopeAuthorityRequest::new(
                 both.scope.clone(),
                 [1; 16],
                 0,
-                ScopeLeaseOperation::Select {
+                ScopeAuthorityOperation::AdmitInitial {
                     execution: execution(1),
                 },
             )
             .unwrap(),
-            ScopeClockBounds::new(timestamp(4), timestamp(4)).unwrap(),
-        )
-        .unwrap();
-    let state = state
-        .transition(
-            &ScopeLeaseRequest::new(
-                both.scope.clone(),
-                [2; 16],
-                1,
-                ScopeLeaseOperation::Acquire {
-                    execution: execution(1),
-                    selection: 1,
-                },
-            )
-            .unwrap(),
-            ScopeClockBounds::new(timestamp(4), timestamp(4)).unwrap(),
         )
         .unwrap();
     let command = both.command(
-        state.view.permit().unwrap(),
+        state.view.stamp().unwrap(),
         3,
         0,
         vec![create(1, &[1])],
@@ -510,20 +475,165 @@ fn scope_batch_native_sqlite_refuses_before_profile_activation() {
             timestamp(4)
         ),
         SessionMutationOutcome::ScopeBatch(Err(ScopeBatchError::Scope(
-            crate::scope_lease::ScopeLeaseError::ProfileNotActivated
+            crate::scope_authority::ScopeAuthorityError::ProfileNotActivated
         )))
     );
     assert!(both.bytes().is_empty());
 }
 
 #[test]
+fn scope_batch_native_sqlite_refuses_before_initial_admission_with_same_error() {
+    let mut both = Both::new(true);
+    let uncommitted = crate::scope_authority::ScopeState::empty(both.scope.clone())
+        .transition(
+            &ScopeAuthorityRequest::new(
+                both.scope.clone(),
+                [1; 16],
+                0,
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: execution(1),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let command = both.command(
+        uncommitted.view.stamp().unwrap(),
+        3,
+        0,
+        vec![create(1, &[1])],
+        vec![ScopeCounterMutation::new(0, 0, 1).unwrap()],
+    );
+    let before = both.bytes();
+    assert_eq!(
+        both.batch(&command, 4),
+        Err(ScopeBatchError::Scope(
+            crate::scope_authority::ScopeAuthorityError::StaleAuthority
+        ))
+    );
+    assert_eq!(both.bytes(), before, "an unadmitted scope writes no rows");
+    assert!(both.row(&rows::batch_key(&both.scope).unwrap()).is_none());
+}
+
+#[test]
+fn required_zero_ledger_is_created_with_initial_authority() {
+    let mut both = Both::new(true);
+    both.admit();
+    let row = both.row(&rows::batch_key(&both.scope).unwrap());
+    let Some(ScopeRow::Batch(checkpoint)) = row else {
+        panic!("initial authority must atomically create its required stable ledger")
+    };
+    assert_eq!(*checkpoint, ScopeBatchCheckpoint::empty(both.scope.clone()));
+    let row = ScopeRow::Batch(checkpoint);
+    assert_eq!(
+        ScopeRow::from_record(&row.to_record().unwrap()).unwrap(),
+        row
+    );
+    both.assert_rows();
+}
+
+#[test]
+fn required_counter_ledger_loss_is_corruption_without_child_rows() {
+    let mut both = Both::new(true);
+    let stamp = both.admit();
+    let command = both.command(
+        &stamp,
+        1,
+        0,
+        vec![],
+        vec![ScopeCounterMutation::new(0, 0, 9).unwrap()],
+    );
+    both.batch(&command, 4).unwrap();
+    let conn = both.sql.conn.blocking_lock();
+    assert_eq!(
+        conn.execute(
+            "DELETE FROM session_records WHERE key_type='opc-scope-batch'",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    assert!(
+        validate_sealed_state_sync(&conn).is_err(),
+        "missing stable counters cannot be admitted as a never-used scope"
+    );
+}
+
+#[test]
+fn scope_batch_snapshot_higher_revision_cannot_lower_any_counter_or_birth_floor() {
+    let mut both = Both::new(true);
+    let stamp = both.admit();
+    let initial = both.command(
+        &stamp,
+        1,
+        0,
+        vec![create(1, &[]), create(2, &[])],
+        (0..SCOPE_COUNTERS)
+            .map(|index| ScopeCounterMutation::new(index as u8, 0, 10 + index as u64).unwrap())
+            .collect(),
+    );
+    both.batch(&initial, 4).unwrap();
+    // Retain the births even when the latest receipt contains no child rows.
+    let compare = both.command(
+        &stamp,
+        2,
+        1,
+        vec![],
+        vec![ScopeCounterMutation::new(0, 10, 10).unwrap()],
+    );
+    both.batch(&compare, 4).unwrap();
+    let retained = both.row(&rows::batch_key(&both.scope).unwrap()).unwrap();
+    let mut future = serde_json::to_value(&retained).unwrap();
+    future["Batch"]["revision"] = 3.into();
+    future["Batch"]["lanes"][0]["sequence"] = 3.into();
+    future["Batch"]["lanes"][0]["floor"] = 2.into();
+    future["Batch"]["lanes"][0]["outcome"]["sequence"] = 3.into();
+    future["Batch"]["lanes"][0]["outcome"]["revision"] = 3.into();
+    let conn = both.sql.conn.blocking_lock();
+    conn.execute("ATTACH DATABASE ':memory:' AS consensus_incoming", [])
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE consensus_incoming.session_records AS SELECT * FROM main.session_records",
+        [],
+    )
+    .unwrap();
+    let replace_incoming = |value| {
+        let row: ScopeRow = serde_json::from_value(value).unwrap();
+        // Every candidate has a valid current encoding and a higher revision.
+        // The rejection must come from the retained floor comparison.
+        let record = row.to_record().unwrap();
+        conn.execute(
+            "UPDATE consensus_incoming.session_records SET generation=?1,payload=?2 WHERE key_type='opc-scope-batch'",
+            params![record.generation.get(), record.payload.as_bytes()],
+        )
+        .unwrap();
+    };
+    let validate = || super::super::scope_batch::validate_snapshot_preserves_scopes(&conn);
+    replace_incoming(future.clone());
+    validate().expect("higher revision preserving all floors is allowed");
+    for index in 0..SCOPE_COUNTERS {
+        let mut rollback = future.clone();
+        rollback["Batch"]["counters"][index] = (9 + index as u64).into();
+        rollback["Batch"]["lanes"][0]["outcome"]["counters"][index] = (9 + index as u64).into();
+        replace_incoming(rollback);
+        assert!(validate().is_err(), "counter {index} is a protected floor");
+    }
+    let mut rollback = future.clone();
+    rollback["Batch"]["birth_floor"] = 1.into();
+    replace_incoming(rollback);
+    assert!(validate().is_err(), "birth floor never resets");
+    replace_incoming(future);
+    validate().unwrap();
+}
+
+#[test]
 fn scope_batch_snapshot_install_preserves_authority_claim_and_deleted_birth_floors() {
     let mut both = Both::new(true);
-    let permit = both.acquire();
+    let permit = both.admit();
     let create = both.command(&permit, 1, 0, vec![create(1, &[1])], vec![]);
     let created = both.batch(&create, 4).unwrap();
     let live_record = both
-        .row(&rows::child_key(&both.scope, key(1)).unwrap())
+        .row(&rows::child_key(&both.namespace(), key(1)).unwrap())
         .unwrap()
         .to_record()
         .unwrap();
@@ -589,7 +699,11 @@ fn scope_batch_snapshot_install_preserves_authority_claim_and_deleted_birth_floo
     .unwrap();
     let validate = || super::super::scope_batch::validate_snapshot_preserves_scopes(&conn);
     validate().expect("same complete snapshot preserves every floor");
-    for kind in rows::RESERVED_KEY_TYPES {
+    // The legacy key is reserved only for refusal; current state never creates it.
+    for kind in rows::RESERVED_KEY_TYPES
+        .into_iter()
+        .filter(|kind| *kind != "opc-scope-lease")
+    {
         let removed = conn
             .execute(
                 "DELETE FROM consensus_incoming.session_records WHERE key_type=?1",

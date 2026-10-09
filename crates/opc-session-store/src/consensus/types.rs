@@ -2188,7 +2188,7 @@ pub enum SessionMutationIntent {
     },
     /// One atomic scope-authority operation; retains only its scope checkpoint.
     #[doc(hidden)]
-    ScopeLease(Box<crate::scope_lease::ScopeLeaseCommand>),
+    ScopeAuthority(Box<crate::scope_authority::ScopeAuthorityCommand>),
     /// One atomic batch of scope-fenced child, claim and counter changes.
     #[doc(hidden)]
     ScopeBatch(Box<crate::scope_batch::ScopeBatchCommand>),
@@ -2197,10 +2197,10 @@ pub enum SessionMutationIntent {
     PreflightScopeProfile,
     /// Exact admitted configuration's unanimously supported scope profile.
     #[doc(hidden)]
-    ActivateScopeProfile(Box<crate::scope_lease::ScopeProfileActivation>),
+    ActivateScopeProfile(Box<crate::scope_authority::ScopeProfileActivation>),
     /// Durable, transition-bound evidence of exact joining-voter profile checks.
     #[doc(hidden)]
-    CertifyScopeProfileContinuation(Box<crate::scope_lease::ScopeProfileContinuation>),
+    CertifyScopeProfileContinuation(Box<crate::scope_authority::ScopeProfileContinuation>),
 }
 
 /// Exact, self-contained precondition and effect request for the appended
@@ -2728,8 +2728,11 @@ pub enum SessionMutationOutcome {
     RosterTerminalV2(ConsensusRosterTerminalOutcome),
     /// Current bounded scope checkpoint, or a deterministic no-effect refusal.
     #[doc(hidden)]
-    ScopeLease(
-        Result<crate::scope_lease::ScopeLeaseCheckpoint, crate::scope_lease::ScopeLeaseError>,
+    ScopeAuthority(
+        Result<
+            crate::scope_authority::ScopeAuthorityCheckpoint,
+            crate::scope_authority::ScopeAuthorityError,
+        >,
     ),
     /// Atomic child-batch outcome; never an ordinary per-request receipt.
     #[doc(hidden)]
