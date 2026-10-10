@@ -113,6 +113,7 @@ struct Fleet {
     directory: tempfile::TempDir,
     snapshot_root: Option<std::path::PathBuf>,
     clock: Option<Arc<dyn crate::Clock>>,
+    scan_limits: Option<crate::scope_scan::ScopeScanLimits>,
     topologies: Vec<ValidatedQuorumTopology>,
     tests: Vec<Arc<PrivateWalTest>>,
     peers: Vec<Arc<Peer>>,
@@ -195,6 +196,7 @@ impl Fleet {
             directory,
             snapshot_root: None,
             clock: None,
+            scan_limits: None,
             topologies,
             tests,
             peers,
@@ -211,6 +213,9 @@ impl Fleet {
             )
             .expect("real SDK database");
             backend.private_wal_test = Some(Arc::clone(&self.tests[index]));
+            if let Some(limits) = self.scan_limits {
+                backend = backend.with_scope_scan_limits(limits);
+            }
             let peers = self
                 .peers
                 .iter()
@@ -673,6 +678,9 @@ mod native_flow;
 mod paced_viability;
 mod scheduling;
 mod scope_authority;
+mod scope_scan_contention;
+mod scope_scan_facade;
+mod scope_scans;
 
 #[path = "sequential_wal_sdk_tests/scope_batch.rs"]
 mod scope_batch;

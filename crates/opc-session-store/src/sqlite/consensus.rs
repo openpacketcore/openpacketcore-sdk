@@ -521,7 +521,9 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 // protected-roster V2 adds three tables and three indexes. Thus the current
 // base layout has exactly 44 objects. The independently validated void-profile
 // marker adds exactly one. Every manifest remains bounded by its own profile;
-// an arbitrary forty-fifth object is not admitted to a baseline store.
+// an arbitrary forty-fifth object is not admitted to a baseline store. The
+// optional derived scope-scan index pair has a separate two-object allowance
+// only after its complete exact definitions have been validated.
 pub(crate) const CONSENSUS_SCHEMA_MAX_OBJECTS: usize = 44;
 #[cfg(all(test, target_os = "linux"))]
 const FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS: usize = 33;
@@ -533,7 +535,13 @@ const FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS: usize = 33;
 #[path = "consensus/void_profile.rs"]
 mod void_profile;
 pub(crate) use void_profile::fenced_transition_profile_in_sync;
-pub(crate) use void_profile::schema_max_objects as consensus_schema_max_objects_in_sync;
+pub(crate) fn consensus_schema_max_objects_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<usize> {
+    Ok(void_profile::schema_max_objects(conn, attached)?
+        + crate::sqlite::scope_scan::schema::optional_object_count(conn, attached)?)
+}
 
 const FENCED_TRANSITION_V1_DATABASE_FORMAT: i64 = 2;
 const FENCED_TRANSITION_V2_DATABASE_FORMAT: i64 = 3;
@@ -5830,6 +5838,7 @@ enum SnapshotDirectoryInitialization {
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    pub(crate) scope_views: Arc<crate::scope_scan::backend::ScopeViewRegistry>,
     #[cfg(target_os = "linux")]
     pub(crate) private_wal: Option<Arc<wal::Wal>>,
     #[cfg(target_os = "linux")]
@@ -6507,6 +6516,21 @@ impl SqliteConsensusCore {
                 admitted_snapshot_dir
             }
         };
+        let mut scope_generation = backend.scope_scan_generation.lock().await;
+        if let Some(previous) = scope_generation.as_ref() {
+            previous
+                .close_and_drain(crate::scope_scan::activity::ViewInvalidation::BackendRestarted)
+                .await;
+        }
+        let scan_limits = *backend
+            .scope_scan_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scope_views = crate::scope_scan::backend::ScopeViewRegistry::new(
+            scan_limits.retention,
+            scan_limits.idle_timeout,
+        )
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
         // `finish_file_open` may have classified a terminal recovery record
         // and retained its selected snapshot descriptor.  Take that one-shot
         // handoff before any ordinary consensus initialization can observe a
@@ -6636,6 +6660,7 @@ impl SqliteConsensusCore {
             backend.terminal_recovery_handoff_restore_slot();
         let core = Self {
             conn: Arc::clone(&backend.conn),
+            scope_views,
             #[cfg(target_os = "linux")]
             private_wal: None,
             #[cfg(target_os = "linux")]
@@ -6678,6 +6703,15 @@ impl SqliteConsensusCore {
             #[cfg(test)]
             snapshot_capture_gate: Arc::clone(&backend.consensus_snapshot_capture_gate),
         };
+        if !native_selected {
+            if let Some(source) = core.database_file.as_ref() {
+                core.scope_views.set_wal_probe(super::scope_scan::wal_probe(
+                    Arc::downgrade(&backend.conn),
+                    Arc::clone(source),
+                ));
+            }
+        }
+        *scope_generation = Some(Arc::clone(&core.scope_views));
         Ok(core)
     }
 }
@@ -18312,7 +18346,16 @@ fn markerless_pre_fenced_schema_is_exact_in_sync(
     attached: bool,
     pre_authority_dynamic: bool,
 ) -> io::Result<bool> {
-    let observed = schema_manifest_in_sync(conn, attached)?;
+    // The manifest reader validates the derived indexes separately. They do
+    // not redefine the frozen authoritative predecessor schema, whether the
+    // image predates the indexes or acquired them on a later writable open.
+    let without_scan_indexes = |mut manifest: BTreeMap<(String, String), String>| {
+        manifest.retain(|(kind, name), _| {
+            kind != "index" || !crate::sqlite::scope_scan::schema::is_index_name(name)
+        });
+        manifest
+    };
+    let observed = without_scan_indexes(schema_manifest_in_sync(conn, attached)?);
     for pre_acquisition_timestamp in [false, true] {
         if pre_authority_dynamic && !pre_acquisition_timestamp {
             continue;
@@ -18363,7 +18406,8 @@ fn markerless_pre_fenced_schema_is_exact_in_sync(
                     }
                     install_published_684_operator_recovery_schema(&canonical, operator_recovery)?;
                     install_published_684_restore_scan_schema(&canonical, restore_scan)?;
-                    if observed == schema_manifest_in_sync(&canonical, false)? {
+                    if observed == without_scan_indexes(schema_manifest_in_sync(&canonical, false)?)
+                    {
                         return Ok(true);
                     }
                 }
@@ -35405,7 +35449,7 @@ fn open_pinned_snapshot_database(
 }
 
 #[cfg(target_os = "linux")]
-fn verify_pinned_snapshot_descriptor(
+pub(crate) fn verify_pinned_snapshot_descriptor(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
     connection: &Connection,
 ) -> io::Result<()> {
@@ -35429,7 +35473,7 @@ fn verify_pinned_snapshot_descriptor(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn verify_pinned_snapshot_descriptor(
+pub(crate) fn verify_pinned_snapshot_descriptor(
     _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
     _connection: &Connection,
 ) -> io::Result<()> {
@@ -35496,7 +35540,7 @@ pub(crate) struct SnapshotReadConnection {
     wal: Mutex<Option<crate::consensus::snapshot::PinnedSqliteFile>>,
 }
 
-fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -> io::Result<()> {
+pub(crate) fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -> io::Result<()> {
     reader.source.verify_identity()?;
     if opc_sqlite_file_control_sys::main_file_has_moved(&reader.connection)
         .map_err(|_| invalid_data("session consensus snapshot reader descriptor is unavailable"))?
@@ -35650,7 +35694,7 @@ fn validate_snapshot_reader_wal_bound(
 /// Return the length from the exact WAL descriptor owned by the reader.
 /// A replacement or unlink changes the retained descriptor or link count and
 /// is rejected. It can never become a path-derived zero sample.
-fn verify_snapshot_reader_wal(reader: &SnapshotReadConnection) -> io::Result<u64> {
+pub(crate) fn verify_snapshot_reader_wal(reader: &SnapshotReadConnection) -> io::Result<u64> {
     let stored = match reader.wal.lock() {
         Ok(stored) => stored,
         Err(poisoned) => poisoned.into_inner(),
@@ -40669,6 +40713,8 @@ mod tests {
     use crate::test_process::CommandExt as _;
     #[cfg(target_os = "linux")]
     mod native;
+    #[cfg(target_os = "linux")]
+    mod scope_scans;
     #[cfg(target_os = "linux")]
     mod sequential_wal;
     #[cfg(target_os = "linux")]
@@ -46457,7 +46503,9 @@ mod tests {
         let raw_schema =
             schema_manifest_in_sync(&raw_connection, false).expect("read raw exact schema");
         assert_eq!(
-            FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS + 1,
+            FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS
+                + crate::sqlite::scope_scan::schema::INDEX_COUNT
+                + 1,
             raw_schema.len(),
             "the raw source retains the local reseed journal until finalization"
         );
@@ -54087,7 +54135,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_roster_v2_exact_44_object_layout_reopens_in_both_activation_orders() {
+    fn protected_roster_v2_exact_indexed_layout_reopens_in_both_activation_orders() {
         for v2_first in [false, true] {
             let backend = SqliteSessionBackend::in_memory().expect("mixed roster backend");
             let conn = backend.conn.blocking_lock();
@@ -54116,21 +54164,21 @@ mod tests {
                 schema_manifest_in_sync(&conn, false)
                     .expect("read exact combined schema manifest")
                     .len(),
-                CONSENSUS_SCHEMA_MAX_OBJECTS,
+                CONSENSUS_SCHEMA_MAX_OBJECTS + crate::sqlite::scope_scan::schema::INDEX_COUNT,
                 "the known V1 plus V2 layout fits exactly at its operational cap",
             );
             initialize_schema(&conn, identity, &members)
-                .expect("exact 44-object combined layout reopens");
+                .expect("exact indexed combined layout reopens");
 
             conn.execute_batch(
                 "CREATE VIEW consensus_protected_roster_v2_over_cap AS SELECT 1 AS singleton;",
             )
-            .expect("inject forty-fifth unknown object");
+            .expect("inject one object beyond the validated layout cap");
             assert!(
                 schema_manifest_in_sync(&conn, false)
                     .expect("read over-cap schema manifest")
                     .is_empty(),
-                "the forty-fifth object is rejected rather than truncating the manifest",
+                "the extra object is rejected rather than truncating the manifest",
             );
             assert_eq!(
                 protected_roster_v2_recovery_layout_sync(&conn),

@@ -285,7 +285,7 @@ fn void_profile_with_both_rosters_builds_a_snapshot() {
             |row| row.get::<_, usize>(0),
         )
         .unwrap(),
-        45,
+        CONSENSUS_SCHEMA_MAX_OBJECTS + 1 + crate::sqlite::scope_scan::schema::INDEX_COUNT,
     );
     build_snapshot_database_sync(&conn, identity(), &directory.path().join("snapshot.sqlite"))
         .unwrap();

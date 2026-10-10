@@ -370,9 +370,14 @@ fn every_fenced_and_roster_profile_combination_snapshots_restores_and_reopens() 
                     ];
                     let expected = tables.map(|table| matrix_rows(&conn, table));
                     let expected_schema = schema_manifest_in_sync(&conn, false).unwrap();
+                    let scan_index_count =
+                        crate::sqlite::scope_scan::schema::optional_object_count(&conn, false)
+                            .unwrap();
+                    assert_eq!(scan_index_count, 2);
                     assert_eq!(
                         expected_schema.len(),
-                        33 + usize::from(lanes & 2 != 0) * 5
+                        33 + scan_index_count
+                            + usize::from(lanes & 2 != 0) * 5
                             + usize::from(lanes & 8 != 0) * 6
                             + usize::from(profile == FencedTransitionV2Profile::V2WithVoid)
                     );

@@ -172,6 +172,7 @@ mod transport_class;
 pub use transport_class::session_consensus_work_class;
 mod scope_batch;
 mod scope_profile;
+mod scope_scan;
 
 use crate::scope_scheduler::{ScopeSchedulerKey, ScopeWorkClass, ScopeWorkPermit};
 use scheduling::{ForwardWorkClass, ProposalAdmission, StoreWorkAdmission};
@@ -1993,6 +1994,10 @@ struct ConsensusSessionStoreInner {
     persistence: SessionPersistenceMode,
     persistence_protocol: PersistenceProtocol,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
+    scope_views: Arc<crate::scope_scan::backend::ScopeViewRegistry>,
+    #[cfg(any(test, feature = "test-control"))]
+    scope_read_barriers_for_test: AtomicU64,
+    scope_database: Option<Arc<super::snapshot::PinnedSqliteFile>>,
     #[cfg(target_os = "linux")]
     private_wal: Option<Arc<crate::sqlite::consensus::wal::Wal>>,
     terminal_recovery_handoff_consumer: storage::LiveTerminalRecoveryHandoffConsumer,
@@ -2091,6 +2096,13 @@ async fn shutdown_consensus_session_store(
     inner: Arc<ConsensusSessionStoreInner>,
     allow_closed_proof: bool,
 ) -> Result<(), StoreError> {
+    // The shared coordinator owns this drain even if every observing caller
+    // times out. Invalidate before joining storage, including work which has
+    // accepted a capture but has not yet taken a native operation permit.
+    inner
+        .scope_views
+        .close_and_drain(crate::scope_scan::activity::ViewInvalidation::Closed)
+        .await;
     #[cfg(not(target_os = "linux"))]
     let _ = allow_closed_proof;
     #[cfg(target_os = "linux")]
@@ -3619,6 +3631,8 @@ impl ConsensusSessionStore {
         let persistence_protocol =
             PersistenceProtocol::new(persistence, reopened_async && !closed_restart);
         let network = network.with_persistence(persistence_protocol.clone());
+        let scope_views = log_store.scope_views();
+        let scope_database = log_store.scope_database();
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let terminal_recovery_handoff_consumer =
@@ -3700,6 +3714,10 @@ impl ConsensusSessionStore {
             persistence,
             persistence_protocol,
             storage_shutdown,
+            scope_views,
+            #[cfg(any(test, feature = "test-control"))]
+            scope_read_barriers_for_test: AtomicU64::new(0),
+            scope_database,
             #[cfg(target_os = "linux")]
             private_wal,
             terminal_recovery_handoff_consumer,
@@ -3867,6 +3885,8 @@ impl ConsensusSessionStore {
             .await?;
         #[cfg(target_os = "linux")]
         let private_wal = log_store.private_wal();
+        let scope_views = log_store.scope_views();
+        let scope_database = log_store.scope_database();
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let terminal_recovery_handoff_consumer =
@@ -3931,6 +3951,10 @@ impl ConsensusSessionStore {
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
+            scope_views,
+            #[cfg(any(test, feature = "test-control"))]
+            scope_read_barriers_for_test: AtomicU64::new(0),
+            scope_database,
             #[cfg(target_os = "linux")]
             private_wal,
             terminal_recovery_handoff_consumer,

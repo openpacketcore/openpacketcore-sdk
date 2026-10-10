@@ -9,6 +9,8 @@ use std::collections::HashMap;
 mod batch;
 #[path = "scope_transport/cross_slot.rs"]
 mod cross_slot;
+#[path = "scope_transport/scans.rs"]
+mod scans;
 
 struct ScopeClock;
 impl AuthenticationClock for ScopeClock {

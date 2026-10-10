@@ -11,6 +11,7 @@ mod lifecycle;
 mod ordinary;
 mod public_reads;
 mod roster;
+mod scope_scans;
 mod v1;
 
 fn fixed_members() -> BTreeSet<SessionConsensusNodeId> {

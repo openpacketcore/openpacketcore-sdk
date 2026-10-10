@@ -225,7 +225,12 @@ impl BootIdentity {
             Method::ApplyBatch
             | Method::BatchCancel
             | Method::BatchReopen
-            | Method::BatchLookup => {
+            | Method::BatchLookup
+            | Method::ScanOpen
+            | Method::ScanPage
+            | Method::ScanLookup
+            | Method::ScanClassify
+            | Method::ScanClose => {
                 let native = super::rpc_server::NativeCall::decode(call, canonical, scope)?;
                 if native.execution().is_some_and(|named| named != execution) {
                     return Err(ScopeRpcError::Unauthorized);

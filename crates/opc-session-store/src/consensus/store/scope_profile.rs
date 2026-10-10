@@ -169,6 +169,10 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
+        #[cfg(any(test, feature = "test-control"))]
+        self.inner
+            .scope_read_barriers_for_test
+            .fetch_add(1, Ordering::Relaxed);
         self.linearizable_barrier_with_scope_admission_before(
             deadline,
             self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum,

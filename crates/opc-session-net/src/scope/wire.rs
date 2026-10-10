@@ -98,6 +98,11 @@ pub(super) enum Method {
     BatchReopen = 9,
     BatchCancel = 10,
     BatchLookup = 11,
+    ScanOpen = 12,
+    ScanPage = 13,
+    ScanLookup = 14,
+    ScanClassify = 15,
+    ScanClose = 16,
 }
 impl TryFrom<u8> for Method {
     type Error = WireError;
@@ -114,17 +119,45 @@ impl TryFrom<u8> for Method {
             9 => Ok(Self::BatchReopen),
             10 => Ok(Self::BatchCancel),
             11 => Ok(Self::BatchLookup),
+            12 => Ok(Self::ScanOpen),
+            13 => Ok(Self::ScanPage),
+            14 => Ok(Self::ScanLookup),
+            15 => Ok(Self::ScanClassify),
+            16 => Ok(Self::ScanClose),
             _ => Err(WireError),
         }
     }
 }
 impl Method {
+    pub(super) const fn is_scan(self) -> bool {
+        matches!(
+            self,
+            Self::ScanOpen
+                | Self::ScanPage
+                | Self::ScanLookup
+                | Self::ScanClassify
+                | Self::ScanClose
+        )
+    }
+    pub(super) fn for_scan(request: &opc_session_store::scope_scan::ScopeScanRequest) -> Self {
+        use opc_session_store::scope_scan::ScopeScanRequest;
+        match request {
+            ScopeScanRequest::Open(_) => Self::ScanOpen,
+            ScopeScanRequest::Page { .. } => Self::ScanPage,
+            ScopeScanRequest::Lookup { .. } => Self::ScanLookup,
+            ScopeScanRequest::Classify { .. } => Self::ScanClassify,
+            ScopeScanRequest::Close(_) => Self::ScanClose,
+        }
+    }
     pub(super) const fn is_startup(self) -> bool {
         matches!(self, Self::Liveness | Self::Candidate)
     }
     pub(super) const fn command_limit(self) -> usize {
         match self {
             Self::ApplyBatch => MAX_SCOPE_COMMAND_BYTES,
+            method if method.is_scan() => {
+                opc_session_store::scope_scan::MAX_SCOPE_SCAN_REQUEST_BYTES
+            }
             Self::Liveness | Self::Candidate => 340,
             _ => MAX_AUTHORITY_BYTES,
         }
@@ -274,6 +307,7 @@ pub(super) fn transport_request_digest(
         Method::Current | Method::Outcome | Method::BatchReopen | Method::BatchLookup => {
             b"openpacketcore/scope/read/v1\0"
         }
+        method if method.is_scan() => b"openpacketcore/scope/scan/v1\0",
         Method::Liveness | Method::Candidate => b"openpacketcore/scope/startup-request/v1\0",
         _ => return Err(WireError), // Native authority and batch helpers own their digests.
     };
@@ -324,6 +358,8 @@ impl Header {
             FrameKind::Result => {
                 if self.method == Method::ApplyBatch {
                     MAX_SCOPE_FRAME_BYTES - HEADER_BYTES
+                } else if self.method.is_scan() {
+                    opc_session_store::scope_scan::MAX_SCOPE_SCAN_REPLY_BYTES + 69
                 } else {
                     MAX_AUTHORITY_BYTES + 69
                 }
@@ -439,6 +475,7 @@ pub(super) enum ResultStatus {
     Obsolete = 3,
     CurrentView = 4,
     BatchError = 5,
+    ScanObservation = 6,
 }
 impl TryFrom<u8> for ResultStatus {
     type Error = WireError;
@@ -450,6 +487,7 @@ impl TryFrom<u8> for ResultStatus {
             3 => Ok(Self::Obsolete),
             4 => Ok(Self::CurrentView),
             5 => Ok(Self::BatchError),
+            6 => Ok(Self::ScanObservation),
             _ => Err(WireError),
         }
     }
@@ -478,9 +516,10 @@ impl ResultPayload {
             ResultStatus::ProvenNoEffect => matches!(body.as_slice(), [0, 1..=5]),
             ResultStatus::OutcomeUnknown => body.is_empty(),
             ResultStatus::Obsolete => matches!(body.as_slice(), [1..=4]),
-            ResultStatus::Committed | ResultStatus::CurrentView | ResultStatus::BatchError => {
-                !body.is_empty()
-            }
+            ResultStatus::Committed
+            | ResultStatus::CurrentView
+            | ResultStatus::BatchError
+            | ResultStatus::ScanObservation => !body.is_empty(),
         };
         if !valid {
             return Err(WireError);

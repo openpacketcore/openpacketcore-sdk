@@ -4,6 +4,77 @@ use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfig
 use opc_types::{NetworkFunctionKind, TenantId};
 
 #[test]
+fn scope_scan_prefix_classification_reads_only_the_bounded_namespace_header() {
+    use crate::scope_batch::{tests::key, ScopeChildRevision, ScopeSealedValue};
+    let namespace = ScopeNamespace::new(
+        crate::scope_authority::tests::scope(),
+        ScopeIncarnation::new(1).unwrap(),
+    )
+    .unwrap();
+    let small = crate::scope_batch::tests::value(1);
+    let mut envelope = opc_crypto::CryptoEnvelopeV1::decode(small.envelope()).unwrap();
+    let overhead = small.envelope().len() - envelope.ciphertext_and_tag.len();
+    envelope
+        .ciphertext_and_tag
+        .resize(MAX_SCOPE_CHILD_VALUE_BYTES - overhead, 1);
+    let records = [
+        ScopeRow::Child(ScopeChildRecord {
+            namespace: namespace.clone(),
+            key: key(1),
+            revision: ScopeChildRevision::new(1, 1).unwrap(),
+            batch_revision: 1,
+            value: Some(ScopeSealedValue::new(envelope.encode().unwrap()).unwrap()),
+            claims: vec![],
+        })
+        .to_record()
+        .unwrap(),
+        ScopeRow::Claim(ClaimRow {
+            namespace,
+            key: crate::scope_batch::tests::claim(1),
+            revision: 1,
+            owner: None,
+        })
+        .to_record()
+        .unwrap(),
+    ];
+    for record in records {
+        let stable = record.key.stable_id.as_ref();
+        let mut damaged = stable.to_vec();
+        damaged[0] ^= 1;
+        let allocation = allocation_counter::measure(|| {
+            assert!(!scope_scan_prefix_mismatch(
+                stable,
+                record.payload.as_bytes()
+            ));
+            assert!(scope_scan_prefix_mismatch(
+                &damaged,
+                record.payload.as_bytes()
+            ));
+            assert!(scope_scan_prefix_mismatch(
+                &damaged[..48],
+                record.payload.as_bytes()
+            ));
+        });
+        assert!(
+            allocation.bytes_total < 16 * 1024,
+            "header-only decoding: {allocation:?}"
+        );
+        for payload in [
+            b"".as_slice(),
+            b"OPSC\x03\x01",
+            b"OPSC\x04\x01",
+            b"OPSC\x04\x00",
+        ] {
+            assert!(!scope_scan_prefix_mismatch(&damaged, payload));
+        }
+        assert!(!scope_scan_prefix_mismatch(
+            &damaged[..31],
+            record.payload.as_bytes()
+        ));
+    }
+}
+
+#[test]
 fn namespace_keys_retain_frozen_a64_vectors() {
     // Synthetic RFC026-shaped scope. Expected bytes are independently frozen,
     // not recomputed with a second implementation of the storage hash.

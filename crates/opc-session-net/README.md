@@ -68,6 +68,22 @@ unacknowledged completions. `batch_outcome` on either client reads a predecessor
 exact attempt without its old key or mutation payload; Applied, Cancelled,
 NotApplied, NotRecorded and Pruned remain distinct.
 
+Use `ScopeClient::scans` with this boot's committed successor and the original
+`PendingScopeAuthority` to obtain a `ScopeScanPort`. `ScopeScanClient` uses that
+port for bounded, sticky-node restore and finite recovery; a `ScopeScanSink`
+stages each cut and preserves conservative claim restrictions through discard.
+Both `restore(sink, deadline)` and `restore_until` require one deadline covering
+queued admission and paging. Waiting retains its queue place; disconnect cancels
+a waiting server admission. Linux TCP keepalive detects silently lost peers in
+about 10 seconds while healthy queued waits consume no retries. Pending reads
+release the process gate and cancel promptly when graceful Close begins.
+The port also exposes same-cut `lookup` and `classify`. Open proves the exact
+committed handover and takes a full read barrier. Later pages and fresh-channel
+proofs revalidate current authorization locally. Classification uses its fixed
+EmergencyClassification budget; bulk scan work uses Normal. Every reply is a
+bounded observation and carries no mutation or effect capability. See
+[RFC 028](../../docs/rfc/028-coherent-scope-scans.md) for byte layouts and bounds.
+
 Install all five class listeners returned by `ScopeServer::serve`, and configure
 each voter hop with `RemoteSessionConsensusPeer::with_class_resolvers` and
 `SessionConsensusServer::listen_classified`. SafetyControl, established Emergency,

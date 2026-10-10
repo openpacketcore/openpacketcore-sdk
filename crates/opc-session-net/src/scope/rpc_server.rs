@@ -33,6 +33,10 @@ const CLASSES: [Class; 5] = [
 #[cfg(test)]
 mod batch_tests;
 mod listener;
+#[cfg(test)]
+mod scan_tests;
+mod scans;
+use scans::ScanViews;
 /// Authenticated scope service with independent per-class connection/proof
 /// capacity and native durable authority dispatch.
 pub struct ScopeServer {
@@ -43,6 +47,8 @@ pub struct ScopeServer {
     class_tls: [opc_tls::AuthenticatedServerConfig; 5],
     #[cfg(test)]
     drop_reply: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    drop_scan_reply: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     corrupt_reply: std::sync::atomic::AtomicU8,
     #[cfg(test)]
@@ -93,6 +99,8 @@ impl ScopeServer {
             #[cfg(test)]
             drop_reply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            drop_scan_reply: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             corrupt_reply: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             pause_reply: std::sync::Mutex::new(None),
@@ -106,6 +114,11 @@ impl ScopeServer {
     #[cfg(test)]
     pub(crate) fn unproven_proof_waiters_for_test(&self, class: Class) -> usize {
         self.proofs.waiting(class, ProofShare::WorkerUnproven)
+    }
+    #[cfg(test)]
+    pub(crate) fn lose_next_scan_reply_for_test(&self) {
+        self.drop_scan_reply
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     #[cfg(test)]
     pub(crate) fn corrupt_next_committed_reply_for_test(&self, kind: u8) {
@@ -136,20 +149,23 @@ impl ScopeServer {
             bound[index] = listener.local_addr().map_err(|_| ScopeRpcError::Retry)?;
             listeners.push(listener);
         }
+        let views = Arc::new(ScanViews::default());
         let (stop, receive) = watch::channel(false);
-        let tasks = listeners
+        let tasks: Vec<_> = listeners
             .into_iter()
             .zip(CLASSES)
             .map(|(listener, class)| {
                 let server = self.clone();
+                let views = views.clone();
                 let stop = receive.clone();
                 tokio::spawn(async move {
                     listener::supervise(
                         || async { listener.accept().await.map(|(stream, _)| stream) },
                         move |stream| {
                             let server = server.clone();
+                            let views = views.clone();
                             async move {
-                                let _ = server.connection(class, stream).await;
+                                let _ = server.connection(class, stream, views).await;
                             }
                         },
                         stop,
@@ -158,14 +174,39 @@ impl ScopeServer {
                 })
             })
             .collect();
+        let cleanup = views.clone();
+        let supervisor = tokio::spawn(async move {
+            let mut stop = receive;
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => break,
+                    _ = interval.tick() => cleanup.reap(),
+                }
+            }
+            cleanup.begin_close();
+            // Cancel connection work before freeing capacity: a queued open
+            // must not be admitted during listener shutdown.
+            for task in tasks {
+                let _ = task.await;
+            }
+            cleanup.shutdown().await;
+        });
         Ok(ScopeServerHandle {
             addresses: bound,
             stop,
-            tasks,
+            tasks: vec![supervisor],
+            views,
         })
     }
-    async fn connection(&self, class: Class, io: TcpStream) -> Result<(), ScopeRpcError> {
-        io.set_nodelay(true).map_err(|_| ScopeRpcError::Retry)?;
+    async fn connection(
+        &self,
+        class: Class,
+        io: TcpStream,
+        views: Arc<ScanViews>,
+    ) -> Result<(), ScopeRpcError> {
+        super::socket::configure(&io).map_err(|_| ScopeRpcError::Retry)?;
         let handshake_slot = self.handshakes[class.index()]
             .acquire()
             .await
@@ -226,7 +267,7 @@ impl ScopeServer {
             {
                 return Err(ScopeRpcError::Invalid);
             }
-            self.call(&mut connection, &header, &scope, &mut promoted)
+            self.call(&mut connection, &header, &scope, &mut promoted, &views)
                 .await?;
             let mut fixed = [0; HEADER_BYTES];
             timeout(Duration::from_secs(5), connection.read_exact(&mut fixed))
@@ -242,6 +283,7 @@ impl ScopeServer {
         header: &Header,
         binding: &ScopeBinding,
         promoted: &mut Option<ScopeAuthorityStamp>,
+        views: &ScanViews,
     ) -> Result<(), ScopeRpcError> {
         let prepared = async {
             let route = Arc::new(
@@ -268,24 +310,31 @@ impl ScopeServer {
                         .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
                 )
                 .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            if promoted.is_some() {
+            if let Some(stamp) = promoted.clone() {
                 let context = Context {
                     route: route.clone(),
                     scope: scope.clone(),
                     authentication: authentication.clone(),
                     clock: self.config.clock.clone(),
                 };
-                let store = ScopeAuthorityStore::new(
-                    self.config.store.clone(),
-                    scope.clone(),
-                    Arc::new(Routing(context.clone())),
-                )
-                .map_err(authority_error)?;
-                let view = store
-                    .current(&context.identity()?)
-                    .await
+                let still_current = if header.method.is_scan() {
+                    self.scan_current(&context, &stamp, header.method == Method::ScanClassify)
+                        .await
+                        .is_ok()
+                } else {
+                    let store = ScopeAuthorityStore::new(
+                        self.config.store.clone(),
+                        scope.clone(),
+                        Arc::new(Routing(context.clone())),
+                    )
                     .map_err(authority_error)?;
-                if !view.is_active() || promoted.as_ref() != view.stamp() {
+                    let view = store
+                        .current(&context.identity()?)
+                        .await
+                        .map_err(authority_error)?;
+                    view.is_active() && view.stamp() == Some(&stamp)
+                };
+                if !still_current {
                     *promoted = None;
                 }
             }
@@ -366,25 +415,41 @@ impl ScopeServer {
                 return Err(error);
             }
         };
-        let reservation = self
-            .config
-            .scheduler
-            .reserve(
-                opc_session_store::ConsensusSessionStore::scope_batch_scheduler_key(
-                    &admission.context.scope,
-                ),
-                work_class(admission.dispatch_class()),
+        let _running = if header.method.is_scan() {
+            // Scan execution is owned by the store's actual workers. In
+            // particular, retention queueing must not hold a second permit.
+            None
+        } else {
+            Some(
+                self.config
+                    .scheduler
+                    .reserve(
+                        opc_session_store::ConsensusSessionStore::scope_batch_scheduler_key(
+                            &admission.context.scope,
+                        ),
+                        work_class(admission.dispatch_class()),
+                    )
+                    .await
+                    .map_err(|_| ScopeRpcError::Retry)?
+                    .start()
+                    .await
+                    .map_err(|_| ScopeRpcError::Retry)?,
             )
-            .await
-            .map_err(|_| ScopeRpcError::Retry)?;
-        let _running = reservation
-            .start()
-            .await
-            .map_err(|_| ScopeRpcError::Retry)?;
+        };
         let outcome = match call {
+            Ok(call) if header.method.is_scan() => {
+                // Requests are sequential on this channel. EOF cancels a
+                // waiting admission promptly; pipelining is not a valid next
+                // call before its response. The caller owns the scan deadline.
+                tokio::select! {
+                    biased;
+                    _ = connection.read_u8() => return Err(ScopeRpcError::Retry),
+                    outcome = self.dispatch(&call, admission.clone(), views) => outcome,
+                }
+            }
             Ok(call) => timeout(
                 Duration::from_secs(5),
-                self.dispatch(&call, admission.clone()),
+                self.dispatch(&call, admission.clone(), views),
             )
             .await
             .map_err(|_| ScopeRpcError::OutcomeUnknown)
@@ -396,6 +461,14 @@ impl ScopeServer {
             Err(error) => (error_status(error).0, [0; 32], error_status(error).1, None),
         };
         admission.check().map_err(authority_error)?;
+        #[cfg(test)]
+        if status == ResultStatus::ScanObservation
+            && self
+                .drop_scan_reply
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(ScopeRpcError::OutcomeUnknown);
+        }
         #[cfg(test)]
         if status == ResultStatus::Committed
             && self
@@ -505,6 +578,7 @@ impl ScopeServer {
         let mut public_key = None;
         let mut reference = None;
         let mut current = false;
+        let mut scan_failure = None;
         if context.route.requires_worker_proof() {
             *refusal_reply = RefusalReply::Silent;
             let challenge_bytes = challenge.to_vec();
@@ -572,56 +646,80 @@ impl ScopeServer {
                     return Err(ScopeRpcError::Unauthorized);
                 }
             }
-            let routing = Arc::new(Routing(context.clone()));
-            let store =
-                ScopeAuthorityStore::new(self.config.store.clone(), context.scope.clone(), routing)
-                    .map_err(authority_error)?;
-            let view = store
-                .current(&context.identity()?)
-                .await
-                .map_err(authority_error)?;
-            if promoted.as_ref() != view.stamp() || !view.is_active() {
-                *promoted = None;
-            }
-            if execution.is_none() {
-                execution = view
-                    .stamp()
-                    .filter(|stamp| {
-                        stamp.execution().transport_digest() == Ok(claims.execution)
-                            && stamp.execution().boot_key() == &hash(&claims.public_key)
-                    })
-                    .map(|stamp| stamp.execution().clone());
-                if execution.is_none() {
-                    let known = self
-                        .config
-                        .boots
-                        .read_known(&context.route.scope, hash(&claims.public_key))
-                        .await
-                        .map_err(evidence_error)?;
-                    if known.scope != context.route.scope
-                        || known.public_key != claims.public_key
-                        || known
-                            .execution
-                            .transport_digest()
-                            .map_err(authority_error)?
-                            != claims.execution
-                    {
-                        return Err(ScopeRpcError::Unauthorized);
+            if let NativeCall::Scan(request) = &call {
+                match self
+                    .scan_current(
+                        &context,
+                        request.stamp(),
+                        header.method == Method::ScanClassify,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        current = true;
+                        *promoted = Some(request.stamp().clone());
                     }
-                    execution = Some(known.execution);
+                    Err(error) => {
+                        scan_failure = Some(error);
+                        *promoted = None;
+                    }
                 }
-            }
-            let value = execution.as_ref().ok_or(ScopeRpcError::Unauthorized)?;
-            if value.identity().as_str() != context.route.principal.as_str()
-                || value.boot_key() != &hash(&claims.public_key)
-            {
-                return Err(ScopeRpcError::Unauthorized);
-            }
-            if view.is_active() && view.stamp().is_some_and(|stamp| stamp.execution() == value) {
-                current = true;
-                *promoted = view.stamp().cloned();
             } else {
-                *promoted = None;
+                let routing = Arc::new(Routing(context.clone()));
+                let store = ScopeAuthorityStore::new(
+                    self.config.store.clone(),
+                    context.scope.clone(),
+                    routing,
+                )
+                .map_err(authority_error)?;
+                let view = store
+                    .current(&context.identity()?)
+                    .await
+                    .map_err(authority_error)?;
+                if promoted.as_ref() != view.stamp() || !view.is_active() {
+                    *promoted = None;
+                }
+                if execution.is_none() {
+                    execution = view
+                        .stamp()
+                        .filter(|stamp| {
+                            stamp.execution().transport_digest() == Ok(claims.execution)
+                                && stamp.execution().boot_key() == &hash(&claims.public_key)
+                        })
+                        .map(|stamp| stamp.execution().clone());
+                    if execution.is_none() {
+                        let known = self
+                            .config
+                            .boots
+                            .read_known(&context.route.scope, hash(&claims.public_key))
+                            .await
+                            .map_err(evidence_error)?;
+                        if known.scope != context.route.scope
+                            || known.public_key != claims.public_key
+                            || known
+                                .execution
+                                .transport_digest()
+                                .map_err(authority_error)?
+                                != claims.execution
+                        {
+                            return Err(ScopeRpcError::Unauthorized);
+                        }
+                        execution = Some(known.execution);
+                    }
+                }
+                let value = execution.as_ref().ok_or(ScopeRpcError::Unauthorized)?;
+                if value.identity().as_str() != context.route.principal.as_str()
+                    || value.boot_key() != &hash(&claims.public_key)
+                {
+                    return Err(ScopeRpcError::Unauthorized);
+                }
+                if view.is_active() && view.stamp().is_some_and(|stamp| stamp.execution() == value)
+                {
+                    current = true;
+                    *promoted = view.stamp().cloned();
+                } else {
+                    *promoted = None;
+                }
             }
         }
         let mut ticket = None;
@@ -674,6 +772,7 @@ impl ScopeServer {
                 closures: self.config.closures.clone(),
                 digest: header.digest,
                 current,
+                scan_failure,
             }),
             payload.nonce,
         ))
@@ -682,6 +781,7 @@ impl ScopeServer {
         &self,
         call: &NativeCall,
         admission: Arc<VerifiedScopeCall>,
+        views: &ScanViews,
     ) -> Result<(ResultStatus, [u8; 32], Vec<u8>, Option<ScopeAuthorityStamp>), ScopeRpcError> {
         admission.check().map_err(authority_error)?;
         let store = ScopeAuthorityStore::new(
@@ -749,6 +849,7 @@ impl ScopeServer {
                     Err(ScopeRpcError::ReceiptUnavailable)
                 }
             },
+            NativeCall::Scan(request) => self.dispatch_scan(request, admission, views).await,
             NativeCall::Batch(_)
             | NativeCall::BatchCancel(_)
             | NativeCall::BatchReopen(_)
@@ -952,6 +1053,7 @@ struct VerifiedScopeCall {
     closures: Arc<dyn ScopeClosureSource>,
     digest: [u8; 32],
     current: bool,
+    scan_failure: Option<opc_session_store::scope_scan::ScopeScanError>,
 }
 impl VerifiedScopeCall {
     fn check(&self) -> Result<(), ScopeAuthorityError> {
@@ -985,6 +1087,13 @@ impl ScopeAuthorityAdmission for VerifiedScopeCall {
             return Err(ScopeAuthorityError::Unauthorized);
         }
         if action == ScopeAuthorityAction::Read {
+            if self.context.route.method.is_scan()
+                && (!self.current
+                    || self.context.route.role != ScopeRole::Worker
+                    || execution != self.execution.as_ref())
+            {
+                return Err(ScopeAuthorityError::Unauthorized);
+            }
             return Ok(self.context.role());
         }
         if action == ScopeAuthorityAction::Recover && self.context.route.method == Method::Outcome {
@@ -1064,6 +1173,7 @@ pub(super) enum NativeCall {
     BatchCancel(Box<ScopeBatchAttempt>),
     BatchReopen(Box<ScopeAuthorityStamp>),
     BatchLookup(Box<ScopeBatchAttempt>),
+    Scan(Box<opc_session_store::scope_scan::ScopeScanRequest>),
 }
 impl NativeCall {
     pub(super) fn execution(&self) -> Option<&ScopeExecution> {
@@ -1071,6 +1181,7 @@ impl NativeCall {
             Self::Authority(request) => Some(request.operation().execution()),
             Self::Batch(request) => Some(request.stamp().execution()),
             Self::BatchCancel(attempt) => Some(attempt.stamp().execution()),
+            Self::Scan(request) => Some(request.stamp().execution()),
             _ => None,
         }
     }
@@ -1080,6 +1191,20 @@ impl NativeCall {
         scope: &ScopeId,
     ) -> Result<Self, ScopeRpcError> {
         match header.method {
+            method if method.is_scan() => {
+                let request =
+                    opc_session_store::scope_scan::ScopeScanRequest::decode_canonical(bytes)
+                        .map_err(|_| ScopeRpcError::Invalid)?;
+                if request.stamp().scope() != scope
+                    || Method::for_scan(&request) != method
+                    || transport_request_digest(method, &header.request_id, bytes)
+                        .map_err(|_| ScopeRpcError::Invalid)?
+                        != header.digest
+                {
+                    return Err(ScopeRpcError::Invalid);
+                }
+                Ok(Self::Scan(Box::new(request)))
+            }
             Method::ApplyBatch => {
                 let request = ScopeBatchRequest::decode_canonical(bytes)
                     .map_err(|_| ScopeRpcError::Invalid)?;
@@ -1289,6 +1414,7 @@ pub struct ScopeServerHandle {
     addresses: [SocketAddr; 5],
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    views: Arc<ScanViews>,
 }
 impl ScopeServerHandle {
     /// Separate SC/E/classification/Normal/Maintenance bound addresses.
@@ -1297,6 +1423,7 @@ impl ScopeServerHandle {
     }
     /// Stop accepting and join every bounded connection supervisor.
     pub async fn shutdown(mut self) {
+        self.views.begin_close();
         let _ = self.stop.send(true);
         for task in self.tasks.drain(..) {
             let _ = task.await;
@@ -1305,6 +1432,7 @@ impl ScopeServerHandle {
 }
 impl Drop for ScopeServerHandle {
     fn drop(&mut self) {
+        self.views.begin_close();
         let _ = self.stop.send(true);
     }
 }

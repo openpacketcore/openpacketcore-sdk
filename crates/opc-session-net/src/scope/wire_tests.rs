@@ -48,7 +48,7 @@ fn malformed_or_oversized_headers_are_rejected_before_payload_read() {
         (7, 4),
         (8, 1),
         (9, 0),
-        (9, 12),
+        (9, 17),
         (10, 1),
         (11, 1),
     ] {

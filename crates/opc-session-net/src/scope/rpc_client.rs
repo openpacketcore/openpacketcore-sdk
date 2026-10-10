@@ -21,6 +21,7 @@ use tokio::{
 pub(super) mod batch;
 #[cfg(test)]
 mod batch_tests;
+pub(super) mod scans;
 
 struct Inner {
     config: ScopeClientConfig,
@@ -541,27 +542,29 @@ impl ScopeClient {
                 .take()
                 .filter(|entry| entry.idle_since.elapsed() < Duration::from_secs(4));
             let mut proof_started = false;
-            let result = timeout_at(
-                deadline,
-                self.exchange(
-                    cached,
-                    method,
-                    class,
-                    id,
-                    digest,
-                    canonical,
-                    close,
-                    &mut proof_started,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(if proof_started {
-                    ScopeRpcError::OutcomeUnknown
-                } else {
-                    ScopeRpcError::Retry
+            let exchange = self.exchange(
+                cached,
+                method,
+                class,
+                id,
+                digest,
+                canonical,
+                close,
+                &mut proof_started,
+            );
+            let result = if method.is_scan() {
+                // A proven scan may be waiting for retention or writer ownership.
+                // The owning restore cancels this exchange at its overall deadline.
+                exchange.await
+            } else {
+                timeout_at(deadline, exchange).await.unwrap_or_else(|_| {
+                    Err(if proof_started {
+                        ScopeRpcError::OutcomeUnknown
+                    } else {
+                        ScopeRpcError::Retry
+                    })
                 })
-            });
+            };
             match result {
                 Ok((reply, stream)) => {
                     *slot = Some(PooledConnection {
@@ -597,10 +600,9 @@ impl ScopeClient {
                     .begin_handshake()
                     .map_err(|_| ScopeRpcError::Retry)?;
                 timeout(Duration::from_secs(5), async {
-                    let socket = TcpStream::connect(self.0.config.addresses[class.index()])
+                    let socket = super::socket::connect(self.0.config.addresses[class.index()])
                         .await
                         .map_err(|_| ScopeRpcError::Retry)?;
-                    socket.set_nodelay(true).map_err(|_| ScopeRpcError::Retry)?;
                     handshake
                         .connect_scope(
                             socket,

@@ -29,6 +29,8 @@ pub(crate) mod roster;
 mod row_map;
 mod scope_authority;
 mod scope_batch;
+mod scope_records;
+pub(crate) use scope_records::ScopeRecordCapture;
 mod shared;
 use row_map::RowMap;
 mod v1;

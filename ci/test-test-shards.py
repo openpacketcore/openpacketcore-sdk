@@ -249,6 +249,29 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 self.assertIn("--exact", command)
                 self.assertIn("--test-threads=1", command)
 
+    def test_scope_scan_tls_contracts_run_once_on_the_serial_shard(self) -> None:
+        plan = TEST_SHARDS.load_plan()
+        targets = [plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
+        names = [
+            "native_scope_scan_tls_keeps_one_cut_and_locally_revalidates_fresh_proofs",
+            "native_scope_scan_tls_queued_open_releases_running_and_shutdown_drains",
+            "native_scope_scan_tls_rejects_a_superseded_boot_on_existing_and_new_channels",
+        ]
+        for name in names:
+            short = "scope_transport::scans::" + name
+            full = "stateless_quorum_consumer::" + short
+            with self.subTest(name=full):
+                self.assertIn(short, TEST_SHARDS.QUIESCENT_LIB_TESTS)
+                command = TEST_SHARDS.quiescent_lib_command(short)
+                owners = [
+                    shard for shard in TEST_SHARDS.shard_ids(plan)
+                    for actual in TEST_SHARDS.commands(plan, shard, targets)
+                    if actual == command
+                ]
+                self.assertEqual(owners, ["it-0"])
+                self.assertIn("--test-threads=1", command)
+                self.assertIn("--exact", command)
+
     def test_protected_transition_runs_once_in_the_optimized_shard(self) -> None:
         name = (
             "stateless_quorum_consumer::"

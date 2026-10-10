@@ -52,3 +52,55 @@ async fn cancelling_quiescence_never_reopens_and_a_retry_can_finish() {
     gate.quiesce().await.unwrap();
     assert!(gate.activate().await.is_err());
 }
+
+#[tokio::test]
+async fn read_observation_releases_gate_at_wait_and_cannot_resume_after_quiescence() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let gate = EffectGate::new();
+    let polls = AtomicUsize::new(0);
+    let read = || {
+        std::future::poll_fn(|_| {
+            polls.fetch_add(1, Ordering::AcqRel);
+            std::task::Poll::<()>::Pending
+        })
+    };
+    assert!(gate.observe(read()).await.is_err());
+    assert_eq!(polls.load(Ordering::Acquire), 0);
+    gate.activate().await.unwrap();
+    let mut pending = Box::pin(gate.observe(read()));
+    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    assert_eq!(polls.load(Ordering::Acquire), 1);
+    // The observation is still pending; a held read guard would block Close.
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.quiesce())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pending.await.is_err());
+    assert!(gate.observe(read()).await.is_err());
+    assert_eq!(polls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn quiescence_wakes_a_read_observation_without_transport_progress() {
+    let gate = Arc::new(EffectGate::new());
+    gate.activate().await.unwrap();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let reader = Arc::clone(&gate);
+    let observation = tokio::spawn(async move {
+        reader
+            .observe(async move {
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    ready.await.unwrap();
+    gate.quiesce().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), observation)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+}

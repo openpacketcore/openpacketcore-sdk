@@ -288,7 +288,8 @@ impl BusinessProof {
     ) -> io::Result<Arc<Self>> {
         // The small frontiers use the same 64KiB header ceiling. The fixed
         // membership has at most five nodes. Derived resident index roots
-        // share only scalar order/key metadata, with their full RSS charge.
+        // share immutable metadata and reserved scope records; retained scope
+        // captures share those roots and reserve their own bounded page work.
         let memory = VerificationMemory::reserve(PROOF_MEMORY)?;
         Ok(Arc::new(Self {
             identity: state.identity,

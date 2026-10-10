@@ -841,7 +841,12 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 33);
+        assert_eq!(objects.len(), 33 + 2);
+        for name in ["scope_scan_keys", "scope_scan_bad_keys"] {
+            assert!(objects
+                .iter()
+                .any(|(kind, observed)| kind == "index" && observed == name));
+        }
         assert!(objects.iter().any(|(kind, name)| {
             kind == "table" && name == "consensus_fenced_transition_receipts"
         }));
@@ -875,6 +880,8 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
                             | "consensus_protected_roster_reclaim_due"
                             | "consensus_protected_roster_partition_epoch"
                             | "consensus_protected_roster_terminal_sequence"
+                            | "scope_scan_keys"
+                            | "scope_scan_bad_keys"
                     ))
         }));
     }
