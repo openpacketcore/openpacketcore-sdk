@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed selection, measurement and nightly latency classification."""
 
+import ast
 import importlib.util
 import io
 import json
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import nightly_qualification as NIGHTLY
+import yaml
 
 SPEC = importlib.util.spec_from_file_location(
     "performance", Path(__file__).with_name("performance-tests.py")
@@ -19,6 +21,85 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 PERFORMANCE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PERFORMANCE)
+
+
+def workflow_condition(expression, event, job, ref="refs/heads/main", result="failure", variable=""):
+    """Evaluate only the boolean subset used by the nightly job conditions."""
+    for key, value in (("github.event_name", event), ("github.ref", ref),
+                       (f"needs.{job}.result", result), ("vars.OPC_PERFORMANCE_GATES", variable)):
+        expression = expression.replace(key, repr(value))
+    expression = expression.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
+    tree = ast.parse(expression, mode="eval")
+    allowed = (ast.Expression, ast.BoolOp, ast.Or, ast.And, ast.Compare, ast.Eq, ast.NotEq, ast.Constant)
+    if not all(isinstance(node, allowed) for node in ast.walk(tree)):
+        raise ValueError(f"unsupported workflow condition: {expression}")
+    return eval(compile(tree, "workflow-condition", "eval"), {"__builtins__": {}}, {})
+
+
+class NightlyWorkflowTests(unittest.TestCase):
+    workflows = (("performance.yml", "latency", "performance"),
+                 ("realtime-qualification.yml", "qualification", "realtime"))
+
+    def workflow(self, name):
+        path = Path(__file__).resolve().parents[1] / ".github/workflows" / name
+        # BaseLoader preserves GitHub's `on` key instead of treating it as a YAML 1.1 boolean.
+        return yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+
+    def test_nightly_triggers_run_without_a_repository_variable(self):
+        for name, job_name, _ in self.workflows:
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name)
+                schedule = workflow["on"].get("schedule", [])
+                self.assertTrue(schedule, "nightly schedule must remain enabled")
+                self.assertTrue(all(entry.get("cron", "").strip() for entry in schedule))
+                job = workflow["jobs"][job_name]
+                for variable in ("", "false"):
+                    self.assertTrue(workflow_condition(job["if"], "schedule", job_name, variable=variable))
+                self.assertEqual(job.get("continue-on-error", "false"), "false")
+        latency = self.workflow("performance.yml")["jobs"]["latency"]
+        self.assertTrue(workflow_condition(latency["if"], "workflow_dispatch", "latency"))
+        self.assertFalse(workflow_condition(latency["if"], "push", "latency"))
+        self.assertTrue(workflow_condition(latency["if"], "push", "latency", variable="true"))
+        self.assertEqual(latency["strategy"]["fail-fast"], "false")
+        self.assertEqual(latency["strategy"]["matrix"]["profile"], list(PERFORMANCE.PROFILES))
+
+    def test_failed_or_incomplete_nights_report_the_shared_merge_hold(self):
+        for name, job_name, kind in self.workflows:
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name)
+                report = workflow["jobs"]["report-nightly"]
+                self.assertEqual(report["needs"], job_name)
+                self.assertIn("always()", report["if"], "report even when the dependency fails")
+                for result in ("failure", "cancelled", "skipped"):
+                    self.assertTrue(workflow_condition(report["if"], "schedule", job_name, result=result))
+                for event, ref, result in (("schedule", "refs/heads/main", "success"),
+                                          ("schedule", "refs/heads/other", "failure"),
+                                          ("pull_request", "refs/pull/1/merge", "failure"),
+                                          ("push", "refs/heads/main", "failure"),
+                                          ("workflow_dispatch", "refs/heads/main", "failure")):
+                    self.assertFalse(workflow_condition(report["if"], event, job_name, ref, result))
+                self.assertEqual(report["permissions"]["issues"], "write")
+                self.assertNotIn("issues", workflow["permissions"])
+                self.assertEqual(report.get("continue-on-error", "false"), "false")
+                steps = [step for step in report["steps"]
+                         if "python3 ci/nightly_qualification.py report" in step.get("run", "")]
+                self.assertEqual(len(steps), 1)
+                step = steps[0]
+                self.assertNotIn("if", step)
+                self.assertEqual(step.get("continue-on-error", "false"), "false")
+                self.assertEqual(step["env"]["QUALIFICATION_RESULT"], "${{ needs." + job_name + ".result }}")
+                self.assertIn('--conclusion "$QUALIFICATION_RESULT"', step["run"])
+                if kind == "performance":
+                    self.assertIn("nightly_qualification.py report --kind performance", step["run"])
+
+    def test_required_rust_gates_check_the_hold_and_workflow_controls(self):
+        gates = self.workflow("ci.yml")["jobs"]["rust-gates"]
+        steps = gates["steps"]
+        for command in ("python3 ci/nightly_qualification.py check", "python3 ci/test-performance-tests.py"):
+            matching = [step for step in steps if command in step.get("run", "").splitlines()]
+            self.assertEqual(len(matching), 1, command)
+            self.assertNotIn("if", matching[0])
+            self.assertEqual(matching[0].get("continue-on-error", "false"), "false")
 
 
 class PerformanceGateTests(unittest.TestCase):
