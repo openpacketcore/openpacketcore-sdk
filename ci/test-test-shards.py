@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import shlex
 import subprocess
 import sys
@@ -411,6 +412,105 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 plan["quiescent_lib_shards"][name] = "it-1"
                 with self.assertRaises(SystemExit):
                     TEST_SHARDS.verify_lib_plan(plan)
+
+
+class RealtimeQualificationPartitionTests(unittest.TestCase):
+    NAME = (
+        "isolated_scale::original::"
+        "original_encrypted_durable_batches_preserve_receipts_and_scope"
+    )
+
+    def setUp(self) -> None:
+        self.plan = TEST_SHARDS.load_plan()
+        self.plan["qualification"] = [{"name": self.NAME}]
+        self.targets = [
+            self.plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))
+        ]
+
+    def test_only_the_listed_full_name_leaves_required_shards(self) -> None:
+        invocations = {
+            shard: [
+                command
+                for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
+                if self.plan["heavy"]["target"] in command
+            ]
+            for shard in TEST_SHARDS.shard_ids(self.plan)
+        }
+        for name, expected in (
+            (self.NAME, []),
+            (self.NAME + "_future", ["misc"]),
+            ("isolated_scale::unlisted_future_test", ["misc"]),
+        ):
+            with self.subTest(name=name):
+                owners = [
+                    shard for shard, commands in invocations.items()
+                    for command in commands
+                    if LibraryGroupPlanTests.selected(command, name)
+                ]
+                self.assertEqual(owners, expected)
+
+    def test_removed_qualification_name_fails_the_live_partition_check(self) -> None:
+        named = [name for group in self.plan["heavy"]["shards"] for name in group]
+        inventory = [*named, "an_unlisted_required_test"]
+
+        def listed(_plan, arguments):
+            command = ["--", *arguments]
+            return {
+                name for name in inventory
+                if LibraryGroupPlanTests.selected(command, name)
+            }
+
+        with (
+            patch.object(TEST_SHARDS, "list_heavy_tests", side_effect=listed),
+            self.assertRaisesRegex(SystemExit, "qualification"),
+        ):
+            TEST_SHARDS.verify_heavy(self.plan)
+
+    def test_live_partition_keeps_unlisted_and_prefix_tests_required(self) -> None:
+        named = [name for group in self.plan["heavy"]["shards"] for name in group]
+        inventory = [*named, self.NAME, self.NAME + "_future", "isolated_scale::future"]
+
+        def listed(_plan, arguments):
+            if "--ignored" in arguments:
+                return []
+            return [name for name in inventory
+                    if LibraryGroupPlanTests.selected(["--", *arguments], name)]
+
+        with patch.object(TEST_SHARDS, "list_heavy_tests", side_effect=listed), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            TEST_SHARDS.verify_heavy(self.plan)
+        self.assertIn("2 on 'misc'", output.getvalue())
+        self.assertIn("1 real-time qualification tests", output.getvalue())
+
+    def test_live_partition_rejects_duplicate_or_ignored_names(self) -> None:
+        named = [name for group in self.plan["heavy"]["shards"] for name in group]
+        inventory = [*named, self.NAME]
+        for duplicate, ignored in ((True, False), (False, True)):
+            def listed(_plan, arguments):
+                if not arguments and duplicate:
+                    return [*inventory, self.NAME]
+                if "--ignored" in arguments:
+                    return [self.NAME] if ignored else []
+                return [name for name in inventory
+                        if LibraryGroupPlanTests.selected(["--", *arguments], name)]
+
+            with self.subTest(duplicate=duplicate, ignored=ignored), \
+                    patch.object(TEST_SHARDS, "list_heavy_tests", side_effect=listed), \
+                    self.assertRaisesRegex(SystemExit, "ambiguous|ignored"):
+                TEST_SHARDS.verify_heavy(self.plan)
+
+    def test_misc_precheck_audits_live_qualification_before_suite_execution(self) -> None:
+        with patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets), \
+                patch.object(TEST_SHARDS, "verify"), \
+                patch.object(TEST_SHARDS, "verify_heavy", side_effect=SystemExit("stale qualification")) as audit, \
+                self.assertRaisesRegex(SystemExit, "stale qualification"):
+            TEST_SHARDS.precheck(self.plan, "misc")
+        audit.assert_called_once_with(self.plan)
+
+    def test_manifest_cannot_overlap_required_heavy_groups(self) -> None:
+        self.plan["qualification"] = [{"name": self.plan["heavy"]["shards"][0][0]}]
+        with self.assertRaisesRegex(SystemExit, "required shard"):
+            TEST_SHARDS.verify_commands(self.plan, self.targets)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,23 @@ lane checks Rust 1.89. Use the same Rust version as the CI run and set
 `CARGO_INCREMENTAL=0`,
 `CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
 
+Required CI excludes only the exact real-time multi-process test names in
+[`ci/realtime-qualification.json`](ci/realtime-qualification.json). A separate,
+visible **Real-time multi-process qualification (non-required)** job runs them
+on every PR, and scheduled main qualification runs ten repetitions. Any failed
+repetition keeps that run red. The manifest is temporary and must shrink as
+ordering/outcome assertions, injected time, and readiness waits replace
+host-clock correctness checks. Assertions must be preserved.
+
+A qualification failure still needs a decision before merging. Compare the PR
+and unchanged main with the same toolchain, features, storage, load, and command;
+a failure unique to the change blocks it. A red nightly stops new merges until
+every failure is classified in its `nightly-qualification` issue, with a known
+flake issue or a verified fix/revert. Check the hold again immediately before
+merging; an earlier green PR check cannot establish the current nightly state.
+See the [CI qualification policy](ci/README.md) for the exact selection,
+reporting, merge checks, and requirements for returning tests to required CI.
+
 The native IPsec, i686 session-net, and egress host-source jobs are separate
 profiles: use `CARGO_INCREMENTAL=0` and their workflow commands, but leave
 `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` unset, as those jobs do.

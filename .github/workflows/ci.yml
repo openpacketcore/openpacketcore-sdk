@@ -39,6 +39,9 @@ jobs:
     name: Rust gates
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -50,6 +53,11 @@ jobs:
           # PR whitespace validation compares the event's base and head, so
           # retain enough history to resolve their exact merge-base.
           fetch-depth: 0
+
+      - name: Require nightly qualification failures to be classified
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/nightly_qualification.py check
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -196,6 +204,7 @@ jobs:
         run: |
           python3 ci/test-test-shards.py
           python3 ci/test-performance-tests.py
+          python3 ci/test-realtime-qualification.py
 
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify

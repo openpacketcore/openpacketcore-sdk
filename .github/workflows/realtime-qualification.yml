@@ -1,0 +1,94 @@
+name: Real-time qualification
+
+on:
+  pull_request:
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+# This visible check is deliberately outside the required Rust workspace
+# aggregator. It fails normally; branch rules must not require its job name.
+# Nightly results are never cancelled by a later PR or nightly run.
+concurrency:
+  group: realtime-qualification-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  qualification:
+    name: Real-time multi-process qualification (non-required)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      REPETITIONS: ${{ github.event_name == 'schedule' && '10' || '1' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Prepare mutable disk scratch
+        run: |
+          scratch="$(mktemp -d "${RUNNER_TEMP}/realtime-qualification.XXXXXX")"
+          printf 'TMPDIR=%s\n' "$scratch" >> "$GITHUB_ENV"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-realtime-qualification
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run every manifest test and preserve every failure
+        run: |
+          python3 ci/realtime_qualification.py \
+            --repetitions "$REPETITIONS" --output qualification-results
+
+      - name: Archive qualification results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: realtime-qualification
+          path: qualification-results/
+          if-no-files-found: error
+
+  report-nightly:
+    name: Report nightly qualification failure
+    needs: qualification
+    if: always() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.qualification.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Checkout scheduled main revision
+        uses: actions/checkout@v7
+
+      - name: Open or update the classification issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFICATION_RESULT: ${{ needs.qualification.result }}
+        run: |
+          # Setup/build/runner failures may leave no artifact. They still
+          # create a merge hold with the run link and an explicit missing report.
+          if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name realtime-qualification --dir qualification-results; then
+            echo "No qualification artifact could be downloaded; reporting the job failure."
+          fi
+          python3 ci/nightly_qualification.py report \
+            --result qualification-results/result.json --conclusion "$QUALIFICATION_RESULT"

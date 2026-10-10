@@ -37,6 +37,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import realtime_qualification
+
 ROOT = Path(__file__).resolve().parent.parent
 PLAN_PATH = ROOT / "ci" / "test-shards.json"
 
@@ -145,7 +147,13 @@ PRIVATE_INTEGRATION_TEST_SOURCES = {
 
 
 def load_plan() -> dict:
-    return json.loads(PLAN_PATH.read_text())
+    plan = json.loads(PLAN_PATH.read_text())
+    plan["qualification"] = realtime_qualification.load_manifest()
+    return plan
+
+
+def qualification_names(plan: dict) -> list[str]:
+    return [entry["name"] for entry in plan.get("qualification", [])]
 
 
 def workspace_packages() -> list[dict]:
@@ -393,8 +401,11 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         # every test in the heavy target that is not claimed by a heavy-N
         # shard. --exact makes the skips exact-match: libtest skips by
         # substring by default, which would also swallow a future test whose
-        # name merely starts with a fleet test's name.
-        skips = [arg for name in named for arg in ("--skip", name)]
+        # name merely starts with a fleet or qualification test's name.
+        skips = [
+            arg for name in [*named, *qualification_names(plan)]
+            for arg in ("--skip", name)
+        ]
         # The raw-adapter qualification module is now crate-private, so it
         # runs inside this ordinary --lib process. Exclude each timing
         # contract here and run it below in its own --lib process; otherwise
@@ -522,7 +533,21 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     dropping (say) the doctest command cannot pass unnoticed.
     """
     verify_lib_plan(plan)
+    if plan["heavy"]["target"] != realtime_qualification.TARGET:
+        sys.exit("real-time qualification manifest target differs from the heavy target")
+    named = [name for group in plan["heavy"]["shards"] for name in group]
+    qualification = qualification_names(plan)
+    if len(set(qualification)) != len(qualification) or set(qualification) & set(named):
+        sys.exit("qualification names are duplicated or also assigned to a required shard")
     misc_commands = commands(plan, "misc", targets)
+    heavy_remainder = SELECTION + [
+        "--test", plan["heavy"]["target"], "--", *HARNESS, "--exact",
+        *[arg for name in [*named, *qualification] for arg in ("--skip", name)],
+    ]
+    if misc_commands[-1] != heavy_remainder:
+        sys.exit("required heavy remainder must exclude exactly the declared test names")
+    if realtime_qualification.SELECTION != SELECTION + ["--test", plan["heavy"]["target"]]:
+        sys.exit("qualification must preserve required CI's package and feature selection")
     misc = [" ".join(command) for command in misc_commands]
     required = {
         "unit tests": " --lib ",
@@ -706,7 +731,7 @@ def verify(plan: dict, targets: list[str]) -> None:
         print(f"  {shard}: {len(buckets[shard]):3d} targets, ~{total:.0f}s")
 
 
-def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
+def list_heavy_tests(plan: dict, extra: list[str]) -> list[str]:
     """Ask the built heavy binary which tests a given filter selects."""
     command = (
         SELECTION
@@ -716,11 +741,11 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
     out = subprocess.run(
         command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
     ).stdout
-    return {
+    return [
         line.rsplit(":", 1)[0]
         for line in out.splitlines()
         if line.endswith(": test")
-    }
+    ]
 
 
 def list_quiescent_test(target: str, name: str) -> list[str]:
@@ -745,7 +770,6 @@ def list_quiescent_test(target: str, name: str) -> list[str]:
 
 def list_quiescent_lib_test(name: str) -> list[str]:
     """Resolve one private-lib contract with its exact CI invocation."""
-    qualified = qualified_quiescent_lib_test(name)
     command = quiescent_lib_list_command(name)
     out = subprocess.run(
         command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
@@ -771,6 +795,10 @@ def precheck(plan: dict, shard: str) -> None:
     # burn seven runners before the gates job reported it.
     targets = integration_targets()
     verify(plan, targets)
+    if shard == "misc":
+        # Run before the suite: a stale exclusion must fail even if another
+        # required test would stop the shard before its final partition audit.
+        verify_heavy(plan)
     groups = [group for group in plan.get("lib_groups", []) if group["shard"] == shard]
     if groups:
         # Resolve all groups in one Cargo invocation. Keep a multiset: a
@@ -828,8 +856,8 @@ def precheck(plan: dict, shard: str) -> None:
         return
     group = plan["heavy"]["shards"][int(shard.split("-", 1)[1])]
     selected = list_heavy_tests(plan, ["--exact", *group])
-    if selected != set(group):
-        missing = sorted(set(group) - selected)
+    if Counter(selected) != Counter(group):
+        missing = sorted(set(group) - set(selected))
         sys.exit(
             f"{shard} names tests that no longer exist: {missing}. They were "
             f"renamed or removed; update ci/test-shards.json."
@@ -840,21 +868,36 @@ def precheck(plan: dict, shard: str) -> None:
 def verify_heavy(plan: dict) -> None:
     """Prove the heavy target's own tests partition exactly.
 
-    Runs on the shard that already built the binary, so this costs three
-    ``--list`` invocations and nothing else.
+    Required shards and the separate qualification job are disjoint and
+    together cover every test, including future tests outside the manifest.
     """
     groups = plan["heavy"]["shards"]
     named = [name for group in groups for name in group]
     # Mirrors the real misc invocation exactly, --exact included: verifying a
     # different filter than the one that runs would prove nothing.
-    skips = ["--exact"] + [arg for name in named for arg in ("--skip", name)]
+    qualification = qualification_names(plan)
+    skips = ["--exact"] + [
+        arg for name in [*named, *qualification] for arg in ("--skip", name)
+    ]
 
-    everything = list_heavy_tests(plan, [])
-    remainder = list_heavy_tests(plan, skips)
+    inventory = list_heavy_tests(plan, [])
+    if len(inventory) != len(set(inventory)):
+        sys.exit("heavy target contains ambiguous test names")
+    everything = set(inventory)
+    remainder = set(list_heavy_tests(plan, skips))
+    qualified = set()
+    if qualification:
+        selected = list_heavy_tests(plan, ["--exact", *qualification])
+        if Counter(selected) != Counter(qualification):
+            sys.exit("qualification manifest contains stale or ambiguous test names")
+        if list_heavy_tests(plan, ["--ignored", "--exact", *qualification]):
+            sys.exit("qualification manifest contains ignored tests; retain executable coverage")
+        qualified = set(selected)
     claimed: set[str] = set()
     for index, group in enumerate(groups):
-        selected = list_heavy_tests(plan, ["--exact", *group])
-        if selected != set(group):
+        listed = list_heavy_tests(plan, ["--exact", *group])
+        selected = set(listed)
+        if Counter(listed) != Counter(group):
             sys.exit(
                 f"heavy-{index} selects {sorted(selected)} but the plan names "
                 f"{sorted(group)}; a test was renamed or removed"
@@ -863,15 +906,18 @@ def verify_heavy(plan: dict) -> None:
             sys.exit(f"heavy-{index} overlaps an earlier shard")
         claimed |= selected
 
+    if qualified & (remainder | claimed):
+        sys.exit("qualification tests also run in a required shard")
     if remainder & claimed:
         sys.exit(f"'misc' also runs {sorted(remainder & claimed)}")
-    if remainder | claimed != everything:
-        lost = everything - (remainder | claimed)
+    if remainder | claimed | qualified != everything:
+        lost = everything - (remainder | claimed | qualified)
         sys.exit(f"tests in the heavy target run on no shard: {sorted(lost)}")
 
     print(
         f"heavy partition ok: {len(everything)} tests = {len(remainder)} on "
-        f"'misc' + {len(claimed)} across {len(groups)} heavy shards"
+        f"'misc' + {len(claimed)} across {len(groups)} heavy shards "
+        f"+ {len(qualified)} real-time qualification tests"
     )
 
 

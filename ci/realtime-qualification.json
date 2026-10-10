@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "package": "opc-session-testkit",
+  "target": "qualification_mtls_multiprocess",
+  "baseline_evidence": "https://github.com/openpacketcore/openpacketcore-sdk/issues/1207 records unchanged main 3bd4459f8 under CPU and disk contention: the Durable batch detector (#923) failed 6/10 and the all-voters-cold detector (#1207) failed 4/10. These are the real-I/O members of that family, not separate measured failure rates for every listed test.",
+  "tests": [
+    {
+      "name": "isolated_scale::isolated_async_voters_preserve_public_receipts_and_joined_shutdown",
+      "issue": 923,
+      "reason": "Real voter process startup, joined shutdown and disk reopen share fixed readiness deadlines; public replay and new operations have 800 ms elapsed bounds."
+    },
+    {
+      "name": "isolated_scale::isolated_durable_voters_preserve_public_receipts_and_joined_shutdown",
+      "issue": 923,
+      "reason": "Real voter process startup, joined shutdown and disk reopen share fixed readiness deadlines; public replay and new operations have 800 ms elapsed bounds."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::isolated_async_all_voters_killed_recover_with_new_usable_authority",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::isolated_async_two_voters_killed_recover_without_restarting_survivor",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::protected_async_all_cold_loses_acknowledged_q1_but_retires_durable_effects",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::protected_async_all_cold_return_recovers_successor_authority",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::protected_async_majority_return_recovers_successor_authority",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::protected_durable_all_cold_return_recovers_successor_authority",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::majority_recovery::protected_durable_majority_return_recovers_successor_authority",
+      "issue": 1207,
+      "reason": "Abrupt real voter-process loss and retained-disk recovery must complete Initialize and authority/readback operations under fixed host-clock deadlines."
+    },
+    {
+      "name": "isolated_scale::original::original_delayed_durable_reply_remains_failed_after_exact_receipt_observation",
+      "issue": 923,
+      "reason": "The delayed-reply diagnostic control uses the same real voter startup and 800 ms wire path before observing the deliberately failed batch."
+    },
+    {
+      "name": "isolated_scale::original::original_encrypted_async_batches_preserve_receipts_and_scope",
+      "issue": 923,
+      "reason": "Authenticated multi-process batches and exact receipt reads use the original 800 ms wall-clock budget around native storage and transport."
+    },
+    {
+      "name": "isolated_scale::original::original_encrypted_durable_batches_preserve_receipts_and_scope",
+      "issue": 923,
+      "reason": "Authenticated multi-process batches and exact receipt reads use the original 800 ms wall-clock budget around native storage and transport."
+    },
+    {
+      "name": "isolated_scale::original::original_mixed_batch_failure_retains_typed_rejection_and_exact_successes",
+      "issue": 923,
+      "reason": "Authenticated multi-process batches and exact receipt reads use the original 800 ms wall-clock budget around native storage and transport."
+    }
+  ]
+}
