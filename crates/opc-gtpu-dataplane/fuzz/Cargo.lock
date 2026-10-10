@@ -1240,11 +1240,13 @@ dependencies = [
  "aya",
  "aya-obj",
  "bytes",
+ "futures-util",
  "hmac",
  "nix",
  "opc-dataplane-observation",
  "opc-gtpu-ebpf-common",
  "opc-linux-gtpu-sys",
+ "opc-local-kernel-lifecycle",
  "opc-proto-gtpu",
  "opc-proto-tft",
  "opc-protocol",
@@ -1322,6 +1324,28 @@ name = "opc-linux-gtpu-sys"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "linux-raw-sys",
+]
+
+[[package]]
+name = "opc-linux-route-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "opc-local-kernel-lifecycle"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "opc-linux-gtpu-sys",
+ "opc-route-steering",
+ "opc-session-store",
+ "rand 0.10.2",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -1371,6 +1395,16 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "zeroize",
+]
+
+[[package]]
+name = "opc-route-steering"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "opc-linux-route-sys",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

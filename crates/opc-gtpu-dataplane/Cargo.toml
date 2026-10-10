@@ -20,6 +20,7 @@ lab-memory = ["opc-session-store/lab-memory"]
 [dependencies]
 bytes = { workspace = true }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
+opc-local-kernel-lifecycle = { path = "../opc-local-kernel-lifecycle", version = "0.2.0", features = ["store"] }
 opc-dataplane-observation = { path = "../opc-dataplane-observation", version = "0.2.0" }
 opc-gtpu-ebpf-common = { path = "../opc-gtpu-ebpf-common", version = "0.2.0" }
 opc-proto-gtpu = { path = "../opc-proto-gtpu", version = "0.2.0" }
@@ -28,6 +29,7 @@ opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 async-trait = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 aes-gcm-siv = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
@@ -46,6 +48,10 @@ rustix = { version = "1", features = ["fs", "process", "system", "thread", "time
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
+opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+tempfile = "3"
+opc-route-steering = { path = "../opc-route-steering", version = "0.2.0" }
 allocation-counter = { workspace = true }
 serde_json = { workspace = true }
 # SDK-owned encrypted mTLS/fixed-voter regression fixture with passive storage
@@ -57,7 +63,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # setns() for the privileged multi-netns integration test.
 nix = { workspace = true, features = ["net", "sched", "socket", "uio"] }
-opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0" }
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["scope-store"] }
 
 [lints]
 workspace = true

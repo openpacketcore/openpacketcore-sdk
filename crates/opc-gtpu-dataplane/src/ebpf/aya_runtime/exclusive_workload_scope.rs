@@ -864,24 +864,7 @@ impl ExclusiveCleanup {
             .filter(|map| !sdk_only || map.sdk)
             .map(|map| map.id)
             .collect::<HashSet<_>>();
-        let mut references = HashSet::new();
-        if maps.is_empty() {
-            return Ok(references);
-        }
-        for info in scan_programs()? {
-            let referenced = match info.map_ids() {
-                Ok(Some(ids)) => ids,
-                // A program can retire between the global ID scan and its
-                // metadata read. ENOENT proves that reference has gone.
-                Err(error) if program_disappeared(&error) => continue,
-                Err(error) => return Err(program_error(PROGRAM_SCAN, &error)),
-                Ok(None) => return Err(state_indeterminate(PROGRAM_SCAN)),
-            };
-            if referenced.iter().any(|id| maps.contains(id)) {
-                references.insert(info.id());
-            }
-        }
-        Ok(references)
+        map_references(&maps)
     }
 
     fn require_unreferenced(&self) -> Result<(), GtpuError> {
@@ -941,12 +924,31 @@ fn interface_index(name: &str) -> Result<Option<u32>, GtpuError> {
 }
 
 fn program_disappeared(error: &ProgramError) -> bool {
-    matches!(error, ProgramError::SyscallError(error) if error.io_error.kind() == io::ErrorKind::NotFound)
+    program_id_disappeared_during_scan(error)
+}
+
+pub(super) fn map_references(maps: &HashSet<u32>) -> Result<HashSet<u32>, GtpuError> {
+    let mut references = HashSet::new();
+    if maps.is_empty() {
+        return Ok(references);
+    }
+    for info in scan_programs()? {
+        let referenced = match program_map_ids_during_scan(&info) {
+            Ok(Some(ids)) => ids,
+            Err(error) if program_disappeared(&error) => continue,
+            Err(error) => return Err(program_error(PROGRAM_SCAN, &error)),
+            Ok(None) => return Err(state_indeterminate(PROGRAM_SCAN)),
+        };
+        if referenced.iter().any(|id| maps.contains(id)) {
+            references.insert(info.id());
+        }
+    }
+    Ok(references)
 }
 
 fn scan_programs() -> Result<Vec<ProgramInfo>, GtpuError> {
     let mut programs = Vec::new();
-    for info in loaded_programs() {
+    for info in programs_during_scan() {
         match info {
             Ok(info) => programs.push(info),
             Err(error) if program_disappeared(&error) => {}

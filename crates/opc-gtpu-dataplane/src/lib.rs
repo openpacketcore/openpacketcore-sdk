@@ -72,6 +72,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../opc-local-kernel-lifecycle/tests/support/quorum.rs"]
+mod local_scope_quorum;
+
 pub mod backend;
 pub mod control_port;
 pub mod ebpf;
@@ -99,10 +103,11 @@ pub use ebpf::{
     historical_ebpf_recovery_compatibility_kat, probe_committed_classifier_load,
     ClassifierLoadBlocker, ClassifierLoadCapability, EbpfGtpuDatapathCounters,
     EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig,
-    EbpfManagedDeviceIdentity, EbpfManagedDeviceInventory, EbpfManagedDeviceInventoryCompleteness,
-    EbpfStrictWorkloadResetReport, EbpfWorkloadScope, ATTACHMENT_BELOW_STACKED_DEVICE,
-    ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE, ATTACHMENT_ON_ENSLAVED_INTERFACE,
-    DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY, MAX_EBPF_MANAGED_DEVICE_IDENTITIES,
+    EbpfLocalGraph, EbpfManagedDeviceIdentity, EbpfManagedDeviceInventory,
+    EbpfManagedDeviceInventoryCompleteness, EbpfStrictWorkloadResetReport, EbpfWorkloadScope,
+    ScopedGtpuReceipt, ATTACHMENT_BELOW_STACKED_DEVICE, ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE,
+    ATTACHMENT_ON_ENSLAVED_INTERFACE, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
+    MAX_EBPF_MANAGED_DEVICE_IDENTITIES,
 };
 pub use error::{GtpuError, ProgramLoadRefusal};
 pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};

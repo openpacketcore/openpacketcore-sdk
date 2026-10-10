@@ -84,6 +84,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check XFRM dependency contract
+        run: python3 ci/check-xfrm-dependency-contract.py
+
       - name: Check diff whitespace
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -163,6 +166,9 @@ jobs:
           python3 ci/test-qualify-tft-nohz-vm.py
           bash -n ci/qualify-tft-nohz-vm.sh
 
+      - name: Test local lifecycle guest qualification evidence
+        run: python3 ci/test-qualify-local-kernel-lifecycle.py
+
       - name: Test live voter memory evidence validators
         run: python3 scripts/test-observe-session-store-live-memory.py
 
@@ -232,7 +238,9 @@ jobs:
           shared-key: opc-rust-clippy
 
       - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --locked -p opc-ipsec-xfrm --lib --no-default-features -- -D warnings
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Compile-check non-Linux targets (default features)
         run: |

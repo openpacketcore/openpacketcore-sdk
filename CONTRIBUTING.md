@@ -70,6 +70,8 @@ the mutable databases or WALs out of `TMPDIR`.
 ```bash
 cargo fmt --all --check
 git diff --check
+python3 ci/check-xfrm-dependency-contract.py
+cargo clippy --locked -p opc-ipsec-xfrm --lib --no-default-features -- -D warnings
 cargo clippy --locked -p opc-persist --all-targets --no-default-features -- -D warnings
 cargo test --locked -p opc-persist --no-run
 cargo test --locked -p opc-persist \
@@ -152,6 +154,35 @@ for target in x86_64-unknown-freebsd aarch64-apple-darwin; do
   cargo clippy --locked -p opc-runtime --lib --target "$target" -- -D warnings
 done
 ```
+
+### Exact local kernel lifecycle qualification
+
+The host job in [gtpu-privileged.yml](.github/workflows/gtpu-privileged.yml)
+runs the required cases in `ci/local-kernel-lifecycle-cases.json`. Run that same
+manifest locally with the worktree's existing Cargo cache:
+
+```bash
+python3 ci/qualify-local-kernel-lifecycle.py \
+  --evidence-dir target/lifecycle-evidence/run-01
+```
+
+This needs Linux BPF/XFRM support, iproute2, Python 3, `libseccomp.so.2`, `unshare`, `timeout`,
+and root or noninteractive sudo. Every case gets a fresh network namespace
+and private bpffs mount. BPF program/map ID enumeration and reopen terminate
+the case. Lifecycle readback must use exact tc entries and already-held load
+or private-pin descriptors, without node-global ID inspection privileges.
+Missing tests, skips, unsupported capabilities,
+timeouts and changed source/binaries fail qualification. The evidence records
+the compiler, source digest, emitted binaries, kernel and exact case results;
+use a new evidence directory on a repeat run, while reusing the build cache.
+`--toolchain` chooses an installed Rust toolchain. Repeated `--case` arguments
+select exact cases for development and explicitly produce a partial result.
+
+This is a functional lifecycle gate on the actual host kernel. The pinned
+Rocky 9.4 enterprise lane also runs the complete lifecycle manifest from a
+verified static bundle on its `5.14.0-427.x.el9_4` kernel. The separate pinned
+Linux 6.8 guest still needs a lifecycle manifest run before its existing
+datapath qualification can be extended to this API.
 
 ### CNF performance qualification
 
