@@ -4,6 +4,15 @@ use crate::CommitRecord;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
+/// Preserve the reserved enum index without enabling its unqualified reader.
+pub(in crate::consensus) fn reject_reserved_commit<'de, D: serde::Deserializer<'de>>(
+    _deserializer: D,
+) -> Result<Box<super::PreparedConfigCommit>, D::Error> {
+    Err(serde::de::Error::custom(
+        "unknown variant `BoundedAppend` in the active configuration profile",
+    ))
+}
+
 struct Bytes<'a>(&'a [u8]);
 impl Serialize for Bytes<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

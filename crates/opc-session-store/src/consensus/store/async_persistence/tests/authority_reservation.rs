@@ -54,7 +54,7 @@ async fn async_authority_promise_is_durable_idempotent_and_monotonic() {
     .catch_unwind()
     .await;
     for index in 0..3 {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
@@ -88,7 +88,7 @@ async fn async_authority_interrupted_promise_never_grants_old_owner_new_range() 
             fleet.form().await;
             fleet.close(0).await;
             fleet.open_with_io_hook(0, hook).await.unwrap();
-            fleet.store(0).drain_async_persistence().await.unwrap();
+            clock::drain(fleet.store(0)).await.unwrap();
             let before = Reservation::initial();
             let after = Reservation::recovery(2, [0xD3; 32]).unwrap();
             armed.store(true, Ordering::Release);
@@ -123,7 +123,7 @@ async fn async_authority_interrupted_promise_never_grants_old_owner_new_range() 
         .catch_unwind()
         .await;
         for index in 0..3 {
-            let _ = fleet.close_result(index).await;
+            let _ = fleet.close_and_join_result(index).await;
         }
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
@@ -174,7 +174,7 @@ async fn async_authority_reservation_is_unchanged_by_ordinary_acknowledgements()
         for (index, before) in retained.iter().enumerate() {
             assert_recorded(fleet.store(index), &request, &outcome).await;
             assert_eq!(&std::fs::read(authority(&fleet, index)).unwrap(), before);
-            fleet.store(index).drain_async_persistence().await.unwrap();
+            clock::drain(fleet.store(index)).await.unwrap();
             assert_eq!(&std::fs::read(authority(&fleet, index)).unwrap(), before);
         }
         assert_eq!(publications.load(Ordering::Relaxed), 9);
@@ -182,7 +182,7 @@ async fn async_authority_reservation_is_unchanged_by_ordinary_acknowledgements()
     .catch_unwind()
     .await;
     for index in 0..3 {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
@@ -229,7 +229,7 @@ async fn async_authority_missing_corrupt_or_foreign_record_cannot_consume_close_
     .catch_unwind()
     .await;
     for index in 0..3 {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

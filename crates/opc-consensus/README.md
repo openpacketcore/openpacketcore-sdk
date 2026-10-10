@@ -22,6 +22,64 @@ through `opc_consensus::engine`, allowing every production consensus consumer
 to share one exact engine version while keeping Openraft details out of
 domain-facing wire and storage APIs.
 
+## Voter slot formats and admission
+
+`voter_slots` provides the shared data formats for [RFC 023](../../docs/rfc/023-voter-slot-incarnations.md).
+`SlotId` and `VoterIncarnation` validate their bounds before mapping to the
+injective engine ID `((incarnation - 1) << 16) | slot`. A fixed installation uses
+`ConsensusClusterId::for_installation` with a fresh enrollment nonce. The dynamic
+profile's existing node-ID derivation is unchanged.
+
+`encode_voter_slot_table` and `decode_voter_slot_table` use exact `OPVI`, version
+1 framing with fixed-width big-endian integers. Slot/member counts use `u8`;
+variable byte/string lengths use `u16`; options have only the tags `0` and `1`.
+Slots and configuration members are strictly ordered by slot ordinal. The table
+is capped at 64 KiB and nine slots; loss attestations at 8 KiB, each workload
+identity at 2,048 bytes, and each snapshot ID at 256 bytes. Unknown table formats
+return `VoterSlotError::FreshInstallationRequired`; crossing a stored-format
+boundary requires a fresh install, with no migration or compatibility reader.
+Unrecognized magic bytes instead return `InvalidRecord`.
+
+Records retain permanent retirement floors, public incarnation bindings, one
+active replacement, exact predecessor/successor configurations, full engine log
+IDs, the initial installed snapshot ID/digest/cut, and one terminal receipt per
+slot. Log IDs contain only term and index under the pinned engine's
+`single-term-leader` profile. `validate_successor_of` rejects snapshot regressions against retained local
+metadata, including changes to an existing incarnation key, accepted operation
+or terminal receipt, and loss of phase evidence. Before Fence, a new leader may
+advance the catch-up marker; after Fence it stays fixed. Fence cannot disappear
+into a supersession.
+
+The Durable profile adds deterministic `VoterSlotControl` transitions and a
+`VoterSlotDurableState` whose provisional intent names its exact retained Prepare
+entry. Both store adapters publish those records atomically with log/apply and
+snapshot state. `VoterAdmission` drains old peer calls, installs the serialized
+engine response fence and restores required fences before startup admission.
+Owned calls survive observer cancellation; obsolete lock entries and fence
+receipts are released after the engine drops the retired identity. Durable
+retirement floors continue rejecting every older incarnation.
+
+A decoded loss attestation remains untrusted data. `VoterChallengeIssuer` and
+`VoterReplacementVerifier` check fresh channel-bound P-256 possession, canonical
+low-S signatures, current controller permission and trusted time. The receiving
+voter's trusted adapter challenges the candidate and consumes its opaque proof
+in the same process. `VoterTransport` requires exact incarnation bindings in
+both directions and records proved key traffic before later admission refusal.
+Only the coordinator decides `TargetStillLive`; no timeout starts a replacement.
+
+These APIs support the unadvertised store integration. Lost-canonical bootstrap,
+activation continuity and adversarial process qualification remain later RFC
+slices. Management framing and TLS adapters consume these helpers separately.
+No store or persistence mode advertises replacement capability from these types.
+
+Controllers and admission adapters share `lost_voter_attestation_signing_input`
+and `voter_replacement_request_digest` for the RFC's exact signing bytes and
+body digest. Fixed vectors pin both. Neither helper authenticates its input or
+verifies a signature. Controller enrollment requires an ECDSA P-256 SVID.
+Async support will require a new record version and a fresh install.
+
+## Shared timing and admission
+
 `DURABLE_CONSENSUS_TIMING_PROFILE` is the sole timing authority for both
 durable domains: AppendEntries/Openraft read-index and heartbeat 2,000 ms,
 Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
@@ -90,7 +148,7 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5` (0.9.25 plus fork fixes). It retains the
+`0be191c797fd8fab603474864ac8ba8211206dc2` (0.9.25 plus fork fixes). It retains the
 per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core

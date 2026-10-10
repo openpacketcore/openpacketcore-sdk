@@ -37,7 +37,7 @@ fn install_proof(path: &std::path::Path, bytes: &[u8]) {
 
 async fn finish(fleet: &mut Fleet, result: Result<(), Box<dyn std::any::Any + Send>>) {
     for index in 0..fleet.stores.len() {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

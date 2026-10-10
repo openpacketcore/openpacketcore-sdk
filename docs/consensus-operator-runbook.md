@@ -40,7 +40,7 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5` with the complete release-0.9 history
+`0be191c797fd8fab603474864ac8ba8211206dc2` with the complete release-0.9 history
 through v0.9.25, bounded apply pages and joined replication retirement. Confirm the lock resolves only
 `openraft` and `openraft-macros` 0.9.25 from that full revision. Do not substitute
 a registry package, a branch, a tag, or a downstream partial patch.

@@ -382,6 +382,7 @@ impl InnerIntent {
 }
 #[derive(Deserialize)]
 enum Intent {
+    VoterSlotControl(Request),
     AdvanceLogicalTime,
     MaintainFencedTransitionV2History(Request),
     // Only this internal command includes a complete bounded owner inventory
@@ -410,6 +411,7 @@ enum Intent {
 impl Intent {
     fn shape(self) -> Shape {
         match self {
+            Self::VoterSlotControl(value) => value.0,
             Self::AdvanceLogicalTime => Shape::default(),
             Self::MaintainFencedTransitionV2History(value) => value.0,
             Self::AsyncRecoveryBoundary(value) => value.0,
@@ -435,22 +437,29 @@ impl Intent {
     }
 }
 
-// Membership sets/maps allocate only their distinct keys in the actual model.
-// Preserve legacy duplicate-key and ignored-field behavior; bound five distinct
-// voters in stack storage, rather than restricting raw duplicate occurrences.
-#[derive(Default)]
-pub(in crate::consensus::native::generation) struct Members {
-    ids: [u64; 5],
+// Allocation bounds remain independent of semantic authority. Legacy decoders
+// retain five nodes and one group; the explicit slot profile permits ten nodes
+// (nine voters plus one learner) and the engine's two joint configurations.
+pub(in crate::consensus::native::generation) struct Members<const N: usize = 5> {
+    ids: [u64; N],
     length: usize,
 }
-impl Members {
+impl<const N: usize> Default for Members<N> {
+    fn default() -> Self {
+        Self {
+            ids: [0; N],
+            length: 0,
+        }
+    }
+}
+impl<const N: usize> Members<N> {
     fn insert<E: de::Error>(&mut self, id: u64) -> Result<(), E> {
         if self.ids[..self.length].contains(&id) {
             return Ok(());
         }
-        if self.length == self.ids.len() {
+        if self.length == N {
             return Err(E::custom(
-                "native fixed membership exceeds its distinct-node bound",
+                "native membership exceeds its distinct-node bound",
             ));
         }
         self.ids[self.length] = id;
@@ -458,15 +467,18 @@ impl Members {
         Ok(())
     }
 }
-impl<'de> Deserialize<'de> for Members {
+impl<'de, const N: usize> Deserialize<'de> for Members<N> {
     fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        struct Nodes;
-        impl<'de> Visitor<'de> for Nodes {
-            type Value = Members;
+        struct Visitor<const N: usize>;
+        impl<'de, const N: usize> de::Visitor<'de> for Visitor<N> {
+            type Value = Members<N>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a fixed membership set")
+                f.write_str("a bounded membership set")
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Members, A::Error> {
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut members = Members::default();
                 while let Some(id) = sequence.next_element::<u64>()? {
                     members.insert(id)?;
@@ -474,43 +486,49 @@ impl<'de> Deserialize<'de> for Members {
                 Ok(members)
             }
         }
-        decoder.deserialize_seq(Nodes)
+        decoder.deserialize_seq(Visitor::<N>)
     }
 }
-struct Configs;
-impl<'de> Deserialize<'de> for Configs {
+struct Configs<const N: usize, const C: usize>;
+impl<'de, const N: usize, const C: usize> Deserialize<'de> for Configs<N, C> {
     fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        struct Groups;
-        impl<'de> Visitor<'de> for Groups {
-            type Value = Configs;
+        struct Visitor<const N: usize, const C: usize>;
+        impl<'de, const N: usize, const C: usize> de::Visitor<'de> for Visitor<N, C> {
+            type Value = Configs<N, C>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("one fixed membership group")
+                f.write_str("bounded membership groups")
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Configs, A::Error> {
-                if sequence.next_element::<Members>()?.is_some()
-                    && sequence.next_element::<IgnoredAny>()?.is_some()
-                {
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                for _ in 0..C {
+                    if sequence.next_element::<Members<N>>()?.is_none() {
+                        return Ok(Configs);
+                    }
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
-                        "native fixed membership has joint groups",
+                        "native membership group count exceeds profile",
                     ));
                 }
                 Ok(Configs)
             }
         }
-        decoder.deserialize_seq(Groups)
+        decoder.deserialize_seq(Visitor::<N, C>)
     }
 }
-struct Nodes;
-impl<'de> Deserialize<'de> for Nodes {
+struct Nodes<const N: usize>;
+impl<'de, const N: usize> Deserialize<'de> for Nodes<N> {
     fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        struct Keys;
-        impl<'de> Visitor<'de> for Keys {
-            type Value = Nodes;
+        struct Visitor<const N: usize>;
+        impl<'de, const N: usize> de::Visitor<'de> for Visitor<N> {
+            type Value = Nodes<N>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("fixed membership nodes")
+                f.write_str("bounded membership nodes")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Nodes, A::Error> {
-                let mut members = Members::default();
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut members = Members::<N>::default();
                 while let Some(id) = map.next_key::<u64>()? {
                     members.insert(id)?;
                     map.next_value::<IgnoredAny>()?;
@@ -518,29 +536,32 @@ impl<'de> Deserialize<'de> for Nodes {
                 Ok(Nodes)
             }
         }
-        decoder.deserialize_map(Keys)
+        decoder.deserialize_map(Visitor::<N>)
     }
 }
 #[derive(Deserialize)]
-pub(in crate::consensus::native::generation) struct Membership {
+pub(in crate::consensus::native::generation) struct Membership<
+    const N: usize = 5,
+    const C: usize = 1,
+> {
     #[serde(rename = "configs")]
-    _configs: Configs,
+    _configs: Configs<N, C>,
     #[serde(rename = "nodes")]
-    _nodes: Nodes,
+    _nodes: Nodes<N>,
 }
 #[derive(Deserialize)]
 struct Command {
     intent: Intent,
 }
 #[derive(Deserialize)]
-enum Payload {
+enum Payload<const N: usize = 5, const C: usize = 1> {
     Blank,
-    Membership(Membership),
+    Membership(Membership<N, C>),
     Normal(Command),
 }
 #[derive(Deserialize)]
-struct Log {
-    payload: Payload,
+struct Log<const N: usize = 5, const C: usize = 1> {
+    payload: Payload<N, C>,
 }
 
 #[cfg(test)]
@@ -555,8 +576,17 @@ pub(super) fn log_preflight_bytes(length: usize) -> io::Result<usize> {
         .ok_or_else(|| invalid("native generation JSON preflight overflow"))
 }
 
+#[cfg(test)]
 pub(super) fn log_scratch_checked(
     bytes: &[u8],
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<usize> {
+    log_scratch_checked_profile(bytes, false, check)
+}
+
+pub(super) fn log_scratch_checked_profile(
+    bytes: &[u8],
+    slots: bool,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<usize> {
     check()?;
@@ -564,14 +594,15 @@ pub(super) fn log_scratch_checked(
     // serde_json's escaped-string scratch is the only growable preflight
     // buffer. Charge its old/new Vec growth before creating the parser.
     let _memory = scratch::LogMemory::reserve(log_preflight_bytes(bytes.len())?, check)?;
-    log_shape(bytes)
+    log_shape_profile(bytes, slots)
 }
 
 /// Optional admission of the same small preflight, before parsing any byte.
 /// Only memory refusal produces None; cancellation and malformed input keep
 /// their original errors. Large preflights retain the original gated lane.
-pub(super) fn log_scratch_small(
+pub(super) fn log_scratch_small_profile(
     bytes: &[u8],
+    slots: bool,
     reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<Option<usize>> {
@@ -583,7 +614,7 @@ pub(super) fn log_scratch_small(
     let Some(_memory) = scratch::LogMemory::reserve_small(charge, reserve) else {
         return Ok(None);
     };
-    log_shape(bytes).map(Some)
+    log_shape_profile(bytes, slots).map(Some)
 }
 
 fn log_size(bytes: &[u8]) -> io::Result<()> {
@@ -595,12 +626,20 @@ fn log_size(bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn log_shape(bytes: &[u8]) -> io::Result<usize> {
+fn log_shape_profile(bytes: &[u8], slots: bool) -> io::Result<usize> {
+    if slots {
+        log_shape::<10, 2>(bytes)
+    } else {
+        log_shape::<5, 1>(bytes)
+    }
+}
+
+fn log_shape<const N: usize, const C: usize>(bytes: &[u8]) -> io::Result<usize> {
     let shape = {
         // Both callers own the complete original preflight reservation.
         // IgnoredAny skips arbitrary legacy metadata without retaining it.
         let mut decoder = serde_json::Deserializer::from_slice(bytes);
-        let log = Log::deserialize(&mut decoder)
+        let log = Log::<N, C>::deserialize(&mut decoder)
             .map_err(|_| invalid("native generation raw log shape invalid"))?;
         decoder
             .end()

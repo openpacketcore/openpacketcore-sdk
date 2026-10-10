@@ -149,9 +149,16 @@ pub(super) fn from_pristine_basis(
     roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
 ) -> io::Result<NativeStorage> {
     validate_roster_root(conn, roster_root.as_deref())?;
+    let voter_seed = super::super::voter_slots::read_seed(conn)?;
+    if voter_seed.is_some() && binding.persistence != SessionPersistenceMode::Durable {
+        return Err(invalid_data(
+            "native voter-slot profile requires Durable persistence",
+        ));
+    }
     if !binding.native
         || authority.profile != ConsensusAuthorityProfile::FixedImmutable
-        || !matches!(authority.members.len(), 3 | 5)
+        || !(matches!(authority.members.len(), 3 | 5)
+            || (voter_seed.is_some() && authority.members.len() == 9))
         || authority.placement.is_none()
         || read_applied_sync(conn, binding.identity)?.is_some()
         || read_committed_sync(conn, binding.identity)?.is_some()
@@ -200,6 +207,15 @@ pub(super) fn from_pristine_basis(
         .map_err(db_error)?;
     if globals != 2 || revision != 0 {
         return Err(invalid_data("native pristine root counters differ"));
+    }
+    if let Some(seed) = voter_seed {
+        if seed.identity()? != binding.identity
+            || seed.members() != authority.members
+            || roster_root.is_some()
+        {
+            return Err(invalid_data("native voter-slot seed authority differs"));
+        }
+        return NativeStorage::empty_with_voter_slot_binding(seed.genesis, seed.initial);
     }
     NativeStorage::empty_with_roster_root_and_profile(
         binding.identity,
@@ -1672,6 +1688,21 @@ impl Wal {
         read(&native.business, exact)
     }
 
+    /// Validate the configured storage anchor before attaching the engine.
+    /// A voter-slot root recovers its committed membership through that
+    /// profile's validator. This does not grant legacy application authority.
+    pub(crate) fn admit_native_fixed_open(
+        &self,
+        expectation: FixedReadExpectation<'_>,
+    ) -> io::Result<()> {
+        let state = lock_state(&self.shared)?;
+        if self.native_fixed_exact_for(&state, &expectation, true)? {
+            Ok(())
+        } else {
+            Err(invalid_data("native configured authority differs"))
+        }
+    }
+
     /// A nonblocking attempt at the same live-owner authority check. An async
     /// caller can yield on contention without blocking its original deadline.
     pub(crate) fn native_fixed_try_read<T>(
@@ -1700,6 +1731,15 @@ impl Wal {
         state: &State,
         expectation: &FixedReadExpectation<'_>,
     ) -> io::Result<bool> {
+        self.native_fixed_exact_for(state, expectation, false)
+    }
+
+    fn native_fixed_exact_for(
+        &self,
+        state: &State,
+        expectation: &FixedReadExpectation<'_>,
+        allow_voter_slot_membership: bool,
+    ) -> io::Result<bool> {
         let FixedReadExpectation {
             identity,
             members,
@@ -1723,6 +1763,14 @@ impl Wal {
         }
         let scope = &state.authority.scope;
         let membership = native.business.membership();
+        let membership_matches = if allow_voter_slot_membership && native.has_voter_slots() {
+            native.validate_voter_slot_open()?;
+            true
+        } else {
+            (membership.log_id().is_some()
+                && super::super::fixed_uniform_membership_matches(membership.membership(), members))
+                || (pristine && membership.log_id().is_none())
+        };
         Ok(
             state.authority.profile == ConsensusAuthorityProfile::FixedImmutable
                 && self.binding.identity == identity
@@ -1740,12 +1788,7 @@ impl Wal {
                 && scope.terminal_history.is_empty()
                 && scope.pending.is_none()
                 && scope.terminal.is_none()
-                && ((membership.log_id().is_some()
-                    && super::super::fixed_uniform_membership_matches(
-                        membership.membership(),
-                        members,
-                    ))
-                    || (pristine && membership.log_id().is_none())),
+                && membership_matches,
         )
     }
 
@@ -1930,6 +1973,137 @@ impl Wal {
                 Some(&copies),
             );
         }
+    }
+
+    /// Read one strict durability cut. The admitted log can be ahead of the
+    /// writer: refusing that interval prevents an unflushed truncation from
+    /// clearing a provisional peer fence. No selected-row I/O runs here.
+    pub(crate) fn native_voter_slot_state(
+        &self,
+    ) -> io::Result<opc_consensus::voter_slots::VoterSlotDurableState> {
+        self.with_durable_voter_slots(|native| native.voter_slot_state())
+    }
+
+    pub(crate) fn native_voter_slots_before(
+        &self,
+        end: u64,
+    ) -> io::Result<(
+        Option<LogId<SessionConsensusNodeId>>,
+        opc_consensus::voter_slots::VoterSlotTable,
+    )> {
+        self.with_durable_voter_slots(|native| native.voter_slots_before(end))
+    }
+
+    pub(crate) fn assert_voter_snapshot_fences(
+        &self,
+        source: &crate::consensus::snapshot::PinnedSqliteFile,
+        meta: &opc_consensus::engine::SnapshotMeta<
+            SessionConsensusNodeId,
+            opc_consensus::engine::EmptyNode,
+        >,
+    ) -> io::Result<()> {
+        let has_profile = {
+            let state = lock_state(&self.shared)?;
+            ensure_native_public_owner(&state)?;
+            state
+                .native
+                .as_ref()
+                .ok_or_else(|| invalid_data("native snapshot owner missing"))?
+                .has_voter_slots()
+        };
+        if !has_profile {
+            return Ok(());
+        }
+        let runtime = self
+            .shared
+            .voter_admission
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| invalid_data("native snapshot lacks voter admission"))?;
+        source.verify_immutable_generation()?;
+        let conn = super::super::open_pinned_snapshot_database(source)?;
+        let incoming = super::super::voter_slots::read_state(&conn)?
+            .ok_or_else(|| invalid_data("native snapshot lacks voter profile"))?;
+        let members = meta
+            .last_membership
+            .nodes()
+            .map(|(node, _)| *node)
+            .collect();
+        if !runtime.snapshot_fences_acknowledged(incoming.table(), &members) {
+            return Err(invalid_data(
+                "native snapshot lacks acknowledged voter fences",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_voter_snapshot(
+        &self,
+    ) -> io::Result<Option<super::super::CurrentSnapshot>> {
+        self.with_durable_voter_slots(|native| Ok(native.business.current_snapshot()))
+    }
+
+    /// Backpressure a peer while strict publication is pending. A notification
+    /// only wakes the read: the complete durability predicate is checked again
+    /// under State before exposing any voter state or log projection.
+    pub(crate) async fn with_durable_voter_slots_until<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        read: impl Fn(&crate::consensus::native::NativeStorage) -> io::Result<T>,
+    ) -> io::Result<T> {
+        // Subscribe before reading so publication between the read and wait
+        // cannot be lost. Retaining self keeps the watch sender alive.
+        let mut published = self.shared.voter_publication.subscribe();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native voter-slot publication deadline",
+                ));
+            }
+            match self.with_durable_voter_slots(&read) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => return result,
+            }
+            tokio::select! {
+                _ = self.terminal_failure() => {
+                    return Err(io::Error::other("native voter-slot owner failed"));
+                }
+                changed = published.changed() => {
+                    changed.map_err(|_| io::Error::other("native voter-slot publisher closed"))?;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "native voter-slot publication deadline",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn with_durable_voter_slots<T>(
+        &self,
+        read: impl FnOnce(&crate::consensus::native::NativeStorage) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let state = lock_state(&self.shared)?;
+        ensure_native_public_owner(&state)?;
+        if self.binding.persistence != SessionPersistenceMode::Durable
+            || !state.durable_cuts.contains_key(&state.sequence)
+            || state.native_install_pending
+            || state.snapshot.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native voter-slot publication is not durable",
+            ));
+        }
+        read(
+            state
+                .native
+                .as_ref()
+                .ok_or_else(|| invalid_data("native voter-slot owner missing"))?,
+        )
     }
 
     pub(crate) fn with_native_read<T>(

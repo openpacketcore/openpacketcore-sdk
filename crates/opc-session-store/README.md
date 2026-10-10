@@ -286,6 +286,33 @@ integration requirement, not a transport qualification claim. Required forwardin
 class metadata advances consensus transport/wire revision to 6; revision 5 fails
 bootstrap. Upgrade all members with a fresh installation across that boundary.
 
+### Voter-slot incarnation profile
+
+The unadvertised [RFC 023](../../docs/rfc/023-voter-slot-incarnations.md) profile
+uses `ValidatedQuorumTopology::try_from_fixed_voter_slots` and
+`ConsensusSessionStore::open_with_voter_slots_and_integrity`. It supports
+explicit three-, five- and nine-slot Durable topologies on Linux. Logical slot
+assignments select the incarnation-based engine IDs; descriptor, placement and
+credential checks remain mandatory. `VoterPeerResolver` supplies authenticated
+incarnation routes. Legacy raw RPCs and unsupported activation families are
+refused. Async and legacy roots cannot be adopted into this profile.
+
+The native owner is the live authority for both the committed table and the
+provisional Prepare pointer. Durable log append, truncation, apply, native
+snapshot installation and selected-generation reopen preserve that ordering;
+SQL is only the cold/export projection. An incoming snapshot is verified and
+sealed before the engine fence and the same artifact is installed. The
+coordinator installs the first snapshot out of band, adds the learner, proves
+catch-up and then completes joint/uniform membership through Openraft. Startup
+reinstalls required response fences before RPCs or automatic voting. Read
+leases are disabled for this profile.
+
+The distinct native formats require a fresh installation. `replace_voter` and
+`voter_replacement_status` implement the controller control path; bootstrap and
+application activation continuity remain a later RFC slice. Those boundaries
+and adversarial process qualification must pass before replacement capability
+is advertised or applications depend on post-replacement readiness.
+
 ### Fixed durable-quorum consumer recipe
 
 For a fixed deployment, choose one `PlacementResiliencePolicy` and carry that
@@ -782,7 +809,9 @@ resolution contract.
 
 `drain_async_persistence().await` explicitly requests local persistence through
 the resident cut captured by that call, within the configured operation
-deadline. Later concurrent mutations need not be included. A timeout or caller
+deadline. Writer publication, failure, and exit wake the drain directly; no
+periodic timer tick is needed to observe a completed cut. Later concurrent
+mutations need not be included. A timeout or caller
 cancellation leaves the writer responsible for its accepted work; typed drain
 errors distinguish deadline, failure, unavailable owner, and wrong mode.
 `shutdown()` joins owned work and reports failed drain. Unlike a local drain,

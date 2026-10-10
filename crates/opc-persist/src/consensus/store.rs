@@ -3,6 +3,7 @@
 mod audit;
 mod audit_continuity;
 mod compatibility;
+pub(crate) mod voter_slots;
 
 #[cfg(test)]
 mod capacity_tests;
@@ -74,6 +75,9 @@ pub enum ConfigConsensusOpenError {
     /// Persisted identity or schema differs from this deployment.
     #[error("config consensus durable identity does not match configuration")]
     DurableIdentityMismatch,
+    /// The durable format is from another installation generation.
+    #[error("config consensus format requires a fresh installation")]
+    FreshInstallationRequired,
     /// Durable SQLite or snapshot storage could not be opened.
     #[error("config consensus durable storage is unavailable")]
     StorageUnavailable,
@@ -101,9 +105,9 @@ impl From<ConfigConsensusStorageError> for ConfigConsensusOpenError {
         match error {
             ConfigConsensusStorageError::RecoveryRequired => Self::RecoveryRequired,
             ConfigConsensusStorageError::IdentityMismatch
-            | ConfigConsensusStorageError::SchemaVersionMismatch
             | ConfigConsensusStorageError::CorruptState
             | ConfigConsensusStorageError::InvalidIdentity => Self::DurableIdentityMismatch,
+            ConfigConsensusStorageError::SchemaVersionMismatch => Self::FreshInstallationRequired,
             ConfigConsensusStorageError::BackendUnavailable => Self::StorageUnavailable,
         }
     }
@@ -309,6 +313,7 @@ struct ConsensusConfigStoreInner {
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
+    voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
 }
 
 /// SQLite config state coordinated by the SDK's shared Openraft engine.
@@ -334,6 +339,14 @@ impl ConsensusConfigStore {
     #[cfg(feature = "dangerous-test-hooks")]
     #[doc(hidden)]
     pub async fn trigger_election_for_test(&self) -> Result<(), PersistError> {
+        if self
+            .inner
+            .voter_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.admission.local_voting_admitted())
+        {
+            return Err(consensus_unavailable());
+        }
         self.inner
             .raft
             .trigger()
@@ -422,6 +435,7 @@ impl ConsensusConfigStore {
             operation_timeout,
             None,
             None,
+            None,
         )
         .await
     }
@@ -444,6 +458,7 @@ impl ConsensusConfigStore {
             DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
             Some(approval),
             None,
+            None,
         )
         .await
     }
@@ -458,6 +473,7 @@ impl ConsensusConfigStore {
         operation_timeout: Duration,
         recovery: Option<ApprovedLegacyConfigRecovery>,
         audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
+        voter_setup: Option<voter_slots::ConfigVoterSetup>,
     ) -> Result<Self, ConfigConsensusOpenError> {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
@@ -500,8 +516,19 @@ impl ConsensusConfigStore {
             operation_timeout,
         );
         let peers = compatibility.guarded_peers();
-        let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
-        let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
+        let (log_store, state_machine, durable_progress) = if let Some(setup) = &voter_setup {
+            if recovery.is_some() {
+                return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
+            }
+            storage::open_with_voter_slots(
+                &backend,
+                snapshot_dir,
+                identity,
+                members.clone(),
+                setup.initial.clone(),
+            )
+            .await?
+        } else if let Some(recovery) = recovery {
             storage::open_with_recovery(
                 &backend,
                 snapshot_dir,
@@ -521,9 +548,40 @@ impl ConsensusConfigStore {
         )
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
+        let voter_profile = if let Some(setup) = voter_setup {
+            Some(
+                voter_slots::ConfigVoterProfile::new(
+                    local_node_id,
+                    log_store.core.clone(),
+                    setup.resolver,
+                    compatibility.digest(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let peers = if let Some(profile) = &voter_profile {
+            expected_peers
+                .iter()
+                .map(|node| (*node, profile.transport.peer(*node)))
+                .collect()
+        } else {
+            peers
+        };
+        let mut network =
+            ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
+        network.voter_transport = voter_profile
+            .as_ref()
+            .map(|profile| profile.transport.clone());
+        let mut config = config_raft_config()?;
+        if voter_profile.is_some() {
+            config.enable_elect = false;
+            config.enable_heartbeat = false;
+        }
         let raft = ConfigRaft::new(
             local_node_id,
-            Arc::new(config_raft_config()?),
+            Arc::new(config),
             network,
             log_store,
             state_machine,
@@ -532,7 +590,21 @@ impl ConsensusConfigStore {
         .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
         let raft_handler = ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
-        Ok(Self {
+        if let Some(profile) = &voter_profile {
+            profile
+                .admission
+                .attach_engine(Arc::new(
+                    opc_consensus::voter_slots::RaftVoterResponseFence::new(
+                        raft.clone(),
+                        Arc::new(|| {}),
+                    ),
+                ))
+                .await
+                .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
+            // Config reads already require a fresh engine barrier; every call uses
+            // LinearizableReadLease::Disabled, so there is no cached lease to retain.
+        }
+        let store = Self {
             inner: Arc::new(ConsensusConfigStoreInner {
                 raft,
                 raft_handler,
@@ -552,8 +624,11 @@ impl ConsensusConfigStore {
                 )),
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
+                voter_profile,
             }),
-        })
+        };
+        voter_slots::start_coordinator(&store);
+        Ok(store)
     }
 
     /// Shared authenticated consensus-only handler.
@@ -589,10 +664,12 @@ impl ConsensusConfigStore {
             .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
             .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
         let canonical_bootstrap = self.inner.members.first().copied();
-        self.inner
-            .compatibility
-            .verify(deadline, !initialized)
-            .await?;
+        if self.inner.voter_profile.is_none() {
+            self.inner
+                .compatibility
+                .verify(deadline, !initialized)
+                .await?;
+        }
         if !initialized
             && canonical_bootstrap == Some(self.inner.local_node_id)
             && !self.inner.backend.retained_repair_only
@@ -1125,6 +1202,9 @@ impl ConsensusConfigStore {
     }
 
     fn exact_membership_is_admitted(&self) -> bool {
+        if let Some(profile) = &self.inner.voter_profile {
+            return profile.application_admitted(&self.inner.raft);
+        }
         if !self.inner.admitted.load(Ordering::Acquire) {
             return false;
         }
@@ -1471,9 +1551,16 @@ impl ConsensusConfigStore {
     {
         let peer = self
             .inner
-            .peers
-            .get(&target)
-            .filter(|peer| peer.node_id() == target)
+            .voter_profile
+            .as_ref()
+            .map(|profile| profile.transport.peer(target))
+            .or_else(|| {
+                self.inner
+                    .peers
+                    .get(&target)
+                    .filter(|peer| peer.node_id() == target)
+                    .cloned()
+            })
             .ok_or_else(consensus_unavailable)?;
         let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
         let wire = ConsensusWireRequest::try_new(
@@ -1764,6 +1851,9 @@ impl fmt::Debug for ConfigConsensusService {
 #[async_trait]
 impl ConsensusRpcHandler for ConfigConsensusService {
     fn compatibility(&self) -> Option<opc_consensus::ConsensusCompatibility> {
+        if self.store.inner.voter_profile.is_some() {
+            return None;
+        }
         Some(self.store.inner.compatibility.digest())
     }
 
@@ -1782,10 +1872,45 @@ impl ConsensusRpcHandler for ConfigConsensusService {
         request: ConsensusWireRequest,
         compatibility: Option<opc_consensus::ConsensusCompatibility>,
     ) -> ConsensusWireResponse {
+        if self.store.inner.voter_profile.is_some() {
+            return ConsensusWireResponse {
+                result: Err(ConsensusPeerError::ScopeMismatch),
+            };
+        }
+        self.handle_admitted(authenticated_sender, request, compatibility)
+            .await
+    }
+
+    async fn handle_with_incarnation(
+        &self,
+        proof: opc_consensus::voter_slots::VerifiedVoterRpc,
+        request: ConsensusWireRequest,
+    ) -> ConsensusWireResponse {
+        voter_slots::handle(self, proof, request).await
+    }
+}
+
+impl ConfigConsensusService {
+    async fn handle_admitted(
+        &self,
+        authenticated_sender: ConsensusNodeId,
+        request: ConsensusWireRequest,
+        compatibility: Option<opc_consensus::ConsensusCompatibility>,
+    ) -> ConsensusWireResponse {
         if request.validate().is_err()
             || request.identity != self.store.inner.identity
             || request.sender != authenticated_sender
-            || !self.store.inner.members.contains(&authenticated_sender)
+            || !self.store.inner.voter_profile.as_ref().map_or_else(
+                || self.store.inner.members.contains(&authenticated_sender),
+                |profile| {
+                    profile.admission.durable_view().is_ok_and(|state| {
+                        state.table().slots.iter().any(|slot| {
+                            slot.member.identity.node_id() == authenticated_sender
+                                && slot.phase == opc_consensus::voter_slots::VoterSlotPhase::Voting
+                        })
+                    })
+                },
+            )
         {
             return ConsensusWireResponse {
                 result: Err(ConsensusPeerError::ScopeMismatch),

@@ -42,9 +42,11 @@ pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 /// semantics so existing durable logs can be replayed after upgrade.
 pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 7;
 /// Current SQLite authority schema revision.
-pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 5;
+pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 6;
 /// Current config snapshot envelope revision.
-pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 5;
+pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 6;
+/// Purpose-separated slot controls; revision 8 remains reserved for capacity records.
+pub(crate) const VOTER_SLOT_CONFIG_COMMAND_VERSION: u16 = 9;
 /// Current config-specific RPC payload revision.
 ///
 /// Revision 7 carries the revision-7 command admission contract. Peers require
@@ -77,6 +79,40 @@ pub struct ConfigConsensusTopology {
 }
 
 impl ConfigConsensusTopology {
+    /// Validate the exact predecessor configuration and local selected incarnation.
+    /// Candidate nodes remain nonvoting until their joint membership applies.
+    pub fn for_voter_slots(
+        table: &opc_consensus::voter_slots::VoterSlotTable,
+        local_node_id: ConfigConsensusNodeId,
+    ) -> Result<Self, ConfigConsensusTopologyError> {
+        opc_consensus::voter_slots::encode_voter_slot_table(table)
+            .map_err(|_| ConfigConsensusTopologyError::InvalidMembers)?;
+        let configuration = table.current_configuration();
+        let members = configuration
+            .members
+            .iter()
+            .map(|member| member.identity.node_id())
+            .collect();
+        if !table
+            .slots
+            .iter()
+            .any(|slot| slot.member.identity.node_id() == local_node_id)
+            && !configuration
+                .members
+                .iter()
+                .any(|member| member.identity.node_id() == local_node_id)
+        {
+            return Err(ConfigConsensusTopologyError::InvalidMembers);
+        }
+        let identity = configuration
+            .identity(table.cluster_instance, table.manifest_digest)
+            .map_err(|_| ConfigConsensusTopologyError::InvalidMembers)?;
+        Ok(Self {
+            identity,
+            local_node_id,
+            members,
+        })
+    }
     /// Validate one fixed, bounded voter configuration.
     pub fn try_new(
         identity: ConfigConsensusIdentity,
@@ -354,15 +390,19 @@ pub(crate) enum ConfigMutationIntent {
     ManagementAudit(super::audit::AuditCommand),
     /// Exact configuration effect and recoverable audit outcome, applied atomically.
     AuditedMutation(super::PreparedAuditedMutation),
-    /// Reserved index 8. Legacy receivers must still report an unknown variant;
-    /// representation support alone does not enable profile admission.
-    #[serde(skip_deserializing)]
+    /// Reserved index 8. Retain its discriminant while rejecting decoding;
+    /// skipping a middle variant would renumber subsequent postcard variants.
     BoundedAppend {
-        #[serde(serialize_with = "record_encoding::serialize_commit")]
+        #[serde(
+            serialize_with = "record_encoding::serialize_commit",
+            deserialize_with = "record_encoding::reject_reserved_commit"
+        )]
         commit: Box<PreparedConfigCommit>,
         binding: super::capacity_record::CapacityRecordBinding,
         resolution: Option<ConfirmedCommitResolution>,
     },
+    /// Bounded incarnation control, admitted only by the slot replacement profile.
+    VoterSlotControl(Vec<u8>),
 }
 
 impl ConfigMutationIntent {
@@ -377,6 +417,7 @@ impl ConfigMutationIntent {
             Self::RetainHistory(_) => 4,
             Self::AuditedMutation(prepared) => prepared.effect.minimum_command_version(),
             Self::BoundedAppend { .. } => 8,
+            Self::VoterSlotControl(_) => VOTER_SLOT_CONFIG_COMMAND_VERSION,
             Self::ManagementAudit(command) => match command {
                 super::audit::AuditCommand::Initialize { .. }
                 | super::audit::AuditCommand::Intent(_)
@@ -400,7 +441,8 @@ impl ConfigMutationIntent {
             | Self::ClearRecoveryRequired { .. }
             | Self::RetainHistory(_)
             | Self::ManagementAudit(_)
-            | Self::AuditedMutation(_) => Ok(None),
+            | Self::AuditedMutation(_)
+            | Self::VoterSlotControl(_) => Ok(None),
         }
     }
 }
@@ -486,6 +528,9 @@ impl ConfigConsensusCommand {
             CONFIG_CONSENSUS_COMMAND_VERSION => {
                 self.intent.minimum_command_version() <= CONFIG_CONSENSUS_COMMAND_VERSION
             }
+            VOTER_SLOT_CONFIG_COMMAND_VERSION => {
+                matches!(self.intent, ConfigMutationIntent::VoterSlotControl(_))
+            }
             _ => false,
         };
         if !supported_revision || self.identity != identity {
@@ -494,6 +539,10 @@ impl ConfigConsensusCommand {
             ));
         }
         match &self.intent {
+            ConfigMutationIntent::VoterSlotControl(bytes) => {
+                opc_consensus::voter_slots::VoterSlotControl::decode(bytes)
+                    .map_err(|_| PersistError::corrupt_blob())?;
+            }
             ConfigMutationIntent::BoundedAppend { .. } => {
                 return Err(PersistError::inconsistent_state(
                     "config consensus command scope or revision mismatch",
@@ -607,6 +656,8 @@ pub(crate) enum ConfigMutationFailure {
     HistoryFull,
     /// Pending resolution or rollback references still protect the prefix.
     HistoryProtected,
+    /// Deterministic bounded slot-control refusal; retained by the slot table.
+    VoterReplacement(opc_consensus::voter_slots::VoterReplacementError),
 }
 
 impl ConfigMutationFailure {
@@ -620,6 +671,9 @@ impl ConfigMutationFailure {
             Self::InvalidInput => PersistError::corrupt_blob(),
             Self::HistoryFull => PersistError::config_history_full(),
             Self::HistoryProtected => PersistError::config_history_protected(),
+            Self::VoterReplacement(_) => {
+                PersistError::constraint_violation("voter replacement refused")
+            }
         }
     }
 }

@@ -22,7 +22,7 @@ async fn lost_majority_authority(all_cold: bool, require_recovery: bool, protect
     .catch_unwind()
     .await;
     for index in 0..3 {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
@@ -77,7 +77,7 @@ async fn exercise_lost_authority(
     let old = outcome.lease().clone();
     for store in fleet.stores.iter().flatten() {
         assert_recorded(store, &request, &outcome).await;
-        store.drain_async_persistence().await.unwrap();
+        clock::drain(store).await.unwrap();
     }
     // Wait for the existing writer to finish its accepted responsibility
     // before injecting failure into the next ordinary generation.
@@ -137,7 +137,7 @@ async fn exercise_lost_authority(
     )
     .await;
     for index in majority {
-        fleet.store(index).drain_async_persistence().await.unwrap();
+        clock::drain(fleet.store(index)).await.unwrap();
     }
     races::until(
         majority.iter().map(|index| {

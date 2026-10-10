@@ -37,6 +37,9 @@ mod v1;
 mod validation;
 #[cfg(test)]
 mod void_tests;
+#[cfg(test)]
+pub(crate) mod voter_slot_tests;
+pub(crate) mod voter_slots;
 pub(crate) use application::ApplicationCapture;
 mod capture;
 mod cold;
@@ -290,6 +293,7 @@ impl<'de> Deserialize<'de> for NativeFrontiers {
             roster_v2_activation: value.roster_v2_activation,
             current_snapshot: value.current_snapshot,
             async_recovery: None,
+            voter_slots: None,
             fenced_transition_profile: FencedTransitionV2Profile::V2,
         })))
     }
@@ -312,6 +316,8 @@ impl std::ops::DerefMut for NativeFrontiers {
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename = "NativeFrontiers")]
 struct NativeFrontierValues {
+    #[serde(default)]
+    voter_slots: Option<voter_slots::Table>,
     #[serde(default)]
     fenced_transition_profile: FencedTransitionV2Profile,
     applied: Option<LogId<SessionConsensusNodeId>>,
@@ -347,7 +353,8 @@ impl Serialize for NativeFrontierValues {
         let include_roster_v2 =
             !serializer.is_human_readable() || self.roster_v2_activation.is_some();
         if !serializer.is_human_readable()
-            && (self.async_recovery.is_some()
+            && (self.voter_slots.is_some()
+                || self.async_recovery.is_some()
                 || self.fenced_transition_profile != FencedTransitionV2Profile::V2)
         {
             return Err(serde::ser::Error::custom(
@@ -363,7 +370,8 @@ impl Serialize for NativeFrontierValues {
                 + usize::from(include_roster_v1)
                 + usize::from(include_roster_v2)
                 + usize::from(include_async_recovery)
-                + usize::from(include_fenced_profile),
+                + usize::from(include_fenced_profile)
+                + usize::from(self.voter_slots.is_some()),
         )?;
         value.serialize_field("applied", &self.applied)?;
         value.serialize_field("membership", &self.membership)?;
@@ -390,6 +398,9 @@ impl Serialize for NativeFrontierValues {
         }
         if include_fenced_profile {
             value.serialize_field("fenced_transition_profile", &self.fenced_transition_profile)?;
+        }
+        if self.voter_slots.is_some() {
+            value.serialize_field("voter_slots", &self.voter_slots)?;
         }
         value.serialize_field("current_snapshot", &self.current_snapshot)?;
         value.end()
@@ -518,6 +529,7 @@ impl NativeStorage {
         check()
     }
 
+    #[cfg(test)]
     pub(crate) fn empty(
         identity: SessionConsensusIdentity,
         members: BTreeSet<SessionConsensusNodeId>,
@@ -525,6 +537,7 @@ impl NativeStorage {
         Self::empty_with_roster_root(identity, members, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn empty_with_roster_root(
         identity: SessionConsensusIdentity,
         members: BTreeSet<SessionConsensusNodeId>,
@@ -688,10 +701,30 @@ impl NativeState {
         members: BTreeSet<SessionConsensusNodeId>,
         roster_root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
     ) -> io::Result<Self> {
+        Self::empty_with_slots(identity, members, roster_root, None)
+    }
+
+    fn empty_with_slots(
+        identity: SessionConsensusIdentity,
+        members: BTreeSet<SessionConsensusNodeId>,
+        roster_root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
+        voter_slots: Option<voter_slots::Table>,
+    ) -> io::Result<Self> {
+        let mut state = Self::empty_unadmitted(identity, members, roster_root)?;
+        state.frontiers.voter_slots = voter_slots;
+        state.admit_business()?;
+        Ok(state)
+    }
+
+    fn empty_unadmitted(
+        identity: SessionConsensusIdentity,
+        members: BTreeSet<SessionConsensusNodeId>,
+        roster_root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
+    ) -> io::Result<Self> {
         if members.is_empty() {
             return Err(invalid("native fixed membership is empty"));
         }
-        let mut state = Self {
+        let state = Self {
             identity,
             members,
             frontiers: NativeFrontiers(Arc::new(NativeFrontierValues {
@@ -710,6 +743,7 @@ impl NativeState {
                 roster_v1_namespace: false,
                 roster_v2_activation: None,
                 async_recovery: None,
+                voter_slots: None,
                 fenced_transition_profile: FencedTransitionV2Profile::V2,
                 current_snapshot: None,
             })),
@@ -724,7 +758,6 @@ impl NativeState {
             proof: None,
             changes: None,
         };
-        state.admit_business()?;
         Ok(state)
     }
 
@@ -1376,7 +1409,16 @@ impl NativeDelta<'_> {
         let response = match &entry.payload {
             EntryPayload::Blank => empty_response(entry.log_id.index),
             EntryPayload::Membership(membership) => {
-                if membership.get_joint_config().len() != 1
+                if let Some(table) = &mut self.frontiers.voter_slots {
+                    table
+                        .current
+                        .observe_membership(
+                            membership.get_joint_config(),
+                            &membership.nodes().map(|(id, _)| *id).collect(),
+                            voter_slots::cut(entry.log_id),
+                        )
+                        .map_err(|_| invalid("native slot membership differs"))?;
+                } else if membership.get_joint_config().len() != 1
                     || membership.voter_ids().collect::<BTreeSet<_>>() != self.base.members
                     || membership
                         .nodes()
@@ -1397,6 +1439,23 @@ impl NativeDelta<'_> {
                 ) =>
             {
                 self.apply_async_boundary(command, entry.log_id)?
+            }
+            EntryPayload::Normal(command)
+                if matches!(command.intent, SessionMutationIntent::VoterSlotControl(_)) =>
+            {
+                let control = voter_slots::control(command, self.base.identity)?
+                    .ok_or_else(|| invalid("native slot control missing"))?;
+                let table = self
+                    .frontiers
+                    .voter_slots
+                    .as_mut()
+                    .ok_or_else(|| invalid("native legacy profile refuses slot control"))?;
+                let result = table
+                    .current
+                    .apply_control(&control, voter_slots::cut(entry.log_id));
+                let mut response = empty_response(entry.log_id.index);
+                response.result = Ok(SessionMutationOutcome::VoterSlotControl(result));
+                response
             }
             EntryPayload::Normal(command) => self.command(command, entry.log_id.index, check)?,
         };

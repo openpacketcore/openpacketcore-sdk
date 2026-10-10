@@ -238,6 +238,7 @@ impl NativeLogEntry {
                 LogInput::new(
                     bytes,
                     selected.row,
+                    entry.slot_profile(),
                     &|bytes| (resources.reserve)(bytes),
                     check,
                 )

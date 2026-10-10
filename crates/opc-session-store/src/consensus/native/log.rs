@@ -60,6 +60,10 @@ pub(crate) struct NativeLog {
     pub(crate) vote: Option<Vote<SessionConsensusNodeId>>,
     pub(crate) committed: Option<LogId<SessionConsensusNodeId>>,
     pub(crate) purged: Option<LogId<SessionConsensusNodeId>>,
+    pub(crate) slot_intent: Option<LogId<SessionConsensusNodeId>>,
+    // Only selected rows with decoded unapplied slot facts. A checkpoint
+    // captures this persistent root without traversing historical log rows.
+    pub(super) slot_projections: OrdMap<u64, SharedRow<NativeLogEntry>>,
     // Process-local admission proofs never authorize business application or
     // survive decoding. A clone shares immutable rows but starts no journal.
     proof: Option<std::sync::Arc<changes::LogProof>>,
@@ -73,6 +77,8 @@ impl Clone for NativeLog {
             vote: self.vote,
             committed: self.committed,
             purged: self.purged,
+            slot_intent: self.slot_intent,
+            slot_projections: self.slot_projections.clone(),
             proof: self.proof.clone(),
             changes: None,
         }
@@ -127,15 +133,59 @@ impl NativeLog {
         {
             return Err(invalid("native store profile does not permit void"));
         }
-        Self::validate_entry_context(entry, state.identity, &state.members)
+        Self::validate_entry_profile(
+            entry,
+            state.identity,
+            &state.members,
+            state.frontiers.voter_slots.is_some(),
+        )
     }
 
+    #[cfg(test)]
     pub(super) fn validate_entry_context(
         entry: &Entry<SessionRaftTypeConfig>,
         identity: SessionConsensusIdentity,
         members: &BTreeSet<SessionConsensusNodeId>,
     ) -> io::Result<()> {
+        Self::validate_entry_profile(entry, identity, members, false)
+    }
+
+    pub(super) fn validate_entry_profile(
+        entry: &Entry<SessionRaftTypeConfig>,
+        identity: SessionConsensusIdentity,
+        members: &BTreeSet<SessionConsensusNodeId>,
+        slots: bool,
+    ) -> io::Result<()> {
         sql::validate_log_id(&entry.log_id)?;
+        if slots {
+            if let EntryPayload::Membership(membership) = &entry.payload {
+                let expected = members
+                    .iter()
+                    .map(|node| {
+                        opc_consensus::voter_slots::VoterSlotIdentity::from_node_id(*node)
+                            .map(|id| id.slot())
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()
+                    .map_err(|_| invalid("native slot genesis invalid"))?;
+                let configs = membership.get_joint_config();
+                if !(1..=2).contains(&configs.len())
+                    || membership.nodes().count() > members.len() + 1
+                    || configs.iter().any(|config| config.len() != members.len())
+                    || membership.nodes().any(|(node, _)| {
+                        opc_consensus::voter_slots::VoterSlotIdentity::from_node_id(*node)
+                            .map_or(true, |id| !expected.contains(&id.slot()))
+                    })
+                {
+                    return Err(invalid("native slot membership shape invalid"));
+                }
+                return Ok(());
+            }
+            if let EntryPayload::Normal(command) = &entry.payload {
+                if voter_slots::control(command, identity)?.is_some() {
+                    return Ok(());
+                }
+            }
+        }
         if sql::fixed_profile_entry_changes_topology(entry, members) {
             return Err(invalid("native fixed log changes topology"));
         }
@@ -224,7 +274,21 @@ impl NativeLog {
         frozen_applied: Option<LogId<SessionConsensusNodeId>>,
         reservation: Option<crate::sqlite::consensus::wal::async_authority::Reservation>,
     ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+        self.project_guarded(operation, state, frozen_applied, reservation, None)
+    }
+
+    pub(crate) fn project_guarded(
+        &mut self,
+        operation: &Operation,
+        state: &NativeState,
+        frozen_applied: Option<LogId<SessionConsensusNodeId>>,
+        reservation: Option<crate::sqlite::consensus::wal::async_authority::Reservation>,
+        fence: Option<&dyn Fn(&opc_consensus::voter_slots::VoterReplacementRequest) -> bool>,
+    ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
         let publication = changes::Publication::prepare(self, operation, state, frozen_applied)?;
+        if let Some(check) = fence {
+            publication.check_voter_fence(check, state.identity)?;
+        }
         if let Some(reservation) = reservation {
             publication.check_async_reservation(reservation)?;
         }
@@ -288,6 +352,7 @@ impl NativeLog {
     }
 
     pub(crate) fn validate(&self, state: &NativeState) -> io::Result<()> {
+        self.validate_slot_intent(state)?;
         let mut previous: Option<LogId<SessionConsensusNodeId>> = None;
         for (index, row) in &self.entries {
             Self::validate_row(*index, row, state)?;

@@ -1,5 +1,246 @@
 use super::*;
 use futures_util::FutureExt;
+use opc_session_net::SessionConsumerFencedTransitionV2ReclaimReport;
+
+#[derive(Debug, Default)]
+struct ReclaimProgress {
+    reports: Vec<SessionConsumerFencedTransitionV2ReclaimReport>,
+    history_unavailable: usize,
+}
+
+impl ReclaimProgress {
+    fn reclaimed(&self) -> usize {
+        self.reports.iter().map(|report| report.reclaimed()).sum()
+    }
+
+    fn voided(&self) -> usize {
+        self.reports.iter().map(|report| report.voided()).sum()
+    }
+}
+
+// All calls in one functional drain keep its original absolute deadline.
+// Only the documented transient history read is retried before a report;
+// other errors fail with every partial report retained for diagnosis.
+async fn next_reclaim_report(
+    facade: &SessionConsumerPreparedFencedTransitionV2Backend,
+    limit: usize,
+    deadline: tokio::time::Instant,
+    progress: &mut ReclaimProgress,
+) -> SessionConsumerFencedTransitionV2ReclaimReport {
+    loop {
+        let result = tokio::time::timeout_at(
+            deadline,
+            facade.reclaim_resolved_fenced_transitions(limit, budget(deadline)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("reclamation exhausted its original budget: {progress:?}"));
+        match result {
+            Ok(report) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "reclamation report exceeded its original budget: {progress:?}"
+                );
+                progress.reports.push(report);
+                return report;
+            }
+            Err(StoreError::BackendUnavailable(message))
+                if message == "prepared fenced transition V2 history state unavailable" =>
+            {
+                progress.history_unavailable += 1;
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "history read exhausted its original budget: {progress:?}"
+                );
+                reclaim_pause(deadline).await;
+            }
+            Err(error) => panic!("reclamation failed: {error:?}; progress={progress:?}"),
+        }
+    }
+}
+
+async fn reclaim_pause(deadline: tokio::time::Instant) {
+    tokio::time::sleep_until(
+        (tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline),
+    )
+    .await;
+}
+
+async fn one_reclaim_sweep(
+    facade: &SessionConsumerPreparedFencedTransitionV2Backend,
+    limit: usize,
+    deadline: tokio::time::Instant,
+) -> SessionConsumerFencedTransitionV2ReclaimReport {
+    next_reclaim_report(facade, limit, deadline, &mut ReclaimProgress::default()).await
+}
+
+async fn drain_void_rows(
+    facade: &SessionConsumerPreparedFencedTransitionV2Backend,
+    limit: usize,
+    deadline: tokio::time::Instant,
+    mut inspect: impl FnMut(&SessionConsumerFencedTransitionV2ReclaimReport),
+) -> ReclaimProgress {
+    let mut progress = ReclaimProgress::default();
+    let finished = tokio::time::timeout_at(deadline, async {
+        loop {
+            let report = next_reclaim_report(facade, limit, deadline, &mut progress).await;
+            assert_eq!(report.unsupported(), 0, "{progress:?}");
+            assert_eq!(report.waiting_callers(), 0, "{progress:?}");
+            inspect(&report);
+            if facade.retained_fenced_transitions().await.unwrap() == 0 {
+                break;
+            }
+            reclaim_pause(deadline).await;
+        }
+    })
+    .await;
+    assert!(
+        finished.is_ok() && tokio::time::Instant::now() < deadline,
+        "drain exceeded its original budget: {progress:?}"
+    );
+    progress
+}
+
+async fn observe_unsupported_cycle(
+    facade: &SessionConsumerPreparedFencedTransitionV2Backend,
+    rows: usize,
+    deadline: tokio::time::Instant,
+) {
+    let mut progress = ReclaimProgress::default();
+    let mut examined = 0;
+    let mut unsupported = 0;
+    let finished = tokio::time::timeout_at(deadline, async {
+        loop {
+            // Finish exactly one cursor cycle, including interrupted pages.
+            // Never count the same retained row twice to reach `rows`.
+            let remaining = rows - examined;
+            let report = next_reclaim_report(facade, remaining, deadline, &mut progress).await;
+            assert_eq!(report.voided(), 0, "{progress:?}");
+            assert_eq!(report.reclaimed(), 0, "{progress:?}");
+            assert_eq!(report.waiting_callers(), 0, "{progress:?}");
+            assert_eq!(report.retained(), report.examined(), "{progress:?}");
+            assert_eq!(
+                facade.retained_fenced_transitions().await.unwrap(),
+                rows,
+                "{progress:?}"
+            );
+            examined += report.examined();
+            unsupported += report.unsupported();
+            assert!(examined <= rows, "{progress:?}");
+            if examined == rows && unsupported == rows {
+                break;
+            }
+            if examined == rows || (!report.interrupted() && report.examined() < remaining) {
+                // A short page wraps the public cursor. Start a fresh cycle
+                // if the previous one began in the middle or had an unknown
+                // capability attempt; it cannot satisfy the negative proof.
+                examined = 0;
+                unsupported = 0;
+            }
+            reclaim_pause(deadline).await;
+        }
+    })
+    .await;
+    assert!(
+        finished.is_ok() && tokio::time::Instant::now() < deadline,
+        "unsupported cycle exceeded its original budget: {progress:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_void_drain_retries_a_transient_history_read_within_the_original_budget() {
+    let fixture =
+        AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])
+            .await
+            .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let facade = fixture
+            .open_local_aead_v2(CountingProvider::new(), "void-history-progress")
+            .await
+            .unwrap();
+        drop(
+            facade
+                .prepare_fenced_transition(create(request_id(930), 930, PAYLOAD), budget(soon()))
+                .await
+                .unwrap(),
+        );
+        for voter in &fixture.voters {
+            voter
+                .service
+                .fail_next_fenced_transition_v2_history_state
+                .store(true, Ordering::Release);
+        }
+        let deadline = soon();
+        let progress = drain_void_rows(&facade, 8, deadline, |_| {}).await;
+        assert!(progress.history_unavailable > 0, "{progress:?}");
+        assert_eq!(progress.voided(), 1, "{progress:?}");
+        assert_eq!(progress.reclaimed(), 1, "{progress:?}");
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
+        assert!(tokio::time::Instant::now() < deadline);
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await.unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_void_drain_continues_a_partial_sweep_within_the_original_budget() {
+    let fixture =
+        AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])
+            .await
+            .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let facade = fixture
+            .open_local_aead_v2(CountingProvider::new(), "void-partial-progress")
+            .await
+            .unwrap();
+        for ordinal in 931..934 {
+            drop(
+                facade
+                    .prepare_fenced_transition(
+                        create(request_id(ordinal), ordinal, PAYLOAD),
+                        budget(soon()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        for voter in &fixture.voters {
+            *voter
+                .service
+                .fenced_transition_v2_void_response_gate
+                .lock()
+                .unwrap() = Some(Arc::clone(&response_gate));
+        }
+        let deadline = soon();
+        let mut first = true;
+        let progress = drain_void_rows(&facade, 3, deadline, |report| {
+            if first {
+                assert!(
+                    report.voided() < 3 && report.retained() > 0,
+                    "the held committed reply forces partial progress: {report:?}"
+                );
+                first = false;
+                response_gate.add_permits(3);
+            }
+        })
+        .await;
+        assert!(progress.reports.len() > 1, "{progress:?}");
+        assert_eq!(progress.voided(), 3, "{progress:?}");
+        assert_eq!(progress.reclaimed(), 3, "{progress:?}");
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
+        assert!(tokio::time::Instant::now() < deadline);
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await.unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
 
 fn stall_original(fixture: &AuthenticatedPreparedFencedTransitionFixture, enabled: bool) {
     for voter in &fixture.voters {
@@ -45,7 +286,7 @@ async fn consumer_void_sweep_preserves_an_unregistered_trait_callers_receipt() {
         let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, provider, "void-trait-caller", journal).unwrap();
         let deadline = soon();
         let prepared = wrapper.prepare_protected_fenced_transition_v2(create(request_id(919), 919, PAYLOAD)).await.unwrap();
-        let report = facade.reclaim_resolved_fenced_transitions(8, budget(deadline)).await.unwrap();
+        let report = one_reclaim_sweep(&facade, 8, deadline).await;
         assert_eq!(report.waiting_callers(), 1);
         assert_eq!(report.voided(), 0);
         assert_eq!(report.reclaimed(), 0);
@@ -177,7 +418,8 @@ async fn consumer_void_profile_preserves_the_legacy_capability_decoder_and_opera
                 .await
                 .unwrap(),
         );
-        let status = recovered.status_once(deadline).await;
+        let status = recovered.status_until_terminal(deadline).await;
+        assert!(tokio::time::Instant::now() < deadline);
         assert!(
             matches!(&status, Ok(FencedTransitionV2Status::Recorded(result)) if result.is_ok()),
             "{status:?}"
@@ -214,7 +456,7 @@ async fn consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_
         let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, Arc::clone(&provider), "void-cursor", Arc::clone(&journal)).unwrap();
         drop(facade.prepare_fenced_transition(create(request_id(911), 911, PAYLOAD), budget(soon())).await.unwrap());
         for voter in &fixture.voters { voter.service.stall_fenced_transition_v2_void_response.store(true, Ordering::Release); }
-        let unknown = facade.reclaim_resolved_fenced_transitions(8, budget(soon())).await.unwrap();
+        let unknown = one_reclaim_sweep(&facade, 8, soon()).await;
         assert_eq!(unknown.reclaimed(), 0);
         assert_eq!(unknown.retained(), 1);
         drop(facade);
@@ -225,13 +467,13 @@ async fn consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_
         let activated = SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(fixture.persistent_clients().unwrap()).await.unwrap();
         let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, provider, "void-cursor", journal).unwrap();
         for ordinal in [910, 912] { drop(facade.prepare_fenced_transition(create(request_id(ordinal), ordinal, PAYLOAD), budget(soon())).await.unwrap()); }
-        let report = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
+        let report = one_reclaim_sweep(&facade, 3, soon()).await;
         assert!(!report.interrupted(), "{report:?}");
         assert_eq!(report.examined(), 3, "{report:?}");
         assert_eq!(report.voided(), 1, "{report:?}");
         assert_eq!(report.reclaimed(), 1, "recorded status behind the unavailable first row: {report:?}");
         assert_eq!(report.retained(), 2, "{report:?}");
-        let wrapped = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
+        let wrapped = one_reclaim_sweep(&facade, 3, soon()).await;
         assert_eq!(wrapped.examined(), 0, "finish the cursor page and wrap: {wrapped:?}");
         // Permit the first committed void reply, but hold the second until
         // this sweep returns. This deterministically spends that attempt's
@@ -246,32 +488,19 @@ async fn consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_
         // must sweep again to observe its exact receipt. Keep one original
         // five-second budget for the entire drain, including every retry.
         let deadline = soon();
-        let mut reports = Vec::new();
-        let mut voided = 0;
-        let mut reclaimed = 0;
-        let drained = tokio::time::timeout_at(deadline, async {
-            loop {
-                let report = facade.reclaim_resolved_fenced_transitions(3, budget(deadline)).await
-                    .unwrap_or_else(|error| panic!("retry drain failed: {error:?}; reports={reports:?}"));
-                voided += report.voided();
-                reclaimed += report.reclaimed();
-                reports.push(report);
-                if reports.len() == 1 {
-                    assert!(!report.interrupted(), "first retry sweep must complete: {reports:?}");
-                    assert_eq!(report.examined(), 2, "one pass reaches rows on both sides of the prior cursor: {reports:?}");
-                    assert!(report.voided() < 2, "the held reply must force a partial sweep: {report:?}");
-                    response_gate.add_permits(1);
-                }
-                if facade.retained_fenced_transitions().await.unwrap() == 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
+        let mut first = true;
+        let progress = drain_void_rows(&facade, 3, deadline, |report| {
+            if first {
+                assert!(!report.interrupted(), "first retry sweep must complete: {report:?}");
+                assert_eq!(report.examined(), 2, "one pass reaches rows on both sides of the prior cursor: {report:?}");
+                assert!(report.voided() < 2, "the held reply must force a partial sweep: {report:?}");
+                first = false;
+                response_gate.add_permits(1);
             }
         }).await;
-        assert!(drained.is_ok(), "retry drain exceeded its unchanged five-second budget: {reports:?}");
-        assert_eq!(voided, 2, "retry rows on both sides of the prior cursor: {reports:?}");
-        assert_eq!(reclaimed, 2, "both retry rows removed exactly once: {reports:?}");
-        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0, "{reports:?}");
+        assert_eq!(progress.voided(), 2, "retry rows on both sides of the prior cursor: {progress:?}");
+        assert_eq!(progress.reclaimed(), 2, "both retry rows removed exactly once: {progress:?}");
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0, "{progress:?}");
     }).catch_unwind().await;
     fixture.shutdown().await.unwrap();
     if let Err(error) = result {
@@ -292,15 +521,17 @@ async fn consumer_void_lost_before_bind_drains_the_row_and_resolves_the_live_han
         let mut prepared = facade.prepare_fenced_transition(transition, budget(deadline)).await.unwrap();
         stall_original(&fixture, true);
         assert!(matches!(prepared.execute_once().await, Err(FencedTransitionExecuteError::OutcomeUnknown { .. })));
-        let waiting = facade.reclaim_resolved_fenced_transitions(8, budget(soon())).await.unwrap();
+        let waiting = one_reclaim_sweep(&facade, 8, soon()).await;
         assert_eq!(waiting.waiting_callers(), 1);
         assert_eq!(waiting.reclaimed(), 0);
         tokio::time::sleep_until(deadline).await;
-        let report = facade.reclaim_resolved_fenced_transitions(8, budget(soon())).await.unwrap();
+        let report = drain_void_rows(&facade, 8, soon(), |_| {}).await;
         assert_eq!(report.voided(), 1, "{report:?}");
         assert_eq!(report.reclaimed(), 1);
         assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
-        assert!(matches!(prepared.status_once(soon()).await, Ok(FencedTransitionV2Status::Recorded(result)) if matches!(*result, Err(StoreError::FencedTransitionVoided))));
+        let status_deadline = soon();
+        assert!(matches!(prepared.status_until_terminal(status_deadline).await, Ok(FencedTransitionV2Status::Recorded(result)) if matches!(*result, Err(StoreError::FencedTransitionVoided))));
+        assert!(tokio::time::Instant::now() < status_deadline);
         prepared.release_resolved().await.unwrap();
         for store in &fixture.cluster.stores {
             assert!(store.get(&session_key(901)).await.unwrap().is_none());
@@ -327,10 +558,7 @@ async fn consumer_void_keeps_a_waiting_call_then_drains_after_cancellation() {
             .prepare_fenced_transition(create(request_id(902), 902, PAYLOAD), budget(soon()))
             .await
             .unwrap();
-        let waiting = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let waiting = one_reclaim_sweep(&facade, 8, soon()).await;
         assert_eq!(waiting.waiting_callers(), 1);
         assert_eq!(waiting.reclaimed(), 0);
         stall_original(&fixture, true);
@@ -348,11 +576,9 @@ async fn consumer_void_keeps_a_waiting_call_then_drains_after_cancellation() {
         }
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
-        let report = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let report = drain_void_rows(&facade, 8, soon(), |_| {}).await;
         assert_eq!(report.voided(), 1, "{report:?}");
+        assert_eq!(report.reclaimed(), 1, "{report:?}");
         assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
     })
     .catch_unwind()
@@ -402,19 +628,15 @@ async fn consumer_void_cancelled_preflight_then_redispatch_protects_the_live_cal
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let report = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let report = one_reclaim_sweep(&facade, 8, soon()).await;
         assert_eq!(report.waiting_callers(), 1);
         assert_eq!(report.reclaimed(), 0);
         call.abort();
         let _ = call.await;
-        let report = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let report = drain_void_rows(&facade, 8, soon(), |_| {}).await;
         assert_eq!(report.voided(), 1, "{report:?}");
+        assert_eq!(report.reclaimed(), 1, "{report:?}");
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
     })
     .catch_unwind()
     .await;
@@ -445,16 +667,8 @@ async fn consumer_void_older_voter_is_reported_and_the_row_stays_retained() {
                 .legacy_fenced_transition_v2_capability
                 .store(true, Ordering::Release);
         }
-        let report = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
-        assert_eq!(report.unsupported(), 3);
-        assert_eq!(report.reclaimed(), 0);
-        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 3);
-        let repeated = facade.reclaim_resolved_fenced_transitions(8, budget(soon())).await.unwrap();
-        assert_eq!(repeated.unsupported(), 3);
-        assert_eq!(repeated.reclaimed(), 0);
+        observe_unsupported_cycle(&facade, 3, soon()).await;
+        observe_unsupported_cycle(&facade, 3, soon()).await;
         for voter in &fixture.voters {
             voter
                 .service
@@ -467,11 +681,9 @@ async fn consumer_void_older_voter_is_reported_and_the_row_stays_retained() {
             client.request_reauthentication().unwrap();
             client.prewarm_v2().await.unwrap();
         }
-        let report = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let report = drain_void_rows(&facade, 8, soon(), |_| {}).await;
         assert_eq!(report.voided(), 3);
+        assert_eq!(report.reclaimed(), 3, "{report:?}");
         assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
     })
     .catch_unwind()
@@ -505,17 +717,11 @@ async fn consumer_void_unknown_response_retains_until_exact_status_confirms_it()
                 .stall_fenced_transition_v2_void_response
                 .store(true, Ordering::Release);
         }
-        let unknown = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let unknown = one_reclaim_sweep(&facade, 8, soon()).await;
         assert!(!unknown.interrupted());
         assert_eq!(unknown.reclaimed(), 0);
         assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 1);
-        let confirmed = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
+        let confirmed = drain_void_rows(&facade, 8, soon(), |_| {}).await;
         assert_eq!(confirmed.voided(), 1);
         assert_eq!(confirmed.reclaimed(), 1);
         assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
@@ -549,13 +755,12 @@ async fn consumer_void_one_unavailable_capability_does_not_veto_certified_quorum
             .service
             .unavailable_fenced_transition_v2_capability
             .store(true, Ordering::Release);
-        let report = facade
-            .reclaim_resolved_fenced_transitions(8, budget(soon()))
-            .await
-            .unwrap();
-        assert!(!report.interrupted());
-        assert_eq!(report.unsupported(), 0);
+        let report = drain_void_rows(&facade, 8, soon(), |report| {
+            assert!(!report.interrupted(), "{report:?}");
+        })
+        .await;
         assert_eq!(report.voided(), 1, "{report:?}");
+        assert_eq!(report.reclaimed(), 1, "{report:?}");
         assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
     })
     .catch_unwind()
@@ -579,11 +784,14 @@ async fn consumer_void_inherited_row_is_reclaimed_without_the_previous_call_dead
         drop(facade);
         let reopened = fixture.open_local_aead_v2(CountingProvider::new(), "void-restart").await.unwrap();
         let mut handle = recovered_v2(reopened.recover_fenced_transition_status(request_id(905), budget(soon())).await.unwrap());
-        let report = reopened.reclaim_resolved_fenced_transitions(8, budget(soon())).await.unwrap();
+        let report = drain_void_rows(&reopened, 8, soon(), |_| {}).await;
         assert_eq!(report.voided(), 1, "{report:?}");
+        assert_eq!(report.reclaimed(), 1, "{report:?}");
         assert_eq!(reopened.retained_fenced_transitions().await.unwrap(), 0);
         assert!(tokio::time::Instant::now() < previous_deadline);
-        assert!(matches!(handle.status_once(soon()).await, Ok(FencedTransitionV2Status::Recorded(result)) if matches!(*result, Err(StoreError::FencedTransitionVoided))));
+        let status_deadline = soon();
+        assert!(matches!(handle.status_until_terminal(status_deadline).await, Ok(FencedTransitionV2Status::Recorded(result)) if matches!(*result, Err(StoreError::FencedTransitionVoided))));
+        assert!(tokio::time::Instant::now() < status_deadline);
         handle.release_resolved().await.unwrap();
     }).catch_unwind().await;
     fixture.shutdown().await.unwrap();
@@ -620,11 +828,12 @@ async fn consumer_void_drains_after_the_leader_loses_authority_during_the_origin
         fixture.cluster.set_node_online(leader, true);
         fixture.cluster.wait_ready(true).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while facade.retained_fenced_transitions().await.unwrap() != 0 {
-            assert!(tokio::time::Instant::now() < deadline);
-            facade.reclaim_resolved_fenced_transitions(8, budget(deadline)).await.unwrap();
-        }
-        assert!(matches!(prepared.status_once(soon()).await, Ok(FencedTransitionV2Status::Recorded(result)) if matches!(*result, Err(StoreError::FencedTransitionVoided))));
+        let progress = drain_void_rows(&facade, 8, deadline, |_| {}).await;
+        assert_eq!(progress.voided(), 1, "{progress:?}");
+        assert_eq!(progress.reclaimed(), 1, "{progress:?}");
+        let status_deadline = soon();
+        assert!(matches!(prepared.status_until_terminal(status_deadline).await, Ok(FencedTransitionV2Status::Recorded(result)) if matches!(*result, Err(StoreError::FencedTransitionVoided))));
+        assert!(tokio::time::Instant::now() < status_deadline);
         prepared.release_resolved().await.unwrap();
         for store in &fixture.cluster.stores {
             assert!(store.get(&session_key(906)).await.unwrap().is_none());
@@ -714,10 +923,7 @@ async fn full_journal_void_case(capacity: usize) {
             let mut reclaimed = 0;
             while facade.retained_fenced_transitions().await.unwrap() != 0 {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                let report = facade
-                    .reclaim_resolved_fenced_transitions(256, budget(deadline))
-                    .await
-                    .unwrap();
+                let report = one_reclaim_sweep(&facade, 256, deadline).await;
                 assert_eq!(report.unsupported(), 0);
                 assert_eq!(report.waiting_callers(), 0);
                 reclaimed += report.reclaimed();

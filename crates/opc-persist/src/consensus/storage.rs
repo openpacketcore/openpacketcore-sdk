@@ -26,7 +26,7 @@ use crate::backend::SqliteBackend;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCCFG01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 2 + 8 + 32;
-const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -106,7 +106,7 @@ pub enum ConfigConsensusStorageError {
 
 #[derive(Clone)]
 pub(crate) struct SqliteConfigLogStore {
-    core: sqlite::ConfigConsensusCore,
+    pub(crate) core: sqlite::ConfigConsensusCore,
 }
 
 #[derive(Clone)]
@@ -232,6 +232,37 @@ pub(crate) async fn open_with_recovery(
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
     let identity = core.identity;
+    progress.set_committed(
+        core.run_sqlite(move |conn| sqlite::read_committed_sync(conn, identity))
+            .await
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?,
+    );
+    Ok((
+        SqliteConfigLogStore { core: core.clone() },
+        SqliteConfigStateMachine { core },
+        progress,
+    ))
+}
+
+pub(crate) async fn open_with_voter_slots(
+    backend: &SqliteBackend,
+    snapshot_dir: PathBuf,
+    identity: ConsensusIdentity,
+    expected_members: std::collections::BTreeSet<ConsensusNodeId>,
+    initial_slots: opc_consensus::voter_slots::VoterSlotTable,
+) -> Result<OpenedConfigStorage, ConfigConsensusStorageError> {
+    let directory = admit_snapshot_directory(backend, snapshot_dir)?;
+    let progress = Arc::new(ConfigDurableProgress::default());
+    let core = sqlite::ConfigConsensusCore::initialize_with_voter_slots(
+        backend,
+        directory,
+        identity,
+        expected_members,
+        progress.clone(),
+        initial_slots,
+    )
+    .await?;
+    validate_and_clean_snapshot_directory(&core).await?;
     progress.set_committed(
         core.run_sqlite(move |conn| sqlite::read_committed_sync(conn, identity))
             .await
@@ -531,7 +562,7 @@ async fn validate_and_clean_snapshot_directory(
         let part_staging = ["incoming-", "promote-", "seal-", "snapshot-"]
             .iter()
             .any(|prefix| file_name.starts_with(prefix) && file_name.ends_with(".part"));
-        let sqlite_staging = ["install-", "build-", "approved-legacy-"]
+        let sqlite_staging = ["install-", "build-", "inspect-", "approved-legacy-"]
             .iter()
             .any(|prefix| file_name.starts_with(prefix))
             && [".sqlite", ".sqlite-journal", ".sqlite-wal", ".sqlite-shm"]
@@ -752,11 +783,18 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
                 return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
             }
         };
+        let hook = self.core.voter_admission.get().cloned();
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         match self
             .core
             .run_sqlite_cancellable(move |conn, cancellation| {
+                sqlite::voter_slots::check_fences_sync(
+                    conn,
+                    identity,
+                    &entries,
+                    hook.as_ref().and_then(std::sync::Weak::upgrade).as_deref(),
+                )?;
                 sqlite::append_logs_cancellable_sync(
                     conn,
                     identity,
@@ -768,6 +806,7 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
             .await
         {
             Ok(()) => {
+                self.core.notify_voter_slots();
                 callback.log_io_completed(Ok(()));
                 Ok(())
             }
@@ -787,7 +826,9 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         self.core
             .run_sqlite(move |conn| sqlite::truncate_logs_sync(conn, identity, &log_id))
             .await
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
+        self.core.notify_voter_slots();
+        Ok(())
     }
 
     async fn purge(
@@ -899,6 +940,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             })
             .await
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+        self.core.notify_voter_slots();
         self.core.durable_progress.notify_applied();
         Ok(responses)
     }
@@ -1047,10 +1089,34 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let raw_for_install = raw.clone();
             let meta_for_install = meta.clone();
             let file_name_for_install = file_name.clone();
+            let voter_hook = self.core.voter_admission.get().cloned();
             let previous = self
                 .core
                 .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
                     let previous = sqlite::read_current_snapshot_sync(conn, identity, &members)?;
+                    if let Some(runtime) = voter_hook.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let source = sqlite::validate_snapshot_database_sync(
+                            &raw_for_install,
+                            identity,
+                            &members,
+                            &audit_key,
+                            &meta_for_install,
+                            cancellation,
+                        )?;
+                        let state = sqlite::voter_slots::read_sync(&source)?.ok_or_else(|| {
+                            sqlite::invalid_data("snapshot lacks config voter profile")
+                        })?;
+                        let incoming_members = meta_for_install
+                            .last_membership
+                            .nodes()
+                            .map(|(node, _)| *node)
+                            .collect();
+                        if !runtime.snapshot_fences_acknowledged(state.table(), &incoming_members) {
+                            return Err(sqlite::invalid_data(
+                                "config snapshot lacks acknowledged voter fences",
+                            ));
+                        }
+                    }
                     sqlite::install_snapshot_database_cancellable_sync(
                         conn,
                         identity,
@@ -1087,6 +1153,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 .persist_snapshot_install_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
+            self.core.notify_voter_slots();
             self.core.durable_progress.notify_applied();
         }
         result
@@ -1353,7 +1420,7 @@ async fn envelope_snapshot_database(
     Ok((checksum, total, cleanup))
 }
 
-async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
+pub(crate) async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
     let source = open_read_nofollow(path)?;
     let metadata = source.metadata()?;
     let total = metadata.len();
@@ -1413,6 +1480,58 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
         ));
     }
     Ok((payload_length, actual, total))
+}
+
+/// Verify the complete artifact outside the engine callback, before admission changes.
+pub(crate) async fn inspect_voter_snapshot(
+    core: &sqlite::ConfigConsensusCore,
+    snapshot: &mut ConfigSnapshotFile,
+    meta: &SnapshotMeta<ConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    deadline: tokio::time::Instant,
+) -> io::Result<opc_consensus::voter_slots::VoterSlotTable> {
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if budget.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "config voter snapshot inspection deadline",
+        ));
+    }
+    snapshot.sync_all().await?;
+    let (length, _, _) = verify_snapshot_envelope(snapshot.path()).await?;
+    let raw = core
+        .snapshot_dir
+        .join(format!("inspect-{}.sqlite", uuid::Uuid::new_v4()));
+    let cleanup = extract_snapshot_database(snapshot.path(), &raw, length).await?;
+    let identity = core.identity;
+    let members = core.expected_members.clone();
+    let key = core.audit_key.clone();
+    let meta = meta.clone();
+    // The accepted file copy makes progress independently of its caller.
+    // Admission to the serialized validator gets a fresh bounded wait.
+    core.run_sqlite_cancellable_until(
+        tokio::time::Instant::now() + budget,
+        move |conn, cancellation| {
+            let _cleanup = cleanup;
+            let source = sqlite::validate_snapshot_database_sync(
+                &raw,
+                identity,
+                &members,
+                &key,
+                &meta,
+                cancellation,
+            )?;
+            let incoming = sqlite::voter_slots::read_sync(&source)?
+                .ok_or_else(|| sqlite::invalid_data("snapshot lacks config voter profile"))?;
+            let current = sqlite::voter_slots::read_sync(conn)?
+                .ok_or_else(|| sqlite::invalid_data("store lacks config voter profile"))?;
+            incoming
+                .table()
+                .validate_successor_of(current.table())
+                .map_err(|_| sqlite::invalid_data("config voter snapshot regressed"))?;
+            Ok(incoming.table().clone())
+        },
+    )
+    .await
 }
 
 async fn extract_snapshot_database(
