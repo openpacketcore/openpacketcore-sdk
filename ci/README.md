@@ -229,6 +229,13 @@ environment, four test threads, logs, commands, source revision, and per-run
 results. Nightly repetitions measure frequency; a later pass never erases an
 earlier failure. Setup errors, partial runs, and missing artifacts are failures.
 
+The [CNF performance workflow](../.github/workflows/performance.yml) separately
+runs all five latency profiles nightly on main at 04:41 UTC, without requiring
+`OPC_PERFORMANCE_GATES`. That variable enables additional push runs. The original
+100 ms protected-request and one-second selector limits remain unchanged.
+Any failed, cancelled or incomplete scheduled matrix uses the same classification
+hold below, including failures that leave no result artifact.
+
 ## Decisions before merging
 
 A red PR qualification job is a review signal that requires classification.
@@ -260,6 +267,8 @@ authenticated GitHub CLI and inspect completed scheduled workflow results:
 python3 ci/nightly_qualification.py check --repository openpacketcore/openpacketcore-sdk
 gh run list --repo openpacketcore/openpacketcore-sdk \
   --workflow realtime-qualification.yml --event schedule --branch main
+gh run list --repo openpacketcore/openpacketcore-sdk \
+  --workflow performance.yml --event schedule --branch main
 ```
 
 Verify that every red nightly since the last classification is accounted for.
