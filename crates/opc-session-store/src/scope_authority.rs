@@ -580,3 +580,9 @@ pub use profile::{ScopeProfileActivation, ScopeProfileContinuation};
 mod service_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+
+mod transport;
+mod transport_codec;
+pub use transport::{ScopeAuthorityOutcome, ScopeAuthorityRemote, ScopeAuthorityResponseVerifier};
+#[cfg(test)]
+mod transport_tests;

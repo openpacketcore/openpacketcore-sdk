@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn outcome_lookup_matches_the_original_digest_and_lane_sequence_without_payloads() {
+    let mut state = State::new();
+    let request = state.command(1, vec![create(1, &[])]).request;
+    let attempt = request.attempt().unwrap();
+    let outcome = state.apply(&ScopeBatchCommand { request }).unwrap();
+    assert!(outcome.matches_attempt(&attempt));
+    for field in 0..3 {
+        let mut changed = outcome.clone();
+        match field {
+            0 => changed.request_digest[0] ^= 1,
+            1 => changed.lane = 1,
+            _ => {
+                changed.sequence += 1;
+                changed.revision += 1;
+            }
+        }
+        let decoded =
+            ScopeBatchOutcome::decode_canonical(&changed.encode_canonical().unwrap()).unwrap();
+        assert!(
+            !decoded.matches_attempt(&attempt),
+            "a canonical foreign outcome must not resolve this attempt (field {field})"
+        );
+    }
+    let mut invalid = attempt;
+    invalid.sequence = 0;
+    assert!(!outcome.matches_attempt(&invalid));
+}
+
+#[test]
 fn attempt_and_terminal_codecs_bind_cancel_to_the_complete_original_attempt() {
     let mut state = State::new();
     let request = state.command(1, vec![create(1, &[])]).request;

@@ -64,6 +64,7 @@ pub mod membership;
 mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod protocol;
+pub mod scope;
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod server;
 #[cfg(test)]
@@ -75,8 +76,8 @@ mod test_support;
 #[cfg(feature = "legacy-session-net-compat")]
 pub use client::RemoteSessionBackend;
 pub use consensus::{
-    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionConsensusServer,
-    SessionConsensusServerHandle,
+    ClassifiedSessionConsensusServerHandle, RemoteAddrResolver, RemoteSessionConsensusPeer,
+    SessionConsensusServer, SessionConsensusServerHandle,
 };
 pub use consumer::{
     session_consumer_payload_budget, ActivatedSessionConsumerFencedTransitionV2Voters,

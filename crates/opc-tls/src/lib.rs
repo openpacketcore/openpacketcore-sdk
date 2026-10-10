@@ -17,6 +17,12 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+mod channel_binding;
+pub use channel_binding::{
+    AuthenticationTimeInterval, ChannelBindingDomain, ChannelBindingPurpose,
+    ScopeTlsAuthentication, ScopeTlsConnection, ScopeTlsError, TlsChannelBinding,
+    UnboundScopeTlsConnection,
+};
 mod material;
 pub use material::{
     TlsAdmittedConnection, TlsClientHandshake, TlsExternalHandshakeMaterial, TlsHandshakeOutcome,
@@ -65,17 +71,17 @@ fn certificate_validity(certificate: &CertificateDer<'_>) -> Result<CertificateV
     })
 }
 
-fn certificate_not_after(certificate: &CertificateDer<'_>) -> Result<Timestamp, ()> {
-    certificate_validity(certificate).map(|validity| validity.not_after)
-}
-
-fn presented_certificate_chain_expires_at(
+fn presented_certificate_chain_validity(
     certificates: &[CertificateDer<'_>],
-) -> Result<Timestamp, ()> {
+) -> Result<CertificateValidity, ()> {
     let mut certificates = certificates.iter();
-    let first = certificates.next().ok_or(())?;
-    certificates.try_fold(certificate_not_after(first)?, |earliest, certificate| {
-        certificate_not_after(certificate).map(|expires_at| earliest.min(expires_at))
+    let first = certificate_validity(certificates.next().ok_or(())?)?;
+    certificates.try_fold(first, |interval, certificate| {
+        let next = certificate_validity(certificate)?;
+        Ok(CertificateValidity {
+            not_before: interval.not_before.max(next.not_before),
+            not_after: interval.not_after.min(next.not_after),
+        })
     })
 }
 
@@ -431,6 +437,15 @@ pub struct AuthenticatedClientConfig {
 }
 
 impl AuthenticatedClientConfig {
+    /// Give a reserved transport class its own bounded handshake allowance.
+    /// Clones of the returned configuration share this allowance; material epochs,
+    /// local identity, trust and source rotation remain shared with this config.
+    #[must_use]
+    pub fn with_independent_handshake_budget(mut self) -> Self {
+        self.controller = self.controller.with_independent_handshake_budget();
+        self
+    }
+
     /// Clone the shared rustls configuration for a connection or connector.
     pub fn rustls_config(&self) -> Arc<rustls::ClientConfig> {
         Arc::clone(&self.config)
@@ -481,6 +496,7 @@ impl AuthenticatedClientConfig {
             Arc::new(config),
             self.controller.clone(),
             snapshot,
+            self.validate_scope_profile().is_ok(),
         ))
     }
 
@@ -598,6 +614,15 @@ pub struct AuthenticatedServerConfig {
 }
 
 impl AuthenticatedServerConfig {
+    /// Give a reserved transport class its own bounded handshake allowance.
+    /// Clones of the returned configuration share this allowance; material epochs,
+    /// local identity, trust and source rotation remain shared with this config.
+    #[must_use]
+    pub fn with_independent_handshake_budget(mut self) -> Self {
+        self.controller = self.controller.with_independent_handshake_budget();
+        self
+    }
+
     /// Clone the shared rustls configuration for a connection or acceptor.
     pub fn rustls_config(&self) -> Arc<rustls::ServerConfig> {
         Arc::clone(&self.config)
@@ -637,6 +662,7 @@ impl AuthenticatedServerConfig {
             Arc::new(config),
             self.controller.clone(),
             snapshot,
+            self.validate_scope_profile().is_ok(),
         ))
     }
 
@@ -761,6 +787,8 @@ pub enum PeerSpiffeIdentityError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerTlsIdentity {
     spiffe_id: SpiffeId,
+    leaf_valid_from: Timestamp,
+    certificate_chain_valid_from: Timestamp,
     leaf_expires_at: Timestamp,
     certificate_chain_expires_at: Timestamp,
 }
@@ -775,6 +803,16 @@ impl PeerTlsIdentity {
     /// Canonical SPIFFE identity authenticated on this connection.
     pub const fn spiffe_id(&self) -> &SpiffeId {
         &self.spiffe_id
+    }
+
+    /// Beginning of the peer leaf certificate's validity interval.
+    pub const fn leaf_valid_from(&self) -> Timestamp {
+        self.leaf_valid_from
+    }
+
+    /// Latest not-before across every certificate presented by the peer.
+    pub const fn certificate_chain_valid_from(&self) -> Timestamp {
+        self.certificate_chain_valid_from
     }
 
     /// Peer leaf-certificate expiry authenticated on this connection.
@@ -826,14 +864,16 @@ fn peer_tls_identity(
     let leaf = peer_certificates
         .first()
         .ok_or(PeerSpiffeIdentityError::PeerCertificateUnavailable)?;
-    let leaf_expires_at =
-        certificate_not_after(leaf).map_err(|()| PeerSpiffeIdentityError::MalformedCertificate)?;
-    let certificate_chain_expires_at = presented_certificate_chain_expires_at(peer_certificates)
+    let leaf_validity =
+        certificate_validity(leaf).map_err(|()| PeerSpiffeIdentityError::MalformedCertificate)?;
+    let chain_validity = presented_certificate_chain_validity(peer_certificates)
         .map_err(|()| PeerSpiffeIdentityError::MalformedCertificate)?;
     Ok(PeerTlsIdentity {
         spiffe_id: extract_spiffe_id_from_cert_der(leaf.as_ref())?,
-        leaf_expires_at,
-        certificate_chain_expires_at,
+        leaf_valid_from: leaf_validity.not_before,
+        certificate_chain_valid_from: chain_validity.not_before,
+        leaf_expires_at: leaf_validity.not_after,
+        certificate_chain_expires_at: chain_validity.not_after,
     })
 }
 

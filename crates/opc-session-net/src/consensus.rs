@@ -1978,9 +1978,13 @@ pub struct RemoteSessionConsensusPeer {
     deadline_policy: ConsensusDeadlinePolicy,
     max_frame_size: usize,
     connection_pool: Arc<ConsensusConnectionPool>,
+    class_transports: Option<Arc<[classified::ClassTransport; 5]>>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 }
+
+mod classified;
+pub use classified::ClassifiedSessionConsensusServerHandle;
 
 impl fmt::Debug for RemoteSessionConsensusPeer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2100,6 +2104,7 @@ impl RemoteSessionConsensusPeer {
             // frame in its worst-case JSON byte-array expansion.
             max_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
             connection_pool: Arc::new(ConsensusConnectionPool::new(lifecycle_policy)),
+            class_transports: None,
             lifecycle_policy,
             reauthentication: SessionReauthenticationControl::new(),
         }
@@ -2112,6 +2117,7 @@ impl RemoteSessionConsensusPeer {
         // A clone-local wire budget cannot reuse a connection negotiated by a
         // differently configured clone.
         self.connection_pool = Arc::new(ConsensusConnectionPool::new(self.lifecycle_policy));
+        self.reset_class_pools();
         self
     }
 
@@ -2120,6 +2126,7 @@ impl RemoteSessionConsensusPeer {
     pub fn with_connection_lifecycle(mut self, policy: ConnectionLifecyclePolicy) -> Self {
         self.lifecycle_policy = policy;
         self.connection_pool = Arc::new(ConsensusConnectionPool::new(policy));
+        self.reset_class_pools();
         self
     }
 
@@ -2131,6 +2138,7 @@ impl RemoteSessionConsensusPeer {
     ) -> Self {
         self.reauthentication = control;
         self.connection_pool = Arc::new(ConsensusConnectionPool::new(self.lifecycle_policy));
+        self.reset_class_pools();
         self
     }
 
@@ -2765,6 +2773,28 @@ impl RemoteSessionConsensusPeer {
         required: Option<ConsensusCompatibility>,
         call_timeout: Duration,
     ) -> Result<ConsensusCallResponse, SessionConsensusPeerError> {
+        if let Some(transports) = &self.class_transports {
+            let class = opc_session_store::consensus::session_consensus_work_class(&request)?;
+            let transport = &transports[classified::class_index(class)?];
+            let mut selected = self.clone();
+            selected.target = transport.target.clone();
+            selected.connection_pool = transport.pool.clone();
+            selected.tls_config = transport.tls_config.clone();
+            selected.class_transports = None;
+            return selected
+                .call_with_selected_class(request, required, call_timeout)
+                .await;
+        }
+        self.call_with_selected_class(request, required, call_timeout)
+            .await
+    }
+
+    async fn call_with_selected_class(
+        &self,
+        request: SessionConsensusWireRequest,
+        required: Option<ConsensusCompatibility>,
+        call_timeout: Duration,
+    ) -> Result<ConsensusCallResponse, SessionConsensusPeerError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(call_timeout)
             .ok_or(SessionConsensusPeerError::Protocol)?;
@@ -2984,6 +3014,7 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         let mut peer = self.clone();
         peer.compatibility = Some(compatibility);
         peer.connection_pool = Arc::new(ConsensusConnectionPool::new(self.lifecycle_policy));
+        peer.reset_class_pools();
         Some(Arc::new(peer))
     }
 
@@ -4385,6 +4416,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod classified;
     mod negotiated_loss;
 
     use std::sync::atomic::AtomicUsize;

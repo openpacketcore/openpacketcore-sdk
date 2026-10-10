@@ -51,10 +51,10 @@ pub use store::test_support;
 #[doc(hidden)]
 pub use store::ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest;
 pub use store::{
-    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
-    ProtectedRosterConsensusDiagnosticSnapshot, SessionConsensusStatus,
-    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    session_consensus_work_class, validate_consensus_physical_fenced_transition_request,
+    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
+    ConsensusStoreDiagnosticSnapshot, ProtectedRosterConsensusDiagnosticSnapshot,
+    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,

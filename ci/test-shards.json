@@ -53,7 +53,11 @@
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction": "it-0",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof": "it-0",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss": "it-0",
-    "singleton_public_protected_flow_preserves_durable_state": "it-0"
+    "singleton_public_protected_flow_preserves_durable_state": "it-0",
+    "scope_transport::native_scope_tls_admission_receipt_after_ticket_change_and_irreversible_close": "it-0",
+    "scope_transport::native_scope_tls_boot_binding_survives_snapshot_leader_loss_and_full_reopen": "it-0",
+    "scope_transport::batch::native_scope_batch_emergency_survives_normal_and_unproven_pressure": "it-0",
+    "scope_transport::cross_slot::native_scope_shared_identity_cannot_sign_for_another_slots_boot": "it-0"
   },
   "_lib_groups_comment": [
     "Exact names keep moved groups disjoint from misc and from isolated timing contracts.",

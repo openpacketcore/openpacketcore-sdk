@@ -5,13 +5,87 @@ session-backend networking is retained only as an opt-in migration surface.
 
 ## Purpose
 
-The default crate surface exposes `RemoteSessionConsensusPeer` and
-`SessionConsensusServer`. It does not expose a client, listener, or public wire
-DTO capable of direct session mutation, raw replication-log append, or rebuild.
-Every production connection is bound to one authenticated member of an exact
-immutable replication manifest. A bounded membership-transition admission
-object can temporarily admit one validated successor manifest for Raft engine
-catch-up without granting that successor consumer mutation/read authority.
+The consensus surface exposes `RemoteSessionConsensusPeer` and
+`SessionConsensusServer`. Every production consensus connection is bound to one
+authenticated member of an exact immutable replication manifest. A bounded
+membership-transition admission object can temporarily admit one validated
+successor manifest for Raft engine catch-up without granting that successor
+consumer mutation/read authority. The separate `scope` module authenticates
+worker boot identities and typed scope operations; it exposes no raw
+replication-log append or rebuild operation.
+
+## Untimed scope transport
+
+The `scope` module implements RFC 026's worker channel over constrained mutual
+TLS 1.3. A shared SPIFFE identity does not identify a boot. `ScopeProcess` owns a
+fresh non-exportable boot key, process nonce, local exclusion lock and irreversible
+submission gate. Generate it before starting the worker's application tasks; the
+Linux process becomes non-dumpable. While a live predecessor holds the lock,
+`ScopeProcess::new` returns `StartupError::ExclusionBusy`; the startup loop
+retries automatically. Process exit releases the lock without removing its file
+or requiring node cleanup.
+
+`BootProofResponder` exposes only the fixed liveness and candidate proof
+exchanges to its configured issuer. `BootstrapIssuerClient` independently reads
+the exact running Pod, verifies its projected Pod-bound token offline, verifies
+the process proof on its own TLS stream, and revalidates the Pod observation.
+Activate `BootstrapCredentialVerifier` against the configured issuer discovery
+and keys before serving. Missing discovery access is an unsupported prerequisite;
+there is no TokenReview, cluster-wide grant or `pods/proxy` fallback.
+
+The issuer sends a bounded `IssuedTicketNotice` on the retained startup stream.
+Its generation and record reference are hints: `ScopeServer` independently reads
+the current issuance again before a new admission. Each streamed `ClosureNotice`
+exposes its canonical predecessor, typed closure evidence and optional immutable
+record reference so the worker can cite the predecessor it actually observes.
+The trusted installation
+ports (`KubernetesPodSource`, `IssuerKeySource`, `ScopeBootAuthority`,
+`ScopeClosureSource` and `ScopeLocalClosurePublisher`) must authenticate their
+fixed sources and enforce the namespaced enrollment documented in RFC 026. They
+must not accept caller-selected URLs or treat public record constructors as
+verification. The local closure publisher receives opaque SDK evidence only
+after submissions have closed and drained; its reader preserves the exact
+record for Close retries.
+
+`ScopeClient` prepares immutable native authority commands after acquiring
+scheduler resident capacity. Preserve each `PendingScopeAuthority` across uncertain
+attempts. An observer's cancellation does not cancel the supervised attempt.
+An exact outcome lookup releases its resolved resident credit and returns
+comparison facts; only a fresh authenticated own-admission response can return
+`CommittedScopeAuthority` and open local effects. `lookup_outcome` also resolves
+a predecessor's exact authority request without replaying that predecessor's
+mutation. `ScopeReadClient` provides controller/observer reads without worker
+capability delivery. Missing retained receipts remain `ReceiptUnavailable`,
+never evidence that an earlier operation had no effect.
+
+Use `ScopeClient::batches` with this boot's committed authority to obtain the
+shared `ScopeBatchCoordinator`. It reserves a lane before building a request,
+supervises exact apply/cancel attempts and retains one resident entitlement
+through uncertainty. Drain its completion stream and acknowledge each result
+after reconciliation. An Emergency waiter can promote an unresolved predecessor's
+retry onto the Emergency connection. Reopening the factory preserves lanes and
+unacknowledged completions. `batch_outcome` on either client reads a predecessor's
+exact attempt without its old key or mutation payload; Applied, Cancelled,
+NotApplied, NotRecorded and Pruned remain distinct.
+
+Install all five class listeners returned by `ScopeServer::serve`, and configure
+each voter hop with `RemoteSessionConsensusPeer::with_class_resolvers` and
+`SessionConsensusServer::listen_classified`. SafetyControl, established Emergency,
+EmergencyClassification, Normal and Maintenance have independent connection and
+execution capacity. Only a connection proving the committed current boot uses
+the reserved current-worker proof share. Class selection does not change native
+request bytes, digests or receipts.
+The native full ReadIndex barrier retains its existing FIFO admission, described
+in RFC 024. It still needs class arbitration before end-to-end isolation under
+arbitrary read pressure can be claimed.
+
+Authentication time can refuse an attempt; it never expires ownership or stops
+installed forwarding. Voluntary shutdown must first finish the application's
+emergency-session drain, then call `prepare_close` and deliver its exact Close.
+Close drains store/peer-control submissions and leaves installed forwarding
+alone. A restart submits its own `SucceedClosed` against the predecessor that
+actually committed. Controller-submitted succession and RFC 023 voter management
+remain deferred. Crossing the scope stored-format boundary is a fresh install.
 
 ## Fixed-quorum identity and placement contract
 

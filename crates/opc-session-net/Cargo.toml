@@ -58,6 +58,10 @@ path = "tests/session_store_facade.rs"
 name = "three_node_quorum"
 path = "tests/three_node_quorum.rs"
 
+[[test]]
+name = "scope_boot_identity"
+path = "tests/scope_boot_identity.rs"
+
 [features]
 default = []
 insecure-test = []
@@ -92,6 +96,12 @@ sha2 = { workspace = true }
 time = { workspace = true }
 rand = { workspace = true }
 opc-key = { path = "../opc-key", version = "0.2.0" }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+zeroize = { workspace = true }
+ring = "0.17.14"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["process", "fs"] }
 
 [dev-dependencies]
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
@@ -101,7 +111,6 @@ tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", 
 bytes = { workspace = true }
 futures-util = "0.3"
 rcgen = { workspace = true }
-p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile = "3"
 

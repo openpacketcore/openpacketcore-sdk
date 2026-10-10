@@ -2,8 +2,13 @@
 
 #![cfg(feature = "test-control")]
 
+#[path = "stateless_quorum_consumer/normal_forward_hold.rs"]
+mod normal_forward_hold;
 #[path = "stateless_quorum_consumer/publication_authority_failover.rs"]
 mod publication_authority_failover;
+#[cfg(target_os = "linux")]
+#[path = "stateless_quorum_consumer/scope_transport.rs"]
+mod scope_transport;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -785,6 +790,8 @@ struct ThreeVoterConsumerFleet {
     reauthentication: Vec<SessionReauthenticationControl>,
     address_slots: Vec<Arc<RwLock<Option<SocketAddr>>>>,
     servers: Vec<Option<SessionConsensusServerHandle>>,
+    class_servers: Vec<Option<crate::ClassifiedSessionConsensusServerHandle>>,
+    normal_reply_hold: Arc<normal_forward_hold::NormalReplyHold>,
     stores: Vec<ConsensusSessionStore>,
     backends: Vec<SqliteSessionBackend>,
     directory: Option<ThreeVoterFleetDirectory>,
@@ -820,6 +827,21 @@ impl Drop for ThreeVoterConsumerFleet {
 
 #[allow(dead_code)]
 impl ThreeVoterConsumerFleet {
+    async fn start_fixed_durable_classified(pki: Arc<TestPki>) -> Self {
+        Self::start_with_topology_and_classes(
+            pki,
+            None,
+            true,
+            None,
+            ThreeVoterFleetDirectory::Owned(tempfile::tempdir().unwrap()),
+            ThreeVoterFleetSnapshotDirectory::Owned(fs_verity_snapshot_tempdir(
+                "scope-class-voters-",
+            )),
+            None,
+            true,
+        )
+        .await
+    }
     async fn start(pki: Arc<TestPki>, read_barrier_delay: Option<Duration>) -> Self {
         Self::start_with_topology(pki, read_barrier_delay, false, None).await
     }
@@ -895,6 +917,30 @@ impl ThreeVoterConsumerFleet {
         snapshot_directory: ThreeVoterFleetSnapshotDirectory,
         inherited_guards: Option<ThreeVoterFleetRestartGuards>,
     ) -> Self {
+        Self::start_with_topology_and_classes(
+            pki,
+            read_barrier_delay,
+            fixed_durable,
+            roster_attestation_root,
+            directory,
+            snapshot_directory,
+            inherited_guards,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_topology_and_classes(
+        pki: Arc<TestPki>,
+        read_barrier_delay: Option<Duration>,
+        fixed_durable: bool,
+        roster_attestation_root: Option<RosterAttestationTrustRootV1>,
+        directory: ThreeVoterFleetDirectory,
+        snapshot_directory: ThreeVoterFleetSnapshotDirectory,
+        inherited_guards: Option<ThreeVoterFleetRestartGuards>,
+        classified: bool,
+    ) -> Self {
         let (test_gate, metrics_test_guard) = match inherited_guards {
             Some(ThreeVoterFleetRestartGuards {
                 test_gate,
@@ -966,6 +1012,9 @@ impl ThreeVoterConsumerFleet {
         let address_slots = (0..THREE_VOTER_COUNT)
             .map(|_| Arc::new(RwLock::new(None)))
             .collect::<Vec<_>>();
+        let class_slots = (0..THREE_VOTER_COUNT)
+            .map(|_| Arc::new(RwLock::new(None::<[SocketAddr; 5]>)))
+            .collect::<Vec<_>>();
         let mut path_enabled = BTreeMap::new();
         let read_barrier_calls = Arc::new(AtomicUsize::new(0));
         let delay_prewrite_empty_append_entries = Arc::new(AtomicBool::new(false));
@@ -1028,6 +1077,18 @@ impl ThreeVoterConsumerFleet {
                         pki.client_config(&three_voter_spiffe(index)),
                     )
                     .with_reauthentication_control(reauthentication[index].clone());
+                    let remote=if classified {
+                        remote.with_class_resolvers(std::array::from_fn(|class|{
+                            let slot=class_slots[target].clone();let enabled=enabled.clone();
+                            Arc::new(move|| -> futures_util::future::BoxFuture<'static,io::Result<SocketAddr>> {
+                                let slot=slot.clone();let enabled=enabled.clone();
+                                Box::pin(async move {
+                                    if !enabled.load(Ordering::Acquire){return Err(io::Error::other("isolated class path"));}
+                                    slot.read().unwrap().map(|addresses|addresses[class]).ok_or_else(||io::Error::other("class listener unavailable"))
+                                })
+                            }) as RemoteAddrResolver
+                        }))
+                    }else{remote};
                     let peer = Arc::new(GatedReadBarrierPeer {
                         inner: remote,
                         enabled: Arc::clone(&enabled),
@@ -1076,6 +1137,8 @@ impl ThreeVoterConsumerFleet {
             stores.push(store.expect("open three-voter consensus store"));
         }
         let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
+        let mut class_servers = Vec::with_capacity(THREE_VOTER_COUNT);
+        let normal_reply_hold = Arc::new(normal_forward_hold::NormalReplyHold::default());
         for index in 0..THREE_VOTER_COUNT {
             let binding = if fixed_durable {
                 manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
@@ -1083,19 +1146,41 @@ impl ThreeVoterConsumerFleet {
                 manifest.bind_local(three_voter_replica_id(index))
             }
             .expect("three-voter consensus server binding");
-            let (server, address) = SessionConsensusServer::new(
-                stores[index].rpc_handler(),
+            let native = stores[index].rpc_handler();
+            let native: Arc<dyn opc_session_store::SessionConsensusRpcHandler> = if classified {
+                Arc::new(normal_forward_hold::Handler {
+                    inner: native,
+                    hold: normal_reply_hold.clone(),
+                })
+            } else {
+                native
+            };
+            let server = SessionConsensusServer::new(
+                native,
                 pki.server_config(&three_voter_spiffe(index)),
                 binding,
             )
-            .with_reauthentication_control(reauthentication[index].clone())
-            .listen(
-                "127.0.0.1:0"
-                    .parse()
-                    .expect("three-voter consensus listener"),
-            )
-            .await
-            .expect("start three-voter consensus listener");
+            .with_reauthentication_control(reauthentication[index].clone());
+            if classified {
+                let handle = server
+                    .listen_classified([SocketAddr::from(([127, 0, 0, 1], 0)); 5])
+                    .await
+                    .unwrap();
+                *class_slots[index].write().unwrap() = Some(handle.addresses());
+                *address_slots[index].write().unwrap() = Some(handle.addresses()[0]);
+                class_servers.push(Some(handle));
+                servers.push(None);
+                continue;
+            }
+            class_servers.push(None);
+            let (server, address) = server
+                .listen(
+                    "127.0.0.1:0"
+                        .parse()
+                        .expect("three-voter consensus listener"),
+                )
+                .await
+                .expect("start three-voter consensus listener");
             *address_slots[index]
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
@@ -1120,6 +1205,8 @@ impl ThreeVoterConsumerFleet {
             reauthentication,
             address_slots,
             servers,
+            class_servers,
+            normal_reply_hold,
             stores,
             backends,
             directory: Some(directory),
@@ -1492,6 +1579,9 @@ impl ThreeVoterConsumerFleet {
         if let Some(server) = self.servers[node].take() {
             server.abort_and_wait().await;
         }
+        if let Some(server) = self.class_servers[node].take() {
+            server.abort_and_wait().await;
+        }
         *self.address_slots[node]
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -1552,6 +1642,9 @@ impl ThreeVoterConsumerFleet {
     /// handles have dropped; a consuming close or shadowed restart releases
     /// these guards too early. Intentional OS process-loss exits bypass Drop.
     async fn quiesce(&mut self) {
+        for server in self.class_servers.iter_mut().filter_map(Option::take) {
+            server.abort_and_wait().await;
+        }
         for enabled in self.path_enabled.values() {
             enabled.store(false, Ordering::Release);
         }
@@ -1591,6 +1684,7 @@ impl ThreeVoterConsumerFleet {
     /// therefore proves a full-fleet durable reopen rather than a client
     /// reconnect or a single-voter listener bounce.
     async fn restart_all(mut self) -> Self {
+        let classified = self.class_servers.iter().any(Option::is_some);
         self.quiesce().await;
         let pki = Arc::clone(&self.pki);
         let read_barrier_delay = self.read_barrier_delay;
@@ -1613,7 +1707,7 @@ impl ThreeVoterConsumerFleet {
             .take()
             .expect("full restart retains metric test isolation");
         drop(self);
-        Self::start_with_topology_in_directory(
+        Self::start_with_topology_and_classes(
             pki,
             read_barrier_delay,
             fixed_durable,
@@ -1624,6 +1718,7 @@ impl ThreeVoterConsumerFleet {
                 test_gate,
                 metrics_test_guard,
             }),
+            classified,
         )
         .await
     }

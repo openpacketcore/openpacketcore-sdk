@@ -99,6 +99,12 @@ QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
     "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
     "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
+    # These boot-key tests use isolated OS children and bounded held proof/reply
+    # credits. Run each alone so another native fleet cannot spend those bounds.
+    "scope_transport::native_scope_tls_admission_receipt_after_ticket_change_and_irreversible_close",
+    "scope_transport::native_scope_tls_boot_binding_survives_snapshot_leader_loss_and_full_reopen",
+    "scope_transport::batch::native_scope_batch_emergency_survives_normal_and_unproven_pressure",
+    "scope_transport::cross_slot::native_scope_shared_identity_cannot_sign_for_another_slots_boot",
 )
 QUIESCENT_CONSENSUS_OPENRAFT_TARGET = "consensus_openraft"
 QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (

@@ -26,7 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflicts. These changes join the single fresh-install scope profile 4;
   activation requires the combined implementation and qualification. See RFC 027.
 
-
+- `opc-session-net`: add authenticated scope boot admission, exact authority
+  retry and read-only predecessor resolution over mutual TLS 1.3. Process-owned
+  keys, independent ticket and closure verification, and irreversible local
+  submission gates bind authority to the boot that committed. A shared batch
+  coordinator retains exact apply/cancel attempts and unacknowledged results
+  across reply loss; successor outcome reads need no predecessor key. Reserved class
+  listeners and connections extend through voter forwarding. `opc-tls` supplies
+  channel/purpose bindings, full-interval certificate checks and independent
+  handshake budgets sharing the same material lifecycle. Authentication time
+  never expires scope ownership or installed forwarding; see RFC 026.
 - `opc-session-store`: add scope-fair backpressure with separate SafetyControl,
   established Emergency, EmergencyClassification, Normal and Maintenance budgets.
   Shared lanes have class ordering, an eight-bypass bound and dynamic priority
@@ -467,6 +476,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-session-net`: keep scope listeners alive after transient accept errors
+  and reconnect idle or rotated channels without marking unsent calls uncertain.
+  Pace persistent accept failures with bounded backoff. Commit complete API
+  termination messages through fixed-size hashes in closure evidence, recover
+  authentication after transient bootstrap or clock failures, and keep ticket
+  notice IDs stable across identical redelivery. Bind notice IDs to their complete
+  evidence contents and refresh predecessor hints without reissuing the ticket.
+  Allow one worker transport identity to hold explicit grants for several slots,
+  with independent proof allowances for each principal and slot. Retry Pod
+  observations while an enrolled container is pending, waiting or still shown
+  as terminated.
 
 - `opc-gtpu-dataplane`: wait for IPv6 address and gateway-neighbour readiness
   in all privileged datapath fixtures before packet assertions. Readiness

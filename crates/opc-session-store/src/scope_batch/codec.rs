@@ -128,6 +128,17 @@ impl ScopeBatchLookup {
 }
 
 impl ScopeBatchOutcome {
+    /// Match the original request digest and lane sequence without its child
+    /// payloads. The digest commits to the complete original request. This
+    /// comparison grants no authority; the caller must authenticate the result.
+    pub fn matches_attempt(&self, attempt: &ScopeBatchAttempt) -> bool {
+        self.validate().is_ok()
+            && attempt.validate().is_ok()
+            && self.request_digest == *attempt.request_digest()
+            && self.lane == attempt.lane()
+            && self.sequence == attempt.sequence()
+    }
+
     pub(super) fn validate(&self) -> Result<(), ScopeBatchError> {
         if usize::from(self.lane) >= SCOPE_BATCH_LANES
             || !(1..=COUNTER_MAX).contains(&self.sequence)
