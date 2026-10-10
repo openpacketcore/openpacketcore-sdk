@@ -267,6 +267,26 @@ impl NativeLog {
         Ok(())
     }
 
+    /// Admit one coherent read cut using the fixed frontier witnesses. The
+    /// separate proofs certify their own roots; these equations also bind the
+    /// applied business position and membership to this exact committed log.
+    /// Cold membership witnesses carry admitted metadata, so no historical
+    /// payload is read or retained here.
+    pub(super) fn require_coherent_business<'a>(
+        &self,
+        state: &'a NativeState,
+    ) -> io::Result<&'a Arc<super::changes::BusinessProof>> {
+        let (business, _) = self.require_proofs(state)?;
+        changes::validate_context(
+            &changes::LogFrontiers::of(self),
+            &state.members,
+            &state.frontiers,
+            state.snapshot_origin.as_deref(),
+            |index| self.entries.get(&index),
+        )?;
+        Ok(business)
+    }
+
     pub(crate) fn validate(&self, state: &NativeState) -> io::Result<()> {
         let mut previous: Option<LogId<SessionConsensusNodeId>> = None;
         for (index, row) in &self.entries {

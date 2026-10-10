@@ -3,7 +3,8 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
 };
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use std::{future::Future, pin::pin, task::Poll};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, RwLock};
 
 /// A local effect gate is not active, or is irreversibly closing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -14,6 +15,7 @@ const ACTIVE: u8 = 1;
 const CLOSING: u8 = 2;
 pub(super) struct EffectGate {
     phase: AtomicU8,
+    closing: Notify,
     inflight: Arc<RwLock<()>>,
     closed: tokio::sync::Mutex<Option<[u8; 32]>>,
 }
@@ -38,6 +40,7 @@ impl EffectGate {
     pub(super) fn new() -> Self {
         Self {
             phase: AtomicU8::new(CANDIDATE),
+            closing: Notify::new(),
             inflight: Arc::new(RwLock::new(())),
             closed: tokio::sync::Mutex::new(None),
         }
@@ -73,9 +76,36 @@ impl EffectGate {
         }
         Ok(ScopeEffectPermit { _guard: guard })
     }
+    /// Poll a read-only observation under the gate, releasing the permit at
+    /// every wait. Quiescence wakes and cancels pending observations, while
+    /// irreversible submissions must still retain `enter` through completion.
+    pub(super) async fn observe<F: Future>(&self, future: F) -> Result<F::Output, ScopeGateError> {
+        let mut future = pin!(future);
+        let mut entered = pin!(self.enter());
+        let mut closing = pin!(self.closing.notified());
+        closing.as_mut().enable();
+        std::future::poll_fn(|cx| {
+            if self.phase.load(Ordering::Acquire) != ACTIVE || closing.as_mut().poll(cx).is_ready()
+            {
+                return Poll::Ready(Err(ScopeGateError));
+            }
+            match entered.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Ready(Ok(permit)) => {
+                    let result = future.as_mut().poll(cx);
+                    drop(permit);
+                    entered.set(self.enter());
+                    result.map(Ok)
+                }
+            }
+        })
+        .await
+    }
     pub(super) async fn quiesce(&self) -> Result<LocalQuiescence, ScopeGateError> {
         // Set the refusal first. Cancellation while draining cannot reopen paths.
         self.phase.fetch_max(CLOSING, Ordering::AcqRel);
+        self.closing.notify_waiters();
         let _drain = self.inflight.write().await;
         let mut closed = self.closed.lock().await;
         let fence = match *closed {

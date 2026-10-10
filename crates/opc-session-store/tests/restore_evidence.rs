@@ -14,6 +14,10 @@ use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::sync::Arc;
 use std::time::Duration;
 
+fn open_raw_fixture(path: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(path).expect("raw sqlite")
+}
+
 #[derive(Debug)]
 struct FixedClock(Timestamp);
 
@@ -688,7 +692,7 @@ async fn sqlite_restore_rejects_legacy_stable_id_above_production_width() {
     let directory = tempfile::tempdir().expect("legacy stable ID directory");
     let path = directory.path().join("session.sqlite");
     let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
-    let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    let raw = open_raw_fixture(&path);
     raw.execute_batch("PRAGMA ignore_check_constraints = ON")
         .expect("allow legacy-invalid stable ID fixture");
     raw.execute(
@@ -840,7 +844,7 @@ async fn sqlite_restore_rejects_one_record_over_the_payload_byte_budget() {
     let directory = tempfile::tempdir().expect("oversized restore directory");
     let path = directory.path().join("session.sqlite");
     let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
-    let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    let raw = open_raw_fixture(&path);
     raw.execute(
         r#"
         INSERT INTO session_records (
@@ -875,7 +879,7 @@ async fn sqlite_restore_key_preflight_accepts_exact_and_rejects_one_over() {
         let directory = tempfile::tempdir().expect("key-bound restore directory");
         let path = directory.path().join("session.sqlite");
         let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
-        let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+        let raw = open_raw_fixture(&path);
         raw.execute_batch("PRAGMA ignore_check_constraints = ON")
             .expect("allow raw boundary fixture");
         raw.execute(
@@ -931,7 +935,7 @@ async fn sqlite_sparse_scope_does_not_load_excluded_oversized_payloads() {
     let directory = tempfile::tempdir().expect("sparse-payload restore directory");
     let path = directory.path().join("session.sqlite");
     let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
-    let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    let raw = open_raw_fixture(&path);
     for index in 0..3 {
         raw.execute(
             r#"
@@ -994,7 +998,7 @@ async fn sqlite_limit_one_does_not_decode_a_later_malformed_record() {
     )
     .await;
 
-    let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    let raw = open_raw_fixture(&path);
     raw.execute(
         r#"
         INSERT INTO session_records (
@@ -1024,7 +1028,7 @@ async fn sqlite_sparse_and_large_scans_make_bounded_seek_progress_without_gaps()
     let directory = tempfile::tempdir().expect("large restore directory");
     let path = directory.path().join("session.sqlite");
     let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
-    let mut raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    let mut raw = open_raw_fixture(&path);
     let tx = raw.transaction().expect("bulk insert transaction");
     {
         let mut insert = tx

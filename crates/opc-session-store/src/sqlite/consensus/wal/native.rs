@@ -9,6 +9,10 @@ use crate::consensus::native::{
 };
 use crate::consensus::verified_snapshot::{PortableSnapshot, VerifiedFile};
 
+#[path = "scope_scan.rs"]
+mod scope_scan;
+pub(crate) use scope_scan::NativeScopeScan;
+
 // Pace private snapshot output by file growth. This is not a dirty-memory
 // accounting limit: SQLite may retain pages or rewrite existing ones. The
 // finalizer still synchronizes and validates the complete pinned image.

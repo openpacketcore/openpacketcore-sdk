@@ -9,6 +9,7 @@ mod notice;
 mod policy;
 mod pool;
 mod proof;
+mod socket;
 mod wire;
 
 pub use boot::{BootError, BootIdentity};
@@ -88,6 +89,7 @@ pub use rpc::{
 };
 
 mod rpc_client;
+pub use rpc_client::scans::{ScopeScanPort, ScopeScanRemoteView};
 #[cfg(all(test, target_os = "linux"))]
 mod rpc_client_tests;
 mod rpc_server;

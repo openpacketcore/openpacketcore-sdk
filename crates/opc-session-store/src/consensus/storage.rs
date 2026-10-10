@@ -2975,6 +2975,14 @@ impl LiveTerminalRecoveryHandoffConsumer {
 }
 
 impl SqliteConsensusLogStore {
+    pub(crate) fn scope_views(&self) -> Arc<crate::scope_scan::backend::ScopeViewRegistry> {
+        Arc::clone(&self.core.scope_views)
+    }
+
+    pub(crate) fn scope_database(&self) -> Option<Arc<super::snapshot::PinnedSqliteFile>> {
+        self.core.database_file.clone()
+    }
+
     /// Retain a recovery-only terminal consumer before Openraft takes this log
     /// store.  The consumer is independent of Openraft reader clones but owns
     /// the same D1 namespace authority for its entire store lifetime.
@@ -5481,10 +5489,34 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         snapshot: Box<SessionSnapshotFile>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let install = SnapshotInstallGuard::begin(&self.core, meta).map_err(|error| *error)?;
-        let result = self
-            .install_snapshot_inner(meta, snapshot)
-            .await
-            .map_err(|error| *error);
+        let result = async {
+            let replacement = self
+                .core
+                .scope_views
+                .begin_replacement(crate::scope_scan::activity::ViewInvalidation::SnapshotInstalled)
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        io::Error::other(error),
+                    )
+                })?;
+            // Accepted workers retain captures even before acquiring their
+            // native operation permit. Drain them before taking `conn` or
+            // entering physical installation, so idle clients cannot block it.
+            replacement.drain().await;
+            self.install_snapshot_inner(meta, snapshot)
+                .await
+                .map_err(|error| *error)?;
+            replacement.complete().map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    io::Error::other(error),
+                )
+            })
+        }
+        .await;
         install.complete(&result);
         result
     }
@@ -8334,6 +8366,11 @@ fn reject_indeterminate_snapshot_publication(core: &SqliteConsensusCore) -> io::
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    mod scope_scans;
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    mod scope_snapshot_rows;
+
     use crate::test_process::CommandExt as _;
     use std::str::FromStr;
     use std::sync::Arc;

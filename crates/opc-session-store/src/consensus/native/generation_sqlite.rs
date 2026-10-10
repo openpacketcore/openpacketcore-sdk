@@ -507,7 +507,11 @@ impl<'a> SqlitePreparedBase<'a> {
             record,
             lease,
             fence,
-            reserved: source::reserved(&self.tx, key)?,
+            // This flag represents protected-roster ownership. Scope keys
+            // reject ordinary mutations through their reserved namespace,
+            // without acquiring a lease or protected-roster reservation.
+            reserved: !crate::scope_storage::is_scope_record_key(key)
+                && source::reserved(&self.tx, key)?,
         };
         validation::validate_key(key, &row, &context.business.frontiers)?;
         account(
@@ -598,6 +602,37 @@ impl<'a> SqlitePreparedBase<'a> {
             )
             .map_err(stored)?;
             self.key(&key, row.get(4).map_err(db)?, writer, &mut context)?;
+        }
+        // Scope authority, profile and inventory rows have zero ordinary
+        // fences. They are still durable business state and must survive
+        // SQL snapshot installation without fabricating key_fences entries.
+        // Visit only the disjoint missing-fence rows, borrowing one bounded
+        // key at a time through the same canonical row reader as above.
+        let mut scope_keys = self
+            .tx
+            .prepare(
+                "SELECT tenant,nf_kind,key_type,stable_id FROM session_records AS record \
+             WHERE key_type IN (?1,?2,?3,?4,?5,?6,?7) AND NOT EXISTS \
+             (SELECT 1 FROM key_fences AS fence WHERE fence.tenant=record.tenant \
+              AND fence.nf_kind=record.nf_kind AND fence.key_type=record.key_type \
+              AND fence.stable_id=record.stable_id) \
+             ORDER BY tenant,nf_kind,key_type,stable_id",
+            )
+            .map_err(db)?;
+        let mut scope_rows = scope_keys
+            .query(crate::scope_storage::RESERVED_KEY_TYPES)
+            .map_err(db)?;
+        while let Some(row) = scope_rows.next().map_err(db)? {
+            check()?;
+            let _memory = row_memory(1024)?;
+            let key = ops::persisted_session_key(
+                row.get(0).map_err(db)?,
+                row.get(1).map_err(db)?,
+                row.get(2).map_err(db)?,
+                row.get(3).map_err(db)?,
+            )
+            .map_err(stored)?;
+            self.key(&key, 0, writer, &mut context)?;
         }
         // A live V2 absence reservation can name a never-materialized key.
         // Its zero fence is a real native row, derived from signed admission.

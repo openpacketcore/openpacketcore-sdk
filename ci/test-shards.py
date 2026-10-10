@@ -105,6 +105,9 @@ QUIESCENT_LIB_TESTS = (
     "scope_transport::native_scope_tls_boot_binding_survives_snapshot_leader_loss_and_full_reopen",
     "scope_transport::batch::native_scope_batch_emergency_survives_normal_and_unproven_pressure",
     "scope_transport::cross_slot::native_scope_shared_identity_cannot_sign_for_another_slots_boot",
+    "scope_transport::scans::native_scope_scan_tls_keeps_one_cut_and_locally_revalidates_fresh_proofs",
+    "scope_transport::scans::native_scope_scan_tls_queued_open_releases_running_and_shutdown_drains",
+    "scope_transport::scans::native_scope_scan_tls_rejects_a_superseded_boot_on_existing_and_new_channels",
 )
 QUIESCENT_CONSENSUS_OPENRAFT_TARGET = "consensus_openraft"
 QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (

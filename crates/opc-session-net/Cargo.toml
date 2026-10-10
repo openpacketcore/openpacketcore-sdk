@@ -101,9 +101,11 @@ zeroize = { workspace = true }
 ring = "0.17.14"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 rustix = { version = "1.1.5", features = ["process", "fs"] }
 
 [dev-dependencies]
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }

@@ -80,6 +80,23 @@ evidence.
   `execute_classified` accepts the authenticated worker's own-scope Emergency,
   EmergencyClassification, Normal or Maintenance declaration outside the request
   digest. Typed authority operations alone use SafetyControl.
+- `scope_scan::ScopeScanStore` retains one coherent cut of children, sealed index
+  children and claims after a full quorum read barrier. Restore requires the exact
+  current `SucceedClosed` successor; every page checks authorization locally and
+  remains an observation, with current apply/effect fences still required.
+  Missing or corrupt items are final results while healthy items continue;
+  unverifiable claims stay held and unreadable claim keys prohibit new allocations.
+  `ScopeScanClient` streams through a caller-owned `ScopeScanSink`, discards old-cut
+  staging on restart, and returns `RestoreStalled` after a finite recovery budget.
+  `restore(sink, deadline)` and its `restore_until` alias require one caller-owned
+  deadline; waiting for capacity or the writer keeps its queue place and does not
+  spend that recovery budget. Expiry returns `DeadlineElapsed`.
+  Defaults are 256 rows per page, four retained views/readers, 512 MiB native
+  page/context reservation, a 1 GiB WAL admission mark and 30 seconds of idle time.
+  Active views are not evicted for pressure. Configure node limits with
+  `SqliteSessionBackend::with_scope_scan_limits`; inspect `ScopeScanStore::metrics`.
+  See [RFC 028](../../docs/rfc/028-coherent-scope-scans.md) for page acknowledgement,
+  malformed-key handling, resource ownership and the authenticated wire format.
 - `scope_scheduler` supplies independent resident/running budgets, scope fairness,
   retained retry entitlements and class-ordered shared-lane arbitration. Full
   capacity waits; it never creates an attach quota. The store preserves eight

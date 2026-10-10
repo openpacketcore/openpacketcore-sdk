@@ -21,6 +21,10 @@ fn database() -> (TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+fn open_fixture(path: &std::path::Path) -> Connection {
+    Connection::open(path).expect("open fixture")
+}
+
 fn limits(max_rows: u64, max_entry: u64, max_total: u64) -> SqliteIdentityAuditLimits {
     SqliteIdentityAuditLimits::try_new(max_rows, max_entry, max_total).expect("valid limits")
 }
@@ -149,7 +153,7 @@ fn relational_identity_violations_are_counted_without_values() {
     let (_dir, path) = database();
     let oversized_owner = "owner-sensitive".repeat(20);
     let oversized_key_type = "key-sensitive".repeat(20);
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     insert_session_record(&conn, 1, "", "valid-custom");
     insert_lease(&conn, 2, &oversized_owner, "");
     insert_fence(&conn, 3, &oversized_key_type);
@@ -170,7 +174,7 @@ fn relational_identity_violations_are_counted_without_values() {
 #[test]
 fn stable_id_audit_covers_exact_bounds_and_sqlite_types_without_values() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     conn.execute_batch("PRAGMA ignore_check_constraints = ON")
         .expect("allow legacy-invalid audit fixtures");
     for (rowid, stable_id) in [
@@ -230,7 +234,7 @@ fn exact_utf8_byte_limits_pass_and_one_over_fails() {
     let (_dir, path) = database();
     let exact_owner = "é".repeat(OWNER_ID_MAX_BYTES / 2);
     let exact_key_type = "é".repeat(SESSION_KEY_TYPE_MAX_BYTES / 2);
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     insert_session_record(&conn, 1, &exact_owner, &exact_key_type);
     insert_lease(
         &conn,
@@ -250,7 +254,7 @@ fn exact_utf8_byte_limits_pass_and_one_over_fails() {
 #[test]
 fn strict_replication_decode_reuses_nested_identity_validation() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     let valid = serde_json::to_string(&replication_entry(1, "owner-a")).expect("valid JSON");
     insert_replication_json(&conn, 1, &valid);
 
@@ -276,7 +280,7 @@ fn strict_replication_decode_reuses_nested_identity_validation() {
 #[test]
 fn replication_transaction_id_audit_is_exact_bounded_and_cross_checks_json() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     conn.execute_batch("PRAGMA ignore_check_constraints = ON")
         .expect("allow legacy-invalid audit fixtures");
 
@@ -354,7 +358,7 @@ fn absolute_expiry_audit_uses_explicit_reference_and_reports_counts_only() {
             .checked_add(time::Duration::nanoseconds(1))
             .expect("plus one"),
     );
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     for (rowid, class, expires_at) in [
         (1_i64, "authoritative-session", None),
         (2_i64, "ephemeral-procedure", None),
@@ -441,7 +445,7 @@ fn replication_cas_expiry_audit_is_bound_to_entry_timestamp() {
         },
     };
     let encoded = serde_json::to_string(&entry).expect("entry JSON");
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     insert_replication_json(&conn, 1, &encoded);
     drop(conn);
 
@@ -479,7 +483,7 @@ async fn duplicate_json_fields_match_runtime_rejection_and_exact_audit_counters(
             "runtime typed decode must reject duplicate {duplicate}"
         );
 
-        let conn = Connection::open(&path).expect("open fixture");
+        let conn = open_fixture(&path);
         insert_replication_json(&conn, 1, &encoded);
         drop(conn);
 
@@ -511,7 +515,7 @@ async fn duplicate_json_fields_match_runtime_rejection_and_exact_audit_counters(
 #[test]
 fn replication_json_sequence_must_match_a_positive_stored_sequence() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     conn.execute_batch("PRAGMA ignore_check_constraints = ON")
         .expect("disable fixture check constraints");
     let first = serde_json::to_string(&replication_entry(1, "owner-a")).expect("entry JSON");
@@ -531,7 +535,7 @@ fn replication_json_sequence_must_match_a_positive_stored_sequence() {
 #[test]
 fn row_budget_is_exact_and_never_returns_a_partial_pass() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     insert_fence(&conn, i64::MIN, "custom-a");
     insert_fence(&conn, 9, "custom-b");
     drop(conn);
@@ -554,7 +558,7 @@ fn row_budget_is_exact_and_never_returns_a_partial_pass() {
 #[test]
 fn keyset_paging_crosses_the_fixed_page_boundary() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     conn.execute(
         r#"
         WITH RECURSIVE counter(value) AS (
@@ -580,7 +584,7 @@ fn keyset_paging_crosses_the_fixed_page_boundary() {
 #[test]
 fn replication_json_budgets_fail_incomplete_before_claiming_validity() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     let first = serde_json::to_string(&replication_entry(1, "owner-a")).expect("entry JSON");
     let second = serde_json::to_string(&replication_entry(2, "owner-b")).expect("entry JSON");
     insert_replication_json(&conn, 1, &first);
@@ -683,7 +687,7 @@ fn case_insensitive_rowid_shadow_is_not_certified() {
 #[test]
 fn malformed_replication_json_is_a_count_only_violation() {
     let (_dir, path) = database();
-    let conn = Connection::open(&path).expect("open fixture");
+    let conn = open_fixture(&path);
     let sensitive = r#"{"owner":"raw-owner-must-not-leak""#;
     insert_replication_json(&conn, 1, sensitive);
     drop(conn);

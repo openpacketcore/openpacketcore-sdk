@@ -151,6 +151,11 @@ impl ScopePolicy {
                 | Method::BatchCancel
                 | Method::BatchLookup,
             ) => class != Class::SafetyControl,
+            (
+                ScopeRole::Worker,
+                Method::ScanOpen | Method::ScanPage | Method::ScanLookup | Method::ScanClose,
+            ) => class == Class::Normal,
+            (ScopeRole::Worker, Method::ScanClassify) => class == Class::EmergencyClassification,
             (ScopeRole::Controller | ScopeRole::Observer, Method::Current | Method::Outcome) => {
                 class == Class::SafetyControl
             }

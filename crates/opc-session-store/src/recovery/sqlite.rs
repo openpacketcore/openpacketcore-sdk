@@ -42,6 +42,10 @@ use crate::{
     REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 
+#[cfg(test)]
+#[path = "sqlite/scope_scan_schema_tests.rs"]
+mod scope_scan_schema_tests;
+
 const PATH_MAX_BYTES: usize = 4_096;
 #[cfg(any(target_os = "linux", test))]
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3010,6 +3014,8 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
         }
     }
     let has_restore_scan_state = validate_restore_scan_schema_if_present(conn)?;
+    let scan_indexes = crate::sqlite::scope_scan::schema::optional_object_count(conn, false)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut expected = BTreeSet::from([
         "key_fences".to_string(),
         "lease_globals".to_string(),
@@ -3032,10 +3038,11 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
         .map_err(|_| RecoveryError::CorruptReplica)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    if objects.len() != expected.len()
-        || objects
-            .iter()
-            .any(|(kind, name)| kind != "table" || !expected.contains(name))
+    if objects.len() != expected.len() + scan_indexes
+        || objects.iter().any(|(kind, name)| {
+            !((kind == "table" && expected.contains(name))
+                || (kind == "index" && crate::sqlite::scope_scan::schema::is_index_name(name)))
+        })
     {
         return Err(RecoveryError::CorruptReplica);
     }
@@ -3449,10 +3456,12 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
         .query([])
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut manifest = BTreeMap::new();
+    let mut object_count = 0;
     while let Some(row) = rows.next().map_err(|_| RecoveryError::CorruptReplica)? {
-        if manifest.len() == maximum_objects {
+        if object_count == maximum_objects {
             return Err(RecoveryError::CorruptReplica);
         }
+        object_count += 1;
         let kind = row
             .get::<_, String>(0)
             .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -3464,6 +3473,12 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
             .map_err(|_| RecoveryError::CorruptReplica)?
             .ok_or(RecoveryError::CorruptReplica)?;
         if kind == "index" {
+            if crate::sqlite::scope_scan::schema::is_index_name(&name) {
+                if !crate::sqlite::scope_scan::schema::matches_definition(&name, &sql) {
+                    return Err(RecoveryError::CorruptReplica);
+                }
+                continue;
+            }
             let expected = match name.as_str() {
                 "consensus_fenced_transition_receipts_due" => normalize_schema_sql(
                     "CREATE INDEX consensus_fenced_transition_receipts_due ON consensus_fenced_transition_receipts (retained_until, request_id) WHERE response_json IS NOT NULL",

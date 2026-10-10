@@ -79,6 +79,7 @@ pub mod test_support {
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
+pub(crate) mod scope_scan;
 
 #[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
@@ -625,6 +626,10 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 #[allow(clippy::type_complexity)]
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
+    // All backend clones serialize initialization of their next view owner.
+    scope_scan_generation:
+        Arc<tokio::sync::Mutex<Option<Arc<crate::scope_scan::backend::ScopeViewRegistry>>>>,
+    scope_scan_limits: Arc<StdMutex<crate::scope_scan::ScopeScanLimits>>,
     pub(crate) fenced_transition_profile: crate::FencedTransitionV2Profile,
     #[cfg(target_os = "linux")]
     pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
@@ -1306,6 +1311,14 @@ impl SqliteSessionBackend {
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
+        // Disjoint, non-authoritative scan indexes keep damaged physical keys
+        // from starving healthy rows and never retain an oversized key as a
+        // continuation. The malformed index's implicit rowid is the exact
+        // locator within a retained read transaction.
+        scope_scan::schema::install(&conn).map_err(|_| {
+            StoreError::BackendUnavailable("scope scan indexes are unavailable".into())
+        })?;
+
         // Local, non-authoritative metadata for opaque bounded restore
         // cursors. The epoch distinguishes database incarnations while the
         // revision invalidates pagination whenever visible record state
@@ -1428,6 +1441,10 @@ impl SqliteSessionBackend {
             #[cfg(all(test, target_os = "linux"))]
             private_wal_test: None,
             terminal_recovery_handoff: Arc::new(StdMutex::new(None)),
+            scope_scan_generation: Arc::new(tokio::sync::Mutex::new(None)),
+            scope_scan_limits: Arc::new(StdMutex::new(
+                crate::scope_scan::ScopeScanLimits::default(),
+            )),
             consensus_acceptance_reader_pool,
             database_path: database_path.map(Arc::new),
             checkpoint_vfs_name: None,

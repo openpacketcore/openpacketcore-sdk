@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store` and `opc-session-net`: add coherent, paged restore of a
+  positively handed-over scope across native and SQLite storage and authenticated
+  worker TLS. Same-cut children, index children and claims carry final per-item
+  failure results; corrupt claims remain held and unreadable claim keys make
+  allocation inventory incomplete. Active captures queue fairly within bounded
+  retention, replay one acknowledged page at a time, and drain on replacement or
+  store shutdown. `ScopeScanClient::restore` and `restore_until` require an overall
+  deadline and return `ScopeScanClientError::DeadlineElapsed` on expiry. A streaming
+  client owns finite backoff/reopen and staging discard; queue and writer waits
+  retain their place without spending retries. `ScopeScanError::CapacityRefused`
+  reports a fixed reservation that cannot fit the configured budget. Linux scope
+  sockets use TCP keepalive and a 10 s user timeout via `socket2` to detect lost
+  peers; pending reads release the process gate so graceful Close can proceed.
+  These observations grant no mutation/effect authority. The implementation joins
+  fresh-install scope profile 4, pending combined qualification; see RFC 028.
+
 - `opc-session-store`: add eight independently sequenced scope batch lanes,
   reserving one for established Emergency work. Compare complete child and claim
   read sets atomically, retain exact apply/cancel winners, and preserve all lane,
@@ -522,6 +538,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Go operators: update `golang.org/x/net` to v0.60.0 and require Go 1.26.9 in
   `operator-sdk-go` and `sdk-reference-operator` to address GO-2026-6617 and
   the related standard-library vulnerabilities.
+
+- `opc-session-store`: validate the exact pair of derived scope-scan indexes
+  during recovery and snapshot schema checks. Preserve existing layouts without
+  them and count the pair separately from authority schema budgets; incomplete
+  or altered pairs remain invalid. Index definitions use only SQLite built-ins,
+  preserving writes, integrity checks and VACUUM by older SDKs and plain SQLite.
+
+- `opc-session-store`: preserve scope profile activation, authority, checkpoints
+  and inventory when rebuilding a native generation from a SQLite snapshot.
+  Scope rows have no ordinary key fence; installation now includes those rows
+  without assigning ordinary lease or protected-roster ownership.
 
 - `opc-session-store`: release the held Async writer synchronously before the
   shutdown fixture's final bounded call, with its rescue thread held until that

@@ -159,7 +159,10 @@ result; an old binary rejects the extended store's format before participation.
 Snapshot export, installation, cold receipt reads, and reopening preserve and
 check the immutable profile. A snapshot cannot convert a store's profile.
 The schema bound counts the admitted schema: 44 objects for the complete
-original layout and 45 with the void marker. Both roster profiles and dynamic
+original layout and 45 with the void marker. The exact pair of derived scope
+scan indexes has an independent two-object allowance, so indexed layouts have
+46 or 47 objects respectively; missing, altered or unrelated objects cannot
+claim that allowance. Both roster profiles and dynamic
 membership remain supported. Offline recovery validates and hashes the marker
 and decodes receipts under the selected profile. Only a void-profile store
 probes its voters during readiness and reports

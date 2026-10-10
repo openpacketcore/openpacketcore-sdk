@@ -46,7 +46,7 @@ pub(crate) const RESERVED_KEY_TYPES: [&str; 7] = [
     CONTINUATION,
 ];
 pub(crate) const MAX_SCOPE_ROW_BYTES: usize = MAX_SCOPE_CHILD_VALUE_BYTES + 4096;
-const MAX_METADATA_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_METADATA_BYTES: usize = 16 * 1024;
 
 /// Recognize the declared fresh-install boundary without decoding or migrating
 /// a previous row. Unknown or malformed current formats remain corruption.
@@ -143,6 +143,29 @@ pub(crate) fn namespace_prefix(namespace: &ScopeNamespace) -> Result<[u8; 32], S
     hash.update(b"openpacketcore/scope-namespace/key/v4\0");
     hash.update(postcard::to_allocvec(namespace).map_err(|_| ScopeBatchError::FormatMismatch)?);
     Ok(hash.finalize().into())
+}
+
+/// Detect a damaged physical namespace prefix from a bounded current-format
+/// child/claim header. This is diagnostic indexing, never scope authority or a
+/// compatibility reader. An unreadable header remains a per-item encoding
+/// failure in the physical namespace; without an independent manifest, damage
+/// to both the prefix and that header cannot be attributed to a scope.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn scope_scan_prefix_mismatch(stable_id: &[u8], payload: &[u8]) -> bool {
+    if stable_id.len() < 32 || !payload.starts_with(MAGIC) {
+        return false;
+    }
+    // The two Postcard enum tags and leading namespace fields are fixed by
+    // ScopeRow::Child/Claim. Never decode or copy the potentially 4 MiB body.
+    if !matches!(payload.get(MAGIC.len()), Some(1 | 2)) {
+        return false;
+    }
+    let start = MAGIC.len() + 1;
+    let header = &payload[start..payload.len().min(start + 4096)];
+    let Ok((namespace, _)) = postcard::take_from_bytes::<ScopeNamespace>(header) else {
+        return false;
+    };
+    namespace_prefix(&namespace).is_ok_and(|prefix| !stable_id.starts_with(&prefix))
 }
 
 /// Sole full-key codec: the canonical 32-byte namespace commitment followed
@@ -362,6 +385,37 @@ impl ScopeRow {
         }
         Ok(bytes)
     }
+    /// Scan transports share these exact stored child/claim bytes. Other row
+    /// kinds cannot enter an inventory envelope through this narrow decoder.
+    pub(crate) fn inventory_body(&self) -> Result<Vec<u8>, ScopeBatchError> {
+        if !matches!(self, Self::Child(_) | Self::Claim(_)) {
+            return Err(ScopeBatchError::FormatMismatch);
+        }
+        self.body()
+    }
+    pub(crate) fn from_inventory_body(bytes: &[u8]) -> Result<Self, ScopeBatchError> {
+        // The current stored enum encodes Child=1 and Claim=2. Reject every
+        // other kind before its nested metadata can be allocated.
+        if !matches!(bytes.get(MAGIC.len()), Some(1 | 2)) {
+            return Err(ScopeBatchError::FormatMismatch);
+        }
+        let row = Self::decode_body(bytes)?;
+        if row.inventory_body()? != bytes {
+            return Err(ScopeBatchError::FormatMismatch);
+        }
+        Ok(row)
+    }
+    fn decode_body(bytes: &[u8]) -> Result<Self, ScopeBatchError> {
+        if bytes.len() > MAX_SCOPE_ROW_BYTES || !bytes.starts_with(MAGIC) {
+            return Err(ScopeBatchError::FormatMismatch);
+        }
+        let (row, trailing): (Self, &[u8]) = postcard::take_from_bytes(&bytes[MAGIC.len()..])
+            .map_err(|_| ScopeBatchError::FormatMismatch)?;
+        if !trailing.is_empty() {
+            return Err(ScopeBatchError::FormatMismatch);
+        }
+        Ok(row)
+    }
     pub(crate) fn to_record(&self) -> Result<StoredSessionRecord, ScopeBatchError> {
         Ok(StoredSessionRecord {
             key: self.key()?,
@@ -383,9 +437,8 @@ impl ScopeRow {
         {
             return Err(ScopeBatchError::FormatMismatch);
         }
-        let (row, trailing): (Self, &[u8]) = postcard::take_from_bytes(&bytes[MAGIC.len()..])
-            .map_err(|_| ScopeBatchError::FormatMismatch)?;
-        if !trailing.is_empty() || row.to_record()? != *record {
+        let row = Self::decode_body(bytes)?;
+        if row.to_record()? != *record {
             return Err(ScopeBatchError::FormatMismatch);
         }
         Ok(row)

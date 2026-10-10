@@ -17,7 +17,7 @@ pub struct ScopeProfileActivation {
 
 pub(crate) fn scope_profile_digest() -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"openpacketcore/scope-store/profile/4/untimed-authority/boot-key-1/closure-1/stable-counter-birth-floors/initialized-ledger-1/namespace-1/batch-3/lanes-8/independent-lanes-1/exact-cancel-1/complete-read-set-1/coherent-reopen-1/monotone-lane-receipts-1/membership-continuity-1\0");
+    hash.update(b"openpacketcore/scope-store/profile/4/untimed-authority/boot-key-1/closure-1/stable-counter-birth-floors/initialized-ledger-1/namespace-1/batch-3/lanes-8/independent-lanes-1/exact-cancel-1/complete-read-set-1/coherent-reopen-1/monotone-lane-receipts-1/membership-continuity-1/coherent-restore-scan-1\0");
     for limit in [
         MAX_SCOPE_AUTHORITY_RECORD_BYTES,
         crate::scope_batch::MAX_SCOPE_BATCH_CHILDREN,

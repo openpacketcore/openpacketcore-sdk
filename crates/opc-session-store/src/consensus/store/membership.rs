@@ -2103,6 +2103,8 @@ impl ConsensusSessionStore {
                 roster_attestation_trust_root.clone(),
             )
             .await?;
+        let scope_views = log_store.scope_views();
+        let scope_database = log_store.scope_database();
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let terminal_recovery_handoff_consumer =
@@ -2165,6 +2167,10 @@ impl ConsensusSessionStore {
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
+            scope_views,
+            #[cfg(any(test, feature = "test-control"))]
+            scope_read_barriers_for_test: AtomicU64::new(0),
+            scope_database,
             #[cfg(target_os = "linux")]
             private_wal: None,
             terminal_recovery_handoff_consumer,

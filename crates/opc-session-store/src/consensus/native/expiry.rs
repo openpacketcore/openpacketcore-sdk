@@ -1,7 +1,8 @@
 //! Derived resident business indexes. Full admission rebuilds these from every
 //! admitted key; publication updates only changed keys. Snapshot captures share
-//! immutable tree roots. Their resident nodes count toward the existing process
-//! RSS limit; they contain no file-verification certificate or decoded payload.
+//! immutable tree roots. The scope-record root additionally shares raw immutable
+//! records and charges their complete retained footprint for scan admission.
+//! None of these indexes retains a file-verification certificate.
 
 use super::*;
 use std::cmp::Ordering;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 // and reserving the full key width in every tree slot. Ordering and equality
 // still compare the original values, never the allocation address.
 #[derive(Clone, PartialEq, Eq)]
-struct OrderedKey(Arc<SessionKey>);
+pub(super) struct OrderedKey(pub(super) Arc<SessionKey>);
 
 impl Ord for OrderedKey {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -55,6 +56,7 @@ impl PartialOrd for OrderedKey {
 pub(super) struct ExpiryIndex {
     records: imbl::OrdSet<(Timestamp, OrderedKey)>,
     ordered_records: imbl::OrdSet<OrderedKey>,
+    scope_records: scope_records::ScopeRecordIndex,
     leases: imbl::OrdSet<(Timestamp, OrderedKey)>,
     released: imbl::OrdSet<OrderedKey>,
     v1_due: imbl::OrdSet<(Timestamp, [u8; 16])>,
@@ -115,6 +117,10 @@ impl ExpiryIndex {
         before: Option<&NativeKeyState>,
         after: Option<&NativeKeyState>,
     ) {
+        if crate::scope_storage::is_scope_record_key(key) {
+            self.scope_records
+                .replace(key, after.and_then(|row| row.record.as_ref()));
+        }
         let key = OrderedKey(Arc::new(key.clone()));
         if let Some(before) = before {
             if before.record.is_some() {
@@ -148,16 +154,30 @@ impl ExpiryIndex {
         }
     }
 
+    pub(super) fn scope_records(&self) -> &scope_records::ScopeRecordIndex {
+        &self.scope_records
+    }
+
     pub(super) fn ordered_records(
         &self,
         after: Option<&SessionKey>,
     ) -> impl Iterator<Item = &SessionKey> {
         use std::ops::Bound::{Excluded, Unbounded};
-        let start = after
-            .map(|key| Excluded(OrderedKey(Arc::new(key.clone()))))
-            .unwrap_or(Unbounded);
+        self.ordered_record_range(after.map(Excluded).unwrap_or(Unbounded), Unbounded)
+    }
+
+    /// Seek in the admitted immutable index without materializing its rows.
+    /// Included namespace bounds preserve malformed prefix-only keys for the
+    /// caller's per-item inspection; continuation bounds remain exclusive.
+    pub(super) fn ordered_record_range(
+        &self,
+        lower: std::ops::Bound<&SessionKey>,
+        upper: std::ops::Bound<&SessionKey>,
+    ) -> impl Iterator<Item = &SessionKey> {
+        let lower = lower.map(|key| OrderedKey(Arc::new(key.clone())));
+        let upper = upper.map(|key| OrderedKey(Arc::new(key.clone())));
         self.ordered_records
-            .range((start, Unbounded))
+            .range((lower, upper))
             .map(|key| key.0.as_ref())
     }
 
@@ -180,6 +200,10 @@ impl ExpiryIndex {
             })
     }
 }
+
+#[cfg(test)]
+#[path = "expiry_scope_scan_tests.rs"]
+mod scope_scan_tests;
 
 #[cfg(test)]
 mod tests {
