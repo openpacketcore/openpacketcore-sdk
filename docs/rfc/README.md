@@ -37,6 +37,7 @@ engineers.
 | [024](024-scope-priority-scheduler.md) | Scope work priorities and backpressure | Implemented class isolation, shared-lane arbitration and class-aware proposal admission; composed lane and authenticated transport qualification remain separate. |
 | [025](025-local-kernel-lifecycle.md) | Exact Local Kernel Lifecycle | Accepted design for untimed local discovery, transient containment, exact reset/readback and supervised undo; implementation qualification remains separate. |
 | [026](026-scope-authenticated-transport.md) | Authenticated scope and voter management transport | Worker scope admission and batch recovery with normative bootstrap, closure and wire vectors; voter management follows RFC 023 helpers. Runtime qualification remains separate. |
+| [030](030-ike-recovery-profile.md) | IKE recovery profile and lifecycle qualification | Implemented SDK contract and deterministic reference composition for CAS, replay, handshake/rekey and pending-KE custody; consumer infrastructure and deployment qualification remain separate. |
 | [031](031-bounded-snaptr-discovery.md) | Bounded S-NAPTR peer discovery | Implemented bounded host prefixes, branch provenance, root classification and DNS freshness; code review and qualification pending. |
 
 ## Recommended Reading Order

@@ -212,6 +212,16 @@ pub const IKEV2_NOTIFY_DEVICE_IDENTITY: u16 = 41_101;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT: u16 = 41_304;
 
+/// IKEv2 Notify status type for INITIAL_CONTACT.
+///
+/// This is an assertion about authenticated peer identity, not a liveness probe.
+/// It belongs in the first IKE_AUTH request or response. Decoding alone never
+/// authorizes removal of another SA.
+///
+/// @spec IETF RFC7296 2.4, 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INITIAL_CONTACT: u16 = 16_384;
+
 /// Protocol ID used by IKE-level notifications with no protocol-specific SPI.
 pub const IKEV2_NOTIFY_PROTOCOL_ID_NONE: u8 = 0;
 
@@ -354,6 +364,85 @@ impl<'a> Ikev2NotifyPayload<'a> {
     pub const fn has_empty_protocol_spi(self) -> bool {
         self.protocol_id == IKEV2_NOTIFY_PROTOCOL_ID_NONE && self.spi_size == 0
     }
+}
+
+/// Structurally valid INITIAL_CONTACT for the supported recovery profile.
+///
+/// Obtain this only through [`decode_ikev2_initial_contact_notify`]. The caller
+/// must additionally authenticate the enclosing first IKE_AUTH and match the
+/// authenticated identity before selecting other SAs for cleanup. This value
+/// carries no authentication, persistence or deletion authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2InitialContact {
+    _private: (),
+}
+
+impl fmt::Debug for Ikev2InitialContact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Ikev2InitialContact")
+    }
+}
+
+/// Structural refusal of INITIAL_CONTACT; contains no packet or identity bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2InitialContactNotifyError {
+    /// The declared SPI Size was not zero.
+    SpiSizeNonzero,
+    /// SPI bytes were present despite a zero SPI Size.
+    SpiNonempty,
+    /// Notification data was present.
+    NotificationDataNonempty,
+}
+
+impl Ikev2InitialContactNotifyError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpiSizeNonzero => "ike_initial_contact_spi_size_nonzero",
+            Self::SpiNonempty => "ike_initial_contact_spi_nonempty",
+            Self::NotificationDataNonempty => "ike_initial_contact_notification_data_nonempty",
+        }
+    }
+}
+
+impl fmt::Display for Ikev2InitialContactNotifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2InitialContactNotifyError {}
+
+/// Decode one INITIAL_CONTACT using the recovery profile's strict empty shape.
+///
+/// Unrelated types return `Ok(None)`. The lossless Notify view is left intact.
+/// Protocol ID is ignored for this empty-SPI notification (RFC 7296 §3.10).
+/// This structural helper cannot establish authenticated identity, first-IKE_AUTH
+/// placement or which other SAs may be removed; the consumer supplies those checks.
+///
+/// # Errors
+/// Returns the first nonzero SPI Size or nonempty SPI/data field,
+/// in wire order. No private packet content is included in errors.
+///
+/// @spec IETF RFC7296 2.4, 3.10, 3.10.1
+/// @conformance boundary-only
+pub const fn decode_ikev2_initial_contact_notify(
+    notify: Ikev2NotifyPayload<'_>,
+) -> Result<Option<Ikev2InitialContact>, Ikev2InitialContactNotifyError> {
+    if notify.notify_message_type != IKEV2_NOTIFY_INITIAL_CONTACT {
+        return Ok(None);
+    }
+    if notify.spi_size != 0 {
+        return Err(Ikev2InitialContactNotifyError::SpiSizeNonzero);
+    }
+    if !notify.spi.is_empty() {
+        return Err(Ikev2InitialContactNotifyError::SpiNonempty);
+    }
+    if !notify.notification_data.is_empty() {
+        return Err(Ikev2InitialContactNotifyError::NotificationDataNonempty);
+    }
+    Ok(Some(Ikev2InitialContact { _private: () }))
 }
 
 /// Validated RFC 5998 EAP_ONLY_AUTHENTICATION signal.

@@ -88,6 +88,13 @@ impl<P: RecoveryProfile> ReceiveState<P> {
         self.replies = None;
         self.last_empty = None;
     }
+
+    pub(super) fn check_cached_reply(&self) -> Result<(), Error> {
+        if let Some(replies) = &self.replies {
+            replies.check_live().map_err(Error::Canonical)?;
+        }
+        Ok(())
+    }
 }
 
 /// What an admitted empty request establishes about freshness (RFC 7296 §2.4).
@@ -211,7 +218,9 @@ impl<P: RecoveryProfile> Window<P> {
     /// newer requests retire older canonical cache entries. The next nonempty
     /// request commits its result and the repaired floor through `prepare_response`.
     ///
-    /// Every invocation, including a cache hit, rechecks `ready()` and admission.
+    /// Every invocation, including a cache hit, rechecks lifecycle and admission.
+    /// An uncertain outbound-only write permits this read-only path; uncertain
+    /// inbound/sync writes or quiescence without a witness keep blocking.
     /// Failed canonical evaluations retain their request identity and charged
     /// attempt history, but advance no receive counter or liveness/effect authority.
     /// Authenticated admitted IDs still join the volatile RFC 6311 drop history.
@@ -221,7 +230,7 @@ impl<P: RecoveryProfile> Window<P> {
     /// Drops wrong class/binding, changed/stale/gapped requests and pending nonempty
     /// work; refuses disabled/blocked/unavailable canonical handling without fallback.
     pub fn reply_empty(&mut self, request: &Request<P>) -> Result<Ikev2EmptyReply<'_, P>, Error> {
-        self.ready()?;
+        self.ready_for_reply()?;
         let id = request
             .canonical_message_id(&self.record.domain)
             .map_err(|_| Error::Drop)?;

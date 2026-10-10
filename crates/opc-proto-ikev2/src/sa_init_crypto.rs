@@ -12,23 +12,25 @@
 
 use std::{error::Error, fmt};
 
+mod checkpoint;
+
 use crypto_bigint::{
     modular::{FixedMontyForm, FixedMontyParams},
     Odd, Random, U1024, U2048, U768,
 };
 use opc_crypto_provider::{CryptoOperationErrorCode, IkeDhKeyPair};
 use p256::{
-    ecdh::EphemeralSecret as P256EphemeralSecret,
     elliptic_curve::{common::Generate, point::PointCompression, sec1::ToSec1Point},
-    PublicKey as P256PublicKey,
+    PublicKey as P256PublicKey, SecretKey as P256SecretKey,
 };
-use p384::{ecdh::EphemeralSecret as P384EphemeralSecret, PublicKey as P384PublicKey};
-use p521::{ecdh::EphemeralSecret as P521EphemeralSecret, PublicKey as P521PublicKey};
+use p384::{PublicKey as P384PublicKey, SecretKey as P384SecretKey};
+use p521::{PublicKey as P521PublicKey, SecretKey as P521SecretKey};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto_module::{
-        execute_dh_agree, execute_dh_generate, execute_prf, execute_prf_plus,
+        check_dh_checkpoint_admission, execute_dh_agree, execute_dh_export_checkpoint,
+        execute_dh_generate, execute_dh_import_checkpoint, execute_prf, execute_prf_plus,
         Ikev2CryptoModuleError,
     },
     hmac_sha1::hmac_sha1,
@@ -1117,11 +1119,12 @@ impl Ikev2SaInitCryptoProfile {
     }
 }
 
-/// Ephemeral DH/ECDH key pair for one IKE_SA_INIT exchange.
+/// Ephemeral DH/ECDH key pair for one IKE_SA_INIT or CREATE_CHILD_SA exchange.
 pub struct Ikev2EphemeralDhKey {
     group: Ikev2DhGroup,
     public_value: Vec<u8>,
     inner: Box<dyn IkeDhKeyPair>,
+    checkpoint_exported: bool,
 }
 
 impl Ikev2EphemeralDhKey {
@@ -1138,6 +1141,72 @@ impl Ikev2EphemeralDhKey {
             group,
             public_value,
             inner,
+            checkpoint_exported: false,
+        })
+    }
+
+    /// Recheck explicit checkpoint admission for a configured KE group.
+    ///
+    /// Use before admitting a durable initiator exchange. No key is generated,
+    /// no private value is exported and no key-provider request is made.
+    /// # Errors
+    /// Refuses absent/withdrawn module admission, unconfigured groups and providers
+    /// that do not support both synchronous checkpoint operations.
+    pub fn checkpoint_readiness(group: Ikev2DhGroup) -> Result<(), Ikev2CryptoModuleError> {
+        check_dh_checkpoint_admission(group)
+    }
+
+    /// Export an initiator's private checkpoint once under current admission.
+    ///
+    /// Persist these zeroizing bytes only within the operation field of the row's
+    /// existing envelope, in the same CAS as the request, before releasing that
+    /// request. Responders derive their keys before committing and need no private
+    /// checkpoint. No KMS call, nested envelope or module-build binding is added.
+    /// Never log the result. The consumer removes it in every terminal outcome CAS.
+    ///
+    /// # Errors
+    /// Refuses a repeated export or a restored handle, unavailable admission,
+    /// provider failure and malformed provider output. A provider `Unavailable`
+    /// remains a stable retryable operation code and consumes no successful export.
+    pub fn export_private_checkpoint(
+        &mut self,
+    ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+        if self.checkpoint_exported {
+            return Err(Ikev2SaInitCryptoError::CryptoModuleFailure {
+                error: Ikev2CryptoModuleError::from_operation_code(
+                    CryptoOperationErrorCode::CheckpointAlreadyExported,
+                ),
+            });
+        }
+        let checkpoint =
+            execute_dh_export_checkpoint(self.group, self.inner.as_mut(), &self.public_value)
+                .map_err(|error| Ikev2SaInitCryptoError::CryptoModuleFailure { error })?;
+        self.checkpoint_exported = true;
+        Ok(checkpoint)
+    }
+
+    /// Import an authenticated row's checkpoint and verify its committed public value.
+    ///
+    /// Obtain the exclusive epoch owner before calling. Group/version encoding
+    /// survives module-build changes; the current process still admits its own
+    /// module and group. The returned handle cannot export again. This is a local
+    /// synchronous operation; envelope unsealing is the consumer's separate step.
+    ///
+    /// # Errors
+    /// Refuses unavailable admission, malformed private encoding, a mismatched
+    /// public value and malformed provider output. Errors expose stable codes only.
+    pub fn import_private_checkpoint(
+        group: Ikev2DhGroup,
+        checkpoint: &[u8],
+        expected_public_value: &[u8],
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        let inner = execute_dh_import_checkpoint(group, checkpoint, expected_public_value)
+            .map_err(|error| Ikev2SaInitCryptoError::CryptoModuleFailure { error })?;
+        Ok(Self {
+            group,
+            public_value: expected_public_value.to_vec(),
+            inner,
+            checkpoint_exported: true,
         })
     }
 
@@ -1229,9 +1298,9 @@ enum SoftwareEphemeralDhSecret {
     Modp768(Zeroizing<U768>),
     Modp1024(Zeroizing<U1024>),
     Modp2048(Zeroizing<U2048>),
-    Ecp256(P256EphemeralSecret),
-    Ecp384(P384EphemeralSecret),
-    Ecp521(P521EphemeralSecret),
+    Ecp256(P256SecretKey),
+    Ecp384(P384SecretKey),
+    Ecp521(P521SecretKey),
 }
 
 impl SoftwareEphemeralDhKey {
@@ -1248,8 +1317,11 @@ impl SoftwareEphemeralDhKey {
             Ikev2DhGroup::Modp1024 => generate_modp1024_key(),
             Ikev2DhGroup::Modp2048 => generate_modp2048_key(),
             Ikev2DhGroup::Ecp256 => {
-                let secret = P256EphemeralSecret::try_generate()
-                    .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?;
+                let scalar = Zeroizing::new(
+                    p256::NonZeroScalar::try_generate()
+                        .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?,
+                );
+                let secret = P256SecretKey::from(&*scalar);
                 let public_value = ecp_public_value_bytes(&secret.public_key(), group)?;
                 Ok(Self {
                     group,
@@ -1258,8 +1330,11 @@ impl SoftwareEphemeralDhKey {
                 })
             }
             Ikev2DhGroup::Ecp384 => {
-                let secret = P384EphemeralSecret::try_generate()
-                    .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?;
+                let scalar = Zeroizing::new(
+                    p384::NonZeroScalar::try_generate()
+                        .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?,
+                );
+                let secret = P384SecretKey::from(&*scalar);
                 let public_value = ecp_public_value_bytes(&secret.public_key(), group)?;
                 Ok(Self {
                     group,
@@ -1268,8 +1343,11 @@ impl SoftwareEphemeralDhKey {
                 })
             }
             Ikev2DhGroup::Ecp521 => {
-                let secret = P521EphemeralSecret::try_generate()
-                    .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?;
+                let scalar = Zeroizing::new(
+                    p521::NonZeroScalar::try_generate()
+                        .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?,
+                );
+                let secret = P521SecretKey::from(&*scalar);
                 let public_value = ecp_public_value_bytes(&secret.public_key(), group)?;
                 Ok(Self {
                     group,
@@ -2543,7 +2621,7 @@ fn sec1_uncompressed_from_ike(
 }
 
 fn agree_ecp256(
-    secret: &P256EphemeralSecret,
+    secret: &P256SecretKey,
     peer_public_value: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
     let group = Ikev2DhGroup::Ecp256;
@@ -2560,7 +2638,7 @@ fn agree_ecp256(
 }
 
 fn agree_ecp384(
-    secret: &P384EphemeralSecret,
+    secret: &P384SecretKey,
     peer_public_value: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
     let group = Ikev2DhGroup::Ecp384;
@@ -2577,7 +2655,7 @@ fn agree_ecp384(
 }
 
 fn agree_ecp521(
-    secret: &P521EphemeralSecret,
+    secret: &P521SecretKey,
     peer_public_value: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
     let group = Ikev2DhGroup::Ecp521;
