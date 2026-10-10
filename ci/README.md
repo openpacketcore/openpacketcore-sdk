@@ -187,6 +187,22 @@ Review still has to establish that changed conditions, values, or helper behavio
 preserve the property under test. The separate policy on wall-clock assertions
 continues to apply; this guard does not replace it.
 
+## Privileged regression coverage
+
+The **Rust SCTP cold multihoming** lane in [ci.yml](../.github/workflows/ci.yml)
+runs both pending-blackhole connection-progress tests in a fresh network
+namespace. The **Privileged Linux GTP-U** lane in
+[gtpu-privileged.yml](../.github/workflows/gtpu-privileged.yml) runs the three
+empty historical hierarchy normalization tests on a private bpffs mount, plus
+the route-steering tests for distinct IPv4/IPv6 mark-only rules and locked-MTU
+ICMP signaling in both families. Both lanes run on PRs and main pushes.
+
+These commands select exact ignored names and require their exact executed
+counts with zero ignored tests. Normalization and locked-MTU tests must also
+emit their success markers, so an unset privileged flag cannot produce a
+passing gate without exercising the kernel. Build as the ordinary user, then
+run the resulting test binary with the namespace privileges it needs.
+
 ## Exact, temporary qualification manifest
 
 [realtime-qualification.json](realtime-qualification.json) is the complete list
