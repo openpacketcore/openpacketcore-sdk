@@ -2161,9 +2161,8 @@ fn assert_recovery_phase_connection_bounds(
     }
     for node_index in 0..member_count {
         // Every phase and the complete interval retain exact conservation and
-        // zero abandoned/protocol/backend/drain-overrun outcomes. Snapshot
-        // catch-up has no fixed duration, so its actual RPC timeouts cannot
-        // spend a connection allowance derived from the finite expiry schedule.
+        // zero abandoned/protocol/backend/drain-overrun outcomes. Catch-up
+        // connections also spend the original complete-interval allowance.
         let fault = recovery_connection_delta(
             node_index,
             &fault_before[node_index],
@@ -2181,10 +2180,11 @@ fn assert_recovery_phase_connection_bounds(
         );
         let complete =
             recovery_connection_delta(node_index, &fault_before[node_index], &settled[node_index]);
-        // Share the original 85/161 allowance across both fixed phases; do not
-        // grant a second allowance when the settlement baseline is captured.
+        // Keep the phase check and apply the same original 85/161 allowance
+        // to the complete interval, including every catch-up connection.
         assert_fixed_recovery_connection_bound(member_count, node_index, fault.combine(settlement));
-        eprintln!("MTLS_RECOVERY_CONNECTION_PHASES profile=fixed-fault-and-settlement-with-catchup-conservation/v2 node_index={node_index} complete={complete:?} fault={fault:?} catchup={catchup:?} settlement={settlement:?}");
+        assert_fixed_recovery_connection_bound(member_count, node_index, complete);
+        eprintln!("MTLS_RECOVERY_CONNECTION_PHASES profile=complete-recovery-with-phase-conservation/v3 node_index={node_index} complete={complete:?} fault={fault:?} catchup={catchup:?} settlement={settlement:?}");
     }
 }
 
@@ -22012,13 +22012,13 @@ fn recovery_phase_accounting_shares_one_fixed_bound_across_catchup() {
         catchup_before[0].connection_attempts += 20;
         catchup_before[0].connection_successes += 20;
         let mut settlement_before = catchup_before.clone();
-        // Longer reconstruction legitimately accumulates more calls than the
-        // entire fixed allowance. The original pending attempt stays owned.
-        settlement_before[0].connection_attempts += 2 * bound;
-        settlement_before[0].connection_successes += 2 * bound;
+        // All three phases share the allowance. The original pending attempt
+        // stays owned through catch-up and terminates during settlement.
+        settlement_before[0].connection_attempts += bound - 40;
+        settlement_before[0].connection_successes += bound - 40;
         let mut settled = settlement_before.clone();
-        settled[0].connection_attempts += bound - 20;
-        settled[0].connection_successes += bound - 20 + 1;
+        settled[0].connection_attempts += 20;
+        settled[0].connection_successes += 21;
         settled[0].active_connections = 0;
         assert_recovery_phase_connection_bounds(
             member_count,
@@ -22028,29 +22028,88 @@ fn recovery_phase_accounting_shares_one_fixed_bound_across_catchup() {
             &settled,
         );
 
-        // Exactly one additional attempt in either fixed phase fails. Each
-        // individual phase remains below its bound, so this detects granting
-        // a fresh full allowance after catch-up instead of sharing the budget.
-        for fault_phase in [false, true] {
+        // One additional attempt in any phase fails, even though each phase
+        // remains below the bound and every attempt has an exact outcome.
+        for phase in 0..3 {
             let mut fault = catchup_before.clone();
+            let mut catchup = settlement_before.clone();
             let mut settlement = settled.clone();
-            if fault_phase {
+            if phase == 0 {
                 fault[0].connection_attempts += 1;
                 fault[0].connection_successes += 1;
-            } else {
-                settlement[0].connection_attempts += 1;
-                settlement[0].connection_successes += 1;
             }
-            assert!(std::panic::catch_unwind(|| {
-                assert_recovery_phase_connection_bounds(
-                    member_count,
-                    &before,
-                    &fault,
-                    &settlement_before,
-                    &settlement,
-                );
-            })
-            .is_err());
+            if phase <= 1 {
+                catchup[0].connection_attempts += 1;
+                catchup[0].connection_successes += 1;
+            }
+            settlement[0].connection_attempts += 1;
+            settlement[0].connection_successes += 1;
+            assert!(
+                std::panic::catch_unwind(|| {
+                    assert_recovery_phase_connection_bounds(
+                        member_count,
+                        &before,
+                        &fault,
+                        &catchup,
+                        &settlement,
+                    );
+                })
+                .is_err(),
+                "phase {phase} must spend the complete recovery allowance"
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_phase_accounting_rejects_catchup_connection_storms() {
+    for member_count in [3, 5] {
+        let bound = recovery_fault_connection_bound(member_count);
+        let before = vec![lifecycle_metrics_fixture(); member_count];
+        for counter in [
+            "connection_attempts",
+            "reconnect_attempts",
+            "reconnect_failures",
+        ] {
+            let mut catchup = before.clone();
+            match counter {
+                "connection_attempts" => {
+                    catchup[0].connection_attempts = bound;
+                    catchup[0].connection_successes = bound;
+                }
+                "reconnect_attempts" => catchup[0].reconnect_attempts = bound,
+                "reconnect_failures" => catchup[0].reconnect_failures = bound,
+                _ => unreachable!(),
+            }
+            assert_recovery_phase_connection_bounds(
+                member_count,
+                &before,
+                &before,
+                &catchup,
+                &catchup,
+            );
+            match counter {
+                "connection_attempts" => {
+                    catchup[0].connection_attempts += 1;
+                    catchup[0].connection_successes += 1;
+                }
+                "reconnect_attempts" => catchup[0].reconnect_attempts += 1,
+                "reconnect_failures" => catchup[0].reconnect_failures += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                std::panic::catch_unwind(|| {
+                    assert_recovery_phase_connection_bounds(
+                        member_count,
+                        &before,
+                        &before,
+                        &catchup,
+                        &catchup,
+                    );
+                })
+                .is_err(),
+                "catch-up {counter} must spend the complete recovery allowance"
+            );
         }
     }
 }

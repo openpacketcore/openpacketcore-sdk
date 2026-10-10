@@ -308,7 +308,7 @@ cadence and independent full-key coverage clock resume immediately after
 recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
 outcomes have settled does it capture the clean member-scoped reauthentication
-baseline. The fixed fault/path-proof and settlement phases share one 85/161
+baseline. The complete fault, catch-up and settlement interval shares one 85/161
 per-node bound for new attempts and reconnects: the ordinary 24/40 allowance,
 no more than fifteen five-second
 refresh rounds over four/eight incident directed paths, and one scheduled
@@ -317,16 +317,16 @@ node. The reverse probe fails local material preflight without dialing. Terminal
 outcomes may additionally include only the exact attempts already outstanding
 at each measured interval's baseline, with interval conservation enforced.
 A passive lifecycle snapshot after the existing-generation path proof ends
-the fixed fault interval. The first settlement snapshot ends catch-up. Both
-fixed intervals spend the same allowance; taking the second baseline does not
-grant another 85/161 attempts. Variable-duration catch-up records its actual
-attempts, terminal outcomes, and reconnects separately. Every phase and the
-complete interval must conserve attempts and live owners with monotonic
-counters. Catch-up cannot spend a total-count allowance derived from a finite
-expiry schedule: real caller deadlines can expire while snapshot installation
-holds a consensus lane, requiring a fresh connection for a later RPC.
+the fixed fault interval. The first settlement snapshot ends catch-up. All
+three phases spend the same allowance; taking another baseline does not
+grant more attempts. Catch-up records its actual attempts, terminal outcomes,
+and reconnects separately, and all of them count against the complete bound.
+Every phase and the complete interval must conserve attempts and live owners
+with monotonic counters. The phase checks remain in addition to the complete
+bound, including exact carry-in for connections already outstanding at a
+measured interval's baseline.
 The functional audit reports this phase accounting as
-`fixed-fault-and-settlement-with-catchup-conservation/v2`.
+`complete-recovery-with-phase-conservation/v3`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
 The frozen private Schedule v6 keeps its historical accounting profile
