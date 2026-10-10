@@ -9,7 +9,8 @@ use opc_key::{
 };
 use opc_session_store::test_support::{
     append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
-    consensus_native_current_snapshot_for_test, trigger_consensus_log_purge_through_for_test,
+    consensus_native_current_snapshot_for_test, pause_consensus_snapshot_publication_for_test,
+    trigger_consensus_log_purge_through_for_test, wait_for_consensus_progress_for_test,
     ConsensusEngineStateForTest,
 };
 use opc_session_store::{
@@ -23,15 +24,25 @@ use std::sync::Mutex;
 #[derive(serde::Deserialize)]
 struct SnapshotChunk {
     _vote: Vote<SessionConsensusNodeId>,
-    _meta: SnapshotMeta<SessionConsensusNodeId, EmptyNode>,
+    meta: SnapshotMeta<SessionConsensusNodeId, EmptyNode>,
     offset: u64,
     data: Vec<u8>,
     done: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TransferProgress {
+    bytes: usize,
+    chunks: usize,
+    complete: bool,
+}
+
 struct PausedSnapshotHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
+    expected: Arc<Vec<u8>>,
+    expected_index: u64,
     first_chunk: Mutex<Option<Vec<u8>>>,
+    progress: tokio::sync::watch::Sender<TransferProgress>,
     entered: tokio::sync::Notify,
     released: AtomicBool,
     release: tokio::sync::Notify,
@@ -51,9 +62,25 @@ impl SessionConsensusRpcHandler for PausedSnapshotHandler {
         sender: SessionConsensusNodeId,
         request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
-        let snapshot = request.family == SessionConsensusRpcFamily::InstallSnapshot;
-        if snapshot {
-            let chunk: SnapshotChunk = decode_bounded(&request.payload).unwrap();
+        let chunk = (request.family == SessionConsensusRpcFamily::InstallSnapshot)
+            .then(|| decode_bounded::<SnapshotChunk>(&request.payload).unwrap());
+        if let Some(chunk) = &chunk {
+            assert_eq!(
+                chunk.meta.last_log_id.map(|log| log.index),
+                Some(self.expected_index),
+                "the already-admitted predecessor must finish without a replacement transfer"
+            );
+            let progress = self.progress.borrow().clone();
+            assert!(!progress.complete, "snapshot must complete exactly once");
+            assert_eq!(
+                chunk.offset, progress.bytes as u64,
+                "no retried or skipped chunk"
+            );
+            assert_eq!(
+                self.expected[progress.bytes..progress.bytes + chunk.data.len()],
+                chunk.data,
+                "every byte must come from the retained predecessor"
+            );
             let mut first = self.first_chunk.lock().unwrap();
             if first.is_none() {
                 assert_eq!(0, chunk.offset);
@@ -61,11 +88,16 @@ impl SessionConsensusRpcHandler for PausedSnapshotHandler {
                     !chunk.done,
                     "fixture must need another production-sized chunk"
                 );
-                *first = Some(chunk.data);
+                *first = Some(chunk.data.clone());
+            } else {
+                assert!(
+                    self.released.load(Ordering::SeqCst),
+                    "retire before the next read"
+                );
             }
         }
         let response = self.inner.handle(sender, request).await;
-        if snapshot {
+        if let Some(chunk) = chunk {
             let result: Result<
                 opc_consensus::engine::raft::InstallSnapshotResponse<SessionConsensusNodeId>,
                 opc_consensus::engine::error::RaftError<
@@ -77,9 +109,15 @@ impl SessionConsensusRpcHandler for PausedSnapshotHandler {
                 result.is_ok(),
                 "voter accepts the gated snapshot chunk: {result:?}"
             );
+            self.progress.send_modify(|progress| {
+                progress.bytes += chunk.data.len();
+                progress.chunks += 1;
+                progress.complete = chunk.done;
+            });
             self.entered.notify_one();
-            // Also hold retries if the normal RPC deadline expires while the
-            // test publishes S2. No timer decides the read/build interleaving.
+            // S2 is already prepared. Only its publication and retirement
+            // happen while this response is held; construction consumes none
+            // of the normal snapshot RPC's deadline.
             loop {
                 let released = self.release.notified();
                 if self.released.load(Ordering::SeqCst) {
@@ -96,22 +134,21 @@ async fn wait_for_progress(
     store: &ConsensusSessionStore,
     ready: impl Fn(opc_session_store::test_support::ConsensusLocalDurableProgressForTest) -> bool,
 ) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let progress = consensus_local_durable_progress_for_test(store);
-            assert_eq!(
-                ConsensusEngineStateForTest::Running,
-                progress.engine_state,
-                "{progress:?}"
-            );
-            if ready(progress) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    let progress = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_for_consensus_progress_for_test(store, &ready),
+    )
     .await
     .expect("native voter reaches the required snapshot frontier");
+    assert_eq!(
+        ConsensusEngineStateForTest::Running,
+        progress.engine_state,
+        "{progress:?}"
+    );
+    assert!(
+        ready(progress),
+        "engine progress closed before the required frontier: {progress:?}"
+    );
 }
 
 async fn write_large_record(store: &ConsensusSessionStore, ordinal: u8) {
@@ -177,13 +214,7 @@ async fn write_large_record(store: &ConsensusSessionStore, ordinal: u8) {
     );
 }
 
-// Run manually on Linux with the storage setup in CONTRIBUTING.md:
-// cargo test --locked -p opc-session-store --all-features \
-//     --test fixed_quorum_authority -- --ignored --exact \
-//     snapshot_retirement::native_leader_streams_retired_snapshot_without_stopping_engine \
-//     --test-threads=1 --nocapture
 #[tokio::test]
-#[ignore = "catch-up exceeded its ten-second bound on hosted runners; tracked in #1009"]
 async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     let (directory, database_paths, stores, paths) =
         open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
@@ -237,7 +268,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
         "production opener attaches the native log"
     );
     let predecessor = std::fs::File::open(&predecessor_path).unwrap();
-    let original = std::fs::read(&predecessor_path).unwrap();
+    let original = Arc::new(std::fs::read(&predecessor_path).unwrap());
     assert!(original.len() > DURABLE_OPENRAFT_PROFILE.snapshot_chunk_bytes as usize);
     trigger_consensus_log_purge_through_for_test(&stores[leader], predecessor_index)
         .await
@@ -247,9 +278,30 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     })
     .await;
 
+    // Build the successor before beginning the transfer. Pause after its
+    // verification and before the real publisher can retire the predecessor.
+    // This makes the critical interleaving independent of snapshot build time.
+    let publication = pause_consensus_snapshot_publication_for_test(&stores[leader]);
+    let successor_index = append_consensus_padding_entry_for_test(&stores[leader], [0xE2; 16])
+        .await
+        .unwrap();
+    trigger_consensus_snapshot_for_test(&stores[leader])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), publication.wait_prepared())
+        .await
+        .expect("successor is prepared before admitting the predecessor transfer");
+    assert!(
+        predecessor_path.exists(),
+        "preparation must not retire the predecessor"
+    );
+
     let paused = Arc::new(PausedSnapshotHandler {
         inner: stores[lagging].rpc_handler(),
+        expected: original.clone(),
+        expected_index: predecessor_index,
         first_chunk: Mutex::new(None),
+        progress: tokio::sync::watch::channel(TransferProgress::default()).0,
         entered: tokio::sync::Notify::new(),
         released: AtomicBool::new(false),
         release: tokio::sync::Notify::new(),
@@ -273,12 +325,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     let prefix = paused.first_chunk.lock().unwrap().clone().unwrap();
     assert_eq!(original[..prefix.len()], prefix);
 
-    let successor_index = append_consensus_padding_entry_for_test(&stores[leader], [0xE2; 16])
-        .await
-        .unwrap();
-    trigger_consensus_snapshot_for_test(&stores[leader])
-        .await
-        .unwrap();
+    publication.release();
     wait_for_progress(&stores[leader], |p| {
         p.snapshot_index == Some(successor_index)
     })
@@ -291,28 +338,35 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     paused.released.store(true, Ordering::SeqCst);
     paused.release.notify_waiters();
 
-    // Check the leader on every iteration: the old implementation reports
+    // Observe every leader metrics change: the old implementation reports
     // StorageIo(Snapshot, Read) as soon as transport reads the retired inode.
     tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let leader_progress = consensus_local_durable_progress_for_test(&stores[leader]);
-            assert_eq!(
-                ConsensusEngineStateForTest::Running,
-                leader_progress.engine_state,
-                "leader stopped after predecessor retirement: {leader_progress:?}"
-            );
-            let follower = consensus_local_durable_progress_for_test(&stores[lagging]);
-            assert_eq!(ConsensusEngineStateForTest::Running, follower.engine_state);
-            if follower.snapshot_index >= Some(predecessor_index)
-                && follower.applied_index >= Some(successor_index)
-            {
-                break;
+        tokio::select! {
+            progress = wait_for_consensus_progress_for_test(&stores[leader], |p| {
+                p.engine_state != ConsensusEngineStateForTest::Running
+            }) => panic!("leader stopped after predecessor retirement: {progress:?}"),
+            follower = async {
+                let mut transfer = paused.progress.subscribe();
+                transfer.wait_for(|progress| progress.complete).await.unwrap();
+                wait_for_consensus_progress_for_test(&stores[lagging], |p| {
+                    p.snapshot_index >= Some(predecessor_index)
+                        && p.applied_index >= Some(successor_index)
+                }).await
+            } => {
+                assert_eq!(ConsensusEngineStateForTest::Running, follower.engine_state, "{follower:?}");
+                assert!(follower.snapshot_index >= Some(predecessor_index), "{follower:?}");
+                assert!(follower.applied_index >= Some(successor_index), "{follower:?}");
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("lagging voter installs the retained stream and catches up");
+    let transferred = paused.progress.borrow().clone();
+    assert_eq!(transferred.bytes, original.len());
+    assert!(
+        transferred.chunks > 1 && transferred.complete,
+        "{transferred:?}"
+    );
     // Catch-up has refreshed this voter's leader contact. Restore campaigns
     // only now, so an expired isolation-era timer cannot race reconnection.
     stores[lagging].set_automatic_election_for_test(true);

@@ -174,6 +174,45 @@ pub async fn trigger_consensus_snapshot_for_test(
         .map_err(|_| "test consensus snapshot capture rejected".to_owned())
 }
 
+/// Scoped pause after snapshot preparation and before current-image publication.
+/// Dropping the pause releases the builder and removes this exact store's hook.
+#[cfg(target_os = "linux")]
+pub struct ConsensusSnapshotPublicationPauseForTest {
+    gate: Arc<crate::consensus::snapshot::SnapshotArtifactGate>,
+    _registration: storage::RecoveryPublicationFenceGateGuard,
+}
+
+#[cfg(target_os = "linux")]
+impl ConsensusSnapshotPublicationPauseForTest {
+    /// Wait until the real builder has finished preparing its successor image.
+    pub async fn wait_prepared(&self) {
+        self.gate.wait_started().await;
+    }
+
+    /// Let the prepared image pass through normal publication and retirement.
+    pub fn release(&self) {
+        self.gate.release();
+    }
+}
+
+/// Pause the next snapshot publication for this live store without holding its
+/// serving gate, so a transfer can first admit the current snapshot descriptor.
+#[cfg(target_os = "linux")]
+pub fn pause_consensus_snapshot_publication_for_test(
+    store: &ConsensusSessionStore,
+) -> ConsensusSnapshotPublicationPauseForTest {
+    let gate = Arc::new(crate::consensus::snapshot::SnapshotArtifactGate::new());
+    gate.arm();
+    let registration = store
+        .inner
+        .terminal_recovery_handoff_consumer
+        .pause_snapshot_publication_for_test(Arc::clone(&gate));
+    ConsensusSnapshotPublicationPauseForTest {
+        gate,
+        _registration: registration,
+    }
+}
+
 /// Append one acknowledged, otherwise inert consensus command for a test.
 ///
 /// The supplied request ID is retained by the normal durable idempotency
@@ -487,6 +526,25 @@ pub fn consensus_local_durable_progress_for_test(
         applied_index: current.last_applied.as_ref().map(|log_id| log_id.index),
         snapshot_index: current.snapshot.as_ref().map(|log_id| log_id.index),
         purged_index: current.purged.as_ref().map(|log_id| log_id.index),
+    }
+}
+
+/// Wait for a passive local progress condition, or return immediately when the
+/// engine stops. No polling timer, read barrier or consensus mutation is used.
+pub async fn wait_for_consensus_progress_for_test(
+    store: &ConsensusSessionStore,
+    ready: impl Fn(ConsensusLocalDurableProgressForTest) -> bool,
+) -> ConsensusLocalDurableProgressForTest {
+    let mut metrics = store.inner.raft.metrics();
+    loop {
+        drop(metrics.borrow_and_update());
+        let progress = consensus_local_durable_progress_for_test(store);
+        if ready(progress) || progress.engine_state != ConsensusEngineStateForTest::Running {
+            return progress;
+        }
+        if metrics.changed().await.is_err() {
+            return consensus_local_durable_progress_for_test(store);
+        }
     }
 }
 
