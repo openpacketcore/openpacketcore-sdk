@@ -23,6 +23,10 @@ const MAX_CONFIG_BYTES: usize = 65_536;
 const MAX_SERVERS: usize = 8;
 const PORT_BIND_ATTEMPTS: usize = 32;
 
+#[path = "dns_order.rs"]
+mod order;
+#[path = "dns_snaptr.rs"]
+mod snaptr;
 #[path = "dns_srv.rs"]
 mod srv;
 
@@ -56,21 +60,26 @@ pub struct DnsClientConfig {
     /// Simultaneous resolutions shared by all client clones (1–1024).
     /// Excess callers receive [`DnsError::Busy`]; there is no waiting queue.
     /// Open DNS sockets can reach `max_in_flight * max_srv_concurrent_targets`
-    /// when these permits are used for SRV refreshes (256 with the defaults).
+    /// for SRV or S-NAPTR refreshes (256 with the defaults).
     pub max_in_flight: usize,
     /// Maximum discarded packets/frames per exchange before failing over
     /// (1–1024). Bounds work even during a continuous mismatch flood.
     pub max_discarded_responses: usize,
     /// Maximum distinct SRV records expanded after ordering the complete
     /// parsed RRset (1–128, default 32). Remaining records are skipped.
+    /// S-NAPTR shares this allowance across all logical SRV record paths.
     pub max_srv_records: usize,
-    /// Maximum unique SRV target names expanded per refresh (1–32, default 16).
+    /// Maximum unique target names expanded per refresh (1–32, default 16).
+    /// S-NAPTR shares this allowance across its address and SRV terminals.
     pub max_srv_targets: usize,
     /// Maximum A/AAAA target lookups per SRV refresh (0–64, default 32).
     /// Retries/fallbacks inside each lookup retain the usual attempt bounds.
     /// Zero permits only addresses supplied in the additional section.
-    /// Allowances are reserved in selection order; aliases or deadline expiry
-    /// may leave reserved work unused without transferring it to later targets.
+    /// S-NAPTR shares this budget across all terminals; memoized address data
+    /// avoids new wire lookups but still consumes its logical lookup allowance.
+    /// Direct SRV reserves allowances in selection order; S-NAPTR admits the
+    /// best-ranked currently ready paths as their ancestors become available.
+    /// Aliases or deadline expiry may leave reserved work unused.
     pub max_srv_address_lookups: usize,
     /// Total SRV refresh budget, including the initial question and all target
     /// lookups. Zero (the default) derives `timeout * (servers.len() + 1)`,
@@ -82,7 +91,25 @@ pub struct DnsClientConfig {
     /// Target resolutions polled concurrently under one admission permit
     /// (1–32, default 4). Each target queries its missing families in order,
     /// so at most this many transport exchanges are live per SRV refresh.
+    /// S-NAPTR uses this ceiling for concurrent logical questions across sibling
+    /// branches. In-flight duplicates share an exchange and each occupy a slot.
+    /// A free slot immediately admits the best-ranked ready continuation.
     pub max_srv_concurrent_targets: usize,
+    /// Maximum NAPTR records per path (1–14, default 8).
+    pub max_snaptr_depth: usize,
+    /// Maximum eligible NAPTR expansions across one refresh (1–1024, default 128).
+    pub max_snaptr_records: usize,
+    /// Logical NAPTR/SRV/address evaluations, including memoized visits (1–256).
+    pub max_snaptr_lookups: usize,
+    /// Whole S-NAPTR refresh deadline. Zero derives the same automatic budget
+    /// as SRV; an explicit value must be 1 ms–300 s. While a ready branch
+    /// needs a new network question queued behind the concurrency limit,
+    /// a non-root question reserves
+    /// `min(timeout, remaining_on_admission / 2)` at the end for backtracking.
+    /// If no alternative remains, it keeps the full deadline and configured
+    /// retries without restarting its exchange. A backtracking cap may cut
+    /// retries or EDNS/TCP fallback short; root discovery is never capped.
+    pub snaptr_refresh_timeout: Duration,
     /// Optional concrete local IP for both UDP and TCP. Servers from another
     /// address family cannot be reached using this source and are skipped.
     pub local_address: Option<IpAddr>,
@@ -113,6 +140,10 @@ impl Default for DnsClientConfig {
             max_srv_address_lookups: 32,
             srv_refresh_timeout: Duration::ZERO,
             max_srv_concurrent_targets: 4,
+            max_snaptr_depth: 8,
+            max_snaptr_records: 128,
+            max_snaptr_lookups: 64,
+            snaptr_refresh_timeout: Duration::ZERO,
             local_address: None,
             interface: None,
             resolver_profile: ResolverProfileId::default(),
@@ -249,6 +280,12 @@ impl DnsClientConfig {
                 && !(Duration::from_millis(1)..=Duration::from_secs(300))
                     .contains(&self.srv_refresh_timeout))
             || !(1..=32).contains(&self.max_srv_concurrent_targets)
+            || !(1..=14).contains(&self.max_snaptr_depth)
+            || !(1..=1024).contains(&self.max_snaptr_records)
+            || !(1..=256).contains(&self.max_snaptr_lookups)
+            || (!self.snaptr_refresh_timeout.is_zero()
+                && !(Duration::from_millis(1)..=Duration::from_secs(300))
+                    .contains(&self.snaptr_refresh_timeout))
             || self.local_address.is_some_and(|ip| !unicast(ip))
             || self
                 .interface
@@ -288,7 +325,7 @@ pub struct DnsResponseSource {
     pub server: SocketAddr,
     /// Canonical question owner, for programmatic correlation only.
     pub owner: crate::DnsName,
-    /// Question record type (A, AAAA or SRV).
+    /// Question record type (A, AAAA, SRV or NAPTR).
     pub record_type: DnsRecordType,
     /// Response transport.
     pub transport: DnsTransport,
@@ -324,7 +361,8 @@ pub struct DnsQueryOutcome {
 }
 
 /// Resolution result plus bounded terminal response sources: at most two for
-/// address mode, or `1 + max_srv_address_lookups` for SRV mode.
+/// address mode, `1 + max_srv_address_lookups` for SRV, or at most
+/// `max_snaptr_lookups` for S-NAPTR.
 /// Transport/timeouts without a validated reply carry no response source.
 /// Publish `result` directly through [`crate::DnsCache::finish_refresh`].
 /// Schedule subsequent cache work using [`crate::DnsCacheStatus::fresh_until`],
@@ -348,16 +386,26 @@ pub struct DnsClientResponse {
     pub outcomes: Vec<DnsQueryOutcome>,
     /// Distinct valid SRV records not expanded because a record, target,
     /// lookup or candidate limit stopped their work. Zero for address mode.
-    /// An attempted target's DNS failure is not a skipped record.
+    /// An attempted target's DNS failure is not a skipped record. In S-NAPTR
+    /// mode, records count logical SRV paths across all terminals.
     pub skipped_srv_records: usize,
     /// Distinct valid SRV targets whose address resolution was entirely
     /// skipped by those limits. A target reused by any expanded record counts
     /// as visited. Fully budget-blocked targets may still have LimitExceeded
     /// family outcomes; targets beyond the other work limits have none.
     pub skipped_srv_targets: usize,
+    /// Bounded branch refusals/failures in traversal order; not retained by the cache.
+    pub snaptr_branches: Vec<crate::SnaptrBranchOutcome>,
+    pub(crate) snaptr_root: Option<crate::SnaptrRootObservation>,
 }
 
 impl DnsClientResponse {
+    /// Diagnostic root classification. Root no-match decisions also travel in
+    /// `result`, so existing `finish_refresh` drivers preserve them.
+    pub fn snaptr_root(&self) -> Option<&crate::SnaptrRootObservation> {
+        self.snaptr_root.as_ref()
+    }
+
     fn error(error: DnsError) -> Self {
         Self {
             result: Err(error),
@@ -365,6 +413,8 @@ impl DnsClientResponse {
             outcomes: Vec::new(),
             skipped_srv_records: 0,
             skipped_srv_targets: 0,
+            snaptr_branches: Vec::new(),
+            snaptr_root: None,
         }
     }
 }
@@ -450,12 +500,22 @@ struct Inner {
     permits: Semaphore,
     counters: Counters,
     server_timeouts: ServerTimeouts,
+    #[cfg(test)]
+    test_datagram: Option<Arc<TestDatagram>>,
 }
 
-/// Async A/AAAA/SRV stub resolver with bounded, cancellation-safe sockets.
+// Unit fixtures keep datagrams in-process so paused time cannot race kernel
+// readiness. The parser, retries, shared refresh deadline and traversal stay
+// unchanged. Integration fixtures exercise the real socket transport.
+#[cfg(test)]
+type TestDatagram = dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+    + Send
+    + Sync;
+
+/// Async A/AAAA/SRV/S-NAPTR stub resolver with bounded, cancellation-safe sockets.
 ///
 /// Only configured servers are contacted; there is no recursive traversal,
-/// DNSSEC validation, S-NAPTR, DoT or DoH. Uses Tokio networking and timers;
+/// DNSSEC validation, DoT or DoH. Uses Tokio networking and timers;
 /// call [`Self::resolve`] inside an I/O/time-enabled Tokio runtime. Dropping
 /// its future closes its sockets and releases admission without a worker task.
 /// There is no durable/node state or operator cleanup on restart or crash.
@@ -497,12 +557,20 @@ impl DnsClient {
                 .saturating_mul((config.servers.len() + 1) as u32)
                 .min(Duration::from_secs(300));
         }
+        if config.snaptr_refresh_timeout.is_zero() {
+            config.snaptr_refresh_timeout = config
+                .timeout
+                .saturating_mul((config.servers.len() + 1) as u32)
+                .min(Duration::from_secs(300));
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 permits: Semaphore::new(config.max_in_flight),
                 config,
                 counters: Counters::default(),
                 server_timeouts: ServerTimeouts::default(),
+                #[cfg(test)]
+                test_datagram: None,
             }),
         })
     }
@@ -519,7 +587,7 @@ impl DnsClient {
         }
     }
 
-    /// Resolve an absolute address or SRV query. `now` is called when each
+    /// Resolve an absolute address, SRV or filtered S-NAPTR query. `now` is called when each
     /// validated response arrives or a transport failure completes, in the cache clock;
     /// it must be fast and must not block. Earlier TTL observations are never
     /// restarted when a second family completes.
@@ -606,6 +674,31 @@ impl DnsClient {
     /// Return at most 16 distinct endpoints, ordered by target selection then
     /// destination rank, preserving DNS address order for ties ([RFC 6724
     /// section 6, rule 10](https://www.rfc-editor.org/rfc/rfc6724.html#section-6)).
+    ///
+    /// S-NAPTR requires [`crate::SnaptrFilter`] and a nonzero service-defined
+    /// default port, validated before admission. It traverses empty/`s`/`a`
+    /// replacement records concurrently, refusing nonempty regexps and isolating
+    /// semantic failures to their branch. The filter and ordering profile are
+    /// part of the cache key. NAPTR and SRV selection remain separate, with
+    /// complete primary/alternate provenance and a bounded host view for the
+    /// consumer's topology policy. No implicit service/transport fallback occurs.
+    /// One permit, absolute deadline and shared work budgets cover the refresh.
+    /// [`DnsClientConfig::max_srv_concurrent_targets`] bounds active questions;
+    /// each non-root question also has the cap documented on
+    /// [`DnsClientConfig::snaptr_refresh_timeout`]. Completed paths retain their
+    /// full ancestral selection order regardless of response arrival order.
+    /// A cap retains the best completed endpoint prefix; a 16-endpoint-only
+    /// truncation does not shorten record-derived freshness. Cached coverage
+    /// retains refusal/failure and omission counts.
+    ///
+    /// Root no-match errors carry an actionable [`crate::SnaptrNoMatch`] kind
+    /// and RRset/alias deadline through ordinary `finish_refresh` publication.
+    /// A root NXDOMAIN/NODATA retains its original SOA timing; child failures
+    /// cannot authorize root absence fallback. [`DnsClientResponse::snaptr_root`]
+    /// is diagnostic context, not another cache lifecycle. RFC 6408 relay
+    /// records match any Diameter application at their own order/preference;
+    /// abandoning a matchless protocol does not prevent independent queries
+    /// for other supported protocols.
     pub async fn resolve(
         &self,
         query: &DnsQuery,
@@ -614,7 +707,7 @@ impl DnsClient {
         self.resolve_inner(query, &now, None).await
     }
 
-    /// Resolve using an injected SRV selection seed. Identical SRV RRsets and
+    /// Resolve using an injected SRV/S-NAPTR selection seed. Identical SRV RRsets and
     /// seeds produce the same target order regardless of wire order. This
     /// affects only service selection; query IDs still use OS entropy and
     /// source ports follow independent kernel allocation policy. Address mode
@@ -638,17 +731,19 @@ impl DnsClient {
         seed: Option<u64>,
     ) -> DnsClientResponse {
         let config = &self.inner.config;
-        if query.resolver_profile() != &config.resolver_profile
-            || query.input().mode == ServiceDiscoveryMode::Snaptr
-        {
+        if query.resolver_profile() != &config.resolver_profile {
             return DnsClientResponse::error(DnsError::Unavailable);
         }
         if query.source_plane() != &config.source_plane {
             return DnsClientResponse::error(DnsError::SourceUnavailable);
         }
-        if (query.input().mode == ServiceDiscoveryMode::Address
-            && query.input().default_port.is_none_or(|port| port == 0))
+        if (matches!(
+            query.input().mode,
+            ServiceDiscoveryMode::Address | ServiceDiscoveryMode::Snaptr
+        ) && query.input().default_port.is_none_or(|port| port == 0))
             || (query.input().mode == ServiceDiscoveryMode::Service && !srv::valid_query(query))
+            || (query.input().mode == ServiceDiscoveryMode::Snaptr
+                && query.snaptr_filter().is_none())
         {
             return DnsClientResponse::error(DnsError::InvalidQuery);
         }
@@ -657,6 +752,9 @@ impl DnsClient {
         };
         if query.input().mode == ServiceDiscoveryMode::Service {
             return self.resolve_srv(query, now, seed).await;
+        }
+        if query.input().mode == ServiceDiscoveryMode::Snaptr {
+            return self.resolve_snaptr(query, now, seed).await;
         }
         let kinds: &[u16] = match query.address_family() {
             AddressFamilyPolicy::Ipv4Only => &[1],
@@ -710,6 +808,8 @@ impl DnsClient {
                 outcomes,
                 skipped_srv_records: 0,
                 skipped_srv_targets: 0,
+                snaptr_branches: Vec::new(),
+                snaptr_root: None,
             };
         }
         candidates
@@ -717,7 +817,7 @@ impl DnsClient {
         candidates.truncate(DnsAnswer::MAX_CANDIDATES);
         // Address-mode ordering is encoded using the legacy selection weight.
         for (index, candidate) in candidates.iter_mut().enumerate() {
-            candidate.peer.weight = u16::MAX - index as u16;
+            candidate.peer.weight = crate::dns::selection_weight(index);
         }
         DnsClientResponse {
             result: DnsAnswer::new(candidates).map(|mut answer| {
@@ -733,6 +833,8 @@ impl DnsClient {
             outcomes,
             skipped_srv_records: 0,
             skipped_srv_targets: 0,
+            snaptr_branches: Vec::new(),
+            snaptr_root: None,
         }
     }
 
@@ -770,6 +872,10 @@ impl DnsClient {
         parse: impl Fn(Message, PeerDiscoveryTime) -> Result<T, DnsError>,
         timed_out: Option<&ServerTimeouts>,
     ) -> (Result<T, DnsError>, Option<DnsResponseSource>) {
+        let record_type = match dns_wire::record_type(kind) {
+            Ok(value) => value,
+            Err(error) => return (Err(error), None),
+        };
         let config = &self.inner.config;
         let mut last = (Err(DnsError::Unavailable), None);
         for _ in 0..config.attempts {
@@ -798,18 +904,15 @@ impl DnsClient {
                                 | Err(DnsError::NxDomain { .. }
                                     | DnsError::NoData { .. }
                                     | DnsError::ServiceUnavailable { .. }
-                                    | DnsError::LimitExceeded)
+                                    | DnsError::LimitExceeded
+                                    | DnsError::Snaptr { .. })
                         );
                         last = (
                             result,
                             Some(DnsResponseSource {
                                 server: *server,
                                 owner: query.name().clone(),
-                                record_type: match kind {
-                                    1 => DnsRecordType::A,
-                                    33 => DnsRecordType::Srv,
-                                    _ => DnsRecordType::Aaaa,
-                                },
+                                record_type,
                                 transport,
                                 observed_at,
                             }),
@@ -875,6 +978,13 @@ impl DnsClient {
         bytes: &[u8],
         edns: Option<u16>,
     ) -> Result<Message, DnsError> {
+        #[cfg(test)]
+        if let Some(respond) = &self.inner.test_datagram {
+            let response = respond(bytes.to_vec()).await;
+            return self
+                .decode(&response, query, kind, id)?
+                .ok_or(DnsError::MalformedAnswer);
+        }
         let config = &self.inner.config;
         // Select the route's concrete local IP without sending a packet. The
         // receiving socket binds that IP, so a packet to a different local

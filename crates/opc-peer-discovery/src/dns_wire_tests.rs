@@ -7,6 +7,101 @@ const ANSWER: &[u8] = &[
     0, 0, 0, 30, 0, 4, 192, 0, 2, 1,
 ];
 
+// RFC 3403 4.1: order 10, preference 20, "a", "x-a:x-b", empty regexp,
+// replacement a. compressed to the question name (receiver rule, RFC 3597 4).
+const NAPTR: &[u8] = &[
+    0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 1, b'a', 0, 0, 35, 0, 1, 0xc0, 0x0c, 0, 35, 0,
+    1, 0, 0, 0, 30, 0, 17, 0, 10, 0, 20, 1, b'a', 7, b'x', b'-', b'a', b':', b'x', b'-', b'b', 0,
+    0xc0, 0x0c,
+];
+
+fn decode_naptr(bytes: &[u8]) -> Result<Message, DecodeError> {
+    decode(bytes, 0x1234, &DnsName::new("a.").unwrap(), 35)
+}
+
+#[test]
+fn spec_authored_naptr_counted_strings_and_compressed_replacement() {
+    let message = decode_naptr(NAPTR).unwrap();
+    let Data::Naptr(record) = &message.answers[0].data else {
+        panic!("NAPTR was not decoded")
+    };
+    assert_eq!((record.order, record.preference), (10, 20));
+    assert_eq!(&*record.flags, b"a");
+    assert_eq!(&*record.services, b"x-a:x-b");
+    assert!(record.regexp.is_empty());
+    assert_eq!(record.replacement.as_ref().unwrap().as_str(), "a.");
+    let mut query = NAPTR[..19].to_vec();
+    query[2..4].copy_from_slice(&[1, 0]);
+    query[6..8].fill(0);
+    assert_eq!(
+        encode(0x1234, &DnsName::new("a.").unwrap(), 35, None),
+        query
+    );
+}
+
+#[test]
+fn naptr_framing_rejects_short_strings_bad_lengths_and_forged_pointers() {
+    for end in 0..NAPTR.len() {
+        assert!(decode_naptr(&NAPTR[..end]).is_err(), "prefix {end}");
+    }
+    for (offset, value) in [
+        (30, 16),
+        (30, 18),
+        (35, 255),
+        (37, 255),
+        (45, 255),
+        (47, 37),
+        (47, 46),
+        (47, 0),
+    ] {
+        let mut bytes = NAPTR.to_vec();
+        bytes[offset] = value;
+        assert!(
+            decode_naptr(&bytes).is_err(),
+            "offset {offset}, value {value}"
+        );
+    }
+    let mut bytes = NAPTR.to_vec();
+    bytes.push(0);
+    assert!(decode_naptr(&bytes).is_err());
+}
+
+#[test]
+fn framed_semantic_errors_remain_records_for_branch_isolation() {
+    let mut regexp = NAPTR.to_vec();
+    regexp[30] = 18;
+    regexp[45] = 1;
+    regexp.insert(46, b'x');
+    let message = decode_naptr(&regexp).unwrap();
+    assert!(matches!(&message.answers[0].data,Data::Naptr(record) if &*record.regexp==b"x"));
+    let mut services = NAPTR.to_vec();
+    services[44] = 0xff;
+    let message = decode_naptr(&services).unwrap();
+    assert!(
+        matches!(&message.answers[0].data,Data::Naptr(record) if record.services.contains(&0xff))
+    );
+    let mut binary = NAPTR[..46].to_vec();
+    binary[30] = 18;
+    binary.extend([1, 0xff, 0]);
+    let message = decode_naptr(&binary).unwrap();
+    assert!(matches!(&message.answers[0].data,Data::Naptr(record) if record.replacement.is_none()));
+}
+
+#[test]
+fn question_type_metadata_is_exhaustive_and_rejects_unknown_types() {
+    for (wire, kind) in [
+        (1, DnsRecordType::A),
+        (28, DnsRecordType::Aaaa),
+        (33, DnsRecordType::Srv),
+        (35, DnsRecordType::Naptr),
+    ] {
+        assert_eq!(record_type(wire), Ok(kind));
+    }
+    for wire in [0, 5, 6, 34, 36, u16::MAX] {
+        assert_eq!(record_type(wire), Err(DnsError::InvalidQuery));
+    }
+}
+
 fn decode_a(bytes: &[u8]) -> Result<Message, DecodeError> {
     decode(bytes, 0x1234, &DnsName::new("a.").unwrap(), 1)
 }

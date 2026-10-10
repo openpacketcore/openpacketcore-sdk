@@ -1306,7 +1306,7 @@ fn client_rejects_invalid_resource_limits() {
 }
 
 #[tokio::test]
-async fn profiles_planes_and_unsupported_modes_fail_before_io() {
+async fn profiles_planes_and_missing_snaptr_filter_fail_before_io() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = DnsClient::new(config(vec![socket.local_addr().unwrap()])).unwrap();
     let different = query().with_resolver_profile(ResolverProfileId::new("different"));
@@ -1326,7 +1326,7 @@ async fn profiles_planes_and_unsupported_modes_fail_before_io() {
             .resolve(&DnsQuery::new(input).unwrap(), now)
             .await
             .result,
-        Err(DnsError::Unavailable)
+        Err(DnsError::InvalidQuery)
     );
     assert!(socket.try_recv_from(&mut [0; 512]).is_err());
 }

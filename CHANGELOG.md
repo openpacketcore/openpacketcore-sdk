@@ -113,7 +113,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering and expose skipped counts, partial-family outcomes and freshness
   bounds. Preserve service-withdrawal deadlines, receive compressed targets,
   keep DNS address order within equal precedence, and skip unusable records
-  and duplicate endpoints. S-NAPTR remains a follow-up.
+  and duplicate endpoints.
+- `opc-peer-discovery`: add bounded S-NAPTR traversal with explicit service and
+  protocol filters, RFC 3958 and 3GPP ordering, complete path provenance and
+  per-host coverage. Keep usable endpoint prefixes under work limits, isolate
+  failed branches, and preserve the shortest observed chain TTL. RFC 6408
+  relay matching and typed root no-match decisions use the existing cache
+  lifecycle; fallback remains caller policy. Resolve sibling paths concurrently
+  with question caps only while a ready branch needs a free concurrency slot,
+  preserving healthy retries beside running siblings, ranked results and
+  backtracking past silent branches under the default configuration. Failures below a complete endpoint prefix retain their
+  outcomes without shortening its freshness. See RFC 031.
 - `opc-peer-discovery`: add an async A/AAAA DNS client with configured/system
   servers, source-bound UDP/TCP, EDNS fallback, strict reply matching, bounded
   CNAME traversal and real TTL/SOA timing. Expose redacted server provenance,

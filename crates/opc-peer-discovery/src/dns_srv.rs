@@ -8,12 +8,13 @@ use super::*;
 use crate::dns_wire::{SrvAnswer, SrvRecord};
 use crate::{DiscoveryTarget, PeerCandidate};
 
-struct SrvSession {
-    deadline: tokio::time::Instant,
+#[derive(Clone)]
+pub(super) struct RefreshSession {
+    pub(super) deadline: tokio::time::Instant,
 }
 
-impl SrvSession {
-    async fn lookup<T>(
+impl RefreshSession {
+    pub(super) async fn lookup<T>(
         &self,
         client: &DnsClient,
         query: &DnsQuery,
@@ -74,7 +75,8 @@ impl SrvRefresh {
         kind: u16,
         result: &Result<T, DnsError>,
         observed_at: PeerDiscoveryTime,
-    ) {
+    ) -> Result<(), DnsError> {
+        let record_type = dns_wire::record_type(kind)?;
         if let Err(error) = result {
             let deadline = client.failure_deadline(*error, observed_at);
             let bound = if error.soa().is_some() {
@@ -86,10 +88,11 @@ impl SrvRefresh {
         }
         self.outcomes.push(DnsQueryOutcome {
             owner: query.name().clone(),
-            record_type: record_type(kind),
+            record_type,
             result: result.as_ref().map(|_| ()).map_err(|error| *error),
             observed_at,
         });
+        Ok(())
     }
 
     fn reject_alias(
@@ -98,11 +101,12 @@ impl SrvRefresh {
         query: &DnsQuery,
         kinds: &[u16],
         observed_at: PeerDiscoveryTime,
-    ) {
+    ) -> Result<(), DnsError> {
         increment(&client.inner.counters.malformed);
         for &kind in kinds {
+            let record_type = dns_wire::record_type(kind)?;
             if let Some(outcome) = self.outcomes.iter_mut().find(|outcome| {
-                outcome.owner == *query.name() && outcome.record_type == record_type(kind)
+                outcome.owner == *query.name() && outcome.record_type == record_type
             }) {
                 if outcome.result.is_ok() {
                     outcome.result = Err(DnsError::MalformedAnswer);
@@ -115,9 +119,10 @@ impl SrvRefresh {
                     kind,
                     &Err(DnsError::MalformedAnswer),
                     observed_at,
-                );
+                )?;
             }
         }
+        Ok(())
     }
 }
 
@@ -232,7 +237,7 @@ impl SrvExpansion {
                 let mut chain = answer.chain.clone();
                 chain.extend_from_slice(address.records().ok_or(DnsError::MalformedAnswer)?);
                 // The legacy selector consumes this draw, not raw SRV weights.
-                let weight = u16::MAX - self.candidates.len() as u16;
+                let weight = crate::dns::selection_weight(self.candidates.len());
                 self.candidates.push(DnsCandidate::new(
                     PeerCandidate::resolved(
                         query.input().service.clone(),
@@ -261,14 +266,6 @@ fn kinds(family: AddressFamilyPolicy) -> &'static [u16] {
     }
 }
 
-fn record_type(kind: u16) -> DnsRecordType {
-    match kind {
-        1 => DnsRecordType::A,
-        33 => DnsRecordType::Srv,
-        _ => DnsRecordType::Aaaa,
-    }
-}
-
 pub(super) fn valid_query(query: &DnsQuery) -> bool {
     let mut labels = query.name().as_str().splitn(3, '.');
     let service = labels.next().and_then(|label| label.strip_prefix('_'));
@@ -286,7 +283,7 @@ impl DnsClient {
         now: &impl Fn() -> PeerDiscoveryTime,
         seed: Option<u64>,
     ) -> DnsClientResponse {
-        let session = SrvSession {
+        let session = RefreshSession {
             deadline: tokio::time::Instant::now() + self.inner.config.srv_refresh_timeout,
         };
         let seed = match seed {
@@ -310,7 +307,9 @@ impl DnsClient {
             .map(|source| source.observed_at)
             .unwrap_or_else(now);
         let mut refresh = SrvRefresh::default();
-        refresh.record(self, query, 33, &answer, observed_at);
+        if let Err(error) = refresh.record(self, query, 33, &answer, observed_at) {
+            return DnsClientResponse::error(error);
+        }
         refresh.sources.extend(source);
         let result = match answer {
             Ok(answer) => {
@@ -333,6 +332,8 @@ impl DnsClient {
             outcomes: refresh.outcomes,
             skipped_srv_records: refresh.skipped_records,
             skipped_srv_targets: refresh.skipped_targets,
+            snaptr_branches: Vec::new(),
+            snaptr_root: None,
         }
     }
 
@@ -342,7 +343,7 @@ impl DnsClient {
         mut answer: SrvAnswer,
         now: &impl Fn() -> PeerDiscoveryTime,
         seed: u64,
-        session: &SrvSession,
+        session: &RefreshSession,
         refresh: &mut SrvRefresh,
     ) -> Result<DnsAnswer, DnsError> {
         let config = &self.inner.config;
@@ -449,7 +450,7 @@ impl DnsClient {
         query: &DnsQuery,
         answer: &SrvAnswer,
         now: &impl Fn() -> PeerDiscoveryTime,
-        session: &SrvSession,
+        session: &RefreshSession,
         lookup_limit: usize,
     ) -> TargetResponse {
         let mut refresh = SrvRefresh::default();
@@ -464,7 +465,7 @@ impl DnsClient {
         query: &DnsQuery,
         answer: &SrvAnswer,
         now: &impl Fn() -> PeerDiscoveryTime,
-        session: &SrvSession,
+        session: &RefreshSession,
         lookup_limit: usize,
         refresh: &mut SrvRefresh,
     ) -> Result<Vec<DnsCandidate>, DnsError> {
@@ -472,7 +473,7 @@ impl DnsClient {
         // RFC 2782, Target: an alias is forbidden. A CNAME from either family
         // invalidates this entire target, including addresses already obtained.
         if answer.target_is_alias(query.name()) {
-            refresh.reject_alias(self, query, kinds, answer.observed_at);
+            refresh.reject_alias(self, query, kinds, answer.observed_at)?;
             return Err(DnsError::MalformedAnswer);
         }
         let mut candidates = Vec::new();
@@ -505,7 +506,7 @@ impl DnsClient {
                 let result = match result {
                     Ok(Some(found)) => Ok(found),
                     Ok(None) => {
-                        refresh.reject_alias(self, query, kinds, observed_at);
+                        refresh.reject_alias(self, query, kinds, observed_at)?;
                         return Err(DnsError::MalformedAnswer);
                     }
                     Err(error) => Err(error),
@@ -524,7 +525,7 @@ impl DnsClient {
             });
             // Preserve target denials for diagnostics and freshness before
             // removing their authority to negatively cache the service key.
-            refresh.record(self, query, kind, &result, observed_at);
+            refresh.record(self, query, kind, &result, observed_at)?;
             match result {
                 Ok(mut found) => candidates.append(&mut found),
                 // Target absence does not authorize negative caching of the
@@ -547,7 +548,10 @@ impl DnsClient {
     }
 }
 
-fn weighted_order(mut records: Vec<SrvRecord>, seed: u64) -> Result<Vec<SrvRecord>, DnsError> {
+pub(super) fn weighted_order(
+    mut records: Vec<SrvRecord>,
+    seed: u64,
+) -> Result<Vec<SrvRecord>, DnsError> {
     // Canonicalization makes seed injection independent of DNS wire order.
     records.sort_by(|a, b| {
         (a.priority, a.target.as_str(), a.port, a.weight).cmp(&(
@@ -557,59 +561,10 @@ fn weighted_order(mut records: Vec<SrvRecord>, seed: u64) -> Result<Vec<SrvRecor
             b.weight,
         ))
     });
-    let mut random = SelectionRandom(seed);
-    let mut ordered = Vec::with_capacity(records.len());
-    while let Some(first) = records.first() {
-        let end = records
-            .iter()
-            .take_while(|r| r.priority == first.priority)
-            .count();
-        let mut group: Vec<_> = records.drain(..end).collect();
-        // RFC 2782 permits any initial order. Shuffle so all-zero groups and
-        // ties among zero-weight records do not systematically prefer a name.
-        for index in (1..group.len()).rev() {
-            let other = random.below(index as u64 + 1)? as usize;
-            group.swap(index, other);
-        }
-        group.sort_by_key(|record| record.weight != 0);
-        while !group.is_empty() {
-            let sum: u64 = group.iter().map(|record| u64::from(record.weight)).sum();
-            // RFC 2782 Weight: draw inclusively from 0 through sum, place
-            // zero weights first, select the first running sum >= the draw.
-            let draw = random.below(sum + 1)?;
-            let mut running = 0;
-            let index = group
-                .iter()
-                .position(|record| {
-                    running += u64::from(record.weight);
-                    running >= draw
-                })
-                .ok_or(DnsError::MalformedAnswer)?;
-            ordered.push(group.remove(index));
-        }
-    }
-    Ok(ordered)
-}
-
-// SplitMix64 is selection-only, never a source for query IDs or source ports.
-// Explicit wrapping operations make its seeded output portable across targets.
-struct SelectionRandom(u64);
-
-impl SelectionRandom {
-    fn below(&mut self, bound: u64) -> Result<u64, DnsError> {
-        let threshold = bound.wrapping_neg() % bound;
-        // Rejection sampling avoids modulo bias; bound work even for an
-        // adversarial seed. Actual bounds are at most 128 * u16::MAX + 1.
-        for _ in 0..32 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut value = self.0;
-            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            value ^= value >> 31;
-            if value >= threshold {
-                return Ok(value % bound);
-            }
-        }
-        Err(DnsError::LimitExceeded)
-    }
+    super::order::weighted_order(
+        records,
+        seed,
+        |record| record.priority,
+        |record| record.weight,
+    )
 }

@@ -13,8 +13,9 @@
 //! outer deadline) and cache the result — never on a per-request hot path.
 //!
 //! Service ([`ServiceDiscoveryMode::Service`], DNS SRV) and S-NAPTR
-//! ([`ServiceDiscoveryMode::Snaptr`], TS 29.303 / RFC 6408) modes are a
-//! documented follow-up and report [`PeerResolverError::Unavailable`].
+//! ([`ServiceDiscoveryMode::Snaptr`], TS 29.303 / RFC 6408) modes use
+//! [`crate::DnsClient`]. This address adapter reports [`PeerResolverError::Unavailable`]
+//! for those modes.
 //!
 //! Redaction: the resolver never logs or embeds the target hostname or resolved
 //! addresses; failures surface only as the crate's stable [`PeerResolverError`]
@@ -114,8 +115,8 @@ impl AddressLookup for StdAddressLookup {
 ///
 /// Resolves the [`ServiceDiscoveryInput`] target through the injected
 /// [`AddressLookup`] and returns one resolved [`PeerCandidate`] per address.
-/// Non-address discovery modes (SRV, S-NAPTR) are a documented follow-up and
-/// report [`PeerResolverError::Unavailable`].
+/// Non-address discovery modes (SRV, S-NAPTR) report
+/// [`PeerResolverError::Unavailable`]; use [`crate::DnsClient`] for those modes.
 pub struct AddressPeerResolver<L> {
     lookup: L,
 }
@@ -174,7 +175,7 @@ impl<L: AddressLookup> AddressPeerResolver<L> {
                 .take(MAX_RESOLVED_ADDRESSES)
                 .enumerate()
                 .map(|(index, endpoint)| {
-                    let weight = u16::try_from(index).map_or(0, |index| u16::MAX - index);
+                    let weight = crate::dns::selection_weight(index);
                     DnsCandidate::without_ttl(PeerCandidate::resolved(
                         input.service.clone(),
                         endpoint,
@@ -195,9 +196,8 @@ impl<L: AddressLookup> PeerResolver for AddressPeerResolver<L> {
         input: &ServiceDiscoveryInput,
         timeout: Duration,
     ) -> Result<ResolvedPeers, PeerResolverError> {
-        // Only address (A/AAAA) discovery is supported today; SRV and S-NAPTR
-        // are a documented follow-up. Report Unavailable so the caller's static
-        // path or negative cache handles it rather than misresolving.
+        // This adapter only resolves addresses. SRV and S-NAPTR require the
+        // separate DNS client; do not reinterpret them as address questions.
         if input.mode != ServiceDiscoveryMode::Address {
             return Err(PeerResolverError::Unavailable);
         }
@@ -224,7 +224,7 @@ impl<L: AddressLookup> PeerResolver for AddressPeerResolver<L> {
                 // A/AAAA records carry no DNS priority, so assign a uniform
                 // priority and a stable descending weight by resolution order:
                 // multi-address results then select deterministically.
-                let weight = u16::try_from(index).map_or(0, |index| u16::MAX - index);
+                let weight = crate::dns::selection_weight(index);
                 PeerCandidate::resolved(
                     input.service.clone(),
                     endpoint,
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn non_address_modes_are_unavailable_until_srv_snaptr_land() {
+    fn non_address_modes_are_unavailable_through_the_address_adapter() {
         let host = "peer.example.org";
         for mode in [ServiceDiscoveryMode::Service, ServiceDiscoveryMode::Snaptr] {
             let input = ServiceDiscoveryInput::new(

@@ -25,6 +25,7 @@
   - [012 — Testbed & Simulator Framework](rfc/012-testbed-simulator-framework.md)
   - [013 — Fault Management & Alarm Substrate](rfc/013-fault-management-alarm-substrate.md)
   - [014 — Interactive Operational Console](rfc/014-interactive-operational-console.md)
+  - [031 — Bounded S-NAPTR Peer Discovery](rfc/031-bounded-snaptr-discovery.md)
 - [ADRs](adr/README.md)
   - [0001 — Secure Config Management](adr/0001-secure-config-management.md)
   - [0002 — Config Store Consensus HA](adr/0002-config-store-consensus-ha.md)

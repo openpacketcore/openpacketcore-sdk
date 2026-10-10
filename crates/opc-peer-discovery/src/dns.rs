@@ -1,8 +1,10 @@
 //! Additive DNS contracts. The legacy resolver and selection structs retain
 //! their original shape; these types carry DNS identity, TTLs and provenance.
 
+use crate::{SnaptrCoverage, SnaptrFailure, SnaptrFilter, SnaptrHost, SnaptrProvenance};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{DiscoveryTarget, PeerCandidate, PeerDiscoveryTime, ServiceDiscoveryInput};
@@ -44,6 +46,11 @@ impl DnsName {
     /// Borrow the name for DNS encoding; never use it as a metric label.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_capacity(&self) -> usize {
+        self.0.capacity()
     }
 }
 
@@ -126,6 +133,7 @@ pub struct DnsQuery {
     resolver_profile: ResolverProfileId,
     source_plane: SourcePlaneId,
     address_family: AddressFamilyPolicy,
+    snaptr_filter: Option<SnaptrFilter>,
 }
 
 impl DnsQuery {
@@ -151,6 +159,7 @@ impl DnsQuery {
             resolver_profile: ResolverProfileId::default(),
             source_plane: SourcePlaneId::default(),
             address_family: AddressFamilyPolicy::default(),
+            snaptr_filter: None,
         })
     }
 
@@ -170,6 +179,24 @@ impl DnsQuery {
     pub fn with_address_family(mut self, policy: AddressFamilyPolicy) -> Self {
         self.address_family = policy;
         self
+    }
+
+    /// Attach the exact application/protocol filter for S-NAPTR mode.
+    ///
+    /// # Errors
+    /// Returns [`DnsError::InvalidQuery`] in other discovery modes. The default
+    /// service port is independently checked before resolver admission or I/O.
+    pub fn with_snaptr_filter(mut self, filter: SnaptrFilter) -> Result<Self, DnsError> {
+        if self.input.mode != crate::ServiceDiscoveryMode::Snaptr {
+            return Err(DnsError::InvalidQuery);
+        }
+        self.snaptr_filter = Some(filter);
+        Ok(self)
+    }
+
+    /// Exact application/protocol filter; required for S-NAPTR resolution.
+    pub fn snaptr_filter(&self) -> Option<&SnaptrFilter> {
+        self.snaptr_filter.as_ref()
     }
 
     /// Canonical DNS name to encode on the wire.
@@ -314,7 +341,8 @@ impl fmt::Debug for DnsRecord {
 #[derive(Clone, PartialEq, Eq)]
 pub struct DnsCandidate {
     pub(crate) peer: PeerCandidate,
-    records: Option<Box<[DnsRecord]>>,
+    pub(crate) records: Option<Arc<[DnsRecord]>>,
+    pub(crate) snaptr: Option<SnaptrProvenance>,
 }
 
 impl DnsCandidate {
@@ -338,7 +366,8 @@ impl DnsCandidate {
         }
         Ok(Self {
             peer,
-            records: Some(records.into_boxed_slice()),
+            records: Some(records.into()),
+            snaptr: None,
         })
     }
 
@@ -347,12 +376,30 @@ impl DnsCandidate {
         Self {
             peer,
             records: None,
+            snaptr: None,
         }
     }
 
     /// Endpoint metadata for the consumer. Its raw fields must not be logged.
     pub fn peer(&self) -> &PeerCandidate {
         &self.peer
+    }
+
+    /// Bounded S-NAPTR derivation, including complete alternate paths.
+    pub fn snaptr(&self) -> Option<&SnaptrProvenance> {
+        self.snaptr.as_ref()
+    }
+
+    pub(crate) fn all_records(&self) -> impl Iterator<Item = &DnsRecord> {
+        self.records
+            .iter()
+            .flat_map(|records| records.iter())
+            .chain(
+                self.snaptr
+                    .iter()
+                    .flat_map(|provenance| provenance.paths())
+                    .flat_map(|path| path.records()),
+            )
     }
 
     /// Traversed records, or `None` when the adapter cannot supply them.
@@ -378,11 +425,14 @@ pub struct DnsAnswer {
     candidates: Box<[DnsCandidate]>,
     freshness_bound: Option<PeerDiscoveryTime>,
     negative_freshness_bound: Option<PeerDiscoveryTime>,
+    pub(crate) snaptr_hosts: Option<Box<[SnaptrHost]>>,
+    pub(crate) snaptr_coverage: Option<SnaptrCoverage>,
 }
 
 impl DnsAnswer {
     /// Maximum retained candidate count per answer, matching the address
-    /// adapter's limit. Oversized DNS answers are rejected, never truncated.
+    /// adapter's limit. The constructor rejects oversized sets; wire resolvers
+    /// retain their best ordered prefix before constructing an answer.
     pub const MAX_CANDIDATES: usize = 16;
 
     /// Build a positive answer. An empty set is malformed, never a positive
@@ -399,12 +449,25 @@ impl DnsAnswer {
             candidates: candidates.into_boxed_slice(),
             freshness_bound: None,
             negative_freshness_bound: None,
+            snaptr_hosts: None,
+            snaptr_coverage: None,
         })
     }
 
     /// Borrow candidates in resolver selection order.
     pub fn candidates(&self) -> &[DnsCandidate] {
         &self.candidates
+    }
+
+    /// Bounded host view for consumer topology/collocation policy, when resolved
+    /// through S-NAPTR. References address the final deduplicated candidate set.
+    pub fn snaptr_hosts(&self) -> Option<&[SnaptrHost]> {
+        self.snaptr_hosts.as_deref()
+    }
+
+    /// Coverage and omission/failure counts that survive cache publication.
+    pub fn snaptr_coverage(&self) -> Option<&SnaptrCoverage> {
+        self.snaptr_coverage.as_ref()
     }
 
     /// Shorten freshness to an absolute deadline without rewriting provenance.
@@ -441,7 +504,8 @@ impl DnsAnswer {
     pub fn expires_at(&self) -> Option<PeerDiscoveryTime> {
         let mut earliest = None;
         for candidate in &self.candidates {
-            for record in candidate.records.as_ref()? {
+            candidate.records.as_ref()?;
+            for record in candidate.all_records() {
                 let expires = record.expires_at();
                 earliest =
                     Some(earliest.map_or(expires, |old: PeerDiscoveryTime| old.min(expires)));
@@ -571,6 +635,14 @@ pub enum DnsError {
         /// data remains stale, but consumers can observe this withdrawal.
         expires_at: PeerDiscoveryTime,
     },
+    /// S-NAPTR branch refusal or root no-match. Only root no-match reasons
+    /// carry a decision deadline, using the existing negative cache lifecycle.
+    Snaptr {
+        /// Stable refusal or actionable root no-match kind.
+        reason: SnaptrFailure,
+        /// Root RRset/alias deadline before the cache's negative TTL cap.
+        expires_at: Option<PeerDiscoveryTime>,
+    },
     /// No usable result fit within the remaining work budget, or a target
     /// family could not be queried within its address-lookup allowance.
     LimitExceeded,
@@ -598,6 +670,7 @@ impl DnsError {
             Self::Refused => "dns-refused",
             Self::Busy => "dns-busy",
             Self::ServiceUnavailable { .. } => "dns-service-unavailable",
+            Self::Snaptr { reason, .. } => reason.code(),
             Self::LimitExceeded => "dns-limit-exceeded",
             Self::Transport => "dns-transport",
             Self::MalformedAnswer => "dns-malformed-answer",
@@ -617,6 +690,10 @@ impl DnsError {
     pub(crate) fn negative_deadline(self) -> Option<PeerDiscoveryTime> {
         match self {
             Self::ServiceUnavailable { expires_at } => Some(expires_at),
+            Self::Snaptr {
+                reason: SnaptrFailure::NoMatchingService(kind),
+                expires_at,
+            } if kind != crate::SnaptrNoMatch::MalformedRequestedService => expires_at,
             _ => self.soa().map(NegativeSoa::expires_at),
         }
     }
@@ -682,4 +759,9 @@ pub(crate) fn destination_rank(ip: IpAddr) -> (std::cmp::Reverse<u8>, u8) {
         }
     };
     (std::cmp::Reverse(precedence), scope)
+}
+
+// Every resolver mode projects final rank identically for the legacy selector.
+pub(crate) fn selection_weight(index: usize) -> u16 {
+    u16::MAX - index.min(usize::from(u16::MAX)) as u16
 }

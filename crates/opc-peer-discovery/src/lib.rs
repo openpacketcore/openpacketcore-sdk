@@ -4,8 +4,8 @@
 //! adapter. [`DnsQuery`], [`DnsAnswer`] and [`DnsCache`] provide additive
 //! contracts for record TTL/provenance, typed failures, per-source identity,
 //! bounded retry and indefinite last-good retention. [`DnsClient`] adds
-//! asynchronous, source-bound A/AAAA and RFC 2782 SRV wire I/O, including
-//! seeded weighted service selection. S-NAPTR remains a follow-up. The original selection,
+//! asynchronous, source-bound A/AAAA, RFC 2782 SRV and bounded S-NAPTR
+//! discovery, including seeded ordering and per-host provenance. The original selection,
 //! resolver and caller-TTL cache APIs remain available for compatibility.
 
 #![forbid(unsafe_code)]
@@ -21,6 +21,7 @@ mod dns_cache;
 mod dns_client;
 mod dns_wire;
 mod resolve;
+mod snaptr;
 
 pub use cache::{CachedPeers, PeerAddressCache};
 pub use dns::{
@@ -36,6 +37,11 @@ pub use dns_client::{
     DnsResponseSource, DnsTransport,
 };
 pub use resolve::{AddressLookup, AddressLookupError, AddressPeerResolver, StdAddressLookup};
+pub use snaptr::{
+    SnaptrBranchOutcome, SnaptrCoverage, SnaptrFailure, SnaptrFilter, SnaptrFlag, SnaptrHop,
+    SnaptrHost, SnaptrHostAddress, SnaptrNoMatch, SnaptrOrdering, SnaptrPath, SnaptrProvenance,
+    SnaptrRootKind, SnaptrRootObservation, SnaptrSrv,
+};
 
 /// Stable SDK profile label for this discovery contract.
 pub const TELCO_PEER_DISCOVERY_PROFILE: &str = "opc-peer-discovery+transport-neutral-v1";

@@ -16,6 +16,20 @@ const MAX_NAME_STEPS: usize = 256;
 mod srv;
 pub(crate) use srv::{valid_host, SrvAnswer, SrvRecord};
 
+#[path = "dns_wire_snaptr.rs"]
+mod snaptr;
+pub(crate) use snaptr::{NaptrAnswer, NaptrRecord};
+
+pub(crate) fn record_type(kind: u16) -> Result<DnsRecordType, DnsError> {
+    match kind {
+        1 => Ok(DnsRecordType::A),
+        28 => Ok(DnsRecordType::Aaaa),
+        33 => Ok(DnsRecordType::Srv),
+        35 => Ok(DnsRecordType::Naptr),
+        _ => Err(DnsError::InvalidQuery),
+    }
+}
+
 pub(crate) fn encode(id: u16, name: &DnsName, kind: u16, edns: Option<u16>) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(288);
     for field in [id, 0x0100, 1, 0, 0, u16::from(edns.is_some())] {
@@ -57,6 +71,7 @@ pub(crate) struct Message {
     additional: Vec<Record>,
 }
 
+#[derive(Clone)]
 struct Record {
     // None is a well-framed binary name outside the public query-name
     // alphabet. It cannot match an ASCII query owner (RFC 2181 section 11).
@@ -67,6 +82,7 @@ struct Record {
     data: Data,
 }
 
+#[derive(Clone)]
 enum Data {
     A(Ipv4Addr),
     Aaaa(Ipv6Addr),
@@ -80,6 +96,7 @@ enum Data {
         port: u16,
         target: Option<DnsName>,
     },
+    Naptr(NaptrRecord),
     Other,
 }
 
@@ -110,6 +127,11 @@ impl Reader<'_> {
     fn u32(&mut self) -> Result<u32, DecodeError> {
         let bytes = self.take(4)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn character_string(&mut self) -> Result<Box<[u8]>, DecodeError> {
+        let len = usize::from(self.take(1)?[0]);
+        Ok(self.take(len)?.into())
     }
 
     fn name(&mut self) -> Result<Option<DnsName>, DecodeError> {
@@ -211,6 +233,16 @@ impl Reader<'_> {
                 port: self.u16()?,
                 target: self.name()?,
             },
+            // RFC 3403 4.1 counted strings and RFC 3597 4 receiver-side
+            // compression handling. Exact RDLENGTH consumption is checked below.
+            (35, 1) => Data::Naptr(NaptrRecord {
+                order: self.u16()?,
+                preference: self.u16()?,
+                flags: self.character_string()?,
+                services: self.character_string()?,
+                regexp: self.character_string()?,
+                replacement: self.name()?,
+            }),
             // Parse name-bearing legacy RDATA even when its semantics are
             // unused, so subsequent compression can reference its labels.
             // RFC 1035 3.3 and RFC 1183 1–3. Only CNAME redirects.
@@ -373,6 +405,16 @@ impl Message {
         observed_at: PeerDiscoveryTime,
         max_chain: usize,
     ) -> Result<CanonicalRrset<'a>, DnsError> {
+        self.canonical_with_loop_error(name, observed_at, max_chain, DnsError::MalformedAnswer)
+    }
+
+    fn canonical_with_loop_error<'a>(
+        &'a self,
+        name: &'a DnsName,
+        observed_at: PeerDiscoveryTime,
+        max_chain: usize,
+        loop_error: DnsError,
+    ) -> Result<CanonicalRrset<'a>, DnsError> {
         match self.rcode {
             0 | 3 => {}
             2 => return Err(DnsError::ServFail),
@@ -385,7 +427,7 @@ impl Message {
         let mut visited = Vec::new();
         loop {
             if visited.contains(&owner) {
-                return Err(DnsError::MalformedAnswer);
+                return Err(loop_error);
             }
             visited.push(owner);
             let rrset: Vec<_> = self
