@@ -13,7 +13,10 @@ fn unavailable(_: impl fmt::Debug) -> ScopeBatchError {
 }
 
 impl ConsensusSessionStore {
-    pub(crate) fn scope_batch_scheduler_key(scope: &ScopeId) -> ScopeSchedulerKey {
+    /// Stable per-scope admission key shared with batch coordinators. Remote
+    /// factories use it for their opening observation and standalone reads;
+    /// later port calls reuse the coordinator's existing reservation.
+    pub fn scope_batch_scheduler_key(scope: &ScopeId) -> ScopeSchedulerKey {
         scheduling::scope_key(scope)
     }
 

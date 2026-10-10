@@ -382,6 +382,8 @@ impl Drop for ControllerInner {
 #[derive(Clone)]
 pub struct TlsMaterialController {
     inner: Arc<ControllerInner>,
+    // Reserved transport classes share coherent material, not a handshake FIFO.
+    handshake_budget: Option<Arc<Semaphore>>,
 }
 
 /// Opaque event-driven subscription to coherent material publications.
@@ -510,6 +512,7 @@ impl TlsMaterialController {
     ) -> Self {
         let (status_tx, _) = watch::channel(TlsMaterialStatus::initial());
         let controller = Self {
+            handshake_budget: None,
             inner: Arc::new(ControllerInner {
                 source_rx: Mutex::new(source_rx),
                 builder_rx,
@@ -554,7 +557,7 @@ impl TlsMaterialController {
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
-                let controller = TlsMaterialController { inner };
+                let controller = TlsMaterialController { inner, handshake_budget: None };
                 let status = controller.status();
                 if previous_status.is_some_and(|previous| previous == status) {
                     unproductive_wakes = unproductive_wakes.saturating_add(1);
@@ -584,7 +587,7 @@ impl TlsMaterialController {
                             changed = source_changes.changed() => {
                                 if changed.is_err() {
                                     if let Some(inner) = weak.upgrade() {
-                                        TlsMaterialController { inner }.status();
+                                        TlsMaterialController { inner, handshake_budget: None }.status();
                                     }
                                     break;
                                 }
@@ -595,7 +598,7 @@ impl TlsMaterialController {
                     None => {
                         if source_changes.changed().await.is_err() {
                             if let Some(inner) = weak.upgrade() {
-                                TlsMaterialController { inner }.status();
+                                TlsMaterialController { inner, handshake_budget: None }.status();
                             }
                             break;
                         }
@@ -714,9 +717,15 @@ impl TlsMaterialController {
         })
     }
 
+    pub(crate) fn with_independent_handshake_budget(mut self) -> Self {
+        self.handshake_budget = Some(Arc::new(Semaphore::new(MAX_TLS_CONCURRENT_HANDSHAKES)));
+        self
+    }
+
     pub(crate) async fn acquire_handshake(&self) -> Result<OwnedSemaphorePermit, TlsMaterialError> {
-        self.inner
-            .handshake_gate
+        self.handshake_budget
+            .as_ref()
+            .unwrap_or(&self.inner.handshake_gate)
             .clone()
             .acquire_owned()
             .await
@@ -1333,18 +1342,45 @@ pub struct TlsClientHandshake {
     pub(crate) config: Arc<ClientConfig>,
     controller: TlsMaterialController,
     snapshot: TlsMaterialSnapshot,
+    scope_profile: bool,
 }
 
 impl TlsClientHandshake {
+    /// Exact local identity pinned in this handshake's coherent material snapshot.
+    /// Application code must still admit the completed connection before use.
+    pub fn local_identity(&self) -> &SpiffeId {
+        &self.snapshot.state.identity.spiffe_id
+    }
+
+    /// Validate the immutable TLS profile before scope handshake I/O.
+    pub fn validate_scope_profile(&self) -> Result<(), crate::ScopeTlsError> {
+        if !self.scope_profile {
+            return Err(crate::ScopeTlsError::ProtocolMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scope_snapshot(&self) -> &TlsMaterialSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) async fn scope_handshake_permit(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, TlsMaterialError> {
+        self.controller.acquire_handshake().await
+    }
+
     pub(crate) fn new(
         config: Arc<ClientConfig>,
         controller: TlsMaterialController,
         snapshot: TlsMaterialSnapshot,
+        scope_profile: bool,
     ) -> Self {
         Self {
             config,
             controller,
             snapshot,
+            scope_profile,
         }
     }
 
@@ -1403,18 +1439,39 @@ pub struct TlsServerHandshake {
     pub(crate) config: Arc<ServerConfig>,
     controller: TlsMaterialController,
     snapshot: TlsMaterialSnapshot,
+    scope_profile: bool,
 }
 
 impl TlsServerHandshake {
+    /// Validate the immutable TLS profile before scope handshake I/O.
+    pub fn validate_scope_profile(&self) -> Result<(), crate::ScopeTlsError> {
+        if !self.scope_profile {
+            return Err(crate::ScopeTlsError::ProtocolMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scope_snapshot(&self) -> &TlsMaterialSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) async fn scope_handshake_permit(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, TlsMaterialError> {
+        self.controller.acquire_handshake().await
+    }
+
     pub(crate) fn new(
         config: Arc<ServerConfig>,
         controller: TlsMaterialController,
         snapshot: TlsMaterialSnapshot,
+        scope_profile: bool,
     ) -> Self {
         Self {
             config,
             controller,
             snapshot,
+            scope_profile,
         }
     }
 

@@ -27,3 +27,13 @@ ae4a66adf24cfdcbf5b5c504d28d7cb363473b69:crates/opc-ipsec-xfrm/src/ikev2.rs:gene
 691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:126
 691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:143
 691d53bad6844a73339e64d8e991f3e028dc7744:crates/opc-proto-ikev2/tests/data/canonical_empty_v1.provenance.json:generic-api-key:160
+ac06cc2ee7f2b47cc5611031633e44239b31b234:crates/opc-session-net/tests/fixtures/scope-bootstrap-rs256.json:jwt:3
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:31
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:42
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:91
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:102
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:113
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:124
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:135
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:146
+ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transport-vectors.json:generic-api-key:157

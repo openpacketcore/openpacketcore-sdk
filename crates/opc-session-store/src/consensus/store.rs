@@ -168,6 +168,8 @@ mod planned_shutdown;
 mod quorum_readiness;
 mod scheduling;
 mod scope_authority;
+mod transport_class;
+pub use transport_class::session_consensus_work_class;
 mod scope_batch;
 mod scope_profile;
 

@@ -1,0 +1,20 @@
+{
+  "description": "Synthetic expired RS256 bootstrap credential, independently produced by Python cryptography. Public verification material only; no credential for any cluster.",
+  "jwt": "eyJhbGciOiJSUzI1NiIsImtpZCI6InNjb3BlLXRlc3QtcnNhIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2NsdXN0ZXIuZXhhbXBsZS50ZXN0IiwiYXVkIjpbIm9wZW5wYWNrZXRjb3JlLXNjb3BlLWJvb3RzdHJhcCJdLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6dGVzdDp3b3JrZXIiLCJpYXQiOjEwMCwibmJmIjoxMDAsImV4cCI6MjAwLCJrdWJlcm5ldGVzLmlvIjp7Im5hbWVzcGFjZSI6InRlc3QiLCJwb2QiOnsibmFtZSI6Indvcmtlci0wIiwidWlkIjoiMjIyMjIyMjItMjIyMi0yMjIyLTIyMjItMjIyMjIyMjIyMjIyIn0sInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJ3b3JrZXIiLCJ1aWQiOiIzMzMzMzMzMy0zMzMzLTMzMzMtMzMzMy0zMzMzMzMzMzMzMzMifX19.UDd2rzoag5Np1Gz5ZGXPQYr5efhWqtIRoAEXsyiTPNsLMbUuVo7mOSKTMLgeOzkv1eRqblko2a0Tfz3y1W6qlkTBkA1PIyk_i6CLy4UNJ9KzsDcHRYoz6vCPcQYFCwT68sak1lJ0WF2GkwHy4s6Nb0WPC9FFG6CCTfd7V_fhvyGTfZneQk5Qw8XfjU-Az02WW2kET4DkXOYUoUgDocfNqd_ik92qjBiZV1ouAXYcOhFKJ58jEzazx6JsJHfsDuwlVW2d70Ph7fVKNkBMEAlMkgEQ5zBAcsg4zw8KLoTInsJG9z_Iyv55oSe7CCBDM9ip-oMz-akiX0ZtoI5n86fS1A",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "kid": "scope-test-rsa",
+        "n": "jocNsg0i95u8cv2oQXFl_2rGwEvzPozb3G00PAKyuk2DQji8ImfffX5vV6MjkVTxq2YfTw06MryHfkd6nBGPF6B9qLmNV3vi_Ox1iiWxRrh9bs5Xn0JzBT58veHEHAWYNrSuiM_z8pbLUjdAlxIFxMWHVhsYGtvZTUDa4ut_hNHqJSKe4KzcZghy8UZ_yb4-7duE8xkahF4mv3Y_44bUjzQZ3pL1rCvkGWwct_GV6WL4o8PAh0DxPDpjqQG9utCDHapFXth4weo6WMlNOA6PQZUxwiTgl-OaSIalv4smuoGIMFuFcWbrTRK2L66Nn0tSRxuUvK8VfVQ3G5cnmNPqew",
+        "e": "AQAB"
+      }
+    ]
+  },
+  "interval_unix": [
+    100,
+    199
+  ]
+}

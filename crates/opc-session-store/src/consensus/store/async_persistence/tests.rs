@@ -456,15 +456,33 @@ impl Fleet {
     }
 
     async fn close(&mut self, index: usize) {
-        self.close_result(index).await.unwrap();
+        self.close_and_join_result(index).await.unwrap();
+    }
+
+    async fn close_and_join_result(&mut self, index: usize) -> Result<(), StoreError> {
+        *self.peers[index].handler.write().await = None;
+        if let Some(store) = self.stores[index].take() {
+            // Ordinary fixture cleanup needs the shared physical drain result.
+            // A bounded caller can time out while that same drain continues.
+            // These cold-incarnation fixtures omit the close certificate.
+            let completion = store
+                .inner
+                .shutdown
+                .start_or_subscribe(Arc::clone(&store.inner), false);
+            return tokio::time::timeout(
+                Duration::from_secs(30),
+                await_consensus_session_store_shutdown(completion),
+            )
+            .await
+            .expect("fixture shutdown joins every engine and disk owner");
+        }
+        Ok(())
     }
 
     async fn close_result(&mut self, index: usize) -> Result<(), StoreError> {
         *self.peers[index].handler.write().await = None;
         if let Some(store) = self.stores[index].take() {
-            // These pre-existing fixtures deliberately exercise uncertified
-            // cold incarnations. Join every real owner, but omit only the new
-            // close certificate. This is not a power-loss simulation.
+            // Explicit caller-result checks retain the configured deadline.
             return store.shutdown_with_closed_proof(false).await;
         }
         Ok(())
@@ -481,13 +499,55 @@ impl Fleet {
     async fn close_all(&mut self) {
         let mut results = Vec::new();
         for index in 0..self.stores.len() {
-            results.push(self.close_result(index).await);
+            results.push(self.close_and_join_result(index).await);
         }
         assert!(
             results.iter().all(Result::is_ok),
             "ordinary shutdown: {results:?}"
         );
     }
+}
+
+#[cfg(feature = "test-vfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_fixture_cleanup_waits_for_the_shared_drain_after_a_caller_deadline() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    fleet.start().await;
+    let store = fleet.store(0).clone();
+    let hold = store.hold_raft_shutdown_before_core_for_test();
+    let gate = Arc::clone(&hold.gate);
+    {
+        let close = AssertUnwindSafe(fleet.close(0)).catch_unwind();
+        tokio::pin!(close);
+        tokio::select! {
+            result = &mut close => panic!("cleanup returned before the held drain: {result:?}"),
+            entered = tokio::task::spawn_blocking(move || gate.wait_until_entered(Duration::from_secs(5))) => {
+                assert!(entered.unwrap(), "fixture cleanup reaches the held core shutdown");
+            }
+        }
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                store.shutdown_with_closed_proof(false),
+            )
+            .await
+            .expect("the public caller retains its configured deadline"),
+            Err(consensus_unavailable()),
+        );
+        assert!(
+            close.as_mut().now_or_never().is_none(),
+            "fixture cleanup must wait for the shared physical drain after a caller deadline"
+        );
+        drop(hold);
+        tokio::time::timeout(Duration::from_secs(5), &mut close)
+            .await
+            .expect("released fixture drain completes")
+            .expect("ordinary cleanup observes successful physical shutdown");
+    }
+    assert_eq!(store.shutdown_with_closed_proof(false).await, Ok(()));
+    drop(store);
+    fleet.close_all().await;
 }
 
 fn provider() -> Arc<MemoryKeyProvider> {

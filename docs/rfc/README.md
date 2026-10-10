@@ -35,6 +35,7 @@ engineers.
 | [020](020-online-audit-recipient-verification.md) | Authority-owned online audit recipient verification | Acceptance is recorded by maintainer-approved merge of #979; implementation qualification remains separate. Online recipient custody, authenticated application boundary and checkpoint/report semantics for #959. |
 | [022](022-scope-leases.md) | Scope authority and atomic child batches, profile 4 | Experimental untimed execution fencing, stable-scope floors and activation continuity; transport, local effects and lost-worker retirement have separate qualification. |
 | [024](024-scope-priority-scheduler.md) | Scope work priorities and backpressure | Implemented class isolation, shared-lane arbitration and class-aware proposal admission; composed lane and authenticated transport qualification remain separate. |
+| [026](026-scope-authenticated-transport.md) | Authenticated scope and voter management transport | Worker scope admission and batch recovery with normative bootstrap, closure and wire vectors; voter management follows RFC 023 helpers. Runtime qualification remains separate. |
 
 ## Recommended Reading Order
 

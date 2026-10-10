@@ -3723,7 +3723,9 @@ dependencies = [
  "postcard",
  "rand 0.10.3",
  "rcgen",
+ "ring",
  "rusqlite",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "serde_ignored",
@@ -3736,6 +3738,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
