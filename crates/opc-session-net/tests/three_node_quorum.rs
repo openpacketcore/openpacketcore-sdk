@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -4250,18 +4250,55 @@ async fn test_persistent_connection_reconnect_after_restart() {
 #[tokio::test]
 async fn capabilities_uses_cached_success_after_disconnect() {
     let mtls = mtls_configs();
-    let (addr, _backend, handle) = start_server(&mtls, 2).await;
-    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
+    // A durable cursor profile makes the restore-bit masking assertion
+    // meaningful: the legacy fake backend masks it even while connected.
+    let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let endpoint_available = Arc::new(AtomicBool::new(true));
+    let unavailable_resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let endpoint_available = Arc::clone(&endpoint_available);
+        let unavailable_resolutions = Arc::clone(&unavailable_resolutions);
+        Arc::new(move || {
+            let result = if endpoint_available.load(Ordering::Acquire) {
+                Ok(addr)
+            } else {
+                unavailable_resolutions.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "fixture replica has stopped",
+                ))
+            };
+            Box::pin(async move { result })
+        })
+    };
+    let remote = RemoteSessionBackend::new_with_resolver(
+        mtls.remote_binding(1, 2),
+        resolver,
+        mtls.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
 
     let warmed = remote.capabilities().await;
     assert!(
         warmed.atomic_compare_and_set && warmed.monotonic_fencing_token && warmed.batch_write,
         "expected warmed remote capabilities to reflect the full backend"
     );
+    assert!(warmed.restore_scan, "the live negotiation enables restore");
 
+    // The awaited probe has populated the cache. Withdraw the endpoint before
+    // teardown releases its ephemeral port: another parallel test can bind it
+    // with a different peer identity, correctly invalidating the old cache.
+    // The existing authenticated connection still observes a real disconnect;
+    // subsequent discovery deterministically reports only transport loss.
+    endpoint_available.store(false, Ordering::Release);
     handle.abort_and_wait().await;
 
     let after_disconnect = remote.capabilities().await;
+    assert!(
+        unavailable_resolutions.load(Ordering::Relaxed) > 0,
+        "the disconnected client must attempt fresh discovery"
+    );
     let mut expected = warmed;
     expected.restore_scan = false;
     assert_eq!(
