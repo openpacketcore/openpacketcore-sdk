@@ -8,7 +8,7 @@ resolver-result selection, redaction-safe evidence, negative caching, and a
 pure stale-while-revalidate address cache.
 
 The crate includes an address-mode resolver over an injected lookup port and
-an async DNS client for A/AAAA and RFC 2782 SRV. S-NAPTR remains unavailable.
+an async DNS client for A/AAAA, RFC 2782 SRV and bounded S-NAPTR discovery.
 
 ## API Shape
 
@@ -29,7 +29,10 @@ an async DNS client for A/AAAA and RFC 2782 SRV. S-NAPTR remains unavailable.
   `DnsCandidate`, `DnsRecord`, `DnsRecordType`, and `NegativeSoa`.
 - DNS cache driving: `DnsCache`, `DnsCacheStatus`, `DnsCachedResult`,
   `DnsRetryPolicy`, `DnsRefresh`, and `DnsRefreshToken`.
-- DNS failures: `DnsError` and `DnsCacheError` expose stable, redacted codes.
+- S-NAPTR policy/results: `SnaptrFilter`, `SnaptrOrdering`, `SnaptrProvenance`,
+  `SnaptrPath`, `SnaptrHost`, `SnaptrCoverage`, and `SnaptrRootObservation`.
+- DNS failures: `DnsError`, `SnaptrFailure`, `SnaptrNoMatch`, and `DnsCacheError`
+  expose typed, redacted failures.
 - Identity and transport: `PeerLabel`, `PeerTransport`, and
   `TELCO_PEER_DISCOVERY_PROFILE`.
 - Errors: `PeerDiscoveryError` and `PeerDiscoveryErrorCode` carry only safe
@@ -89,7 +92,8 @@ assert_eq!(selected.label.as_str(), "pgw-a");
 - `AddressPeerResolver` supports `ServiceDiscoveryMode::Address` with a default
   port and caps one lookup to 16 candidates.
 - The legacy address resolver returns `PeerResolverError::Unavailable` for
-  `Service` and `Snaptr`. `DnsClient` supports `Address` and `Service`.
+  `Service` and `Snaptr`. `DnsClient` supports all three modes; S-NAPTR
+  requires an explicit `SnaptrFilter` and service-defined default port.
 - Selection is deterministic: lower priority wins, then higher weight, then a
   stable tie-break.
 - `Debug` for targets, endpoints, and selected peers avoids raw host/address
@@ -97,7 +101,7 @@ assert_eq!(selected.label.as_str(), "pgw-a");
 
 ## Roadmap
 
-- Add bounded S-NAPTR traversal using the DNS contracts.
+- Extend qualified service/protocol profiles without implicit fallback.
 - Keep asynchronous lookup driving outside the pure selection/cache core.
 - Preserve redaction-safe evidence as new resolver modes are added.
 
@@ -127,8 +131,8 @@ from malformed DNS answers. Configure IP literals as static peers.
 
 A `DnsCandidate` retains the endpoint and every `DnsRecord` used to reach it,
 in traversal order. Each record carries its canonical owner, type, remaining
-TTL and monotonic observation time. NAPTR provenance can be represented before
-its resolver exists. The cache uses the earliest absolute
+TTL and monotonic observation time. S-NAPTR also retains its alternate paths.
+The cache uses the earliest absolute
 expiry of every record in every candidate chain; completing a traversal never
 restarts earlier TTLs. Zero TTL is immediately stale. A missing TTL remains
 unknown and gains no fresh lifetime. High-bit record TTLs and SOA TTL-valued
@@ -269,7 +273,7 @@ corresponding candidate. Wire parsers must map invalid record-owner names from
 SRV applies priority and weighted selection before expanding target addresses;
 its numeric-address tie-break is documented below.
 
-## Legacy system adapter and next slices
+## Legacy system adapter
 
 `AddressPeerResolver::resolve_dns` bridges `AddressLookup`, including
 `StdAddressLookup`, to `DnsAnswer` with explicitly absent TTL/provenance. It
@@ -286,9 +290,9 @@ is a retry policy, not an SOA-derived DNS negative TTL.
 
 `DnsClient` supplies asynchronous DNS wire I/O, actual record/SOA timing,
 system or explicit server configuration, and source-bound UDP/TCP sockets.
-Its SRV mode adds priority/weighted target selection and port handling. Bounded
-S-NAPTR traversal is a follow-up using the same cache admission tokens and
-original record observation times.
+Its SRV mode adds priority/weighted target selection and port handling.
+S-NAPTR uses the same cache admission tokens and original record observation
+times, with separate NAPTR/SRV ranking and per-host provenance.
 
 ## Async DNS client
 
@@ -453,7 +457,7 @@ ASCII query. Caller names still follow the public ASCII `DnsName` contract;
 a required CNAME target outside that contract is unusable. Literal dots inside
 wire labels cannot forge label boundaries. Pointer targets inside unsupported
 opaque RDATA are unusable.
-There is **no DNSSEC validation**, including no trust in the AD bit. S-NAPTR,
+There is **no DNSSEC validation**, including no trust in the AD bit.
 DNS over TLS and DNS over HTTPS are separate work.
 
 The deterministic suite uses loopback fake servers and spec-authored wire
@@ -584,9 +588,110 @@ its sockets and releases that permit. No worker task, new dependency,
 durable state or operator cleanup is introduced.
 [ADR 0032](../../docs/adr/0032-bounded-dns-srv.md) records these choices.
 
-For the next S-NAPTR slice, an "S" flag's REPLACEMENT is the exact SRV query
-name ([RFC 3958 section 2.2.3](https://www.rfc-editor.org/rfc/rfc3958.html#section-2.2.3));
-it need not have the `_service._proto.domain.` shape. Keep that validation at
-the direct Service-mode entry point, and reuse the generic SRV decoder and
-ordering for S-NAPTR replacements. NAPTR traversal and its own chain timing
-and work bounds remain follow-up work.
+## S-NAPTR discovery
+
+Use an explicit application service/protocol pair and ordering profile. The
+operator label is independent of the DNS service tag, including Diameter's
+`aaa+ap<ID>` tags. The filter, family, resolver and source identities all
+participate in the query's cache key.
+
+```rust
+use opc_peer_discovery::{
+    DiscoveryTarget, DnsQuery, PeerLabel, PeerTransport, ServiceDiscoveryInput,
+    ServiceDiscoveryMode, SnaptrFilter, SnaptrOrdering,
+};
+
+let query = DnsQuery::new(ServiceDiscoveryInput::new(
+    PeerLabel::new("pgw-control").unwrap(),
+    DiscoveryTarget::new("ims.apn.epc.mnc001.mcc001.3gppnetwork.org."),
+    ServiceDiscoveryMode::Snaptr,
+    PeerTransport::Udp,
+    Some(2123),
+)).unwrap().with_snaptr_filter(SnaptrFilter::new(
+    "x-3gpp-pgw", "x-s2b-gtp", SnaptrOrdering::ThreeGpp,
+).unwrap()).unwrap();
+```
+
+Pass this query to `resolve` or `resolve_with_seed`, then publish `result`
+through the existing `DnsCache::finish_refresh`. Default ports are validated
+before I/O even for an all-SRV answer: GTP-C uses 2123; Diameter TCP/SCTP uses
+3868 and secure profiles use 5658. The caller supplies the supported
+protocol/transport/default-port association. An `s` record uses the explicit
+SRV port and queries the exact replacement, without requiring the direct
+Service-mode `_service._proto.domain.` shape.
+
+Empty flags delegate to another NAPTR owner; `a` resolves addresses; `s`
+resolves SRV and then addresses. Matching is case insensitive and exact at
+every hop. Unrelated applications are filtered before interpreting their
+flags/regexp. Nonempty regexps, unsupported flags, malformed requested
+services, unusable replacements and active-path loops refuse only their own
+branches. Shared children are memoized per refresh, preserving observation
+times and distinct derivations. RFC 6408 relay records match any Diameter
+application, using the relay record's own order/preference.
+
+`Rfc3958` sorts order then preference; `ThreeGpp` weights each order group by
+`65535 - preference`. SRV priority/weight apply only inside their NAPTR path.
+One injected seed gives repeatable draws independent of wire ordering. Every
+mode projects final endpoint rank as `u16::MAX - index` for legacy selection;
+raw NAPTR and SRV fields remain separate in provenance.
+
+An answer retains the best 16 distinct endpoints, merging duplicates at their
+best rank. Each endpoint has one primary and up to three alternate complete
+paths, with at most 16 timed records per path. `snaptr_hosts()` groups actual
+path/address references under advertised host names; primary hosts take
+precedence over alternate metadata. `snaptr_coverage()` exposes omitted work,
+refused/failed branches and incomplete hosts through cache publication. The
+consumer owns topology/collocation selection and authentication against the
+original name. The view does not promise an exhaustive topology search.
+
+One admission permit and absolute `snaptr_refresh_timeout` cover the traversal.
+NAPTR depth defaults to 8 (maximum 14), eligible record expansions to 128
+(maximum 1024), and logical lookups including memoized visits to 64 (maximum
+256). SRV record, target and address-query allowances are shared across all
+terminals. Sibling paths progress concurrently within
+`max_srv_concurrent_targets` (default 4). Each free slot admits the best-ranked
+ready continuation; duplicate in-flight questions share their DNS exchange
+while each logical continuation occupies a slot. NAPTR, SRV and address ranks
+determine result order independently of response arrival. A late higher-ranked
+endpoint or path replaces a worse retained entry.
+
+While a ready branch needs a new network question queued behind the concurrency
+limit, a non-root question reserves `min(timeout, remaining_on_admission / 2)`
+at the end of the refresh for backtracking. Shared waiters for the same question are not alternatives;
+neither are branches excluded by the endpoint prefix or unable to admit their
+next question within the work budgets.
+Cached paths are inspected in rank order by the same traversal steps on a bounded
+snapshot, sharing admission and prefix rules with execution. This distinguishes
+dependent repeats and running siblings from new work waiting for a slot.
+When no alternative remains, the question keeps its full remaining deadline
+and configured retries, without restarting the exchange. Root discovery always
+keeps the full deadline. Retries, EDNS and TCP fallback share that deadline;
+a backtracking cap can cut them short while a queued branch can use the released
+slot.
+This preserves single-path retries and slow healthy chains, while leaving time
+for healthy siblings even with one concurrency slot. Work limits and many
+silent branches can still make coverage incomplete. Dropping the future cancels
+all work.
+A cap/deadline retains completed endpoints;
+truncation solely at the 16-endpoint cap keeps record-derived freshness.
+Failed or incomplete work bounds partial freshness using its timed prefix
+and SOA/withdrawal deadline or `partial_failure_ttl`, without granting child
+negative authority to the root. An admitted failure strictly below the 16th
+retained endpoint at completion keeps its outcome and coverage counts without
+shortening the full prefix's freshness.
+
+For Diameter, an original NXDOMAIN/NODATA allows caller-owned RFC 6408 5(f)
+SRV fallback. `DnsError::Snaptr` distinguishes `NotAdvertised` (unrelated-only
+data, fallback allowed), `ExtendedPresentNoMatch` (abandon this protocol),
+and `LegacyOnly` (explicit caller compatibility policy). Another supported
+protocol can be queried independently. Malformation, transport errors, and
+failure after a root match never authorize absence fallback. No-match kinds
+and root RRset/alias deadlines survive ordinary `finish_refresh`, using the
+existing negative TTL cap, last-good retention and retry/token fencing.
+`snaptr_root()` is diagnostic context, with no separate cache lifecycle.
+
+The DNS-derived retained payload is bounded conservatively by 2 MiB per
+answer, plus up to 16 copies of the caller-owned label; allocator bookkeeping
+and cache query keys are separate. [RFC 031](../../docs/rfc/031-bounded-snaptr-discovery.md)
+specifies the matching grammar, fallback table, exact seed derivation,
+resource bounds and qualification matrix.

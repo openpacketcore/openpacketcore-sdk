@@ -407,7 +407,8 @@ impl DnsCache {
     /// Finish the admitted attempt. Returns false for an expired, foreign or
     /// removed token; a late answer can never overwrite newer state. A valid
     /// failure updates retry/error metadata and preserves every last-good byte.
-    /// Future-dated record observations or disallowed families are malformed.
+    /// Future-dated record observations (including retained alternate paths),
+    /// disallowed families, or mismatched S-NAPTR origin/filter are malformed.
     #[must_use = "check whether this attempt still owned publication"]
     pub fn finish_refresh(
         &mut self,
@@ -444,9 +445,12 @@ impl DnsCache {
                         .0
                         .address_family()
                         .accepts(candidate.peer().endpoint)
-                        || candidate
-                            .records()
-                            .is_some_and(|records| records.iter().any(|r| r.observed_at > now))
+                        || candidate.all_records().any(|r| r.observed_at > now)
+                        || candidate.snaptr().is_some_and(|provenance| {
+                            provenance.origin() != token.key.0.name()
+                                || Some(provenance.filter()) != token.key.0.snaptr_filter()
+                                || candidate.peer().transport != token.key.0.input().transport
+                        })
                 }) {
                     Err(DnsError::MalformedAnswer)
                 } else {

@@ -14,5 +14,8 @@ getrandom = { version = "0.4", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
