@@ -13,7 +13,9 @@ pub(super) const READ_BARRIER_DOMAIN: [u8; 8] = *b"opc-sb-4";
 pub(super) fn is_scope_command(intent: &SessionMutationIntent) -> bool {
     matches!(
         intent,
-        SessionMutationIntent::ScopeAuthority(_) | SessionMutationIntent::ScopeBatch(_)
+        SessionMutationIntent::ScopeAuthority(_)
+            | SessionMutationIntent::ScopeBatch(_)
+            | SessionMutationIntent::ScopeBatchCancel(_)
     )
 }
 

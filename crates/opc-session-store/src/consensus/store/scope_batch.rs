@@ -3,8 +3,8 @@
 use super::*;
 use crate::scope_authority::{ScopeAuthorityError, ScopeId, ScopeNamespace};
 use crate::scope_batch::{
-    ScopeBatchCheckpoint, ScopeBatchCommand, ScopeBatchError, ScopeBatchOutcome, ScopeChildKey,
-    ScopeChildRecord,
+    ScopeBatchCancelCommand, ScopeBatchCheckpoint, ScopeBatchCommand, ScopeBatchError,
+    ScopeBatchOutcome, ScopeBatchReadCut, ScopeBatchReceipt, ScopeChildKey, ScopeChildRecord,
 };
 use crate::scope_storage::{self, ScopeRow};
 
@@ -13,6 +13,44 @@ fn unavailable(_: impl fmt::Debug) -> ScopeBatchError {
 }
 
 impl ConsensusSessionStore {
+    pub(crate) fn scope_batch_scheduler_key(scope: &ScopeId) -> ScopeSchedulerKey {
+        scheduling::scope_key(scope)
+    }
+
+    pub(crate) async fn scope_batch_cut(
+        &self,
+        scope: &ScopeId,
+    ) -> Result<ScopeBatchReadCut, ScopeBatchError> {
+        let (identity, _) = self.current_scope().map_err(unavailable)?;
+        if identity.cluster_id() != scope.store() {
+            return Err(ScopeAuthorityError::Unauthorized.into());
+        }
+        let current = SessionConsumerScope::new(identity);
+        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+        drop(
+            self.admit_scope_read_before(current, deadline)
+                .await
+                .map_err(unavailable)?,
+        );
+        self.scope_read_barrier_before(deadline)
+            .await
+            .map_err(unavailable)?;
+        let _admission = self
+            .admit_scope_read_before(current, deadline)
+            .await
+            .map_err(unavailable)?;
+        let cut = self
+            .inner
+            .backend
+            .consensus_scope_batch_cut(self.inner.storage_identity, scope.clone())
+            .await
+            .map_err(unavailable)?;
+        self.require_scope_read_authority_before(current, deadline)
+            .await
+            .map_err(unavailable)?;
+        cut
+    }
+
     async fn scope_row(
         &self,
         scope: &ScopeId,
@@ -55,12 +93,9 @@ impl ConsensusSessionStore {
         &self,
         scope: &ScopeId,
     ) -> Result<ScopeBatchCheckpoint, ScopeBatchError> {
-        match self
-            .scope_row(scope, scope_storage::batch_key(scope)?)
-            .await?
-        {
-            Some(ScopeRow::Batch(row)) => Ok(*row),
-            _ => Err(ScopeBatchError::FormatMismatch),
+        match self.scope_batch_cut(scope).await? {
+            ScopeBatchReadCut::Initialized { checkpoint, .. } => Ok(*checkpoint),
+            ScopeBatchReadCut::Uninitialized => Err(ScopeBatchError::FormatMismatch),
         }
     }
 
@@ -110,6 +145,40 @@ impl ConsensusSessionStore {
             .map_err(|_| ScopeBatchError::OutcomeUnknown)?;
         match response.result {
             Ok(SessionMutationOutcome::ScopeBatch(result)) => result,
+            _ => Err(ScopeBatchError::OutcomeUnknown),
+        }
+    }
+
+    pub(crate) async fn commit_scope_batch_cancel(
+        &self,
+        operation: ScopeBatchCancelCommand,
+        class: ScopeWorkClass,
+    ) -> Result<ScopeBatchReceipt, ScopeBatchError> {
+        operation.validate()?;
+        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+        self.ensure_scope_profile_before(deadline)
+            .await
+            .map_err(|error| match error {
+                StoreError::CapabilityNotSupported(_) => {
+                    ScopeBatchError::Scope(ScopeAuthorityError::ProfileNotActivated)
+                }
+                _ => ScopeBatchError::Unavailable,
+            })?;
+        let (current, _) = self.current_scope().map_err(unavailable)?;
+        if current.cluster_id() != operation.attempt.stamp().scope().store() {
+            return Err(ScopeAuthorityError::Unauthorized.into());
+        }
+        let response = self
+            .submit_classified_scope_batch(
+                SessionConsensusRequestId::from_bytes(operation.proposal_id()?),
+                SessionMutationIntent::ScopeBatchCancel(Box::new(operation)),
+                current,
+                class,
+            )
+            .await
+            .map_err(|_| ScopeBatchError::OutcomeUnknown)?;
+        match response.result {
+            Ok(SessionMutationOutcome::ScopeBatchCancel(result)) => result,
             _ => Err(ScopeBatchError::OutcomeUnknown),
         }
     }

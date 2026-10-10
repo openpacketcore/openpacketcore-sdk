@@ -23,13 +23,28 @@ impl ForwardMutationRequest {
             | (ForwardWorkClass::Declared(_), SessionMutationIntent::Authorized { .. }) => {
                 return Err(StoreError::TopologyAuthorityRevoked);
             }
-            (ForwardWorkClass::Declared(class), SessionMutationIntent::ScopeBatch(_)) => class,
+            (
+                ForwardWorkClass::Declared(class),
+                SessionMutationIntent::ScopeBatch(_) | SessionMutationIntent::ScopeBatchCancel(_),
+            ) => class,
             (ForwardWorkClass::Declared(_), _) => return Err(StoreError::TopologyAuthorityRevoked),
             (ForwardWorkClass::Inferred, intent) => inferred_class(intent),
         };
+        let lane = match &self.intent {
+            SessionMutationIntent::ScopeBatch(command) => Some(command.request.lane()),
+            SessionMutationIntent::ScopeBatchCancel(command) => Some(command.attempt.lane()),
+            _ => None,
+        };
+        if let Some(lane) = lane {
+            crate::scope_batch::require_data_lane_class(lane, class)
+                .map_err(|_| StoreError::TopologyAuthorityRevoked)?;
+        }
         let key = match &self.intent {
             SessionMutationIntent::ScopeAuthority(command) => scope_key(command.request.scope()),
             SessionMutationIntent::ScopeBatch(command) => scope_key(command.request.scope()),
+            SessionMutationIntent::ScopeBatchCancel(command) => {
+                scope_key(command.attempt.stamp().scope())
+            }
             // Non-scope legacy traffic is an aggregate, not one tenant. It
             // shares the full class budget without a per-scope reduction.
             // Only the authenticated scope API can declare emergency classes.
@@ -88,11 +103,12 @@ fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
         | SessionMutationIntent::RosterTerminalV2(_)
         | SessionMutationIntent::VoidFencedTransitionV2(_)
         | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
-        | SessionMutationIntent::ScopeBatch(_) => ScopeWorkClass::Normal,
+        | SessionMutationIntent::ScopeBatch(_)
+        | SessionMutationIntent::ScopeBatchCancel(_) => ScopeWorkClass::Normal,
     }
 }
 
-fn scope_key(scope: &crate::scope_authority::ScopeId) -> ScopeSchedulerKey {
+pub(super) fn scope_key(scope: &crate::scope_authority::ScopeId) -> ScopeSchedulerKey {
     let mut hash = Sha256::new();
     hash.update(b"openpacketcore/scope-scheduling-key/v1\0");
     hash.update(scope.store().as_bytes());

@@ -8397,7 +8397,9 @@ impl ConsensusSessionStore {
         }
         if matches!(
             &request.intent,
-            SessionMutationIntent::ScopeAuthority(_) | SessionMutationIntent::ScopeBatch(_)
+            SessionMutationIntent::ScopeAuthority(_)
+                | SessionMutationIntent::ScopeBatch(_)
+                | SessionMutationIntent::ScopeBatchCancel(_)
         ) && !self
             .activated_scope_profile_is_current(deadline)
             .await
@@ -10995,6 +10997,7 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
                 | SessionMutationIntent::RosterTerminal(_)
                 | SessionMutationIntent::ScopeAuthority(_)
                 | SessionMutationIntent::ScopeBatch(_)
+                | SessionMutationIntent::ScopeBatchCancel(_)
                 | SessionMutationIntent::PreflightScopeProfile
                 | SessionMutationIntent::ActivateScopeProfile(_)
         )
@@ -11081,6 +11084,7 @@ fn committed_response_matches_intent(
         let uses_dedicated_roster_validation = matches!(
             outcome,
             SessionMutationOutcome::ScopeBatch(_)
+                | SessionMutationOutcome::ScopeBatchCancel(_)
                 | SessionMutationOutcome::ScopeAuthority(_)
                 | SessionMutationOutcome::RosterAdmission(_)
                 | SessionMutationOutcome::RosterTerminal(_)
@@ -11094,6 +11098,13 @@ fn committed_response_matches_intent(
         }
     }
     match (&response.result, intent) {
+        (
+            Ok(SessionMutationOutcome::ScopeBatchCancel(result)),
+            SessionMutationIntent::ScopeBatchCancel(operation),
+        ) => match result {
+            Ok(receipt) => operation.matches(receipt),
+            Err(error) => operation.matches_error(error),
+        },
         (
             Ok(SessionMutationOutcome::ScopeBatch(result)),
             SessionMutationIntent::ScopeBatch(operation),
@@ -11743,6 +11754,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         SessionMutationIntent::AdvanceLogicalTime
         | SessionMutationIntent::ScopeAuthority(_)
         | SessionMutationIntent::ScopeBatch(_)
+        | SessionMutationIntent::ScopeBatchCancel(_)
         | SessionMutationIntent::PreflightScopeProfile
         | SessionMutationIntent::CertifyScopeProfileContinuation(_)
         | SessionMutationIntent::ActivateScopeProfile(_) => false,
@@ -12041,7 +12053,7 @@ fn validate_consensus_intent_with_recovery(
             .validate()
             .map_err(|_| StoreError::InvalidKey("scope operation invalid".into()))?;
     }
-    if let SessionMutationIntent::ScopeBatch(operation) = intent {
+    if let Some(operation) = crate::scope_batch::ScopeBatchOperation::from_intent(intent) {
         operation
             .validate()
             .map_err(|_| StoreError::InvalidKey("scope batch invalid".into()))?;

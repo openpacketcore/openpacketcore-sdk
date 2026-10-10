@@ -3,6 +3,17 @@ use crate::scope_authority::tests::{admitted, close, retired_fixture, scope, suc
 use crate::scope_authority::ScopeState;
 use std::collections::HashMap;
 
+#[path = "cancel_tests.rs"]
+mod cancel;
+#[path = "codec_tests.rs"]
+mod codec;
+#[path = "coordinator_tests.rs"]
+mod coordinator;
+#[path = "cut_tests.rs"]
+mod cut;
+#[path = "integration_tests.rs"]
+mod independent_lanes;
+
 pub(crate) fn key(n: u8) -> ScopeChildKey {
     ScopeChildKey::new([n; 32]).unwrap()
 }
@@ -166,7 +177,7 @@ fn scope_batch_reserves_lane_sequence_and_eight_durable_slots() {
     let request = serde_json::to_value(&command.request).unwrap();
     assert_eq!(
         request["lane"], 0,
-        "the initial batch profile uses lane zero"
+        "the serialized convenience constructor uses lane zero"
     );
     assert_eq!(request["sequence"], 1, "the first lane sequence is one");
     let outcome = state.apply(&command).unwrap();
@@ -183,9 +194,9 @@ fn scope_batch_reserves_lane_sequence_and_eight_durable_slots() {
     for lane in &lanes[1..] {
         assert_eq!(lane["sequence"], 0);
         assert_eq!(lane["floor"], 0);
-        assert_eq!(lane["outcome"], serde_json::Value::Null);
+        assert_eq!(lane["receipt"], serde_json::Value::Null);
     }
-    for (field, value) in [("lane", 1), ("sequence", 2)] {
+    for (field, value) in [("lane", 8), ("sequence", 0)] {
         let mut invalid = request.clone();
         invalid[field] = value.into();
         let request: ScopeBatchRequest = serde_json::from_value(invalid).unwrap();
@@ -204,41 +215,62 @@ fn scope_batch_reserves_lane_sequence_and_eight_durable_slots() {
 }
 
 #[test]
-fn scope_batch_reserved_lane_layout_fits_eight_maximum_outcomes() {
+fn scope_batch_lane_layout_fits_eight_maximum_complete_receipts() {
     let mut state = State::new();
     state
         .apply(&state.command(3, vec![create(1, &[1])]))
         .unwrap();
+    let mut stamp = serde_json::to_value(state.authority.view.stamp().unwrap()).unwrap();
+    stamp["namespace"]["scope"]["tenant"] = "t".repeat(128).into();
+    stamp["namespace"]["scope"]["nf_kind"] = "n".repeat(64).into();
+    stamp["namespace"]["incarnation"] = COUNTER_MAX.into();
+    stamp["revision"] = COUNTER_MAX.into();
+    stamp["execution"]["admission_generation"] = COUNTER_MAX.into();
+    stamp["execution"]["identity"] = "x".repeat(253).into();
+    let stamp: ScopeAuthorityStamp = serde_json::from_value(stamp).unwrap();
+    stamp.validate().unwrap();
     let mut future = state.checkpoint;
+    future.scope = stamp.scope().clone();
     future.revision = COUNTER_MAX;
     future.birth_floor = COUNTER_MAX;
     future.counters = [COUNTER_MAX; SCOPE_COUNTERS];
-    let mut lane = future.lanes[0].clone();
-    lane.floor = COUNTER_MAX - 1;
-    lane.sequence = COUNTER_MAX;
-    let outcome = lane.outcome.as_mut().unwrap();
-    outcome.sequence = COUNTER_MAX;
-    outcome.revision = COUNTER_MAX;
-    outcome.counters = future.counters;
-    outcome.rows =
-        vec![ScopeChildRevision::new(COUNTER_MAX, COUNTER_MAX).unwrap(); MAX_SCOPE_BATCH_CHILDREN];
+    let template = future.lanes[0].clone();
     for (index, slot) in future.lanes.iter_mut().enumerate() {
-        *slot = lane.clone();
-        slot.outcome.as_mut().unwrap().lane = index as u8;
+        *slot = template.clone();
+        slot.sequence = COUNTER_MAX / 8 + u64::from(index < (COUNTER_MAX % 8) as usize);
+        slot.floor = slot.sequence - 1;
+        let receipt = slot.receipt.as_mut().unwrap();
+        receipt.attempt.stamp = stamp.clone();
+        receipt.attempt.lane = index as u8;
+        receipt.attempt.sequence = slot.sequence;
+        receipt.attempt.request_id = [index as u8 + 1; 16];
+        receipt.revision = COUNTER_MAX - 7 + index as u64;
+        let ScopeBatchTerminal::Applied(outcome) = &mut receipt.terminal else {
+            panic!("applied receipt required");
+        };
+        outcome.lane = index as u8;
+        outcome.sequence = slot.sequence;
+        outcome.revision = receipt.revision;
+        outcome.counters = future.counters;
+        outcome.rows = (0..MAX_SCOPE_BATCH_CHILDREN)
+            .map(|n| ScopeChildRevision::new(COUNTER_MAX - n as u64, COUNTER_MAX).unwrap())
+            .collect();
     }
-    // This proves space for future lanes, not permission to use them yet.
-    assert_eq!(
-        future.validate_stored(),
-        Err(ScopeBatchError::FormatMismatch)
-    );
+    future.validate_stored().unwrap();
     let row = crate::scope_storage::ScopeRow::Batch(Box::new(future));
     let bytes = postcard::to_allocvec(&row).unwrap();
     assert!(
-        bytes.len() <= 16 * 1024,
-        "all eight maximum outcomes fit the metadata row cap"
+        bytes.len() <= MAX_SCOPE_BATCH_LEDGER_BYTES,
+        "all eight maximum receipts fit the metadata row cap: {} bytes",
+        bytes.len()
     );
     let decoded: crate::scope_storage::ScopeRow = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(postcard::to_allocvec(&decoded).unwrap(), bytes);
+    let record = row.to_record().unwrap();
+    assert_eq!(
+        crate::scope_storage::ScopeRow::from_record(&record).unwrap(),
+        row
+    );
 }
 
 #[test]
@@ -446,10 +478,7 @@ fn required_zero_ledger_encoding_is_canonical() {
             0..=15 => wire["Batch"]["counters"][field] = 1.into(),
             16 => wire["Batch"]["birth_floor"] = 1.into(),
             17 => wire["Batch"]["lanes"][0]["floor"] = 1.into(),
-            _ => {
-                wire["Batch"]["lanes"][7]["last_request_id"] =
-                    serde_json::to_value([1; 16]).unwrap()
-            }
+            _ => wire["Batch"]["lanes"][7]["sequence"] = 1.into(),
         }
         let forged: crate::scope_storage::ScopeRow = serde_json::from_value(wire).unwrap();
         assert!(
@@ -475,12 +504,17 @@ fn snapshot_may_not_lower_any_stable_counter_or_birth_floor() {
         .unwrap();
     for n in 0..17 {
         let mut lower = state.checkpoint.clone();
+        let ScopeBatchTerminal::Applied(outcome) =
+            &mut lower.lanes[0].receipt.as_mut().unwrap().terminal
+        else {
+            panic!("applied receipt required");
+        };
         if n == 16 {
             lower.birth_floor = 0;
-            lower.lanes[0].outcome.as_mut().unwrap().rows.clear();
+            outcome.rows.clear();
         } else {
             lower.counters[n] = 7;
-            lower.lanes[0].outcome.as_mut().unwrap().counters[n] = 7;
+            outcome.counters[n] = 7;
         }
         let after = crate::scope_storage::ScopeRow::Batch(Box::new(lower))
             .facts()

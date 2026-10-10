@@ -5,9 +5,8 @@
 //! Apply compares the exact current Active authority stamp and retirement floor.
 //! Stable counters, birth and sequence floors never reset across incarnations.
 //!
-//! Retain the complete request and allow one unresolved batch per scope. This
-//! initial profile uses lane zero, an exact scope batch revision and one retained
-//! result. Eight lane slots are reserved for later independent replay; coherent
+//! Retain the complete request and allow one unresolved batch per lane. Eight
+//! independent lanes retain their last immutable terminal receipt; coherent
 //! scans remain separate. A lost
 //! reply or configuration switch can return [`ScopeBatchError::OutcomeUnknown`];
 //! retry the exact request before submitting its successor.
@@ -24,21 +23,51 @@ use crate::scope_authority::{
 };
 use crate::SessionKey;
 
+mod attempt;
+mod codec;
+mod completion;
+mod coordinator;
+mod cut;
+mod lane;
+mod operation;
+mod progress;
+mod read_set;
 mod service;
+pub use attempt::{
+    ScopeBatchAttempt, ScopeBatchCancelCommand, ScopeBatchLookup, ScopeBatchReceipt,
+    ScopeBatchTerminal,
+};
+pub use completion::{ScopeBatchCompletion, ScopeBatchCompletionOutcome, ScopeBatchNoApplyProof};
+pub use coordinator::{
+    ScopeBatchBuildContext, ScopeBatchCompletions, ScopeBatchCoordinator, ScopeBatchHandle,
+    ScopeBatchLaneStatus, ScopeBatchPort, ScopeBatchReservation,
+};
+pub(crate) use cut::ScopeBatchReadCut;
+pub use cut::{ScopeBatchLaneView, ScopeBatchReopen, ScopeBatchReopenState};
+pub(crate) use operation::Operation as ScopeBatchOperation;
+pub use read_set::{ScopeChildCondition, ScopeClaimCondition, ScopeClaimOwner};
 pub(crate) mod state;
+pub(crate) use service::require_data_lane_class;
 pub use service::ScopeBatchStore;
 
 /// Maximum child records touched by one atomic command.
 pub const MAX_SCOPE_BATCH_CHILDREN: usize = 64;
 /// Maximum serialized consensus command, including authority and framing.
 pub const MAX_SCOPE_BATCH_COMMAND_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum stored stable-scope ledger, including eight complete receipts and framing.
+pub const MAX_SCOPE_BATCH_LEDGER_BYTES: usize = 20 * 1024;
+/// Maximum canonical reopening observation, including authority and all receipts.
+pub const MAX_SCOPE_BATCH_REOPEN_BYTES: usize =
+    MAX_SCOPE_BATCH_LEDGER_BYTES + crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES;
+/// Maximum canonical error, including all child, claim and counter conflicts.
+pub const MAX_SCOPE_BATCH_ERROR_BYTES: usize = 20 * 1024;
 /// Maximum sealed envelope bytes in one child value.
 pub const MAX_SCOPE_CHILD_VALUE_BYTES: usize = 1024 * 1024;
 /// Maximum unique claims owned by one live child.
 pub const MAX_SCOPE_CHILD_CLAIMS: usize = 8;
 /// Fixed number of independently compared counters in one scope.
 pub const SCOPE_COUNTERS: usize = 16;
-/// Fixed durable replay slots. This initial API admits only lane zero.
+/// Fixed independently sequenced durable replay slots.
 pub const SCOPE_BATCH_LANES: usize = 8;
 const COUNTER_MAX: u64 = i64::MAX as u64;
 const COMMAND_HEADROOM: usize = 16 * 1024;
@@ -177,6 +206,7 @@ pub enum ScopeChildMutation {
         /// Already sealed value.
         value: ScopeSealedValue,
         /// Complete unique claim set.
+        #[serde(deserialize_with = "codec::claims")]
         claims: Vec<ScopeClaimKey>,
     },
     /// Replace exactly one live birth and generation.
@@ -188,6 +218,7 @@ pub enum ScopeChildMutation {
         /// Already sealed successor value.
         value: ScopeSealedValue,
         /// Complete successor claim set, changed atomically with the row.
+        #[serde(deserialize_with = "codec::claims")]
         claims: Vec<ScopeClaimKey>,
     },
     /// Delete exactly one live birth and generation and release its claims.
@@ -269,13 +300,19 @@ pub struct ScopeBatchRequest {
     request_id: [u8; 16],
     lane: u8,
     sequence: u64,
-    expected_revision: u64,
+    expected_revision: Option<u64>,
+    #[serde(deserialize_with = "codec::children")]
     operations: Vec<ScopeChildMutation>,
+    #[serde(deserialize_with = "codec::counters")]
     counters: Vec<ScopeCounterMutation>,
+    #[serde(deserialize_with = "codec::children")]
+    child_conditions: Vec<ScopeChildCondition>,
+    #[serde(deserialize_with = "codec::claim_conditions")]
+    claim_conditions: Vec<ScopeClaimCondition>,
 }
 impl ScopeBatchRequest {
     /// Build one bounded batch in lane zero, with sequence `expected_revision + 1`.
-    /// Counter-only batches are permitted; other lanes are reserved.
+    /// This convenience constructor also compares the whole-scope revision.
     pub fn new(
         stamp: &ScopeAuthorityStamp,
         request_id: [u8; 16],
@@ -290,12 +327,59 @@ impl ScopeBatchRequest {
             sequence: expected_revision
                 .checked_add(1)
                 .ok_or(ScopeBatchError::InvalidRequest)?,
-            expected_revision,
+            expected_revision: Some(expected_revision),
             operations,
             counters,
+            child_conditions: Vec::new(),
+            claim_conditions: Vec::new(),
         };
         value.validate()?;
         Ok(value)
+    }
+    /// Build one independently sequenced lane request without a whole-scope
+    /// revision guard. Read predicates and mutation comparisons protect its cut.
+    pub fn in_lane(
+        stamp: &ScopeAuthorityStamp,
+        request_id: [u8; 16],
+        lane: u8,
+        sequence: u64,
+        operations: Vec<ScopeChildMutation>,
+        counters: Vec<ScopeCounterMutation>,
+    ) -> Result<Self, ScopeBatchError> {
+        let value = Self {
+            stamp: stamp.clone(),
+            request_id,
+            lane,
+            sequence,
+            expected_revision: None,
+            operations,
+            counters,
+            child_conditions: Vec::new(),
+            claim_conditions: Vec::new(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Add exact live-child and retained-claim comparisons to the same atomic
+    /// pre-state as the mutations. Missing is distinct from Released.
+    pub fn with_read_conditions(
+        mut self,
+        children: Vec<ScopeChildCondition>,
+        claims: Vec<ScopeClaimCondition>,
+    ) -> Result<Self, ScopeBatchError> {
+        self.child_conditions = children;
+        self.claim_conditions = claims;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Add the optional whole-scope comparison for rare operations whose
+    /// absence/range dependencies cannot be expressed as exact live predicates.
+    pub fn with_revision_guard(mut self, revision: u64) -> Result<Self, ScopeBatchError> {
+        self.expected_revision = Some(revision);
+        self.validate()?;
+        Ok(self)
     }
     /// Stable scope of this batch.
     pub const fn scope(&self) -> &ScopeId {
@@ -313,16 +397,16 @@ impl ScopeBatchRequest {
     pub const fn request_id(&self) -> &[u8; 16] {
         &self.request_id
     }
-    /// Replay lane, always zero in this initial profile.
+    /// Independently sequenced replay lane.
     pub const fn lane(&self) -> u8 {
         self.lane
     }
-    /// Positive lane sequence, one greater than the compared revision.
+    /// Positive lane sequence, one greater than its last terminal sequence.
     pub const fn sequence(&self) -> u64 {
         self.sequence
     }
-    /// Scope batch revision compared by committed apply.
-    pub const fn expected_revision(&self) -> u64 {
+    /// Optional whole-scope batch revision compared by committed apply.
+    pub const fn expected_revision(&self) -> Option<u64> {
         self.expected_revision
     }
     /// Child mutations in result order.
@@ -336,9 +420,11 @@ impl ScopeBatchRequest {
 
     pub(crate) fn validate(&self) -> Result<(), ScopeBatchError> {
         if self.request_id == [0; 16]
-            || self.expected_revision >= COUNTER_MAX
-            || self.lane != 0
-            || self.sequence != self.expected_revision + 1
+            || self
+                .expected_revision
+                .is_some_and(|revision| revision >= COUNTER_MAX)
+            || usize::from(self.lane) >= SCOPE_BATCH_LANES
+            || !(1..=COUNTER_MAX).contains(&self.sequence)
             || self.operations.len() > MAX_SCOPE_BATCH_CHILDREN
             || self.counters.len() > SCOPE_COUNTERS
             || (self.operations.is_empty() && self.counters.is_empty())
@@ -360,6 +446,30 @@ impl ScopeBatchRequest {
                 ScopeChildRevision::new(expected.birth, expected.generation)?;
             }
         }
+        for condition in &self.child_conditions {
+            condition.validate()?;
+            if !keys.insert(condition.key()) {
+                return Err(ScopeBatchError::InvalidRequest);
+            }
+        }
+        let mut claims = HashSet::new();
+        for condition in &self.claim_conditions {
+            condition.validate()?;
+            if !claims.insert(condition.key()) {
+                return Err(ScopeBatchError::InvalidRequest);
+            }
+            if let Some(owner) = condition.owner() {
+                keys.insert(owner.child());
+            }
+        }
+        for operation in &self.operations {
+            claims.extend(operation.claims());
+        }
+        if keys.len() > MAX_SCOPE_BATCH_CHILDREN
+            || claims.len() > MAX_SCOPE_BATCH_CHILDREN * MAX_SCOPE_CHILD_CLAIMS
+        {
+            return Err(ScopeBatchError::InvalidRequest);
+        }
         let mut counters = HashSet::new();
         for counter in &self.counters {
             ScopeCounterMutation::new(counter.counter, counter.expected, counter.next)?;
@@ -374,7 +484,9 @@ impl ScopeBatchRequest {
         }
         Ok(())
     }
-    fn digest(&self) -> Result<[u8; 32], ScopeBatchError> {
+    /// Canonical digest used by apply, cancellation and exact receipt matching.
+    /// The digest binds every field, including the complete read predicates.
+    pub fn digest(&self) -> Result<[u8; 32], ScopeBatchError> {
         self.validate()?;
         let mut hash = Sha256::new();
         hash.update(b"openpacketcore/scope-batch/request/v4\0");
@@ -389,14 +501,21 @@ impl ScopeBatchRequest {
 #[serde(deny_unknown_fields)]
 pub struct ScopeBatchConflicts {
     /// Child comparisons that failed.
+    #[serde(deserialize_with = "codec::children")]
     pub children: Vec<ScopeChildKey>,
     /// Unique claims that were already held by another birth.
+    #[serde(deserialize_with = "codec::claim_conditions")]
     pub claims: Vec<ScopeClaimKey>,
     /// Counter comparisons that failed.
+    #[serde(deserialize_with = "codec::counters")]
     pub counters: Vec<u8>,
 }
 
 /// Stable, value-free batch refusal or unresolved outcome.
+///
+/// Transport adapters use [`Self::encode_canonical`] and [`Self::decode_canonical`]
+/// to preserve retry and cancellation distinctions within fixed metadata bounds.
+/// Decoded errors alone are not evidence that an attempt committed or was cancelled.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[non_exhaustive]
 pub enum ScopeBatchError {
@@ -426,6 +545,16 @@ pub enum ScopeBatchError {
     /// A linearizable, strictly durable backend was unavailable.
     #[error("scope_batch_unavailable")]
     Unavailable,
+    /// The next request must use the exact successor of this lane's frontier.
+    #[error("scope_batch_sequence_conflict")]
+    SequenceConflict,
+    /// Cancellation durably won this exact attempt before its effects applied.
+    #[error("scope_batch_cancelled")]
+    Cancelled,
+    /// Sixteen whole-scope revision conflicts were resolved and acknowledged.
+    /// This is a local progress result, never a committed batch refusal.
+    #[error("scope_guard_stalled")]
+    ScopeGuardStalled,
 }
 impl From<ScopeAuthorityError> for ScopeBatchError {
     fn from(value: ScopeAuthorityError) -> Self {
@@ -442,6 +571,7 @@ pub struct ScopeBatchOutcome {
     lane: u8,
     sequence: u64,
     revision: u64,
+    #[serde(deserialize_with = "codec::children")]
     rows: Vec<ScopeChildRevision>,
     counters: [u64; SCOPE_COUNTERS],
 }
@@ -507,6 +637,7 @@ pub struct ScopeChildRecord {
     pub(crate) revision: ScopeChildRevision,
     pub(crate) batch_revision: u64,
     pub(crate) value: Option<ScopeSealedValue>,
+    #[serde(deserialize_with = "codec::claims")]
     pub(crate) claims: Vec<ScopeClaimKey>,
 }
 impl ScopeChildRecord {
@@ -542,6 +673,17 @@ pub struct ScopeBatchCommand {
 }
 impl ScopeBatchCommand {
     #[cfg(target_os = "linux")]
+    pub(crate) fn metadata_request_count(&self) -> usize {
+        (self.request.operations.len() + self.request.child_conditions.len())
+            .max(
+                self.request
+                    .claim_conditions
+                    .len()
+                    .div_ceil(MAX_SCOPE_CHILD_CLAIMS),
+            )
+            .max(1)
+    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
         use std::mem::size_of;
         // The fixed authority allowance covers the bounded scope and execution
@@ -559,6 +701,18 @@ impl ScopeBatchCommand {
                     .counters
                     .capacity()
                     .checked_mul(size_of::<ScopeCounterMutation>())?,
+            )?
+            .checked_add(
+                self.request
+                    .child_conditions
+                    .capacity()
+                    .checked_mul(size_of::<ScopeChildCondition>())?,
+            )?
+            .checked_add(
+                self.request
+                    .claim_conditions
+                    .capacity()
+                    .checked_mul(size_of::<ScopeClaimCondition>())?,
             )?;
         for operation in &self.request.operations {
             if let ScopeChildMutation::Create { value, claims, .. }
@@ -588,6 +742,7 @@ impl ScopeBatchCommand {
 
     pub(crate) fn matches_error(&self, error: &ScopeBatchError) -> bool {
         match error {
+            ScopeBatchError::ScopeGuardStalled => false,
             ScopeBatchError::Conflict(conflicts) => {
                 let unique = |len, count| len == count;
                 (!conflicts.children.is_empty()
@@ -608,15 +763,24 @@ impl ScopeBatchCommand {
                         conflicts.counters.len(),
                         conflicts.counters.iter().collect::<HashSet<_>>().len(),
                     )
-                    && conflicts
-                        .children
-                        .iter()
-                        .all(|key| self.request.operations.iter().any(|op| op.key() == *key))
+                    && conflicts.children.iter().all(|key| {
+                        self.request.operations.iter().any(|op| op.key() == *key)
+                            || self
+                                .request
+                                .child_conditions
+                                .iter()
+                                .any(|condition| condition.key() == *key)
+                    })
                     && conflicts.claims.iter().all(|key| {
                         self.request
                             .operations
                             .iter()
                             .any(|op| op.claims().contains(key))
+                            || self
+                                .request
+                                .claim_conditions
+                                .iter()
+                                .any(|condition| condition.key() == *key)
                     })
                     && conflicts
                         .counters
@@ -631,30 +795,7 @@ impl ScopeBatchCommand {
         Ok(())
     }
     pub(crate) fn matches(&self, outcome: &ScopeBatchOutcome) -> bool {
-        self.request.digest() == Ok(outcome.request_digest)
-            && outcome.lane == self.request.lane
-            && outcome.sequence == self.request.sequence
-            && outcome.revision == self.request.expected_revision + 1
-            && outcome.rows.len() == self.request.operations.len()
-            && outcome
-                .rows
-                .iter()
-                .zip(&self.request.operations)
-                .all(|(row, op)| {
-                    ScopeChildRevision::new(row.birth, row.generation).is_ok()
-                        && match op.expected() {
-                            Some(old) => {
-                                row.birth == old.birth && row.generation == old.generation + 1
-                            }
-                            None => row.generation == 1,
-                        }
-                })
-            && outcome.counters.iter().all(|value| *value <= COUNTER_MAX)
-            && self
-                .request
-                .counters
-                .iter()
-                .all(|counter| outcome.counters[usize::from(counter.counter)] == counter.next)
+        outcome.matches_request(&self.request)
     }
 }
 
@@ -668,16 +809,13 @@ pub(crate) struct ScopeBatchCheckpoint {
     lanes: [ScopeBatchLaneCheckpoint; SCOPE_BATCH_LANES],
 }
 
-/// Reserve the complete fixed lane layout now. Only slot zero is populated
-/// until independent lanes are enabled; other slots must remain canonical zero.
+/// The current terminal frontier and its complete immutable receipt.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeBatchLaneCheckpoint {
     floor: u64,
     sequence: u64,
-    last_request_id: [u8; 16],
-    last_digest: [u8; 32],
-    outcome: Option<ScopeBatchOutcome>,
+    receipt: Option<ScopeBatchReceipt>,
 }
 
 macro_rules! redacted_debug {

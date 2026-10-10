@@ -208,6 +208,34 @@ impl<'de> Deserialize<'de> for ScopeChildren {
     }
 }
 
+struct ScopePredicates<const LIMIT: usize>(usize);
+impl<'de, const LIMIT: usize> Deserialize<'de> for ScopePredicates<LIMIT> {
+    fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Predicates<const LIMIT: usize>;
+        impl<'de, const LIMIT: usize> Visitor<'de> for Predicates<LIMIT> {
+            type Value = ScopePredicates<LIMIT>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("bounded scope read predicates")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                for count in 0..LIMIT {
+                    if sequence.next_element::<Request>()?.is_none() {
+                        return Ok(ScopePredicates(count));
+                    }
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom("native scope predicates exceed count"));
+                }
+                Ok(ScopePredicates(LIMIT))
+            }
+        }
+        decoder.deserialize_seq(Predicates::<LIMIT>)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeRequest {
@@ -220,10 +248,17 @@ struct ScopeRequest {
     #[serde(rename = "sequence")]
     _sequence: u64,
     #[serde(rename = "expected_revision")]
-    _expected_revision: u64,
+    _expected_revision: Option<u64>,
     operations: ScopeChildren,
     #[serde(rename = "counters")]
     _counters: Request,
+    child_conditions: ScopePredicates<{ crate::scope_batch::MAX_SCOPE_BATCH_CHILDREN }>,
+    claim_conditions: ScopePredicates<
+        {
+            crate::scope_batch::MAX_SCOPE_BATCH_CHILDREN
+                * crate::scope_batch::MAX_SCOPE_CHILD_CLAIMS
+        },
+    >,
 }
 
 #[derive(Deserialize)]
@@ -273,6 +308,7 @@ impl<'de> Deserialize<'de> for Batch {
 #[derive(Deserialize)]
 enum InnerIntent {
     ScopeBatch(ScopeBatch),
+    ScopeBatchCancel(Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>),
     ActivateScopeProfile(Request),
     ScopeAuthority(Request<1, { crate::consumer::SESSION_CONSUMER_IDENTITY_MAX_BYTES }>),
     AdvanceLogicalTime,
@@ -301,8 +337,17 @@ enum InnerIntent {
 impl InnerIntent {
     fn shape(self) -> Shape {
         match self {
+            Self::ScopeBatchCancel(value) => value.0,
             Self::ScopeBatch(value) => Shape {
-                requests: value.request.operations.0.requests.max(1),
+                requests: (value.request.operations.0.requests + value.request.child_conditions.0)
+                    .max(
+                        value
+                            .request
+                            .claim_conditions
+                            .0
+                            .div_ceil(crate::scope_batch::MAX_SCOPE_CHILD_CLAIMS),
+                    )
+                    .max(1),
                 payload: value.request.operations.0.payload,
             },
             Self::ActivateScopeProfile(value) => value.0,

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store`: add eight independently sequenced scope batch lanes,
+  reserving one for established Emergency work. Compare complete child and claim
+  read sets atomically, retain exact apply/cancel winners, and preserve all lane,
+  counter and birth floors through compaction, snapshots and restart. A shared
+  coordinator owns uncertain requests through caller cancellation and reconnect,
+  inherits retry priority, and redelivers terminal results until exact local
+  acknowledgement. Same-cut lookup/reopen and bounded canonical transport codecs
+  distinguish eligible absence from proven no-application and pruned history.
+  Shared-lane reservations obtain their class budget first; exclusive Emergency
+  lane 7 takes its lane first to preserve capacity across scopes. Reservations
+  refuse reused IDs before dispatch, including IDs acknowledged during a build.
+  Permanent same-lane ID collisions resolve without wedging the
+  lane; unresolved work remains visible through age and failure diagnostics.
+  Rare whole-scope guarded operations return a typed stall after sixteen resolved
+  conflicts. These changes join the single fresh-install scope profile 4;
+  activation requires the combined implementation and qualification. See RFC 027.
+
+
 - `opc-session-store`: add scope-fair backpressure with separate SafetyControl,
   established Emergency, EmergencyClassification, Normal and Maintenance budgets.
   Shared lanes have class ordering, an eight-bypass bound and dynamic priority

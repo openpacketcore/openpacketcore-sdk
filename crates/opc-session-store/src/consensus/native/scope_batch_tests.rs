@@ -6,7 +6,9 @@ use crate::scope_authority::{
     ScopeProfileActivation,
 };
 use crate::scope_batch::tests::{claim, create, key, value};
-use crate::scope_batch::{ScopeBatchRequest, ScopeChildMutation, ScopeChildRevision};
+use crate::scope_batch::{
+    ScopeBatchCommand, ScopeBatchRequest, ScopeChildMutation, ScopeChildRevision,
+};
 
 fn entry(
     storage: &NativeStorage,

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::scope_authority::{ScopeAuthorityCheckpoint, ScopeAuthorityError};
-use crate::scope_batch::{ScopeBatchCommand, ScopeBatchError};
+use crate::scope_batch::{ScopeBatchError, ScopeBatchOperation};
 use crate::scope_storage::{self, ScopeRow};
 
 #[cfg(test)]
@@ -51,7 +51,9 @@ pub(super) fn validate_links<'a>(
             .and_then(|row| row.record.as_ref())
             .ok_or_else(|| invalid("scope required ledger absent"))?;
         return match ScopeRow::from_record(ledger) {
-            Ok(ScopeRow::Batch(row)) if &row.scope == authority.view.scope() => Ok(()),
+            Ok(ScopeRow::Batch(row)) if &row.scope == authority.view.scope() => row
+                .validate_authority(&authority)
+                .map_err(|_| invalid("scope authority/ledger cut invalid")),
             _ => Err(invalid("scope required ledger invalid")),
         };
     }
@@ -79,6 +81,11 @@ pub(super) fn validate_links<'a>(
             .map_err(|_| invalid("scope batch authority invalid"))?;
         if authority.view.scope() != scope {
             return Err(invalid("scope batch authority differs"));
+        }
+        if let ScopeRow::Batch(checkpoint) = &row {
+            checkpoint
+                .validate_authority(&authority)
+                .map_err(|_| invalid("scope authority/ledger cut invalid"))?;
         }
     }
     row.validate_links(&decode_row)
@@ -130,6 +137,21 @@ fn decode(row: &NativeKeyState) -> Result<Option<ScopeRow>, ScopeBatchError> {
 }
 
 impl NativeState {
+    pub(crate) fn scope_batch_cut(
+        &self,
+        identity: SessionConsensusIdentity,
+        scope: &crate::scope_authority::ScopeId,
+    ) -> Result<Result<crate::scope_batch::ScopeBatchReadCut, ScopeBatchError>, StoreError> {
+        // Both reads borrow this one certified immutable NativeState. Never
+        // reacquire a second owner borrow between authority and ledger.
+        let (legacy, authority) = self.scope_authority_checkpoint(identity, scope)?;
+        let key = scope_storage::batch_key(scope).map_err(|_| unavailable())?;
+        let row = self.scope_record(identity, &key)?;
+        Ok(crate::scope_batch::ScopeBatchReadCut::from_records(
+            scope, legacy, authority, row,
+        ))
+    }
+
     pub(crate) fn scope_record(
         &self,
         identity: SessionConsensusIdentity,
@@ -163,12 +185,12 @@ impl NativeDelta<'_> {
     pub(super) fn scope_batch(
         &mut self,
         command: &SessionConsensusCommand,
-        operation: &ScopeBatchCommand,
+        operation: ScopeBatchOperation<'_>,
         authorized: bool,
         now: Timestamp,
         index: u64,
     ) -> io::Result<SessionConsensusResponse> {
-        let scope = operation.request.scope();
+        let scope = operation.scope();
         let result = if scope.store() != self.base.identity.cluster_id() {
             Err(ScopeAuthorityError::Unauthorized.into())
         } else if !authorized {
@@ -184,11 +206,9 @@ impl NativeDelta<'_> {
         };
         let outcome = match result {
             Ok(plan) => {
-                let outcome = plan
-                    .checkpoint
-                    .outcome(operation.request.lane())
-                    .cloned()
-                    .ok_or_else(|| invalid("scope batch outcome absent"))?;
+                let outcome = operation
+                    .success(&plan.checkpoint)
+                    .map_err(|_| invalid("scope batch receipt invalid"))?;
                 // Finish every conversion before publishing any row into the
                 // enclosing native delta. The WAL owner publishes that delta
                 // only after its ordinary strict durability boundary.
@@ -207,9 +227,9 @@ impl NativeDelta<'_> {
                     .collect::<Result<_, ScopeBatchError>>();
                 self.keys
                     .extend(rows.map_err(|_| invalid("scope batch record invalid"))?);
-                Ok(outcome)
+                outcome
             }
-            Err(error) => Err(error),
+            Err(error) => operation.failure(error),
         };
         let sequence = self
             .frontiers
@@ -223,14 +243,14 @@ impl NativeDelta<'_> {
         self.frontiers.sequence = sequence;
         self.frontiers.digest = digest;
         self.frontiers.logical_time = Some(now);
-        Ok(self.response(index, Ok(SessionMutationOutcome::ScopeBatch(outcome))))
+        Ok(self.response(index, Ok(outcome)))
     }
 
     fn prepare_scope_batch(
         &self,
-        operation: &ScopeBatchCommand,
+        operation: ScopeBatchOperation<'_>,
     ) -> Result<crate::scope_batch::state::ScopeBatchPlan, ScopeBatchError> {
-        let scope = operation.request.scope();
+        let scope = operation.scope();
         if self.request_receipt(&scope.checkpoint_id()?).is_some() {
             return Err(ScopeBatchError::FormatMismatch);
         }

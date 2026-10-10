@@ -139,15 +139,19 @@ to its scheduling rank.
 
 ## Shared lanes, inheritance and bounded waiting
 
-The scheduler supplies the lane arbiter; the independent-lane slice composes it with replay
-ownership and exact outcome resolution. Acquire a lane **before** reserving and
-building a request. Read the current revision and build only after the grant.
-Do not hold a reservation while waiting for another lane, peer, or another
-request's outcome. One explicit control exception is activation preflight: it
-retains a bounded SafetyControl resident reservation across the read barrier and
-unanimous peer probe, without a SafetyControl running credit. One running credit
-covers one bounded attempt/page, including
-its reply; it does not span an indefinite retry loop or an idle reconciliation
+The scheduler supplies the lane arbiter; the batch coordinator composes it with
+replay ownership and exact outcome resolution. Obtain the class's resident
+reservation **before** acquiring a shared lane. A producer blocked on its class
+budget holds no shared lane. Exclusive Emergency lane 7 takes its lane before
+its resident reservation, so queued producers behind a stalled scope cannot
+consume all Emergency capacity across scopes. Emergency dependencies on shared
+lanes still take their resident reservation first. After both grants, acquire a
+running credit, then read the current revision and build the request. The builder
+must not await another lane, peer, or unrelated request's outcome. One explicit
+control exception is activation preflight: it retains a bounded SafetyControl
+resident reservation across the read barrier and unanimous peer probe, without a
+SafetyControl running credit. One running credit covers one bounded attempt/page,
+including its reply; it does not span an indefinite retry loop or an idle reconciliation
 wait. CPU-heavy sealing, digest and validation run under a running credit or a
 bounded blocking pool.
 
@@ -166,10 +170,15 @@ borrow a resident slot, create another payload, preempt running work or change
 canonical request bytes. A running attempt keeps its granted class to completion;
 the next attempt observes current waiters.
 
-Normal lane waiters cannot consume resident positions while awaiting a lane.
-Unresolved holders keep their entitlement until exact resolution, including during
-quiescence. Both rules prevent a full queue from deadlocking recovery after quorum
-returns. An independent Emergency replay lane remains unavailable to ordinary
+Shared-lane waiters retain their original class's resident credit without
+building a request. This trades cross-scope ordinary capacity for admission
+priority: with the default budgets, two stalled scopes can each retain twelve
+Normal credits, including queued producers, filling the global twenty-four.
+Exclusive lane-7 waiters retain only lane-waiter metadata and no resident credit.
+Unresolved holders keep their entitlement until exact resolution,
+including during quiescence, and never reacquire resident capacity for retries.
+Thus a full queue cannot deadlock recovery after quorum returns. An independent
+Emergency replay lane remains unavailable to ordinary
 traffic; SafetyControl is independent of child-batch lanes. The authority and
 lane slices still own request validation, replay and cancellation after submission.
 

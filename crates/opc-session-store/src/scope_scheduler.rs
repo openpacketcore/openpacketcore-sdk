@@ -2,7 +2,9 @@
 //!
 //! Capacity always waits. Each class has independent resident and running
 //! credits; an unresolved operation keeps its resident entitlement between
-//! bounded attempts. Acquire a replay lane before reserving/building a request.
+//! bounded attempts. Reserve resident capacity before acquiring a shared replay
+//! lane; the exclusive Emergency lane takes its lane first. Build only after
+//! both grants and a running credit.
 //! The service supervisor, not a cancellable observer, must own dispatched
 //! permits through local attempt completion and lanes through exact resolution.
 //! Scheduling never grants store authority or changes canonical request bytes.
@@ -555,7 +557,8 @@ impl ScopeScheduler {
             .available_permits()
     }
 
-    /// Wait before materializing a full request. Acquire any replay lane first.
+    /// Wait before materializing a full request. Reserve before acquiring a
+    /// shared replay lane; the exclusive Emergency lane acquires its lane first.
     /// Waiting callers need an upstream bound; they retain only fixed metadata.
     pub async fn reserve(
         &self,
