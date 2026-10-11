@@ -52,6 +52,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel/purpose bindings, full-interval certificate checks and independent
   handshake budgets sharing the same material lifecycle. Authentication time
   never expires scope ownership or installed forwarding; see RFC 026.
+
+- `opc-crypto-provider` and `opc-proto-ikev2`: add opt-in DH private checkpoint
+  export/import for pending initiator exchanges, with per-group startup and
+  runtime admission. The software provider supports a bounded group/version
+  encoding for all implemented KE groups, recomputes the public value on import,
+  and permits one successful export per fresh handle. Checkpoints belong in the
+  row's existing envelope; the API makes no KMS call or nested envelope and
+  preserves a typed retryable provider-unavailable error.
+
+- `opc-proto-ikev2`: add checked `from_profile_persisted` construction with an
+  explicit base/negotiated mode, immutable SA agreement binding and complete
+  synchronization-event history. Add strict typed `INITIAL_CONTACT` decoding;
+  authenticated identity matching and cleanup remain consumer responsibilities.
+
 - `opc-session-store`: add scope-fair backpressure with separate SafetyControl,
   established Emergency, EmergencyClassification, Normal and Maintenance budgets.
   Shared lanes have class ordering, an eight-bypass bound and dynamic priority
@@ -320,6 +334,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
 ### Changed
+
+- `opc-proto-ikev2`: distinguish authenticated, correctly bound SKF packets with
+  `Ikev2WindowError::UnsupportedShape` in ordinary recovery windows. Partial
+  fragment cleartext is not parsed as a complete payload chain; unauthenticated
+  and foreign packets still drop. This diagnostic grants no cleanup authority.
+
+- `opc-proto-ikev2`: `Ikev2CommittedWindow::replay_request` now returns only a
+  pending committed request; settled exchanges return `None` and cannot serve
+  as liveness probes. Empty INFORMATIONAL replies and exact applicable cached
+  responses remain available during an outbound-only uncertain write. New work,
+  uncertain inbound/sync writes and terminal lifecycles remain blocked; cached
+  response classification and replay share the same admission guard.
 
 - `opc-session-store` / `opc-session-net`: consensus transport/wire revision 6
   requires scheduling metadata and rejects older peers. Upgrade every member

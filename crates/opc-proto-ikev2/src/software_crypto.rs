@@ -82,6 +82,7 @@ const SOFTWARE_CAPABILITIES: CapabilitySet = CapabilitySet::empty()
     .with(CryptoCapability::IkeEncryption)
     .with(CryptoCapability::IkeSignature)
     .with(CryptoCapability::IkeDiffieHellman)
+    .with(CryptoCapability::IkeDhCheckpoint)
     .with(CryptoCapability::ApprovedEntropy)
     .with(CryptoCapability::Zeroization);
 
@@ -312,6 +313,20 @@ impl IkeEncryptionOperations for Ikev2SoftwareCryptoModule {
 }
 
 impl IkeDiffieHellmanOperations for Ikev2SoftwareCryptoModule {
+    fn supports_dh_checkpoint(&self, group: IkeDhGroup) -> bool {
+        self.operations.supports_dh_checkpoint(group)
+    }
+
+    fn import_keypair_checkpoint(
+        &self,
+        group: IkeDhGroup,
+        checkpoint: &[u8],
+        expected_public_value: &[u8],
+    ) -> Result<Box<dyn IkeDhKeyPair>, CryptoOperationError> {
+        self.operations
+            .import_keypair_checkpoint(group, checkpoint, expected_public_value)
+    }
+
     fn supports_dh_group(&self, group: IkeDhGroup) -> bool {
         self.operations.supports_dh_group(group)
     }
@@ -475,6 +490,7 @@ fn software_self_test(operations: &Ikev2SoftwareCryptoOperations) -> SelfTestOut
         },
         _ => false,
     };
+    let checkpoint_ok = software_checkpoint_self_test(operations);
     let signature_ok = software_signature_self_test(operations);
     let mut entropy_probe = Zeroizing::new([0_u8; 32]);
     let entropy_ok = operations.fill_random(&mut *entropy_probe).is_ok();
@@ -504,6 +520,12 @@ fn software_self_test(operations: &Ikev2SoftwareCryptoOperations) -> SelfTestOut
     record_self_test(
         &mut passed,
         &mut failed,
+        CryptoCapability::IkeDhCheckpoint,
+        checkpoint_ok,
+    );
+    record_self_test(
+        &mut passed,
+        &mut failed,
         CryptoCapability::ApprovedEntropy,
         dh_ok && entropy_ok,
     );
@@ -523,10 +545,36 @@ fn software_self_test(operations: &Ikev2SoftwareCryptoOperations) -> SelfTestOut
             && aead_ok
             && cbc_ok
             && dh_ok
+            && checkpoint_ok
             && signature_ok
             && entropy_ok,
     );
     SelfTestOutcome::new(passed, failed)
+}
+
+fn software_checkpoint_self_test(operations: &Ikev2SoftwareCryptoOperations) -> bool {
+    [
+        IkeDhGroup::Modp768,
+        IkeDhGroup::Modp1024,
+        IkeDhGroup::Modp2048,
+        IkeDhGroup::Ecp256,
+        IkeDhGroup::Ecp384,
+        IkeDhGroup::Ecp521,
+    ]
+    .into_iter()
+    .all(|group| {
+        let Ok(mut original) = operations.generate_keypair(group) else {
+            return false;
+        };
+        let public = original.public_value().to_vec();
+        let Ok(checkpoint) = original.export_private_checkpoint() else {
+            return false;
+        };
+        drop(original);
+        operations
+            .import_keypair_checkpoint(group, &checkpoint, &public)
+            .is_ok_and(|restored| restored.group() == group && restored.public_value() == public)
+    })
 }
 
 fn software_signature_self_test(operations: &Ikev2SoftwareCryptoOperations) -> bool {
@@ -896,6 +944,26 @@ impl IkeEncryptionOperations for Ikev2SoftwareCryptoOperations {
 }
 
 impl IkeDiffieHellmanOperations for Ikev2SoftwareCryptoOperations {
+    fn supports_dh_checkpoint(&self, group: IkeDhGroup) -> bool {
+        self.supports_dh_group(group)
+    }
+
+    fn import_keypair_checkpoint(
+        &self,
+        group: IkeDhGroup,
+        checkpoint: &[u8],
+        expected_public_value: &[u8],
+    ) -> Result<Box<dyn IkeDhKeyPair>, CryptoOperationError> {
+        let mapped = map_dh_group(group)?;
+        let inner =
+            SoftwareEphemeralDhKey::from_checkpoint(mapped, checkpoint, expected_public_value)?;
+        Ok(Box::new(SoftwareIkeDhKeyPair {
+            group,
+            inner,
+            checkpoint_exported: true,
+        }))
+    }
+
     fn supports_dh_group(&self, group: IkeDhGroup) -> bool {
         matches!(
             group,
@@ -914,7 +982,11 @@ impl IkeDiffieHellmanOperations for Ikev2SoftwareCryptoOperations {
     ) -> Result<Box<dyn IkeDhKeyPair>, CryptoOperationError> {
         let mapped = map_dh_group(group)?;
         let inner = SoftwareEphemeralDhKey::generate(mapped).map_err(map_sa_init_error)?;
-        Ok(Box::new(SoftwareIkeDhKeyPair { group, inner }))
+        Ok(Box::new(SoftwareIkeDhKeyPair {
+            group,
+            inner,
+            checkpoint_exported: false,
+        }))
     }
 }
 
@@ -922,10 +994,22 @@ impl IkeDiffieHellmanOperations for Ikev2SoftwareCryptoOperations {
 /// enum out of the provider boundary.
 struct SoftwareIkeDhKeyPair {
     group: IkeDhGroup,
+    checkpoint_exported: bool,
     inner: SoftwareEphemeralDhKey,
 }
 
 impl IkeDhKeyPair for SoftwareIkeDhKeyPair {
+    fn export_private_checkpoint(&mut self) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError> {
+        if self.checkpoint_exported {
+            return Err(CryptoOperationError::new(
+                CryptoOperationErrorCode::CheckpointAlreadyExported,
+            ));
+        }
+        let checkpoint = self.inner.export_checkpoint();
+        self.checkpoint_exported = true;
+        Ok(checkpoint)
+    }
+
     fn group(&self) -> IkeDhGroup {
         self.group
     }

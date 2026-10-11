@@ -28,8 +28,10 @@
 //!
 //! Secret-bearing outputs are returned as [`zeroize::Zeroizing`] buffers so
 //! they are wiped on drop. Opaque handles ([`IkeDhKeyPair`],
-//! [`IkeSigningKey`]) own backend-native secret state without ever exposing
-//! it; implementations must wipe that state on drop and must keep their
+//! [`IkeSigningKey`]) own backend-native secret state. Only the explicitly
+//! admitted optional DH checkpoint capability permits private-value export
+//! into the existing session-row envelope. Implementations must wipe secret
+//! state on drop and must keep their
 //! `Debug` output free of key material (lengths, counts, and stable
 //! identifiers only).
 
@@ -76,6 +78,14 @@ pub enum CryptoOperationErrorCode {
     SignatureVerificationFailed,
     /// The module's admitted entropy source was unavailable.
     EntropyUnavailable,
+    /// A provider is temporarily unavailable; retry with backpressure, not teardown.
+    Unavailable,
+    /// This handle already exported its private checkpoint or was restored from one.
+    CheckpointAlreadyExported,
+    /// A checkpoint has an unsupported version, wrong group/length or invalid private value.
+    InvalidCheckpoint,
+    /// The recomputed checkpoint public value differs from the committed value.
+    CheckpointPublicValueMismatch,
     /// The operation failed for a reason not covered by a more specific code.
     OperationFailed,
 }
@@ -99,6 +109,10 @@ impl CryptoOperationErrorCode {
             Self::SignatureComputationFailed => "crypto_op_signature_computation_failed",
             Self::SignatureVerificationFailed => "crypto_op_signature_verification_failed",
             Self::EntropyUnavailable => "crypto_op_entropy_unavailable",
+            Self::Unavailable => "crypto_op_unavailable",
+            Self::CheckpointAlreadyExported => "crypto_op_checkpoint_already_exported",
+            Self::InvalidCheckpoint => "crypto_op_invalid_checkpoint",
+            Self::CheckpointPublicValueMismatch => "crypto_op_checkpoint_public_value_mismatch",
             Self::OperationFailed => "crypto_op_operation_failed",
         }
     }
@@ -408,6 +422,31 @@ pub enum IkeDhGroup {
 }
 
 impl IkeDhGroup {
+    /// IANA Transform Type 4 identifier, also binding the checkpoint encoding.
+    #[must_use]
+    pub const fn transform_id(self) -> u16 {
+        match self {
+            Self::Modp768 => 1,
+            Self::Modp1024 => 2,
+            Self::Modp2048 => 14,
+            Self::Ecp256 => 19,
+            Self::Ecp384 => 20,
+            Self::Ecp521 => 21,
+        }
+    }
+
+    /// Exact version-1 private checkpoint length, including its three-byte header.
+    ///
+    /// Encoding: version byte `1`, big-endian two-byte group Transform ID, then
+    /// a fixed-width big-endian MODP private exponent or ECP secret scalar.
+    /// MODP widths are 96/128/256 and ECP widths 32/48/66 octets. No module build
+    /// identity, public value, nonce or envelope is embedded. These secret bytes
+    /// must never appear in diagnostics or outside the enclosing row's custody.
+    #[must_use]
+    pub const fn checkpoint_len(self) -> usize {
+        3 + self.shared_secret_len()
+    }
+
     /// Stable machine-readable group code.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -697,8 +736,8 @@ pub trait IkeDiffieHellmanOperations: Send + Sync {
 
     /// Generate an ephemeral key pair for `group` behind an opaque handle.
     ///
-    /// The handle owns the backend-native private key; the secret never
-    /// crosses this boundary in any form.
+    /// The handle owns the backend-native private key. It may leave this
+    /// boundary only through separately admitted checkpoint export.
     ///
     /// # Errors
     ///
@@ -710,6 +749,39 @@ pub trait IkeDiffieHellmanOperations: Send + Sync {
         &self,
         group: IkeDhGroup,
     ) -> Result<Box<dyn IkeDhKeyPair>, CryptoOperationError>;
+
+    /// Whether both checkpoint operations implement version 1 for this group.
+    ///
+    /// The caller must also admit [`crate::CryptoCapability::IkeDhCheckpoint`].
+    /// Default refusal preserves providers that forbid exporting private values.
+    fn supports_dh_checkpoint(&self, _group: IkeDhGroup) -> bool {
+        false
+    }
+
+    /// Synchronously restore a private checkpoint and verify its public value.
+    ///
+    /// Decode exactly [`IkeDhGroup::checkpoint_len`] bytes in the documented
+    /// group/version format, validate the private value, recompute the public
+    /// value and compare it with `expected_public_value` before returning an
+    /// opaque handle. A restored handle cannot export again. This operation
+    /// makes no KMS request and requires no sealed-key-storage capability.
+    /// The caller must already hold the authenticated row and exclusive epoch
+    /// owner. Never log these bytes, including in errors or diagnostic archives.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedAlgorithm` unless the provider opts in, `Unavailable`
+    /// for retryable provider failures, `InvalidCheckpoint` for invalid encoding
+    /// or private material, and `CheckpointPublicValueMismatch` for a mismatch.
+    fn import_keypair_checkpoint(
+        &self,
+        _group: IkeDhGroup,
+        _checkpoint: &[u8],
+        _expected_public_value: &[u8],
+    ) -> Result<Box<dyn IkeDhKeyPair>, CryptoOperationError> {
+        Err(CryptoOperationError::new(
+            CryptoOperationErrorCode::UnsupportedAlgorithm,
+        ))
+    }
 }
 
 /// Opaque ephemeral Diffie-Hellman key pair handle.
@@ -725,6 +797,25 @@ pub trait IkeDhKeyPair: fmt::Debug + Send + Sync {
     /// Public value bytes in the IKEv2 Key Exchange payload representation
     /// for the group (exactly [`IkeDhGroup::public_value_len`] octets).
     fn public_value(&self) -> &[u8];
+
+    /// Export this initiator's private checkpoint once into zeroizing bytes.
+    ///
+    /// Requires separately admitted [`crate::CryptoCapability::IkeDhCheckpoint`]
+    /// and group support. Return the exact version-1 group encoding documented
+    /// by [`IkeDhGroup::checkpoint_len`]. Mark export consumed only on success;
+    /// a retryable provider failure consumes no export. Agreement remains usable.
+    /// Store the bytes only inside the row's existing envelope, in the same CAS
+    /// as the outbound request. This synchronous call makes no KMS request.
+    /// Never log its result; zeroize it when the row seal no longer needs it.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedAlgorithm` by default, `CheckpointAlreadyExported`
+    /// after success or import, and `Unavailable` for retryable provider failures.
+    fn export_private_checkpoint(&mut self) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError> {
+        Err(CryptoOperationError::new(
+            CryptoOperationErrorCode::UnsupportedAlgorithm,
+        ))
+    }
 
     /// Perform key agreement with a peer public value in the IKEv2 Key
     /// Exchange payload representation.

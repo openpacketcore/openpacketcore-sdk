@@ -20,6 +20,14 @@ pub(super) struct Witness<P: RecoveryProfile = Gcm> {
 }
 
 impl<P: RecoveryProfile> Window<P> {
+    // Only ordinary outbound preparation leaves the inbound record and receive
+    // boundary unchanged. An absent witness never establishes this exception.
+    pub(super) fn has_outbound_witness(&self) -> bool {
+        self.witness
+            .as_ref()
+            .is_some_and(|witness| witness.kind == Kind::Outbound)
+    }
+
     pub(super) fn remember_prepared(&mut self, record: &Record<P>, kind: Kind) {
         self.quiescent = true;
         self.witness = Some(Witness {

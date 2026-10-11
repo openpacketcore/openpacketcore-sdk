@@ -282,8 +282,8 @@ impl<P: RecoveryProfile> Ikev2CanonicalEmptyReplies<P> {
     /// admission. Request padding/ignored bits never enter the output. Message ID
     /// is already a wire `u32`; no narrowing, exhaustion sentinel or wrap is accepted.
     /// The consumer must check current receive admission and
-    /// [`crate::recovery::Ikev2CommittedWindow::ready`] on every reply, even a cache
-    /// hit. Retain current send authority through transmission; an owned reply or
+    /// the window's reply admission on every reply, even a cache hit. Retain
+    /// current send authority through transmission; an owned reply or
     /// previously minted capability cannot establish it after the window changes.
     ///
     /// At most three attempts and one newly released packet per sending key/salt/ID

@@ -33,6 +33,10 @@ pub enum CryptoCapability {
     Zeroization,
     /// Sealed, non-exportable key storage: keys never leave the module.
     SealedKeyStorage,
+    /// Opt-in IKE initiator private-key checkpoint export and checked import.
+    /// This capability permits export into the session row's existing envelope;
+    /// it does not imply non-exportable storage or remote key custody.
+    IkeDhCheckpoint,
 }
 
 impl CryptoCapability {
@@ -51,6 +55,7 @@ impl CryptoCapability {
         CryptoCapability::ApprovedEntropy,
         CryptoCapability::Zeroization,
         CryptoCapability::SealedKeyStorage,
+        CryptoCapability::IkeDhCheckpoint,
     ];
 
     /// Stable machine-readable capability code.
@@ -66,6 +71,7 @@ impl CryptoCapability {
             Self::ApprovedEntropy => "approved_entropy",
             Self::Zeroization => "zeroization",
             Self::SealedKeyStorage => "sealed_key_storage",
+            Self::IkeDhCheckpoint => "ike_dh_checkpoint",
         }
     }
 

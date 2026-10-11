@@ -739,7 +739,7 @@ fn cached_replies_recheck_quiescence_sync_wait_and_terminal_dispositions() {
                     )
                     .unwrap();
                 drop(prepared);
-                Error::CommitUncertain
+                None
             }
             1 | 2 => {
                 let clock = Clock::new(100, 1);
@@ -758,9 +758,9 @@ fn cached_replies_recheck_quiescence_sync_wait_and_terminal_dispositions() {
                     let close = window.close_sync().unwrap();
                     let closed = close.record().clone();
                     let _token = close.commit_after_durable(&closed, clock).unwrap();
-                    Error::SyncClosed
+                    Some(Error::SyncClosed)
                 } else {
-                    Error::SyncInProgress
+                    Some(Error::SyncInProgress)
                 }
             }
             _ => {
@@ -787,12 +787,17 @@ fn cached_replies_recheck_quiescence_sync_wait_and_terminal_dispositions() {
                     .unwrap();
                 let committed = prepared.record().clone();
                 let _token = prepared.commit_after_durable(&committed).unwrap();
-                Error::OutcomeUncertain
+                Some(Error::OutcomeUncertain)
             }
         };
         let before = window.record().clone();
         for request in [&request, &f.request(20)] {
-            assert_eq!(window.reply_empty(request).unwrap_err(), expected);
+            if let Some(expected) = expected {
+                assert_eq!(window.reply_empty(request).unwrap_err(), expected);
+            } else {
+                assert_eq!(window.ready(), Err(Error::CommitUncertain));
+                assert!(window.reply_empty(request).is_ok());
+            }
         }
         assert_eq!(window.record(), &before);
         window.delete();

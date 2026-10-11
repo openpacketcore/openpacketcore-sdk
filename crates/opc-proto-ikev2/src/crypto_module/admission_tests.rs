@@ -50,6 +50,8 @@ use crate::canonical_test_fixtures as canonical_fixtures;
 mod cbc_runtime_tests;
 #[path = "cbc_tests.rs"]
 mod cbc_tests;
+#[path = "checkpoint_tests.rs"]
+mod checkpoint_tests;
 #[path = "reconcile_tests.rs"]
 mod reconcile_tests;
 #[path = "../../tests/support/mod.rs"]
@@ -160,6 +162,8 @@ struct OperationCounts {
     encryption: AtomicUsize,
     dh_generate: AtomicUsize,
     dh_agree: AtomicUsize,
+    checkpoint_export: AtomicUsize,
+    checkpoint_import: AtomicUsize,
     signature_load: AtomicUsize,
     signature_sign: AtomicUsize,
     signature_verify: AtomicUsize,
@@ -194,6 +198,8 @@ struct CountingModule {
     readiness_reads: AtomicUsize,
     withdraw_extra_after_first_readiness: AtomicBool,
     reject_prf_support: AtomicBool,
+    reject_checkpoint_support: AtomicBool,
+    checkpoint_fault: Arc<AtomicU8>,
     reject_integrity_support: AtomicBool,
     reject_hash_support: AtomicBool,
     fail_hash_operation: AtomicBool,
@@ -241,6 +247,8 @@ impl CountingModule {
             readiness_reads: AtomicUsize::new(0),
             withdraw_extra_after_first_readiness: AtomicBool::new(false),
             reject_prf_support: AtomicBool::new(false),
+            reject_checkpoint_support: AtomicBool::new(false),
+            checkpoint_fault: Arc::new(AtomicU8::new(0)),
             reject_integrity_support: AtomicBool::new(false),
             reject_hash_support: AtomicBool::new(false),
             fail_hash_operation: AtomicBool::new(false),
@@ -685,6 +693,35 @@ impl IkeEncryptionOperations for CountingModule {
 }
 
 impl IkeDiffieHellmanOperations for CountingModule {
+    fn supports_dh_checkpoint(&self, group: IkeDhGroup) -> bool {
+        !self.reject_checkpoint_support.load(Ordering::SeqCst)
+            && self.operations.supports_dh_checkpoint(group)
+    }
+
+    fn import_keypair_checkpoint(
+        &self,
+        group: IkeDhGroup,
+        checkpoint: &[u8],
+        expected_public_value: &[u8],
+    ) -> Result<Box<dyn IkeDhKeyPair>, CryptoOperationError> {
+        self.counts.checkpoint_import.fetch_add(1, Ordering::SeqCst);
+        if self.checkpoint_fault.load(Ordering::SeqCst) == 1 {
+            return Err(CryptoOperationError::new(
+                CryptoOperationErrorCode::Unavailable,
+            ));
+        }
+        let inner =
+            self.operations
+                .import_keypair_checkpoint(group, checkpoint, expected_public_value)?;
+        Ok(Box::new(CountingDhKeyPair {
+            inner,
+            counts: Arc::clone(&self.counts),
+            malformed_output: Arc::clone(&self.malformed_output),
+            checkpoint_fault: Arc::clone(&self.checkpoint_fault),
+            invalid_public_value: vec![0; group.public_value_len()],
+        }))
+    }
+
     fn supports_dh_group(&self, group: IkeDhGroup) -> bool {
         self.operations.supports_dh_group(group)
     }
@@ -699,6 +736,7 @@ impl IkeDiffieHellmanOperations for CountingModule {
                 inner,
                 counts: Arc::clone(&self.counts),
                 malformed_output: Arc::clone(&self.malformed_output),
+                checkpoint_fault: Arc::clone(&self.checkpoint_fault),
                 invalid_public_value: vec![0; group.public_value_len()],
             }) as Box<dyn IkeDhKeyPair>
         })
@@ -706,6 +744,7 @@ impl IkeDiffieHellmanOperations for CountingModule {
 }
 
 struct CountingDhKeyPair {
+    checkpoint_fault: Arc<AtomicU8>,
     inner: Box<dyn IkeDhKeyPair>,
     counts: Arc<OperationCounts>,
     malformed_output: Arc<AtomicU8>,
@@ -722,6 +761,26 @@ impl fmt::Debug for CountingDhKeyPair {
 }
 
 impl IkeDhKeyPair for CountingDhKeyPair {
+    fn export_private_checkpoint(&mut self) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError> {
+        self.counts.checkpoint_export.fetch_add(1, Ordering::SeqCst);
+        let fault = self.checkpoint_fault.load(Ordering::SeqCst);
+        if fault == 1 {
+            return Err(CryptoOperationError::new(
+                CryptoOperationErrorCode::Unavailable,
+            ));
+        }
+        let mut output = self.inner.export_private_checkpoint()?;
+        match fault {
+            2 => {
+                output.pop();
+            }
+            3 => output[0] ^= 1,
+            4 => output[2] ^= 1,
+            _ => {}
+        }
+        Ok(output)
+    }
+
     fn group(&self) -> IkeDhGroup {
         if self.malformed_output.load(Ordering::SeqCst) == MalformedOutput::DhGroup as u8 {
             IkeDhGroup::Modp2048
