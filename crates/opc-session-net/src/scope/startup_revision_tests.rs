@@ -1,5 +1,9 @@
 //! Old startup headers and pre-authentication ALPN failures remain distinct.
 use super::*;
+use crate::scope::{
+    revision_tests::signal, ScopeTransportDirection as Direction, ScopeTransportPurpose as Purpose,
+    ScopeTransportRole as Role,
+};
 
 #[test]
 fn startup_revision_mismatch_is_typed_for_alpn_calls_and_retained_notices() {
@@ -93,6 +97,10 @@ fn startup_revision_mismatch_is_typed_for_alpn_calls_and_retained_notices() {
                 assert!(peer.is_err());
                 assert_eq!(result.err(), Some(StartupError::TransportRevisionMismatch));
                 assert_eq!(
+                    signal(Role::Responder, Purpose::Handshake, Direction::Inbound),
+                    (1, 0, true)
+                );
+                assert_eq!(
                     token.0.load(Ordering::SeqCst),
                     0,
                     "a pre-authentication alert cannot read the projected credential"
@@ -122,6 +130,18 @@ fn startup_revision_mismatch_is_typed_for_alpn_calls_and_retained_notices() {
                         "old authenticated {mode:?} header is refused without reading its body"
                     );
                     drop(peer);
+                    let purpose = match mode {
+                        StartupMode::Liveness => Purpose::BootLiveness,
+                        StartupMode::Candidate => Purpose::BootCandidate,
+                    };
+                    assert_eq!(
+                        signal(Role::Responder, purpose, Direction::Inbound),
+                        (1, 1, true)
+                    );
+                    assert_eq!(
+                        signal(Role::Responder, Purpose::Handshake, Direction::Inbound),
+                        (1, 0, false)
+                    );
                 }
                 assert_eq!(token.0.load(Ordering::SeqCst), 0);
                 let (header, payload, _) = call(StartupMode::Candidate);
@@ -156,6 +176,12 @@ fn startup_revision_mismatch_is_typed_for_alpn_calls_and_retained_notices() {
                     "fresh authenticated revision two recovers without restarting the process",
                 );
                 assert_eq!(token.0.load(Ordering::SeqCst), 1);
+                for purpose in [Purpose::BootLiveness, Purpose::BootCandidate] {
+                    assert_eq!(
+                        signal(Role::Responder, purpose, Direction::Inbound),
+                        (1, 1, false)
+                    );
+                }
                 let mut old = header
                     .response(FrameKind::TicketNotice, 256)
                     .unwrap()
@@ -178,6 +204,10 @@ fn startup_revision_mismatch_is_typed_for_alpn_calls_and_retained_notices() {
                     "a retained startup connection rejects an old notice before body allocation"
                 );
                 assert!(process.enter_peer_control().await.is_err());
+                assert_eq!(
+                    signal(Role::Responder, Purpose::BootCandidate, Direction::Inbound),
+                    (2, 2, true)
+                );
             })
             .await
             .expect("bounded startup revision fixture");

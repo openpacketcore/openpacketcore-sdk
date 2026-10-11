@@ -1,6 +1,14 @@
 use super::*;
 use opc_session_store::scope_batch::{ScopeBatchError, ScopeBatchRequest, ScopeCounterMutation};
 
+#[test]
+fn scope_revision_mismatch_is_local_and_never_encoded_as_a_result_status() {
+    assert_eq!(
+        error_status(ScopeRpcError::TransportRevisionMismatch),
+        Err(ScopeRpcError::TransportRevisionMismatch),
+    );
+}
+
 fn stamp() -> ScopeAuthorityStamp {
     let vectors: serde_json::Value = serde_json::from_str::<serde_json::Value>(include_str!(
         "../../../../../docs/rfc/026-scope-transport-revision2-vectors.json"

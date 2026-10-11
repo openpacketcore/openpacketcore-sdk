@@ -1,6 +1,10 @@
 //! Issuer requests preserve revision diagnostics and recover on a later probe.
 use super::*;
 use crate::scope::{proof::StartupMode, wire::*};
+use crate::scope::{
+    revision_tests::signal, ScopeTransportDirection as Direction, ScopeTransportPurpose as Purpose,
+    ScopeTransportRole as Role,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -51,6 +55,8 @@ fn issuer_revision_mismatch_is_typed_for_alpn_and_both_proof_purposes() {
                 });
                 assert!(peer.is_err());
                 assert_eq!(result.err(), Some(StartupError::TransportRevisionMismatch), "ALPN refusal for {mode:?}");
+                let alerts = if mode == BootstrapProofMode::Liveness { 1 } else { 2 };
+                assert_eq!(signal(Role::Issuer, Purpose::Handshake, Direction::Outbound), (alerts, 0, true));
                 let purpose = match mode { BootstrapProofMode::Liveness => StartupMode::Liveness, BootstrapProofMode::Candidate => StartupMode::Candidate };
                 let (result, peer) = tokio::join!(issuer.probe(&enrollment, mode), async {
                     let (socket, _) = listener.accept().await.unwrap();
@@ -68,6 +74,9 @@ fn issuer_revision_mismatch_is_typed_for_alpn_and_both_proof_purposes() {
                     stream
                 });
                 assert_eq!(result.err(), Some(StartupError::TransportRevisionMismatch), "old authenticated proof header for {mode:?} before body allocation");
+                let diagnostic_purpose = match mode { BootstrapProofMode::Liveness => Purpose::BootLiveness, BootstrapProofMode::Candidate => Purpose::BootCandidate };
+                assert_eq!(signal(Role::Issuer, diagnostic_purpose, Direction::Outbound), (1, 1, true));
+                assert_eq!(signal(Role::Issuer, Purpose::Handshake, Direction::Outbound), (alerts, 0, false));
                 drop(peer);
                 assert!(process.enter_peer_control().await.is_err());
                 let (result, worker) = tokio::join!(issuer.probe(&enrollment, mode), async {
@@ -77,6 +86,7 @@ fn issuer_revision_mismatch_is_typed_for_alpn_and_both_proof_purposes() {
                 let result = result.expect("a later authenticated revision-two probe must recover without restart");
                 assert_eq!(result.proof().is_candidate(), mode == BootstrapProofMode::Candidate);
                 worker.unwrap();
+                assert_eq!(signal(Role::Issuer, diagnostic_purpose, Direction::Outbound), (1, 1, false));
             }
         }).await.expect("bounded issuer revision fixture");
     });

@@ -2,6 +2,20 @@
 use super::revision::*;
 use std::time::{Duration, Instant};
 
+pub(super) fn signal(
+    role: ScopeTransportRole,
+    purpose: ScopeTransportPurpose,
+    direction: ScopeTransportDirection,
+) -> (u64, u64, bool) {
+    let entry = scope_transport_revision_diagnostics()
+        .into_iter()
+        .find(|entry| {
+            entry.role == role && entry.purpose == purpose && entry.direction == direction
+        })
+        .unwrap();
+    (entry.total, entry.authenticated, entry.active)
+}
+
 #[test]
 fn revision_diagnostics_count_every_signal_but_limit_logs_across_reconnects() {
     let diagnostics = Diagnostics::default();

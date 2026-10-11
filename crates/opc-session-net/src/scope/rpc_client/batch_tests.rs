@@ -27,6 +27,9 @@ use tokio::net::TcpListener;
 #[path = "child_read_error_tests.rs"]
 mod child_reads;
 
+#[path = "read_revision_tests.rs"]
+mod read_revision;
+
 struct NoPublication;
 #[async_trait::async_trait]
 impl crate::scope::ScopeLocalClosurePublisher for NoPublication {

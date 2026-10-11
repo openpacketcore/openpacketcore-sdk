@@ -1,5 +1,9 @@
 //! Public callers distinguish revision failures and retain the ability to recover.
 use super::*;
+use crate::scope::{
+    revision_tests::signal, ScopeTransportDirection as Direction, ScopeTransportPurpose as Purpose,
+    ScopeTransportRole as Role,
+};
 
 struct Fixture {
     client: ScopeClient,
@@ -244,6 +248,8 @@ fn run(scenario: Scenario, name: &str) {
                     assert_eq!(fixture.handshakes.load(Ordering::SeqCst), 1, "a typed mismatch must not enter the transparent reconnect arm");
                     assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), 0);
                     assert_eq!(fixture.peer.child_proofs.load(Ordering::SeqCst), 0);
+                    assert_eq!(signal(Role::Worker, Purpose::Handshake, Direction::Outbound), (1, 0, true));
+                    assert_eq!(signal(Role::Worker, Purpose::ScopeResponse, Direction::Outbound), (0, 0, false));
                     fixture.legacy.store(false, Ordering::SeqCst);
                 }
                 Scenario::ChildFrame => {
@@ -260,6 +266,9 @@ fn run(scenario: Scenario, name: &str) {
                         assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), calls + 1);
                         assert_eq!(fixture.peer.child_proofs.load(Ordering::SeqCst), proofs + usize::from(!preproof));
                         assert_eq!(fixture.handshakes.load(Ordering::SeqCst), handshakes + 1, "no immediate reconnect on an authenticated old frame");
+                        let events = if preproof { 1 } else { 2 };
+                        assert_eq!(signal(Role::Worker, Purpose::ScopeResponse, Direction::Outbound), (events, events, true));
+                        assert_eq!(signal(Role::Worker, Purpose::Handshake, Direction::Outbound), (0, 0, false));
                     }
                 }
             }
@@ -267,6 +276,9 @@ fn run(scenario: Scenario, name: &str) {
             fixture.peer.child_replies.lock().await.push_back(Reply::new(ResultStatus::ChildObservation, missing));
             assert_eq!(fixture.client.read_child(&fixture.authority, key, ScopeWorkClass::Normal, Instant::now() + Duration::from_secs(2)).await, Ok(None),
                 "a later authenticated revision-two connection recovers without a process restart");
+            let (alerts, frames) = match scenario { Scenario::ChildFrame => (0, 2), _ => (1, 0) };
+            assert_eq!(signal(Role::Worker, Purpose::Handshake, Direction::Outbound), (alerts, 0, false));
+            assert_eq!(signal(Role::Worker, Purpose::ScopeResponse, Direction::Outbound), (frames, frames, false));
             assert_eq!(fixture.owner.scheduler().snapshot().class(ScopeWorkClass::Normal).resident, 0);
             assert_eq!(fixture.peer.applied.load(Ordering::SeqCst), 0, "no revision refusal submits an application batch");
             fixture.stop().await;
