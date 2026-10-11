@@ -182,7 +182,7 @@ pub enum XfrmObjectInstallOwnership {
     /// The runner has not acquired or issued a mutation, or every issued
     /// mutation was observed as rejected.
     NotStarted,
-    /// The install is currently in flight.
+    /// The install runner retains its claim through the final journal transition.
     InstallInFlight,
     /// The install was acknowledged and residue may remain.
     Acquired,
@@ -554,6 +554,7 @@ enum RunLifecycle {
 struct JournalState {
     stage: Stage,
     lifecycle: RunLifecycle,
+    // Retain the operation until terminal ownership and completion are published.
     runner_inflight: Option<XfrmCompositeOperation>,
     recovery_inflight: Option<XfrmCompositeOperation>,
     recovery_running: bool,
@@ -589,9 +590,29 @@ impl JournalState {
     }
 
     fn touch(&mut self) {
+        #[cfg(test)]
+        self.assert_publication_invariant();
         self.generation = Arc::new(());
         #[cfg(test)]
         self.changed.send_replace(());
+    }
+
+    #[cfg(test)]
+    fn assert_publication_invariant(&self) {
+        if std::thread::panicking() {
+            return;
+        }
+        match self.lifecycle {
+            RunLifecycle::NotStarted => assert!(self.runner_inflight.is_none()),
+            RunLifecycle::Running => assert!(
+                self.runner_inflight.is_some() || !self.possible && self.uncertainty.is_none(),
+                "terminal ownership is visible while the install runner is live"
+            ),
+            RunLifecycle::Finished => assert!(
+                self.runner_inflight.is_none() || self.runner_supervision_lost,
+                "an install claim is visible after the runner finished"
+            ),
+        }
     }
 
     fn mark_indeterminate(&mut self, operation: XfrmCompositeOperation) {
@@ -625,11 +646,11 @@ impl JournalState {
         if let Some(operation) = self.recovery_inflight {
             return XfrmObjectInstallOwnership::Recovering { operation };
         }
-        if let Some(operation) = self.uncertainty {
-            return XfrmObjectInstallOwnership::Indeterminate { operation };
-        }
         if self.runner_inflight.is_some() {
             return XfrmObjectInstallOwnership::InstallInFlight;
+        }
+        if let Some(operation) = self.uncertainty {
+            return XfrmObjectInstallOwnership::Indeterminate { operation };
         }
         if self.possible {
             XfrmObjectInstallOwnership::Acquired
@@ -713,6 +734,10 @@ impl XfrmObjectInstallJournal {
     }
 
     /// Current typed mutation ownership.
+    ///
+    /// A live install runner retains `InstallInFlight` through finalization.
+    /// Terminal ownership and runner completion become visible together, so a
+    /// fresh recovery plan cannot race unfinished installation after `Acquired`.
     pub fn ownership(&self) -> XfrmObjectInstallOwnership {
         self.state().ownership()
     }
@@ -947,7 +972,10 @@ impl RunGuard {
 
     fn finish(&mut self) {
         let mut state = self.journal.state();
+        // Publish terminal ownership and runner completion in one transition.
+        // No later runner touch can stale a plan observed at that handoff.
         state.lifecycle = RunLifecycle::Finished;
+        state.runner_inflight = None;
         state.touch();
         self.active = false;
     }
@@ -1010,6 +1038,15 @@ impl Drop for RecoveryGuard {
 pub struct XfrmStagedObjectInstall {
     request: XfrmObjectInstallRequest,
     journal: XfrmObjectInstallJournal,
+    #[cfg(test)]
+    finish_barrier: Option<Arc<RunnerFinishBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RunnerFinishBarrier {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl fmt::Debug for XfrmStagedObjectInstall {
@@ -1042,7 +1079,12 @@ impl XfrmStagedObjectInstall {
             request.removal(),
             request.policy_if_id(),
         );
-        Self { request, journal }
+        Self {
+            request,
+            journal,
+            #[cfg(test)]
+            finish_barrier: None,
+        }
     }
 
     /// Clone the caller-visible mutation journal.
@@ -1100,6 +1142,11 @@ impl XfrmStagedObjectInstall {
         let worker = runtime.spawn(async move {
             let mut guard = guard;
             let result = self.run_inner(backend.as_ref()).await;
+            #[cfg(test)]
+            if let Some(barrier) = &self.finish_barrier {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
+            }
             guard.finish();
             result
         });
@@ -1132,7 +1179,6 @@ impl XfrmStagedObjectInstall {
         if let Err(source) = result {
             let indeterminate = matches!(&source, XfrmError::StateIndeterminate { .. });
             let mut state = self.journal.state();
-            state.runner_inflight = None;
             if indeterminate {
                 state.mark_indeterminate(install_operation);
             } else {
@@ -1142,7 +1188,6 @@ impl XfrmStagedObjectInstall {
         }
         {
             let mut state = self.journal.state();
-            state.runner_inflight = None;
             state.stage = Stage::Acquired;
             state.touch();
         }
@@ -1152,6 +1197,8 @@ impl XfrmStagedObjectInstall {
 
 #[cfg(test)]
 mod tests {
+    mod completion_tests;
+
     use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
     use async_trait::async_trait;
