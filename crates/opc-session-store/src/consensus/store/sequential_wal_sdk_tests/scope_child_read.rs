@@ -8,6 +8,21 @@ use std::sync::atomic::AtomicU64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scope_child_read_current_uses_one_cut_before_and_after_concurrent_commits() {
+    run_cut_cases(&[
+        ScopeChildReadStage::BeforeCapture,
+        ScopeChildReadStage::AfterCapture,
+        ScopeChildReadStage::BetweenKeys,
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_child_read_current_keeps_its_original_cut_between_keys() {
+    run_cut_cases(&[ScopeChildReadStage::BetweenKeys]).await;
+}
+
+async fn run_cut_cases(stages: &[ScopeChildReadStage]) {
+    let mut failure = None;
     for native in [false, true] {
         let snapshots =
             tempfile::tempdir_in(std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").unwrap()).unwrap();
@@ -22,14 +37,7 @@ async fn scope_child_read_current_uses_one_cut_before_and_after_concurrent_commi
                 .position(|store| store.status().leader_id == Some(store.status().node_id))
                 .unwrap();
             let store = &fleet.stores[leader];
-            for (case, stage) in [
-                ScopeChildReadStage::BeforeCapture,
-                ScopeChildReadStage::AfterCapture,
-                ScopeChildReadStage::BetweenKeys,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (case, stage) in stages.iter().copied().enumerate() {
                 let scope = ScopeId::new(
                     fleet.topologies[0].consensus_identity().unwrap(),
                     TenantId::from_static("child-cut"),
@@ -169,7 +177,15 @@ async fn scope_child_read_current_uses_one_cut_before_and_after_concurrent_commi
         .catch_unwind()
         .await;
         fleet.close().await;
-        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        // Exercise and drain both adapters even when the first one rejects a
+        // deliberately mutated implementation. Every original assertion stays
+        // fatal after both backend runs have reported their evidence.
+        if let Err(panic) = result {
+            failure.get_or_insert(panic);
+        }
+    }
+    if let Some(panic) = failure {
+        std::panic::resume_unwind(panic);
     }
 }
 
