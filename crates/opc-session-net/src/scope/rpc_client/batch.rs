@@ -106,6 +106,20 @@ struct BatchPort {
 
 #[async_trait::async_trait]
 impl ScopeBatchPort for BatchPort {
+    async fn read_current(
+        &self,
+        request: &ScopeChildReadRequest,
+        class: ScopeWorkClass,
+        deadline: Instant,
+    ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError> {
+        if request.stamp() != &self.stamp {
+            return Err(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized).into());
+        }
+        self.client
+            .read_children_admitted(request, class, deadline)
+            .await
+    }
+
     async fn reopen(&self, class: ScopeWorkClass) -> Result<ScopeBatchReopen, ScopeBatchError> {
         let payload = self
             .client
