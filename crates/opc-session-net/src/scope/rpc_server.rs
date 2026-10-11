@@ -230,34 +230,27 @@ impl ScopeServer {
             let mut connection = handshake.accept_scope_unbound(io).await.map_err(|error| {
                 revision::rpc_handshake_error(QUORUM_REQUEST, error, ScopeRpcError::Unauthorized)
             })?;
-            let authentication = connection
-                .authentication_state(
-                    self.config
-                        .clock
-                        .interval()
-                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
-                )
-                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            revision::authenticated_handshake(QUORUM_REQUEST, &authentication);
+            if let Ok(interval) = self.config.clock.interval() {
+                if let Ok(authentication) = connection.authentication_state(interval) {
+                    revision::authenticated_handshake(QUORUM_REQUEST, &authentication);
+                }
+            }
             let mut fixed = [0; HEADER_BYTES];
             connection
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let authentication = connection
-                .authentication_state(
-                    self.config
-                        .clock
-                        .interval()
-                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
-                )
-                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            let header = revision::rpc_header(
-                &fixed,
-                &authentication,
-                QUORUM_REQUEST,
-                ScopeRpcError::Invalid,
-            )?;
+            let header =
+                revision::rpc_header(&fixed, QUORUM_REQUEST, ScopeRpcError::Invalid, || {
+                    connection
+                        .authentication_state(
+                            self.config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if header.kind != FrameKind::Call || header.class != class {
                 return Err(ScopeRpcError::Invalid);
             }
@@ -307,20 +300,16 @@ impl ScopeServer {
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let authentication = connection
-                .authentication_state(
-                    self.config
-                        .clock
-                        .interval()
-                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
-                )
-                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            header = revision::rpc_header(
-                &fixed,
-                &authentication,
-                QUORUM_REQUEST,
-                ScopeRpcError::Invalid,
-            )?;
+            header = revision::rpc_header(&fixed, QUORUM_REQUEST, ScopeRpcError::Invalid, || {
+                connection
+                    .authentication_state(
+                        self.config
+                            .clock
+                            .interval()
+                            .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                    )
+                    .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+            })?;
         }
     }
     async fn call(
@@ -691,20 +680,17 @@ impl ScopeServer {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let authentication = connection
-                .authentication_state(
-                    self.config
-                        .clock
-                        .interval()
-                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
-                )
-                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            let proof_header = revision::rpc_header(
-                &fixed,
-                &authentication,
-                QUORUM_REQUEST,
-                ScopeRpcError::Invalid,
-            )?;
+            let proof_header =
+                revision::rpc_header(&fixed, QUORUM_REQUEST, ScopeRpcError::Invalid, || {
+                    connection
+                        .authentication_state(
+                            self.config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if proof_header.kind != FrameKind::Proof || !proof_header.matches_attempt(header) {
                 return Err(ScopeRpcError::Invalid);
             }

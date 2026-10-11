@@ -717,21 +717,18 @@ impl ScopeClient {
             } else {
                 ScopeRpcError::Invalid
             };
-            let authentication = connection
-                .authentication_state(
-                    self.0
-                        .config
-                        .clock
-                        .interval()
-                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
-                )
-                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            let header = revision::rpc_header(
-                &fixed,
-                &authentication,
-                WORKER_RESPONSE,
-                malformed_before_proof,
-            )?;
+            let header =
+                revision::rpc_header(&fixed, WORKER_RESPONSE, malformed_before_proof, || {
+                    connection
+                        .authentication_state(
+                            self.0
+                                .config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if !header.matches_attempt(&call) {
                 return Err(malformed_before_proof);
             }
@@ -819,21 +816,18 @@ impl ScopeClient {
             } else {
                 ScopeRpcError::OutcomeUnknown
             };
-            let authentication = connection
-                .authentication_state(
-                    self.0
-                        .config
-                        .clock
-                        .interval()
-                        .map_err(|_| malformed_after_proof)?,
-                )
-                .map_err(|_| malformed_after_proof)?;
-            let header = revision::rpc_header(
-                &fixed,
-                &authentication,
-                WORKER_RESPONSE,
-                malformed_after_proof,
-            )?;
+            let header =
+                revision::rpc_header(&fixed, WORKER_RESPONSE, malformed_after_proof, || {
+                    connection
+                        .authentication_state(
+                            self.0
+                                .config
+                                .clock
+                                .interval()
+                                .map_err(|_| malformed_after_proof)?,
+                        )
+                        .map_err(|_| malformed_after_proof)
+                })?;
             if header.kind != FrameKind::Result || !header.matches_attempt(&call) {
                 return Err(malformed_after_proof);
             }

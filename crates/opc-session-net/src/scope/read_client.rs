@@ -268,20 +268,17 @@ impl ScopeReadClient {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let authentication = connection
-                .authentication_state(
-                    self.config
-                        .clock
-                        .interval()
-                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
-                )
-                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            let header = revision::rpc_header(
-                &fixed,
-                &authentication,
-                OBSERVER_RESPONSE,
-                ScopeRpcError::Invalid,
-            )?;
+            let header =
+                revision::rpc_header(&fixed, OBSERVER_RESPONSE, ScopeRpcError::Invalid, || {
+                    connection
+                        .authentication_state(
+                            self.config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if header.kind != FrameKind::Result || !header.matches_attempt(&call) {
                 return Err(ScopeRpcError::Unauthorized);
             }

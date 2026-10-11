@@ -309,11 +309,18 @@ fn decode_header(
 }
 pub(super) fn rpc_header(
     fixed: &[u8; HEADER_BYTES],
-    authentication: &ScopeTlsAuthentication,
     context: DiagnosticContext,
     malformed: ScopeRpcError,
+    authenticate: impl FnOnce() -> Result<ScopeTlsAuthentication, ScopeRpcError>,
 ) -> Result<Header, ScopeRpcError> {
-    decode_header(fixed, authentication, context).map_err(|error| match error {
+    // Current-revision headers are bounded claims. Parsing them must still let
+    // the server return its existing correlated authentication-time refusal.
+    // Only claiming a proven old revision requires authentication at this point.
+    if fixed[4..6] != 1_u16.to_be_bytes() {
+        return Header::decode(fixed).map_err(|_| malformed);
+    }
+    let authentication = authenticate()?;
+    decode_header(fixed, &authentication, context).map_err(|error| match error {
         HeaderError::Invalid => malformed,
         HeaderError::Revision => ScopeRpcError::TransportRevisionMismatch,
     })
