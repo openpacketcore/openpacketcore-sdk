@@ -134,21 +134,23 @@ impl fmt::Debug for XfrmIndeterminateOperations {
 /// [`XfrmInstallRecoveryPlan`] and are omitted from its `Debug` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XfrmInstallOwnership {
-    /// The runner has not acquired or issued a mutation.
+    /// The operation is unstarted, or its finished runner left no possible residue.
     NotStarted,
-    /// The SA install is currently in flight.
+    /// The runner owns the SA install, including finalization after its result.
     SaInFlight,
     /// Only SA residue may remain.
     SaAcquired,
-    /// The policy install is currently in flight after SA acknowledgement.
+    /// The runner owns the policy install after SA acknowledgement, including
+    /// finalization after its result.
     PolicyInFlight,
     /// Only policy residue may remain.
     PolicyAcquired,
-    /// Both SA and policy were acknowledged.
+    /// Both SA and policy were acknowledged and the runner has finished.
     Complete,
-    /// The runner rolled back every candidate it owned.
+    /// The runner finished after rolling back every candidate it owned.
     RolledBack,
-    /// Classified recovery is currently issuing this removal.
+    /// The install runner is rolling back, or classified recovery is issuing
+    /// this removal. The claim remains live through finalization.
     Recovering {
         /// Removal operation in flight.
         operation: XfrmCompositeOperation,
@@ -538,6 +540,8 @@ enum RunLifecycle {
 struct JournalState {
     stage: Stage,
     lifecycle: RunLifecycle,
+    // Retain the last operation through finalization, so ownership cannot
+    // expose a terminal result before the runner relinquishes its claim.
     runner_inflight: Option<XfrmCompositeOperation>,
     recovery_inflight: Option<XfrmCompositeOperation>,
     recovery_running: bool,
@@ -577,9 +581,31 @@ impl JournalState {
     }
 
     fn touch(&mut self) {
+        #[cfg(test)]
+        self.assert_publication_invariant();
         self.generation = Arc::new(());
         #[cfg(test)]
         self.changed.send_replace(());
+    }
+
+    #[cfg(test)]
+    fn assert_publication_invariant(&self) {
+        if std::thread::panicking() {
+            return;
+        }
+        match self.lifecycle {
+            RunLifecycle::NotStarted => assert!(self.runner_inflight.is_none()),
+            RunLifecycle::Running => assert!(
+                self.runner_inflight.is_some()
+                    || !(self.sa_possible || self.policy_possible || self.rolled_back)
+                        && self.uncertainties.is_empty(),
+                "terminal ownership is visible while the install runner is live"
+            ),
+            RunLifecycle::Finished => assert!(
+                self.runner_inflight.is_none() || self.runner_supervision_lost,
+                "an install claim is visible after the runner finished"
+            ),
+        }
     }
 
     fn mark_indeterminate(&mut self, operation: XfrmCompositeOperation) {
@@ -619,17 +645,18 @@ impl JournalState {
         if let Some(operation) = self.recovery_inflight {
             return XfrmInstallOwnership::Recovering { operation };
         }
-        if !self.uncertainties.is_empty() {
-            return XfrmInstallOwnership::Indeterminate {
-                operations: self.uncertainties,
-            };
-        }
         match self.runner_inflight {
             Some(XfrmCompositeOperation::InstallSa) => return XfrmInstallOwnership::SaInFlight,
             Some(XfrmCompositeOperation::InstallPolicy) => {
                 return XfrmInstallOwnership::PolicyInFlight;
             }
-            _ => {}
+            Some(operation) => return XfrmInstallOwnership::Recovering { operation },
+            None => {}
+        }
+        if !self.uncertainties.is_empty() {
+            return XfrmInstallOwnership::Indeterminate {
+                operations: self.uncertainties,
+            };
         }
         match (self.sa_possible, self.policy_possible) {
             (true, true) => XfrmInstallOwnership::Complete,
@@ -699,6 +726,11 @@ impl XfrmInstallJournal {
     }
 
     /// Current typed mutation ownership.
+    ///
+    /// A live install runner retains its in-flight ownership through finalization.
+    /// When it finishes normally, terminal ownership and runner completion become
+    /// visible together. A fresh recovery plan cannot race unfinished installation
+    /// bookkeeping. Abnormal termination still permanently disables recovery.
     pub fn ownership(&self) -> XfrmInstallOwnership {
         self.state().ownership()
     }
@@ -965,7 +997,11 @@ impl RunGuard {
 
     fn finish(&mut self) {
         let mut state = self.journal.state();
+        // Publish terminal ownership and runner completion in one transition.
+        // No backend work remains, and no later runner touch can stale a plan
+        // obtained from this completed ownership state.
         state.lifecycle = RunLifecycle::Finished;
+        state.runner_inflight = None;
         state.touch();
         self.active = false;
     }
@@ -1028,6 +1064,15 @@ impl Drop for RecoveryGuard {
 pub struct XfrmStagedInstall {
     request: XfrmCompositeInstallRequest,
     journal: XfrmInstallJournal,
+    #[cfg(test)]
+    finish_barrier: Option<Arc<RunnerFinishBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RunnerFinishBarrier {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl fmt::Debug for XfrmStagedInstall {
@@ -1056,7 +1101,12 @@ impl XfrmStagedInstall {
             request.rollback_remove_sa(),
             request.rollback_remove_policy(),
         );
-        Self { request, journal }
+        Self {
+            request,
+            journal,
+            #[cfg(test)]
+            finish_barrier: None,
+        }
     }
 
     /// Clone the caller-visible mutation journal.
@@ -1161,6 +1211,11 @@ impl XfrmStagedInstall {
         let worker = runtime.spawn(async move {
             let mut guard = guard;
             let result = self.run_inner(backend.as_ref()).await;
+            #[cfg(test)]
+            if let Some(barrier) = &self.finish_barrier {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
+            }
             guard.finish();
             result
         });
@@ -1186,7 +1241,6 @@ impl XfrmStagedInstall {
         if let Err(source) = backend.install_sa(self.request.sa.clone()).await {
             let indeterminate = matches!(&source, XfrmError::StateIndeterminate { .. });
             let mut state = self.journal.state();
-            state.runner_inflight = None;
             if indeterminate {
                 state.mark_indeterminate(XfrmCompositeOperation::InstallSa);
             } else {
@@ -1201,7 +1255,6 @@ impl XfrmStagedInstall {
         }
         {
             let mut state = self.journal.state();
-            state.runner_inflight = None;
             state.stage = Stage::SaAcquired;
             state.touch();
         }
@@ -1216,7 +1269,6 @@ impl XfrmStagedInstall {
             let policy_indeterminate = matches!(&source, XfrmError::StateIndeterminate { .. });
             {
                 let mut state = self.journal.state();
-                state.runner_inflight = None;
                 if policy_indeterminate {
                     state.mark_indeterminate(XfrmCompositeOperation::InstallPolicy);
                 } else {
@@ -1230,7 +1282,6 @@ impl XfrmStagedInstall {
             return match rollback {
                 Ok(()) | Err(XfrmError::NotFound) => {
                     let mut state = self.journal.state();
-                    state.runner_inflight = None;
                     state.clear_sa();
                     state.rolled_back = true;
                     let outcome = if policy_indeterminate {
@@ -1242,7 +1293,6 @@ impl XfrmStagedInstall {
                 }
                 Err(rollback) => {
                     let mut state = self.journal.state();
-                    state.runner_inflight = None;
                     if matches!(&rollback, XfrmError::StateIndeterminate { .. }) {
                         state.mark_indeterminate(XfrmCompositeOperation::RollbackRemoveSa);
                     } else {
@@ -1261,7 +1311,6 @@ impl XfrmStagedInstall {
 
         {
             let mut state = self.journal.state();
-            state.runner_inflight = None;
             state.stage = Stage::Complete;
             state.touch();
         }
@@ -1283,6 +1332,8 @@ fn rolled_back_with_possible_residue(
 
 #[cfg(test)]
 mod tests {
+    mod completion_tests;
+
     use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
     use async_trait::async_trait;
@@ -1764,11 +1815,15 @@ mod tests {
                 state.started = true;
                 progress.send_replace(());
                 changed.notify_all();
-                while !state.released {
-                    state = changed
-                        .wait(state)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
+                let (mut state, _) = changed
+                    .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| {
+                        !state.released
+                    })
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    state.released,
+                    "hang guard: spawn_blocking install was not released"
+                );
                 state.sa_present = true;
                 progress.send_replace(());
             });
@@ -2482,7 +2537,12 @@ mod tests {
         let first_journal = journal.clone();
         let first_backend = backend.clone();
         let first = tokio::spawn(first_journal.recover(first_backend, first_classification));
-        backend.remove_policy_decided.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backend.remove_policy_decided.notified(),
+        )
+        .await
+        .expect("hang guard: concurrent recovery never reached policy removal");
 
         let current = journal.recovery_plan();
         let error = journal
@@ -2518,7 +2578,12 @@ mod tests {
         let recovery_backend = backend.clone();
         let classification = classify_all_owned(&old_plan);
         let recovery = tokio::spawn(recovery_journal.recover(recovery_backend, classification));
-        backend.remove_policy_decided.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backend.remove_policy_decided.notified(),
+        )
+        .await
+        .expect("hang guard: detached recovery never reached policy removal");
         recovery.abort();
         assert!(recovery.await.is_err());
 
@@ -2557,7 +2622,12 @@ mod tests {
         let recovery_backend = backend.clone();
         let classification = classify_all_owned(&old_plan);
         let recovery = tokio::spawn(recovery_journal.recover(recovery_backend, classification));
-        backend.remove_sa_decided.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backend.remove_sa_decided.notified(),
+        )
+        .await
+        .expect("hang guard: detached recovery never reached SA removal");
         recovery.abort();
         assert!(recovery.await.is_err());
 

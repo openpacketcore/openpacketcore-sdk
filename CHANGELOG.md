@@ -572,6 +572,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
+  ownership together with runner completion, so a fresh plan observed at
+  `Complete` or `Acquired` can be recovered or committed without a spurious
+  `RunnerNotFinished` or completion-induced
+  `StaleClassification`. Install and rollback claims remain live until every
+  backend result has returned and the final transition is published.
+  `ownership()` now reports `Recovering { operation: RollbackRemoveSa }` during
+  the install runner's own rollback and holds in-flight values until completion.
+
 - `opc-session-store`: wait for a leader's strict WAL publication before returning
   voter-replacement status. Quorum confirmation and the local durable read share
   one operation deadline, so a publication window neither returns a spurious

@@ -15,6 +15,7 @@ rejects failed, skipped, and cancelled dependencies. The reusable
 with the merge base of the event's base/head revisions. On a train push it
 compares with the default branch's merge base; on a main push it compares the
 event's before/after revisions. A missing revision or parser error fails the job.
+Manual `workflow_dispatch` runs use the same comparison as train pushes; a dispatch on the default branch itself passes as an empty comparison.
 
 The guard reads immutable Git blobs. It does not check out either compared tree,
 run its generators, compile the workspace, or execute its tests. Rust and Go use
