@@ -20,6 +20,7 @@ files remain revision-1 implementation fixtures during design review; their
 The separate [revision-2 vectors](026-scope-transport-revision2-vectors.json)
 regenerate all their scope frames and affected cryptographic inputs. Reproduce
 them with `python3 docs/rfc/026-scope-transport-revision2-vectors.py --check`.
+Run this command in required CI alongside the other reference-vector checks.
 That independent reference script uses synthetic public fixtures, never runtime
 credentials. Matching vectors is not runtime qualification.
 
@@ -40,16 +41,22 @@ credentials. Matching vectors is not runtime qualification.
 
 All scope roles cross revision 2 together at a **fresh installation**. No ALPN
 fallback or mixed revision-1/2 operation. No-common-ALPN failure on either TLS
-endpoint and frame version 1 on a negotiated revision-2 connection surface
+endpoint and frame version 1 on an authenticated revision-2 connection surface
 `TransportRevisionMismatch`, separately from invalid input, authentication,
-Retry and Unavailable. Emit a value-free counter and log on both endpoints;
-never retry this permanent configuration result automatically. It is not
-no-effect evidence for a pending mutation. Startup, RPC, batch/coordinator and
+Retry and Unavailable. The ALPN alert precedes server authentication and may be
+forged or from a wrong endpoint; only the authenticated frame proves a mismatch.
+Fail the call with no immediate retry, but **never latch** the result. A later
+call or a background probe no more often than every 30 seconds may retry a fresh
+handshake; the first authenticated revision-2 handshake clears the diagnostic
+condition. Emit a value-free counter and rate-limited log on both endpoints.
+Neither signal is no-effect evidence for a pending mutation. Startup, RPC, batch/coordinator and
 local-effect public errors retain the distinction; a local-only batch mismatch
-variant cannot enter canonical error/receipt serialization.
+variant must be refused by canonical error/receipt serialization, with no tag
+assignment or substitution.
 Use counter `scope_transport_revision_mismatch_total` and log reason
 `scope_transport_revision_mismatch`; only bounded role/purpose/direction labels
 are permitted, with no peer identity, request bytes or credential values.
+Log at most once per label combination every 30 seconds; count every event.
 
 For revisions after 2, negotiate N/N−1 for one release and enable N-only
 behavior once relevant peers support N; N+1 may drop N−1, as the later-release
@@ -125,6 +132,8 @@ P(Some(sealed_bytes)) = 01 || P(byte_length) || sealed_bytes
 
 Count is 1–32. Presence is exactly 0 or 1. A successful response repeats the
 requested namespace, count and each key in order, including absent keys.
+The server validates the set from raw peers too: duplicate/zero keys and counts
+0 or 33 are invalid and refused before any read barrier.
 A present record's namespace/key must equal both request and echo, its value
 must exist, and its birth/generation/batch revision must be in 1..=COUNTER_MAX (2^63−1).
 Require at most eight distinct nonzero claims and the canonical bounded

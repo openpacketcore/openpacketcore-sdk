@@ -49,8 +49,13 @@ in each backend and raw descriptor operations remain in the sys boundary.
 The implemented interfaces are summarized below. See the
 [coordinator guide](../../crates/opc-local-kernel-lifecycle/README.md) for the
 consumer sequence. The concrete authority adapter currently uses the SDK's
-`ScopeAuthorityStore` and `ScopeBatchStore`; transport authentication remains a
-separate integration boundary.
+`ScopeAuthorityStore` and `ScopeBatchStore`. The proposed
+[RFC 026 child-read addendum](026-scope-child-point-read.md) specifies #1225's
+optional `native-scope` adapter over the authenticated ScopeClient, after #1221.
+That adapter receives a genuine coordinator completion and reads it back before
+acknowledgement; it exposes no `commit_activation`. `CommittedScopeEffect`
+remains concrete and non-generic in both backend APIs, with sealed backend
+dispatch and trusted class retained internally.
 
 | Interface | Contract |
 | :--- | :--- |
@@ -60,7 +65,8 @@ separate integration boundary.
 | `LocalKernelScope::contain` | Close and read back the declared local paths after the consumer authorizes disruption. Return an opaque `ContainedScope` bound to this guard, namespace and observed containment objects. ARP continues to pass. |
 | `LocalKernelLifecycle::reset` | Supervise contained XFRM, owned route/rule, companion and complete graph retirement. Return `LocalScopeResetReceipt` only after verified local retirement. Independent global-release observations do not gate rebuild. |
 | Backend `rebuild_local_graph` / `rebuild_scoped_dscp` | Consume that reset receipt and publish fresh, empty current-image graphs. Abandoned partial builds retain their barrier through supervised exact retirement. Structural completion grants no session authority. |
-| `ScopeKernelAuthority::commit_activation` | Execute or recover the exact batch through the actual store, then verify current authority and the child's resulting birth/revision and sealed body. Return a private-constructor `CommittedScopeEffect`; unknown outcomes grant no effect authority. |
+| `ScopeKernelAuthority::commit_activation` | Local adapter only: execute or recover the exact batch through the actual store, then verify current authority and the child's resulting birth/revision and sealed body. Return a private-constructor `CommittedScopeEffect`; unknown outcomes grant no effect authority. Under the proposed #1225 extension, preserve the pre-submission `current()` check and move readback/recheck to `ScopeBatchStore::read_current`, also comparing batch revision. |
+| Proposed `ScopeKernelAuthority<NativeScopeAuthority>::readback_activation` (#1225) | Consume native-authenticated completion provenance for the original full coordinator request before `ack`; one current-authority/child cut checks Applied, the exact operation, birth/generation, batch revision, bytes and claims. Carry the effect's trusted class into readback/recheck. No raw commit method or caller-created outcome can mint the concrete effect token. |
 | Backend `install_scoped` / `remove_scoped` / `read_scoped` | Bind actor-owned effects to the complete immutable activation request, child birth/revision, local epoch and backend object identity. Fresh installs recheck untimed currentness; receipt-bound undo removes only the exact local effect. |
 | `LocalKernelLifecycle::open` | Recheck current execution and every declared graph before each containment removal. Publish `KernelCompletion` only after verified absence of all containment filters. An interrupted unpublished opening restores closure under retained supervision. |
 | `KernelCompletion::recheck` | Passively verify the same published opening and local graph identities. Dropping the completion or losing the store does not expire forwarding. Reset receipts report global object residue separately. |
@@ -337,6 +343,17 @@ map to `LocalEffectError::RetryableNoEffect`, separately from stale authority or
 a changed request. Re-read and replan conflicts; a cancelled attempt requires a
 successor, while an inactive profile permits exact retry. `OutcomeUnknown`
 remains distinct and requires recovery of the exact submitted request.
+The proposed native adapter adds `LocalEffectError::TransportRevisionMismatch`
+as a distinct call failure, with no immediate retry or permanent latch. Update
+both GTP-U and XFRM matches on this exhaustive enum. A later authenticated
+revision-2 handshake clears the mismatch condition; it never proves an
+unresolved mutation's outcome or authorizes a kernel effect.
+
+The proposed `native-scope` feature alone adds `opc-session-net`/`opc-tls`.
+Default and `store`-only consumers, including XFRM's `scope-store`, retain their
+current dependency boundary. Extend `ci/check-xfrm-dependency-contract.py`,
+`ci/local-kernel-lifecycle-cases.json` and the native shard case list to cover
+that boundary and both authority adapters when implementing #1225.
 
 Undo runs in reverse effect order and verifies each object still matches its
 receipt. It cannot delete a successor birth, widen to whole-scope reset, send

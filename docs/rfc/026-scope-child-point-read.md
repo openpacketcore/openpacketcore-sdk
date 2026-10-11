@@ -4,7 +4,8 @@ Status: proposed; design review precedes implementation. Addresses
 [#1221](https://github.com/openpacketcore/openpacketcore-sdk/issues/1221) and the
 follow-on authority adapter in [#1225](https://github.com/openpacketcore/openpacketcore-sdk/issues/1225).
 Implement #1221 first, then #1225. Applies to [RFC 026](026-scope-authenticated-transport.md)
-and [RFC 027](027-scope-batch-lanes.md); retained restore remains RFC 028.
+and [RFC 027](027-scope-batch-lanes.md); [RFC 025](025-local-kernel-lifecycle.md)
+owns the kernel authority contract, and retained restore remains RFC 028.
 
 ## API and linearization
 
@@ -39,9 +40,24 @@ and the independent current-execution/key binding **before** established
 Emergency dispatch admission. Unproven work uses EmergencyClassification
 capacity; a cached promotion hint alone grants no authority or current credit.
 Hold this bounded cut through class admission and child materialization, at
-most until the original deadline. Backend ownership must not hold a process
-gate or synchronous mutex across an async wait. Count exactly one full barrier
-for the entire successful RPC, on fresh and reused connections.
+most **10 seconds from opening the cut**, using a server-local monotonic timer.
+The request carries no deadline. Watch peer closure while waiting, as the scan
+path does; peer close or expiry cancels admission/materialization and releases
+the cut. On expiry, release it before sending the existing retryable
+`ProvenNoEffect(Retry)` refusal if the peer remains connected. Never send a late
+child observation. The client's original deadline remains independently binding.
+Backend ownership must not hold a process gate or synchronous mutex across an
+async wait. Count exactly one full barrier for the entire successful RPC, on
+fresh and reused connections.
+
+Method 17 selects `WorkerCurrent` proof share only from a cached promotion hint;
+an unpromoted worker uses `WorkerUnproven`. An unpromoted Emergency call charges
+`EmergencyClassification` proof capacity. The hint neither replaces the cut nor
+authorizes Emergency dispatch. A successful read promotes the connection to
+the stamp checked at its cut; `StaleAuthority` or either boot-key mismatch clears
+the hint before another call. A stale hint can therefore spend at most one
+current-share credit. Only the verified current cut admits established Emergency
+dispatch. These rules apply to method 17's own path without a refresh barrier.
 
 `None` means missing or a tombstone at that cut. A present record includes
 namespace, key, birth, generation, batch revision, complete claims and canonical
@@ -141,6 +157,8 @@ The latter three add no stored batch-error encoding. Other scope RPC APIs
 preserve mismatch as their own typed variant, including a local-only,
 non-serializable `ScopeBatchError::TransportRevisionMismatch` where the batch
 interface requires it. Canonical batch-error tags and receipt bytes stay fixed.
+The canonical encoder must refuse the local-only mismatch variant, never assign
+it a tag or silently encode a different error.
 
 | Condition | Exact child-read result |
 | --- | --- |
@@ -153,7 +171,8 @@ interface requires it. Canonical batch-error tags and receipt bytes stay fixed.
 | Authenticated canonical store refusal | `Batch(e)`, preserving exact `ScopeBatchError` e |
 | Aggregate exceeds frame limit | `ObservationTooLarge`; no partial result |
 | Whole-builder exchange budget exhausted | `ReadBudgetExceeded` |
-| ALPN mismatch or frame 1 on connection 2 | `TransportRevisionMismatch`, non-retryable |
+| No-common-ALPN alert or frame 1 on authenticated connection 2 | `TransportRevisionMismatch`; no immediate retry, never latched |
+| Voter replacement from Fence to successor admission | `Batch(Unavailable)`, never `StaleAuthority` |
 | Admission closure, unavailable barrier, zero/elapsed deadline, TLS/time failure, malformed/noncanonical/oversized or mismatched peer observation | `Batch(Unavailable)` |
 | Existing ambiguous transport OutcomeUnknown | `Batch(OutcomeUnknown)` |
 
@@ -165,8 +184,9 @@ Typed store errors require live TLS, nonce and full header/request correlation.
 The existing **pre-challenge ProvenNoEffect** is the explicit exception to
 proof/response-binding processing: TLS authenticates it and its nonce/header
 correlate its fixed reason before proof transmission. Unauthorized maps as
-above; Invalid to `Batch(InvalidRequest)`; Retry/AuthTimeUnavailable/
-ProfileUnavailable to `Batch(Unavailable)`. It proves nothing about a different
+above; Invalid to `Batch(InvalidRequest)`; Retry/AuthTimeUnavailable to
+`Batch(Unavailable)`; ProfileUnavailable to `Batch(Scope(ProfileNotActivated))`,
+matching the batch path. It proves nothing about a different
 or pending mutation. Parser failure, absence and successful reads likewise
 cannot settle that mutation.
 
@@ -181,6 +201,12 @@ method**. An optional `native-scope` feature enables `store` and
 capability, local execution/lifecycle and worker ScopeClient, checking their
 identity/scope/process binding. A checked `Current` wrapper may run at
 construction. A caller-supplied observation provider is not a capability factory.
+`CommittedScopeEffect` stays concrete and non-generic in GTP-U and XFRM APIs;
+erase the sealed backend internally and retain the effect's trusted class there.
+Default and `store`-only consumers, including XFRM's `scope-store`, must not
+depend on `opc-session-net` or `opc-tls`. Extend the dependency-contract check,
+`ci/local-kernel-lifecycle-cases.json` and the native shard case list for
+`native-scope` when implementing #1225.
 
 The consumer commits through the **shared batch coordinator**, retains the
 original full request and supplies its committed completion to
@@ -201,6 +227,9 @@ local adapter, including the new batch-revision comparison. Combine with local
 fence, reset epoch, single effect owner and bounded shared consumption before
 issuing a token. Rechecks repeat the one-cut child/current-stamp validation and
 local checks. **Neither path surrounds the child read with two Current calls.**
+The local adapter also uses `ScopeBatchStore::read_current`; its pre-submission
+`current()` in `commit_activation` stays, so obsolete local authority cannot
+submit a new activation.
 
 Each readback/recheck takes the effect's **trusted work class from its activation
 submission**, matching bound provenance. Constructor class is only a default
@@ -219,7 +248,8 @@ Ack permits receipt pruning on lane reuse: early-ack `Pruned` and `NotRecorded`
 are unknown and yield no token. Only authenticated exact Cancelled/NotApplied
 evidence proves no effect. Preserve unavailable/unknown through existing
 local-effect refusal; expose `LocalEffectError::TransportRevisionMismatch`
-distinctly.
+distinctly. This exhaustive enum change requires updating both backend matches
+and RFC 025's error mapping; it grants no effect or teardown authority.
 
 ## Integration with the landed contracts
 
@@ -227,7 +257,7 @@ distinctly.
 | --- | --- |
 | [RFC 028 coherent restore](028-coherent-scope-scans.md) | Retained restore pages and lookups keep their original cut, successor eligibility, claim/tombstone detail and explicit completion. Method 17 supplies fresh bounded predicates; separate calls cannot replace a retained restore. Methods 12–16 and page payload bytes remain unchanged inside revision-2 frames. |
 | [RFC 030 IKE recovery](030-ike-recovery-profile.md#durability-writer-fencing-and-ownership) | Return the complete sealed row and store birth/generation so the consumer can preserve exact child CAS, distinct from the protocol window's generation. A latest read cannot settle a possibly applying predecessor: first resolve or fence its exact attempt as RFC 030 requires. Unsealing, provider-unavailable classification, affine runtime ownership and uncertain-operation resolution remain consumer obligations; observations grant no send or effect token. |
-| [RFC 023 voter replacement](023-voter-slot-incarnations.md#composition-with-untimed-scope-authority) | The full barrier and follower forwarding must retain current-incarnation application admission through Fence and successor admission; an obsolete voter reply cannot complete the read. Scope-profile continuation preserves scope/execution, birth and lane floors. Transport revision 2 changes neither that profile nor the voter incarnation encoding, and requires no extra all-voter reactivation. |
+| [RFC 023 voter replacement](023-voter-slot-incarnations.md#composition-with-untimed-scope-authority) | The full barrier and follower forwarding retain current-incarnation application admission; from Fence to successor admission return `Batch(Unavailable)`, never `StaleAuthority`. An obsolete voter reply cannot complete the read. Scope-profile continuation preserves scope/execution, birth and lane floors. Transport revision 2 changes neither that profile nor the voter incarnation encoding, and requires no extra all-voter reactivation. |
 | [RFC 025 local kernel lifecycle](025-local-kernel-lifecycle.md) | Extend the landed `ScopeKernelAuthority` and its private activation/readback boundary. Replace its surrounding `Current` calls with the one-cut check and add the outcome batch-revision comparison. Preserve the opaque `CommittedScopeEffect` accepted by existing backend/open APIs, with sealed backend dispatch inside the capability. Both adapters retain the lifecycle's single owner, epoch and shared consumption frontier, supervised shutdown and store-independent receipt teardown. The optional native adapter must preserve ordinary XFRM's store-free dependency boundary. |
 
 The configuration-change qualification below includes voter replacement across
@@ -249,22 +279,27 @@ tests; preserve all existing assertions and deadlines.
 | Record namespace/key | Correct echo, wrong record: `Batch(Unavailable)` | Remove each record/request comparison |
 | Canonical bytes, versions, claims, envelope | Overlong/trailing bytes, zero/overflow birth/generation/batch revision, duplicate/ninth claim, malformed envelope: `Batch(Unavailable)` | Bypass each validator/re-encoding |
 | Presence/result tags | Unknown tag or present-without-value: `Batch(Unavailable)` | Accept unknown tag or present tombstone |
-| Bounds before allocation | Counts 0/33, excessive LP lengths, oversized frame; bounded allocator sees no prohibited allocation | Allocate before each bound |
+| Bounds before allocation | Counts 0/33, excessive LP lengths, oversized frame; bounded allocator sees no prohibited allocation. Raw-peer duplicate/zero keys and counts 0/33 are refused before any barrier | Allocate before each bound or bypass server key-set validation |
 | Atomic aggregate | Mixed presence, 1/17/32 keys; too large gives only `ObservationTooLarge`; split calls use separate cuts | Truncate, silently mark missing, exceed cap |
-| Exact stamp at one cut | Hold after full barrier **before opening cut**, commit Close (separately succession), release: `Batch(Scope(StaleAuthority))`, no records, on native and SQLite | Check authority before held gate or children from another cut |
-| Full barrier/configuration | Ordered write through follower; held cutover revalidates or gives `Batch(Unavailable)`; exactly one full barrier per success | Skip round/applied/config check or add Current |
-| Both boot-key comparisons | Add method 17 to `native_scope_shared_identity_cannot_sign_for_another_slots_boot`: A's key signing B's stamp gets Unauthorized **before any read barrier**, unchanged log/frontiers; A's stamp on B's scope also Unauthorized. Retain inconsistent-retained-record case and B positive controls | Independently remove carried-execution/key and retained/current-execution/key comparisons; each full native test fails |
+| Exact stamp at one cut | Hold after full barrier **before opening cut**, commit Close (separately succession), release: `Batch(Scope(StaleAuthority))`, no records, on native and SQLite | Check authority before the held gate |
+| Cut retained after capture | A second gate **after opening the cut** holds materialization; commit a child update, and separately Close, then release: return the records from the original cut, on both backends | Fetch children from another cut or refresh Current after capture |
+| All keys share the cut | Hold between materializing two keys, commit one batch changing both, release: both returned entries have the original values/revisions | Open a new cut per key |
+| Full barrier/configuration | Ordered write through follower; held replacement from Fence to successor admission gives `Batch(Unavailable)`, never `StaleAuthority`; delayed retired-voter replies cannot release the read; exactly one full barrier per success | Skip round/applied/config/incarnation check, misclassify cutover or add Current |
+| Both boot-key comparisons | Add method 17 to `native_scope_shared_identity_cannot_sign_for_another_slots_boot`: A's key signing B's stamp gets Unauthorized **before any read barrier**, unchanged log/frontiers; A's stamp on B's scope also Unauthorized. Retain inconsistent-retained-record case and B positive controls | In method 17's own path remove **both** carried-execution/key and cut-level current-execution/key checks: A can read B's children and the test must fail. Retain existing independent single-removal mutations on the generic path; a redundant cut check alone is not claimed to be killed |
 | Live policy/process/generation | Held revocation/wrong process/principal/scope: Unauthorized; stale generation: StaleAuthority | Reuse cached grant or compare only namespace |
 | Class/currentness | SafetyControl/wrong listener: Unauthorized; stale Emergency boot spends no Emergency dispatch credit; #1225 Emergency progresses with Normal full | Ignore class/listener/currentness or force one fixed class |
+| Method-17 proof share/promotion | Unpromoted calls spend only `WorkerUnproven`; success promotes; stale hint or key mismatch clears it, so a second call cannot use `WorkerCurrent` | Treat unpromoted as current, omit promotion or retain a stale hint |
+| Unproven Emergency proof | Unpromoted Emergency charges classification proof capacity, spends no established Emergency dispatch credit before the current cut, and progresses after that cut proves currentness | Charge Emergency proof/dispatch before proof of currentness or use only the header class |
+| Server cut release | Hold class admission; peer close releases the cut. Separately advance paused time to 10 seconds: release cut, return Retry to a connected peer, never emit a late observation | Omit peer-close watch, fixed maximum or cancellation/drop of cut ownership |
 | Absolute deadline/budget | Hold admission, connection lock, exchange separately; paused-time expiry: `Batch(Unavailable)`; exhausted budget: `ReadBudgetExceeded`, no call; later read cannot restart budget | Reset timeout per stage/read or omit debit |
 | Borrowed permit/cancellation | Caller resident/running limits 1: 17-key builder progresses; compile-fail escape/detach; cancel/Close release resources | Nested reserve, Clone/owned context, held process gate |
-| Every error-table row | Script each exact variant, every canonical batch error and pre-challenge reason; never absent or pending-mutation no-effect | Collapse variants, trust unauthenticated error, infer no-effect |
+| Every error-table row | Script each exact variant, every canonical batch error and pre-challenge reason; canonical encoder refuses local-only mismatch; never absent or pending-mutation no-effect | Collapse variants, encode mismatch, trust unauthenticated error, infer no-effect |
 | No side effects | Compare application log index, all lane sequences/receipts, TTL/Maintenance counters; no capability-producing API | Enter proposal/lane path or fabricate capability |
 | Update/delete-recreate | Later update/recreate makes old child condition conflict; observe changed generation/birth | Ignore either version |
 | Freshness/uncertainty | Replay nonce/request or drop reply after proof: Unavailable/OutcomeUnknown as applicable, never absence | Remove correlation or map loss to absence |
-| Revision/startup | TLS mismatch both directions, frame 1 on connection 2, issuer/worker startup and retained TicketNotice: non-retryable mismatch plus value-free signals | Fallback, map to Retry, leave purpose/frame at 1 |
+| Revision/startup | TLS alert both directions, authenticated frame 1 on connection 2, issuer/worker startup and retained TicketNotice: typed mismatch plus value-free signals. Wrong-endpoint alert followed by authenticated revision 2 recovers without restart; bounded probe/log rate, no immediate retry | Fallback, map to Retry, leave purpose/frame at 1, latch mismatch, trust an unauthenticated alert as proof or hot-loop retries/logs |
 | Activation provenance/ack | Reject forged outcome/port completion, altered request/row/batch revision/class, early-ack Pruned, epoch change, duplicate consumption; compile-fail native commit_activation | Remove each provenance/readback/fence/consumption guard or expose raw commit |
-| Independent bytes | Reference script reproduces all revision-2 frames, exporters, proof/bindings and child positive/negative vectors; implementation matches | Change version, unchanged domain/input version, order or bound |
+| Independent bytes | Reference script `--check` runs in required CI and reproduces all revision-2 frames, exporters, proof/bindings and child positive/negative vectors; implementation matches | Change version, unchanged domain/input version, order or bound, or omit the CI check |
 
 Run existing local authority cases against both adapters, plus native failures,
 Close/drain/reset/restart. Run full local gates on the candidate before handoff.
@@ -272,13 +307,23 @@ Close/drain/reset/restart. Run full local gates on the candidate before handoff.
 ## Installation and lifecycle
 
 Revision 2 is **fresh-install only**, consistent with RFC 026: no mixed-revision
-rollout or fallback, and no stored-format change. Both endpoints emit a
-value-free mismatch counter/log and typed non-retryable
-`TransportRevisionMismatch` on ALPN mismatch; reject frame 1 before body
-allocation. It is never retryable unavailability or pending-mutation no-effect.
-The coordinator surfaces this terminal transport configuration error and stops
-automatic retries while retaining any unresolved exact attempt for recovery;
-it does not acknowledge, cancel or infer an outcome from the mismatch.
+rollout or fallback, and no stored-format change. Pin revision 2 with other
+fresh-install boundaries so a consumer can cross them in one installation.
+Both endpoints emit a value-free mismatch counter and rate-limited log, and
+return typed `TransportRevisionMismatch`. A no-common-ALPN alert precedes server
+authentication: it may be forged or from a wrong endpoint and is **not proof**
+of peer revision. Only frame 1 on an established authenticated connection proves
+a mismatch; reject it before body allocation. Neither signal establishes a
+pending mutation's outcome.
+
+Fail that call without an immediate retry; **never latch** the mismatch or
+require a restart. A later call tries a fresh handshake; unresolved background
+work may probe at most once every **30 seconds**, without a hot retry loop.
+The first authenticated revision-2 handshake clears the diagnostic condition.
+Emit at most one mismatch log per role/purpose/direction every 30 seconds;
+the counter may count every event. The coordinator retains any unresolved exact
+attempt for later recovery and preserves the typed error distinctly from
+Unavailable. It does not acknowledge, cancel or infer an outcome from mismatch.
 
 For later revisions, accept N and N−1 for one release, negotiated per connection;
 enable N-only behavior after relevant peers support N, and N+1 may drop N−1.
