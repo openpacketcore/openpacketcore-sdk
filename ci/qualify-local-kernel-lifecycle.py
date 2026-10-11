@@ -131,7 +131,9 @@ def check_kernel(pattern: str | None) -> None:
         raise RuntimeError(f"guest kernel {platform.release()} does not match {pattern}")
 
 
-def run_cases(record: dict, evidence: Path, binaries: dict, runner_root: Path, unchanged, save) -> None:
+def run_cases(record: dict, evidence: Path, binaries: dict, runner_root: Path, unchanged, save,
+              keep_going: bool = False) -> None:
+    record["keep_going"] = keep_going
     for crate, binary in binaries.items():
         listing = subprocess.check_output([str(binary), "--ignored", "--list"], text=True)
         available = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")}
@@ -165,10 +167,10 @@ def run_cases(record: dict, evidence: Path, binaries: dict, runner_root: Path, u
             })
             save()
             print(f"{case}: {'passed' if passed else 'FAILED'}", flush=True)
-            if not passed:
+            if not passed and not keep_going:
                 raise RuntimeError(f"native case failed or skipped: {case}; inspect {log}")
     record["complete"] = True
-    record["passed"] = True
+    record["passed"] = all(case["passed"] for case in record["cases"])
 
 
 def main() -> int:
@@ -181,6 +183,7 @@ def main() -> int:
     mode.add_argument("--run-bundle", type=Path, help="execute a verified static bundle without Cargo or Git")
     parser.add_argument("--require-kernel", help="full regular expression for the execution kernel release")
     parser.add_argument("--case", action="append", default=[], help="exact case; omit for the full manifest")
+    parser.add_argument("--keep-going", action="store_true", help="run all cases after a test failure; still fail qualification")
     args = parser.parse_args()
     if platform.system() != "Linux":
         parser.error("native lifecycle qualification requires Linux")
@@ -227,7 +230,7 @@ def main() -> int:
             })
             binaries = {crate: bundle_path(bundle, binary["path"]) for crate, binary in record["binaries"].items()}
             save()
-            run_cases(record, evidence, binaries, bundle, unchanged, save)
+            run_cases(record, evidence, binaries, bundle, unchanged, save, args.keep_going)
         else:
             os.chdir(ROOT)
             all_cases = required_cases(MANIFEST)
@@ -297,7 +300,7 @@ def main() -> int:
                 record["bundle"] = str(args.build_bundle.resolve())
                 record["bundle_sha256"] = sha256(args.build_bundle.resolve() / "bundle.json")
             else:
-                run_cases(record, evidence, binaries, ROOT, unchanged, save)
+                run_cases(record, evidence, binaries, ROOT, unchanged, save, args.keep_going)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
         record["error"] = str(error)
         print(str(error), file=sys.stderr)
