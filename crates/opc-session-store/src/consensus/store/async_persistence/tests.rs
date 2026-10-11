@@ -29,6 +29,7 @@ mod activation_ack;
 mod admission;
 mod authority_reservation;
 mod bootstrap;
+mod clock;
 mod closed;
 mod initialization;
 mod majority_authority;
@@ -37,6 +38,8 @@ mod protected;
 mod races;
 mod retirement;
 mod snapshots;
+mod timing;
+mod voter_control;
 mod writer;
 
 type GenerationHook = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
@@ -576,11 +579,16 @@ async fn create_request(
             .try_into()
             .unwrap(),
     };
-    let fence = store
-        .observe_fenced_transition(&key)
+    let fence = {
+        let store = store.clone();
+        let key = key.clone();
+        clock::complete(store.inner.operation_timeout, async move {
+            store.observe_fenced_transition(&key).await
+        })
         .await
-        .unwrap_or_else(|error| panic!("ordinary fence observation {index}: {error:?}"))
-        .current_fence();
+    }
+    .unwrap_or_else(|error| panic!("ordinary fence observation {index}: {error:?}"))
+    .current_fence();
     let owner = OwnerId::new(format!("async-public-owner-{index}")).unwrap();
     let lease =
         FencedTransitionLease::acquire(key.clone(), owner.clone(), fence, Duration::from_secs(60))
@@ -611,10 +619,13 @@ async fn create(
     store: &ConsensusSessionStore,
     request: &FencedTransitionV2Request,
 ) -> FencedTransitionOutcome {
-    let mut result = store
-        .fenced_transition_v2_batch(vec![request.clone()])
-        .await
-        .unwrap();
+    let store = store.clone();
+    let requested = request.clone();
+    let mut result = clock::complete(store.inner.operation_timeout, async move {
+        store.fenced_transition_v2_batch(vec![requested]).await
+    })
+    .await
+    .unwrap();
     assert_eq!(result.len(), 1);
     let outcome = result.remove(0).unwrap();
     assert!(outcome.matches_v2_request(request));
@@ -628,7 +639,13 @@ async fn assert_recorded(
     request: &FencedTransitionV2Request,
     outcome: &FencedTransitionOutcome,
 ) {
-    let status = store.fenced_transition_v2_status(request).await.unwrap();
+    let store = store.clone();
+    let request = request.clone();
+    let status = clock::complete(store.inner.operation_timeout, async move {
+        store.fenced_transition_v2_status(&request).await
+    })
+    .await
+    .unwrap();
     assert!(
         matches!(status, FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone()))
     );
@@ -730,7 +747,7 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
                     .traffic_authority(),
                 FixedQuorumTrafficAuthority::PersistenceNotDurable
             );
-            let health = store.drain_async_persistence().await.unwrap();
+            let health = clock::drain(store).await.unwrap();
             assert!(health.asynchronous.unwrap().completed_generation > 0);
         }
         fleet.close(follower).await;
@@ -791,12 +808,11 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
             .last_log_index;
         let initialized = {
             let cold = cold.clone();
-            tokio::spawn(async move { cold.initialize_cluster().await })
+            tokio::spawn(async move { clock::initialize(&cold).await })
         };
         races::until_catchup(
             &cold,
             [fleet.peers[follower].as_ref()],
-            Duration::from_secs(2),
             || {
                 cold.persistence_health().recovery == Some(SessionAsyncRecoveryState::CatchingUp)
                     && fleet.peers[follower]
@@ -835,12 +851,7 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
             .is_granted());
         assert_recorded(&cold, &first, &first_outcome).await;
         assert_recorded(&cold, &second, &second_outcome).await;
-        let drained = cold
-            .drain_async_persistence()
-            .await
-            .unwrap()
-            .asynchronous
-            .unwrap();
+        let drained = clock::drain(&cold).await.unwrap().asynchronous.unwrap();
         assert!(drained
             .completed_applied_index
             .is_some_and(|index| index >= cut.barrier.index));
@@ -860,7 +871,7 @@ async fn async_persistence_all_cold_roots_withhold_votes_and_restored_leader_tra
         let leader = fleet.leader();
         let former_leader = fleet.peers[leader].node;
         for store in fleet.stores.iter().flatten() {
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         fleet.close_all().await;
         let before = fleet.engine_calls_from(former_leader);

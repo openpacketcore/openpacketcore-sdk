@@ -296,9 +296,9 @@ pub(crate) fn map_failure(failure: ConfigMutationFailure) -> AuditAuthorityError
         ConfigMutationFailure::Conflict
         | ConfigMutationFailure::RequestIdCollision
         | ConfigMutationFailure::HistoryProtected => AuditAuthorityError::BindingMismatch,
-        ConfigMutationFailure::NotFound | ConfigMutationFailure::InvalidInput => {
-            AuditAuthorityError::InvalidInput
-        }
+        ConfigMutationFailure::NotFound
+        | ConfigMutationFailure::InvalidInput
+        | ConfigMutationFailure::VoterReplacement(_) => AuditAuthorityError::InvalidInput,
     }
 }
 

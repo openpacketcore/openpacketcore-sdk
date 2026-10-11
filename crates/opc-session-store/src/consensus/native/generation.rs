@@ -42,6 +42,7 @@ pub(crate) use catalog::{Catalog, CatalogScope};
 pub(crate) use sqlite::SqlitePreparedBase;
 
 const MAGIC: &[u8; 8] = b"OPCNJD04";
+const SLOT_MAGIC: &[u8; 8] = b"OPCNJD05";
 const V3_MAGIC: &[u8; 8] = b"OPCNJD03";
 const LEGACY_MAGIC: &[u8; 8] = b"OPCNJD02";
 
@@ -50,13 +51,16 @@ pub(super) enum Format {
     V2,
     V3,
     V4,
+    V5,
 }
 
 impl Format {
     fn read(reader: &mut dyn Read, base: bool) -> io::Result<Self> {
         let mut magic = [0; 8];
         reader.read_exact(&mut magic)?;
-        if &magic == if base { base::MAGIC } else { MAGIC } {
+        if &magic == if base { base::SLOT_MAGIC } else { SLOT_MAGIC } {
+            Ok(Self::V5)
+        } else if &magic == if base { base::MAGIC } else { MAGIC } {
             Ok(Self::V4)
         } else if &magic == if base { base::V3_MAGIC } else { V3_MAGIC } {
             Ok(Self::V3)
@@ -74,7 +78,12 @@ impl Format {
     }
 
     fn validate_context(self, context: &Context) -> io::Result<()> {
-        if self != Self::V4
+        if (self == Self::V5) != context.business.frontiers.voter_slots.is_some()
+            || (self < Self::V5 && context.log.slot_intent.is_some())
+        {
+            return Err(invalid("native generation voter-slot format differs"));
+        }
+        if self < Self::V4
             && (context.business.roster.is_some()
                 || context.business.frontiers.roster_v1_namespace
                 || context.business.frontiers.roster_v2_activation.is_some())
@@ -83,7 +92,7 @@ impl Format {
                 "native roster context requires its complete generation vocabulary",
             ));
         }
-        if self == Self::V4
+        if self >= Self::V4
             && context.business.roster.is_none()
             && (context.business.frontiers.roster_v1_namespace
                 || context.business.frontiers.roster_v2_activation.is_some())
@@ -197,6 +206,8 @@ pub(super) struct LogContext {
     pub(super) vote: Option<Vote<SessionConsensusNodeId>>,
     pub(super) committed: Option<LogId<SessionConsensusNodeId>>,
     pub(super) purged: Option<LogId<SessionConsensusNodeId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) slot_intent: Option<LogId<SessionConsensusNodeId>>,
     pub(super) count: usize,
     pub(super) content: [u8; 32],
     pub(super) first: Option<LogId<SessionConsensusNodeId>>,
@@ -433,7 +444,20 @@ impl PreparedDelta {
         check()?;
         let bytes = serde_json::to_vec(&self.header)
             .map_err(|_| invalid("native generation header cannot encode"))?;
-        writer.write_all(MAGIC)?;
+        writer.write_all(
+            if self
+                .target
+                .context()
+                .business
+                .frontiers
+                .voter_slots
+                .is_some()
+            {
+                SLOT_MAGIC
+            } else {
+                MAGIC
+            },
+        )?;
         write_bytes(writer, &bytes, MAX_HEADER)?;
         self.capture.business.write_generation(writer, check)?;
         self.capture.log.write_generation(writer, check)?;
@@ -453,7 +477,21 @@ impl PreparedDelta {
         check()?;
         let mut positioned = PositionedReader::new(reader, self.previous.identity().length);
         let reader = &mut positioned;
-        expect(reader, MAGIC)?;
+        expect(
+            reader,
+            if self
+                .target
+                .context()
+                .business
+                .frontiers
+                .voter_slots
+                .is_some()
+            {
+                SLOT_MAGIC
+            } else {
+                MAGIC
+            },
+        )?;
         {
             let input = read_bytes(reader, MAX_HEADER)?;
             // This is expected readback: bind the complete canonical header
@@ -529,13 +567,28 @@ impl PreparedDelta {
         // Tombstones remain in the encoded inventory and complete verifier,
         // but cannot produce a selected-row replacement. Admission covers
         // precisely the output population, not every changed input row.
+        let applied_end = self
+            .header
+            .after
+            .business
+            .frontiers
+            .applied
+            .map_or(0, |cut| cut.index + 1);
+        let retired = self.capture.slot_projections.range(..applied_end);
         let maximum = self
             .capture
             .business
             .relocation_count()?
             .checked_add(self.capture.log.relocation_count())
+            .and_then(|count| {
+                count.checked_add(self.capture.slot_projections.range(..applied_end).count())
+            })
             .ok_or_else(|| invalid("native relocation captured count overflow"))?;
         let mut rows = RelocationBuilder::new(maximum)?;
+        for (index, row) in retired {
+            check()?;
+            rows.retire_slot_projection(*index, row)?;
+        }
         let source = owner.append(
             &self.previous,
             crate::consensus::native::prefix::AppendTransaction {
@@ -551,6 +604,7 @@ impl PreparedDelta {
         let relocations = rows.prepare(
             Arc::clone(&source),
             self.header.after.business.identity,
+            self.header.after.business.frontiers.applied,
             &self.header.after.business.members,
             self.capture.business.target_proof().roster_root(),
             check,

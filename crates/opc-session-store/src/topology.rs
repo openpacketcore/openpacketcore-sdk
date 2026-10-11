@@ -833,9 +833,51 @@ pub struct ValidatedQuorumTopology {
     consensus_identity: Option<SessionConsensusIdentity>,
     roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     consensus_node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
+    voter_slot_genesis: Option<opc_consensus::voter_slots::VoterSlotTable>,
 }
 
 impl ValidatedQuorumTopology {
+    /// Bind a fresh fixed 3-, 5-, or 9-slot installation to exact descriptors.
+    /// Slot identities are explicit; legacy logical-ID hashes are never
+    /// reinterpreted as incarnations. Placement remains a separate claim.
+    pub fn try_from_fixed_voter_slots(
+        config: QuorumTopologyConfig,
+        genesis: opc_consensus::voter_slots::VoterSlotTable,
+        assignments: BTreeMap<ReplicaId, opc_consensus::voter_slots::SlotId>,
+        placement_policy: PlacementResiliencePolicy,
+    ) -> Result<Self, QuorumTopologyError> {
+        use opc_consensus::voter_slots::*;
+        encode_voter_slot_table(&genesis)
+            .map_err(|_| QuorumTopologyError::ConsensusConfigurationIdMismatch)?;
+        if genesis.revision != 1
+            || genesis.replacement.is_some()
+            || genesis.slots.iter().any(|slot| {
+                slot.phase != VoterSlotPhase::Voting
+                    || slot.retired_through != 0
+                    || slot.last_result.is_some()
+            })
+            || config.roster_attestation_trust_root.is_some()
+            || assignments.len() != genesis.slots.len()
+            || config.members.len() != genesis.slots.len()
+        {
+            return Err(QuorumTopologyError::ConsensusConfigurationIdMismatch);
+        }
+        validate_topology_inner(
+            config.local_replica_id,
+            config.members,
+            QuorumTopologyMode::FixedDurableQuorum,
+            config.consensus_identity,
+            config.roster_attestation_trust_root,
+            placement_policy == PlacementResiliencePolicy::AllowReducedResilience,
+            Some(placement_policy),
+            Some((&genesis, &assignments)),
+        )
+    }
+
+    pub(crate) fn voter_slot_genesis(&self) -> Option<&opc_consensus::voter_slots::VoterSlotTable> {
+        self.voter_slot_genesis.as_ref()
+    }
+
     /// Validate HA descriptors and authenticate one fresh platform-fact token
     /// for every exact member.
     ///
@@ -1117,6 +1159,32 @@ fn validate_topology(
     allow_correlated_failure_domains: bool,
     fixed_durable_placement_policy: Option<PlacementResiliencePolicy>,
 ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
+    validate_topology_inner(
+        local_replica_id,
+        members,
+        mode,
+        consensus_identity,
+        roster_attestation_trust_root,
+        allow_correlated_failure_domains,
+        fixed_durable_placement_policy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_topology_inner(
+    local_replica_id: ReplicaId,
+    members: Vec<QuorumReplicaDescriptor>,
+    mode: QuorumTopologyMode,
+    consensus_identity: Option<SessionConsensusIdentity>,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    allow_correlated_failure_domains: bool,
+    fixed_durable_placement_policy: Option<PlacementResiliencePolicy>,
+    voter_slots: Option<(
+        &opc_consensus::voter_slots::VoterSlotTable,
+        &BTreeMap<ReplicaId, opc_consensus::voter_slots::SlotId>,
+    )>,
+) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
     if members.len() > QUORUM_TOPOLOGY_MAX_MEMBERS {
         return Err(QuorumTopologyError::MemberCountTooLarge {
             configured: members.len(),
@@ -1137,7 +1205,10 @@ fn validate_topology(
                 configured: members.len(),
             });
         }
-        QuorumTopologyMode::FixedDurableQuorum if !matches!(members.len(), 3 | 5) => {
+        QuorumTopologyMode::FixedDurableQuorum
+            if !(matches!(members.len(), 3 | 5)
+                || (voter_slots.is_some() && members.len() == 9)) =>
+        {
             return Err(QuorumTopologyError::FixedQuorumMemberCount {
                 configured: members.len(),
             });
@@ -1192,22 +1263,29 @@ fn validate_topology(
             .iter()
             .map(QuorumReplicaDescriptor::configuration_fingerprint)
             .collect::<Vec<_>>();
-        let expected_identity = match (mode, fixed_durable_placement_policy) {
-            (QuorumTopologyMode::FixedDurableQuorum, Some(placement_policy)) => {
-                derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+        let expected_identity = if let Some((genesis, _)) = voter_slots {
+            genesis
+                .current_configuration()
+                .identity(genesis.cluster_instance, genesis.manifest_digest)
+                .map_err(|_| QuorumTopologyError::ConsensusConfigurationIdMismatch)?
+        } else {
+            match (mode, fixed_durable_placement_policy) {
+                (QuorumTopologyMode::FixedDurableQuorum, Some(placement_policy)) => {
+                    derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+                        identity.cluster_id(),
+                        identity.configuration_epoch(),
+                        &component_fingerprints,
+                        placement_policy,
+                        roster_attestation_trust_root.as_ref(),
+                    )
+                }
+                _ => derive_durable_quorum_consensus_identity_with_roster_attestation_root(
                     identity.cluster_id(),
                     identity.configuration_epoch(),
                     &component_fingerprints,
-                    placement_policy,
                     roster_attestation_trust_root.as_ref(),
-                )
+                ),
             }
-            _ => derive_durable_quorum_consensus_identity_with_roster_attestation_root(
-                identity.cluster_id(),
-                identity.configuration_epoch(),
-                &component_fingerprints,
-                roster_attestation_trust_root.as_ref(),
-            ),
         };
         if identity != expected_identity {
             return Err(QuorumTopologyError::ConsensusConfigurationIdMismatch);
@@ -1215,11 +1293,26 @@ fn validate_topology(
 
         let mut admitted_node_ids = HashSet::with_capacity(members.len());
         for descriptor in &members {
-            let node_id = opc_consensus::derive_node_id(
-                identity.cluster_id(),
-                descriptor.replica_id().as_str().as_bytes(),
-            )
-            .map_err(|_| QuorumTopologyError::DuplicateConsensusNodeId)?;
+            let node_id = if let Some((genesis, assignments)) = voter_slots {
+                let slot = assignments
+                    .get(descriptor.replica_id())
+                    .ok_or(QuorumTopologyError::ConsensusConfigurationIdMismatch)?;
+                let record = genesis
+                    .slots
+                    .iter()
+                    .find(|record| record.member.identity.slot() == *slot)
+                    .ok_or(QuorumTopologyError::ConsensusConfigurationIdMismatch)?;
+                if record.member.descriptor_digest != descriptor.configuration_fingerprint() {
+                    return Err(QuorumTopologyError::ConsensusConfigurationIdMismatch);
+                }
+                record.member.identity.node_id()
+            } else {
+                opc_consensus::derive_node_id(
+                    identity.cluster_id(),
+                    descriptor.replica_id().as_str().as_bytes(),
+                )
+                .map_err(|_| QuorumTopologyError::DuplicateConsensusNodeId)?
+            };
             if !admitted_node_ids.insert(node_id) {
                 return Err(QuorumTopologyError::DuplicateConsensusNodeId);
             }
@@ -1251,6 +1344,7 @@ fn validate_topology(
         consensus_identity,
         roster_attestation_trust_root,
         consensus_node_ids,
+        voter_slot_genesis: voter_slots.map(|(genesis, _)| genesis.clone()),
     })
 }
 

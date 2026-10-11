@@ -202,6 +202,18 @@ impl NativeStorage {
             .map_err(|error| db!(error))?;
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
             .map_err(|error| db!(error))?;
+        if let Some(table) = &frontiers.voter_slots {
+            let captured = if purpose == Purpose::InstallBase {
+                self.voter_slot_state()?
+            } else {
+                opc_consensus::voter_slots::VoterSlotDurableState::new(table.current.clone())
+                    .map_err(|_| invalid("native exported voter table invalid"))?
+            };
+            sql::voter_slots::write_state(&tx, &table.genesis, &captured)?;
+        } else if sql::voter_slots::read_seed(&tx)?.is_some() {
+            return Err(invalid("legacy export cannot carry voter-slot seed"));
+        }
+
         for (key, value) in &state.keys {
             check()?;
             if let Some(record) = &value.record {

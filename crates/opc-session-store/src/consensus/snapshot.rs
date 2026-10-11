@@ -3519,6 +3519,14 @@ struct VerifiedReadBuffer {
 
 #[allow(dead_code)]
 impl SessionSnapshotFile {
+    /// Move the already-admitted receiver budget to its verified immutable
+    /// copy. Cleanup and later installation must still see this as a live
+    /// receiver while its retained file is in use.
+    pub(crate) fn retain_receiver_from(&mut self, receiver: &mut Self) {
+        self._receive_admission = receiver._receive_admission.take();
+        self._namespace_lease = receiver._namespace_lease.take();
+    }
+
     /// Create a new receiving file. Existing data is never reused.
     pub(crate) async fn create(path: PathBuf) -> io::Result<Self> {
         Self::create_with_cleanup(path, None).await

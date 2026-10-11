@@ -2204,6 +2204,9 @@ pub enum SessionMutationIntent {
     /// Cancellation competing for one exact batch lane terminal receipt.
     #[doc(hidden)]
     ScopeBatchCancel(Box<crate::scope_batch::ScopeBatchCancelCommand>),
+    /// Internal fixed-slot control, admitted only by the incarnation storage profile.
+    #[doc(hidden)]
+    VoterSlotControl(Vec<u8>),
 }
 
 /// Exact, self-contained precondition and effect request for the appended
@@ -2745,6 +2748,9 @@ pub enum SessionMutationOutcome {
     ScopeBatchCancel(
         Result<crate::scope_batch::ScopeBatchReceipt, crate::scope_batch::ScopeBatchError>,
     ),
+    /// Deterministic fixed-slot control result; consumes no application receipt.
+    #[doc(hidden)]
+    VoterSlotControl(Result<(), opc_consensus::voter_slots::VoterReplacementError>),
 }
 
 impl fmt::Debug for SessionMutationOutcome {

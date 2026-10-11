@@ -49,13 +49,18 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<SessionPersistenceHealth, SessionPersistenceDrainError> {
-        let cut = self
+        let wal = self
             .inner
             .private_wal
             .as_ref()
-            .ok_or(SessionPersistenceDrainError::Unavailable)?
-            .request_async_persistence()?;
+            .ok_or(SessionPersistenceDrainError::Unavailable)?;
+        let mut publication = wal.async_persistence_progress();
+        let cut = wal.request_async_persistence()?;
         loop {
+            // Consume the notification before reading the cut. Publication
+            // after this read remains visible to changed(), including failure
+            // and writer exit. Never hold a watch borrow while reading the WAL.
+            drop(publication.borrow_and_update());
             let health = self.persistence_health();
             let progress = health
                 .asynchronous
@@ -69,9 +74,10 @@ impl ConsensusSessionStore {
             if health.storage_state != SessionStorageState::Running {
                 return Err(SessionPersistenceDrainError::Unavailable);
             }
-            tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10)))
+            tokio::time::timeout_at(deadline, publication.changed())
                 .await
-                .map_err(|_| SessionPersistenceDrainError::DeadlineExceeded)?;
+                .map_err(|_| SessionPersistenceDrainError::DeadlineExceeded)?
+                .map_err(|_| SessionPersistenceDrainError::Unavailable)?;
         }
     }
 

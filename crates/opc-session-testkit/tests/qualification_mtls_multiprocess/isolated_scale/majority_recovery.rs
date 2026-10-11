@@ -3,6 +3,58 @@
 
 use super::*;
 
+fn recovery_generation_ready(
+    after: &QualificationIsolatedScaleReadiness,
+    prior: &QualificationIsolatedScaleReadiness,
+    protected_applied_index: Option<u64>,
+) -> bool {
+    after.completed_generation > prior.completed_generation
+        && !after.background_failed
+        && prior
+            .applied_index
+            .is_some_and(|index| after.completed_applied_index >= Some(index))
+        && protected_applied_index.is_none_or(|index| after.completed_applied_index >= Some(index))
+}
+
+#[test]
+fn recovery_setup_waits_for_persisted_membership_after_generation_advances() {
+    let prior = QualificationIsolatedScaleReadiness {
+        ready: true,
+        persistence: QualificationIsolatedPersistence::Async,
+        node_id: 1,
+        leader_id: Some(1),
+        term: 1,
+        configured_voter_ids: vec![1, 2, 3],
+        committed_index: Some(1),
+        applied_index: Some(1),
+        engine_running: true,
+        storage_failed: false,
+        storage_running: true,
+        background_failed: false,
+        saturated: false,
+        async_active: true,
+        completed_snapshot_count: 0,
+        awaiting_live_quorum: false,
+        captured_generation: Some(3),
+        completed_generation: Some(2),
+        completed_applied_index: None,
+        persistence_lag_millis: Some(0),
+    };
+    let mut after = prior.clone();
+    after.completed_generation = Some(3);
+    // A selected generation can contain an uncommitted initial membership.
+    // Killing this voter now leaves no retained membership for cold recovery.
+    assert!(!recovery_generation_ready(&after, &prior, None));
+    after.completed_applied_index = Some(0);
+    assert!(!recovery_generation_ready(&after, &prior, None));
+    after.completed_applied_index = prior.applied_index;
+    assert!(recovery_generation_ready(&after, &prior, None));
+    // Protected recovery additionally retains the later admitted roster cut.
+    assert!(!recovery_generation_ready(&after, &prior, Some(3)));
+    after.completed_applied_index = Some(3);
+    assert!(recovery_generation_ready(&after, &prior, Some(3)));
+}
+
 fn recover_unclean(fleet: &mut Fleet, scale: QualificationIsolatedScaleConfig) -> usize {
     let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     loop {
@@ -151,6 +203,8 @@ fn unclean_return_with_tail(
         .max()
         .flatten();
     // Establish that the healthy membership reached background persistence.
+    // A generation may advance while the initial membership is uncommitted;
+    // require the applied frontier observed before issuing the workload too.
     // This deliberately does not assert that the last acknowledged operation
     // is durable: its presence is checked, and reconciled, after recovery.
     let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
@@ -171,10 +225,11 @@ fn unclean_return_with_tail(
                 continue;
             }
             if reports.iter().zip(&before).all(|(after, prior)| {
-                after.completed_generation > prior.completed_generation
-                    && !after.background_failed
-                    && (prepared_roster.is_none()
-                        || after.completed_applied_index >= admission_applied)
+                recovery_generation_ready(
+                    after,
+                    prior,
+                    prepared_roster.as_ref().and(admission_applied),
+                )
             }) {
                 break;
             }

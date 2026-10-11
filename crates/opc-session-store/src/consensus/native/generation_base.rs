@@ -6,6 +6,7 @@
 use super::*;
 
 pub(super) const MAGIC: &[u8; 8] = b"OPCNJ004";
+pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJ005";
 pub(super) const V3_MAGIC: &[u8; 8] = b"OPCNJ003";
 pub(super) const LEGACY_MAGIC: &[u8; 8] = b"OPCNJ002";
 
@@ -93,12 +94,17 @@ impl<'a> PreparedBase<'a> {
             native_restore,
             context,
         };
+        let format = if header.context.business.frontiers.voter_slots.is_some() {
+            Format::V5
+        } else {
+            Format::V4
+        };
         let mut value = Self {
             storage,
             header,
             payload_bytes: 0,
             length: 0,
-            format: Format::V4,
+            format,
             _memory: memory,
         };
         let mut counter = Counter { bytes: 0 };
@@ -138,6 +144,7 @@ impl<'a> PreparedBase<'a> {
             Format::V2 => LEGACY_MAGIC,
             Format::V3 => V3_MAGIC,
             Format::V4 => MAGIC,
+            Format::V5 => SLOT_MAGIC,
         })?;
         let header = encode_header(&self.header)?;
         write_bytes(writer, &header, MAX_HEADER)?;
@@ -207,7 +214,7 @@ impl<'a> PreparedBase<'a> {
                 crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES,
             )?;
         }
-        if self.format == Format::V4 {
+        if self.format >= Format::V4 {
             roster::generation::write_base(
                 &self.storage.business.roster,
                 writer,

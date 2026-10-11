@@ -272,7 +272,7 @@ async fn protected_async_rejoin_preserves_admitted_survivor_authority() {
                 .activated_fenced_transition_scope_is_current()
                 .await
                 .unwrap());
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         let unavailable = (leader + 1) % 5;
         let returning = (leader + 2) % 5;
@@ -358,7 +358,7 @@ async fn protected_async_rejoin_preserves_admitted_survivor_authority() {
         for result in join_all(
             survivors
                 .iter()
-                .map(|index| fleet.store(*index).initialize_cluster()),
+                .map(|index| clock::initialize(fleet.store(*index))),
         )
         .await
         {
@@ -785,6 +785,8 @@ async fn exercise_retries_an_election_interrupted_after_preparation(protected: b
         }
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
+                // Vote replies are deliberately withheld. These attempts must
+                // consume their caller deadlines before the recovery retry.
                 let _ = join_all(
                     fleet
                         .stores
@@ -1241,17 +1243,10 @@ async fn async_recovery_protected_trust_root_needs_authority_even_without_retain
                 .await
                 .unwrap();
         }
-        let initialized = join_all(
-            fleet
-                .stores
-                .iter()
-                .flatten()
-                .map(ConsensusSessionStore::initialize_cluster),
-        )
-        .await;
+        let initialized = join_all(fleet.stores.iter().flatten().map(clock::initialize)).await;
         assert!(initialized.iter().all(Result::is_ok));
         for store in fleet.stores.iter().flatten() {
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         cold(&mut fleet).await;
         for store in fleet.stores.iter().flatten() {
@@ -1386,7 +1381,7 @@ async fn exercise_stale_cold_attempt_cannot_replace_recovery(activate: bool) {
     .await;
     let mut closed = Vec::new();
     for index in 0..fleet.stores.len() {
-        closed.push(fleet.close_result(index).await);
+        closed.push(fleet.close_and_join_result(index).await);
     }
     if result.is_ok() {
         assert!(closed.iter().all(Result::is_ok), "ordinary cleanup");

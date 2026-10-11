@@ -208,9 +208,7 @@ pub(super) async fn until<T>(
     check: impl FnMut() -> bool,
     message: &str,
 ) {
-    tokio::time::timeout(OPERATION_BOUND, wait_for(progress, check))
-        .await
-        .unwrap_or_else(|_| panic!("{message}"));
+    clock::watchdog(wait_for(progress, check), message).await;
 }
 
 pub(super) async fn wait_for<T>(
@@ -245,7 +243,6 @@ pub(super) async fn wait_for<T>(
 pub(super) async fn until_catchup<'a>(
     store: &ConsensusSessionStore,
     peers: impl IntoIterator<Item = &'a Peer>,
-    bound: Duration,
     mut check: impl FnMut() -> bool,
     message: &str,
 ) {
@@ -255,25 +252,27 @@ pub(super) async fn until_catchup<'a>(
         .map(|peer| peer.changed.subscribe())
         .collect::<Vec<_>>();
     assert!(!progress.is_empty());
-    tokio::time::timeout(bound, async {
-        loop {
-            drop(metrics.borrow_and_update());
-            for observed in &mut progress {
-                drop(observed.borrow_and_update());
+    clock::watchdog(
+        async {
+            loop {
+                drop(metrics.borrow_and_update());
+                for observed in &mut progress {
+                    drop(observed.borrow_and_update());
+                }
+                if check() {
+                    return;
+                }
+                tokio::select! {
+                    result = metrics.changed() => result.expect("live catch-up metrics"),
+                    result = futures_util::future::select_all(
+                        progress.iter_mut().map(|observed| Box::pin(observed.changed()))
+                    ) => result.0.expect("live catch-up peer observation"),
+                }
             }
-            if check() {
-                return;
-            }
-            tokio::select! {
-                result = metrics.changed() => result.expect("live catch-up metrics"),
-                result = futures_util::future::select_all(
-                    progress.iter_mut().map(|observed| Box::pin(observed.changed()))
-                ) => result.0.expect("live catch-up peer observation"),
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{message}"));
+        },
+        message,
+    )
+    .await;
 }
 
 pub(super) async fn wait_for_lease_expiry(store: &ConsensusSessionStore) {
@@ -310,7 +309,7 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
                 .unwrap();
             for store in fleet.stores.iter().flatten() {
                 assert_recorded(store, &first, &outcome).await;
-                store.drain_async_persistence().await.unwrap();
+                clock::drain(store).await.unwrap();
             }
             fleet.close(recovering).await;
             fleet
@@ -431,9 +430,7 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
                 old_store.inner.raft.metrics().borrow().last_log_index,
                 before_rejected
             );
-            let initialized = tokio::time::Instant::now();
-            cold.initialize_cluster().await.unwrap();
-            assert!(initialized.elapsed() < OPERATION_BOUND);
+            clock::initialize(&cold).await.unwrap();
             let cut = fleet.peers[next].last_cut.lock().unwrap().unwrap();
             assert!(cut.vote.leader_id.term > vote.leader_id.term);
             assert!(cut.barrier.index > old_applied.index);
@@ -483,7 +480,7 @@ async fn async_persistence_cached_append_success_cannot_commit_a_fresh_cold_barr
         live.activate_fenced_transition_capability().await.unwrap();
         for store in fleet.stores.iter().flatten() {
             assert_recorded(store, &first, &first_outcome).await;
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         let second = create_request(&live, 2, &provider).await;
         let minimum = live.inner.raft.metrics().borrow().last_log_index.unwrap() + 1;
@@ -523,9 +520,7 @@ async fn async_persistence_cached_append_success_cannot_commit_a_fresh_cold_barr
         assert!(!cold.inner.persistence_protocol.is_active());
         assert!(live.inner.raft.metrics().borrow().last_applied.unwrap().index < new_index);
         *fleet.peers[other].blocked_append_above.lock().unwrap() = None;
-        let started = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(started.elapsed() < OPERATION_BOUND);
+        clock::initialize(&cold).await.unwrap();
         let cut = fleet.peers[leader].last_cut.lock().unwrap().unwrap();
         assert!(cut.barrier.index > new_index);
         for store in fleet.stores.iter().flatten() {
@@ -596,7 +591,7 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
         )
         .await;
         for store in fleet.stores.iter().flatten() {
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         until(
             fleet.stores.iter().flatten().map(|store| {
@@ -752,9 +747,7 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             );
             fleet.set_link(survivor, forgotten, true);
         }
-        let initialized = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(initialized.elapsed() < OPERATION_BOUND);
+        clock::initialize(&cold).await.unwrap();
         let cut = fleet.peers[leader].last_cut.lock().unwrap().unwrap();
         assert_eq!(cut.vote, retained_vote);
         assert_eq!(cut.requester, fleet.peers[forgotten].node);

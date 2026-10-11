@@ -282,6 +282,11 @@ impl<'a> SqlitePreparedBase<'a> {
             )
             .map_err(db)
         };
+        let slot_state = sql::voter_slots::read_state(&tx)?;
+        let slot_table = sql::voter_slots::read_seed(&tx)?.map(|seed| voter_slots::Table {
+            genesis: Arc::new(seed.genesis),
+            current: seed.initial,
+        });
         let context = Context {
             business: BusinessContext {
                 identity,
@@ -323,6 +328,7 @@ impl<'a> SqlitePreparedBase<'a> {
                         }
                     }),
                     async_recovery: metadata.async_recovery,
+                    voter_slots: slot_table,
                     current_snapshot: sql::read_current_snapshot_sync(&tx, identity)?,
                 })),
                 counts: [0; 4],
@@ -338,6 +344,10 @@ impl<'a> SqlitePreparedBase<'a> {
                 vote: sql::read_vote_sync(&tx, identity)?,
                 committed: sql::read_committed_sync(&tx, identity)?,
                 purged: sql::read_purged_sync(&tx, identity)?,
+                slot_intent: slot_state
+                    .as_ref()
+                    .and_then(|state| state.intent())
+                    .map(|intent| sql::voter_slots::engine_cut(intent.log_id)),
                 count: 0,
                 content: [0; 32],
                 first: None,
@@ -412,7 +422,20 @@ impl<'a> SqlitePreparedBase<'a> {
         )?;
         let header = encode_header(&value.header)?;
         let mut counter = Counter { bytes: 0 };
-        counter.write_all(base::MAGIC)?;
+        counter.write_all(
+            if value
+                .header
+                .context
+                .business
+                .frontiers
+                .voter_slots
+                .is_some()
+            {
+                base::SLOT_MAGIC
+            } else {
+                base::MAGIC
+            },
+        )?;
         write_bytes(&mut counter, &header, MAX_HEADER)?;
         counter.bytes = counter
             .bytes
@@ -738,11 +761,12 @@ impl<'a> SqlitePreparedBase<'a> {
             check()?;
             let index: u64 = row.get(0).map_err(db)?;
             let encoded = bytes(row, 3, sql::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES)?;
-            let facts = decode::inspect_log(
+            let facts = decode::inspect_log_profile(
                 encoded,
                 index,
                 context.business.identity,
                 &context.business.members,
+                context.business.frontiers.voter_slots.is_some(),
                 check,
             )?;
             if row.get::<_, u64>(1).map_err(db)?
@@ -856,7 +880,13 @@ impl<'a> SqlitePreparedBase<'a> {
             position: 0,
             maximum: self.length,
         };
-        output.write_all(base::MAGIC)?;
+        output.write_all(
+            if self.header.context.business.frontiers.voter_slots.is_some() {
+                base::SLOT_MAGIC
+            } else {
+                base::MAGIC
+            },
+        )?;
         let header = encode_header(&self.header)?;
         write_bytes(&mut output, &header, MAX_HEADER)?;
         if self.write_rows(&mut output, check)? != self.header.context {

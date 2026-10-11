@@ -10,7 +10,7 @@ async fn async_persistence_retry_retains_certified_catch_up_across_deadlines() {
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         for store in fleet.stores.iter().flatten() {
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         let leader = fleet.leader();
         let returning = (leader + 1) % 3;
@@ -67,7 +67,7 @@ async fn async_persistence_resumed_catch_up_recertifies_a_new_committed_leader()
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         for store in fleet.stores.iter().flatten() {
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         let leader = fleet.leader();
         let returning = (leader + 1) % 3;
@@ -262,7 +262,7 @@ async fn async_persistence_real_certificate_binds_request_scope_full_vote_and_me
         live.activate_fenced_transition_capability().await.unwrap();
         for store in fleet.stores.iter().flatten() {
             assert_recorded(store, &first, &first_outcome).await;
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         fleet.close(recovering).await;
         fleet
@@ -327,9 +327,7 @@ async fn async_persistence_real_certificate_binds_request_scope_full_vote_and_me
             }
         }
         *fleet.peers[leader].cut_mutation.lock().unwrap() = None;
-        let initialized = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(initialized.elapsed() < OPERATION_BOUND);
+        clock::initialize(&cold).await.unwrap();
         let fresh = fleet.peers[leader].last_cut.lock().unwrap().unwrap();
         assert!(fresh.barrier.index > previous_cut.unwrap().barrier.index);
         for store in fleet.stores.iter().flatten() {
@@ -451,7 +449,7 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
             Some(retained)
         );
         assert_eq!(old.inner.raft.metrics().borrow().vote, retained_vote);
-        old.drain_async_persistence().await.unwrap();
+        clock::drain(&old).await.unwrap();
         fleet.close(old_leader).await;
         for completion in completions {
             assert!(!matches!(completion.await.unwrap(), Ok(Ok(_))));
@@ -514,9 +512,12 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
             fleet.set_link(old_leader, peer, true);
             fleet.set_link(peer, old_leader, true);
         }
+        // This attempt is cancelled at the publication hold. Its protocol
+        // clock must not expire while the fixture blocks application and
+        // waits for real replication to replace the conflicting suffix.
         let initialized = {
             let cold = cold.clone();
-            tokio::spawn(async move { cold.initialize_cluster().await })
+            tokio::spawn(clock::run(async move { clock::initialize(&cold).await }))
         };
         races::until_catchup(
             &cold,
@@ -524,7 +525,6 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
                 fleet.peers[old_leader].as_ref(),
                 fleet.peers[successor].as_ref(),
             ],
-            OPERATION_BOUND,
             || {
                 cold.persistence_health().recovery == Some(SessionAsyncRecoveryState::CatchingUp)
                     && fleet.peers[old_leader]
@@ -564,9 +564,11 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
         );
         assert!(!cold.inner.persistence_protocol.is_active() && !cold.status().admitted);
         drop(applied);
-        tokio::time::timeout(OPERATION_BOUND, activation.0.entered.notified())
-            .await
-            .unwrap();
+        clock::watchdog(
+            activation.0.entered.notified(),
+            "activation reaches its publication hold",
+        )
+        .await;
         assert!(cold
             .inner
             .raft
@@ -599,9 +601,7 @@ async fn async_persistence_conflicting_suffix_and_cancelled_activation_require_a
             .await
             .is_err());
         assert!(!cold.inner.persistence_protocol.is_active() && !cold.status().admitted);
-        let start = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(start.elapsed() < OPERATION_BOUND);
+        clock::initialize(&cold).await.unwrap();
         let fresh = fleet.peers[successor].last_cut.lock().unwrap().unwrap();
         assert!(fresh.request.attempt > request.attempt && fresh.barrier.index > cut.barrier.index);
         assert_ne!(fresh.request.nonce, cut.request.nonce);

@@ -8,6 +8,10 @@ use crate::consensus::native::resident::RowFingerprint;
 use std::mem::size_of;
 
 enum Expected {
+    RetireSlotProjection {
+        index: u64,
+        row: SharedRow<log::NativeLogEntry>,
+    },
     Receipt {
         id: FencedTransitionV2RequestId,
         row: SharedRow<NativeReceipt>,
@@ -179,10 +183,22 @@ impl RelocationBuilder {
         })
     }
 
+    pub(super) fn retire_slot_projection(
+        &mut self,
+        index: u64,
+        row: &SharedRow<log::NativeLogEntry>,
+    ) -> io::Result<()> {
+        self.push(Expected::RetireSlotProjection {
+            index,
+            row: row.clone(),
+        })
+    }
+
     pub(super) fn prepare(
         self,
         source: Arc<VerifiedPrefix>,
         identity: SessionConsensusIdentity,
+        applied: Option<LogId<SessionConsensusNodeId>>,
         members: &BTreeSet<SessionConsensusNodeId>,
         root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
         check: &impl Fn() -> io::Result<()>,
@@ -199,6 +215,15 @@ impl RelocationBuilder {
         for expected in rows {
             check()?;
             replacements.push(match expected {
+                Expected::RetireSlotProjection { index, row } => {
+                    if applied.is_none_or(|cut| index > cut.index) {
+                        return Err(invalid("native projection retirement exceeds applied cut"));
+                    }
+                    Replacement::Log {
+                        index,
+                        row: row.relocated(row.without_slot_projection()?),
+                    }
+                }
                 Expected::Receipt {
                     id,
                     row,
@@ -261,17 +286,20 @@ impl RelocationBuilder {
                     let facts = facts::Row {
                         content: row.content(index)?,
                         facts: facts::Log {
+                            slot_control: row.is_slot_control(),
                             id: row.id(),
                             membership: row.membership()?,
                         },
                     };
-                    let cold = log::NativeLogEntry::from_admitted_range(
+                    let cold = log::NativeLogEntry::from_admitted_range_with_profile(
                         facts,
                         Arc::clone(&source),
                         offset,
                         length,
                         identity,
                         members,
+                        row.slot_profile(),
+                        applied,
                     )?;
                     if cold.content(index)? != facts.content {
                         return Err(invalid("native log relocation content differs"));
@@ -376,6 +404,11 @@ impl Relocations {
                         .get(index)
                         .is_some_and(|current| current.ptr_eq(row))
                     {
+                        if row.has_slot_projection() {
+                            storage.log.slot_projections.insert(*index, row.clone());
+                        } else {
+                            storage.log.slot_projections.remove(index);
+                        }
                         if let Some(previous) = storage.log.entries.insert(*index, row.clone()) {
                             *row = previous;
                         }

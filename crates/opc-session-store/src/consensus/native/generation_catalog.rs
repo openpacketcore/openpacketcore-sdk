@@ -337,27 +337,28 @@ impl Catalog {
         }
         for (index, indexed) in logs {
             check()?;
-            let row = log::NativeLogEntry::from_admitted_range(
+            let row = log::NativeLogEntry::from_admitted_range_with_profile(
                 indexed.row,
                 Arc::clone(&source),
                 indexed.range.offset,
                 indexed.range.length,
                 storage.business.identity,
                 &storage.business.members,
+                storage.business.frontiers.voter_slots.is_some(),
+                storage.business.applied(),
             )?;
-            if row.id().index != index
-                || storage
-                    .log
-                    .entries
-                    .insert(index, SharedRow::new(row)?)
-                    .is_some()
-            {
+            let row = SharedRow::new(row)?;
+            if row.has_slot_projection() {
+                storage.log.slot_projections.insert(index, row.clone());
+            }
+            if row.id().index != index || storage.log.entries.insert(index, row).is_some() {
                 return Err(invalid("native resident log conversion differs"));
             }
         }
         storage.log.vote = context.log.vote;
         storage.log.committed = context.log.committed;
         storage.log.purged = context.log.purged;
+        storage.log.slot_intent = context.log.slot_intent;
         // These process proofs are reconstructed from complete native
         // predicates and actual owned rows. Serialized summaries cannot mint
         // them. Compare all resulting table/frontier equations to the catalog.
@@ -671,7 +672,7 @@ impl Rows {
             hash: Sha256::new(),
         };
         let mut format = Format::read(&mut reader, true)?;
-        let loaded = header::base(&mut reader)?;
+        let loaded = header::base(&mut reader, format)?;
         let base = &loaded.value;
         BaseRestore::require_origin(base.native_restore.as_ref(), origin, format)?;
         format.validate_context(&base.context)?;
@@ -728,7 +729,7 @@ impl Rows {
             &mut ordinals,
             check,
         )?;
-        if format == Format::V4 {
+        if format >= Format::V4 {
             rows.rosters.read(
                 &mut reader,
                 roster_index::Section {
@@ -766,13 +767,13 @@ impl Rows {
                 return Err(invalid("native generation format regressed"));
             }
             format = next_format;
-            let delta = header::delta(&mut reader)?;
+            let delta = header::delta(&mut reader, format)?;
             let delta = &delta.value;
             format.validate_context(&delta.before)?;
             format.validate_context(&delta.after)?;
             roster_index::validate_context(&delta.before, root)?;
             roster_index::validate_context(&delta.after, root)?;
-            if delta.roster_changed.is_some() != (format == Format::V4) {
+            if delta.roster_changed.is_some() != (format >= Format::V4) {
                 return Err(invalid(
                     "native generation roster frame counts differ from its format",
                 ));
@@ -1081,11 +1082,12 @@ impl Rows {
             }
             let after = if present {
                 let (range, input) = reader.bytes(sql::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES)?;
-                let row = decode::inspect_log(
+                let row = decode::inspect_log_profile(
                     input.bytes(),
                     index,
                     after.business.identity,
                     &after.business.members,
+                    after.business.frontiers.voter_slots.is_some(),
                     check,
                 )?;
                 Some(Indexed {
@@ -1197,6 +1199,7 @@ impl Rows {
                 vote: context.log.vote,
                 committed: context.log.committed,
                 purged: context.log.purged,
+                slot_intent: context.log.slot_intent,
             },
             &context.business.members,
             frontiers,

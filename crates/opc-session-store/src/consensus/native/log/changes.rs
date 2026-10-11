@@ -27,6 +27,7 @@ pub(in crate::consensus::native) struct LogFrontiers {
     pub(in crate::consensus::native) vote: Option<Vote<SessionConsensusNodeId>>,
     pub(in crate::consensus::native) committed: Option<LogId<SessionConsensusNodeId>>,
     pub(in crate::consensus::native) purged: Option<LogId<SessionConsensusNodeId>>,
+    pub(in crate::consensus::native) slot_intent: Option<LogId<SessionConsensusNodeId>>,
 }
 
 impl LogFrontiers {
@@ -35,6 +36,7 @@ impl LogFrontiers {
             vote: log.vote,
             committed: log.committed,
             purged: log.purged,
+            slot_intent: log.slot_intent,
         }
     }
 }
@@ -85,6 +87,7 @@ fn stamp(index: u64, row: &SharedRow<NativeLogEntry>) -> io::Result<Stamp> {
 }
 
 pub(super) struct LogProof {
+    slots: bool,
     identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     snapshot_origin: Option<Arc<NativeSnapshotAuthority>>,
@@ -108,6 +111,7 @@ impl LogProof {
         let memory =
             VerificationMemory::reserve(64 * 1024 + size_of::<Self>() + 2 * size_of::<usize>())?;
         Ok(Arc::new(Self {
+            slots: state.frontiers.voter_slots.is_some(),
             identity: state.identity,
             members: state.members.clone(),
             snapshot_origin: state.snapshot_origin.clone(),
@@ -210,10 +214,13 @@ pub(in crate::consensus::native) fn validate_context_metadata(
     }
     if let Some(vote) = frontiers.vote {
         if vote.leader_id.term > COUNTER_MAX
-            || vote
-                .leader_id
-                .voted_for()
-                .is_some_and(|node| !members.contains(&node))
+            || vote.leader_id.voted_for().is_some_and(|node| {
+                !members.contains(&node)
+                    && business
+                        .voter_slots
+                        .as_ref()
+                        .is_none_or(|table| !voter_slots::known_node(&table.current, node))
+            })
         {
             return Err(invalid("native recovered vote authority differs"));
         }
@@ -429,6 +436,38 @@ pub(super) struct Publication {
 }
 
 impl Publication {
+    pub(super) fn check_voter_fence(
+        &self,
+        check: &dyn Fn(&opc_consensus::voter_slots::VoterReplacementRequest) -> bool,
+        identity: SessionConsensusIdentity,
+    ) -> io::Result<()> {
+        let Some(intent) = self
+            .proof
+            .frontiers
+            .slot_intent
+            .filter(|intent| Some(*intent) != self.predecessor.frontiers.slot_intent)
+        else {
+            return Ok(());
+        };
+        let row = self
+            .rows
+            .get(&intent.index)
+            .and_then(|change| change.after.as_ref())
+            .filter(|row| row.id() == intent)
+            .ok_or_else(|| invalid("new native voter intent lacks its exact append"))?;
+        let projection = row.slot_projection(identity)?;
+        let request = projection
+            .as_deref()
+            .and_then(voter_slots::Projection::begin)
+            .ok_or_else(|| invalid("new native voter intent is not Begin"))?;
+        if !check(request) {
+            return Err(invalid(
+                "native voter append lacks acknowledged engine fence",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn check_async_reservation(
         &self,
         reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
@@ -489,12 +528,43 @@ impl Publication {
         let memory = Arc::new(VerificationMemory::reserve(bytes)?);
         let mut rows = BTreeMap::new();
         let mut frontiers = predecessor.frontiers;
+        if frontiers.slot_intent.is_some_and(|id| {
+            state
+                .applied()
+                .is_some_and(|applied| id.index <= applied.index)
+        }) {
+            frontiers.slot_intent = None;
+        }
         match operation {
             Operation::Append(encoded) => {
                 let mut previous: Option<LogId<SessionConsensusNodeId>> = None;
+                let mut projected = None;
                 for encoded in encoded {
                     let entry = sql::decode_consensus_log_entry(encoded)?;
                     NativeLog::validate_entry(&entry, state)?;
+                    if state.frontiers.voter_slots.is_some()
+                        && state
+                            .applied()
+                            .is_none_or(|applied| entry.log_id.index > applied.index)
+                    {
+                        if projected.is_none() {
+                            projected = log.slots_before(state, entry.log_id.index)?;
+                        }
+                        if let Some(table) = &mut projected {
+                            let before = table.clone();
+                            voter_slots::project(table, &entry, state.identity)?;
+                            if matches!(&entry.payload, EntryPayload::Normal(command) if matches!(voter_slots::control(command, state.identity)?, Some(opc_consensus::voter_slots::VoterSlotControl::Begin(_))))
+                                && *table != before
+                            {
+                                if frontiers.slot_intent.is_some_and(|id| id != entry.log_id) {
+                                    return Err(invalid(
+                                        "native multiple provisional Prepare entries",
+                                    ));
+                                }
+                                frontiers.slot_intent = Some(entry.log_id);
+                            }
+                        }
+                    }
                     if log
                         .purged
                         .is_some_and(|floor| entry.log_id.index <= floor.index)
@@ -547,7 +617,11 @@ impl Publication {
                     }
                     let index = entry.log_id.index;
                     previous = Some(entry.log_id);
-                    let after = SharedRow::new(NativeLogEntry::new(encoded.clone(), entry))?;
+                    let after = SharedRow::new(NativeLogEntry::new_with_profile(
+                        encoded.clone(),
+                        entry,
+                        state.frontiers.voter_slots.is_some(),
+                    ))?;
                     rows.insert(
                         index,
                         RowChange {
@@ -564,10 +638,14 @@ impl Publication {
             }
             Operation::Vote(vote) => {
                 if vote.leader_id.term > COUNTER_MAX
-                    || vote
-                        .leader_id
-                        .voted_for()
-                        .is_some_and(|node| !state.members.contains(&node))
+                    || vote.leader_id.voted_for().is_some_and(|node| {
+                        !state.members.contains(&node)
+                            && state
+                                .frontiers
+                                .voter_slots
+                                .as_ref()
+                                .is_none_or(|table| !voter_slots::known_node(&table.current, node))
+                    })
                 {
                     return Err(invalid("native vote is outside fixed authority"));
                 }
@@ -599,6 +677,12 @@ impl Publication {
                 frontiers.committed = *committed;
             }
             Operation::Truncate(since) => {
+                if frontiers
+                    .slot_intent
+                    .is_some_and(|id| id.index >= since.index)
+                {
+                    frontiers.slot_intent = None;
+                }
                 sql::validate_log_id(since)?;
                 for protected in [log.committed, state.applied(), log.purged]
                     .into_iter()
@@ -751,7 +835,11 @@ impl Publication {
         // publication. As in the original log, immutable tree node allocation can
         // abort or unwind; the enclosing owner mutex fences any unwind.
         for (index, change) in self.rows {
+            log.slot_projections.remove(&index);
             if let Some(after) = &change.after {
+                if after.has_slot_projection() {
+                    log.slot_projections.insert(index, after.clone());
+                }
                 log.entries.insert(index, after.clone());
             } else {
                 log.entries.remove(&index);
@@ -776,6 +864,7 @@ impl Publication {
         log.vote = self.proof.frontiers.vote;
         log.committed = self.proof.frontiers.committed;
         log.purged = self.proof.frontiers.purged;
+        log.slot_intent = self.proof.frontiers.slot_intent;
         log.proof = Some(self.proof);
         Ok(log.committed)
     }
@@ -787,6 +876,9 @@ impl NativeLog {
         row: &NativeLogEntry,
         state: &NativeState,
     ) -> io::Result<()> {
+        if row.slot_profile() != state.frontiers.voter_slots.is_some() {
+            return Err(invalid("native log row profile differs"));
+        }
         Self::validate_row_context(index, row, state.identity, &state.members)
     }
 
@@ -816,6 +908,7 @@ impl NativeLog {
             .as_ref()
             .ok_or_else(|| invalid("native log has no process admission proof"))?;
         if proof.identity != state.identity
+            || proof.slots != state.frontiers.voter_slots.is_some()
             || proof.members != state.members
             || proof.frontiers != LogFrontiers::of(self)
             || proof.summary.count != self.entries.len()

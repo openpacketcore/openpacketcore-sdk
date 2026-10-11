@@ -91,7 +91,7 @@ async fn planned_native_retirement(stop_leader: bool) {
             !fleet.store(stopped).status().admitted,
             "close proof alone does not grant consumer admission"
         );
-        fleet.store(stopped).initialize_cluster().await.unwrap();
+        clock::initialize(fleet.store(stopped)).await.unwrap();
         fleet.ready().await;
         assert_recorded(fleet.store(stopped), &request, &outcome).await;
         let fresh = create_request(fleet.store(stopped), 3, keys.as_ref()).await;
@@ -100,7 +100,7 @@ async fn planned_native_retirement(stop_leader: bool) {
     .catch_unwind()
     .await;
     for index in 0..fleet.stores.len() {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
@@ -149,7 +149,7 @@ async fn retiring_native_voter_does_not_manufacture_missing_v1_activation() {
     .catch_unwind()
     .await;
     for index in 0..fleet.stores.len() {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
@@ -231,7 +231,7 @@ async fn planned_native_handoff_preserves_an_accepted_mutations_original_complet
     .catch_unwind()
     .await;
     for index in 0..fleet.stores.len() {
-        let _ = fleet.close_result(index).await;
+        let _ = fleet.close_and_join_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

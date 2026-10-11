@@ -346,7 +346,6 @@ pub(super) fn write_loop(
                 }
             }
         }
-        #[cfg(test)]
         shared.async_progress.send_replace(());
         shared.ready.notify_all();
     }

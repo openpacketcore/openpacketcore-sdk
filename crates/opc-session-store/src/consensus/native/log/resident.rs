@@ -11,6 +11,7 @@ mod export;
 #[derive(Clone)]
 pub(crate) struct NativeLogEntry {
     body: Body,
+    slots: bool,
 }
 
 #[derive(Clone)]
@@ -30,20 +31,100 @@ struct SelectedLog {
     range: SelectedRange,
     row: generation::facts::Row<generation::facts::Log>,
     authority: [u8; 32],
+    projection: Option<Arc<voter_slots::AdmittedProjection>>,
+    projection_reclaimed: bool,
 }
 
 impl NativeLogEntry {
+    #[cfg(test)]
+    pub(in crate::consensus::native) fn slot_projection_bytes_for_test(&self) -> usize {
+        match &self.body {
+            Body::Selected(row) => row
+                .projection
+                .as_ref()
+                .map_or(0, |projection| projection._memory.reserved_bytes_for_test()),
+            Body::Resident(_) => 0,
+        }
+    }
+
+    pub(in crate::consensus::native) fn is_slot_control(&self) -> bool {
+        match &self.body {
+            Body::Resident(row) => {
+                matches!(&row.entry.payload, EntryPayload::Normal(command) if matches!(command.intent, SessionMutationIntent::VoterSlotControl(_)))
+            }
+            Body::Selected(row) => row.row.facts.slot_control,
+        }
+    }
+
+    pub(in crate::consensus::native) fn slot_projection(
+        &self,
+        anchor: SessionConsensusIdentity,
+    ) -> io::Result<Option<std::borrow::Cow<'_, voter_slots::Projection>>> {
+        if !self.slots {
+            return Err(invalid("native slot projection requires its profile"));
+        }
+        match &self.body {
+            Body::Resident(row) => Ok(voter_slots::Projection::from_entry(&row.entry, anchor)?
+                .map(std::borrow::Cow::Owned)),
+            Body::Selected(row) => {
+                if row.projection_reclaimed {
+                    return Err(invalid(
+                        "native applied slot projection cannot be reused as unapplied",
+                    ));
+                }
+                Ok(row
+                    .projection
+                    .as_ref()
+                    .map(|projection| std::borrow::Cow::Borrowed(&projection.value)))
+            }
+        }
+    }
+    pub(in crate::consensus::native) fn has_slot_projection(&self) -> bool {
+        matches!(&self.body, Body::Selected(row) if row.projection.is_some())
+    }
+
+    // Preparation runs outside State. The immutable range, content, authority
+    // and logical revision are unchanged; old captures retain their projection.
+    pub(in crate::consensus::native) fn without_slot_projection(&self) -> io::Result<Self> {
+        let Body::Selected(row) = &self.body else {
+            return Err(invalid(
+                "native projection retirement requires a selected row",
+            ));
+        };
+        let mut row = row.clone();
+        row.projection = None;
+        row.projection_reclaimed = true;
+        Ok(Self {
+            body: Body::Selected(row),
+            slots: self.slots,
+        })
+    }
+
     pub(in crate::consensus::native) fn relocation_allocation_bytes() -> usize {
         SharedRow::<Self>::relocated_allocation_bytes() + std::mem::size_of::<SelectedLog>()
     }
 
+    #[cfg(test)]
     pub(in crate::consensus::native) fn new(
         encoded: Bytes,
         entry: Entry<SessionRaftTypeConfig>,
     ) -> Self {
+        Self::new_with_profile(encoded, entry, false)
+    }
+
+    pub(in crate::consensus::native) fn new_with_profile(
+        encoded: Bytes,
+        entry: Entry<SessionRaftTypeConfig>,
+        slots: bool,
+    ) -> Self {
         Self {
             body: Body::Resident(Box::new(ResidentLog { encoded, entry })),
+            slots,
         }
+    }
+
+    pub(in crate::consensus::native) fn slot_profile(&self) -> bool {
+        self.slots
     }
 
     pub(crate) fn id(&self) -> LogId<SessionConsensusNodeId> {
@@ -119,6 +200,7 @@ impl NativeLogEntry {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::consensus::native) fn from_admitted_range(
         row: generation::facts::Row<generation::facts::Log>,
         source: std::sync::Arc<prefix::VerifiedPrefix>,
@@ -127,6 +209,22 @@ impl NativeLogEntry {
         identity: SessionConsensusIdentity,
         members: &BTreeSet<SessionConsensusNodeId>,
     ) -> io::Result<Self> {
+        Self::from_admitted_range_with_profile(
+            row, source, offset, length, identity, members, false, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::consensus::native) fn from_admitted_range_with_profile(
+        row: generation::facts::Row<generation::facts::Log>,
+        source: std::sync::Arc<prefix::VerifiedPrefix>,
+        offset: u64,
+        length: u32,
+        identity: SessionConsensusIdentity,
+        members: &BTreeSet<SessionConsensusNodeId>,
+        slots: bool,
+        applied: Option<LogId<SessionConsensusNodeId>>,
+    ) -> io::Result<Self> {
         sql::validate_log_id(&row.facts.id)?;
         let range = SelectedRange::new(
             source,
@@ -134,11 +232,34 @@ impl NativeLogEntry {
             length,
             sql::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES,
         )?;
+        let projection_reclaimed = slots
+            && (row.facts.slot_control || row.facts.membership.is_some())
+            && applied.is_some_and(|cut| row.facts.id.index <= cut.index);
+        let projection = if slots
+            && !projection_reclaimed
+            && (row.facts.slot_control || row.facts.membership.is_some())
+        {
+            let bytes = range.read(&|| Ok(()))?;
+            let owned = generation::decode::owned_selected_log_profile(
+                bytes.bytes(),
+                row,
+                identity,
+                members,
+                true,
+                &|| Ok(()),
+            )?;
+            voter_slots::AdmittedProjection::from_entry(owned.entry(), identity)?
+        } else {
+            None
+        };
         Ok(Self {
+            slots,
             body: Body::Selected(Box::new(SelectedLog {
                 range,
                 row,
                 authority: authority_binding(identity, members)?,
+                projection,
+                projection_reclaimed,
             })),
         })
     }
@@ -159,7 +280,7 @@ impl NativeLogEntry {
                 if decoded != row.entry {
                     return Err(invalid("native retained raw/typed log row differs"));
                 }
-                NativeLog::validate_entry_context(&decoded, identity, members)
+                NativeLog::validate_entry_profile(&decoded, identity, members, self.slots)
             }
             Body::Selected(row) => {
                 if row.authority != authority_binding(identity, members)? {
@@ -183,16 +304,18 @@ impl NativeLogEntry {
             Body::Selected(row) => {
                 self.validate_context(row.row.facts.id.index, identity, members)?;
                 let input = row.range.read(check)?;
-                let actual = generation::decode::inspect_log(
+                let actual = generation::decode::inspect_log_profile(
                     input.bytes(),
                     row.row.facts.id.index,
                     identity,
                     members,
+                    self.slots,
                     check,
                 )?;
                 if actual.content != row.row.content
                     || actual.facts.id != row.row.facts.id
                     || actual.facts.membership != row.row.facts.membership
+                    || actual.facts.slot_control != row.row.facts.slot_control
                 {
                     return Err(invalid("native selected log differs from admitted row"));
                 }
@@ -211,17 +334,23 @@ impl NativeLogEntry {
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<generation::decode::OwnedLog> {
         match &self.body {
-            Body::Resident(row) => {
-                generation::decode::owned_log(&row.encoded, index, identity, members, check)
-            }
+            Body::Resident(row) => generation::decode::owned_log_profile(
+                &row.encoded,
+                index,
+                identity,
+                members,
+                self.slots,
+                check,
+            ),
             Body::Selected(row) => {
                 self.validate_context(index, identity, members)?;
                 let input = row.range.read(check)?;
-                generation::decode::owned_selected_log(
+                generation::decode::owned_selected_log_profile(
                     input.bytes(),
                     row.row,
                     identity,
                     members,
+                    self.slots,
                     check,
                 )
             }

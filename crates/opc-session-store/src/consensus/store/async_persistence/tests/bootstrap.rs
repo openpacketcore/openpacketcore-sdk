@@ -295,7 +295,7 @@ async fn async_persistence_public_reopen_before_first_generation_requires_live_q
     // and may report its expected drain error; preserve the original panic.
     let mut shutdown = Vec::new();
     for index in 0..3 {
-        shutdown.push(fleet.close_result(index).await);
+        shutdown.push(fleet.close_and_join_result(index).await);
     }
     if result.is_ok() {
         assert!(
