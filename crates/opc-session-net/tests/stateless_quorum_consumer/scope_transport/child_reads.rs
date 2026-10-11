@@ -5,6 +5,8 @@ use opc_session_store::{
     scope_scheduler::{ClassBudget, ScopeSchedulerBudgets, ScopeWorkClass},
 };
 use tokio::time::Instant;
+#[path = "completion_provenance.rs"]
+mod completion_provenance;
 
 fn key(tag: u8) -> ScopeChildKey {
     ScopeChildKey::new([tag; 32]).unwrap()
@@ -29,6 +31,7 @@ fn value(tag: u8) -> ScopeSealedValue {
 fn native_scope_child_read_client_keeps_one_barrier_on_fresh_and_reused_connections() {
     run(
         false,
+        false,
         concat!(
             "stateless_quorum_consumer::scope_transport::child_reads::",
             "native_scope_child_read_client_keeps_one_barrier_on_fresh_and_reused_connections"
@@ -40,6 +43,7 @@ fn native_scope_child_read_client_keeps_one_barrier_on_fresh_and_reused_connecti
 fn native_scope_child_read_builder_reuses_running_credit_and_bounds_all_exchanges() {
     run(
         true,
+        false,
         concat!(
             "stateless_quorum_consumer::scope_transport::child_reads::",
             "native_scope_child_read_builder_reuses_running_credit_and_bounds_all_exchanges"
@@ -47,7 +51,15 @@ fn native_scope_child_read_builder_reuses_running_credit_and_bounds_all_exchange
     );
 }
 
-fn run(builder: bool, name: &str) {
+#[test]
+fn native_scope_completion_provenance_rejects_forged_ports_and_early_ack() {
+    run(false, true, concat!(
+        "stateless_quorum_consumer::scope_transport::child_reads::",
+        "native_scope_completion_provenance_rejects_forged_ports_and_early_ack"
+    ));
+}
+
+fn run(builder: bool, provenance: bool, name: &str) {
     const CHILD: &str = "OPC_SCOPE_CHILD_READ_TLS_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -95,7 +107,11 @@ fn run(builder: bool, name: &str) {
                 boots, closures: closures.clone(), scheduler: server_scheduler.scheduler(), proofs: ProofBudgets::default(),
             }).unwrap());
             let handle = server.clone().serve([SocketAddr::from(([127, 0, 0, 1], 0)); 5]).await.unwrap();
-            let client = ScopeClient::new(ScopeClientConfig { process: process.clone(), scope: scope.clone(), ticket,
+            let client = ScopeClient::new(ScopeClientConfig { process: process.clone(), scope: scope.clone(), ticket: ticket.clone(),
+                tls: client_tls(&pki, &worker, &follower.to_string()),
+                server: opc_types::SpiffeId::new(three_voter_spiffe(follower)).unwrap(), addresses: handle.addresses(),
+                clock: Arc::new(ScopeClock), scheduler: client_scheduler.scheduler(), local_closure: closures.clone() }).unwrap();
+            let other_client = ScopeClient::new(ScopeClientConfig { process: process.clone(), scope: scope.clone(), ticket,
                 tls: client_tls(&pki, &worker, &follower.to_string()),
                 server: opc_types::SpiffeId::new(three_voter_spiffe(follower)).unwrap(), addresses: handle.addresses(),
                 clock: Arc::new(ScopeClock), scheduler: client_scheduler.scheduler(), local_closure: closures }).unwrap();
@@ -103,14 +119,27 @@ fn run(builder: bool, name: &str) {
             let ScopeAuthorityReply::Admitted(authority) = client.submit(&initial, Duration::from_secs(5)).await.unwrap()
                 else { panic!("own initial authority"); };
             let batches = client.batches(&authority, ScopeWorkClass::Normal, Duration::from_secs(2)).await.unwrap();
+            let saved = Arc::new(std::sync::Mutex::new(None));
+            let retained = saved.clone();
             let write = batches.reserve_lane(0, ScopeWorkClass::Normal).await.unwrap().submit(|context| async move {
-                context.request([61; 16], vec![1, 2].into_iter().map(|tag| ScopeChildMutation::Create {
+                let request = context.request([61; 16], vec![1, 2].into_iter().map(|tag| ScopeChildMutation::Create {
                     key: key(tag), value: value(tag), claims: vec![ScopeClaimKey::new([tag + 10; 32]).unwrap()],
-                }).collect(), vec![])
+                }).collect(), vec![])?;
+                *retained.lock().unwrap() = Some(request.clone());
+                Ok(request)
             }).await.unwrap();
             let written = write.completion().await;
             let ScopeBatchCompletionOutcome::Applied(outcome) = written.outcome() else { panic!("children committed"); };
+            if provenance {
+                let request = saved.lock().unwrap().clone().unwrap();
+                completion_provenance::check(&client, &other_client, &authority, &batches,
+                    &request, &written, Arc::new(fleet.stores[follower].clone()), client_scheduler.scheduler()).await;
+            }
             assert!(batches.ack(written.attempt()));
+            if provenance {
+                assert_eq!(client.verify_batch_completion(&authority, saved.lock().unwrap().as_ref().unwrap(), &written).err(),
+                    Some(ScopeBatchError::OutcomeUnknown), "a retained completion cannot revive an early acknowledgement");
+            }
             let requested = [key(2), key(9), key(1)];
             if !builder {
                 for class in [ScopeWorkClass::Normal, ScopeWorkClass::Emergency,
