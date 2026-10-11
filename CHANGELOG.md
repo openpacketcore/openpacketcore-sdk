@@ -374,6 +374,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `opc-yanggen`: generated configuration lists with `ordered-by user` now use
+  the SDK-owned `serde::UserOrderedMap<Key, Value>` instead of `BTreeMap`. This
+  public API change is limited to user-ordered keyed lists; system-ordered
+  lists keep `BTreeMap`. JSON, XML, gNMI reads, canonical configuration, diff,
+  and apply retain user order. Duplicate keys and user-ordered leaf-list values
+  are rejected. NETCONF placement attributes return typed `UnsupportedShape`
+  errors because normalized edits cannot represent explicit insertion or moves.
+
 - `opc-proto-ikev2`: distinguish authenticated, correctly bound SKF packets with
   `Ikev2WindowError::UnsupportedShape` in ordinary recovery windows. Partial
   fragment cleartext is not parsed as a complete payload chain; unauthenticated

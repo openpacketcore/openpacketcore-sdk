@@ -32,6 +32,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let root_type_ident = format_ident!("{}", root_type);
 
     let mut render_fns = Vec::new();
+    let mut has_ordered_projection = false;
     for node in &sorted_nodes {
         match node.kind {
             SchemaNodeKind::Container => {
@@ -42,6 +43,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
             SchemaNodeKind::List => {
                 render_fns.push(render_list_fn(node, &nodes_by_path)?);
+                has_ordered_projection |= super::is_user_ordered(node)
+                    && !node.key_leaves.is_empty()
+                    && !super::types::is_sensitive_node(node)
+                    && !list_has_sensitive_key(node, &nodes_by_path)?;
             }
             SchemaNodeKind::LeafList => {
                 render_fns.push(render_leaf_list_fn(node, &nodes_by_path)?);
@@ -57,6 +62,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     let root_path = &root.path;
     let root_function = format_ident!("render_{}", path_to_snake(root_path));
+    let ordered_projection = if has_ordered_projection {
+        ordered_projection_helpers()
+    } else {
+        TokenStream::new()
+    };
 
     let tokens = quote! {
         #[allow(unused_imports)]
@@ -83,6 +93,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #(#render_fns)*
+        #ordered_projection
 
         fn push_update(
             updates: &mut Vec<GnmiJsonUpdate>,
@@ -283,6 +294,30 @@ fn render_list_fn(
 
     let entry_fn = render_list_entry_fn(node, nodes_by_path, &entry_fn_ident, &entry_type_ident)?;
     let iter_expr = quote! { value.values() };
+    let render_entries = if super::is_user_ordered(node) {
+        quote! {
+            // An RFC 7951 array carries user order even when the surrounding
+            // gNMI updates are sorted or delivered independently. Build rows
+            // only from the authorized, already-redacted child projections.
+            let mut rows = Vec::new();
+            for entry in #iter_expr {
+                let mut children = Vec::new();
+                #entry_fn_ident(entry, selection, schema_path, canonical_path, &mut children)?;
+                if !children.is_empty() {
+                    rows.push(ordered_projection_row(schema_path, children)?);
+                }
+            }
+            if !rows.is_empty() || selection.contains(schema_path) {
+                push_update(updates, canonical_path, to_json(schema_path, &rows)?)?;
+            }
+        }
+    } else {
+        quote! {
+            for entry in #iter_expr {
+                #entry_fn_ident(entry, selection, schema_path, canonical_path, updates)?;
+            }
+        }
+    };
 
     Ok(quote! {
         #entry_fn
@@ -298,12 +333,98 @@ fn render_list_fn(
             if !selection.is_subtree_selected(schema_path) {
                 return Ok(());
             }
-            for entry in #iter_expr {
-                #entry_fn_ident(entry, selection, schema_path, canonical_path, updates)?;
-            }
+            #render_entries
             Ok(())
         }
     })
+}
+
+fn ordered_projection_helpers() -> TokenStream {
+    quote! {
+        // Preserve nested list row order without exposing predicates or fields
+        // that were not returned by the existing authorized leaf renderers.
+        enum OrderedProjection {
+            Object(std::collections::BTreeMap<String, OrderedProjection>),
+            List(Vec<(std::collections::BTreeMap<String, String>, OrderedProjection)>),
+            Value(serde_json::Value),
+        }
+
+        impl Default for OrderedProjection {
+            fn default() -> Self { Self::Object(Default::default()) }
+        }
+
+        impl OrderedProjection {
+            fn into_json(self) -> serde_json::Value {
+                match self {
+                    Self::Object(fields) => serde_json::Value::Object(fields.into_iter()
+                        .map(|(name, value)| (name, value.into_json())).collect()),
+                    Self::List(rows) => serde_json::Value::Array(rows.into_iter()
+                        .map(|(_, row)| row.into_json()).collect()),
+                    Self::Value(value) => value,
+                }
+            }
+
+            fn insert(
+                &mut self,
+                segments: &[super::patch::PathSegment],
+                parent: &opc_mgmt_schema::NodeMeta,
+                value: serde_json::Value,
+            ) -> Result<(), GnmiJsonProjectionError> {
+                let Some((segment, rest)) = segments.split_first() else {
+                    *self = Self::Value(value);
+                    return Ok(());
+                };
+                let path = format!("{}/{}", parent.path, segment.name);
+                let node = super::schema_registry::registry().node(&path)
+                    .ok_or_else(|| GnmiJsonProjectionError::projection("invalid ordered-list child path"))?;
+                let local = opc_mgmt_schema::bare_segment(&segment.name);
+                let name = if node.module == parent.module {
+                    local.to_string()
+                } else {
+                    format!("{}:{local}", node.module)
+                };
+                let Self::Object(fields) = self else {
+                    return Err(GnmiJsonProjectionError::projection("conflicting ordered-list projections"));
+                };
+                let field = fields.entry(name).or_default();
+                if segment.keys.is_empty() {
+                    return field.insert(rest, node, value);
+                }
+                if matches!(field, Self::Object(fields) if fields.is_empty()) {
+                    *field = Self::List(Vec::new());
+                }
+                let Self::List(rows) = field else {
+                    return Err(GnmiJsonProjectionError::projection("conflicting ordered-list rows"));
+                };
+                let index = rows.iter().position(|(keys, _)| keys == &segment.keys)
+                    .unwrap_or_else(|| {
+                        rows.push((segment.keys.clone(), Self::default()));
+                        rows.len() - 1
+                    });
+                rows[index].1.insert(rest, node, value)
+            }
+        }
+
+        fn ordered_projection_row(
+            schema_path: &'static str,
+            children: Vec<GnmiJsonUpdate>,
+        ) -> Result<serde_json::Value, GnmiJsonProjectionError> {
+            let parent = super::schema_registry::registry().node(schema_path)
+                .ok_or_else(|| GnmiJsonProjectionError::projection("invalid ordered-list path"))?;
+            let depth = schema_path.split('/').filter(|segment| !segment.is_empty()).count();
+            let mut row = OrderedProjection::default();
+            for child in children {
+                let segments = super::patch::parse_path(child.path().as_str())
+                    .map_err(|_| GnmiJsonProjectionError::projection("invalid ordered-list projection path"))?;
+                let suffix = segments.get(depth..)
+                    .ok_or_else(|| GnmiJsonProjectionError::projection("invalid ordered-list projection depth"))?;
+                let value = serde_json::from_str(child.value_json())
+                    .map_err(|_| GnmiJsonProjectionError::projection("invalid ordered-list JSON"))?;
+                row.insert(suffix, parent, value)?;
+            }
+            Ok(row.into_json())
+        }
+    }
 }
 
 fn render_list_entry_fn(
@@ -676,7 +797,11 @@ fn sequence_field_type(
                 quote! { Vec<super::types::#type_ident> }
             } else {
                 let key_type = list_key_type(node, nodes_by_path);
-                quote! { std::collections::BTreeMap<#key_type, super::types::#type_ident> }
+                if super::is_user_ordered(node) {
+                    quote! { super::serde::UserOrderedMap<#key_type, super::types::#type_ident> }
+                } else {
+                    quote! { std::collections::BTreeMap<#key_type, super::types::#type_ident> }
+                }
             }
         }
         SchemaNodeKind::LeafList => {

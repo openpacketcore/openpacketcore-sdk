@@ -334,7 +334,13 @@ fn push_element(
     }
 
     let parent_scope = stack.last().map(|f| &f.ns_scope);
-    let (local, namespace, ns_scope, op_attr) = resolve_start(start, parent_scope)?;
+    let ResolvedStart {
+        local,
+        namespace,
+        ns_scope,
+        operation: op_attr,
+        positioning,
+    } = resolve_start(start, parent_scope)?;
 
     let parent = stack.last().expect("non-empty stack has a parent");
     if matches!(parent.node_kind, NodeKind::Leaf | NodeKind::LeafList) {
@@ -361,6 +367,15 @@ fn push_element(
     if !node.config {
         return Err(NetconfEditError::ReadOnly { path: schema_path });
     }
+    // EditConfigNode has no placement field. Recognize RFC 7950 positioning
+    // attributes and reject them explicitly instead of applying at another
+    // position or reporting well-formed YANG XML as malformed.
+    if positioning {
+        return Err(NetconfEditError::UnsupportedShape {
+            path: schema_path,
+            kind: node.kind,
+        });
+    }
 
     let operation = op_attr.unwrap_or(parent.operation);
 
@@ -378,10 +393,18 @@ fn push_element(
     })
 }
 
+struct ResolvedStart {
+    local: String,
+    namespace: String,
+    ns_scope: NsScope,
+    operation: Option<EditOperation>,
+    positioning: bool,
+}
+
 fn resolve_start(
     start: &BytesStart<'_>,
     parent_scope: Option<&NsScope>,
-) -> Result<(String, String, NsScope, Option<EditOperation>), NetconfEditError> {
+) -> Result<ResolvedStart, NetconfEditError> {
     let raw_name = start.name();
     let (prefix, local) = split_qname(raw_name.as_ref())?;
     let mut scope = parent_scope.cloned().unwrap_or_default();
@@ -407,6 +430,7 @@ fn resolve_start(
     }
 
     let mut operation = None;
+    let mut positioning = false;
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
         let key = attr.key.as_ref();
@@ -429,6 +453,10 @@ fn resolve_start(
                 return Err(NetconfEditError::MalformedXml);
             }
             operation = Some(parse_operation(value)?);
+        } else if attr_ns.as_deref() == Some("urn:ietf:params:xml:ns:yang:1")
+            && matches!(attr_local, "insert" | "key" | "value")
+        {
+            positioning = true;
         } else {
             // Unknown non-namespace attribute; fail closed.
             return Err(NetconfEditError::MalformedXml);
@@ -447,7 +475,13 @@ fn resolve_start(
             .ok_or(NetconfEditError::MalformedXml)?,
     };
 
-    Ok((local.to_string(), namespace, scope, operation))
+    Ok(ResolvedStart {
+        local: local.to_string(),
+        namespace,
+        ns_scope: scope,
+        operation,
+        positioning,
+    })
 }
 
 /// Resolves the `<config>` wrapper element. Unlike ordinary data nodes, the

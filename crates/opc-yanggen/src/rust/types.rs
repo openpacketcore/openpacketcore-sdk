@@ -53,7 +53,7 @@ fn get_raw_type_internal(
     }
 }
 
-fn get_key_type(
+pub(super) fn get_key_type(
     list_node: &SchemaNode,
     nodes_by_path: &HashMap<String, &SchemaNode>,
 ) -> TokenStream {
@@ -463,7 +463,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 quote! { Vec<#ty_name> }
                             } else {
                                 let key_ty = get_key_type(child, &nodes_by_path);
-                                quote! { std::collections::BTreeMap<#key_ty, #ty_name> }
+                                if super::is_user_ordered(child) {
+                                    quote! { super::serde::UserOrderedMap<#key_ty, #ty_name> }
+                                } else {
+                                    quote! { std::collections::BTreeMap<#key_ty, #ty_name> }
+                                }
                             }
                         }
                         SchemaNodeKind::LeafList => {
@@ -544,9 +548,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                     let serde_helper_attr = if child.kind == SchemaNodeKind::List
                         && !child.key_leaves.is_empty()
+                        && !super::is_user_ordered(child)
                     {
                         quote! {
                             #[serde(serialize_with = "super::serde::serialize_list", deserialize_with = "super::serde::deserialize_list")]
+                        }
+                    } else if child.kind == SchemaNodeKind::LeafList
+                        && super::is_user_ordered(child)
+                    {
+                        quote! {
+                            #[serde(serialize_with = "super::serde::serialize_unique_leaf_list", deserialize_with = "super::serde::deserialize_unique_leaf_list")]
                         }
                     } else {
                         quote! {}

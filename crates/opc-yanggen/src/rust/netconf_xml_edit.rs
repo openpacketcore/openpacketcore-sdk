@@ -739,10 +739,21 @@ fn apply_list_fn(
         })
         .collect();
 
+    let map_type = if super::is_user_ordered(node) {
+        quote! { super::serde::UserOrderedMap<#key_type, #entry_type_ident> }
+    } else {
+        quote! { std::collections::BTreeMap<#key_type, #entry_type_ident> }
+    };
+    let upsert = if super::is_user_ordered(node) {
+        quote! { *map.entry(parsed_key).or_default() = entry; }
+    } else {
+        quote! { map.insert(parsed_key, entry); }
+    };
+
     Ok(quote! {
         fn #fn_ident(
             node: &EditConfigNode,
-            map: &mut std::collections::BTreeMap<#key_type, #entry_type_ident>,
+            map: &mut #map_type,
             edit_keys: &mut std::collections::BTreeSet<#key_type>,
         ) -> Result<(), NetconfEditError> {
             if node.schema_path != #path {
@@ -791,13 +802,13 @@ fn apply_list_fn(
                     let mut entry = #entry_type_ident::default();
                     #(#key_assigns)*
                     #children_fn_ident(&node.children, &mut entry)?;
-                    map.insert(parsed_key, entry);
+                    #upsert
                 }
                 EditOperation::Replace => {
                     let mut entry = #entry_type_ident::default();
                     #(#key_assigns)*
                     #children_fn_ident(&node.children, &mut entry)?;
-                    map.insert(parsed_key, entry);
+                    #upsert
                 }
                 EditOperation::Merge => {
                     let entry = map.entry(parsed_key.clone()).or_default();
@@ -813,7 +824,7 @@ fn apply_list_fn(
                         let baseline = entry.clone();
                         #children_fn_ident(&node.children, &mut entry)?;
                         if entry != baseline {
-                            map.insert(parsed_key, entry);
+                            #upsert
                         }
                     }
                 }

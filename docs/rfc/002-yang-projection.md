@@ -202,12 +202,41 @@ YANG list projection depends on key and ordering:
 | YANG List Kind | Rust Representation |
 | :--- | :--- |
 | keyed, `ordered-by system` | `BTreeMap<Key, Value>` |
-| keyed, `ordered-by user` | `Vec<Value>` plus generated key index |
+| keyed config, `ordered-by user` | SDK-owned `serde::UserOrderedMap<Key, Value>` |
 | unkeyed config list | `Vec<Value>` with min/max validation |
 | `config false` operational list | `Vec<Value>` or backend-specific iterator |
 
 The key type MUST be a generated struct when there are multiple key leaves.
 Duplicate keys MUST be rejected during deserialization and patch application.
+
+`UserOrderedMap` stores rows in insertion order and supports key lookup without
+adding a generated-code dependency. Lookup is linear. `insert` returns
+`DuplicateListKey` without replacing a row; `get_mut` and `entry(...).or_default()`
+update existing rows in place. New rows append, and removal preserves the
+remaining order. Equality and RFC 7951 arrays include order. An order-only diff
+emits a collection replacement, whose application retains the supplied order.
+Collection merge/update retains existing positions and appends new keys in
+payload order. System-ordered keyed lists retain their sorted representation.
+As specified by RFC 7950, `ordered-by` is ignored for state data.
+
+Generated gNMI reads represent a user-ordered keyed list as an RFC 7951 array,
+assembled from authorized, redacted child projections. This preserves order
+independently of the order in which gNMI updates are delivered.
+
+The normalized NETCONF `EditConfigNode` currently has no placement field.
+Requests carrying YANG `insert`, `key`, or `value` positioning attributes fail
+with `NetconfEditError::UnsupportedShape`, including `first`, `last`, `before`,
+and `after` insertions or moves. Default append, in-place entry update, delete,
+and parent replacement in XML document order remain supported.
+
+Repository model inventory: the existing `example.yang` IR fixture in
+`crates/opc-yanggen/tests/netconf_xml_edit.rs` declares the user-ordered
+`/ex:system/ex:servers` leaf-list. It remains `Vec<String>` with duplicate
+checks added; no existing fixture expectations change. The
+`ordered_by_user.rs` regression fixture adds `ordered-example` (the minimal
+`/ex:root/ex:server` list) and `ordered-collections` (single-key and composite-key
+user lists, a system-ordered control list, and user-ordered leaf-lists). No
+standalone YANG model files in this repository declare user ordering.
 
 ### 6.4 Leaf-Lists
 
@@ -218,6 +247,12 @@ Leaf-lists map to `Vec<T>` plus generated validation for:
 - uniqueness, when required by YANG semantics
 - user ordering
 - default values
+
+User-ordered configuration leaf-lists retain their `Vec<T>` public type and
+element order. Generated JSON serialization/deserialization, patch application,
+and syntax validation reject duplicates, including manually constructed nested
+values. NETCONF leaf-list edits retain their existing order and duplicate
+checks.
 
 Generated code SHOULD build a temporary set for uniqueness checks rather than
 performing O(n^2) comparisons.

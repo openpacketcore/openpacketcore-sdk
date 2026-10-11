@@ -169,6 +169,41 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         }
                         SchemaNodeKind::List => {
                             let ty_name = format_ident!("{}", to_pascal_case(child_name));
+                            let collection_patch = if super::is_user_ordered(child)
+                                && !child.key_leaves.is_empty()
+                            {
+                                let key_type = super::types::get_key_type(child, &nodes_by_path);
+                                let access = if is_sensitive {
+                                    quote! { self.#field_ident.get_mut() }
+                                } else {
+                                    quote! { &mut self.#field_ident }
+                                };
+                                quote! {
+                                    if segments.len() == 1 && next_seg.keys.is_empty() {
+                                        let list = #access;
+                                        match op {
+                                            ConfigOp::Delete | ConfigOp::Remove => list.clear(),
+                                            ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
+                                                let value = value.ok_or_else(|| config_error("missing-value", "Value is required for list"))?;
+                                                let rows: super::serde::UserOrderedMap<#key_type, #ty_name> = serde_json::from_str(value)
+                                                    .map_err(|_| config_error("invalid-value", "invalid user-ordered list"))?;
+                                                if op == &ConfigOp::Replace {
+                                                    *list = rows;
+                                                } else {
+                                                    for (key, row) in rows {
+                                                        let value = serde_json::to_string(&row)
+                                                            .map_err(|_| config_error("invalid-value", "invalid list entry"))?;
+                                                        list.entry(key).or_default().apply_patch_segments(op, &[], Some(&value))?;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                quote! {}
+                            };
                             if child.key_leaves.is_empty() {
                                 quote! {
                                     #child_name_str => {
@@ -238,6 +273,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                 quote! {
                                     #child_name_str => {
+                                        #collection_patch
                                         let key_val = next_seg.keys.get(#key_leaf).ok_or_else(|| config_error("missing-key", format!("missing key: {}", #key_leaf)))?;
                                         #parse_key
                                         if segments.len() == 1 {
@@ -329,6 +365,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                 quote! {
                                     #child_name_str => {
+                                        #collection_patch
                                         #(#parse_keys)*
                                         let parsed_key = #key_struct_name {
                                             #key_fields
@@ -368,6 +405,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 quote! { self.#field_ident.get_mut() }
                             } else {
                                 quote! { &mut self.#field_ident }
+                            };
+                            let check_duplicates = if super::is_user_ordered(child) {
+                                quote! {
+                                    if super::serde::has_duplicate_values(values) {
+                                        return Err(config_error("invalid-value", super::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR));
+                                    }
+                                }
+                            } else {
+                                quote! {}
                             };
                             // Match the element type emitted by `types`: a
                             // leafref carries its target's scalar type, not
@@ -437,6 +483,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                     #parse_elem
                                                     values.push(parsed_elem);
                                                 }
+                                                #check_duplicates
                                             }
                                         }
                                     } else {
@@ -547,7 +594,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 let key_bracket_construction_prev =
                                     key_bracket_construction.clone();
 
-                                quote! {
+                                let keyed_diff = quote! {
                                     let list_path = format!("{}/{}", _path_prefix, #child_segment_str);
                                     for (k, cur_val) in &self.#field_ident {
                                         #key_bracket_construction
@@ -565,6 +612,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             deltas.push(ConfigDelta::Delete(YangPath::new(&entry_path).expect("valid path")));
                                         }
                                     }
+                                };
+                                if super::is_user_ordered(child) {
+                                    quote! {
+                                        if !self.#field_ident.keys().eq(previous.#field_ident.keys()) {
+                                            let path = YangPath::new(format!("{}/{}", _path_prefix, #child_segment_str))
+                                                .map_err(|_| config_error("invalid-path", "invalid list path"))?;
+                                            let value = serde_json::to_string(&self.#field_ident)
+                                                .map_err(|_| config_error("invalid-value", "invalid user-ordered list"))?;
+                                            deltas.push(ConfigDelta::Replace(path, value));
+                                        } else {
+                                            #keyed_diff
+                                        }
+                                    }
+                                } else {
+                                    keyed_diff
                                 }
                             }
                         }

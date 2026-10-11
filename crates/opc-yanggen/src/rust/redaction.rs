@@ -137,13 +137,31 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         }
                                     }
 
+                                    let (new_map, insert) = if super::is_user_ordered(child) {
+                                        (
+                                            quote! { super::serde::UserOrderedMap::new() },
+                                            quote! {
+                                                if new_map.insert(k, val).is_err() {
+                                                    // A redacted-key collision cannot retain either
+                                                    // row unambiguously. Suppress the collection.
+                                                    new_map.clear();
+                                                    break;
+                                                }
+                                            },
+                                        )
+                                    } else {
+                                        (
+                                            quote! { std::collections::BTreeMap::new() },
+                                            quote! { new_map.insert(k, val); },
+                                        )
+                                    };
                                     redactions.extend(quote! {
-                                        let mut new_map = std::collections::BTreeMap::new();
+                                        let mut new_map = #new_map;
                                         #[allow(unused_mut)]
                                         for (mut k, mut val) in std::mem::take(&mut self.#field_ident) {
                                             #key_redact
                                             val.redact_sensitive_depth(depth + 1);
-                                            new_map.insert(k, val);
+                                            #insert
                                         }
                                         self.#field_ident = new_map;
                                     });

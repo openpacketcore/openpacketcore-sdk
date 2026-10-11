@@ -41,6 +41,11 @@ impl fmt::Display for RustGenerationError {
 
 impl std::error::Error for RustGenerationError {}
 
+/// RFC 7950 ignores `ordered-by` on state data.
+fn is_user_ordered(node: &SchemaNode) -> bool {
+    node.config && node.ordered_by.as_deref() == Some("user")
+}
+
 pub fn generate_rust(
     input: &CanonicalInput,
 ) -> Result<HashMap<String, String>, RustGenerationError> {
