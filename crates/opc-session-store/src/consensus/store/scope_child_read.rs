@@ -34,12 +34,12 @@ fn header_error(error: ScopeScanError) -> ScopeChildReadError {
 #[derive(Clone)]
 struct ReadCheck {
     control: ScopeChildReadControl,
-    deadline: std::time::Instant,
+    deadline: tokio::time::Instant,
 }
 
 impl ReadCheck {
     fn interrupted(&self) -> bool {
-        self.control.is_cancelled() || std::time::Instant::now() >= self.deadline
+        self.control.is_cancelled() || tokio::time::Instant::now() >= self.deadline
     }
 
     fn check(&self) -> io::Result<()> {
@@ -102,7 +102,7 @@ impl ChildReadCut {
     }
 
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.check.deadline)
+        self.check.deadline
     }
 
     pub(crate) async fn materialize<G: Send + 'static>(
@@ -332,7 +332,7 @@ impl ConsensusSessionStore {
         let worker = tokio::task::spawn_blocking(move || {
             let opening = ReadCheck {
                 control: worker_control.clone(),
-                deadline: deadline.into_std(),
+                deadline,
             };
             opening.check().map_err(unavailable)?;
             #[cfg(any(test, feature = "test-control"))]
@@ -343,7 +343,7 @@ impl ConsensusSessionStore {
             // subsequent materialization step fit within the fixed maximum.
             let check = ReadCheck {
                 control: worker_control,
-                deadline: std::time::Instant::now() + SCOPE_CHILD_READ_MAX_CUT_LIFETIME,
+                deadline: tokio::time::Instant::now() + SCOPE_CHILD_READ_MAX_CUT_LIFETIME,
             };
             let backend = store.capture_child_backend(barrier, &check)?;
             #[cfg(any(test, feature = "test-control"))]
