@@ -10,7 +10,7 @@
 #[path = "scope_storage_tests.rs"]
 mod tests;
 
-use std::{collections::HashSet, fmt};
+use std::fmt;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,7 @@ use crate::scope_authority::{
 };
 use crate::scope_batch::{
     ScopeBatchCheckpoint, ScopeBatchError, ScopeChildKey, ScopeChildRecord, ScopeClaimKey,
-    MAX_SCOPE_BATCH_LEDGER_BYTES, MAX_SCOPE_CHILD_CLAIMS, MAX_SCOPE_CHILD_VALUE_BYTES,
-    SCOPE_BATCH_LANES, SCOPE_COUNTERS,
+    MAX_SCOPE_BATCH_LEDGER_BYTES, MAX_SCOPE_CHILD_VALUE_BYTES, SCOPE_BATCH_LANES, SCOPE_COUNTERS,
 };
 use crate::{
     EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
@@ -338,21 +337,7 @@ impl ScopeRow {
         }
         match self {
             Self::Batch(row) => row.validate_stored(),
-            Self::Child(row) => {
-                crate::scope_batch::ScopeChildRevision::new(
-                    row.revision.birth(),
-                    row.revision.generation(),
-                )?;
-                if row.key.as_bytes() == &[0; 32]
-                    || row.claims.len() > MAX_SCOPE_CHILD_CLAIMS
-                    || row.claims.iter().any(|key| key.as_bytes() == &[0; 32])
-                    || row.claims.iter().collect::<HashSet<_>>().len() != row.claims.len()
-                    || (row.value.is_none() && !row.claims.is_empty())
-                {
-                    return Err(ScopeBatchError::FormatMismatch);
-                }
-                Ok(())
-            }
+            Self::Child(row) => row.validate_stored(),
             Self::Claim(row) => {
                 if row.key.as_bytes() == &[0; 32]
                     || row.owner.is_some_and(|owner| {
