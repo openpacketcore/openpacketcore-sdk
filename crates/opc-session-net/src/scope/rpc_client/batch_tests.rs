@@ -24,6 +24,9 @@ use std::{
 };
 use tokio::net::TcpListener;
 
+#[path = "child_read_error_tests.rs"]
+mod child_reads;
+
 struct NoPublication;
 #[async_trait::async_trait]
 impl crate::scope::ScopeLocalClosurePublisher for NoPublication {
@@ -52,6 +55,9 @@ struct Peer {
     reopen_release: Notify,
     entered: Notify,
     release: Notify,
+    child_replies: Mutex<std::collections::VecDeque<child_reads::Reply>>,
+    child_calls: AtomicUsize,
+    child_proofs: AtomicUsize,
 }
 impl Peer {
     async fn reopen(&self) -> ScopeBatchReopen {
@@ -86,6 +92,22 @@ impl Peer {
             connection.read_exact(&mut bytes).await.unwrap();
             let payload = CallPayload::decode(call.method, &bytes).unwrap();
             let native = NativeCall::decode(&call, &payload.canonical, &self.scope).unwrap();
+            let child_reply = if matches!(native, NativeCall::ChildRead(_)) {
+                self.child_calls.fetch_add(1, Ordering::SeqCst);
+                let reply = self
+                    .child_replies
+                    .lock()
+                    .await
+                    .pop_front()
+                    .expect("scripted child reply");
+                if reply.preproof {
+                    reply.send(&mut connection, &call, payload.nonce).await;
+                    continue;
+                }
+                Some(reply)
+            } else {
+                None
+            };
             let challenge = [71; 32];
             let malformed = self.malformed_challenge.swap(false, Ordering::AcqRel);
             let mut response = call.response(FrameKind::Challenge, 32).unwrap();
@@ -139,6 +161,14 @@ impl Peer {
             };
             assert_eq!(execution.boot_key(), &hash(&claims.public_key));
             proof.verify_against(&claims).unwrap();
+            if let Some(reply) = child_reply {
+                self.child_proofs.fetch_add(1, Ordering::SeqCst);
+                if reply.drop_reply {
+                    return;
+                }
+                reply.send(&mut connection, &call, payload.nonce).await;
+                continue;
+            }
             let (status, own, body) = match native {
                 NativeCall::Authority(request) => {
                     let stamp: ScopeAuthorityStamp = serde_json::from_value(json!({
@@ -442,6 +472,9 @@ fn authenticated_batch_reuses_one_reservation_and_resolves_a_lost_reply() {
                     reopen_release: Notify::new(),
                     entered: Notify::new(),
                     release: Notify::new(),
+                    child_replies: Mutex::new(Default::default()),
+                    child_calls: AtomicUsize::new(0),
+                    child_proofs: AtomicUsize::new(0),
                 });
                 let mut addresses = [std::net::SocketAddr::from(([127, 0, 0, 1], 9)); 5];
                 let mut tasks = Vec::new();
