@@ -59,7 +59,7 @@ fn native_scope_child_read_promotes_only_after_current_cut_and_clears_stale_hint
 }
 
 async fn eventually(check: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
         while !check() {
             tokio::task::yield_now().await;
         }

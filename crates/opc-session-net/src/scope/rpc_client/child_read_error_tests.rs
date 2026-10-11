@@ -10,6 +10,14 @@ pub(super) struct Reply {
     pub(super) preproof: bool,
     pub(super) drop_reply: bool,
     corruption: u8,
+    hold_result: Option<Arc<HeldChildResult>>,
+}
+
+#[derive(Default)]
+struct HeldChildResult {
+    entered: Notify,
+    release: Notify,
+    peer_closed: Notify,
 }
 
 impl Reply {
@@ -20,6 +28,7 @@ impl Reply {
             preproof: false,
             drop_reply: false,
             corruption: 0,
+            hold_result: None,
         }
     }
 
@@ -29,6 +38,22 @@ impl Reply {
         call: &Header,
         nonce: [u8; 32],
     ) {
+        if let Some(hold) = &self.hold_result {
+            hold.entered.notify_one();
+            let mut unexpected = [0; 1];
+            tokio::select! {
+                () = hold.release.notified() => {},
+                result = connection.read(&mut unexpected) => {
+                    match result {
+                        Ok(0) => {},
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {},
+                        other => panic!("the timed-out exchange must close its connection: {other:?}"),
+                    }
+                    hold.peer_closed.notify_one();
+                    return;
+                }
+            }
+        }
         let mut body = ResultPayload::new(nonce, self.status, [0; 32], self.body)
             .unwrap()
             .encode()
@@ -59,6 +84,159 @@ impl Reply {
         connection.write_all(&body).await.unwrap();
         connection.flush().await.unwrap();
     }
+}
+
+#[derive(Clone, Copy)]
+enum ChildDeadlineCase {
+    Result,
+    Connection,
+    ExistingBatch,
+}
+
+#[test]
+fn child_read_result_deadline_is_unavailable_and_discards_the_connection() {
+    run_child_deadline_case(
+        ChildDeadlineCase::Result,
+        "child_read_result_deadline_is_unavailable_and_discards_the_connection",
+    );
+}
+
+#[test]
+fn child_read_deadline_includes_waiting_for_the_pooled_connection() {
+    run_child_deadline_case(
+        ChildDeadlineCase::Connection,
+        "child_read_deadline_includes_waiting_for_the_pooled_connection",
+    );
+}
+
+#[test]
+fn batch_attempt_starts_after_pooled_connection_acquisition() {
+    run_child_deadline_case(
+        ChildDeadlineCase::ExistingBatch,
+        "batch_attempt_starts_after_pooled_connection_acquisition",
+    );
+}
+
+fn run_child_deadline_case(case: ChildDeadlineCase, name: &str) {
+    const CHILD: &str = "OPC_CHILD_READ_DEADLINE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = format!("scope::rpc_client::batch_tests::child_reads::{name}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child must execute the exact named case"
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        timeout(Duration::from_secs(20), async {
+            let fixture = revision::Fixture::new().await;
+            let key = ScopeChildKey::new([8; 32]).unwrap();
+            let request = ScopeChildReadRequest::new(fixture.authority.stamp(), vec![key]).unwrap();
+            let missing = crate::scope::child_read_wire::encode_observation(&request, &[None]).unwrap();
+            let hold = Arc::new(HeldChildResult::default());
+            let mut reply = Reply::new(ResultStatus::ChildObservation, missing.clone());
+            reply.hold_result = Some(hold.clone());
+            fixture.peer.child_replies.lock().await.push_back(reply);
+            let mut first = Box::pin(fixture.client.read_child(
+                &fixture.authority, key, ScopeWorkClass::Normal,
+                Instant::now() + Duration::from_secs(10),
+            ));
+            timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    () = hold.entered.notified() => {},
+                    result = first.as_mut() => panic!("read ended before its Result was held: {result:?}"),
+                }
+            }).await.unwrap();
+            assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.peer.child_proofs.load(Ordering::SeqCst), 1);
+            // Advance only after the real authenticated exchange reaches Result.
+            // TLS/network setup is outside the controlled deadline experiment.
+            tokio::time::pause();
+            match case {
+                ChildDeadlineCase::Result => {
+                    tokio::time::advance(Duration::from_secs(10)).await;
+                    let result = first.as_mut().await;
+                    assert_eq!(result,
+                        Err(ScopeChildReadError::Batch(ScopeBatchError::Unavailable)),
+                        "a withheld child Result must remain Unavailable, not an unknown mutation outcome: {}",
+                        result.as_ref().err().unwrap());
+                    drop(first);
+                    tokio::time::resume();
+                    timeout(Duration::from_secs(10), hold.peer_closed.notified()).await.unwrap();
+                    assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), 1,
+                        "a withheld Result causes no replay or recovery exchange");
+                    fixture.peer.child_replies.lock().await.push_back(
+                        Reply::new(ResultStatus::ChildObservation, missing));
+                    assert_eq!(fixture.client.read_child(&fixture.authority, key,
+                        ScopeWorkClass::Normal, Instant::now() + Duration::from_secs(2)).await, Ok(None));
+                    assert_eq!(fixture.handshakes.load(Ordering::SeqCst), 2,
+                        "the expired exchange cannot return its connection to the pool");
+                    assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), 2);
+                }
+                ChildDeadlineCase::Connection => {
+                    let mut second = Box::pin(fixture.client.read_child(&fixture.authority, key,
+                        ScopeWorkClass::Normal, Instant::now() + Duration::from_millis(40)));
+                    assert!(futures_util::poll!(second.as_mut()).is_pending());
+                    tokio::time::advance(Duration::from_millis(40)).await;
+                    assert_eq!(timeout(Duration::from_secs(1), second.as_mut()).await.unwrap(),
+                        Err(ScopeChildReadError::Batch(ScopeBatchError::Unavailable)));
+                    drop(second);
+                    assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), 1,
+                        "an expired connection waiter must start no second exchange");
+                    assert_eq!(fixture.peer.child_proofs.load(Ordering::SeqCst), 1);
+                    // A batch builder already owns its running entitlement.
+                    // Exercise that entry point too, without the public read's
+                    // outer admission timeout masking the pooled-wait bound.
+                    let mut admitted = Box::pin(fixture.client.read_children_admitted(
+                        &request, ScopeWorkClass::Normal,
+                        Instant::now() + Duration::from_millis(40)));
+                    assert!(futures_util::poll!(admitted.as_mut()).is_pending());
+                    tokio::time::advance(Duration::from_millis(40)).await;
+                    assert_eq!(timeout(Duration::from_secs(1), admitted.as_mut()).await
+                        .expect("the admitted pooled waiter must finish at its own deadline"),
+                        Err(ScopeChildReadError::Batch(ScopeBatchError::Unavailable)));
+                    drop(admitted);
+                    assert_eq!(fixture.peer.child_calls.load(Ordering::SeqCst), 1,
+                        "the admitted expired waiter must start no second exchange");
+                    assert_eq!(fixture.peer.child_proofs.load(Ordering::SeqCst), 1);
+                    hold.release.notify_one();
+                    tokio::time::resume();
+                    assert_eq!(first.as_mut().await, Ok(None), "the owner of the connection is unaffected");
+                    drop(first);
+                    assert_eq!(fixture.handshakes.load(Ordering::SeqCst), 1);
+                }
+                ChildDeadlineCase::ExistingBatch => {
+                    let mut batches = Box::pin(fixture.client.batches(&fixture.authority,
+                        ScopeWorkClass::Normal, Duration::from_millis(40)));
+                    assert!(futures_util::poll!(batches.as_mut()).is_pending());
+                    tokio::time::advance(Duration::from_millis(50)).await;
+                    assert!(futures_util::poll!(batches.as_mut()).is_pending(),
+                        "existing methods keep waiting for the pooled connection before starting their attempt");
+                    hold.release.notify_one();
+                    tokio::time::resume();
+                    assert_eq!(first.as_mut().await, Ok(None));
+                    drop(first);
+                    let outcome = batches.await;
+                    assert!(outcome.is_ok(),
+                        "the original full attempt starts after acquisition: {:?}",
+                        outcome.err().map(|error| error.encode_canonical()));
+                    assert_eq!(fixture.handshakes.load(Ordering::SeqCst), 1);
+                }
+            }
+            fixture.stop().await;
+        }).await.unwrap();
+    });
 }
 
 #[test]

@@ -357,7 +357,6 @@ fn native_authority_readback_keeps_the_backend_effect_type_concrete() {
             execution,
             committed,
             client,
-            opc_session_store::scope_scheduler::ScopeWorkClass::Normal,
             std::time::Duration::from_secs(2),
         )
         .await

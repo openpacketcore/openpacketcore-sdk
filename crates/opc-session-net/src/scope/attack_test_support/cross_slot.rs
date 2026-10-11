@@ -1,7 +1,7 @@
 //! Raw test peers deliberately bypass the SDK's own-key and local-gate checks.
 #[path = "cross_slot_child_read.rs"]
 mod child_reads;
-pub(crate) use child_reads::reject_before_proof;
+pub(crate) use child_reads::{child_read_with_boot_on, reject_before_proof};
 
 use super::super::{
     proof::{PossessionClaims, PossessionProof},

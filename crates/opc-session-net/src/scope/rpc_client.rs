@@ -14,7 +14,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, Notify},
+    sync::{Mutex, MutexGuard, Notify},
     time::{timeout, timeout_at, Instant},
 };
 
@@ -537,10 +537,12 @@ impl ScopeClient {
         close: Option<&LocalClosureRecord>,
         attempt: Duration,
     ) -> Result<VerifiedResponse, ScopeRpcError> {
+        // Existing methods receive a full attempt after connection acquisition.
+        let slot = self.0.connections[class.index()].lock().await;
         let deadline = Instant::now()
             .checked_add(attempt)
             .ok_or(ScopeRpcError::Invalid)?;
-        self.roundtrip_at(method, class, id, digest, canonical, close, deadline)
+        self.roundtrip_with_slot(method, class, id, digest, canonical, close, deadline, slot)
             .await
     }
 
@@ -555,15 +557,26 @@ impl ScopeClient {
         close: Option<&LocalClosureRecord>,
         deadline: Instant,
     ) -> Result<VerifiedResponse, ScopeRpcError> {
-        let slot = self.0.connections[class.index()].lock();
-        let mut slot = if method.is_scan() {
-            // Restores own one external deadline, including connection ownership.
-            slot.await
-        } else {
-            timeout_at(deadline, slot)
-                .await
-                .map_err(|_| ScopeRpcError::Retry)?
-        };
+        // Child reads own one absolute deadline, including connection ownership.
+        let slot = timeout_at(deadline, self.0.connections[class.index()].lock())
+            .await
+            .map_err(|_| ScopeRpcError::Retry)?;
+        self.roundtrip_with_slot(method, class, id, digest, canonical, close, deadline, slot)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn roundtrip_with_slot(
+        &self,
+        method: Method,
+        class: Class,
+        id: [u8; 16],
+        digest: [u8; 32],
+        canonical: &[u8],
+        close: Option<&LocalClosureRecord>,
+        deadline: Instant,
+        mut slot: MutexGuard<'_, Option<PooledConnection>>,
+    ) -> Result<VerifiedResponse, ScopeRpcError> {
         for reconnect in [false, true] {
             if method == Method::ChildRead && Instant::now() >= deadline {
                 return Err(ScopeRpcError::Retry);

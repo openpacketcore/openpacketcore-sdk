@@ -6,6 +6,232 @@ use crate::scope_batch::tests::{claim, create, key, value};
 use crate::scope_batch::*;
 use std::sync::atomic::AtomicU64;
 
+async fn child_read_authority_fixture(fleet: &Fleet) -> (usize, CommittedScopeAuthority) {
+    let leader = fleet
+        .stores
+        .iter()
+        .position(|store| store.status().leader_id == Some(store.status().node_id))
+        .unwrap();
+    let scope = ScopeId::new(
+        fleet.topologies[0].consensus_identity().unwrap(),
+        TenantId::from_static("child-read-refusal"),
+        NetworkFunctionKind::smf(),
+        [1; 32],
+    )
+    .unwrap();
+    let authority = ScopeAuthorityStore::new(
+        Arc::new(fleet.stores[leader].clone()),
+        scope.clone(),
+        Arc::new(Admission),
+    )
+    .unwrap();
+    let granted = authority
+        .admit(
+            &identity("worker-1"),
+            &ScopeAuthorityRequest::new(
+                scope,
+                [1; 16],
+                0,
+                ScopeAuthorityOperation::AdmitInitial {
+                    execution: execution(1),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    (leader, granted)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_child_read_three_large_children_refuse_the_whole_observation() {
+    let mut failure = None;
+    for native in [false, true] {
+        let snapshots =
+            tempfile::tempdir_in(std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").unwrap()).unwrap();
+        let mut fleet = Fleet::new_with_mode("scope_child_read_aggregate_bound", native);
+        fleet.snapshot_root = Some(snapshots.path().to_path_buf());
+        fleet.clock = Some(Arc::new(Clock(AtomicU64::new(0))));
+        fleet.open().await;
+        let result = AssertUnwindSafe(async {
+            let (leader, granted) = child_read_authority_fixture(&fleet).await;
+            let store = &fleet.stores[leader];
+            let reader = ScopeBatchStore::new(
+                Arc::new(store.clone()),
+                granted.stamp().namespace().clone(),
+                Arc::new(Admission),
+            )
+            .unwrap();
+            let encoded = value(1).envelope().to_vec();
+            let mut envelope = opc_crypto::CryptoEnvelopeV1::decode(&encoded).unwrap();
+            let overhead = encoded.len() - envelope.ciphertext_and_tag.len();
+            envelope
+                .ciphertext_and_tag
+                .resize(MAX_SCOPE_CHILD_VALUE_BYTES - 4096 - overhead, 1);
+            let large = ScopeSealedValue::new(envelope.encode().unwrap()).unwrap();
+            for tag in 1..=3 {
+                reader
+                    .execute(
+                        &identity("worker-1"),
+                        &ScopeBatchRequest::in_lane(
+                            granted.stamp(),
+                            [tag + 1; 16],
+                            0,
+                            u64::from(tag),
+                            vec![ScopeChildMutation::Create {
+                                key: key(tag),
+                                value: large.clone(),
+                                claims: vec![],
+                            }],
+                            vec![],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let pair = reader
+                .read_current(&identity("worker-1"), granted.stamp(), &[key(1), key(2)])
+                .await
+                .unwrap();
+            assert_eq!(
+                pair.len(),
+                2,
+                "two individually valid near-1-MiB children fit"
+            );
+            assert!(pair
+                .iter()
+                .all(|row| row.as_ref().unwrap().value() == Some(&large)));
+            let applied = store.status().applied_index;
+            let barriers = store.scope_read_barrier_count_for_test();
+            assert_eq!(
+                reader
+                    .read_current(
+                        &identity("worker-1"),
+                        granted.stamp(),
+                        &[key(1), key(2), key(3)]
+                    )
+                    .await,
+                Err(ScopeChildReadError::ObservationTooLarge)
+            );
+            assert_eq!(store.scope_read_barrier_count_for_test(), barriers + 1);
+            assert_eq!(
+                store.status().applied_index,
+                applied,
+                "refusal appends no command"
+            );
+        })
+        .catch_unwind()
+        .await;
+        fleet.close().await;
+        if let Err(panic) = result {
+            failure.get_or_insert(panic);
+        }
+    }
+    if let Some(panic) = failure {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_child_read_retired_incarnation_has_the_exact_store_error() {
+    // This fixture needs a stored retirement, which has no proposal operation.
+    // Use the ordinary SQLite store: editing the private WAL's verified SQL
+    // projection would correctly trip its corruption guard before the read.
+    let directory = tempfile::tempdir().unwrap();
+    let topology = super::super::membership_tests::singleton_topology();
+    let scope = ScopeId::new(
+        topology.consensus_identity().unwrap(),
+        TenantId::from_static("child-read-retired"),
+        NetworkFunctionKind::smf(),
+        [1; 32],
+    )
+    .unwrap();
+    let store = ConsensusSessionStore::open_with_clock(
+        topology,
+        SqliteSessionBackend::open(directory.path().join("store.sqlite")).unwrap(),
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+        Arc::new(Clock(AtomicU64::new(0))),
+        super::super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    store.initialize_cluster().await.unwrap();
+    let result = AssertUnwindSafe(async {
+        assert!(store.inner.private_wal.is_none());
+        let authority =
+            ScopeAuthorityStore::new(Arc::new(store.clone()), scope.clone(), Arc::new(Admission))
+                .unwrap();
+        let granted = authority
+            .admit(
+                &identity("worker-1"),
+                &ScopeAuthorityRequest::new(
+                    scope,
+                    [1; 16],
+                    0,
+                    ScopeAuthorityOperation::AdmitInitial {
+                        execution: execution(1),
+                    },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let reader = ScopeBatchStore::new(
+            Arc::new(store.clone()),
+            granted.stamp().namespace().clone(),
+            Arc::new(Admission),
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .read_current(&identity("worker-1"), granted.stamp(), &[key(1)])
+                .await
+                .unwrap(),
+            vec![None]
+        );
+
+        // Seed a validated, monotonic retirement in the real backend, then exercise
+        // the public read, its barrier, capture, header decode and error mapping.
+        let physical = granted.stamp().scope().key().unwrap();
+        let conn = store.inner.backend.lock_connection_for_test().await;
+        let mut record = crate::sqlite::ops::get_raw_sync(&conn, &physical)
+            .unwrap()
+            .unwrap();
+        let previous = ScopeAuthorityCheckpoint::from_record(&record).unwrap();
+        let retired = crate::scope_authority::tests::retired_fixture(&previous.state().unwrap(), 2);
+        let body = retired.encode().unwrap();
+        let mut bytes = (body.len() as u16).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        bytes.resize(MAX_SCOPE_AUTHORITY_RECORD_BYTES, 0);
+        record.generation = crate::Generation::new(retired.view.revision());
+        record.payload = crate::EncryptedSessionPayload::new(bytes);
+        let checkpoint = ScopeAuthorityCheckpoint::from_record(&record).unwrap();
+        assert!(
+            checkpoint.can_replace(&previous),
+            "the fixture advances durable retirement floors"
+        );
+        crate::sqlite::ops::insert_or_replace_scope_record_sync(&conn, &record).unwrap();
+        drop(conn);
+        let barriers = store.scope_read_barrier_count_for_test();
+        assert_eq!(
+            reader
+                .read_current(&identity("worker-1"), granted.stamp(), &[key(1)])
+                .await,
+            Err(ScopeChildReadError::Batch(ScopeBatchError::Scope(
+                ScopeAuthorityError::Retired
+            )))
+        );
+        assert_eq!(store.scope_read_barrier_count_for_test(), barriers + 1);
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = store.shutdown().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    shutdown.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scope_child_read_current_uses_one_cut_before_and_after_concurrent_commits() {
     run_cut_cases(&[

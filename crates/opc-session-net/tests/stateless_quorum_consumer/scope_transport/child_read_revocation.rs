@@ -171,7 +171,7 @@ fn native_scope_child_read_held_policy_revocation_returns_unauthorized_without_o
                             )
                             .await
                     });
-                    tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
                         while fleet.stores[follower].scope_child_read_cuts_for_test() != 1
                             || server_scheduler
                                 .scheduler()
@@ -199,7 +199,7 @@ fn native_scope_child_read_held_policy_revocation_returns_unauthorized_without_o
                         "a revoked admitted read reports Unauthorized and returns no observation"
                     );
                     assert_eq!(fleet.stores[follower].scope_child_read_cuts_for_test(), 0);
-                    tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
                         while server.child_read_proof_usage_for_test(Class::Normal) != (0, 0) {
                             tokio::task::yield_now().await;
                         }

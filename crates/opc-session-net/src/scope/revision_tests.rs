@@ -2,6 +2,91 @@
 use super::revision::*;
 use std::time::{Duration, Instant};
 
+#[test]
+fn revision_mismatches_are_exported_with_bounded_labels_even_when_logs_are_limited() {
+    const CHILD: &str = "OPC_SCOPE_REVISION_METRICS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "scope::revision_tests::revision_mismatches_are_exported_with_bounded_labels_even_when_logs_are_limited", "--nocapture"])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    for _ in 0..2 {
+        assert!(matches!(
+            rpc_handshake_error(
+                WORKER_RESPONSE,
+                opc_tls::ScopeTlsError::TransportRevisionMismatch,
+                super::ScopeRpcError::Retry
+            ),
+            super::ScopeRpcError::TransportRevisionMismatch
+        ));
+    }
+    let observer = DiagnosticContext::new(
+        ScopeTransportRole::Observer,
+        ScopeTransportPurpose::ScopeResponse,
+        ScopeTransportDirection::Inbound,
+    );
+    assert!(matches!(
+        rpc_handshake_error(
+            observer,
+            opc_tls::ScopeTlsError::TransportRevisionMismatch,
+            super::ScopeRpcError::Retry
+        ),
+        super::ScopeRpcError::TransportRevisionMismatch
+    ));
+    assert_eq!(
+        signal(
+            ScopeTransportRole::Worker,
+            ScopeTransportPurpose::Handshake,
+            ScopeTransportDirection::Outbound
+        ),
+        (2, 0, true)
+    );
+    for (role, purpose, direction) in [
+        ("claimed-peer", "handshake", "outbound"),
+        ("worker", "request-id", "outbound"),
+        ("worker", "handshake", "peer-address"),
+    ] {
+        opc_redaction::metrics::METRICS
+            .record_scope_transport_revision_mismatch(role, purpose, direction);
+    }
+    let exposition = opc_redaction::metrics::export_prometheus_text();
+    assert!(exposition
+        .lines()
+        .any(|line| line == "# TYPE scope_transport_revision_mismatch_total counter"));
+    assert!(exposition.lines().any(|line| line ==
+        "scope_transport_revision_mismatch_total{role=\"worker\",purpose=\"handshake\",direction=\"outbound\"} 2"),
+        "both signals must be exported, including the rate-limited log's event");
+    assert!(exposition.lines().any(|line| line ==
+        "scope_transport_revision_mismatch_total{role=\"observer\",purpose=\"handshake\",direction=\"inbound\"} 1"),
+        "roles and directions must retain separate counter buckets");
+    let buckets: Vec<_> = exposition
+        .lines()
+        .filter(|line| line.starts_with("scope_transport_revision_mismatch_total{"))
+        .collect();
+    assert_eq!(
+        buckets.len(),
+        50,
+        "unknown labels allocate no additional buckets"
+    );
+    assert!(buckets.iter().all(|line| !line.contains("claimed-peer")
+        && !line.contains("request-id")
+        && !line.contains("peer-address")));
+    opc_redaction::metrics::METRICS.reset_all();
+    assert!(opc_redaction::metrics::export_prometheus_text()
+        .lines()
+        .filter(|line| line.starts_with("scope_transport_revision_mismatch_total{"))
+        .all(|line| line.ends_with(" 0")));
+}
+
 pub(super) fn signal(
     role: ScopeTransportRole,
     purpose: ScopeTransportPurpose,

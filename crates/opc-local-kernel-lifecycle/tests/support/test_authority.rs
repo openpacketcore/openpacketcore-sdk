@@ -26,7 +26,6 @@ impl TestAuthority {
                 quorum.execution().clone(),
                 quorum.committed.clone(),
                 transport.client.clone(),
-                opc_session_store::scope_scheduler::ScopeWorkClass::Normal,
                 Duration::from_secs(1),
             )
             .await?;

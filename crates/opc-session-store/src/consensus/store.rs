@@ -17753,7 +17753,7 @@ mod membership_tests {
         )
     }
 
-    fn singleton_topology() -> ValidatedQuorumTopology {
+    pub(super) fn singleton_topology() -> ValidatedQuorumTopology {
         let replica_id = ReplicaId::new("membership-admission-singleton").expect("replica ID");
         let descriptor = QuorumReplicaDescriptor::new(
             replica_id.clone(),

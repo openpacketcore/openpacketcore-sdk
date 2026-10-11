@@ -88,7 +88,18 @@ pub(crate) fn close(before: &ScopeState, n: u8) -> ScopeAuthorityRequest {
 /// Retirement has no production entry point in this profile. Model a valid durable
 /// retirement to exercise the already-required apply and snapshot predicates.
 pub(crate) fn retired_fixture(before: &ScopeState, n: u8) -> ScopeState {
-    let mut after = before.transition(&successor(before, n)).unwrap();
+    let request = ScopeAuthorityRequest::new(
+        before.view.scope().clone(),
+        [n; 16],
+        before.view.revision(),
+        ScopeAuthorityOperation::SucceedClosed {
+            predecessor: before.view.stamp().unwrap().clone(),
+            execution: execution(n),
+            evidence: evidence(ScopeClosureKind::FinalTermination, n),
+        },
+    )
+    .unwrap();
+    let mut after = before.transition(&request).unwrap();
     let old = before.view.current_incarnation().unwrap().get();
     after.view.retired_through = old;
     after.view.stamp.as_mut().unwrap().namespace.incarnation =

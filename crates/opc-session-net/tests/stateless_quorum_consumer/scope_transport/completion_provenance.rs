@@ -121,10 +121,15 @@ pub(super) async fn check(
         }
         let altered: ScopeBatchRequest = serde_json::from_value(altered).unwrap();
         assert_ne!(&altered, request, "fixture really changes {field}");
-        assert!(
+        assert_eq!(
             client
                 .verify_batch_completion(authority, &altered, completion)
-                .is_err(),
+                .err(),
+            Some(if field == "stamp" {
+                ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized)
+            } else {
+                ScopeBatchError::OutcomeUnknown
+            }),
             "{field}"
         );
     }

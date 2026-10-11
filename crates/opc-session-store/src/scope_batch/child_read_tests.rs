@@ -52,14 +52,23 @@ fn child_read_rejects_invalid_sets_from_constructors_and_raw_peers() {
         .encode_canonical()
         .unwrap();
     for end in 0..bytes.len() {
-        assert!(ScopeChildReadRequest::decode_canonical(&bytes[..end]).is_err());
+        assert_eq!(
+            ScopeChildReadRequest::decode_canonical(&bytes[..end]).err(),
+            Some(ScopeBatchError::InvalidRequest)
+        );
     }
     let mut trailing = bytes.clone();
     trailing.push(0);
-    assert!(ScopeChildReadRequest::decode_canonical(&trailing).is_err());
+    assert_eq!(
+        ScopeChildReadRequest::decode_canonical(&trailing).err(),
+        Some(ScopeBatchError::InvalidRequest)
+    );
     let mut oversized = bytes;
     oversized[..2].copy_from_slice(&u16::MAX.to_be_bytes());
-    assert!(ScopeChildReadRequest::decode_canonical(&oversized).is_err());
+    assert_eq!(
+        ScopeChildReadRequest::decode_canonical(&oversized).err(),
+        Some(ScopeBatchError::InvalidRequest)
+    );
 }
 
 #[test]
@@ -105,18 +114,27 @@ fn child_read_record_rejects_noncanonical_invalid_and_deleted_records() {
             7 => invalid.value = None,
             _ => invalid.value = Some(ScopeSealedValue(Zeroizing::new(vec![0; 8]))),
         }
-        assert!(invalid.encode_canonical().is_err(), "field {field}");
+        assert_eq!(
+            invalid.encode_canonical().err(),
+            Some(ScopeBatchError::InvalidRequest),
+            "field {field}"
+        );
         let raw = postcard::to_allocvec(&invalid).unwrap();
-        assert!(
-            ScopeChildRecord::decode_canonical(&raw).is_err(),
+        assert_eq!(
+            ScopeChildRecord::decode_canonical(&raw).err(),
+            Some(ScopeBatchError::InvalidRequest),
             "raw field {field}"
         );
     }
     let mut bytes = row.encode_canonical().unwrap();
     bytes.push(0);
-    assert!(ScopeChildRecord::decode_canonical(&bytes).is_err());
-    assert!(
-        ScopeChildRecord::decode_canonical(&vec![0; MAX_SCOPE_CHILD_VALUE_BYTES + 8193]).is_err()
+    assert_eq!(
+        ScopeChildRecord::decode_canonical(&bytes).err(),
+        Some(ScopeBatchError::InvalidRequest)
+    );
+    assert_eq!(
+        ScopeChildRecord::decode_canonical(&vec![0; MAX_SCOPE_CHILD_VALUE_BYTES + 8193]).err(),
+        Some(ScopeBatchError::InvalidRequest)
     );
 }
 

@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Counter name for the bounded snapshots returned by
-/// [`scope_transport_revision_diagnostics`].
+/// Counter exported by the SDK metrics registry with fixed role, purpose and
+/// direction labels. The diagnostic snapshots retain authentication and recovery state.
 pub const SCOPE_TRANSPORT_REVISION_MISMATCH_COUNTER: &str =
     "scope_transport_revision_mismatch_total";
 
@@ -153,6 +153,11 @@ impl DiagnosticContext {
         (self.role as usize * 5 + self.purpose as usize) * 2 + self.direction as usize
     }
     fn record(self, proven: bool) {
+        opc_redaction::metrics::METRICS.record_scope_transport_revision_mismatch(
+            self.role.label(),
+            self.purpose.label(),
+            self.direction.label(),
+        );
         if DIAGNOSTICS.record(self, proven, Instant::now()) {
             tracing::warn!(
                 reason = "scope_transport_revision_mismatch",

@@ -161,29 +161,19 @@ impl ScopeKernelAuthority<NativeScopeAuthority> {
     /// Bind a stateless worker to its actual protected native client and genuine
     /// committed capability. Construction verifies Current once; readback and
     /// later rechecks use one current-child cut and the activation's trusted class.
-    /// `class` validates the caller's data-work context; the existing Current
-    /// method uses its reserved control path and cannot establish an effect class.
+    /// The existing Current method uses its reserved control path and cannot
+    /// establish an effect class; the verified completion supplies that class.
     pub async fn from_scope_client(
         lifecycle: LocalKernelLifecycle,
         execution: ScopeExecution,
         committed: CommittedScopeAuthority,
         client: opc_session_net::scope::ScopeClient,
-        class: ScopeWorkClass,
         attempt: std::time::Duration,
     ) -> Result<Self, LocalEffectError> {
         committed
             .check_execution(&execution)
             .map_err(|_| LocalEffectError::Stale)?;
-        if client.execution() != &execution
-            || attempt.is_zero()
-            || !matches!(
-                class,
-                ScopeWorkClass::Normal
-                    | ScopeWorkClass::Emergency
-                    | ScopeWorkClass::EmergencyClassification
-                    | ScopeWorkClass::Maintenance
-            )
-        {
+        if client.execution() != &execution || attempt.is_zero() {
             return Err(LocalEffectError::WrongRequest);
         }
         if lifecycle.effects_closed() {

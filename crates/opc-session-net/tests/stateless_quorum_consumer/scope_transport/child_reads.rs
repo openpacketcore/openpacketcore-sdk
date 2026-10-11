@@ -229,6 +229,21 @@ fn run(builder: bool, provenance: bool, name: &str) {
             assert!(matches!(client.submit(&close, Duration::from_secs(2)).await.unwrap(), ScopeAuthorityReply::Closed(_)));
             assert_eq!(client.read_child(&authority, key(1), ScopeWorkClass::Normal, Instant::now() + Duration::from_secs(2)).await,
                 Err(ScopeChildReadError::Batch(ScopeBatchError::Scope(ScopeAuthorityError::StaleAuthority))));
+            let barriers = fleet.read_barrier_calls();
+            let log = fleet.stores[leader].status().last_log_index;
+            let tls = client_tls(&pki, &worker, &follower.to_string());
+            let stream = tls.begin_handshake().unwrap().connect_scope(
+                tokio::net::TcpStream::connect(handle.addresses()[3]).await.unwrap(),
+                binding.tls_domain().unwrap()).await.unwrap();
+            let request = ScopeChildReadRequest::new(authority.stamp(), vec![key(1)]).unwrap();
+            let (_, reply) = crate::scope::attack_test_support::cross_slot::child_read_with_boot_on(
+                process.boot(), stream, &request, Class::Normal, 63, &ScopeClock).await;
+            assert_eq!(reply.status, 5, "the voter returns a typed batch error after Close");
+            assert_eq!(ScopeBatchError::decode_canonical(&reply.body).unwrap(),
+                ScopeBatchError::Scope(ScopeAuthorityError::StaleAuthority));
+            assert_eq!(fleet.read_barrier_calls(), barriers + 1,
+                "the raw read reaches the voter's complete barrier despite the client's closed gate");
+            assert_eq!(fleet.stores[leader].status().last_log_index, log);
             handle.shutdown().await;
         })).catch_unwind().await;
         fleet.quiesce().await;

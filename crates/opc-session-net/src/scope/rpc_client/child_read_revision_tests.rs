@@ -5,19 +5,19 @@ use crate::scope::{
     ScopeTransportRole as Role,
 };
 
-struct Fixture {
-    client: ScopeClient,
-    authority: Box<CommittedScopeAuthority>,
-    peer: Arc<Peer>,
+pub(super) struct Fixture {
+    pub(super) client: ScopeClient,
+    pub(super) authority: Box<CommittedScopeAuthority>,
+    pub(super) peer: Arc<Peer>,
     legacy: Arc<AtomicBool>,
-    handshakes: Arc<AtomicUsize>,
+    pub(super) handshakes: Arc<AtomicUsize>,
     owner: ScopeSchedulerOwner,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     _directory: tempfile::TempDir,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let identity = SessionConsensusIdentity::new(
             SessionConsensusClusterId::from_bytes([1; 32]),
             SessionConsensusConfigurationId::from_bytes([2; 32]),
@@ -113,6 +113,9 @@ impl Fixture {
                 let mut connections = tokio::task::JoinSet::new();
                 loop {
                     let (socket, _) = listener.accept().await.unwrap();
+                    // Match the real voter socket, including TCP_NODELAY for
+                    // the separately framed challenge and Result payloads.
+                    crate::scope::socket::configure(&socket).unwrap();
                     let handshake = tls.begin_handshake().unwrap();
                     let use_legacy = class == Class::Normal && legacy.load(Ordering::SeqCst);
                     if class == Class::Normal {
@@ -169,7 +172,7 @@ impl Fixture {
         }
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         for task in self.tasks {
             task.abort();
             let _ = task.await;
