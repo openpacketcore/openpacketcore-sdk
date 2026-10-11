@@ -65,6 +65,32 @@ pub(crate) struct ChildReadCut {
     check: ReadCheck,
     // Fixed-topology reads retain their existing topology admission semantics.
     _admission: Option<ConsumerScopeAdmission>,
+    #[cfg(any(test, feature = "test-control"))]
+    _capture_count: CaptureCount,
+}
+
+#[cfg(any(test, feature = "test-control"))]
+struct CaptureCount(ConsensusSessionStore);
+
+#[cfg(any(test, feature = "test-control"))]
+impl CaptureCount {
+    fn new(store: &ConsensusSessionStore) -> Self {
+        store
+            .inner
+            .scope_child_read_cuts_for_test
+            .fetch_add(1, Ordering::AcqRel);
+        Self(store.clone())
+    }
+}
+
+#[cfg(any(test, feature = "test-control"))]
+impl Drop for CaptureCount {
+    fn drop(&mut self) {
+        self.0
+            .inner
+            .scope_child_read_cuts_for_test
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ChildReadCut {
@@ -334,6 +360,8 @@ impl ConsensusSessionStore {
             })?;
             check.check().map_err(unavailable)?;
             Ok(ChildReadCut {
+                #[cfg(any(test, feature = "test-control"))]
+                _capture_count: CaptureCount::new(&store),
                 backend,
                 headers,
                 store,
@@ -391,6 +419,14 @@ impl ConsensusSessionStore {
         let state = Arc::new(crate::scope_batch::child_read_control::PauseState::default());
         *self.inner.scope_child_read_pause.lock().unwrap() = Some((stage, state.clone()));
         ScopeChildReadPause(state)
+    }
+
+    /// Number of opened child cuts still owning their backend and admission resources.
+    #[cfg(any(test, feature = "test-control"))]
+    pub fn scope_child_read_cuts_for_test(&self) -> u64 {
+        self.inner
+            .scope_child_read_cuts_for_test
+            .load(Ordering::Acquire)
     }
 
     #[cfg(any(test, feature = "test-control"))]

@@ -1,4 +1,7 @@
 //! Raw test peers deliberately bypass the SDK's own-key and local-gate checks.
+#[path = "cross_slot_child_read.rs"]
+mod child_reads;
+
 use super::super::{
     proof::{PossessionClaims, PossessionProof},
     wire::*,

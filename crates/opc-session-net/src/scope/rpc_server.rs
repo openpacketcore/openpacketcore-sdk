@@ -120,6 +120,13 @@ impl ScopeServer {
         self.proofs.waiting(class, ProofShare::WorkerUnproven)
     }
     #[cfg(test)]
+    pub(crate) fn child_read_proof_usage_for_test(&self, class: Class) -> (usize, usize) {
+        (
+            self.proofs.used(class, ProofShare::WorkerUnproven),
+            self.proofs.used(class, ProofShare::WorkerCurrent),
+        )
+    }
+    #[cfg(test)]
     pub(crate) fn lose_next_scan_reply_for_test(&self) {
         self.drop_scan_reply
             .store(true, std::sync::atomic::Ordering::Release);
