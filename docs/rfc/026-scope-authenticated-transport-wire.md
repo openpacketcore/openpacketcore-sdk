@@ -1,4 +1,4 @@
-# RFC 026 wire appendix: scope transport version 1
+# RFC 026 wire appendix: scope transport
 
 This normative appendix accompanies [RFC 026](026-scope-authenticated-transport.md).
 It freezes startup proof, local context, exporter context, scope header,
@@ -9,6 +9,152 @@ public fixtures; they are not credentials or runtime qualification. Store
 profile integration must compare these vectors with the landed core helpers
 before advertising the profile. Changing a layout changes the wire/profile
 contract; do not infer a layout from a Rust struct's memory representation.
+
+## Proposed revision 2
+
+This section specifies the [child-read addendum](026-scope-child-point-read.md),
+pending design review and implementation. The following older sections describe
+revision 1 unless overridden here. Existing authority/startup and batch JSON
+files remain revision-1 implementation fixtures during design review; their
+`format` labels are fixture-schema versions, **not** transport revisions.
+The separate [revision-2 vectors](026-scope-transport-revision2-vectors.json)
+regenerate all their scope frames and affected cryptographic inputs. Reproduce
+them with `python3 docs/rfc/026-scope-transport-revision2-vectors.py --check`.
+That independent reference script uses synthetic public fixtures, never runtime
+credentials. Matching vectors is not runtime qualification.
+
+### Changed and unchanged bytes
+
+| Item | Revision 2 contract |
+| --- | --- |
+| Four scope-purpose ALPNs | `scope-request`, `scope-response`, `boot-liveness` and `boot-candidate` all use the exact ASCII `opc-scope/2` (hex `6f70632d73636f70652f32`) |
+| Header | Same 128-byte layout; offsets 4–5 become `00 02` on **every** Call, Challenge, Proof, Result and TicketNotice |
+| Exporter context | Only the scope ALPN field changes: `LP16(ALPN) = 00 0b 6f 70 63 2d 73 63 6f 70 65 2f 32`. Therefore each scope-purpose context hash and binding changes |
+| Exporter label/purpose strings | Unchanged, including `EXPERIMENTAL-openpacketcore-channel-binding-v1`; voter-management and consensus ALPNs/bindings are unchanged |
+| Possession/response inputs | Existing domains, `U16(1)` input-version fields and directions remain unchanged. Embedded header and corresponding CB change, hence digests/signatures change |
+| Startup input | Existing `…/boot-liveness/v1\0` and `…/boot-candidate/v1\0` domains, `U16(1)`, method/direction and local-context bytes remain unchanged. Only the CB changes within StartupInput; its outer frame becomes 2 |
+| Startup connection and notices | Issuer-to-worker liveness/candidate traffic and the retained connection carrying TicketNotice all use ALPN/frame 2. Startup Call still wraps its canonical body in `caller_nonce:B[32] || LP32(body)`. Notice page version remains 1; page/payload, notice ID/digest and redelivery bytes stay identical |
+| Immutable requests/digests | Methods 1–16 retain exact canonical bytes, domain literals and digests, including `…/scope/read/v1\0` and `…/scope/scan/v1\0`. Method 17 adds its distinct domain below |
+| Stored/profile bytes | Authority/profile, ticket, Pod-token, batch command/outcome/receipt/error, sealed envelope and closure-evidence formats/digests do not change |
+| Class/kind/flags/correlation | Existing values and binding remain unchanged; reads and errors always have zero own-execution digest |
+
+All scope roles cross revision 2 together at a **fresh installation**. No ALPN
+fallback or mixed revision-1/2 operation. No-common-ALPN failure on either TLS
+endpoint and frame version 1 on a negotiated revision-2 connection surface
+`TransportRevisionMismatch`, separately from invalid input, authentication,
+Retry and Unavailable. Emit a value-free counter and log on both endpoints;
+never retry this permanent configuration result automatically. It is not
+no-effect evidence for a pending mutation. Startup, RPC, batch/coordinator and
+local-effect public errors retain the distinction; a local-only batch mismatch
+variant cannot enter canonical error/receipt serialization.
+Use counter `scope_transport_revision_mismatch_total` and log reason
+`scope_transport_revision_mismatch`; only bounded role/purpose/direction labels
+are permitted, with no peer identity, request bytes or credential values.
+
+For revisions after 2, negotiate N/N−1 for one release and enable N-only
+behavior once relevant peers support N; N+1 may drop N−1, as the later-release
+policy tracked by [#1227](https://github.com/openpacketcore/openpacketcore-sdk/issues/1227)
+requires. This does not make revision 2 an in-service upgrade.
+
+### Complete method and status tables
+
+The byte at header offset 9 is:
+
+| Method | Name | Canonical request / contract |
+| ---: | --- | --- |
+| 1 | AdmitInitial | Core authority request |
+| 2 | SucceedClosed | Core authority request |
+| 3 | Close | Core authority request |
+| 4 | ApplyBatch | Core batch request, RFC 027 |
+| 5 | Current | P(ScopeId) |
+| 6 | Outcome | P(ScopeId), target ID and digest |
+| 7 | Liveness | Startup request; issuer challenge |
+| 8 | Candidate | Startup request; also the TicketNotice method tag |
+| 9 | BatchReopen | P(Stamp), RFC 027 |
+| 10 | BatchCancel | P(Attempt), RFC 027 |
+| 11 | BatchLookup | P(Attempt), RFC 027 |
+| 12 | ScanOpen | ScopeScanRequest::Open, RFC 028 |
+| 13 | ScanPage | ScopeScanRequest::Page, RFC 028 |
+| 14 | ScanLookup | ScopeScanRequest::Lookup, RFC 028 |
+| 15 | ScanClassify | ScopeScanRequest::Classify, RFC 028 |
+| 16 | ScanClose | ScopeScanRequest::Close, RFC 028 |
+| 17 | ChildRead | Bounded stamp/key set below; new in revision 2 |
+
+Methods 12–16 and status 6 already belong to revision 1 through RFC 028.
+Methods 1–6 and 9–17 use the worker challenge/proof exchange; startup remains
+separate. These closed method tags and their live role/class policy still apply.
+
+| Status | Name | Result body |
+| ---: | --- | --- |
+| 0 | ProvenNoEffect | U16 reason 1 Invalid, 2 Unauthorized, 3 Retry, 4 AuthTimeUnavailable, 5 ProfileUnavailable |
+| 1 | Committed | Method-specific canonical authority/batch outcome or cancellation receipt |
+| 2 | OutcomeUnknown | Empty |
+| 3 | Obsolete | U8 reason 1 Superseded, 2 Closed, 3 Retired, 4 ReceiptUnavailable |
+| 4 | CurrentView | Method-specific authority current/outcome or batch reopen/lookup observation |
+| 5 | BatchError | Existing canonical P(ScopeBatchError), unchanged |
+| 6 | ScanObservation | Existing canonical RFC 028 scan observation |
+| 7 | ChildObservation | Complete child set or no-observation refusal below; new in revision 2 |
+
+Unknown tags are invalid. Method 17 accepts statuses 0, 2, 5 and 7 only; any
+other status is `Unavailable` to its caller. Revision mismatch is an endpoint
+error, not a new on-wire status or stored error tag. The pre-challenge status-0
+form remains exactly nonce/header-correlated and TLS-authenticated as specified
+below; no possession proof is implied by that early refusal.
+
+### ChildRead bytes and bounds
+
+`P` and lengths retain the primitives below. Key order is caller order;
+duplicates and zero keys are invalid. The full stamp binds namespace and boot.
+
+```text
+request = LP16(P(Stamp)) || count:U8 || child_key:B[32] * count
+D = H("openpacketcore/scope/child-read/v1\0" || U8(17)
+      || request_id:B[16] || request)
+
+ChildObservation = kind:U8 || contents
+kind 0 contents = LP16(P(Namespace)) || count:U8 || entry * count
+entry = child_key:B[32] || present:U8
+      || (LP32(P(ScopeChildRecord)) if present == 1)
+kind 1 contents = empty                     # ObservationTooLarge
+
+P(ScopeChildRecord) = P(Namespace) || child_key:B[32]
+                   || P(birth:u64) || P(generation:u64) || P(batch_revision:u64)
+                   || P(Some(sealed_bytes)) || P(claim_count) || claim:B[32] * claim_count
+P(Some(sealed_bytes)) = 01 || P(byte_length) || sealed_bytes
+```
+
+Count is 1–32. Presence is exactly 0 or 1. A successful response repeats the
+requested namespace, count and each key in order, including absent keys.
+A present record's namespace/key must equal both request and echo, its value
+must exist, and its birth/generation/batch revision must be in 1..=COUNTER_MAX (2^63−1).
+Require at most eight distinct nonzero claims and the canonical bounded
+envelope; compare canonical re-encoding exactly. The consumer still checks
+envelope authentication and logical AAD. No observation carries a capability.
+
+The request bound is `2 + MAX_SCOPE_AUTHORITY_RECORD_BYTES + 1 + 32*32 = 5123`
+bytes; enforce its LP16/count/key bounds before allocation. Its Call adds
+36 payload bytes and the 128-byte header. A record has the existing 1 MiB
+sealed-value bound and a conservative `MAX_SCOPE_CHILD_VALUE_BYTES + 8192`
+canonical-record cap. Apply both the per-record and aggregate cap before
+allocating or accepting declared lengths/counts.
+
+The complete Call/Result frame limit stays `2*1024*1024 + 512 = 2097664`.
+The Result envelope is 69 bytes and the header 128, leaving **2097467 bytes**
+for its body (including kind, namespace, count, keys and record prefixes).
+Kind 1 is exactly `01` with no entries; its complete Result is 198 bytes.
+The server buffers/size-checks within the aggregate bound before emitting any
+observation. If the full set cannot fit, emit only kind 1; never truncate or
+stream partial entries. The caller may explicitly split, obtaining separate
+cuts. Reject an over-cap incoming frame before reading its payload.
+
+New vectors include request/D, Call/Challenge/Proof, all-present, all-missing,
+mixed and too-large Results, their response bindings, and validly framed
+negative contents. Oversize vectors use bounded prefixes/declarations instead
+of embedding multi-megabyte buffers. Existing frame-containing vectors are
+regenerated, including possession/response inputs; startup proof signatures and
+new startup/notice outer-frame vectors use the new bindings/revision. Unchanged
+canonical requests, ticket pages, stored bytes and non-scope bindings are copied
+verbatim and checked for equality.
 
 ## Primitives and identities
 
@@ -168,7 +314,7 @@ untimed profile; negotiation cannot select the timed predecessor.
 | 6 | 1 | Kind: 1 Call, 2 Challenge, 3 Proof, 4 Result, 5 TicketNotice |
 | 7 | 1 | Class: 0 SafetyControl, 1 Emergency, 2 Normal, 3 Maintenance |
 | 8 | 1 | Emergency bucket: 0 none, 1 established, 2 classification |
-| 9 | 1 | Method: 1 AdmitInitial, 2 SucceedClosed, 3 Close, 4 ApplyBatch, 5 Current, 6 Outcome, 7 Liveness, 8 Candidate, 9 BatchReopen, 10 BatchCancel, 11 BatchLookup |
+| 9 | 1 | Method: see the complete table above; 1–16 in revision 1, 1–17 in revision 2 |
 | 10 | 2 | Flags, U16 = 0 |
 | 12 | 32 | Installation I |
 | 44 | 32 | Scope commitment K |
@@ -186,7 +332,7 @@ One pooled connection has one in-flight call/proof exchange.
 A Call payload is `caller_nonce:B[32] || LP32(canonical_request)`. The caller
 chooses a fresh nonzero OS-random nonce per attempt, outside D; this distinguishes
 responses to exact retries. Startup uses the startup request body above.
-For worker calls (methods 1–6 and 9–11), the receiver sends a Challenge payload
+For worker calls (methods 1–6 and 9–16 in revision 1), the receiver sends a Challenge payload
 `challenge:B[32]` after authorization, bounded body decoding and proof reservation.
 Before that challenge it may instead send a correlated Result with status
 `ProvenNoEffect`, a zero `own_execution_digest`, and one U16 reason from 1–5
@@ -464,7 +610,7 @@ caller_nonce:B[32] || status:U8 || own_execution_digest:B[32] || LP32(result_bod
 ```
 
 Status codes are 0 ProvenNoEffect, 1 Committed, 2 OutcomeUnknown, 3 Obsolete,
-4 CurrentView, 5 BatchError. Unknown has an empty result body. ProvenNoEffect carries a
+4 CurrentView, 5 BatchError, 6 ScanObservation (RFC 028). Unknown has an empty result body. ProvenNoEffect carries a
 U16 reason (1 Invalid, 2 Unauthorized, 3 Retry, 4 AuthTimeUnavailable,
 5 ProfileUnavailable). Obsolete carries U8 (1 Superseded, 2 Closed, 3 Retired,
 4 ReceiptUnavailable). These are closed enums in wire version 1.

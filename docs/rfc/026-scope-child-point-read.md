@@ -1,200 +1,279 @@
-# RFC 026 addendum: worker child point reads
+# RFC 026 addendum: bounded worker child reads
 
-Status: proposed; design review precedes implementation. Resolves the API gap in
-[#1221](https://github.com/openpacketcore/openpacketcore-sdk/issues/1221).
-The follow-on adapter in [#1225](https://github.com/openpacketcore/openpacketcore-sdk/issues/1225)
-uses this read; its implementation follows the reviewed child-read implementation.
-Applies to [RFC 026](026-scope-authenticated-transport.md) and
-[RFC 027](027-scope-batch-lanes.md); coherent restore remains RFC 028.
+Status: proposed; design review precedes implementation. Addresses
+[#1221](https://github.com/openpacketcore/openpacketcore-sdk/issues/1221) and the
+follow-on authority adapter in [#1225](https://github.com/openpacketcore/openpacketcore-sdk/issues/1225).
+Implement #1221 first, then #1225. Applies to [RFC 026](026-scope-authenticated-transport.md)
+and [RFC 027](027-scope-batch-lanes.md); retained restore remains RFC 028.
 
 ## API and linearization
 
-Add `ScopeClient::read_child(authority, key, class, deadline)`, returning
-`Result<Option<ScopeChildRecord>, ScopeBatchError>`. `authority` is this process's
-`CommittedScopeAuthority`; its stamp supplies the explicit `ScopeNamespace`.
-`key` is a `ScopeChildKey`, never an encoded internal `SessionKey`. The absolute
-caller deadline covers local admission, connection ownership and the exchange.
+Add `ScopeClient::read_children(authority, keys, class, deadline)`, returning
+`Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError>`. Accept **1–32
+distinct nonzero keys**, preserve caller order, and return exactly one entry per
+key. A convenience `read_child` uses the same method with one key.
+`authority` is this process's genuine `CommittedScopeAuthority`; its full stamp
+supplies the explicit namespace. Keys are opaque `ScopeChildKey`, never internal
+`SessionKey`. The deadline is one absolute monotonic `tokio::time::Instant`,
+established before admission and covering admission, connection ownership,
+proof and reply. A Duration wrapper computes it once; no stage restarts it.
 
-The worker checks its scope, execution and live process gate. The server checks
-live principal/scope/method/class policy, TLS authentication, and boot-key
-possession bound to the full requested stamp. Only the current worker may use
-this method. Historical outcome reads keep their existing separate contract;
-this change adds no observer or general claim-read API.
+The worker checks scope, execution and its live process gate. The server checks
+live principal/scope/method/class policy, TLS and boot-key possession against
+the full stamp. Only the current worker may read. Ticket and Pod-bound-token
+verification are inherited through the committed execution; reads recheck the
+boot key and exact active stamp, without reissuing tickets or fetching tokens.
 
-Dispatch through `ScopeBatchStore`, beside its existing `read`. Add a narrow
-`read_current(authenticated, stamp, key)` path: perform the existing complete
-current-configuration ReadIndex barrier, then read the active authority and
-requested child from **one backend cut**. Native uses one admitted immutable
-generation; SQLite uses one read transaction. Require the exact active stamp,
-including namespace, authority revision, execution and admission generation,
-and retain the existing configuration-authority checks before returning.
-Separate unlocked authority and child observations are insufficient. The
-existing unrestricted local observation method need not change semantics.
+Add `ScopeBatchStore::read_current(authenticated, stamp, keys)` beside `read`:
+**one complete current-configuration ReadIndex barrier and one backend cut**
+for active authority and all children. Native uses one admitted immutable
+generation; SQLite one read transaction. Check exact namespace, authority
+revision, execution and admission generation, retaining configuration-authority
+checks. Followers forward the complete barrier and wait for applied position;
+obsolete configuration authority cannot release a result.
 
-A follower uses the existing complete barrier/forwarding path and waits for
-its applied position; a configuration change cannot authorize a reply from an
-obsolete configuration. This path appends no application command, performs no
-TTL or Maintenance proposal, and allocates no replay-lane sequence or retained
-scan. Policy and TLS are revalidated before release of the response.
+Method 17 bypasses the generic RPC path's auxiliary `Current` reads, including
+cached-connection promotion refresh. Verify possession and the carried
+execution's boot key before any barrier. At the sole cut, check active authority
+and the independent current-execution/key binding **before** established
+Emergency dispatch admission. Unproven work uses EmergencyClassification
+capacity; a cached promotion hint alone grants no authority or current credit.
+Hold this bounded cut through class admission and child materialization, at
+most until the original deadline. Backend ownership must not hold a process
+gate or synchronous mutex across an async wait. Count exactly one full barrier
+for the entire successful RPC, on fresh and reused connections.
 
-`None` means missing or a deletion tombstone at the read's linearization point.
-`Some` carries namespace, opaque key, birth, generation, batch revision, the
-complete claim set and canonical sealed envelope. Add the missing public
-`ScopeChildRecord::batch_revision()` accessor and bounded canonical record
-helpers in `scope_batch`; share stored-row validation rather than duplicating
-it in transport. Envelope authentication/decryption and logical AAD checks stay
-with the consumer. The observation never constructs an effect capability.
-Use exact child conditions/CAS after acquiring the entire consumer key set;
-separate point reads do not constitute one multi-key snapshot. A later update
-or delete/recreate must conflict with the old generation or birth.
+`None` means missing or a tombstone at that cut. A present record includes
+namespace, key, birth, generation, batch revision, complete claims and canonical
+sealed envelope. Add `ScopeChildRecord::batch_revision()` and bounded canonical
+helpers sharing stored-row validation. Envelope authentication, decryption and
+logical AAD checks stay with the consumer. Reads cannot construct effect
+capabilities. One call is a multi-key snapshot; separate calls, including
+splits, are not. After acquiring the full consumer key set, exact conditions/CAS
+still protect updates and delete/recreate with a new birth.
 
-## Admission and builder lifetime
+Append no application command, make no TTL or Maintenance proposal, and allocate
+no replay lane, sequence or retained scan. Revalidate live policy and TLS before
+response release.
 
-Standalone reads take one resident/running read reservation under the native
-stable-scope scheduler key, without acquiring a batch lane. The trusted class
-is carried through authenticated framing and class-specific connection,
-handshake, proof and server-dispatch pools. Normal is ordinary foreground work;
-Emergency is established emergency work; EmergencyClassification handles
-unverified classification; Maintenance is background work. SafetyControl is
-refused. The server admits a current Emergency worker before spending its
-Emergency dispatch credit. The existing class-unaware leader ReadIndex FIFO
-boundary remains explicit; this change does not claim isolation beyond it.
+## Admission, whole-builder budget and capacity
 
-Add `ScopeBatchReservation::submit_with_reads` for a post-grant builder with a
-borrowed `ScopeBatchReadContext<'run>`. It exposes the existing build context
-and `read_child(key, deadline)` through the coordinator's trusted
-`ScopeBatchPort::read_child`. The context borrows the running permit, fixes its
-effective class and stamp, and has no public constructor or `Clone`. A mutable
-read borrow permits one such exchange at a time. It cannot escape the builder,
-survive cancellation, or be detached into a task after the permit is released.
-Keep the existing `submit` API for builders that need no child reads.
+Standalone reads reserve native resident/running read capacity under the stable
+scope key, without a lane. Carry trusted Normal, established Emergency,
+EmergencyClassification or Maintenance through authenticated framing and the
+separate listener, connection, handshake, proof and dispatch pools. Refuse
+SafetyControl.
 
-The native port and the local-store adapter reuse that running/resident
-entitlement; neither calls the caller scheduler's `reserve` again. The server's
-independent admission still applies. The read acquires no additional lane; its
-enclosing builder continues to own its original lane until normal transfer or
-cancellation. This must progress with caller resident/running limits of one.
-Take the process gate per polling step, as scan observations do, so a waiting
-read cannot hold graceful Close. Deadline/cancellation releases read resources
-without submitting, cancelling or resolving an application batch.
+Add `ScopeBatchReservation::submit_with_reads` with a borrowed
+`ScopeBatchReadContext<'run>` and required `ScopeBatchReadBudget`. Expose the
+build context and `read_children` through a new trusted `ScopeBatchPort` read
+operation. Native and local adapters reuse the builder's resident/running
+entitlement; neither reserves again. Server admission remains independent.
+Keep existing `submit` for builders without reads.
 
-## Wire revision and bounds
+The context fixes the full stamp and the **running attempt's effective class**,
+including inheritance at grant, as RFC 027 requires. It is not Clone, has no
+public constructor, and serializes reads through a mutable borrow. It cannot
+escape the builder, survive cancellation or be detached. Its enclosing builder
+retains the original lane; reads acquire none. Take the process gate per poll
+so a waiting read cannot hold Close.
 
-Introduce scope transport **revision 2**: TLS ALPN `opc-scope/2`, frame version
-`U16(2)`, and revision-2 process-possession/response-binding inputs and vectors.
-ALPN participates in the TLS exporter context. Reject revision 1 at negotiation
-or framing; there is no old-transport fallback. Independent stored profiles,
-authority digests, ticket schemas and envelope formats do not change.
+The whole-builder budget has one absolute deadline and a caller-selected
+maximum of **1–64 exchanges**, normally one. Debit each attempted call,
+including refusals, splits and retries, before transport admission; exhaustion
+returns `ReadBudgetExceeded` without an exchange. Use the earlier of each
+call's deadline and the unchanged builder deadline. A running Normal builder
+cannot extend lane occupancy with fresh per-key timeouts. Cancellation releases
+read resources without submitting, cancelling or resolving an application batch.
+Splitting is explicit: recursive bisection costs at most 63 calls for 32 keys
+(33 for 17 keys). There is no automatic split or retry loop.
 
-Add method **17 `ChildRead`** and result status **7 `ChildObservation`**. Preserve
-the existing header correlation, fresh caller nonce, proof challenge and TLS
-response binding. `own_execution_digest` is zero on every observation/error.
-Using the wire appendix's `P`, `LP16` and `LP32` notation:
+For a representative attach with 17 predicate keys fitting one response and one
+activation, budget:
 
-```text
-request = LP16(P(Stamp)) || child_key:B[32]
-D = H("openpacketcore/scope/child-read/v1\0" || U8(17)
-      || request_id:B[16] || request)
-observation = LP16(P(Namespace)) || child_key:B[32] || present:U8
-            || (LP32(P(ScopeChildRecord)) when present == 1)
-```
+| Operation | Serialized exchanges |
+| --- | ---: |
+| Coordinator reopen | 1 |
+| Predicate read of all 17 keys | 1 |
+| Apply through the coordinator | 1 |
+| #1225 activation readback | 1 |
+| Each later effect recheck | 1 |
 
-Request limit: `MAX_SCOPE_AUTHORITY_RECORD_BYTES + 34` (4 KiB + 34).
-Observation limit: `MAX_SCOPE_CHILD_VALUE_BYTES + 8192` (1 MiB + 8 KiB).
-The existing outer result adds 69 bytes and its fixed header adds 128; enforce
-these method-specific limits before allocating/reading variable payloads.
-Only presence tags 0/1 are valid. A present record must have a value and match
-both the echoed and requested namespace/key. Validate positive bounded birth,
-generation and batch revision, at most eight distinct nonzero claims, and the
-bounded canonical envelope. Reject trailing bytes, overlong encodings and
-invalid lengths/counts before allocation; canonical re-encoding must agree.
-Missing replies echo the namespace/key too. A valid envelope for another key
-or incarnation is never usable merely because its TLS/header binding passes.
+There is no per-effect `Current` or normal-path outcome lookup. With B predicate
+calls (including refused/split calls) and R later rechecks, budget `3+B+R`.
+An exchange is Call/Challenge/Proof/Result. One pooled connection per worker and
+class serializes exchanges across all lanes. An **illustrative, unmeasured**
+2 ms mean complete exchange gives about 8 ms for B=1/R=0, an upper bound near
+125 attaches/s per worker/class before write quorum, CPU, bandwidth and queueing.
+Large records reduce it.
 
-## Error contract
+At V voters, current-worker proof capacity for a class is V×C (default C=4),
+also bounded by active client connections and each listener's 64 connections.
+A target rate λ requires at least `λ × (3+B+R) × t` concurrent exchanges at
+mean service time t, plus other traffic and headroom. Three voters provide 12
+default current-worker credits per class: the same ideal model gives at most
+1,500 attaches/s aggregate, **not measured capacity**. Proof budgets still
+reserve four roles across five class buckets within 128 total credits per
+voter; increasing C cannot remove those reservations.
 
-| Condition | Public result |
+The leader's ReadIndex admission remains class-unaware FIFO: 64 callers, one
+coalesced round at a time. For Q queued/concurrent callers, plan roughly
+`ceil(Q/64)` rounds, **conditional on bounded round completion**. Proof-bearing
+scope calls are bounded by 128 per voter; count other ReadIndex consumers in Q
+too. Three voters alone can contribute six waves. Elections or unavailable
+quorum provide no time guarantee: expiry gives `Unavailable`. Add leader class
+arbitration when the target Emergency deadline/throughput cannot be met under
+measured, bounded Normal occupancy. Separate transport pools alone cannot
+promise that bound.
+
+## Wire and errors
+
+[The wire appendix](026-scope-authenticated-transport-wire.md#proposed-revision-2)
+pins changed bytes, full enum tables and revision-2 vectors. Method **17
+ChildRead** takes 1–32 keys. Status **7 ChildObservation** returns all entries
+or typed `ObservationTooLarge`, with **no partial observations**. Preserve the
+**2 MiB + 512 byte complete Call/Result cap**, including header. The caller
+may split within its budget; overflow never means missing.
+
+`ScopeChildReadError` distinguishes `Batch(ScopeBatchError)`,
+`ObservationTooLarge`, `ReadBudgetExceeded` and `TransportRevisionMismatch`.
+The latter three add no stored batch-error encoding. Other scope RPC APIs
+preserve mismatch as their own typed variant, including a local-only,
+non-serializable `ScopeBatchError::TransportRevisionMismatch` where the batch
+interface requires it. Canonical batch-error tags and receipt bytes stay fixed.
+
+| Condition | Exact child-read result |
 | --- | --- |
-| Invalid local input or an already elapsed deadline | `InvalidRequest` for invalid input; `Unavailable` for deadline expiry |
-| Class/authorization, obsolete-stamp, retired-scope or verified profile refusal | Preserve `Scope(Unauthorized/StaleAuthority/Retired/ProfileNotActivated)` |
-| Verified stored corruption/incompatible row | `FormatMismatch` |
-| Valid correlated store refusal | Preserve its canonical `ScopeBatchError` through existing `BatchError` framing |
-| Admission closure, unavailable barrier, deadline, TLS/time failure, malformed or mismatched observation | `Unavailable`; never `None`, a conflict, or a final no-effect claim |
-| Existing transport `OutcomeUnknown`, including an ambiguous lost response | Preserve `OutcomeUnknown`; this read alone does not settle any pending batch |
+| Empty/duplicate/zero keys, count >32, invalid local stamp | `Batch(InvalidRequest)` |
+| SafetyControl, wrong listener or principal/scope/process/boot-key policy refusal | `Batch(Scope(Unauthorized))` |
+| Obsolete authority or admission generation, including Close | `Batch(Scope(StaleAuthority))` |
+| Retired scope | `Batch(Scope(Retired))` |
+| Verified inactive profile | `Batch(Scope(ProfileNotActivated))` |
+| Verified corrupt/incompatible stored row | `Batch(FormatMismatch)` |
+| Authenticated canonical store refusal | `Batch(e)`, preserving exact `ScopeBatchError` e |
+| Aggregate exceeds frame limit | `ObservationTooLarge`; no partial result |
+| Whole-builder exchange budget exhausted | `ReadBudgetExceeded` |
+| ALPN mismatch or frame 1 on connection 2 | `TransportRevisionMismatch`, non-retryable |
+| Admission closure, unavailable barrier, zero/elapsed deadline, TLS/time failure, malformed/noncanonical/oversized or mismatched peer observation | `Batch(Unavailable)` |
+| Existing ambiguous transport OutcomeUnknown | `Batch(OutcomeUnknown)` |
 
-An untrusted reply cannot turn a transport/parser failure into a definitive
-store refusal. Decode typed errors only after response authentication and full
-request correlation. A fresh read is safe after an unavailable observation;
-exact retry rules for already submitted mutations remain unchanged.
+No error returns an absent entry or capability. Test every supported canonical
+store-error variant; preserve conflict, cancellation and uncertainty.
+Local mismatch is never serialized as `BatchError`.
+
+Typed store errors require live TLS, nonce and full header/request correlation.
+The existing **pre-challenge ProvenNoEffect** is the explicit exception to
+proof/response-binding processing: TLS authenticates it and its nonce/header
+correlate its fixed reason before proof transmission. Unauthorized maps as
+above; Invalid to `Batch(InvalidRequest)`; Retry/AuthTimeUnavailable/
+ProfileUnavailable to `Batch(Unavailable)`. It proves nothing about a different
+or pending mutation. Parser failure, absence and successful reads likewise
+cannot settle that mutation.
 
 ## Follow-on: native kernel authority (#1225)
 
-Add a concrete `ScopeKernelAuthority::from_scope_client` constructor in
-`opc-local-kernel-lifecycle`, once that crate's local authority has landed. An
-optional `native-scope` feature enables `store` and `opc-session-net`. Retain the
-local constructor. Both backends share the private authority/readback checks,
-local effect owner, reset epoch and bounded consumption state; a caller-supplied
-observation provider must not become a capability factory.
+Use sealed backend type state (`ScopeKernelAuthority<B = LocalScopeAuthority>`):
+preserve the local `ScopeKernelAuthority` constructor and
+`commit_activation`. `from_scope_client` returns
+`ScopeKernelAuthority<NativeScopeAuthority>`, with **no commit_activation
+method**. An optional `native-scope` feature enables `store` and
+`opc-session-net`. The concrete constructor consumes a genuine committed
+capability, local execution/lifecycle and worker ScopeClient, checking their
+identity/scope/process binding. A checked `Current` wrapper may run at
+construction. A caller-supplied observation provider is not a capability factory.
 
-The native constructor consumes a real `CommittedScopeAuthority`, the local
-`ScopeExecution` and lifecycle, and a concrete worker `ScopeClient` with a data
-class and bounded attempt budget. It verifies that capability, client, process
-and scope agree. Add a checked current-authority wrapper to `ScopeClient` for
-this binding; it uses the existing full-round `Current` RPC and SafetyControl
-read admission. Child and exact batch-outcome reads use the configured data
-class. The constructor and each effect recheck retain local fence checks and
-the complete current-stamp, retirement and admission-generation checks.
+The consumer commits through the **shared batch coordinator**, retains the
+original full request and supplies its committed completion to
+`readback_activation` **before ack(attempt)**. Carry an opaque
+native-authenticated completion provenance token from the concrete ScopeClient
+apply/reconciliation path through the coordinator, binding client/process,
+stamp, full request digest, lane, sequence, trusted effect class and outcome.
+It is neither serializable nor publicly constructible. A deserializable
+`ScopeBatchOutcome` or a completion synthesized by an arbitrary public
+`ScopeBatchPort` is insufficient. Reconnection preserves provenance for the same
+bound execution, never retagging another client/attempt's result.
 
-Provide shared verification/recovery of an activation's **original full batch
-request**, using native `batch_outcome(request.attempt())` and this child read.
-Require an authenticated `Applied` outcome matching the complete request,
-lane, sequence and operation index; compare the child's namespace, key, birth,
-generation, sealed bytes and complete claims. Also compare its exposed batch
-revision with the applied outcome revision in both backends. Keep the current
-read before and after child verification. Only this composed check, under the
-held committed authority and local epoch, may yield a local effect token.
-Neither an observed stamp nor a matching child alone is sufficient.
+Require Applied, `matches_request` against the original full request, and a
+valid non-delete operation index. One method-17 read verifies exact active stamp
+and child's namespace, key, birth, generation, **batch revision equal to the
+outcome revision**, sealed bytes and complete claims. Share checks with the
+local adapter, including the new batch-revision comparison. Combine with local
+fence, reset epoch, single effect owner and bounded shared consumption before
+issuing a token. Rechecks repeat the one-cut child/current-stamp validation and
+local checks. **Neither path surrounds the child read with two Current calls.**
 
-New mutations continue through the shared batch coordinator, with its original
-request and reconciliation ownership; the adapter adds no raw apply shortcut,
-new lane, automatic acknowledgement or rebuilt retry. Preserve the local commit
-entry point and add the shared readback entry point for already submitted
-activations. `NotRecorded` and `Pruned` remain unknown; authenticated `Cancelled`
-and `NotApplied` may prove no effect. Transport/parser failures remain
-`Unavailable` or `OutcomeUnknown` before the existing `LocalEffectError`
-mapping. Rechecks outside a builder use standalone read admission; any predicate
-inside a builder uses the borrowed read context, never a nested reservation.
+Each readback/recheck takes the effect's **trusted work class from its activation
+submission**, matching bound provenance. Constructor class is only a default
+for unrelated setup/recovery. Refuse SafetyControl. Normal never spends
+Emergency capacity; Emergency rechecks must progress while Normal is saturated.
+Keep the effect's original trusted class distinct from the scheduler's inherited
+running class: a temporary lane priority boost cannot promote an ordinary
+effect's later standalone rechecks into Emergency capacity.
+Builder predicates use the borrowed running context; other checks use
+standalone read admission.
 
-No further wire method or revision is needed. Run the existing authority
-verification cases unchanged for both adapters, plus native TLS faults for
-wrong principal/process/scope, stale authority, substituted rows/outcomes and
-lost replies. Prove read-only verification appends no application command and
-holds no lane. Preserve cancellation-safe Close, drain and contained reset;
-transport loss prevents new effects without resetting published forwarding.
-The consumer's disruption policy still protects emergency sessions. Restart
-uses the existing local cleanup and fresh committed authority, with no node or
-operator recovery step.
+Exact-outcome lookup is only recovery of a lost supervised completion:
+authenticate provenance and match the full original request. No normal-path
+duplicate lookup, raw ApplyBatch, extra lane, rebuilt retry or automatic ack.
+Ack permits receipt pruning on lane reuse: early-ack `Pruned` and `NotRecorded`
+are unknown and yield no token. Only authenticated exact Cancelled/NotApplied
+evidence proves no effect. Preserve unavailable/unknown through existing
+local-effect refusal; expose `LocalEffectError::TransportRevisionMismatch`
+distinctly.
 
-## Qualification and operation
+## Qualification: guards, tests and mutations
 
-Start implementation with REDs from #1221: correctly framed/authenticated
-responses containing another key or namespace; wrong process, boot key,
-principal or scope (including one principal with two slots); policy change and
-stale admission/authority generations; delete/recreate with a new birth and
-update with a new generation; malformed/noncanonical/oversized records and
-envelopes; follower reads, configuration cutover and dropped replies. Observe
-fresh ordered writes through the read and reject replay of an earlier response.
+Write **failing tests first**. Each mutation below must fail its protecting
+test. Use held gates, paused Tokio time and authenticated scripted peers,
+not sleeps. Wrong-content replies have valid TLS, fresh nonce and recomputed
+binding, so they reach the target guard. Combine native TLS, parser and backend
+tests; preserve all existing assertions and deadlines.
 
-Also prove no application append, no standalone lane/sequence change, no effect
-capability issuance, and progress of a post-grant predicate read with the caller
-budget saturated by its own builder. Cover borrowed-context escape rejection,
-cancellation/Close, and rejection of transport revision 1. Test native TLS plus
-both backend cuts; retain every existing assertion and deadline. Run full local
-gates on the final candidate before handoff.
+| Guard | Test and exact assertion | Mutation that must fail |
+| --- | --- | --- |
+| Echo namespace/count/ordered keys | Swap each in a validly bound reply: `Batch(Unavailable)`, never absence | Remove each comparison |
+| Record namespace/key | Correct echo, wrong record: `Batch(Unavailable)` | Remove each record/request comparison |
+| Canonical bytes, versions, claims, envelope | Overlong/trailing bytes, zero/overflow birth/generation/batch revision, duplicate/ninth claim, malformed envelope: `Batch(Unavailable)` | Bypass each validator/re-encoding |
+| Presence/result tags | Unknown tag or present-without-value: `Batch(Unavailable)` | Accept unknown tag or present tombstone |
+| Bounds before allocation | Counts 0/33, excessive LP lengths, oversized frame; bounded allocator sees no prohibited allocation | Allocate before each bound |
+| Atomic aggregate | Mixed presence, 1/17/32 keys; too large gives only `ObservationTooLarge`; split calls use separate cuts | Truncate, silently mark missing, exceed cap |
+| Exact stamp at one cut | Hold after full barrier **before opening cut**, commit Close (separately succession), release: `Batch(Scope(StaleAuthority))`, no records, on native and SQLite | Check authority before held gate or children from another cut |
+| Full barrier/configuration | Ordered write through follower; held cutover revalidates or gives `Batch(Unavailable)`; exactly one full barrier per success | Skip round/applied/config check or add Current |
+| Both boot-key comparisons | Add method 17 to `native_scope_shared_identity_cannot_sign_for_another_slots_boot`: A's key signing B's stamp gets Unauthorized **before any read barrier**, unchanged log/frontiers; A's stamp on B's scope also Unauthorized. Retain inconsistent-retained-record case and B positive controls | Independently remove carried-execution/key and retained/current-execution/key comparisons; each full native test fails |
+| Live policy/process/generation | Held revocation/wrong process/principal/scope: Unauthorized; stale generation: StaleAuthority | Reuse cached grant or compare only namespace |
+| Class/currentness | SafetyControl/wrong listener: Unauthorized; stale Emergency boot spends no Emergency dispatch credit; #1225 Emergency progresses with Normal full | Ignore class/listener/currentness or force one fixed class |
+| Absolute deadline/budget | Hold admission, connection lock, exchange separately; paused-time expiry: `Batch(Unavailable)`; exhausted budget: `ReadBudgetExceeded`, no call; later read cannot restart budget | Reset timeout per stage/read or omit debit |
+| Borrowed permit/cancellation | Caller resident/running limits 1: 17-key builder progresses; compile-fail escape/detach; cancel/Close release resources | Nested reserve, Clone/owned context, held process gate |
+| Every error-table row | Script each exact variant, every canonical batch error and pre-challenge reason; never absent or pending-mutation no-effect | Collapse variants, trust unauthenticated error, infer no-effect |
+| No side effects | Compare application log index, all lane sequences/receipts, TTL/Maintenance counters; no capability-producing API | Enter proposal/lane path or fabricate capability |
+| Update/delete-recreate | Later update/recreate makes old child condition conflict; observe changed generation/birth | Ignore either version |
+| Freshness/uncertainty | Replay nonce/request or drop reply after proof: Unavailable/OutcomeUnknown as applicable, never absence | Remove correlation or map loss to absence |
+| Revision/startup | TLS mismatch both directions, frame 1 on connection 2, issuer/worker startup and retained TicketNotice: non-retryable mismatch plus value-free signals | Fallback, map to Retry, leave purpose/frame at 1 |
+| Activation provenance/ack | Reject forged outcome/port completion, altered request/row/batch revision/class, early-ack Pruned, epoch change, duplicate consumption; compile-fail native commit_activation | Remove each provenance/readback/fence/consumption guard or expose raw commit |
+| Independent bytes | Reference script reproduces all revision-2 frames, exporters, proof/bindings and child positive/negative vectors; implementation matches | Change version, unchanged domain/input version, order or bound |
 
-Restart discards only in-flight read observations and retries under fresh
-authentication. Revision mismatch during rollout produces retryable transport
-unavailability until both endpoints use revision 2. No node cleanup, volume
-conversion or operator recovery step is introduced. Existing scope ownership,
-pending mutation reconciliation and emergency forwarding are unaffected by a
-read timeout, restart or dropped response.
+Run existing local authority cases against both adapters, plus native failures,
+Close/drain/reset/restart. Run full local gates on the candidate before handoff.
+
+## Installation and lifecycle
+
+Revision 2 is **fresh-install only**, consistent with RFC 026: no mixed-revision
+rollout or fallback, and no stored-format change. Both endpoints emit a
+value-free mismatch counter/log and typed non-retryable
+`TransportRevisionMismatch` on ALPN mismatch; reject frame 1 before body
+allocation. It is never retryable unavailability or pending-mutation no-effect.
+The coordinator surfaces this terminal transport configuration error and stops
+automatic retries while retaining any unresolved exact attempt for recovery;
+it does not acknowledge, cancel or infer an outcome from the mismatch.
+
+For later revisions, accept N and N−1 for one release, negotiated per connection;
+enable N-only behavior after relevant peers support N, and N+1 may drop N−1.
+[SDK #1227](https://github.com/openpacketcore/openpacketcore-sdk/issues/1227)
+tracks voter compatibility; this later-release policy also applies to scope
+endpoints. Revision 2's fresh-install boundary is not an in-service upgrade.
+
+Restart discards in-flight observations and obtains fresh authentication.
+Transport loss prevents new effects without resetting published forwarding.
+Preserve local cleanup, cancellation-safe Close, drain, contained reset and the
+consumer's emergency-session disruption policy. No Pod lifecycle event needs a
+node reboot, manual cleanup or operator recovery.
