@@ -6,6 +6,18 @@ shards in [ci.yml](../.github/workflows/ci.yml). Use
 to reproduce the shards with the profile and disk setup in
 [CONTRIBUTING](../CONTRIBUTING.md#validation-gates).
 
+## Secret scan scope
+
+The [security workflow](../.github/workflows/security.yml) scans a pull request's
+exact `base.sha..head.sha` range with the head's `.gitleaksignore`. Pushes to
+`main` scan the pushed commit's full reachable history, so every commit that
+reaches `main` is scanned in its pull request and again on the push to `main`.
+Scheduled runs fetch and scan all refs, including branches without pull requests;
+findings or scan failures open or update a `secret-scan` issue with the run link.
+That issue does not impose a merge hold on unrelated pull requests. Manual runs
+scan the dispatched commit's full history. Required workflow regressions in
+`ci/test-test-inventory.py` pin these scopes and scheduled issue reporting.
+
 ## Test inventory guard
 
 **Test inventory guard** is a dependency of **Rust workspace**, whose aggregate
