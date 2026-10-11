@@ -12,6 +12,9 @@ use tokio::sync::{watch, Notify};
 // an elapsed-time bound on admission, retries or backend progress.
 const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[path = "coordinator_read_tests.rs"]
+mod child_reads;
+
 struct Model {
     state: Mutex<State>,
     calls: Mutex<Vec<(ScopeBatchAttempt, ScopeWorkClass)>>,
