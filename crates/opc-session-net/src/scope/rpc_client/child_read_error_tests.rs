@@ -1,6 +1,9 @@
 //! An authenticated scripted peer exercises the public read's complete error table.
 use super::*;
 
+#[path = "child_read_revision_tests.rs"]
+mod revision;
+
 pub(super) struct Reply {
     status: ResultStatus,
     body: Vec<u8>,
@@ -39,6 +42,13 @@ impl Reply {
             5 => {
                 body.push(0);
                 header.payload_len += 1;
+            }
+            6 => {
+                let mut fixed = header.encode().unwrap();
+                fixed[4..6].copy_from_slice(&1_u16.to_be_bytes());
+                connection.write_all(&fixed).await.unwrap();
+                connection.flush().await.unwrap();
+                return;
             }
             _ => {}
         }

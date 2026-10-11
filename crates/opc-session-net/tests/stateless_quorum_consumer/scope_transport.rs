@@ -9,6 +9,8 @@ use std::collections::HashMap;
 mod batch;
 #[path = "scope_transport/child_read_guards.rs"]
 mod child_read_guards;
+#[path = "scope_transport/child_read_revocation.rs"]
+mod child_read_revocation;
 #[path = "scope_transport/child_reads.rs"]
 mod child_reads;
 #[path = "scope_transport/cross_slot.rs"]
