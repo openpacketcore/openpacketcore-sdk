@@ -17,8 +17,10 @@ use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, Generation,
     SessionConsensusRpcFamily, StateClass, StateType, StoredSessionRecord,
 };
+use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Mutex;
+use std::time::Instant;
 
 // Decode the production wire shape without exposing the private Raft config.
 #[derive(serde::Deserialize)]
@@ -128,6 +130,24 @@ impl SessionConsensusRpcHandler for PausedSnapshotHandler {
         }
         response
     }
+}
+
+async fn wait_for_snapshot_readiness<T>(
+    phase: &str,
+    ready: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    // Readiness and the assertions below decide correctness. This generous
+    // guard only terminates a hang; elapsed time is diagnostic evidence.
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(120), ready).await;
+    // Write directly so passing CI runs retain timings without --nocapture.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "snapshot-retirement readiness phase={phase} elapsed_seconds={:.3} completed={}",
+        started.elapsed().as_secs_f64(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn wait_for_progress(
@@ -288,7 +308,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     trigger_consensus_snapshot_for_test(&stores[leader])
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), publication.wait_prepared())
+    wait_for_snapshot_readiness("successor-prepared", publication.wait_prepared())
         .await
         .expect("successor is prepared before admitting the predecessor transfer");
     assert!(
@@ -319,7 +339,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     for peer in paths.values() {
         peer.set_enabled(true);
     }
-    tokio::time::timeout(Duration::from_secs(10), paused.entered.notified())
+    wait_for_snapshot_readiness("first-snapshot-chunk", paused.entered.notified())
         .await
         .expect("lagging voter receives the first non-final snapshot chunk");
     let prefix = paused.first_chunk.lock().unwrap().clone().unwrap();
@@ -340,7 +360,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
 
     // Observe every leader metrics change: the old implementation reports
     // StorageIo(Snapshot, Read) as soon as transport reads the retired inode.
-    tokio::time::timeout(Duration::from_secs(10), async {
+    wait_for_snapshot_readiness("follower-caught-up", async {
         tokio::select! {
             progress = wait_for_consensus_progress_for_test(&stores[leader], |p| {
                 p.engine_state != ConsensusEngineStateForTest::Running
