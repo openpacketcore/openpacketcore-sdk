@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 #[path = "scope_transport/batch.rs"]
 mod batch;
+#[path = "scope_transport/child_reads.rs"]
+mod child_reads;
 #[path = "scope_transport/cross_slot.rs"]
 mod cross_slot;
 #[path = "scope_transport/scans.rs"]
