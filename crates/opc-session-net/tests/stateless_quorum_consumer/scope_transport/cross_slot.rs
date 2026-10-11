@@ -163,7 +163,11 @@ fn native_scope_shared_identity_cannot_sign_for_another_slots_boot() {
             // Positive controls use the identical wire payloads with B's key.
             // A still observes its own slot, and all four B reads succeed.
             peers[0].send(&tls, addresses, &scopes[0], peers[0].record.execution(), RawCall::Current, &ScopeClock).await.unwrap();
+            let reads = fleet.read_barrier_calls();
+            let log = fleet.stores[leader].status().last_log_index;
             let observed = peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::ChildRead(&child_read), &ScopeClock).await.unwrap();
+            assert_eq!(fleet.read_barrier_calls(), reads + 1, "one full forwarded barrier for the complete fresh-connection child RPC");
+            assert_eq!(fleet.stores[leader].status().last_log_index, log, "child observations append no application command");
             let observed = crate::scope::child_read_wire::decode_observation(&child_read, &observed).unwrap();
             assert_eq!(observed.len(), 1);
             let observed = observed[0].as_ref().unwrap();

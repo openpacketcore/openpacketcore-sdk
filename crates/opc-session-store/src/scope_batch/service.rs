@@ -190,7 +190,7 @@ impl ScopeBatchStore {
             stamp,
             keys,
             ScopeChildReadControl::default(),
-            |_| async { Ok(()) },
+            |_, _| async { Ok(()) },
         )
         .await
     }
@@ -198,7 +198,8 @@ impl ScopeBatchStore {
     /// Native transport hook: validate the sole cut before established-class
     /// admission, and retain its returned entitlement through materialization.
     /// On peer closure, cancel `control` and await this call before releasing
-    /// proof credit. The callback receives comparison facts, never authority.
+    /// proof credit. The callback receives comparison facts and the cut's fixed
+    /// deadline, never authority; no response may be released after that deadline.
     #[doc(hidden)]
     pub async fn read_current_with_admission<F, Fut, G>(
         &self,
@@ -209,7 +210,7 @@ impl ScopeBatchStore {
         admit: F,
     ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError>
     where
-        F: FnOnce(ScopeAuthorityStamp) -> Fut,
+        F: FnOnce(ScopeAuthorityStamp, tokio::time::Instant) -> Fut,
         Fut: std::future::Future<Output = Result<G, ScopeChildReadError>>,
         G: Send + 'static,
     {
@@ -233,7 +234,7 @@ impl ScopeBatchStore {
             .scope_child_read_cut(request, control.clone())
             .await?;
         let deadline = cut.deadline();
-        let admission = before(&control, deadline, admit(cut.stamp().clone())).await?;
+        let admission = before(&control, deadline, admit(cut.stamp().clone(), deadline)).await?;
         let rows = cut.materialize(admission).await?;
         before(
             &control,

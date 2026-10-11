@@ -21,6 +21,82 @@ fn bytes(value: &Value) -> Vec<u8> {
 }
 
 #[test]
+fn child_read_native_call_binds_execution_namespace_digest_and_raw_key_sets() {
+    use super::rpc_server::NativeCall;
+    let v = vectors();
+    let child = &v["child_read"];
+    let request = ScopeChildReadRequest::decode_canonical(&bytes(&child["request_hex"])).unwrap();
+    let frame = Frame::decode(&bytes(&child["frames"][0]["frame_hex"])).unwrap();
+    let canonical = request.encode_canonical().unwrap();
+    let decoded = NativeCall::decode(&frame.header, &canonical, request.stamp().scope()).unwrap();
+    assert_eq!(decoded.execution(), Some(request.stamp().execution()));
+    for field in 0..2 {
+        let mut header = frame.header.clone();
+        if field == 0 {
+            header.digest[0] ^= 1;
+        } else {
+            header.request_id[0] ^= 1;
+        }
+        assert!(NativeCall::decode(&header, &canonical, request.stamp().scope()).is_err());
+    }
+    let mut foreign = serde_json::to_value(request.stamp().scope()).unwrap();
+    foreign["slot"] = serde_json::to_value([99_u8; 32]).unwrap();
+    let foreign = serde_json::from_value(foreign).unwrap();
+    assert!(NativeCall::decode(&frame.header, &canonical, &foreign).is_err());
+    for fixture in child["negative_requests"].as_array().unwrap() {
+        let encoded = bytes(&fixture["request_hex"]);
+        let mut header = frame.header.clone();
+        header.digest =
+            transport_request_digest(Method::ChildRead, &header.request_id, &encoded).unwrap();
+        assert!(
+            NativeCall::decode(&header, &encoded, request.stamp().scope()).is_err(),
+            "{}",
+            fixture["name"]
+        );
+    }
+}
+
+#[test]
+fn child_read_routing_requires_worker_and_a_data_class() {
+    use super::{policy::*, PrincipalGrant};
+    let v = vectors();
+    let request =
+        ScopeChildReadRequest::decode_canonical(&bytes(&v["child_read"]["request_hex"])).unwrap();
+    let scope = ScopeBinding::from_scope(request.stamp().scope()).unwrap();
+    let principal =
+        opc_types::SpiffeId::new(request.stamp().execution().identity().as_str()).unwrap();
+    for role in [
+        ScopeRole::Worker,
+        ScopeRole::Controller,
+        ScopeRole::Observer,
+    ] {
+        let policy = ScopePolicy::new(vec![PrincipalGrant::new(
+            principal.clone(),
+            role,
+            vec![scope.clone()],
+        )
+        .unwrap()])
+        .unwrap();
+        for class in [
+            Class::SafetyControl,
+            Class::Emergency,
+            Class::EmergencyClassification,
+            Class::Normal,
+            Class::Maintenance,
+        ] {
+            let allowed = policy.authorize(&principal, &scope, Method::ChildRead, class);
+            assert_eq!(
+                allowed.is_ok(),
+                role == ScopeRole::Worker && class != Class::SafetyControl
+            );
+            if let Ok(route) = allowed {
+                assert!(route.requires_worker_proof());
+            }
+        }
+    }
+}
+
+#[test]
 fn child_read_revision_two_keeps_every_frame_kind_and_all_seventeen_methods() {
     let v = vectors();
     for method in 1..=17 {
