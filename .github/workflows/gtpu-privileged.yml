@@ -258,6 +258,7 @@ jobs:
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
             "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
@@ -308,6 +309,7 @@ jobs:
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
             "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up

@@ -191,11 +191,13 @@ continues to apply; this guard does not replace it.
 
 The **Rust SCTP cold multihoming** lane in [ci.yml](../.github/workflows/ci.yml)
 runs both pending-blackhole connection-progress tests in a fresh network
-namespace. The **Privileged Linux GTP-U** lane in
+namespace. The **Privileged Linux GTP-U and route regressions** job in
 [gtpu-privileged.yml](../.github/workflows/gtpu-privileged.yml) runs the three
 empty historical hierarchy normalization tests on a private bpffs mount, plus
 the route-steering tests for distinct IPv4/IPv6 mark-only rules and locked-MTU
-ICMP signaling in both families. Both lanes run on PRs and main pushes.
+ICMP signaling in both families. The required **Privileged Linux GTP-U** check
+requires both this job and the datapath job to succeed. Both workflows run on
+PRs and main pushes.
 
 These commands select exact ignored names and require their exact executed
 counts with zero ignored tests. Normalization and locked-MTU tests must also
