@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub(crate) struct NativeChanges {
     pub(super) business: changes::BusinessChanges,
     pub(super) log: log::CapturedLog,
+    pub(super) slot_projections: imbl::OrdMap<u64, SharedRow<log::NativeLogEntry>>,
 }
 
 pub(crate) struct SnapshotCapture {
@@ -97,6 +98,7 @@ impl NativeStorage {
     /// only exact certificates, bounded frontiers, counts, endpoints and at
     /// most five log witnesses; it never visits historical or dirty rows.
     pub(crate) fn take_changes(&mut self) -> io::Result<super::NativeChanges> {
+        let slot_projections = self.log.slot_projections.clone();
         let log = self.log.prepare_transfer(&self.business)?;
         let business = self.business.prepare_transfer()?;
         // Both exclusive borrows remain held. These moves are infallible,
@@ -104,6 +106,7 @@ impl NativeStorage {
         Ok(NativeChanges {
             business: business.take(),
             log: log.take(),
+            slot_projections,
         })
     }
 
@@ -117,6 +120,7 @@ impl NativeStorage {
         let snapshot = snapshot
             .map(|snapshot| self.business.prepare_snapshot_selection(snapshot))
             .transpose()?;
+        let slot_projections = self.log.slot_projections.clone();
         let log = self
             .log
             .prepare_checkpoint_transfer(&self.business, snapshot.as_ref())?;
@@ -127,6 +131,7 @@ impl NativeStorage {
             NativeChanges {
                 business: business.take(),
                 log: log.take(),
+                slot_projections,
             },
             snapshot,
         ))

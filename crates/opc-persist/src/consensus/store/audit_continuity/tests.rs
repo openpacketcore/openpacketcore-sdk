@@ -127,6 +127,7 @@ impl Fixture {
             Some(Arc::new(
                 AuditContinuityPolicy::new(keys, external.clone(), 1, 1).unwrap(),
             )),
+            None,
         )
         .await
         .unwrap();

@@ -57,6 +57,7 @@ impl ForwardMutationRequest {
 fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
     match intent {
         SessionMutationIntent::ScopeAuthority(_)
+        | SessionMutationIntent::VoterSlotControl(_)
         | SessionMutationIntent::PreflightScopeProfile
         | SessionMutationIntent::ActivateScopeProfile(_)
         | SessionMutationIntent::CertifyScopeProfileContinuation(_)

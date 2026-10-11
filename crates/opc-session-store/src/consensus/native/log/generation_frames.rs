@@ -12,6 +12,7 @@ impl GenerationLogVersion {
             vote: value.frontiers.vote,
             committed: value.frontiers.committed,
             purged: value.frontiers.purged,
+            slot_intent: value.frontiers.slot_intent,
             count: value.summary.count,
             content: value.summary.content,
             first: value.first,
@@ -113,7 +114,12 @@ impl CapturedLog {
                     if decoded != resident.entry || decoded.log_id.index != *index {
                         return Err(invalid("native generation raw and typed log differ"));
                     }
-                    NativeLog::validate_entry_context(&decoded, identity, members)
+                    NativeLog::validate_entry_profile(
+                        &decoded,
+                        identity,
+                        members,
+                        row.slot_profile(),
+                    )
                 })?;
                 if let Some(relocations) = &mut relocations {
                     relocations.log(*index, row, offset, input.bytes().len() as u32)?;

@@ -1010,8 +1010,21 @@ impl SessionTopologyCoordinatorState {
         let identity = topology
             .consensus_identity()
             .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
-        let descriptors = descriptors_by_node_id(identity, topology.members())
-            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+        let descriptors = if topology.voter_slot_genesis().is_some() {
+            topology
+                .members()
+                .iter()
+                .map(|descriptor| {
+                    topology
+                        .consensus_node_id(descriptor.replica_id())
+                        .map(|node| (node, descriptor.clone()))
+                        .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?
+        } else {
+            descriptors_by_node_id(identity, topology.members())
+                .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?
+        };
         Ok(Self {
             operation_gate: Arc::new(tokio::sync::RwLock::new(())),
             local_admission_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -2164,6 +2177,7 @@ impl ConsensusSessionStore {
             #[cfg(test)]
             scope_profile_supported: AtomicBool::new(true),
             raft,
+            voter_profile: None,
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,

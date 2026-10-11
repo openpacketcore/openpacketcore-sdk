@@ -392,7 +392,7 @@ impl NativeOwner {
         let placement = core
             .fixed_placement_policy
             .ok_or_else(|| invalid_data("native fixed placement missing"))?;
-        wal.native_fixed_read(
+        wal.admit_native_fixed_open(
             crate::sqlite::consensus::wal::native::FixedReadExpectation {
                 identity: core.storage_identity,
                 members: &core.expected_members,
@@ -400,13 +400,6 @@ impl NativeOwner {
                 placement,
                 pristine: true,
                 database_path: None,
-            },
-            |_, exact| {
-                if exact {
-                    Ok(())
-                } else {
-                    Err(invalid_data("native configured authority differs"))
-                }
             },
         )?;
         core.applied_progress

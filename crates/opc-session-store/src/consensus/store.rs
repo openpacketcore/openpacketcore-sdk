@@ -173,6 +173,9 @@ pub use transport_class::session_consensus_work_class;
 mod scope_batch;
 mod scope_profile;
 mod scope_scan;
+#[cfg(all(test, target_os = "linux"))]
+mod voter_slot_tests;
+pub(crate) mod voter_slots;
 
 use crate::scope_scheduler::{ScopeSchedulerKey, ScopeWorkClass, ScopeWorkPermit};
 use scheduling::{ForwardWorkClass, ProposalAdmission, StoreWorkAdmission};
@@ -1991,6 +1994,7 @@ struct ConsensusSessionStoreInner {
     #[cfg(test)]
     scope_profile_supported: AtomicBool,
     raft: SessionRaft,
+    voter_profile: Option<Arc<voter_slots::SessionVoterProfile>>,
     persistence: SessionPersistenceMode,
     persistence_protocol: PersistenceProtocol,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
@@ -3536,6 +3540,47 @@ impl ConsensusSessionStore {
         snapshot_integrity: super::SnapshotIntegrityPolicy,
         persistence: SessionPersistenceMode,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_fixed_quorum_inner(
+            topology,
+            backend,
+            snapshot_dir,
+            peers,
+            clock,
+            operation_timeout,
+            snapshot_integrity,
+            persistence,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_fixed_quorum_inner(
+        topology: ValidatedQuorumTopology,
+        mut backend: SqliteSessionBackend,
+        snapshot_dir: super::SnapshotDirectory,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+        snapshot_integrity: super::SnapshotIntegrityPolicy,
+        persistence: SessionPersistenceMode,
+        voter_setup: Option<voter_slots::SessionVoterSetup>,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        if topology.voter_slot_genesis().is_some() != voter_setup.is_some() {
+            return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        if let Some(setup) = &voter_setup {
+            if persistence != SessionPersistenceMode::Durable {
+                return Err(ConsensusSessionStoreOpenError::PersistenceModeMismatch);
+            }
+            backend.voter_seed = Some(Arc::new(
+                crate::sqlite::consensus::voter_slots::Seed::with_initial(
+                    setup.genesis.clone(),
+                    setup.initial.clone(),
+                )
+                .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?,
+            ));
+        }
         if !cfg!(target_os = "linux") {
             return Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform);
         }
@@ -3551,8 +3596,10 @@ impl ConsensusSessionStore {
         let identity = topology
             .consensus_identity()
             .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
-        let local_node_id = topology
-            .local_consensus_node_id()
+        let local_node_id = voter_setup
+            .as_ref()
+            .map(|setup| setup.local)
+            .or_else(|| topology.local_consensus_node_id())
             .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
         let members = topology
             .members()
@@ -3563,9 +3610,9 @@ impl ConsensusSessionStore {
                     .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
-        if !matches!(members.len(), 3 | 5)
+        if !(matches!(members.len(), 3 | 5) || (members.len() == 9 && voter_setup.is_some()))
             || members.len() != topology.summary().configured_members()
-            || !members.contains(&local_node_id)
+            || (voter_setup.is_none() && !members.contains(&local_node_id))
         {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
@@ -3574,10 +3621,11 @@ impl ConsensusSessionStore {
             .copied()
             .filter(|node_id| *node_id != local_node_id)
             .collect::<BTreeSet<_>>();
-        if peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers
-            || peers.iter().any(|(node_id, peer)| {
-                peer.node_id() != *node_id || peer.scope_identity() != Some(identity)
-            })
+        if voter_setup.is_none()
+            && (peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers
+                || peers.iter().any(|(node_id, peer)| {
+                    peer.node_id() != *node_id || peer.scope_identity() != Some(identity)
+                }))
         {
             return Err(ConsensusSessionStoreOpenError::PeerSetMismatch);
         }
@@ -3597,8 +3645,11 @@ impl ConsensusSessionStore {
                 .is_some();
         #[cfg(not(target_os = "linux"))]
         let reopened_async = false;
-        let network =
-            SessionRaftNetworkFactory::try_new(identity, local_node_id, members.clone(), peers)?;
+        let network = if voter_setup.is_some() {
+            SessionRaftNetworkFactory::for_voter_slots(identity, local_node_id, members.clone())?
+        } else {
+            SessionRaftNetworkFactory::try_new(identity, local_node_id, members.clone(), peers)?
+        };
         let peer_directory = network.peer_directory();
         let bindings = topology_node_bindings(&topology);
         let placement_policy = topology
@@ -3630,9 +3681,24 @@ impl ConsensusSessionStore {
         let closed_restart = false;
         let persistence_protocol =
             PersistenceProtocol::new(persistence, reopened_async && !closed_restart);
-        let network = network.with_persistence(persistence_protocol.clone());
+        let mut network = network.with_persistence(persistence_protocol.clone());
         let scope_views = log_store.scope_views();
         let scope_database = log_store.scope_database();
+        let voter_profile = if let Some(setup) = voter_setup {
+            Some(
+                voter_slots::SessionVoterProfile::new(
+                    local_node_id,
+                    log_store.voter_slot_core(),
+                    setup.resolver,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        network.voter_transport = voter_profile
+            .as_ref()
+            .map(|profile| profile.transport.clone());
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let terminal_recovery_handoff_consumer =
@@ -3648,7 +3714,10 @@ impl ConsensusSessionStore {
             .load_retained_transitions(&membership_scope)
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let mut config = session_raft_config()?;
-        config.enable_elect = persistence_protocol.is_active();
+        config.enable_elect = persistence_protocol.is_active() && voter_profile.is_none();
+        if voter_profile.is_some() {
+            config.enable_heartbeat = false;
+        }
         let config = Arc::new(config);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
@@ -3687,8 +3756,24 @@ impl ConsensusSessionStore {
             // Raw V2 admission is the only leased read boundary. It keeps
             // the bounded same-term optimization without allowing a cached
             // proof to satisfy readiness or any generic read.
-            LinearizableReadLease::Enabled,
+            if voter_profile.is_some() {
+                LinearizableReadLease::Disabled
+            } else {
+                LinearizableReadLease::Enabled
+            },
         );
+        if let Some(profile) = &voter_profile {
+            profile
+                .admission
+                .attach_engine(Arc::new(
+                    opc_consensus::voter_slots::RaftVoterResponseFence::new(
+                        raft.clone(),
+                        Arc::new(|| {}),
+                    ),
+                ))
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        }
         let topology_summary = topology.summary().clone();
         let topology_attestation_time_high_water = topology_summary
             .attestation_admission()
@@ -3711,6 +3796,7 @@ impl ConsensusSessionStore {
             #[cfg(test)]
             scope_profile_supported: AtomicBool::new(true),
             raft,
+            voter_profile,
             persistence,
             persistence_protocol,
             storage_shutdown,
@@ -3778,7 +3864,9 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_batch_receiver,
             Arc::downgrade(&inner),
         );
-        Ok(Self { inner })
+        let store = Self { inner };
+        voter_slots::start_coordinator(&store);
+        Ok(store)
     }
 
     /// Start one durable Openraft node with a bounded complete operation
@@ -3948,6 +4036,7 @@ impl ConsensusSessionStore {
             #[cfg(test)]
             scope_profile_supported: AtomicBool::new(true),
             raft,
+            voter_profile: None,
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
@@ -6590,6 +6679,11 @@ impl ConsensusSessionStore {
             && self.inner.admitted.load(Ordering::Acquire)
             && self.inner.persistence_protocol.is_active()
             && self.engine_is_running_in_local_scope()
+            && self
+                .inner
+                .voter_profile
+                .as_ref()
+                .is_none_or(|profile| profile.application_admitted(&self.inner.raft))
             && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
                 || self.fixed_durable_quorum_scope_is_exact())
     }
@@ -7036,7 +7130,8 @@ impl ConsensusSessionStore {
         matches!(
             self.inner.topology.mode(),
             QuorumTopologyMode::FixedDurableQuorum
-        ) && matches!(self.inner.bootstrap_members.len(), 3 | 5)
+        ) && (matches!(self.inner.bootstrap_members.len(), 3 | 5)
+            || (self.inner.bootstrap_members.len() == 9 && self.inner.voter_profile.is_some()))
             && self
                 .inner
                 .topology
@@ -11782,8 +11877,9 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::ScopeBatch(_)
         | SessionMutationIntent::ScopeBatchCancel(_)
         | SessionMutationIntent::PreflightScopeProfile
+        | SessionMutationIntent::ActivateScopeProfile(_)
         | SessionMutationIntent::CertifyScopeProfileContinuation(_)
-        | SessionMutationIntent::ActivateScopeProfile(_) => false,
+        | SessionMutationIntent::VoterSlotControl(_) => false,
         SessionMutationIntent::BindConsumerRequest { .. } => {
             matches!(error, StoreError::CasIdempotencyConflict)
         }
@@ -12054,6 +12150,7 @@ fn validate_consensus_intent_with_recovery(
             | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
             | SessionMutationIntent::ActivateScopeProfile(_)
+            | SessionMutationIntent::VoterSlotControl(_)
             | SessionMutationIntent::Authorized { .. }
     ) {
         return Err(StoreError::CapabilityNotSupported(
@@ -12320,6 +12417,11 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
         authenticated_sender: SessionConsensusNodeId,
         mut request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
+        if self.store.inner.voter_profile.is_some() {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::ScopeMismatch),
+            };
+        }
         if request.validate().is_err()
             || request.schema_version != SESSION_CONSENSUS_SCHEMA_VERSION
             || request.sender != authenticated_sender
@@ -12358,6 +12460,13 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
             self.store.persistence_mode(),
             self.handle_application(authenticated_sender, request).await,
         )
+    }
+    async fn handle_with_incarnation(
+        &self,
+        proof: opc_consensus::voter_slots::VerifiedVoterRpc,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        voter_slots::handle(self, proof, request).await
     }
 }
 

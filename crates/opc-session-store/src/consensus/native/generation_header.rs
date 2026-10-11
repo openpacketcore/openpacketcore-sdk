@@ -33,47 +33,47 @@ impl<'de> Deserialize<'de> for Name {
 }
 
 #[derive(Deserialize)]
-struct Stored {
+struct Stored<const N: usize, const C: usize> {
     #[serde(rename = "membership")]
-    _membership: decode::json::Membership,
+    _membership: decode::json::Membership<N, C>,
 }
 #[derive(Deserialize)]
-struct Snapshot {
+struct Snapshot<const N: usize, const C: usize> {
     #[serde(rename = "last_membership")]
-    _membership: Stored,
+    _membership: Stored<N, C>,
     #[serde(rename = "snapshot_id")]
     _id: Name,
 }
 #[derive(Deserialize)]
-struct Frontiers {
+struct Frontiers<const N: usize, const C: usize> {
     #[serde(rename = "membership")]
-    _membership: Stored,
+    _membership: Stored<N, C>,
     #[serde(rename = "current_snapshot")]
-    _snapshot: Option<(Snapshot, Name, IgnoredAny, IgnoredAny)>,
+    _snapshot: Option<(Snapshot<N, C>, Name, IgnoredAny, IgnoredAny)>,
 }
 #[derive(Deserialize)]
-struct Business {
+struct Business<const M: usize, const N: usize, const C: usize> {
     #[serde(rename = "members")]
-    _members: decode::json::Members,
+    _members: decode::json::Members<M>,
     #[serde(rename = "frontiers")]
-    _frontiers: Frontiers,
+    _frontiers: Frontiers<N, C>,
 }
 #[derive(Deserialize)]
-struct Shape {
+struct Shape<const M: usize, const N: usize, const C: usize> {
     #[serde(rename = "business")]
-    _business: Business,
+    _business: Business<M, N, C>,
 }
 #[derive(Deserialize)]
-struct BaseShape {
+struct BaseShape<const M: usize, const N: usize, const C: usize> {
     #[serde(rename = "context")]
-    _context: Shape,
+    _context: Shape<M, N, C>,
 }
 #[derive(Deserialize)]
-struct DeltaShape {
+struct DeltaShape<const M: usize, const N: usize, const C: usize> {
     #[serde(rename = "before")]
-    _before: Shape,
+    _before: Shape<M, N, C>,
     #[serde(rename = "after")]
-    _after: Shape,
+    _after: Shape<M, N, C>,
 }
 
 pub(super) struct Loaded<T> {
@@ -106,9 +106,17 @@ fn read<T: serde::de::DeserializeOwned + Serialize, S: serde::de::DeserializeOwn
     })
 }
 
-pub(super) fn base(reader: &mut dyn Read) -> io::Result<Loaded<BaseHeader>> {
-    read::<BaseHeader, BaseShape>(reader)
+pub(super) fn base(reader: &mut dyn Read, format: Format) -> io::Result<Loaded<BaseHeader>> {
+    if format == Format::V5 {
+        read::<BaseHeader, BaseShape<9, 10, 2>>(reader)
+    } else {
+        read::<BaseHeader, BaseShape<5, 5, 1>>(reader)
+    }
 }
-pub(super) fn delta(reader: &mut dyn Read) -> io::Result<Loaded<Header>> {
-    read::<Header, DeltaShape>(reader)
+pub(super) fn delta(reader: &mut dyn Read, format: Format) -> io::Result<Loaded<Header>> {
+    if format == Format::V5 {
+        read::<Header, DeltaShape<9, 10, 2>>(reader)
+    } else {
+        read::<Header, DeltaShape<5, 5, 1>>(reader)
+    }
 }

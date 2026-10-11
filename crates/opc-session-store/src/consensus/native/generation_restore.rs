@@ -29,7 +29,7 @@ impl BaseRestore {
         match (value, origin) {
             (None, None) => Ok(()),
             (Some(value), Some(origin))
-                if format == Format::V4 && value.0 == origin.incarnation().native_image() =>
+                if format >= Format::V4 && value.0 == origin.incarnation().native_image() =>
             {
                 Ok(())
             }
@@ -93,12 +93,13 @@ impl Catalog {
     ) -> io::Result<RestoreScanIncarnation> {
         let mut choice = None;
         let owner = VerifiedAppendOwner::open(path, expected, maximum, check, |reader| {
-            if Format::read(reader, true)? != Format::V4 {
+            let format = Format::read(reader, true)?;
+            if format < Format::V4 {
                 return Err(invalid(
                     "native restore identity requires a complete V4 base",
                 ));
             }
-            let loaded = header::base(reader)?;
+            let loaded = header::base(reader, format)?;
             let base = &loaded.value;
             if base.binding != expected.binding
                 || base.file_epoch != expected.file_epoch

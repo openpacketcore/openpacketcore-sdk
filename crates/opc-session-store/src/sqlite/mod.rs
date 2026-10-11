@@ -631,6 +631,7 @@ pub struct SqliteSessionBackend {
         Arc<tokio::sync::Mutex<Option<Arc<crate::scope_scan::backend::ScopeViewRegistry>>>>,
     scope_scan_limits: Arc<StdMutex<crate::scope_scan::ScopeScanLimits>>,
     pub(crate) fenced_transition_profile: crate::FencedTransitionV2Profile,
+    pub(crate) voter_seed: Option<Arc<consensus::voter_slots::Seed>>,
     #[cfg(target_os = "linux")]
     pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -1436,6 +1437,7 @@ impl SqliteSessionBackend {
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             fenced_transition_profile,
+            voter_seed: None,
             #[cfg(target_os = "linux")]
             native_owner,
             #[cfg(all(test, target_os = "linux"))]
@@ -1514,6 +1516,13 @@ impl SqliteSessionBackend {
                     "canonical session schema connection is unexpectedly shared".into(),
                 )
             })
+    }
+
+    pub(crate) async fn voter_profile_preflight(
+        &self,
+    ) -> Result<bool, crate::consensus::storage::SessionConsensusStorageError> {
+        let conn = self.conn.lock().await;
+        consensus::voter_slots::preflight(&conn, self.voter_seed.as_deref())
     }
 
     /// Validate the selected native root before comparing caller scope. Only

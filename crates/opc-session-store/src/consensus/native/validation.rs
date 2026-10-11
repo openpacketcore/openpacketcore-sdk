@@ -181,7 +181,8 @@ pub(super) fn validate_frontiers(
     root: Option<&crate::fenced_mutation_roster::RosterAttestationTrustRootV1>,
 ) -> io::Result<()> {
     let [keys, receipts, generic, notifications] = counts;
-    if !matches!(members.len(), 3 | 5)
+    voter_slots::validate_frontiers(identity, members, frontiers)?;
+    if !(matches!(members.len(), 3 | 5) || (members.len() == 9 && frontiers.voter_slots.is_some()))
         || [keys, generic, notifications]
             .into_iter()
             .any(|count| count > MAX_ITEMS)
@@ -270,7 +271,9 @@ pub(super) fn validate_snapshot(
     validate_snapshot_metadata(snapshot)?;
     let meta = &snapshot.0;
     let installed = origin.is_some_and(|origin| origin.matches_snapshot(snapshot));
-    if !installed && meta.last_membership != frontiers.membership {
+    if let Some(slots) = &frontiers.voter_slots {
+        crate::sqlite::consensus::voter_slots::snapshot_metadata(&slots.current, meta)?;
+    } else if !installed && meta.last_membership != frontiers.membership {
         return Err(invalid("native current snapshot membership differs"));
     }
     match meta.last_log_id {
@@ -296,6 +299,9 @@ fn logically_invalid_membership(
     match (frontiers.applied, membership.log_id()) {
         (None, None) => false,
         (Some(applied), Some(membership_id)) => {
+            if frontiers.voter_slots.is_some() {
+                return membership_id.index > applied.index;
+            }
             membership_id.index > applied.index
                 || membership.membership().get_joint_config().len() != 1
                 || membership.membership().voter_ids().collect::<BTreeSet<_>>() != *members

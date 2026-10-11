@@ -427,7 +427,7 @@ pub(super) fn inspect_key_format(
     let _memory = VerificationMemory::reserve(key_scratch(bytes)?)?;
     let (key, row): (SessionKey, Option<NativeKeyState>) = binary::decode(bytes)?;
     if let Some(row) = &row {
-        if row.reserved && format != Format::V4 {
+        if row.reserved && format < Format::V4 {
             return Err(invalid(
                 "native legacy generation cannot contain roster reservations",
             ));
@@ -473,7 +473,7 @@ pub(super) fn owned_key(
     let memory = VerificationMemory::reserve(key_scratch(bytes)?)?;
     let (decoded_key, decoded): (SessionKey, Option<NativeKeyState>) = binary::decode(bytes)?;
     let decoded = decoded.ok_or_else(|| invalid("native resident key selected a tombstone"))?;
-    if decoded.reserved && expected.facts.format != Format::V4 {
+    if decoded.reserved && expected.facts.format < Format::V4 {
         return Err(invalid(
             "native legacy generation cannot contain roster reservations",
         ));
@@ -940,6 +940,7 @@ pub(super) fn verify_log(
     inspect_log(bytes, index, identity, members, check).map(|_| ())
 }
 
+#[cfg(test)]
 pub(in crate::consensus::native) fn inspect_log(
     bytes: &[u8],
     index: u64,
@@ -947,10 +948,21 @@ pub(in crate::consensus::native) fn inspect_log(
     members: &BTreeSet<SessionConsensusNodeId>,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<facts::Row<facts::Log>> {
+    inspect_log_profile(bytes, index, identity, members, false, check)
+}
+
+pub(in crate::consensus::native) fn inspect_log_profile(
+    bytes: &[u8],
+    index: u64,
+    identity: SessionConsensusIdentity,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    slots: bool,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<facts::Row<facts::Log>> {
     check()?;
-    let bytes_to_reserve = json::log_scratch_checked(bytes, check)?;
+    let bytes_to_reserve = json::log_scratch_checked_profile(bytes, slots, check)?;
     let _memory = scratch::LogMemory::reserve(bytes_to_reserve, check)?;
-    let facts = inspect_log_row(bytes, index, identity, members)?;
+    let facts = inspect_log_row(bytes, index, identity, members, slots)?;
     check()?;
     Ok(facts)
 }
@@ -962,12 +974,13 @@ fn inspect_log_row(
     index: u64,
     identity: SessionConsensusIdentity,
     members: &BTreeSet<SessionConsensusNodeId>,
+    slots: bool,
 ) -> io::Result<facts::Row<facts::Log>> {
     let row = crate::sqlite::consensus::decode_consensus_log_entry(bytes)?;
     if row.log_id.index != index {
         return Err(invalid("native generation log index differs"));
     }
-    log::NativeLog::validate_entry_context(&row, identity, members)?;
+    log::NativeLog::validate_entry_profile(&row, identity, members, slots)?;
     let membership = match &row.payload {
         EntryPayload::Membership(value) => Some(facts::membership(value)?),
         _ => None,
@@ -975,6 +988,7 @@ fn inspect_log_row(
     let facts = facts::Row {
         content: log::fingerprint(index, bytes),
         facts: facts::Log {
+            slot_control: matches!(&row.payload, EntryPayload::Normal(command) if matches!(command.intent, SessionMutationIntent::VoterSlotControl(_))),
             id: row.log_id,
             membership,
         },
@@ -990,6 +1004,7 @@ pub(in crate::consensus::native) struct LogInput {
     input: resident::SelectedBytes,
     expected: facts::Row<facts::Log>,
     scratch: Option<usize>,
+    slots: bool,
 }
 
 impl LogInput {
@@ -1002,15 +1017,17 @@ impl LogInput {
     pub(in crate::consensus::native) fn new(
         input: resident::SelectedBytes,
         expected: facts::Row<facts::Log>,
+        slots: bool,
         reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Self> {
         check()?;
-        let scratch = json::log_scratch_small(input.bytes(), reserve, check)?;
+        let scratch = json::log_scratch_small_profile(input.bytes(), slots, reserve, check)?;
         Ok(Self {
             input,
             expected,
             scratch,
+            slots,
         })
     }
 
@@ -1051,11 +1068,12 @@ impl LogInput {
         members: &BTreeSet<SessionConsensusNodeId>,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<resident::SelectedBytes> {
-        let actual = inspect_log(
+        let actual = inspect_log_profile(
             self.input.bytes(),
             self.expected.facts.id.index,
             identity,
             members,
+            self.slots,
             check,
         )?;
         self.compare(actual)?;
@@ -1066,6 +1084,7 @@ impl LogInput {
         if actual.content != self.expected.content
             || actual.facts.id != self.expected.facts.id
             || actual.facts.membership != self.expected.facts.membership
+            || actual.facts.slot_control != self.expected.facts.slot_control
         {
             return Err(invalid("native selected log differs from admitted row"));
         }
@@ -1096,6 +1115,7 @@ impl PreparedLog {
             self.input.expected.facts.id.index,
             identity,
             members,
+            self.input.slots,
         )?;
         self.input.compare(actual)
     }
@@ -1129,6 +1149,7 @@ impl OwnedLog {
 /// or Bytes backing escapes its scratch owner. After dropping that model,
 /// the retained copy keeps the remaining reservation until its final owner
 /// check; only the adapter's caller-output boundary releases it.
+#[cfg(test)]
 pub(in crate::consensus::native) fn owned_log(
     bytes: &[u8],
     index: u64,
@@ -1136,16 +1157,28 @@ pub(in crate::consensus::native) fn owned_log(
     members: &BTreeSet<SessionConsensusNodeId>,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedLog> {
-    owned_log_inner(bytes, index, None, identity, members, check)
+    owned_log_profile(bytes, index, identity, members, false, check)
+}
+
+pub(in crate::consensus::native) fn owned_log_profile(
+    bytes: &[u8],
+    index: u64,
+    identity: SessionConsensusIdentity,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    slots: bool,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<OwnedLog> {
+    owned_log_inner(bytes, index, None, identity, members, slots, check)
 }
 
 /// Bind the same complete closed decode to every fact of the selected row.
 /// No decoded model or unchecked selected bytes cross this boundary.
-pub(in crate::consensus::native) fn owned_selected_log(
+pub(in crate::consensus::native) fn owned_selected_log_profile(
     bytes: &[u8],
     expected: facts::Row<facts::Log>,
     identity: SessionConsensusIdentity,
     members: &BTreeSet<SessionConsensusNodeId>,
+    slots: bool,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedLog> {
     owned_log_inner(
@@ -1154,6 +1187,7 @@ pub(in crate::consensus::native) fn owned_selected_log(
         Some(expected),
         identity,
         members,
+        slots,
         check,
     )
 }
@@ -1164,16 +1198,17 @@ fn owned_log_inner(
     expected: Option<facts::Row<facts::Log>>,
     identity: SessionConsensusIdentity,
     members: &BTreeSet<SessionConsensusNodeId>,
+    slots: bool,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedLog> {
     check()?;
-    let scratch = json::log_scratch_checked(bytes, check)?;
+    let scratch = json::log_scratch_checked_profile(bytes, slots, check)?;
     let mut memory = scratch::LogMemory::reserve(scratch, check)?;
     let decoded = crate::sqlite::consensus::decode_consensus_log_entry(bytes)?;
     if decoded.log_id.index != index {
         return Err(invalid("native owned log index differs"));
     }
-    log::NativeLog::validate_entry_context(&decoded, identity, members)?;
+    log::NativeLog::validate_entry_profile(&decoded, identity, members, slots)?;
     if let Some(expected) = expected {
         let membership = match &decoded.payload {
             EntryPayload::Membership(value) => Some(facts::membership(value)?),
@@ -1182,6 +1217,8 @@ fn owned_log_inner(
         if log::fingerprint(index, bytes) != expected.content
             || decoded.log_id != expected.facts.id
             || membership != expected.facts.membership
+            || matches!(&decoded.payload, EntryPayload::Normal(command) if matches!(command.intent, SessionMutationIntent::VoterSlotControl(_)))
+                != expected.facts.slot_control
         {
             return Err(invalid("native selected log differs from admitted row"));
         }

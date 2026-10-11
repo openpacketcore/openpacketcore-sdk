@@ -17,6 +17,7 @@ const V2_MAGIC: &[u8; 8] = b"OPCNAT02";
 // Changing that layout requires another discriminator and explicit reader.
 const V3_MAGIC: &[u8; 8] = b"OPCNAT03";
 const MAGIC: &[u8; 8] = b"OPCNAT04";
+const SLOT_MAGIC: &[u8; 8] = b"OPCNAT05";
 const MAX_ITEMS: usize = 1_048_576;
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_ITEM: usize = 2 * crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES;
@@ -32,6 +33,8 @@ struct Header {
     vote: Option<Vote<SessionConsensusNodeId>>,
     committed: Option<LogId<SessionConsensusNodeId>>,
     purged: Option<LogId<SessionConsensusNodeId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slot_intent: Option<LogId<SessionConsensusNodeId>>,
     keys: usize,
     receipts: usize,
     generic_receipts: usize,
@@ -115,7 +118,17 @@ impl NativeStorage {
         wal_sequence: u64,
         snapshot: Option<&crate::sqlite::consensus::CurrentSnapshot>,
     ) -> io::Result<()> {
-        self.write_version(writer, root, wal_sequence, snapshot, 4)
+        self.write_version(
+            writer,
+            root,
+            wal_sequence,
+            snapshot,
+            if self.business.frontiers.voter_slots.is_some() {
+                5
+            } else {
+                4
+            },
+        )
     }
 
     #[cfg(test)]
@@ -159,6 +172,11 @@ impl NativeStorage {
     ) -> io::Result<()> {
         self.business.require_legacy_roster_absent()?;
         self.validate_image()?;
+        if version < 5
+            && (self.business.frontiers.voter_slots.is_some() || self.log.slot_intent.is_some())
+        {
+            return Err(invalid("native slot state requires image format five"));
+        }
         if version < 4 && self.business.frontiers.v1_activation.is_some() {
             return Err(invalid("native V1 state requires full image format four"));
         }
@@ -182,6 +200,7 @@ impl NativeStorage {
             vote: self.log.vote,
             committed: self.log.committed,
             purged: self.log.purged,
+            slot_intent: self.log.slot_intent,
             keys: self.business.keys.len(),
             receipts: self.business.receipts.len(),
             generic_receipts: self.business.generic_receipts.len(),
@@ -193,6 +212,7 @@ impl NativeStorage {
             1 => LEGACY_MAGIC,
             2 => V2_MAGIC,
             3 => V3_MAGIC,
+            5 => SLOT_MAGIC,
             _ => MAGIC,
         })?;
         write_item(writer, &header, MAX_HEADER)?;
@@ -243,6 +263,8 @@ impl NativeStorage {
             2
         } else if &magic == V3_MAGIC {
             3
+        } else if &magic == SLOT_MAGIC {
+            5
         } else if &magic == MAGIC {
             4
         } else {
@@ -250,6 +272,11 @@ impl NativeStorage {
         };
         let legacy = version == 1;
         let header: Header = read_item(reader, MAX_HEADER)?;
+        if (version == 5) != header.frontiers.voter_slots.is_some()
+            || (version < 5 && header.slot_intent.is_some())
+        {
+            return Err(invalid("native image voter-slot format differs"));
+        }
         if header.frontiers.roster_v1_namespace || header.frontiers.roster_v2_activation.is_some() {
             return Err(invalid(
                 "native full image carries an unsupported roster context",
@@ -263,7 +290,8 @@ impl NativeStorage {
         if header.root != root
             || header.wal_sequence != wal_sequence
             || header.identity != identity
-            || !matches!(header.members.len(), 3 | 5)
+            || !(matches!(header.members.len(), 3 | 5)
+                || (version == 5 && header.members.len() == 9))
             || [header.keys, header.generic_receipts, header.notifications]
                 .into_iter()
                 .any(|count| count > MAX_ITEMS)
@@ -277,11 +305,15 @@ impl NativeStorage {
         {
             return Err(invalid("native image identity or cardinality differs"));
         }
-        let mut image = Self::empty(header.identity, header.members)?;
+        let mut image = Self {
+            business: NativeState::empty_unadmitted(header.identity, header.members, None)?,
+            log: log::NativeLog::default(),
+        };
         image.business.frontiers = header.frontiers;
         image.log.vote = header.vote;
         image.log.committed = header.committed;
         image.log.purged = header.purged;
+        image.log.slot_intent = header.slot_intent;
         for _ in 0..header.keys {
             let (key, value) = if version < 3 {
                 let (key, value): (SessionKey, legacy::Key) = read_row(reader, legacy)?;
@@ -339,7 +371,11 @@ impl NativeStorage {
                 .entries
                 .insert(
                     entry.log_id.index,
-                    SharedRow::new(log::NativeLogEntry::new(encoded.into(), entry))?,
+                    SharedRow::new(log::NativeLogEntry::new_with_profile(
+                        encoded.into(),
+                        entry,
+                        version == 5,
+                    ))?,
                 )
                 .is_some()
             {

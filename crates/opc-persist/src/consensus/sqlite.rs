@@ -5,6 +5,9 @@
 
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod voter_slot_tests;
+pub(crate) mod voter_slots;
 
 use std::collections::BTreeSet;
 use std::io;
@@ -65,6 +68,10 @@ CREATE TABLE config_raft_identity (
     audit_key_epoch INTEGER NOT NULL CHECK (audit_key_epoch > 0),
     audit_key_fingerprint BLOB NOT NULL CHECK (length(audit_key_fingerprint) = 32),
     schema_manifest_digest BLOB NOT NULL CHECK (length(schema_manifest_digest) = 32)
+);
+CREATE TABLE config_raft_voter_slots (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state BLOB NOT NULL CHECK (length(state) BETWEEN 1 AND 2097152)
 );
 CREATE TABLE config_raft_management_audit (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -270,6 +277,7 @@ const AUTHORITY_TABLES: &[&str] = &[
 
 const RAFT_TABLES: &[&str] = &[
     "config_raft_identity",
+    "config_raft_voter_slots",
     "config_raft_management_audit",
     "config_raft_history_retention",
     "config_raft_vote",
@@ -304,6 +312,8 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
     pub(crate) snapshot_binding_path: Arc<PathBuf>,
     pub(crate) durable_progress: Arc<super::storage::ConfigDurableProgress>,
+    pub(crate) voter_admission:
+        Arc<std::sync::OnceLock<std::sync::Weak<super::store::voter_slots::ConfigVoterAdmission>>>,
     sqlite_worker_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
@@ -325,6 +335,29 @@ impl ConfigConsensusCore {
             expected_members,
             durable_progress,
             recovery,
+            None,
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn initialize_with_voter_slots(
+        backend: &SqliteBackend,
+        snapshot_directory: super::storage::AdmittedSnapshotDirectory,
+        identity: ConsensusIdentity,
+        expected_members: BTreeSet<ConsensusNodeId>,
+        durable_progress: Arc<super::storage::ConfigDurableProgress>,
+        initial_slots: opc_consensus::voter_slots::VoterSlotTable,
+    ) -> Result<Self, ConfigConsensusStorageError> {
+        Self::initialize_with_timeout(
+            backend,
+            snapshot_directory,
+            identity,
+            expected_members,
+            durable_progress,
+            None,
+            Some(initial_slots),
             Duration::from_secs(30),
             None,
         )
@@ -353,6 +386,7 @@ impl ConfigConsensusCore {
             expected_members,
             durable_progress,
             recovery,
+            None,
             timeout,
             Some(Box::new(before_commit)),
         )
@@ -367,6 +401,7 @@ impl ConfigConsensusCore {
         expected_members: BTreeSet<ConsensusNodeId>,
         durable_progress: Arc<super::storage::ConfigDurableProgress>,
         recovery: Option<StagedLegacyRecovery>,
+        initial_slots: Option<opc_consensus::voter_slots::VoterSlotTable>,
         timeout: Duration,
         before_commit: Option<InitializationCommitHook>,
     ) -> Result<Self, ConfigConsensusStorageError> {
@@ -415,14 +450,18 @@ impl ConfigConsensusCore {
                         false,
                         &worker_cancellation,
                     )
+                    .and_then(|()| {
+                        voter_slots::validate_profile_sync(&worker_conn, initial_slots.as_ref())
+                    })
                 }
             } else {
-                initialize_schema(
+                initialize_schema_with_slots(
                     &worker_conn,
                     identity,
                     &worker_members,
                     &worker_audit_key,
                     recovery.as_ref(),
+                    initial_slots.as_ref(),
                     &worker_cancellation,
                     before_commit,
                 )
@@ -471,6 +510,7 @@ impl ConfigConsensusCore {
             _snapshot_dir_guard: snapshot_dir_guard,
             snapshot_binding_path: Arc::new(snapshot_binding_path),
             durable_progress,
+            voter_admission: Arc::new(std::sync::OnceLock::new()),
             sqlite_worker_gate: worker_gate,
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
@@ -698,6 +738,48 @@ fn initialize_schema(
     cancellation: &Arc<SqliteWorkCancellation>,
     before_commit: Option<InitializationCommitHook>,
 ) -> Result<(), ConfigConsensusStorageError> {
+    initialize_schema_with_slots(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        recovery,
+        None,
+        cancellation,
+        before_commit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_schema_with_slots(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    recovery: Option<&StagedLegacyRecovery>,
+    initial_slots: Option<&opc_consensus::voter_slots::VoterSlotTable>,
+    cancellation: &Arc<SqliteWorkCancellation>,
+    before_commit: Option<InitializationCommitHook>,
+) -> Result<(), ConfigConsensusStorageError> {
+    if let Some(slots) = initial_slots {
+        opc_consensus::voter_slots::encode_voter_slot_table(slots)
+            .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
+        let configuration = slots.current_configuration();
+        if configuration
+            .identity(slots.cluster_instance, slots.manifest_digest)
+            .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?
+            != identity
+            || configuration
+                .members
+                .iter()
+                .map(|member| member.identity.node_id())
+                .collect::<BTreeSet<_>>()
+                != *expected_members
+            || recovery.is_some()
+        {
+            return Err(ConfigConsensusStorageError::InvalidIdentity);
+        }
+    }
     if let Some(recovery) = recovery {
         validate_legacy_recovery_snapshot(recovery, audit_key, cancellation)?;
         let path = recovery
@@ -713,6 +795,7 @@ fn initialize_schema(
         expected_members,
         audit_key,
         recovery,
+        initial_slots,
         cancellation,
         before_commit,
     );
@@ -725,12 +808,14 @@ fn initialize_schema(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_schema_transaction(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
     recovery: Option<&StagedLegacyRecovery>,
+    initial_slots: Option<&opc_consensus::voter_slots::VoterSlotTable>,
     cancellation: &SqliteWorkCancellation,
     before_commit: Option<InitializationCommitHook>,
 ) -> Result<(), ConfigConsensusStorageError> {
@@ -769,6 +854,8 @@ fn initialize_schema_transaction(
             ],
         )
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        voter_slots::initialize_sync(&tx, initial_slots)
+            .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
         super::audit::initialize_sync(&tx, audit_key, identity)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         super::history::initialize_sync(&tx, identity, audit_key, cancellation)
@@ -815,6 +902,7 @@ fn initialize_schema_transaction(
             cancellation,
         )?;
     }
+    voter_slots::validate_profile_sync(&tx, initial_slots)?;
     if let Some(before_commit) = before_commit {
         before_commit(cancellation);
     }
@@ -1111,6 +1199,18 @@ fn validate_existing_schema(
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
+    // The format marker is authoritative before inspecting a schema or identity
+    // belonging to another format. Crossing this boundary requires a fresh install.
+    let version: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM config_raft_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    if version != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
+        return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
+    }
     for table in RAFT_TABLES {
         cancellation.check()?;
         if !table_exists(conn, table)
@@ -1160,7 +1260,7 @@ fn validate_existing_schema(
     let membership = read_membership_unchecked_sync(conn, identity)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     if !is_pristine_membership(&membership) {
-        validate_fixed_membership(&membership, expected_members)
+        voter_slots::validate_membership_sync(conn, &membership, expected_members, false)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     }
     read_vote_sync(conn, identity, expected_members)
@@ -1452,10 +1552,14 @@ pub(crate) fn read_vote_sync(
             "persisted config consensus vote term mismatch",
         ));
     }
+    let slots = voter_slots::read_sync(conn)?;
     match (node_id, vote.leader_id.voted_for()) {
         (Some(stored), Some(voted_for))
             if checked_positive_u64(stored)? == voted_for.get()
-                && expected_members.contains(&voted_for) => {}
+                && slots.as_ref().map_or_else(
+                    || expected_members.contains(&voted_for),
+                    |state| voter_slots::historical_node(state.table(), voted_for),
+                ) => {}
         (None, None) => {}
         _ => {
             return Err(invalid_data(
@@ -1472,11 +1576,13 @@ pub(crate) fn save_vote_sync(
     expected_members: &BTreeSet<ConsensusNodeId>,
     vote: &Vote<ConsensusNodeId>,
 ) -> io::Result<()> {
-    if vote
-        .leader_id
-        .voted_for()
-        .is_some_and(|node| !expected_members.contains(&node))
-    {
+    let slots = voter_slots::read_sync(conn)?;
+    if vote.leader_id.voted_for().is_some_and(|node| {
+        !slots.as_ref().map_or_else(
+            || expected_members.contains(&node),
+            |state| voter_slots::historical_node(state.table(), node),
+        )
+    }) {
         return Err(invalid_data(
             "config consensus vote is outside the immutable voter set",
         ));
@@ -1645,17 +1751,30 @@ pub(crate) fn last_log_sync(
 }
 
 fn validate_entry(
+    conn: &Connection,
     entry: &Entry<ConfigRaftTypeConfig>,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
 ) -> io::Result<()> {
     match &entry.payload {
-        EntryPayload::Normal(command) => command
-            .validate(identity)
-            .map_err(|_| invalid_data("invalid encrypted config consensus command")),
-        EntryPayload::Membership(membership) => validate_fixed_membership(
+        EntryPayload::Normal(command) => {
+            command
+                .validate(identity)
+                .map_err(|_| invalid_data("invalid encrypted config consensus command"))?;
+            if matches!(command.intent, ConfigMutationIntent::VoterSlotControl(_))
+                && voter_slots::read_sync(conn)?.is_none()
+            {
+                return Err(invalid_data(
+                    "voter controls require the config incarnation profile",
+                ));
+            }
+            Ok(())
+        }
+        EntryPayload::Membership(membership) => voter_slots::validate_membership_sync(
+            conn,
             &StoredMembership::new(Some(entry.log_id), membership.clone()),
             expected_members,
+            true,
         ),
         EntryPayload::Blank => Ok(()),
     }
@@ -1816,14 +1935,21 @@ fn validate_durable_log_state_sync(
                     "persisted config consensus log crosses purged floor",
                 ));
             }
-            let expected_minimum = match purged.or(snapshot_log_id) {
+            // Installing a snapshot and purging its log prefix are separate
+            // engine commands. A crash after install must still admit the
+            // complete retained prefix beginning at the last *durable purge*.
+            // The snapshot also witnesses a missing prefix when no purge row
+            // has yet been published, but never permits an arbitrary hole.
+            let expected_minimum = match purged {
                 Some(floor) => floor
                     .index
                     .checked_add(1)
                     .ok_or_else(|| invalid_data("config consensus log floor overflow"))?,
                 None => 0,
             };
-            if minimum != expected_minimum {
+            let snapshot_witness = purged.is_none()
+                && snapshot_log_id.is_some_and(|cut| cut.index.checked_add(1) == Some(minimum));
+            if minimum != expected_minimum && !snapshot_witness {
                 return Err(invalid_data(
                     "persisted config consensus log is detached from its floor",
                 ));
@@ -1941,7 +2067,7 @@ fn read_log_rows_unchecked_sync(
         {
             return Err(invalid_data("persisted config consensus log row mismatch"));
         }
-        validate_entry(&entry, identity, expected_members)?;
+        validate_entry(conn, &entry, identity, expected_members)?;
         let decision = batch
             .as_mut()
             .map(|batch| {
@@ -2091,7 +2217,7 @@ pub(crate) fn append_logs_cancellable_sync(
     let mut encoded_bytes = 0_usize;
     for entry in entries {
         cancellation.check_io()?;
-        validate_entry(entry, identity, expected_members)?;
+        validate_entry(conn, entry, identity, expected_members)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
             .checked_sub(encoded_bytes)
             .ok_or_else(|| {
@@ -2145,6 +2271,7 @@ pub(crate) fn append_logs_cancellable_sync(
     }
     for (entry, encoded) in entries.iter().zip(encoded_entries) {
         cancellation.check_io()?;
+        voter_slots::append_sync(&tx, entry)?;
         tx.execute(
             "INSERT INTO config_raft_log (log_index, configuration_epoch, term, entry_json) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -2177,6 +2304,7 @@ pub(crate) fn truncate_logs_sync(
             ));
         }
     }
+    voter_slots::truncate_sync(&tx, log_id.index)?;
     tx.execute(
         "DELETE FROM config_raft_log WHERE log_index >= ?1",
         [checked_i64(log_id.index)?],
@@ -2244,7 +2372,7 @@ pub(crate) fn read_membership_sync(
     if is_pristine_membership(&membership) && read_applied_sync(conn, identity)?.is_none() {
         return Ok(membership);
     }
-    validate_fixed_membership(&membership, expected_members)?;
+    voter_slots::validate_membership_sync(conn, &membership, expected_members, false)?;
     Ok(membership)
 }
 
@@ -2254,7 +2382,8 @@ fn store_membership_sync(
     expected_members: &BTreeSet<ConsensusNodeId>,
     membership: &StoredMembership<ConsensusNodeId, EmptyNode>,
 ) -> io::Result<()> {
-    validate_fixed_membership(membership, expected_members)?;
+    voter_slots::apply_membership_sync(conn, membership)?;
+    voter_slots::validate_membership_sync(conn, membership, expected_members, false)?;
     conn.execute(
         "INSERT OR REPLACE INTO config_raft_membership (singleton, configuration_epoch, membership_json) VALUES (1, ?1, ?2)",
         params![epoch_i64(identity)?, encode_json(membership)?],
@@ -2683,7 +2812,8 @@ fn updates_existing_records(intent: &ConfigMutationIntent) -> bool {
         ConfigMutationIntent::AppendCommit(_)
         | ConfigMutationIntent::RetainHistory(_)
         | ConfigMutationIntent::ManagementAudit(_)
-        | ConfigMutationIntent::AuditedMutation(_) => false,
+        | ConfigMutationIntent::AuditedMutation(_)
+        | ConfigMutationIntent::VoterSlotControl(_) => false,
         ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
         | ConfigMutationIntent::ClearRecoveryRequired { .. }
         | ConfigMutationIntent::MarkConfirmed { .. }
@@ -2711,7 +2841,7 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
-        ConfigMutationIntent::BoundedAppend { .. } => {
+        ConfigMutationIntent::BoundedAppend { .. } | ConfigMutationIntent::VoterSlotControl(_) => {
             Err(invalid_data("invalid committed config consensus command"))
         }
         ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
@@ -2904,7 +3034,7 @@ pub(crate) fn apply_entries_cancellable_sync(
     let mut encoded_bytes = 0_usize;
     for entry in &entries {
         cancellation.check_io()?;
-        validate_entry(entry, identity, expected_members)?;
+        validate_entry(conn, entry, identity, expected_members)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
             .checked_sub(encoded_bytes)
             .ok_or_else(|| invalid_data("config consensus apply exceeds aggregate byte limit"))?;
@@ -2960,6 +3090,17 @@ pub(crate) fn apply_entries_cancellable_sync(
                     audit_receipt: None,
                 }
             }
+            EntryPayload::Normal(super::ConfigConsensusCommand {
+                intent: ConfigMutationIntent::VoterSlotControl(bytes),
+                ..
+            }) => ConfigConsensusResponse {
+                result: voter_slots::apply_control_sync(&tx, &bytes, entry.log_id)?,
+                sequence: 0,
+                digest: None,
+                logical_time: None,
+                raft_log_index: entry.log_id.index,
+                audit_receipt: None,
+            },
             EntryPayload::Normal(command) => {
                 command
                     .validate(identity)
@@ -3117,13 +3258,14 @@ pub(crate) fn apply_entries_cancellable_sync(
                 }
             }
         };
+        voter_slots::publish_applied_sync(&tx, entry.log_id)?;
         save_log_pointer(&tx, "config_raft_applied", identity, &entry.log_id)?;
         last_applied = Some(entry.log_id);
         responses.push(response);
     }
     let membership = read_membership_unchecked_sync(&tx, identity)?;
     if !is_pristine_membership(&membership) {
-        validate_fixed_membership(&membership, expected_members)?;
+        voter_slots::validate_membership_sync(&tx, &membership, expected_members, false)?;
     }
     cancellation.check_io()?;
     tx.commit().map_err(db_error)?;
@@ -3446,7 +3588,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     validate_sealed_state_sync(conn, audit_key, cancellation)?;
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity, expected_members)?;
-    validate_fixed_membership(&membership, expected_members)?;
+    voter_slots::validate_membership_sync(conn, &membership, expected_members, false)?;
     let mut destination = Connection::open(path).map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
     destination
@@ -3482,6 +3624,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         )
         .map_err(db_error)?;
     cancellation.check_io()?;
+    voter_slots::strip_intent_sync(&destination)?;
     validate_existing_schema(
         &destination,
         identity,
@@ -3506,6 +3649,11 @@ fn validate_snapshot_has_no_log_authority(
             |row| row.get(0),
         )
         .map_err(db_error)?;
+    if voter_slots::read_sync(conn)?.is_some_and(|state| state.intent().is_some()) {
+        return Err(invalid_data(
+            "config snapshot contains a provisional voter intent",
+        ));
+    }
     if local_binding {
         return Err(invalid_data(
             "config snapshot contains local storage authority",
@@ -3531,7 +3679,7 @@ fn validate_snapshot_has_no_log_authority(
     Ok(())
 }
 
-fn validate_snapshot_database_sync(
+pub(crate) fn validate_snapshot_database_sync(
     path: &Path,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
@@ -3540,7 +3688,6 @@ fn validate_snapshot_database_sync(
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<Connection> {
     cancellation.check_io()?;
-    validate_fixed_membership(&meta.last_membership, expected_members)?;
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -3663,6 +3810,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     // cannot prevent a destination trigger or temporary table from changing the
     // imported state. Repair may replace damaged rows, so check only schema here.
     validate_live_history_schema_sync(&tx, cancellation)?;
+    voter_slots::install_snapshot_sync(&tx, &source, meta.last_log_id)?;
     for table in [
         "config_lifecycle_audit",
         "rollback_labels",
@@ -3785,7 +3933,7 @@ pub(crate) fn save_current_snapshot_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
-    validate_fixed_membership(&meta.last_membership, expected_members)?;
+    voter_slots::validate_membership_sync(conn, &meta.last_membership, expected_members, true)?;
     if !valid_snapshot_file_name(file_name) {
         return Err(invalid_data("invalid config consensus snapshot file name"));
     }
@@ -3831,7 +3979,7 @@ pub(crate) fn read_current_snapshot_sync(
         return Err(invalid_data("invalid persisted config snapshot file name"));
     }
     let meta: SnapshotMeta<ConsensusNodeId, EmptyNode> = decode_json(&encoded)?;
-    validate_fixed_membership(&meta.last_membership, expected_members)?;
+    voter_slots::validate_membership_sync(conn, &meta.last_membership, expected_members, true)?;
     Ok(Some((
         meta,
         file_name,

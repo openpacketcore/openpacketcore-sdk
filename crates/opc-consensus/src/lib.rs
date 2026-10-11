@@ -16,6 +16,7 @@ pub mod identity;
 pub mod linearizability;
 pub mod profile;
 pub mod transport;
+pub mod voter_slots;
 
 /// The single consensus engine used by production-path SDK adapters.
 ///

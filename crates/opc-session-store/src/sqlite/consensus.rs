@@ -534,6 +534,7 @@ const FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS: usize = 33;
 // revision they must never be derived from a future `SESSION_*` bump.
 #[path = "consensus/void_profile.rs"]
 mod void_profile;
+pub(crate) mod voter_slots;
 pub(crate) use void_profile::fenced_transition_profile_in_sync;
 pub(crate) fn consensus_schema_max_objects_in_sync(
     conn: &Connection,
@@ -6559,7 +6560,7 @@ impl SqliteConsensusCore {
             let fresh_native_basis = !super::consensus_identity_exists(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
             let storage_identity =
-                initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
+                initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile_and_voter_slots(
                     &conn,
                     required_storage_identity,
                     identity,
@@ -6570,6 +6571,7 @@ impl SqliteConsensusCore {
                     fixed_placement_policy,
                     roster_attestation_trust_root.as_ref(),
                     backend.fenced_transition_profile,
+                    backend.voter_seed.as_deref(),
                 )?;
             let applied = read_applied_sync(&conn, storage_identity)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -6905,6 +6907,7 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
     conn: &Connection,
     required_storage_identity: Option<SessionConsensusIdentity>,
@@ -6916,6 +6919,26 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_pro
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
     fenced_profile: crate::FencedTransitionV2Profile,
+) -> Result<SessionConsensusIdentity, SessionConsensusStorageError> {
+    initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile_and_voter_slots(
+        conn, required_storage_identity, requested_identity, expected_members, expected_bindings,
+        pending, authority_profile, fixed_placement_policy, roster_attestation_trust_root, fenced_profile, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile_and_voter_slots(
+    conn: &Connection,
+    required_storage_identity: Option<SessionConsensusIdentity>,
+    requested_identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    pending: Option<PendingMembershipBootstrap<'_>>,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+    fenced_profile: crate::FencedTransitionV2Profile,
+    voter_seed: Option<&voter_slots::Seed>,
 ) -> Result<SessionConsensusIdentity, SessionConsensusStorageError> {
     if matches!(authority_profile, ConsensusAuthorityProfile::FixedImmutable)
         != fixed_placement_policy.is_some()
@@ -6939,6 +6962,14 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_pro
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     let identity_table_exists = table_exists(&tx, "consensus_identity")
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    voter_slots::initialize(
+        &tx,
+        identity_table_exists,
+        voter_seed,
+        requested_identity,
+        expected_members,
+        authority_profile,
+    )?;
 
     if !identity_table_exists {
         if legacy_authority_is_nonempty(&tx)
@@ -23653,6 +23684,9 @@ impl MembershipLogProjection {
 
     fn project_intent(&mut self, intent: &SessionMutationIntent, log_index: u64) -> io::Result<()> {
         match intent {
+            SessionMutationIntent::VoterSlotControl(_) => {
+                Err(invalid_data("slot control cannot enter dynamic authority"))
+            }
             SessionMutationIntent::PrepareTopologyTransition {
                 transition_id,
                 request_digest,
@@ -25296,7 +25330,11 @@ fn last_log_with_optional_capture_sync(
         return Err(invalid_data("persisted session consensus log row mismatch"));
     }
     if let EntryPayload::Normal(command) = &entry.payload {
-        validate_command_for_log(command, identity)?;
+        if voter_slots::read_seed(conn)?.is_some() {
+            voter_slots::validate_command(command, identity)?;
+        } else {
+            validate_command_for_log(command, identity)?;
+        }
     }
     let log_id = entry.log_id;
     if let Some(reuse) = reuse {
@@ -25520,6 +25558,9 @@ fn visit_log_range_with_reuse_sync(
     reuse: &mut LogRowReadReuse<'_>,
     mut visit: impl FnMut(Entry<SessionRaftTypeConfig>),
 ) -> io::Result<()> {
+    if voter_slots::read_seed(conn)?.is_some() {
+        return voter_slots::visit_range(conn, identity, options, visit);
+    }
     let LogRangeReadOptions {
         start,
         end,
@@ -26537,6 +26578,10 @@ fn validate_persisted_membership_sync(
 ) -> io::Result<()> {
     let applied = read_applied_sync(conn, storage_identity)?;
     let membership = read_membership_unchecked_sync(conn, storage_identity)?;
+    if voter_slots::read_seed(conn)?.is_some() {
+        voter_slots::current_membership(conn, storage_identity, &membership)?;
+        return Ok(());
+    }
     if is_pristine_membership(&membership) {
         if applied.is_none() {
             return Ok(());
@@ -26573,6 +26618,10 @@ pub(crate) fn read_membership_sync(
     storage_identity: SessionConsensusIdentity,
 ) -> io::Result<StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>> {
     let membership = read_membership_unchecked_sync(conn, storage_identity)?;
+    if voter_slots::read_seed(conn)?.is_some() {
+        voter_slots::current_membership(conn, storage_identity, &membership)?;
+        return Ok(membership);
+    }
     if is_pristine_membership(&membership) && read_applied_sync(conn, storage_identity)?.is_none() {
         return Ok(membership);
     }
@@ -30909,6 +30958,9 @@ pub(crate) fn validate_consensus_outcome_records(
     outcome: &SessionMutationOutcome,
 ) -> Result<(), StoreError> {
     match outcome {
+        SessionMutationOutcome::VoterSlotControl(_) => Err(StoreError::Serialization(
+            "voter-slot control cannot enter application receipts".into(),
+        )),
         SessionMutationOutcome::ScopeBatch(_)
         | SessionMutationOutcome::ScopeBatchCancel(_)
         | SessionMutationOutcome::ScopeAuthority(_) => Err(StoreError::Serialization(
@@ -31097,6 +31149,9 @@ fn execute_application_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
+        SessionMutationIntent::VoterSlotControl(_) => Err(StoreError::CapabilityNotSupported(
+            "voter-slot native profile required".into(),
+        )),
         SessionMutationIntent::ActivateScopeProfile(certificate) => {
             scope_batch::activate(conn, certificate)?;
             Ok((SessionMutationOutcome::Unit, None))
@@ -31450,6 +31505,9 @@ fn execute_intent_sync(
                 .map_err(membership_mutation_store_error)
                 .map(|_| (SessionMutationOutcome::Unit, None))
         }
+        SessionMutationIntent::VoterSlotControl(_) => Err(StoreError::CapabilityNotSupported(
+            "voter-slot native profile required".into(),
+        )),
         SessionMutationIntent::ScopeBatch(_)
         | SessionMutationIntent::ScopeBatchCancel(_)
         | SessionMutationIntent::ScopeAuthority(_) => Err(StoreError::BackendUnavailable(
@@ -32957,7 +33015,17 @@ pub(crate) fn fixed_quorum_authority_is_exact_sync(
     expected_placement_policy: PlacementResiliencePolicy,
     allow_pristine_membership: bool,
 ) -> io::Result<bool> {
-    if !matches!(expected_members.len(), 3 | 5)
+    let voter_seed = voter_slots::read_seed(conn)?;
+    if voter_seed.as_ref().is_some_and(|seed| {
+        seed.identity().ok() != Some(identity) || seed.members() != *expected_members
+    }) {
+        return Ok(false);
+    }
+    if !(matches!(expected_members.len(), 3 | 5)
+        || (expected_members.len() == 9
+            && voter_slots::read_seed(conn)?.is_some_and(|seed| {
+                seed.identity().ok() == Some(identity) && seed.members() == *expected_members
+            })))
         || validate_member_bindings(expected_members, expected_bindings).is_err()
     {
         return Ok(false);
@@ -32984,7 +33052,11 @@ pub(crate) fn fixed_quorum_authority_is_exact_sync(
         .map_err(|_| invalid_data("session consensus fixed scope is invalid"))?;
     let membership = read_membership_sync(conn, identity)?;
     let applied_membership_is_exact = membership.log_id().is_some()
-        && fixed_uniform_membership_matches(membership.membership(), expected_members);
+        && if voter_seed.is_some() {
+            voter_slots::current_membership(conn, identity, &membership).is_ok()
+        } else {
+            fixed_uniform_membership_matches(membership.membership(), expected_members)
+        };
     Ok(scope.current_identity == identity
         && scope.current_members == *expected_members
         && scope.current_bindings == *expected_bindings
@@ -33501,8 +33573,19 @@ fn validate_fixed_live_durable_state_sync(
     identity: SessionConsensusIdentity,
     expected_members: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<()> {
+    let voter_state = voter_slots::read_state(conn)?;
     if let Some(vote) = read_vote_sync(conn, identity)? {
-        validate_fixed_vote_member(&vote, expected_members)?;
+        if let Some(state) = &voter_state {
+            if vote
+                .leader_id
+                .voted_for()
+                .is_some_and(|node| !voter_slots::known_node(state.table(), node))
+            {
+                return Err(invalid_data("voter-slot vote names unknown incarnation"));
+            }
+        } else {
+            validate_fixed_vote_member(&vote, expected_members)?;
+        }
     }
 
     let committed = read_committed_sync(conn, identity)?;
@@ -33527,7 +33610,11 @@ fn validate_fixed_live_durable_state_sync(
 
     let membership = read_membership_sync(conn, identity)?;
     if !is_pristine_membership(&membership) {
-        validate_uniform_membership(&membership, expected_members)?;
+        if voter_state.is_some() {
+            voter_slots::current_membership(conn, identity, &membership)?;
+        } else {
+            validate_uniform_membership(&membership, expected_members)?;
+        }
         let membership_log_id = membership.log_id().ok_or_else(|| {
             invalid_data("session consensus fixed membership log identity is missing")
         })?;
@@ -33547,7 +33634,11 @@ fn validate_fixed_live_durable_state_sync(
     }
 
     if let Some((meta, _, _, _)) = read_current_snapshot_sync(conn, identity)? {
-        validate_fixed_snapshot_metadata(&meta, expected_members)?;
+        if let Some(state) = &voter_state {
+            voter_slots::snapshot_metadata(state.table(), &meta)?;
+        } else {
+            validate_fixed_snapshot_metadata(&meta, expected_members)?;
+        }
         match (meta.last_log_id.as_ref(), applied.as_ref()) {
             (Some(snapshot), Some(applied)) => ensure_log_id_not_after(
                 snapshot,
@@ -33576,6 +33667,9 @@ fn validate_fixed_durable_state_sync(
     expected_members: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<()> {
     validate_fixed_live_durable_state_sync(conn, identity, expected_members)?;
+    if voter_slots::read_seed(conn)?.is_some() {
+        return voter_slots::validate_full(conn, identity);
+    }
     // Dynamic scope validation permits its narrow purge-attested successor
     // membership case. Fixed authority deliberately retains the historical
     // exact-payload rule: once M is compacted, only selected snapshot M may
@@ -33832,6 +33926,7 @@ fn validate_snapshot_install_retained_rows_sync(
     fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
     incoming: Option<&LogId<SessionConsensusNodeId>>,
 ) -> io::Result<()> {
+    let voter_profile = voter_slots::read_seed(conn)?.is_some();
     let purged = read_purged_sync(conn, identity)?;
     let current_snapshot = read_current_snapshot_sync(conn, identity)?;
     let snapshot = current_snapshot
@@ -33882,7 +33977,9 @@ fn validate_snapshot_install_retained_rows_sync(
                 if entry_validation.is_err() {
                     return;
                 }
-                if fixed_profile_entry_changes_topology(&entry, fixed_expected_members) {
+                if !voter_profile
+                    && fixed_profile_entry_changes_topology(&entry, fixed_expected_members)
+                {
                     entry_error_message = Some("session consensus fixed log entry is invalid");
                     return;
                 }
@@ -33981,7 +34078,11 @@ fn validate_retained_durable_log_sync(
         let entry = decode_consensus_log_entry(&encoded)?;
         validate_log_id(&entry.log_id)?;
         if let EntryPayload::Normal(command) = &entry.payload {
-            validate_command_for_log(command, identity)?;
+            if voter_slots::read_seed(conn)?.is_some() {
+                voter_slots::validate_command(command, identity)?;
+            } else {
+                validate_command_for_log(command, identity)?;
+            }
         }
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
@@ -34094,7 +34195,8 @@ fn fixed_profile_intent_changes_topology(intent: &SessionMutationIntent) -> bool
         | SessionMutationIntent::MarkTopologyLearnersReady { .. }
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
-        | SessionMutationIntent::FinalizeTopologyTransition { .. } => true,
+        | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::VoterSlotControl(_) => true,
         SessionMutationIntent::Authorized { mutation, .. } => {
             fixed_profile_intent_changes_topology(mutation)
         }
@@ -35310,7 +35412,7 @@ fn pinned_snapshot_uri(
 }
 
 #[cfg(target_os = "linux")]
-fn open_pinned_snapshot_database(
+pub(crate) fn open_pinned_snapshot_database(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<Connection> {
     pinned.verify_identity()?;
@@ -35439,7 +35541,7 @@ fn open_empty_pinned_snapshot_compaction_database(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_pinned_snapshot_database(
+pub(crate) fn open_pinned_snapshot_database(
     _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<Connection> {
     Err(io::Error::new(
@@ -37045,6 +37147,7 @@ fn validate_fixed_immutable_membership_scope(
 /// already-attached incoming snapshot. The names are constants controlled by
 /// this adapter; no snapshot-supplied identifier is interpolated into SQL.
 const ATTACHED_SNAPSHOT_VALIDATION_TABLES: &[&str] = &[
+    "consensus_voter_slots",
     "consensus_identity",
     "session_records",
     "leases",
@@ -38680,6 +38783,9 @@ fn create_attached_snapshot_validation_views(
 ) -> io::Result<()> {
     for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
         let source_exists = attached_snapshot_table_exists(conn, table)?;
+        if *table == "consensus_voter_slots" && !source_exists {
+            continue;
+        }
         let sql = if *table == "leases"
             && lease_schema == AttachedSnapshotLeaseSchema::PreAcquisitionTimestamp
         {
@@ -38920,9 +39026,15 @@ fn validate_attached_snapshot_database_sync(
         // The existing fixed metadata contract permits pristine membership
         // only with an absent last log. The exact equality below binds this
         // check to the attached source's applied and membership rows.
-        validate_fixed_snapshot_metadata(meta, &incoming_scope.current_members)?;
+        if let Some(state) = voter_slots::read_state(conn)? {
+            voter_slots::snapshot_metadata(state.table(), meta)?;
+        } else {
+            validate_fixed_snapshot_metadata(meta, &incoming_scope.current_members)?;
+        }
     }
-    if let Some(log_id) = meta.last_membership.log_id() {
+    if voter_slots::read_seed(conn)?.is_some() {
+        voter_slots::current_membership(conn, identity, &meta.last_membership)?;
+    } else if let Some(log_id) = meta.last_membership.log_id() {
         validate_membership_for_log(&meta.last_membership, &incoming_scope, log_id.index)?;
     } else if !is_pristine_membership(&meta.last_membership) {
         return Err(invalid_data(
@@ -39160,6 +39272,15 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_syn
         let tx =
             Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
         before_write(&tx)?;
+        let local_voter_seed = voter_slots::read_seed(&tx)?;
+        let local_voter_state = voter_slots::read_state(&tx)?;
+        if local_voter_seed.is_some()
+            != attached_snapshot_table_exists(&tx, "consensus_voter_slots")?
+        {
+            return Err(invalid_data("snapshot cannot convert voter-slot profile"));
+        }
+        let mut installed_voter_state = None;
+
         // Re-check under the same transaction that swaps the state image. A
         // second process must not be able to advance the durable floor between
         // validation and replacement even though deployment admission already
@@ -39306,6 +39427,30 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_syn
             incoming_has_protected_roster_v2,
         )?;
         let validation: io::Result<()> = (|| {
+            if let Some(local_seed) = &local_voter_seed {
+                let incoming_seed = voter_slots::read_seed(&tx)?
+                    .ok_or_else(|| invalid_data("snapshot voter seed absent"))?;
+                let incoming_state = voter_slots::read_state(&tx)?
+                    .ok_or_else(|| invalid_data("snapshot voter state absent"))?;
+                if incoming_seed.genesis != local_seed.genesis || incoming_state.intent().is_some()
+                {
+                    return Err(invalid_data("snapshot voter genesis or intent differs"));
+                }
+                let mut installed = local_voter_state
+                    .clone()
+                    .ok_or_else(|| invalid_data("local voter state absent"))?;
+                installed
+                    .publish_snapshot(
+                        incoming_state.table().clone(),
+                        voter_slots::cut(
+                            meta.last_log_id
+                                .ok_or_else(|| invalid_data("voter snapshot lacks cut"))?,
+                        ),
+                    )
+                    .map_err(|_| invalid_data("snapshot voter publication regressed"))?;
+                installed_voter_state = Some(installed);
+            }
+
             let incoming_scope = validate_attached_snapshot_database_sync(
                 &tx,
                 identity,
@@ -39711,6 +39856,9 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_syn
             // new purge floor, so process loss cannot leave installed applied
             // state ahead of the durable committed frontier.
         }
+        if let (Some(seed), Some(state)) = (&local_voter_seed, &installed_voter_state) {
+            voter_slots::write_state(&tx, &seed.genesis, state)?;
+        }
         validate_snapshot_install_retained_log_sync(
             &tx,
             identity,
@@ -40047,7 +40195,11 @@ pub(crate) fn save_current_snapshot_with_authority_and_hooks_sync(
         fixed_placement_policy,
     )?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-        validate_fixed_snapshot_metadata(meta, expected_members)?;
+        if let Some(state) = voter_slots::read_state(&tx)? {
+            voter_slots::snapshot_metadata(state.table(), meta)?;
+        } else {
+            validate_fixed_snapshot_metadata(meta, expected_members)?;
+        }
     }
     if let Some(snapshot_log_id) = meta
         .last_log_id

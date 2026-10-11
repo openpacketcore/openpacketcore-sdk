@@ -1,7 +1,8 @@
 //! Keep functional fixture formation independent of host scheduling delays.
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+#[path = "controlled_clock.rs"]
+pub(crate) mod controlled_clock;
 
 /// Poll only formation on a controlled clock, preserving the caller's runtime.
 ///
@@ -14,45 +15,13 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let (lifetime, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .expect("test formation runtime");
-        runtime.block_on(async move {
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            // A live blocking task inhibits automatic protocol-clock advance.
-            // Dropping the sender also releases it if formation panics.
-            let mut watchdog = tokio::task::spawn_blocking(move || {
-                held.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            });
-            let (result, watchdog_finished) = tokio::select! {
-                biased;
-                _ = cancelled => (Err("test formation caller was cancelled"), false),
-                result = formation => (Ok(result), false),
-                expired = &mut watchdog => {
-                    let _ = expired.expect("test formation watchdog task");
-                    (Err("test formation wall-clock watchdog expired"), true)
-                }
-            };
-            drop(release);
-            if !watchdog_finished {
-                let _ = watchdog.await.expect("retire test formation watchdog");
-            }
-            result
-        })
-    });
-    let result = task.await.expect("test formation task");
-    drop(lifetime);
-    result.expect("complete test formation")
+    controlled_clock::run(formation).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::sync::oneshot;
 
     #[tokio::test(start_paused = true)]

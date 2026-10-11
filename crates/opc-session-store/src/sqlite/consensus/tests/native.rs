@@ -13,6 +13,7 @@ mod public_reads;
 mod roster;
 mod scope_scans;
 mod v1;
+mod voter_slots;
 
 fn fixed_members() -> BTreeSet<SessionConsensusNodeId> {
     members(&[7, 8, 9])

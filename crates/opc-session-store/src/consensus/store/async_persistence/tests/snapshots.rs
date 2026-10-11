@@ -111,7 +111,7 @@ async fn prepare(fleet: &mut Fleet) -> Story {
         .unwrap();
     for store in fleet.stores.iter().flatten() {
         assert_recorded(store, &first, &first_outcome).await;
-        store.drain_async_persistence().await.unwrap();
+        clock::drain(store).await.unwrap();
     }
     let old_applied = fleet
         .store(follower)
@@ -316,15 +316,40 @@ async fn async_persistence_cold_repair_rejects_wrong_authority_and_requires_real
             .unwrap() = Some((leader, cut.barrier.index - 1));
         fleet.set_link(story.leader, story.follower, true);
         let repair = persistence_protocol::ColdRepairRequest::new(cut);
-        assert!(cold
+        let response = cold
             .call_peer::<_, ()>(
                 leader,
                 SessionConsensusRpcFamily::ReadBarrier,
                 &repair,
                 tokio::time::Instant::now() + OPERATION_BOUND,
             )
-            .await
-            .is_err());
+            .await;
+        assert!(
+            matches!(
+                response,
+                Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                    SessionConsensusPeerError::Rejected
+                ))
+            ),
+            "the deliberately blocked matching append is rejected: {response:?}"
+        );
+        // An RPC reply is not a metrics-publication event. Observe the real
+        // completed install before testing that it did not grant admission.
+        races::until(
+            [cold.inner.raft.metrics()],
+            || {
+                let metrics = cold.inner.raft.metrics();
+                let current = metrics.borrow();
+                current
+                    .snapshot
+                    .is_some_and(|last| persistence_protocol::covers(last, cut.barrier))
+                    && current
+                        .last_applied
+                        .is_some_and(|last| persistence_protocol::covers(last, cut.barrier))
+            },
+            "the actual cold snapshot publishes before the blocked matching append can admit",
+        )
+        .await;
         assert!(cold
             .inner
             .raft
@@ -374,9 +399,7 @@ async fn async_persistence_cold_repair_rejects_wrong_authority_and_requires_real
                 .load(Ordering::Acquire)
                 > appends
         );
-        let initialized = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(initialized.elapsed() < OPERATION_BOUND);
+        clock::initialize(&cold).await.unwrap();
         assert_eq!(cold.inner.raft.metrics().borrow().vote, cut.vote);
         assert_eq!(live.inner.raft.metrics().borrow().vote, cut.vote);
         assert_recorded(&cold, &story.first, &story.first_outcome).await;
@@ -420,7 +443,7 @@ async fn install_base(cold: &ConsensusSessionStore, sender: SessionConsensusNode
     );
     // The real install dispatches a separate log purge. Let that legitimate
     // background generation finish before byte-exact rejection assertions.
-    cold.drain_async_persistence().await.unwrap();
+    clock::drain(cold).await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
         races::wait_for(
@@ -592,9 +615,7 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
                 fleet.set_link(sender, story.follower, true);
             }
         }
-        let initialized = tokio::time::Instant::now();
-        cold.initialize_cluster().await.unwrap();
-        assert!(initialized.elapsed() < OPERATION_BOUND);
+        clock::initialize(&cold).await.unwrap();
         let fresh = fleet.peers[story.leader].last_cut.lock().unwrap().unwrap();
         assert!(fresh.barrier.index > story.cut.barrier.index);
         assert_ne!(fresh.request.nonce, story.cut.request.nonce);
@@ -608,7 +629,7 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
         assert!(
             local.meta.last_log_id.unwrap().index > story.covering.meta.last_log_id.unwrap().index
         );
-        cold.drain_async_persistence().await.unwrap();
+        clock::drain(&cold).await.unwrap();
         fleet.close(story.follower).await;
         drop(cold);
         fleet
@@ -616,13 +637,9 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             .await
             .unwrap();
         assert!(!fleet.store(story.follower).status().admitted);
-        let reopened = tokio::time::Instant::now();
-        fleet
-            .store(story.follower)
-            .initialize_cluster()
+        clock::initialize(fleet.store(story.follower))
             .await
             .unwrap();
-        assert!(reopened.elapsed() < OPERATION_BOUND);
         assert_recorded(
             fleet.store(story.follower),
             &story.first,
