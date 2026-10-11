@@ -621,10 +621,11 @@ class RepositoryWorkflowTests(unittest.TestCase):
         self.assertEqual(step['env']['LANE_RESULTS'], '${{ toJSON(needs) }}')
         self.assertNotIn('if', step)
         self.assertNotIn('continue-on-error', step)
+        self.assertNotIn('shell', step)
         lanes = {name: {'result': 'success'} for name in self.aggregate['needs']}
 
         def run(results):
-            return subprocess.run(['bash', '-euo', 'pipefail', '-c', step['run']],
+            return subprocess.run(['bash', '-e', '-c', step['run']],
                                   env={**os.environ, 'LANE_RESULTS': json.dumps(results)},
                                   capture_output=True, text=True, check=False)
 
@@ -637,6 +638,24 @@ class RepositoryWorkflowTests(unittest.TestCase):
                     result = run({**lanes, name: {'result': status}})
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn(f'::error::Rust lanes did not succeed: {name}', result.stdout)
+
+    def test_nested_i686_aggregate_rejects_each_non_success_result(self):
+        job = self.jobs['session-net-i686']
+        self.assertEqual(job['if'], 'always()')
+        self.assertEqual(job['needs'], ['session-net-i686-tests'])
+        self.assertNotIn('continue-on-error', job)
+        self.assertEqual(job['env'], {'I686_TESTS_RESULT': '${{ needs.session-net-i686-tests.result }}'})
+        (step,) = job['steps']
+        self.assertEqual(set(step), {'name', 'run'})
+
+        def run(status):
+            return subprocess.run(['bash', '-e', '-c', step['run']], env={**os.environ, 'I686_TESTS_RESULT': status},
+                                  capture_output=True, text=True, check=False)
+
+        self.assertEqual(run('success').returncode, 0)
+        for status in ('failure', 'cancelled', 'skipped', 'unknown', ''):
+            with self.subTest(status=status):
+                self.assertNotEqual(run(status).returncode, 0)
 
 
 class DeclarationTests(unittest.TestCase):
@@ -969,6 +988,43 @@ class LocalRevisionTests(unittest.TestCase):
                                          'after': self.main, 'repository': {'default_branch': 'main'}}))
         report_path = self.root / 'report.json'
         with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_EVENT_PATH': str(event_path)}):
+            with patch('sys.stdout', new=io.StringIO()) as output:
+                self.assertEqual(main(['--repo', str(self.root), '--json', str(report_path)]), 0)
+                self.assertIn('nothing to compare', output.getvalue().lower())
+        self.assertEqual(json.loads(report_path.read_text()),
+                         dict(base=self.main, head=self.main, success=True, nothing_to_compare=True,
+                              base_tests=None, head_tests=None, findings=[], errors=[]))
+
+    def test_manual_dispatch_uses_default_branch_merge_base_and_dispatched_head(self):
+        self.git('update-ref', 'refs/remotes/origin/trunk', self.main)
+        self.git('update-ref', '-d', 'refs/remotes/origin/main')
+        (self.root / 'src/lib.rs').write_text(rust()['src/lib.rs'])
+        self.git('add', '.')
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'later checkout restores test')
+        restored = self.git('rev-parse', 'HEAD')
+        event_path = self.root / 'event.json'
+        event_path.write_text(json.dumps({'ref': 'fixture', 'repository': {'default_branch': 'trunk'}}))
+        report_path = self.root / 'report.json'
+        for head, expected_exit in ((self.head, 1), (restored, 0)):
+            with self.subTest(head=head), patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+                                                                 'GITHUB_EVENT_PATH': str(event_path), 'GITHUB_SHA': head}):
+                self.assertEqual(comparison_revisions(self.root), (self.base, head, 'GitHub event'))
+                with patch('sys.stdout', new=io.StringIO()) as output:
+                    self.assertEqual(main(['--repo', str(self.root), '--json', str(report_path)]), expected_exit)
+                    if expected_exit:
+                        self.assertIn('UNDECLARED removed', output.getvalue())
+                report = json.loads(report_path.read_text())
+                self.assertEqual((report['base'], report['head']), (self.base, head))
+                self.assertEqual(report['success'], expected_exit == 0)
+                self.assertEqual(len(report['findings']), expected_exit)
+
+    def test_manual_dispatch_on_default_branch_reports_nothing_to_compare(self):
+        self.git('checkout', '-B', 'main', self.main)
+        event_path = self.root / 'event.json'
+        event_path.write_text(json.dumps({'ref': 'main', 'repository': {'default_branch': 'main'}}))
+        report_path = self.root / 'report.json'
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+                                     'GITHUB_EVENT_PATH': str(event_path), 'GITHUB_SHA': self.main}):
             with patch('sys.stdout', new=io.StringIO()) as output:
                 self.assertEqual(main(['--repo', str(self.root), '--json', str(report_path)]), 0)
                 self.assertIn('nothing to compare', output.getvalue().lower())

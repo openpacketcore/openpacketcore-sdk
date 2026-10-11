@@ -43,6 +43,11 @@ def event_revisions(repo, event_name, event):
         return git(repo, 'merge-base', revision(repo, base), revision(repo, head)).decode().strip(), head
     if event_name == 'merge_group':
         return event['merge_group']['base_sha'], event['merge_group']['head_sha']
+    if event_name == 'workflow_dispatch':
+        head = os.environ['GITHUB_SHA']
+        branch = event['repository']['default_branch']
+        base = git(repo, 'merge-base', revision(repo, 'refs/remotes/origin/' + branch), revision(repo, head)).decode().strip()
+        return base, head
     if event_name == 'push':
         head = event['after']
         if event.get('deleted') or head == '0' * 40:
@@ -55,7 +60,7 @@ def event_revisions(repo, event_name, event):
         if not before or before == '0' * 40:
             raise GuardError('Initial branch push needs an explicit base revision')
         return before, head
-    raise GuardError('Supply both --base and --head, or run on a pull_request/merge_group/push event')
+    raise GuardError('Supply both --base and --head, or run on a pull_request/merge_group/push/workflow_dispatch event')
 
 
 def comparison_revisions(repo, base=None, head=None):
