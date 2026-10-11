@@ -1,6 +1,12 @@
 //! Safe Linux XFRM backend over the raw netlink sys boundary.
 
+mod local_dscp;
+#[cfg(feature = "scope-store")]
+mod local_effect;
+mod local_netlink;
+mod local_profile;
 mod namespace_reset;
+pub(crate) use local_profile::LocalAdmissionProbe;
 
 use std::fmt;
 use std::io;
@@ -173,6 +179,8 @@ pub struct LinuxXfrmBackend {
 }
 
 struct LinuxXfrmBackendInner {
+    local_lifecycle: Option<opc_local_kernel_lifecycle::LocalKernelLifecycle>,
+    local_actor_registration: Option<Arc<opc_local_kernel_lifecycle::LocalXfrmActorRegistration>>,
     transport: Arc<dyn LinuxXfrmTransport>,
     next_sequence: AtomicU32,
     config: LinuxXfrmBackendConfig,
@@ -233,6 +241,8 @@ impl LinuxXfrmBackend {
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
+                local_lifecycle: None,
+                local_actor_registration: None,
             }),
         }
     }
@@ -266,6 +276,8 @@ impl LinuxXfrmBackend {
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
+                local_lifecycle: None,
+                local_actor_registration: None,
             }),
         })
     }
@@ -323,6 +335,8 @@ impl LinuxXfrmBackend {
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
+                local_lifecycle: None,
+                local_actor_registration: None,
             }),
         })
     }
@@ -348,6 +362,8 @@ impl LinuxXfrmBackend {
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
+                local_lifecycle: None,
+                local_actor_registration: None,
             }),
         }
     }
@@ -380,6 +396,8 @@ impl LinuxXfrmBackend {
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
+                local_lifecycle: None,
+                local_actor_registration: None,
             }),
         })
     }
@@ -610,10 +628,45 @@ impl LinuxXfrmBackend {
         )
     }
 
+    pub(crate) fn with_local_lifecycle(
+        mut self,
+        lifecycle: opc_local_kernel_lifecycle::LocalKernelLifecycle,
+    ) -> Result<Self, XfrmError> {
+        lifecycle
+            .local_scope()
+            .verify()
+            .map_err(crate::local_scope::scope_error)?;
+        let registration =
+            lifecycle
+                .register_xfrm_actor()
+                .map_err(|_| XfrmError::UnsupportedFeature {
+                    feature: "local_scope_xfrm_actor_busy",
+                })?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(XfrmError::Unavailable)?;
+        inner.transport = Arc::new(local_netlink::ScopedNetlinkTransport);
+        inner.local_actor_registration = Some(Arc::new(registration));
+        #[cfg(target_os = "linux")]
+        {
+            inner.dscp_runtime = Arc::new(crate::dscp::scoped_runtime::ScopedRuntime::new(
+                lifecycle.clone(),
+            ));
+        }
+        inner.local_lifecycle = Some(lifecycle);
+        Ok(self)
+    }
+
+    pub(crate) fn local_lifecycle(
+        &self,
+    ) -> Option<&opc_local_kernel_lifecycle::LocalKernelLifecycle> {
+        self.inner.local_lifecycle.as_ref()
+    }
+
     pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
         let inner = self.inner;
         Self {
             inner: Arc::new(LinuxXfrmBackendInner {
+                local_lifecycle: inner.local_lifecycle.clone(),
+                local_actor_registration: inner.local_actor_registration.clone(),
                 transport: Arc::clone(&inner.transport),
                 next_sequence: AtomicU32::new(inner.next_sequence.load(Ordering::Acquire)),
                 config: inner.config,
@@ -634,6 +687,12 @@ impl LinuxXfrmBackend {
     }
 
     pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
+        if let Some(lifecycle) = self.local_lifecycle() {
+            lifecycle
+                .local_scope()
+                .verify()
+                .map_err(crate::local_scope::scope_error)?;
+        }
         self.ensure_namespace_binding()?;
         if !self.inner.dscp_activation_deferred {
             if let Some(config) = &self.inner.dscp_config {
@@ -1709,6 +1768,17 @@ pub(crate) enum NetlinkDumpCompletion {
 }
 
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
+    fn verify_empty_scoped(
+        &self,
+        _message_type: u16,
+        _sequence: u32,
+        _config: LinuxXfrmBackendConfig,
+    ) -> Result<(), XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "local_scope_profile_empty_readback",
+        })
+    }
+
     fn verify_empty(
         &self,
         _message_type: u16,
@@ -1785,6 +1855,15 @@ impl LinuxXfrmSession for NetlinkXfrmSession {
 struct NetlinkXfrmTransport;
 
 impl LinuxXfrmTransport for NetlinkXfrmTransport {
+    fn verify_empty_scoped(
+        &self,
+        message_type: u16,
+        sequence: u32,
+        config: LinuxXfrmBackendConfig,
+    ) -> Result<(), XfrmError> {
+        namespace_reset::verify_empty_scoped(message_type, sequence, config)
+    }
+
     fn verify_empty(
         &self,
         message_type: u16,
@@ -2382,6 +2461,29 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuff
     push_u32_ne(&mut out, request.max_spi);
     debug_assert_eq!(out.len(), XFRM_USER_SPI_INFO_LEN);
     Ok(out)
+}
+
+#[cfg(feature = "scope-store")]
+pub(crate) fn validate_scoped_install_encoding(
+    sa: &SaParameters,
+    policy: &PolicyParameters,
+) -> Result<(), XfrmError> {
+    if sa.aead.as_ref().is_some_and(|(algorithm, key)| {
+        algorithm.name == "rfc4106(gcm(aes))" && !matches!(key.len(), 20 | 28 | 36)
+    }) {
+        return Err(XfrmError::invalid_config(
+            "local_scope.request",
+            "RFC4106 requires an AES key and four-byte salt",
+        ));
+    }
+    // The reserved DSCP mark window belongs to the bound backend. Validate
+    // every other wire field now; the actor validates the actual profile and
+    // companion readback before creating even the protective policy.
+    let mut wire = sa.clone();
+    wire.egress_dscp = None;
+    let _sa = encode_sa_info_inner(&wire, false, None)?;
+    let _policy = encode_policy_info(policy)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3631,10 +3733,9 @@ const fn family_of_ip(address: IpAddress) -> u8 {
     }
 }
 
-fn parse_outbound_sa_binding_snapshot(
+fn parse_outbound_sa_binding_shape(
     payload: &[u8],
     expectation: &OutboundSaPolicyExpectation,
-    supplied_sa: Option<&SaParameters>,
 ) -> Result<SaRelocationSnapshot, XfrmError> {
     let expected = expected_sa(expectation);
     validate_route_attribute_stream(payload, XFRM_USER_SA_INFO_LEN, "query_outbound_sa_binding")?;
@@ -3671,11 +3772,20 @@ fn parse_outbound_sa_binding_snapshot(
     };
     validate_sa_binding_dynamic_attributes(payload, direction)?;
     validate_outbound_sa_replay_attributes(payload, expectation.replay_esn())?;
+    parse_sa_relocation_snapshot(payload)
+}
+
+fn parse_outbound_sa_binding_snapshot(
+    payload: &[u8],
+    expectation: &OutboundSaPolicyExpectation,
+    supplied_sa: Option<&SaParameters>,
+) -> Result<SaRelocationSnapshot, XfrmError> {
+    let observed = parse_outbound_sa_binding_shape(payload, expectation)?;
     match supplied_sa {
         Some(supplied_sa) => validate_outbound_sa_crypto(payload, supplied_sa)?,
         None => validate_outbound_sa_crypto_metadata(payload, expectation.crypto())?,
     }
-    parse_sa_relocation_snapshot(payload)
+    Ok(observed)
 }
 
 fn validate_outbound_sa_fixed_header(

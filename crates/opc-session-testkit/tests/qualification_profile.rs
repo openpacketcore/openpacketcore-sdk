@@ -79,7 +79,8 @@ const MTLS_CANDIDATE_REMAINING_ACCEPTANCE: [&str; 7] = [
     "bounded_drain_and_reconnect_evidence",
     "platform_and_soak_matrix",
 ];
-const CURRENT_SOURCE_BUILD_ONLY: [&str; 30] = [
+// Historical qualification evidence retains its original release inventory.
+const FROZEN_V6_SOURCE_BUILD_ONLY: [&str; 30] = [
     "opc-alarm",
     "opc-alarm-k8s",
     "opc-alarm-testkit",
@@ -93,6 +94,42 @@ const CURRENT_SOURCE_BUILD_ONLY: [&str; 30] = [
     "opc-gnmi-server",
     "opc-gtpu-dataplane",
     "opc-ipsec-lb",
+    "opc-mgmt-audit-store",
+    "opc-mgmt-authz",
+    "opc-mgmt-transport",
+    "opc-netconf-server",
+    "opc-persist",
+    "opc-runtime",
+    "opc-sa-mirror",
+    "opc-sbi",
+    "opc-sdk",
+    "opc-sdk-integration",
+    "opc-session-cache",
+    "opc-session-net",
+    "opc-session-store",
+    "opc-session-testkit",
+    "operator-controller",
+    "operator-lifecycle",
+    "operator-lifecycle-cli",
+];
+
+// The current publication boundary includes optional normal dependencies.
+const CURRENT_SOURCE_BUILD_ONLY: [&str; 32] = [
+    "opc-alarm",
+    "opc-alarm-k8s",
+    "opc-alarm-testkit",
+    "opc-alarm-yang",
+    "opc-amf-lite",
+    "opc-amf-lite-testkit",
+    "opc-config-bus",
+    "opc-config-bus-consensus",
+    "opc-consensus",
+    "opc-egress-fence",
+    "opc-gnmi-server",
+    "opc-gtpu-dataplane",
+    "opc-ipsec-lb",
+    "opc-ipsec-xfrm",
+    "opc-local-kernel-lifecycle",
     "opc-mgmt-audit-store",
     "opc-mgmt-authz",
     "opc-mgmt-transport",
@@ -533,7 +570,7 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
     );
     assert_eq!(
         profile.source_build_gate.affected_workspace_crates,
-        CURRENT_SOURCE_BUILD_ONLY
+        FROZEN_V6_SOURCE_BUILD_ONLY
     );
     assert_eq!(profile.source_build_gate.crates_io_check_date, "2026-07-13");
     assert!(profile.source_build_gate.crates_io_exact_matches.is_empty());

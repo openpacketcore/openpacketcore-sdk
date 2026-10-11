@@ -1060,6 +1060,11 @@ pub struct NamespaceBoundLinuxXfrmBackend {
 }
 
 struct NamespaceBoundLinuxXfrmBackendInner {
+    #[cfg(all(test, feature = "scope-store"))]
+    actor_join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(feature = "scope-store")]
+    local_installs: Arc<tokio::sync::Semaphore>,
+    local_lifecycle: Option<opc_local_kernel_lifecycle::LocalKernelLifecycle>,
     sender: mpsc::Sender<NamespaceCommand>,
     actor_binding: NamespaceActorBinding,
     // The actor runtime owns retained finish tasks.  This lets the special
@@ -1112,6 +1117,7 @@ fn bind_with_capacity(
     let binding = NetworkNamespaceBinding::capture()?;
     let actor_binding = NamespaceActorBinding::new(binding);
     let backend = backend.for_namespace_actor(binding);
+    let local_lifecycle = backend.local_lifecycle().cloned();
     let (sender, receiver) = mpsc::channel(capacity);
     let (startup_sender, startup_receiver) = std::sync::mpsc::sync_channel(1);
 
@@ -1129,11 +1135,17 @@ fn bind_with_capacity(
     // A JoinHandle detaches on drop. The channel lifetime is authoritative:
     // closing the final sender makes the actor drain and then exit, without a
     // potentially blocking Drop implementation.
+    #[cfg(not(all(test, feature = "scope-store")))]
     drop(worker);
     startup?;
 
     Ok(NamespaceBoundLinuxXfrmBackend {
         inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+            #[cfg(all(test, feature = "scope-store"))]
+            actor_join: std::sync::Mutex::new(Some(worker)),
+            #[cfg(feature = "scope-store")]
+            local_installs: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            local_lifecycle,
             sender,
             actor_binding,
             #[cfg(test)]
@@ -1307,6 +1319,7 @@ fn bind_with_capacity_and_recovery(
         .map_err(|source| XfrmObjectRecoveryBindError::Backend { source })?;
     let actor_binding = NamespaceActorBinding::new(binding);
     let backend = backend.for_namespace_actor(binding);
+    let local_lifecycle = backend.local_lifecycle().cloned();
     let (sender, receiver) = mpsc::channel(capacity);
     let (startup_sender, startup_receiver) = std::sync::mpsc::sync_channel(1);
 
@@ -1338,12 +1351,18 @@ fn bind_with_capacity_and_recovery(
     // A JoinHandle detaches on drop. The channel lifetime is authoritative:
     // closing the final sender makes the actor drain and then exit, without a
     // potentially blocking Drop implementation.
+    #[cfg(not(all(test, feature = "scope-store")))]
     drop(worker);
     let (store, relocation_store, roster_store, retained_finish_runtime) = startup?;
 
     Ok((
         NamespaceBoundLinuxXfrmBackend {
             inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+                #[cfg(all(test, feature = "scope-store"))]
+                actor_join: std::sync::Mutex::new(Some(worker)),
+                #[cfg(feature = "scope-store")]
+                local_installs: Arc::new(tokio::sync::Semaphore::new(capacity)),
+                local_lifecycle,
                 sender,
                 actor_binding,
                 retained_finish_runtime: Some(retained_finish_runtime),
@@ -1508,9 +1527,7 @@ fn run_actor(
     }
 
     runtime.block_on(async move {
-        while let Some(command) = receiver.recv().await {
-            command.execute(&backend, &mut state).await;
-        }
+        drive_actor(&backend, &mut state, &mut receiver).await;
     });
 }
 
@@ -1541,13 +1558,52 @@ fn run_actor(
 
     runtime.block_on(async move {
         let mut state = NamespaceActorState::new(actor_binding);
-        while let Some(command) = receiver.recv().await {
-            command.execute(&backend, &mut state).await;
-        }
+        drive_actor(&backend, &mut state, &mut receiver).await;
     });
 }
 
+async fn drive_actor(
+    backend: &LinuxXfrmBackend,
+    state: &mut NamespaceActorState,
+    receiver: &mut mpsc::Receiver<NamespaceCommand>,
+) {
+    let mut callers_closed = false;
+    loop {
+        let deadline = state.local_profile.next_attempt();
+        #[cfg(feature = "scope-store")]
+        let deadline = deadline
+            .into_iter()
+            .chain(state.local_operations.next_attempt())
+            .min();
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                command = receiver.recv(), if !callers_closed => {
+                    if let Some(command) = command { command.execute(backend, state).await; }
+                    else { callers_closed = true; }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    if state.local_profile.next_attempt().is_some_and(|at| at <= deadline) {
+                        state.local_profile.step(backend).await;
+                    } else {
+                        #[cfg(feature = "scope-store")]
+                        state.local_operations.step(backend).await;
+                    }
+                }
+            }
+        } else if callers_closed {
+            return;
+        } else if let Some(command) = receiver.recv().await {
+            command.execute(backend, state).await;
+        } else {
+            callers_closed = true;
+        }
+    }
+}
+
 struct NamespaceActorState {
+    #[cfg(feature = "scope-store")]
+    local_operations: crate::local_scope::operations::Operations,
+    local_profile: crate::local_scope::LocalXfrmState,
     reset_gate: NamespaceResetGate,
     #[cfg(test)]
     reset_fail_after_step: Option<usize>,
@@ -1584,6 +1640,9 @@ struct NamespaceActorState {
 impl NamespaceActorState {
     fn new(actor_binding: NamespaceActorBinding) -> Self {
         Self {
+            local_profile: crate::local_scope::LocalXfrmState::default(),
+            #[cfg(feature = "scope-store")]
+            local_operations: crate::local_scope::operations::Operations::default(),
             reset_gate: NamespaceResetGate::default(),
             #[cfg(test)]
             reset_fail_after_step: None,
@@ -1621,7 +1680,9 @@ impl NamespaceActorState {
     fn reset_namespace(
         &mut self,
         backend: &LinuxXfrmBackend,
+        contained: Option<&opc_linux_gtpu_sys::tc::ContainedScope>,
     ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
+        self.local_profile = crate::local_scope::LocalXfrmState::default();
         self.invalidate_live_authorities();
         #[cfg(unix)]
         {
@@ -1629,11 +1690,29 @@ impl NamespaceActorState {
             self.relocation_admissions.clear();
             self.roster_admissions.clear();
         }
-        backend.flush_namespace_policies()?;
+        match contained {
+            Some(contained) => backend.flush_namespace_policies_contained(Some(contained))?,
+            None => backend.flush_namespace_policies()?,
+        }
         self.reset_checkpoint(1)?;
+        if let Some(contained) = contained {
+            contained
+                .recheck()
+                .map_err(crate::local_scope::scope_error)?;
+        }
         backend.flush_namespace_sas()?;
         self.reset_checkpoint(2)?;
+        if let Some(contained) = contained {
+            contained
+                .recheck()
+                .map_err(crate::local_scope::scope_error)?;
+        }
         backend.verify_namespace_empty()?;
+        if let Some(contained) = contained {
+            contained
+                .recheck()
+                .map_err(crate::local_scope::scope_error)?;
+        }
         self.reset_checkpoint(3)?;
         #[allow(unused_mut)]
         let mut stores_reset = 0;
@@ -2259,6 +2338,163 @@ impl NamespaceBoundLinuxXfrmBackend {
         &self,
         _acknowledgement: ExclusiveNamespaceResetAcknowledgement,
     ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
+        self.reset_namespace_command(None).await
+    }
+
+    pub(crate) fn local_lifecycle(
+        &self,
+    ) -> Option<&opc_local_kernel_lifecycle::LocalKernelLifecycle> {
+        self.inner.local_lifecycle.as_ref()
+    }
+
+    /// Freshly build every configured DSCP graph under this contained reset.
+    /// Successful publication enables only receipt-bound scoped SA operations.
+    pub async fn rebuild_scoped_dscp(
+        &self,
+        reset: &opc_local_kernel_lifecycle::LocalScopeResetReceipt,
+    ) -> Result<Vec<opc_local_kernel_lifecycle::LocalInstalledGraph>, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::RebuildLocalDscp {
+                reset: reset.clone(),
+                reply,
+            }
+        })
+        .await
+    }
+
+    #[cfg(all(test, feature = "scope-store"))]
+    pub(crate) fn test_actor_join(&self) -> std::thread::JoinHandle<()> {
+        self.inner.actor_join.lock().unwrap().take().unwrap()
+    }
+
+    #[cfg(all(test, feature = "scope-store"))]
+    pub(crate) async fn scoped_test_retained(&self) -> usize {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Retained(reply))
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(all(test, feature = "scope-store"))]
+    pub(crate) async fn scoped_test_fault(&self, fault: crate::local_scope::operations::TestFault) {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Fault(
+                fault, reply,
+            ))
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Install and publish one exact protected SA under actual committed
+    /// activation authority. Saturation waits for admission; it never refuses
+    /// an attach for capacity. Cancellation before publication leaves exact
+    /// undo owned by this actor. Reply loss after publication keeps forwarding;
+    /// retry the same effect and request to obtain its receipt.
+    #[cfg(feature = "scope-store")]
+    pub async fn install_scoped(
+        &self,
+        profile: &crate::LocalXfrmProfile,
+        effect: opc_local_kernel_lifecycle::CommittedScopeEffect,
+        request: crate::ScopedXfrmRequest,
+    ) -> Result<crate::ScopedXfrmReceipt, XfrmError> {
+        let permit = self
+            .inner
+            .local_installs
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| XfrmError::Unavailable)?;
+        let guard = profile.begin().await?;
+        self.dispatch(LostReply::Mutation("local_scope_install"), |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Install(
+                Box::new(crate::local_scope::operations::Install {
+                    profile: profile.clone(),
+                    effect,
+                    request: Arc::new(request),
+                    guard,
+                    permit,
+                    reply,
+                }),
+            ))
+        })
+        .await
+    }
+
+    /// Retire exactly the receipt's SA, then its protective policy, using
+    /// fresh full-key readback. Cleanup needs no fresh store authority, bypasses
+    /// install admission, and remains supervised if this future is dropped.
+    #[cfg(feature = "scope-store")]
+    pub async fn remove_scoped(&self, receipt: &crate::ScopedXfrmReceipt) -> Result<(), XfrmError> {
+        let guard = receipt.begin().await?;
+        self.dispatch(LostReply::Mutation("local_scope_remove"), |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Remove {
+                receipt: receipt.clone(),
+                guard,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Fresh local SA/policy readback without reauthorizing or recreating a
+    /// published effect. Expiration reports false and retains the reservation
+    /// until explicit exact cleanup retires the protective policy as well.
+    #[cfg(feature = "scope-store")]
+    pub async fn read_scoped(&self, receipt: &crate::ScopedXfrmReceipt) -> Result<bool, XfrmError> {
+        let guard = receipt.begin().await?;
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Read {
+                receipt: receipt.clone(),
+                guard,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Identifier-free progress for actor-owned pending install and cleanup.
+    /// Attempt pacing and age are diagnostics, never ownership timeouts.
+    #[cfg(feature = "scope-store")]
+    pub async fn scoped_cleanup_progress(
+        &self,
+    ) -> Result<Vec<opc_local_kernel_lifecycle::CleanupProgress>, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Progress(reply))
+        })
+        .await
+    }
+
+    pub(crate) async fn admit_local_profile(
+        &self,
+        guard: opc_local_kernel_lifecycle::LocalContainedOperation,
+    ) -> Result<crate::LocalXfrmProfile, XfrmError> {
+        self.dispatch(
+            LostReply::Mutation("local_scope_profile_admission"),
+            |reply| NamespaceCommand::AdmitLocalProfile { guard, reply },
+        )
+        .await
+    }
+
+    pub(crate) async fn local_namespace_empty(&self) -> Result<bool, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, NamespaceCommand::LocalNamespaceEmpty)
+            .await
+    }
+
+    pub(crate) async fn reset_local_namespace(
+        &self,
+        contained: opc_linux_gtpu_sys::tc::ContainedScope,
+    ) -> Result<(), XfrmError> {
+        self.reset_namespace_command(Some(contained))
+            .await
+            .map(|_| ())
+    }
+
+    async fn reset_namespace_command(
+        &self,
+        contained: Option<opc_linux_gtpu_sys::tc::ContainedScope>,
+    ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
         let permit = self
             .inner
             .sender
@@ -2268,6 +2504,7 @@ impl NamespaceBoundLinuxXfrmBackend {
         let (reply, received) = oneshot::channel();
         let (observed, observation) = oneshot::channel();
         permit.send(NamespaceCommand::ResetExclusivelyOwnedNamespace {
+            contained,
             reply,
             observed: observation,
         });
@@ -3600,10 +3837,24 @@ enum DetectorRosterCut {
 }
 
 enum NamespaceCommand {
+    RebuildLocalDscp {
+        reset: opc_local_kernel_lifecycle::LocalScopeResetReceipt,
+        reply: oneshot::Sender<
+            Result<Vec<opc_local_kernel_lifecycle::LocalInstalledGraph>, XfrmError>,
+        >,
+    },
+    #[cfg(feature = "scope-store")]
+    LocalEffect(crate::local_scope::operations::Command),
+    AdmitLocalProfile {
+        guard: opc_local_kernel_lifecycle::LocalContainedOperation,
+        reply: oneshot::Sender<Result<crate::LocalXfrmProfile, XfrmError>>,
+    },
     ResetExclusivelyOwnedNamespace {
+        contained: Option<opc_linux_gtpu_sys::tc::ContainedScope>,
         reply: oneshot::Sender<Result<ExclusiveNamespaceResetReport, XfrmError>>,
         observed: oneshot::Receiver<()>,
     },
+    LocalNamespaceEmpty(oneshot::Sender<Result<bool, XfrmError>>),
     #[cfg(all(unix, feature = "ikev2"))]
     ChildSaMobike(child_sa_mobike::Command),
     BeginChildSaRosterUpdate(oneshot::Sender<Result<ChildSaRosterUpdate, XfrmError>>),
@@ -4017,6 +4268,9 @@ async fn finish_object_roster_effect_quiesced_retained(
 
 impl NamespaceCommand {
     fn is_passive_read(&self) -> bool {
+        if matches!(self, Self::LocalNamespaceEmpty(..)) {
+            return true;
+        }
         matches!(
             self,
             Self::QuerySa(..)
@@ -4034,14 +4288,100 @@ impl NamespaceCommand {
         // read-only commands is startup-ending by default, including future
         // command variants.
         !self.is_passive_read()
+            && !self.is_local_effect()
             && !matches!(
                 self,
-                Self::ResetExclusivelyOwnedNamespace { .. } | Self::BeginChildSaRosterUpdate(..)
+                Self::ResetExclusivelyOwnedNamespace { .. }
+                    | Self::BeginChildSaRosterUpdate(..)
+                    | Self::AdmitLocalProfile { .. }
+                    | Self::RebuildLocalDscp { .. }
             )
     }
 
+    fn is_local_effect(&self) -> bool {
+        #[cfg(feature = "scope-store")]
+        {
+            matches!(self, Self::LocalEffect(..))
+        }
+        #[cfg(not(feature = "scope-store"))]
+        {
+            false
+        }
+    }
+
     async fn execute(self, backend: &LinuxXfrmBackend, state: &mut NamespaceActorState) {
-        if matches!(self, Self::ResetExclusivelyOwnedNamespace { .. }) {
+        if let Some(lifecycle) = backend.local_lifecycle() {
+            if let Err(error) = lifecycle.local_scope().verify() {
+                self.send_error(crate::local_scope::scope_error(error));
+                return;
+            }
+            if let Self::ResetExclusivelyOwnedNamespace {
+                contained: Some(contained),
+                ..
+            } = &self
+            {
+                if !lifecycle.local_scope().is_same_instance(contained.scope()) {
+                    self.send_error(XfrmError::StateMismatch {
+                        operation: "local_scope_binding",
+                    });
+                    return;
+                }
+            } else if let Self::AdmitLocalProfile { guard, .. } = &self {
+                if !lifecycle
+                    .local_scope()
+                    .is_same_instance(guard.local_scope())
+                {
+                    self.send_error(XfrmError::StateMismatch {
+                        operation: "local_scope_binding",
+                    });
+                    return;
+                }
+            } else if !self.is_local_effect()
+                && !matches!(
+                    self,
+                    Self::QuerySa(..)
+                        | Self::QueryPolicy(..)
+                        | Self::QuerySaRelocationIdentity(..)
+                        | Self::QuerySaKeySnapshot(..)
+                        | Self::Probe(..)
+                        | Self::LocalNamespaceEmpty(..)
+                        | Self::RebuildLocalDscp { .. }
+                )
+            {
+                // The legacy relocation capability probe sends MIGRATE_STATE;
+                // it is not a passive read in the restricted local profile.
+                self.send_error(XfrmError::UnsupportedFeature {
+                    feature: "local_scope_requires_scoped_operation",
+                });
+                return;
+            }
+        } else if self.is_local_effect()
+            || matches!(
+                self,
+                Self::LocalNamespaceEmpty(..)
+                    | Self::AdmitLocalProfile { .. }
+                    | Self::RebuildLocalDscp { .. }
+                    | Self::ResetExclusivelyOwnedNamespace {
+                        contained: Some(_),
+                        ..
+                    }
+            )
+        {
+            self.send_error(XfrmError::UnsupportedFeature {
+                feature: "local_scope_requires_scoped_operation",
+            });
+            return;
+        }
+        if matches!(
+            self,
+            Self::ResetExclusivelyOwnedNamespace {
+                contained: Some(_),
+                ..
+            }
+        ) {
+            // The scoped lifecycle owns the exclusive barrier and epoch. Its
+            // normal-exit reset remains available after scoped publication.
+        } else if matches!(self, Self::ResetExclusivelyOwnedNamespace { .. }) {
             if let Err(error) = state.reset_gate.start() {
                 self.send_error(error);
                 return;
@@ -4061,17 +4401,53 @@ impl NamespaceCommand {
         }
 
         match self {
-            Self::ResetExclusivelyOwnedNamespace { reply, observed } => {
-                match state.reset_namespace(backend) {
-                    Ok(report) => {
-                        if reply.send(Ok(report)).is_ok() && observed.await.is_ok() {
-                            state.reset_gate.required = false;
-                        }
+            Self::ResetExclusivelyOwnedNamespace {
+                reply,
+                observed,
+                contained,
+            } => match state.reset_namespace(backend, contained.as_ref()) {
+                Ok(report) => {
+                    if contained.is_some() {
+                        #[cfg(feature = "scope-store")]
+                        state.local_operations.clear_after_reset();
+                        backend.clear_scoped_dscp_activation();
                     }
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
+                    if reply.send(Ok(report)).is_ok() && observed.await.is_ok() {
+                        state.reset_gate.required = false;
                     }
                 }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            },
+            #[cfg(feature = "scope-store")]
+            Self::LocalEffect(command) => {
+                let profile = state.local_profile.profile();
+                state
+                    .local_operations
+                    .command(
+                        backend,
+                        profile.as_ref(),
+                        state.local_profile.progress(),
+                        command,
+                    )
+                    .await;
+            }
+            Self::AdmitLocalProfile { guard, reply } => {
+                state.local_profile.admit(guard, reply);
+            }
+            Self::RebuildLocalDscp { reset, reply } => {
+                backend.start_scoped_dscp_rebuild(reset, reply);
+            }
+            Self::LocalNamespaceEmpty(reply) => {
+                let result = match backend.verify_namespace_empty() {
+                    Ok(()) => Ok(true),
+                    Err(XfrmError::StateMismatch {
+                        operation: "exclusive_namespace_reset_readback",
+                    }) => Ok(false),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::BeginChildSaRosterUpdate(reply) => {
                 let result = state
@@ -5029,6 +5405,17 @@ impl NamespaceCommand {
 
     fn send_error(self, error: XfrmError) {
         match self {
+            Self::RebuildLocalDscp { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            #[cfg(feature = "scope-store")]
+            Self::LocalEffect(command) => command.send_error(error),
+            Self::AdmitLocalProfile { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::LocalNamespaceEmpty(reply) => {
+                let _ = reply.send(Err(error));
+            }
             Self::ResetExclusivelyOwnedNamespace { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -6975,10 +7362,17 @@ mod tests {
     ) -> NamespaceBoundLinuxXfrmBackend {
         NamespaceBoundLinuxXfrmBackend {
             inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+                #[cfg(feature = "scope-store")]
+                actor_join: std::sync::Mutex::new(None),
+                #[cfg(feature = "scope-store")]
+                local_installs: Arc::new(tokio::sync::Semaphore::new(
+                    LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY,
+                )),
                 sender,
                 actor_binding: NamespaceActorBinding::new(
                     NetworkNamespaceBinding::capture().unwrap(),
                 ),
+                local_lifecycle: None,
                 #[cfg(unix)]
                 retained_finish_runtime: None,
                 retained_finish_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -8862,8 +9256,15 @@ mod tests {
         let actor_binding = NamespaceActorBinding::new(binding);
         let backend = NamespaceBoundLinuxXfrmBackend {
             inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+                #[cfg(feature = "scope-store")]
+                actor_join: std::sync::Mutex::new(None),
+                #[cfg(feature = "scope-store")]
+                local_installs: Arc::new(tokio::sync::Semaphore::new(
+                    LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY,
+                )),
                 sender,
                 actor_binding,
+                local_lifecycle: None,
                 #[cfg(unix)]
                 retained_finish_runtime: None,
                 retained_finish_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),

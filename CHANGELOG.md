@@ -74,6 +74,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class metadata outside canonical request bytes.
   Authenticated connection/accept isolation remains a transport integration gate;
   see RFC 024.
+- `opc-local-kernel-lifecycle`, `opc-gtpu-dataplane`, and `opc-ipsec-xfrm`: add
+  read-only pre-admission scope inspection that checks TCX and topology even
+  on empty hooks and distinguishes owned partial predecessor containment from
+  complete containment without changing kernel state. Classify preserved
+  foreign filters separately for diagnostics, so an otherwise empty owned scope
+  remains empty. Unsupported TCX queries terminate reset and local shutdown
+  before containment writes. Add
+  a shared exact local writer scope, ARP-preserving containment, ordered
+  GTP-U/XFRM/DSCP reset and fresh rebuild, and untimed committed activation.
+  Actor-owned session effects retain exact undo through cancellation and panic;
+  published retries and local teardown survive store outages. Lifecycle-owned
+  consumption bits refuse completed-effect replay across authority-adapter rebuilds.
+  Local retirement
+  permits rebuild independently of harmless detached-object descriptor residue.
+  Scoped backends refuse legacy reset/adoption paths. Native lifecycle tests
+  cover packet suppression, lost replies, private bpffs replacement, foreign
+  neighbors and XFRM expiration/ACQUIRE. Supported-kernel matrix qualification
+  remains required before deployment. Store-backed XFRM effects require the
+  opt-in `scope-store` feature; ordinary XFRM builds remain store-free.
+  The lifecycle package is source-build-only while that adapter reaches
+  source-only consensus crates. Publication checks use the current dependency
+  closure independently of frozen qualification inventories.
+  Scoped discovery uses tc readback and owned load/private-pin descriptors,
+  without BPF ID reopening or an added `CAP_SYS_ADMIN` requirement.
 
 - `opc-consensus`: add the RFC 023 voter-slot record foundation: bounded
   incarnation identities, installation nonce binding, canonical durable table

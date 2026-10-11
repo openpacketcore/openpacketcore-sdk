@@ -10,8 +10,7 @@ on:
 permissions:
   contents: read
 
-# This workflow now requests 26 concurrent jobs per run (19 job definitions;
-# one expands to a 7-way shard matrix and one to a 2-way matrix). Without a
+# The shard matrices and standalone lanes run on separate runners. Without a
 # concurrency group a superseded push keeps its whole fleet running and the
 # replacement run queues behind it, which costs far more wall clock than the
 # sharding saves. Runs on main are never cancelled.
@@ -31,10 +30,11 @@ jobs:
   # It is now split across runners: the lanes below do the work and the
   # aggregator job at the end still reports one "Rust workspace" check.
   # Debug symbols dominate the hosted runner's disk budget for this large
-  # all-target workspace, so every Rust lane keeps them off. CI validates
+  # all-target workspace, so its build lanes keep them off. CI validates
   # behavior and diagnostics without retaining symbol tables; release-profile
   # artifacts are unaffected. These pins are also what keeps each lane's
-  # target directory small enough that no lane needs `cargo clean`.
+  # target directory small enough that no lane needs `cargo clean`. The native
+  # lifecycle lane retains its original qualification build profile.
   rust-gates:
     name: Rust gates
     runs-on: ubuntu-latest
@@ -83,6 +83,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Check XFRM dependency contract
+        run: python3 ci/check-xfrm-dependency-contract.py
 
       - name: Check diff whitespace
         env:
@@ -163,6 +166,9 @@ jobs:
           python3 ci/test-qualify-tft-nohz-vm.py
           bash -n ci/qualify-tft-nohz-vm.sh
 
+      - name: Test local lifecycle qualification and CI cleanup
+        run: python3 ci/test-qualify-local-kernel-lifecycle.py
+
       - name: Test live voter memory evidence validators
         run: python3 scripts/test-observe-session-store-live-memory.py
 
@@ -233,7 +239,9 @@ jobs:
           shared-key: opc-rust-clippy
 
       - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --locked -p opc-ipsec-xfrm --lib --no-default-features -- -D warnings
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Compile-check non-Linux targets (default features)
         run: |
@@ -583,6 +591,93 @@ jobs:
             exit 1
           fi
 
+  rust-local-kernel-lifecycle:
+    name: Privileged local kernel lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/local-kernel-lifecycle
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache local kernel lifecycle build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-local-kernel-lifecycle
+          workspaces: . -> target/local-kernel-lifecycle
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ethtool iproute2 kmod libseccomp2 nftables wireguard-tools
+
+      - name: Check local kernel lifecycle support
+        run: |
+          set -euo pipefail
+          uname -r
+          uname -v
+          if ! sudo modprobe gtp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe gtp
+          fi
+          lsmod | grep '^gtp'
+          sudo modprobe wireguard
+          # Loading GRE creates fallback interfaces in the host namespace.
+          # Include module setup in the baseline, before any private probes.
+          sudo modprobe ip_gre
+          sudo -n python3 ci/check-local-kernel-lifecycle-cleanup.py snapshot \
+            "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup"
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe vrf
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
+          fi
+          # Probe in private namespaces, including the bpffs mount. The
+          # qualification creates the same isolation for every exact case.
+          sudo unshare -n -m --propagation private -- sh -euc '
+            mount -t bpf -o mode=0700 bpf /sys/fs/bpf
+            ip link set lo up
+            ip link add bridge-probe type bridge
+            ip link add lower-probe type dummy
+            ip link add link lower-probe name macvlan-probe type macvlan mode passthru
+            ip link del macvlan-probe
+            ip link add link lower-probe name ipvlan-probe type ipvlan mode l2
+            ip link add link lower-probe name vlan-probe type vlan id 100
+            ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
+            tc qdisc add dev lower-probe clsact
+            tc filter add dev lower-probe ingress pref 1 matchall action drop
+            ip xfrm state list
+            ip xfrm policy list
+          '
+          python3 -c 'import ctypes; ctypes.CDLL("libseccomp.so.2")'
+
+      - name: Qualify exact local kernel lifecycle
+        run: |
+          python3 ci/qualify-local-kernel-lifecycle.py \
+            --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle"
+
+      - name: Require local kernel lifecycle cleanup
+        if: always()
+        run: |
+          sudo -n python3 ci/check-local-kernel-lifecycle-cleanup.py verify \
+            "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup"
+
+      - name: Upload local kernel lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: local-kernel-lifecycle
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/local-kernel-lifecycle
+            ${{ runner.temp }}/local-kernel-lifecycle-cleanup
+          if-no-files-found: error
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
@@ -595,6 +690,7 @@ jobs:
       - rust-persist
       - rust-gtpu-cfg
       - rust-sctp-privileged
+      - rust-local-kernel-lifecycle
       - session-net-i686
     steps:
       # Preserves the single check name the previous monolithic job reported,

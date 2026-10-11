@@ -980,6 +980,7 @@ impl NativeLog {
             .ok_or_else(|| invalid("native log capture disappeared"))
     }
 
+    #[cfg(any(test, feature = "test-control"))]
     pub(in crate::consensus::native) fn prepare_transfer(
         &mut self,
         state: &NativeState,

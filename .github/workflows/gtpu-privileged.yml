@@ -733,6 +733,11 @@ jobs:
           cp "${grace_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-grace"
           sha256sum "${RUNNER_TEMP}/opc-gtpu-el9-grace"
 
+          python3 ci/qualify-local-kernel-lifecycle.py \
+            --target x86_64-unknown-linux-musl \
+            --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle-el9-build" \
+            --build-bundle "${RUNNER_TEMP}/local-kernel-lifecycle-el9-bundle"
+
           bundle="${RUNNER_TEMP}/gtpu-nohz-el9-binaries"
           mkdir -p "${bundle}"
           cp "${RUNNER_TEMP}/opc-gtpu-el9-datapath" "${bundle}/datapath"
@@ -1056,6 +1061,24 @@ jobs:
             < ci/qualify-gtpu-control-native.sh \
             2>&1 | tee "${RUNNER_TEMP}/gtpu-el9-control.log"
 
+          # Run the entire source-bound lifecycle manifest in this pinned guest.
+          # Each case gets private namespaces and denies BPF ID enumeration and
+          # reopening, just as in the host qualification. Copy failure evidence
+          # before the guest cleanup trap runs.
+          tar -C "${RUNNER_TEMP}/local-kernel-lifecycle-el9-bundle" -cf - . \
+            | ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'mkdir /tmp/opc-lifecycle-bundle && tar -C /tmp/opc-lifecycle-bundle -xf -'
+          lifecycle_status=0
+          ssh "${ssh_options[@]}" opc@127.0.0.1 \
+            'sudo python3 /tmp/opc-lifecycle-bundle/ci/qualify-local-kernel-lifecycle.py --run-bundle /tmp/opc-lifecycle-bundle --evidence-dir /tmp/opc-lifecycle-evidence --require-kernel "5\\.14\\.0-427\\..*\\.el9_4\\.x86_64"' \
+            > "${RUNNER_TEMP}/local-kernel-lifecycle-el9.log" 2>&1 || lifecycle_status=$?
+          mkdir -p "${RUNNER_TEMP}/local-kernel-lifecycle-el9"
+          ssh "${ssh_options[@]}" opc@127.0.0.1 \
+            'sudo tar -C /tmp/opc-lifecycle-evidence -cf - .' \
+            | tar -C "${RUNNER_TEMP}/local-kernel-lifecycle-el9" -xf -
+          cat "${RUNNER_TEMP}/local-kernel-lifecycle-el9.log"
+          test "${lifecycle_status}" -eq 0
+
           # The committed source is the authority on how many datapath tests
           # must run. Deriving the number from the shipped binary instead
           # would be circular: anything that drops a test from the binary --
@@ -1154,6 +1177,18 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
+
+      - name: Retain EL9 local lifecycle build and guest evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: local-kernel-lifecycle-el9
+          path: |
+            ${{ runner.temp }}/local-kernel-lifecycle-el9-build
+            ${{ runner.temp }}/local-kernel-lifecycle-el9-bundle
+            ${{ runner.temp }}/local-kernel-lifecycle-el9
+            ${{ runner.temp }}/local-kernel-lifecycle-el9.log
+          if-no-files-found: warn
 
       - name: Retain EL9 control and injection evidence
         if: always()

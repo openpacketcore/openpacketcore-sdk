@@ -36,12 +36,14 @@ use std::cell::RefCell;
 #[cfg(target_os = "linux")]
 mod control_port;
 pub(crate) mod grouped_simulation;
+mod local_scope;
 #[cfg(target_os = "linux")]
 mod n3_end_marker;
 mod ordinary_ipv6;
 #[cfg(target_os = "linux")]
 mod reassembled_downlink;
 mod workload_scope;
+pub use local_scope::{EbpfLocalGraph, ScopedGtpuReceipt};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 #[cfg(any(target_os = "linux", test))]
@@ -3830,6 +3832,9 @@ impl Future for RetainedGraphCleanupAcquisition {
 }
 
 struct EbpfGtpuDataplaneBackendInner {
+    local_scope: Option<opc_local_kernel_lifecycle::LocalGraphBinding>,
+    #[cfg(target_os = "linux")]
+    local_runtime: Option<Arc<aya_runtime::local_scope::Runtime>>,
     runtime: Arc<dyn EbpfGtpuRuntime>,
     /// Serializes every state-changing reconciliation performed by this
     /// backend instance. Runtime map operations are individually atomic, but
@@ -4352,6 +4357,9 @@ impl EbpfGtpuDataplaneBackend {
         let clock_origin = traffic_random_u128().unwrap_or(0);
         Self {
             inner: Arc::new(EbpfGtpuDataplaneBackendInner {
+                local_scope: None,
+                #[cfg(target_os = "linux")]
+                local_runtime: None,
                 runtime,
                 operation_lock: Mutex::new(()),
                 devices: Mutex::new(HashMap::new()),
@@ -4384,6 +4392,11 @@ impl EbpfGtpuDataplaneBackend {
         T: Send + 'static,
         F: FnOnce(Self) -> Result<T, GtpuError> + Send + 'static,
     {
+        if self.inner.local_scope.is_some() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "local_scope_requires_scoped_operation",
+            });
+        }
         let backend = self.clone();
         let state = Arc::new(AtomicU8::new(BLOCKING_WORKER_PENDING));
         let worker_state = Arc::clone(&state);
@@ -4648,6 +4661,11 @@ impl EbpfGtpuDataplaneBackend {
     }
 
     fn operation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, GtpuError> {
+        if self.inner.local_scope.is_some() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "local_scope_requires_scoped_operation",
+            });
+        }
         self.inner
             .operation_lock
             .lock()
@@ -16209,6 +16227,7 @@ mod aya_runtime {
     //! tc clsact filters, and performs pinned BPF map operations.
 
     mod exclusive_workload_scope;
+    pub(super) mod local_scope;
     mod workload_scope;
 
     use std::collections::{HashMap, HashSet};
@@ -36057,7 +36076,7 @@ mod aya_runtime {
             let graph_ids = map_ids.iter().copied().collect::<HashSet<_>>();
             let mut exact_seen = false;
             let mut foreign_seen = false;
-            for result in loaded_programs() {
+            for result in programs_during_scan() {
                 // Enumeration and map_ids() reopen program IDs separately.
                 // A program retired in either gap no longer retains a graph;
                 // every other inspection failure still prevents proving it safe.
@@ -36072,7 +36091,7 @@ mod aya_runtime {
                         hook(&info);
                     }
                 });
-                let mut referenced = match info.map_ids() {
+                let mut referenced = match program_map_ids_during_scan(&info) {
                     Err(error) if program_id_disappeared_during_scan(&error) => continue,
                     result => result
                         .map_err(|error| program_error("ebpf_current_program_scan", &error))?,

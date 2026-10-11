@@ -74,6 +74,9 @@ impl std::fmt::Display for ProgramLoadRefusal {
 #[non_exhaustive]
 #[derive(Debug, Clone, Error)]
 pub enum GtpuError {
+    /// Legacy workload cleanup cannot bypass the shared local-scope reset.
+    #[error("GTP-U legacy workload reset is unavailable on a local scope")]
+    LegacyResetOnLocalScope,
     /// The platform does not support Linux GTP-U operations.
     #[error("GTP-U dataplane operations are not supported on this platform")]
     UnsupportedPlatform,

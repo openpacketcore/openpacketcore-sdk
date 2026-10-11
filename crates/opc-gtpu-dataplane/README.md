@@ -3126,6 +3126,43 @@ offload support.
   tc/bpffs cleanup requires the documented exclusive-writer boundary; it does
   not claim atomic conditional deletion against uncoordinated external writers.
 
+## Scoped local lifecycle
+
+`EbpfGtpuDataplaneBackend::for_local_scope` binds the backend to the shared
+[`LocalKernelLifecycle`](../opc-local-kernel-lifecycle/README.md). All three
+legacy workload resets refuse with `LegacyResetOnLocalScope`; ordinary retained
+graph mutation/adoption entry points are unavailable on this binding.
+
+After contained reset, `rebuild_local_graph` loads the current embedded image,
+initializes and verifies its grouped configuration, PMTU state and packet gate,
+then publishes an empty graph. `install_scoped` requires a real
+`CommittedScopeEffect` and stages exact selectors before publishing the group.
+Successful lifecycle opening removes every containment filter.
+
+The actor owns partial effects and exact undo after cancellation. Published
+retry and `read_scoped` use local readback during store outages;
+`remove_scoped` removes only its receipt's group and selectors, with qualified
+kernel-reader synchronization. Changed values and stale receipts cannot remove
+a successor. Occupied selectors and admission saturation wait with backpressure.
+Dropping a published receipt preserves forwarding. Normal shutdown uses the
+shared contained reset, including XFRM and DSCP participants.
+Confirmed removal drops the actor's full request and reservation. Caller-held
+receipts retain a retirement marker, and recovered activation tokens share
+bounded consumption bits; no actor tombstone list grows with session churn.
+Consumers still enforce durable `GtpuSessionGroupId` non-reuse. An opening that
+exceeds ten seconds restores containment and returns `OpeningAttemptExpired`
+once closure is verified; the supervisor does not restart opening indefinitely.
+
+This path adds no durable journal or old-image compatibility reader. Its native
+lifecycle tests are separate from the established privileged datapath suite;
+qualification of that suite alone does not qualify this lifecycle on a kernel.
+Graph inspection uses retained load/private-pin descriptors and exact tc
+observations, without BPF ID reopen or node-wide enumeration. Undeclared BPF
+neighbors remain untouched and refuse the reference proof. TCX query support
+and the existing `CAP_BPF`/`CAP_NET_ADMIN` profile are required; this scoped
+path adds no `CAP_SYS_ADMIN` requirement. See RFC 025's
+[native prerequisites](../../docs/rfc/025-local-kernel-lifecycle.md#native-prerequisites).
+
 ## Roadmap
 
 - Qualify a bounded grouped outer-IPv4/IPv6 fragment-reassembly consumer before
