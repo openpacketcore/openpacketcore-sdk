@@ -85,6 +85,10 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
                 count = 1;
                 largest_payload = crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES * 2;
             }
+            SessionMutationIntent::VoterSlotControl(bytes) => {
+                count = 1;
+                largest_payload = bytes.len();
+            }
             SessionMutationIntent::AdvanceLogicalTime => {}
             SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
                 count = 1;
@@ -256,6 +260,9 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
                     .map_err(|_| invalid("scope operation invalid"))?;
                 Ok(size_of::<crate::scope_authority::ScopeAuthorityCommand>()
                     + crate::scope_authority::MAX_SCOPE_AUTHORITY_RECORD_BYTES)
+            }
+            SessionMutationIntent::VoterSlotControl(bytes) if allow_authorized => {
+                Ok(bytes.capacity())
             }
             SessionMutationIntent::AdvanceLogicalTime => Ok(0),
             SessionMutationIntent::MaintainFencedTransitionV2History { .. } if allow_authorized => {

@@ -238,6 +238,7 @@ pub(in crate::consensus::native) struct Notification {
 
 #[derive(Clone, Copy)]
 pub(in crate::consensus::native) struct Log {
+    pub(in crate::consensus::native) slot_control: bool,
     pub(in crate::consensus::native) id: LogId<SessionConsensusNodeId>,
     pub(in crate::consensus::native) membership: Option<[u8; 32]>,
 }

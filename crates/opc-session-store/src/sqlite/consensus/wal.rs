@@ -590,10 +590,24 @@ struct State {
 }
 
 struct Shared {
+    voter_admission: std::sync::OnceLock<std::sync::Weak<super::voter_slots::Admission>>,
+    voter_publication: tokio::sync::watch::Sender<()>,
     state: Mutex<State>,
     ready: Condvar,
-    #[cfg(test)]
     async_progress: tokio::sync::watch::Sender<()>,
+}
+
+impl Shared {
+    fn notify_voter_slots(&self) {
+        self.voter_publication.send_modify(|_| {});
+        if let Some(runtime) = self
+            .voter_admission
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            runtime.notify_durable_changed();
+        }
+    }
 }
 
 pub(crate) struct Wal {
@@ -715,6 +729,20 @@ impl State {
 }
 
 impl Wal {
+    pub(crate) fn attach_voter_admission(
+        &self,
+        runtime: &Arc<super::voter_slots::Admission>,
+    ) -> io::Result<()> {
+        self.shared
+            .voter_admission
+            .set(Arc::downgrade(runtime))
+            .map_err(|_| invalid_data("native voter admission already attached"))
+    }
+
+    pub(crate) fn notify_voter_slots(&self) {
+        self.shared.notify_voter_slots();
+    }
+
     #[cfg(test)]
     pub(super) fn create(
         directory: &Path,
@@ -957,9 +985,10 @@ impl Wal {
             .and_then(|native| native.business.roster_root().cloned());
         let terminal_failure = state.terminal_failure.clone();
         let shared = Arc::new(Shared {
+            voter_admission: std::sync::OnceLock::new(),
+            voter_publication: tokio::sync::watch::channel(()).0,
             state: Mutex::new(state),
             ready: Condvar::new(),
-            #[cfg(test)]
             async_progress: tokio::sync::watch::Sender::default(),
         });
         let writer_shared = Arc::clone(&shared);
@@ -993,6 +1022,12 @@ impl Wal {
 
     #[cfg(test)]
     pub(crate) fn async_progress_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.async_persistence_progress()
+    }
+
+    /// Subscribe before capturing a drain cut so publication and writer exit
+    /// cannot race between the health predicate and the next wake-up.
+    pub(crate) fn async_persistence_progress(&self) -> tokio::sync::watch::Receiver<()> {
         self.shared.async_progress.subscribe()
     }
 
@@ -1200,16 +1235,34 @@ impl Wal {
             ));
         }
         let projection_started = Instant::now();
-        let committed_after =
-            match application::project_operation(&mut state, self.binding, &operation) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    if state.status == Status::Failed {
-                        self.shared.ready.notify_all();
-                    }
-                    return Err(error);
+        let runtime = self
+            .shared
+            .voter_admission
+            .get()
+            .and_then(std::sync::Weak::upgrade);
+        let check = |request: &opc_consensus::voter_slots::VoterReplacementRequest| {
+            runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.intent_fence_acknowledged(request))
+        };
+        // The test-only raw writer admits format/replay fixtures directly. All
+        // production adapter admissions require the exact live engine receipt.
+        let fence: Option<&dyn Fn(&opc_consensus::voter_slots::VoterReplacementRequest) -> bool> =
+            checkpoint_on_retention.then_some(&check);
+        let committed_after = match application::project_operation_guarded(
+            &mut state,
+            self.binding,
+            &operation,
+            fence,
+        ) {
+            Ok(committed) => committed,
+            Err(error) => {
+                if state.status == Status::Failed {
+                    self.shared.ready.notify_all();
                 }
-            };
+                return Err(error);
+            }
+        };
         let projection = projection_started.elapsed();
         state.sequence += 1;
         let sequence = state.sequence;
@@ -1407,6 +1460,10 @@ impl Drop for WriterExit {
         if state.status != Status::Closed {
             state.fence(); // Request::drop owns each failure completion.
         }
+        // Pending strict readers must observe closure. It publishes no new
+        // voter state and must not start admission reconciliation on a dead WAL.
+        self.0.voter_publication.send_modify(|_| {});
+        self.0.async_progress.send_replace(());
         self.0.ready.notify_all();
     }
 }
@@ -1785,6 +1842,7 @@ fn write_loop_body(
             if binding.native {
                 drop(state);
                 snapshot::advance_native(&shared, disk, basis, binding, limits, control)?;
+                shared.notify_voter_slots();
                 shared.ready.notify_all();
                 continue;
             }
@@ -2094,6 +2152,7 @@ fn write_loop_body(
         let callback_delay = callback_started.elapsed();
         state.outstanding -= count;
         state.outstanding_bytes -= charge;
+        shared.notify_voter_slots();
         #[cfg(feature = "test-control")]
         if state.volatile_experiment.is_some() {
             shared.ready.notify_all();

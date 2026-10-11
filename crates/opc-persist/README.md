@@ -92,6 +92,28 @@ It implements no configuration-authoring or voter trait. Its
 [consumer contract](../opc-config-bus-consensus/CONSUMER_CHECKPOINT.md) documents
 the exact custody, apply ordering and rollback-freshness limits.
 
+## Voter-slot incarnation profile
+
+The unadvertised [RFC 023](../../docs/rfc/023-voter-slot-incarnations.md) profile
+uses `ConfigConsensusTopology::for_voter_slots` and
+`ConsensusConfigStore::open_with_voter_slots`. Its separate
+`VoterPeerResolver` must bind every channel to the committed descriptor,
+workload credential and incarnation key. Raw legacy RPC admission is refused.
+`replace_voter` accepts a verified controller request; `voter_replacement_status`
+resolves an accepted request under current controller authorization without
+renewing the original credential or granting another replacement.
+
+A provisional retirement is stored with the exact retained Prepare log entry.
+The committed table and bounded receipt are published with apply. Truncation
+and snapshot installation release a provisional gate only when durable evidence
+resolves its entry. Engine response fences are restored before RPC admission;
+Openraft continues to own every election, membership and quorum decision.
+After Fence applies with effect, survivors finish joint and uniform membership
+without another candidate barrier. The format boundary requires a fresh
+installation. Lost-canonical bootstrap, activation continuity and adversarial
+process qualification are later RFC slices; this API is not an advertised
+replacement capability.
+
 ## One consensus authority
 
 Returning retained voters can call `initialize_cluster` with a majority of

@@ -130,12 +130,14 @@ The primitive neither admits a receive ID nor grants permission to transmit.
 `Ikev2CommittedWindow::enable_empty_replies` and `reply_empty` compose it with
 the zero-write receive handler described below.
 
-For every reply, including cached bytes, the consumer must check current receive
-admission and `Ikev2CommittedWindow::ready()` and retain send authority through
-transmission. A minted capability does not follow later window lifecycle changes.
-The lifecycle check alone supplies no receive admission or transmission authority.
-`reply_empty` performs both checks on every call, including cache hits, and its
-reply borrows the window exclusively while retained. The consumer must still
+For every reply, including cached bytes, use the window's reply admission:
+`reply_empty`, the cached branch of `request_disposition`, or `replay_response`.
+These paths enforce their lifecycle and receive checks, including the narrow
+outbound-only uncertain-write exception. `ready()` is the stricter admission
+check for new work; using it before these replies would silence DPD during an
+outage. `reply_empty` also checks its current provider and borrows the window
+exclusively while the reply is retained. Cached ordinary replay checks capability
+revocation without requiring the empty-reply provider. The consumer must still
 retain its external fenced SA/send authority; copied bytes carry no authority.
 
 The former `Ikev2AesGcmIvAllocator::canonical_replies` and
@@ -416,12 +418,21 @@ preparation remain burned. Completion tokens are single-use and must pass
 a later commit fences them. The consumer applies durable outcomes idempotently;
 restoration reads history and never manufactures a fresh completion.
 
-A probe replays the last committed request, pending or settled, with no new
-Message ID, IV, durable write or outcome. Without such a request there is no
-artificial probe. Replies to old bytes do not establish fresh liveness. Empty
-INFORMATIONAL requests are refused as durable work; use `reply_empty` below.
-Keepalives remain outside IKE windows. Negotiation alone grants no fresh-DPD
-bypass or permission to reserve an IV for one.
+An authenticated encrypted fragment (`SKF`) outside this profile returns the
+typed `UnsupportedShape` reason. Preserve it for the scoped protocol exit in
+RFC 030; unauthenticated input remains a drop and cannot trigger that exit.
+
+Retransmit only a pending committed request whose response has not committed;
+never use a settled request as a liveness probe. `replay_request` returns `None`
+for settled exchanges, as specified in
+[RFC 030](../../docs/rfc/030-ike-recovery-profile.md). A live peer
+may have forgotten an old response, and replies to old bytes establish no fresh
+liveness. Without a pending request there is no artificial probe. This profile
+has no local empty-INFORMATIONAL liveness-check API: fresh empty requests are
+refused as durable work; `reply_empty` answers peer requests only. Use fresh
+authenticated inbound traffic or genuine new committed work, such as rekey,
+with its declared retry/liveness bound. Keepalives remain outside IKE windows;
+negotiation grants no fresh-DPD bypass or IV reservation for a probe.
 
 ### Zero-write empty requests and restart reconstruction
 
@@ -437,7 +448,9 @@ same checked runtime once the cause clears.
 The window owns that epoch's capability; do not mint a second one independently.
 Authenticate each complete peer packet with `open_peer`, then pass an empty
 INFORMATIONAL request to `reply_empty`. Every call rechecks current module
-admission, window `ready()` and receive admission, including byte-cache hits.
+admission and the window's empty-reply lifecycle and receive admission, including
+byte-cache hits. Use `ready()` for new work; the reply paths admit their narrow
+outbound-only uncertain-write exception independently.
 Submit the returned `Ikev2EmptyReply` promptly while retaining it and the
 external fenced authority through transport submission. SDK lifecycle changes
 cannot occur while that reply borrows the window. Discard copied bytes on trust
@@ -485,9 +498,12 @@ liveness. Restore may have forgotten an unwritten empty prefix,
 so it starts uncertain. `Fresh` is possible only beyond a new inbound boundary
 or synchronization cutover committed in the current runtime. These observations
 never authorize endpoint, key, bearer, lifetime or application-outcome changes.
-Outbound liveness checks remain replay-only. An idle peer's DPD after restart
-remains `Uncertain` until a nonempty exchange or sync boundary commits, so a
-consumer cannot require `Fresh` from DPD alone to recover liveness.
+Settled replay is not a liveness check. An idle peer's DPD after restart remains
+`Uncertain` until a nonempty exchange or sync boundary commits, so a consumer
+cannot require `Fresh` from DPD alone to recover liveness. A §2.4 liveness probe
+would require a genuinely new INFORMATIONAL request; this recovery profile does
+not provide such a local probe. Its consumer must bound outgoing-only failure
+detection through genuine new committed requests and protocol lifetime policy.
 The recovery extension is SDK policy justified by the trusted durable history;
 RFC 7296 does not specify crash reconstruction. Its relevant protocol rules are
 [§1.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.4) (empty

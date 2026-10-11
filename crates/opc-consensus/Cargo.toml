@@ -16,7 +16,9 @@ categories = ["network-programming", "data-structures"]
 [dependencies]
 async-trait = { workspace = true }
 openraft = { workspace = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 postcard = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

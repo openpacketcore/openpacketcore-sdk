@@ -48,6 +48,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 hmac = { workspace = true }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-proto-ikev2 = { path = ".", version = "0.2.0", features = ["testkit"] }
 opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
 quickcheck = "1"

@@ -206,14 +206,8 @@ fn cbc_ordinary_roundtrip_replay_and_restore_all_profiles_both_directions() {
                 sender.apply_committed(commit).unwrap(),
                 Some(Bytes::from_static(b"done"))
             );
-            assert_eq!(
-                a.restore(&completed)
-                    .replay_request()
-                    .unwrap()
-                    .unwrap()
-                    .bytes(),
-                request
-            );
+            assert!(sender.replay_request().unwrap().is_none());
+            assert!(a.restore(&completed).replay_request().unwrap().is_none());
             assert_eq!(
                 sender
                     .prepare_completion(&opened_response, Bytes::new())

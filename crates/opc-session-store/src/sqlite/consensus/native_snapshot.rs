@@ -53,6 +53,7 @@ pub(crate) fn reserve_input(
     // namespaces are classified by the original exact-layout validator below.
     for table in [
         "consensus_identity",
+        "consensus_voter_slots",
         "consensus_async_recovery",
         "consensus_membership_scope",
         "consensus_membership_history",

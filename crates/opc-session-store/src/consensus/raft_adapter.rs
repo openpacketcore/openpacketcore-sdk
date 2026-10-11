@@ -867,9 +867,40 @@ pub(crate) struct SessionRaftNetworkFactory {
     local_node_id: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
     persistence: PersistenceProtocol,
+    pub(crate) voter_transport: Option<Arc<super::store::voter_slots::SessionVoterTransport>>,
 }
 
 impl SessionRaftNetworkFactory {
+    pub(crate) fn for_voter_slots(
+        identity: SessionConsensusIdentity,
+        local_node_id: SessionConsensusNodeId,
+        current_members: BTreeSet<SessionConsensusNodeId>,
+    ) -> Result<Self, SessionRaftAdapterError> {
+        if !matches!(current_members.len(), 3 | 5 | 9) {
+            return Err(SessionRaftAdapterError::InvalidPeerTransitionScope);
+        }
+        Ok(Self {
+            local_node_id,
+            persistence: PersistenceProtocol::default(),
+            voter_transport: None,
+            peer_directory: SessionRaftPeerDirectory {
+                local_node_id,
+                state: Arc::new(RwLock::new(SessionRaftPeerDirectoryState {
+                    current_identity: identity,
+                    current_members,
+                    active: BTreeMap::new(),
+                    staged: None,
+                    terminal: None,
+                    last_applied_membership: None,
+                    engine_admission_suspended: false,
+                })),
+                membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
+                #[cfg(test)]
+                membership_apply_queued: tokio::sync::watch::Sender::default(),
+            },
+        })
+    }
+
     /// Bind the engine network to one immutable cluster scope and canonical
     /// node-ID routing table.
     pub(crate) fn try_new(
@@ -881,6 +912,7 @@ impl SessionRaftNetworkFactory {
         Ok(Self {
             local_node_id,
             persistence: PersistenceProtocol::default(),
+            voter_transport: None,
             peer_directory: SessionRaftPeerDirectory::try_new(
                 identity,
                 local_node_id,
@@ -900,6 +932,7 @@ impl SessionRaftNetworkFactory {
         Ok(Self {
             local_node_id,
             persistence: PersistenceProtocol::default(),
+            voter_transport: None,
             peer_directory: SessionRaftPeerDirectory::try_new_candidate(
                 current_identity,
                 local_node_id,
@@ -941,6 +974,7 @@ impl RaftNetworkFactory<SessionRaftTypeConfig> for SessionRaftNetworkFactory {
             target,
             peer_directory: self.peer_directory.clone(),
             persistence: self.persistence.clone(),
+            voter_transport: self.voter_transport.clone(),
         }
     }
 }
@@ -951,6 +985,7 @@ pub(crate) struct SessionRaftNetwork {
     target: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
     persistence: PersistenceProtocol,
+    pub(crate) voter_transport: Option<Arc<super::store::voter_slots::SessionVoterTransport>>,
 }
 
 impl fmt::Debug for SessionRaftNetwork {
@@ -1007,12 +1042,29 @@ impl SessionRaftNetwork {
         // uniform apply waits for all predecessor-scoped calls already in
         // flight before publishing successor routes.
         let _engine_rpc = self.peer_directory.begin_engine_rpc().await;
-        let route = self
-            .peer_directory
-            .resolve_engine_for(self.target, family)
-            .map_err(|_| EngineRpcError::Unreachable(Unreachable::new(&PeerDirectoryUnavailable)))?
-            .ok_or_else(|| EngineRpcError::Unreachable(Unreachable::new(&MissingConsensusPeer)))?;
-        let peer = route.peer;
+        let (identity, peer) = if let Some(transport) = &self.voter_transport {
+            // The authenticated transport selects the current committed scope
+            // again at dispatch; this anchor is only the initial envelope value.
+            let identity = self
+                .peer_directory
+                .summary()
+                .map(|value| value.0)
+                .ok_or_else(|| {
+                    EngineRpcError::Unreachable(Unreachable::new(&PeerDirectoryUnavailable))
+                })?;
+            (identity, transport.peer(self.target))
+        } else {
+            let route = self
+                .peer_directory
+                .resolve_engine_for(self.target, family)
+                .map_err(|_| {
+                    EngineRpcError::Unreachable(Unreachable::new(&PeerDirectoryUnavailable))
+                })?
+                .ok_or_else(|| {
+                    EngineRpcError::Unreachable(Unreachable::new(&MissingConsensusPeer))
+                })?;
+            (route.identity, route.peer)
+        };
         if peer.node_id() != self.target {
             return Err(EngineRpcError::Unreachable(Unreachable::new(
                 &PeerIdentityChanged,
@@ -1025,13 +1077,9 @@ impl SessionRaftNetwork {
             family.max_request_payload_bytes(),
         )
         .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
-        let wire = SessionConsensusWireRequest::try_new(
-            route.identity,
-            self.local_node_id,
-            family,
-            payload,
-        )
-        .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
+        let wire =
+            SessionConsensusWireRequest::try_new(identity, self.local_node_id, family, payload)
+                .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
 
         let hard_ttl = option.hard_ttl();
         let remaining = match async_deadline {
@@ -1566,7 +1614,7 @@ fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
     )
 }
 
-trait EngineRequestSender {
+pub(crate) trait EngineRequestSender {
     fn vote(&self) -> &Vote<SessionConsensusNodeId>;
 }
 
@@ -1594,7 +1642,7 @@ impl EngineRequestSender for InstallSnapshotRequest<SessionRaftTypeConfig> {
     }
 }
 
-fn decode_and_bind_sender<T>(
+pub(crate) fn decode_and_bind_sender<T>(
     payload: &[u8],
     sender: SessionConsensusNodeId,
 ) -> Result<T, SessionConsensusPeerError>
@@ -1623,7 +1671,9 @@ where
     Ok(request)
 }
 
-fn encode_engine_result<T, E>(result: &Result<T, E>) -> Result<Vec<u8>, SessionConsensusPeerError>
+pub(crate) fn encode_engine_result<T, E>(
+    result: &Result<T, E>,
+) -> Result<Vec<u8>, SessionConsensusPeerError>
 where
     T: Serialize,
     E: Serialize,
@@ -3346,6 +3396,7 @@ mod tests {
             target,
             peer_directory: directory.clone(),
             persistence: PersistenceProtocol::default(),
+            voter_transport: None,
         };
         let hard_ttl = Duration::from_secs(4);
         let option = RPCOption::new(hard_ttl);
@@ -3437,6 +3488,7 @@ mod tests {
             target,
             peer_directory: directory,
             persistence: PersistenceProtocol::default(),
+            voter_transport: None,
         };
         assert!(matches!(
             call_test_network(&retired).await,

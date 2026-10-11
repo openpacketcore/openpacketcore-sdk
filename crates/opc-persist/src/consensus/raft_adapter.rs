@@ -42,6 +42,7 @@ pub(crate) struct ConfigRaftNetworkFactory {
     identity: ConsensusIdentity,
     local_node_id: ConsensusNodeId,
     peers: Arc<BTreeMap<ConsensusNodeId, Arc<dyn ConsensusPeer>>>,
+    pub(crate) voter_transport: Option<Arc<super::store::voter_slots::ConfigVoterTransport>>,
 }
 
 impl ConfigRaftNetworkFactory {
@@ -60,6 +61,7 @@ impl ConfigRaftNetworkFactory {
             identity,
             local_node_id,
             peers: Arc::new(peers),
+            voter_transport: None,
         })
     }
 }
@@ -84,10 +86,15 @@ impl RaftNetworkFactory<ConfigRaftTypeConfig> for ConfigRaftNetworkFactory {
             local_node_id: self.local_node_id,
             target,
             peer: self
-                .peers
-                .get(&target)
-                .filter(|peer| peer.node_id() == target)
-                .cloned(),
+                .voter_transport
+                .as_ref()
+                .map(|transport| transport.peer(target))
+                .or_else(|| {
+                    self.peers
+                        .get(&target)
+                        .filter(|peer| peer.node_id() == target)
+                        .cloned()
+                }),
         }
     }
 }
@@ -379,7 +386,7 @@ fn validate_envelope(
     Ok(())
 }
 
-trait EngineRequestSender {
+pub(crate) trait EngineRequestSender {
     fn vote(&self) -> &Vote<ConsensusNodeId>;
 }
 
@@ -401,7 +408,7 @@ impl EngineRequestSender for InstallSnapshotRequest<ConfigRaftTypeConfig> {
     }
 }
 
-fn decode_and_bind_sender<T>(
+pub(crate) fn decode_and_bind_sender<T>(
     payload: &[u8],
     sender: ConsensusNodeId,
 ) -> Result<T, ConsensusPeerError>
@@ -415,7 +422,9 @@ where
     Ok(request)
 }
 
-fn encode_engine_result<T, E>(result: &Result<T, E>) -> Result<Vec<u8>, ConsensusPeerError>
+pub(crate) fn encode_engine_result<T, E>(
+    result: &Result<T, E>,
+) -> Result<Vec<u8>, ConsensusPeerError>
 where
     T: Serialize,
     E: Serialize,

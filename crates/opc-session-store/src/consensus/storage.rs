@@ -2983,6 +2983,10 @@ impl SqliteConsensusLogStore {
         self.core.database_file.clone()
     }
 
+    pub(crate) fn voter_slot_core(&self) -> SqliteConsensusCore {
+        self.core.clone()
+    }
+
     /// Retain a recovery-only terminal consumer before Openraft takes this log
     /// store.  The consumer is independent of Openraft reader clones but owns
     /// the same D1 namespace authority for its entire store lifetime.
@@ -3536,6 +3540,12 @@ async fn open_with_member_bindings_for_profile(
 > {
     if persistence == SessionPersistenceMode::Async
         && authority_profile != ConsensusAuthorityProfile::FixedImmutable
+    {
+        return Err(SessionConsensusStorageError::PersistenceModeMismatch);
+    }
+    if backend.voter_profile_preflight().await?
+        && (authority_profile != ConsensusAuthorityProfile::FixedImmutable
+            || persistence != SessionPersistenceMode::Durable)
     {
         return Err(SessionConsensusStorageError::PersistenceModeMismatch);
     }
@@ -5344,6 +5354,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             if let Some(last_applied) = last_applied {
                 self.core.applied_progress.send_replace(Some(last_applied));
             }
+            wal.notify_voter_slots();
             notify_watchers(&self.core, &applied.notifications).await;
             #[cfg(test)]
             self.core.apply_publication_gate.block_if_armed().await;
@@ -6237,6 +6248,10 @@ impl SqliteConsensusStateMachine {
                         )
                     })?;
                     let source = if wal.is_native() {
+                        // No engine storage callback may await a fence. Verify
+                        // the exact artifact's acknowledged barrier before any
+                        // native selector or durable publication can advance.
+                        wal.assert_voter_snapshot_fences(&raw_snapshot, meta)?;
                         consensus::wal::snapshot::InstallSource::new_native(
                             meta,
                             &file_name,
@@ -6323,6 +6338,10 @@ impl SqliteConsensusStateMachine {
                     error,
                 )),
                 Ok(()) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(wal) = &self.core.private_wal {
+                        wal.notify_voter_slots();
+                    }
                     self.observe_applied_membership(&meta.last_membership)
                         .map_err(membership_admission_storage_error)?;
                     Ok((previous, previous_artifact))
@@ -7700,7 +7719,134 @@ async fn snapshot_handle_identity_pin(
     PinnedSqliteFile::from_file(cloned.into_std().await?, path.to_path_buf())
 }
 
-async fn verify_snapshot_envelope_reader(
+/// A verified artifact is retained through the engine call. Inspection and
+/// installation read the same immutable generation, never the received inode.
+pub(crate) struct InspectedVoterSnapshot {
+    pub(crate) table: opc_consensus::voter_slots::VoterSlotTable,
+    pub(crate) data: Option<Box<SessionSnapshotFile>>,
+    _cleanup: UnpublishedSnapshotArtifact,
+    _lease: Arc<SnapshotDirectoryLease>,
+}
+
+pub(crate) async fn inspect_voter_snapshot(
+    owner: &LiveTerminalRecoveryHandoffConsumer,
+    snapshot: &mut SessionSnapshotFile,
+    meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    deadline: tokio::time::Instant,
+) -> io::Result<InspectedVoterSnapshot> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (owner, snapshot, meta, deadline);
+        Err(io::Error::other("voter snapshot unsupported"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let gate = tokio::time::timeout_at(deadline, owner.acquire_gate())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "voter snapshot inspection deadline",
+                )
+            })?
+            .map_err(io::Error::other)?;
+        let lease = owner.snapshot_directory_lease.clone();
+        let core = owner.core.clone();
+        let work = SnapshotIntegrityWork {
+            _gate: SnapshotIntegrityGate::Mutation { _guard: gate },
+            _lease: lease.clone(),
+        };
+        let survivors = validate_and_clean_snapshot_directory(&core, Some(&lease))
+            .await
+            .map_err(io::Error::other)?;
+        reserve_snapshot_directory_entries(survivors, 3).map_err(io::Error::other)?;
+        snapshot.shutdown().await?;
+        snapshot.sync_all().await?;
+        let length = snapshot.metadata().await?.len();
+        let name = std::ffi::OsString::from(format!("incoming-{}.part", uuid::Uuid::new_v4()));
+        let temporary = std::ffi::OsString::from(format!("promote-{}.part", uuid::Uuid::new_v4()));
+        let path = lease.namespace.sqlite_child_path(&name)?;
+        let (cleanup, pin) = copy_and_promote_from_reader_fixed_in_namespace(
+            snapshot,
+            lease.namespace.clone(),
+            &temporary,
+            &name,
+            length,
+            core.snapshot_integrity,
+            work.clone(),
+        )
+        .await?;
+        let (pin, checksum, verified) =
+            verify_received_snapshot(pin, path.clone(), work.clone()).await?;
+        let mut data = SessionSnapshotFile::from_pinned(pin, path).await?;
+        let raw_name = std::ffi::OsString::from(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
+        let raw = extract_snapshot_database_from_reader_in_namespace(
+            &mut data,
+            lease.namespace.clone(),
+            &raw_name,
+            verified.payload_length,
+            checksum,
+        )
+        .await?;
+        let raw_pin = raw.pin_readonly_from_writer()?;
+        let (raw_file, raw_cleanup) = raw.into_file_with_cleanup();
+        raw_file.sync_all()?;
+        drop(raw_file);
+        let raw_pin = seal_snapshot_pin(
+            raw_pin,
+            core.snapshot_integrity,
+            Some(checksum),
+            Some(work.clone()),
+        )
+        .await?;
+        let meta = meta.clone();
+        let table = tokio::task::spawn_blocking(move || {
+            let _retention = (work, raw_cleanup);
+            let conn = consensus::open_pinned_snapshot_database(&raw_pin)?;
+            consensus::validate_native_snapshot_export_sync(
+                &conn,
+                &raw_pin,
+                consensus::SnapshotBuildAuthority {
+                    identity: core.storage_identity,
+                    profile: core.authority_profile,
+                    expected_members: &core.expected_members,
+                    expected_bindings: &core.expected_bindings,
+                    fixed_placement_policy: core.fixed_placement_policy,
+                },
+                &(meta.last_log_id, meta.last_membership.clone()),
+            )?;
+            let incoming = consensus::voter_slots::read_state(&conn)?
+                .ok_or_else(|| consensus::invalid_data("incoming snapshot lacks voter slots"))?;
+            if incoming.intent().is_some() {
+                return Err(consensus::invalid_data(
+                    "portable snapshot carries local intent",
+                ));
+            }
+            let current = core
+                .private_wal
+                .as_ref()
+                .ok_or_else(|| consensus::invalid_data("voter snapshot requires native owner"))?
+                .native_voter_slot_state()?;
+            incoming
+                .table()
+                .validate_successor_of(current.table())
+                .map_err(|_| consensus::invalid_data("voter snapshot regressed"))?;
+            Ok::<_, io::Error>(incoming.table().clone())
+        })
+        .await
+        .map_err(|_| io::Error::other("voter snapshot inspection worker failed"))??;
+        data.seek(io::SeekFrom::Start(0)).await?;
+        data.retain_receiver_from(snapshot);
+        Ok(InspectedVoterSnapshot {
+            table,
+            data: Some(Box::new(data)),
+            _cleanup: cleanup,
+            _lease: lease,
+        })
+    }
+}
+
+pub(crate) async fn verify_snapshot_envelope_reader(
     file: &mut SessionSnapshotFile,
 ) -> io::Result<(u64, [u8; 32], u64)> {
     let total_length = file.seek(io::SeekFrom::End(0)).await?;

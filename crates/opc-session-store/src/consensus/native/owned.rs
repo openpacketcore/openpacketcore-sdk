@@ -109,6 +109,9 @@ fn intent(
     allow_authorized: bool,
 ) -> io::Result<SessionMutationIntent> {
     Ok(match value {
+        SessionMutationIntent::VoterSlotControl(bytes) if allow_authorized => {
+            SessionMutationIntent::VoterSlotControl(bytes.clone())
+        }
         SessionMutationIntent::AdvanceLogicalTime => SessionMutationIntent::AdvanceLogicalTime,
         SessionMutationIntent::ScopeBatch(operation) => {
             operation

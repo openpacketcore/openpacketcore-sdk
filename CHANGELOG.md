@@ -52,6 +52,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel/purpose bindings, full-interval certificate checks and independent
   handshake budgets sharing the same material lifecycle. Authentication time
   never expires scope ownership or installed forwarding; see RFC 026.
+
+- `opc-crypto-provider` and `opc-proto-ikev2`: add opt-in DH private checkpoint
+  export/import for pending initiator exchanges, with per-group startup and
+  runtime admission. The software provider supports a bounded group/version
+  encoding for all implemented KE groups, recomputes the public value on import,
+  and permits one successful export per fresh handle. Checkpoints belong in the
+  row's existing envelope; the API makes no KMS call or nested envelope and
+  preserves a typed retryable provider-unavailable error.
+
+- `opc-proto-ikev2`: add checked `from_profile_persisted` construction with an
+  explicit base/negotiated mode, immutable SA agreement binding and complete
+  synchronization-event history. Add strict typed `INITIAL_CONTACT` decoding;
+  authenticated identity matching and cleanup remain consumer responsibilities.
+
 - `opc-session-store`: add scope-fair backpressure with separate SafetyControl,
   established Emergency, EmergencyClassification, Normal and Maintenance budgets.
   Shared lanes have class ordering, an eight-bypass bound and dynamic priority
@@ -60,6 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class metadata outside canonical request bytes.
   Authenticated connection/accept isolation remains a transport integration gate;
   see RFC 024.
+
+- `opc-consensus`: add the RFC 023 voter-slot record foundation: bounded
+  incarnation identities, installation nonce binding, canonical durable table
+  and loss-attestation codecs, and snapshot retirement/evidence regression
+  checks. The Durable store integration now adds provisional log-bound gates,
+  authenticated incarnation admission, live-target refusal, and automatic
+  snapshot, learner, joint and uniform coordination in both stores. Startup
+  reinstalls engine response fences before admitting traffic. Replacement
+  capability remains unadvertised pending bootstrap, activation continuity and
+  process/fault qualification. Configuration storage and snapshots advance to
+  version 6 for every `ConsensusConfigStore`, including profiles without voter
+  replacement. All existing configuration deployments require fresh
+  installation; version-5 databases and snapshots are refused. The session
+  incarnation profile uses distinct native image/generation formats and also
+  requires fresh installation, with no migration or Async fallback.
 
 - `opc-proto-ikev2`: add typed CBC recovery epochs, committed ordinary windows,
   exact replay, fenced readback and both RFC 6311 sync handlers for all 48
@@ -321,6 +350,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `opc-proto-ikev2`: distinguish authenticated, correctly bound SKF packets with
+  `Ikev2WindowError::UnsupportedShape` in ordinary recovery windows. Partial
+  fragment cleartext is not parsed as a complete payload chain; unauthenticated
+  and foreign packets still drop. This diagnostic grants no cleanup authority.
+
+- `opc-proto-ikev2`: `Ikev2CommittedWindow::replay_request` now returns only a
+  pending committed request; settled exchanges return `None` and cannot serve
+  as liveness probes. Empty INFORMATIONAL replies and exact applicable cached
+  responses remain available during an outbound-only uncertain write. New work,
+  uncertain inbound/sync writes and terminal lifecycles remain blocked; cached
+  response classification and replay share the same admission guard.
+
 - `opc-session-store` / `opc-session-net`: consensus transport/wire revision 6
   requires scheduling metadata and rejects older peers. Upgrade every member
   through a coordinated fresh installation; mixed-profile operation is refused.
@@ -331,6 +372,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-egress-fence-common`: remove the unused experimental `scope_time` API
   from the retired timed packet-gate proposal.
+
+- `opc-consensus`: pin Openraft to `0be191c797fd` for serialized peer-response
+  fences and exact-vote leader resignation. Align the root, example and fuzz
+  locks, publishing guard and qualification assertions with the same revision.
 
 - CI: run the root-cgroup egress-fence qualification when fence inputs or its
   resolved dependency versions, sources, features or path dependencies change.
@@ -503,6 +548,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: wait for a leader's strict WAL publication before returning
+  voter-replacement status. Quorum confirmation and the local durable read share
+  one operation deadline, so a publication window neither returns a spurious
+  unavailable result nor starts a fresh timeout.
+
 - `opc-session-net`: keep scope listeners alive after transient accept errors
   and reconnect idle or rotated channels without marking unsent calls uncertain.
   Pace persistent accept failures with bounded backoff. Commit complete API
@@ -514,6 +564,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with independent proof allowances for each principal and slot. Retry Pod
   observations while an enrolled container is pending, waiting or still shown
   as terminated.
+
+- `opc-session-store`: wake asynchronous persistence drains directly on writer
+  publication, failure, and exit, preserving the captured cut and operation
+  deadline. Functional consensus fixtures separate protocol time from physical
+  completion and join accepted work before releasing their runtime. Consumer
+  reclamation fixtures continue partial cursor sweeps and transient history
+  reads within one unchanged caller budget.
+
+- Voter-admission reconciliation backs off persistent storage or fence failures
+  to a five-second cap while fresh durable publication wakes it immediately.
+  Native writer exit wakes strict-publication readers without starting a new
+  reconciliation loop against the closed WAL.
+
+- Voter replacement in both stores reports an existing provisional intent or
+  owned attempt before probing target liveness. A returning old voter cannot
+  make a retry claim a no-effect `TargetStillLive` while Prepare can still commit.
+
+- `opc-session-store`: refuse forwarded voter-slot control before proposal so
+  an ordinary native store cannot append an unreplayable topology entry. Voter
+  appends wait within their existing deadline while strict WAL publication is
+  pending, preserving durable admission without spurious quorum-read failures.
 
 - `opc-gtpu-dataplane`: wait for IPv6 address and gateway-neighbour readiness
   in all privileged datapath fixtures before packet assertions. Readiness
@@ -534,6 +605,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replay still requires the original tombstone and unchanged retention
   deadline. Fixture synchronization uses a separate hang watchdog and reports
   expiry without poisoning its release mutex (#863).
+
+- `opc-session-store`: release decoded voter-control projections after their
+  applied checkpoint, including snapshot selection and purge, and reclaim
+  abandoned projections on truncation. Retain the bounded slot table and
+  unapplied facts, with allocation-sized memory charges; Markers retain no
+  projection. Completed replacement history no longer exhausts the process
+  verification budget during relocation or reopen.
+
+- `opc-session-store` / `opc-persist`: bound voter-replacement retries by
+  retaining one Marker and snapshot per operation and leader term, with capped
+  backoff while a candidate is unavailable. Snapshot transfer resumes from its
+  acknowledged offset with a separate deadline per chunk, allowing transfers
+  longer than the client operation budget and safe retries after lost replies.
+
+- `opc-consensus`: allow an authenticated higher-term leader to resolve an
+  uncommitted voter retirement by append or snapshot, including after a reopen.
+  Keep the retired peer's responses and votes fenced until durable resolution.
+  A survivor veto or a crashed Prepare leader no longer strands the quorum.
 
 - Go operators: update `golang.org/x/net` to v0.60.0 and require Go 1.26.9 in
   `operator-sdk-go` and `sdk-reference-operator` to address GO-2026-6617 and

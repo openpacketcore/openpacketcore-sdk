@@ -112,7 +112,10 @@ pub(super) fn open<P: RecoveryProfile>(
         || header.responder_spi != direction.responder_spi()
         || header.flags.initiator()
             != (direction.direction() == Ikev2ProtectedPayloadDirection::InitiatorToResponder)
-        || header.next_payload != PayloadType::Encrypted.as_u8()
+        || !matches!(
+            PayloadType::from_u8(header.next_payload),
+            PayloadType::Encrypted | PayloadType::EncryptedFragment
+        )
         || !matches!(
             Ikev2ExchangeKind::from_u8(header.exchange_type),
             Some(
@@ -131,6 +134,12 @@ pub(super) fn open<P: RecoveryProfile>(
         return Err(Error::Drop);
     }
     let opened = opened.into_iter().next().ok_or(Error::Drop)?;
+    if opened.kind == ProtectedPayloadKind::EncryptedFragment {
+        // Only authenticated, correctly bound fragments receive this local
+        // diagnostic. Their cleartext may be a partial payload; never validate
+        // it as an ordinary complete chain or admit it to an ordinary window.
+        return Err(Error::UnsupportedShape);
+    }
     validate_payloads(PayloadChain::new(
         opened.first_inner_payload,
         &opened.cleartext,

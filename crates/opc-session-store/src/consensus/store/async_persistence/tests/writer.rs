@@ -18,6 +18,12 @@ impl Drop for ReleaseWriters {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_stall() {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
+    // Require real-time progress and frozen-clock completion on fresh fleets.
+    public_writer_stall(false).await;
+    public_writer_stall(true).await;
+}
+
+async fn public_writer_stall(frozen_clock: bool) {
     let mut fleet = Fleet::new(3);
     let gates = (0..3)
         .map(|_| Arc::new(SnapshotArtifactGate::new()))
@@ -47,7 +53,7 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
         let first = create(&store, &requests[0]).await;
         for voter in fleet.stores.iter().flatten() {
             assert_recorded(voter, &requests[0], &first).await;
-            voter.drain_async_persistence().await.unwrap();
+            clock::drain(voter).await.unwrap();
         }
         for gate in &gates {
             gate.arm();
@@ -120,12 +126,23 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
         // Complete seventeen real eight-item public batches while every
         // ordinary disk writer remains blocked in its captured generation.
         for batch in requests[2..138].chunks(8) {
-            let started = tokio::time::Instant::now();
-            let outcomes = store
-                .fenced_transition_v2_batch(batch.to_vec())
+            let outcomes = if frozen_clock {
+                let store = store.clone();
+                let batch = batch.to_vec();
+                clock::complete(store.inner.operation_timeout, async move {
+                    store.fenced_transition_v2_batch(batch).await
+                })
                 .await
-                .unwrap();
-            assert!(started.elapsed() < OPERATION_BOUND);
+                .unwrap()
+            } else {
+                let started = tokio::time::Instant::now();
+                let outcomes = store
+                    .fenced_transition_v2_batch(batch.to_vec())
+                    .await
+                    .unwrap();
+                assert!(started.elapsed() < OPERATION_BOUND);
+                outcomes
+            };
             assert_eq!(outcomes.len(), batch.len());
             for (request, outcome) in batch.iter().zip(outcomes) {
                 let outcome = outcome.unwrap();
@@ -139,9 +156,16 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
             drain.await.unwrap(),
             Err(SessionPersistenceDrainError::DeadlineExceeded)
         );
-        let started = tokio::time::Instant::now();
-        retained.push((requests[138].clone(), create(&store, &requests[138]).await));
-        assert!(started.elapsed() < OPERATION_BOUND);
+        if frozen_clock {
+            retained.push((requests[138].clone(), create(&store, &requests[138]).await));
+        } else {
+            let started = tokio::time::Instant::now();
+            retained.push((
+                requests[138].clone(),
+                create_on_caller_clock(&store, &requests[138]).await,
+            ));
+            assert!(started.elapsed() < OPERATION_BOUND);
+        }
         for (index, voter) in fleet.stores.iter().flatten().enumerate() {
             let health = voter.persistence_health();
             let progress = health.asynchronous.unwrap();
@@ -186,7 +210,7 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
         .await
         .expect("all verified snapshot publications complete after writer release");
         for voter in fleet.stores.iter().flatten() {
-            let health = voter.drain_async_persistence().await.unwrap();
+            let health = clock::drain(voter).await.unwrap();
             assert!(health.storage_failure.is_none());
             assert!(voter
                 .probe_fixed_quorum_readiness()
@@ -203,6 +227,22 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
     drop(release);
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+async fn create_on_caller_clock(
+    store: &ConsensusSessionStore,
+    request: &FencedTransitionV2Request,
+) -> FencedTransitionOutcome {
+    let mut result = store
+        .fenced_transition_v2_batch(vec![request.clone()])
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    let outcome = result.remove(0).unwrap();
+    assert!(outcome.matches_v2_request(request));
+    assert_eq!(outcome.mutation(), FencedTransitionMutationResult::Created);
+    assert_eq!(outcome.committed_generation(), Generation::new(1));
+    outcome
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -274,7 +314,7 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
             assert_recorded(store, &first, &first_outcome).await;
         }
         for store in fleet.stores.iter().flatten() {
-            store.drain_async_persistence().await.unwrap();
+            clock::drain(store).await.unwrap();
         }
         tokio::time::timeout(Duration::from_secs(3), races::wait_for(fleet.stores.iter().flatten().map(|store| store.inner.private_wal.as_ref().unwrap().async_progress_for_test()), || fleet.stores.iter().flatten().all(|store| {
  let progress = store.persistence_health().asynchronous.unwrap();
@@ -479,9 +519,7 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
         assert_recorded(fleet.store(follower), &first, &first_outcome).await;
         assert_recorded(fleet.store(follower), &second, &second_outcome).await;
         assert_recorded(fleet.store(follower), &third, &third_outcome).await;
-        let recovered = fleet
-            .store(follower)
-            .drain_async_persistence()
+        let recovered = clock::drain(fleet.store(follower))
             .await
             .unwrap();
         assert!(recovered.asynchronous.unwrap().background_failure.is_none());
@@ -524,7 +562,7 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
             .unwrap();
         let request = create_request(&leader, 1, &provider()).await;
         for voter in fleet.stores.iter().flatten() {
-            voter.drain_async_persistence().await.unwrap();
+            clock::drain(voter).await.unwrap();
         }
         gate.arm();
         let outcome = create(&leader, &request).await;

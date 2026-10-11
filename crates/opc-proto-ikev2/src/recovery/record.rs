@@ -7,6 +7,8 @@ use super::profile::{
 use super::{Ikev2SyncResponderRecord, Ikev2WindowError as Error};
 use crate::{
     Header, HeaderFlags, Ikev2AesGcmIvDomain, Ikev2ExchangeKind,
+    Ikev2MessageIdSyncAgreement as Agreement, Ikev2MessageIdSyncMode as Mode,
+    Ikev2MessageIdSyncRole as Role, Ikev2MessageIdSyncSa as Sa,
     Ikev2ProtectedPayloadDirection as Direction, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
     PayloadType,
 };
@@ -178,6 +180,31 @@ impl Ikev2CommittedExchangeRecord {
     }
 }
 
+/// Mandatory recovery-profile metadata from the same atomic authenticated SA row.
+///
+/// There is deliberately no default. The immutable agreement must be decoded
+/// independently of the mutable synchronization history, never inferred from
+/// missing fields. An explicit `None` recovery event is valid only if no local
+/// sync proposal has been recorded. Neither variant proves authentication,
+/// exclusive ownership or the freshness of the stored row.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Ikev2PersistedProfileSync<P: RecoveryProfile = Gcm> {
+    /// The authenticated SA did not negotiate synchronization.
+    Base {
+        /// Explicit immutable base-mode agreement, including SPIs and original role.
+        agreement: Agreement,
+    },
+    /// Both peers negotiated synchronization; retain all history and event fields.
+    Negotiated {
+        /// Immutable negotiated agreement decoded with the SA's keys and identity.
+        agreement: Agreement,
+        /// Complete responder history, including dispositions and proposal floors.
+        state: Ikev2SyncResponderRecord<P>,
+        /// Explicit event presence or absence; retain completed/closed events too.
+        recovery: Option<super::Ikev2SyncRecoveryRecord<P>>,
+    },
+}
+
 /// Consumer-owned durable ordinary state for one fenced IKE key epoch.
 ///
 /// No storage format or authentication of the storage acknowledgement is defined.
@@ -262,6 +289,75 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             sync: None,
             recovery: None,
         })
+    }
+
+    /// Rebuild the supported recovery profile with mandatory synchronization mode.
+    ///
+    /// Obtain every argument from one latest, fenced atomic record. The codec must
+    /// reject omitted mode, history or event-presence fields before calling this
+    /// function. In particular it must not synthesize `Base` or an absent event.
+    /// This checks structural completeness and the immutable agreement binding;
+    /// [`super::Ikev2CommittedWindow::restore`] must still authenticate cached
+    /// packets and validate key/IV state. Construction grants no effect authority.
+    ///
+    /// # Errors
+    /// Rejects invalid ordinary fields, a foreign SA/original role, disagreement
+    /// between the explicit mode and immutable agreement, inconsistent sync
+    /// history, or missing event history after any local synchronization proposal.
+    pub fn from_profile_persisted(
+        domain: Ikev2CommittedWindowDomain<P>,
+        generation: u64,
+        next_send: Option<u32>,
+        next_receive: Option<u32>,
+        outbound: Option<Ikev2CommittedExchangeRecord>,
+        inbound: Option<Ikev2CommittedExchangeRecord>,
+        synchronization: Ikev2PersistedProfileSync<P>,
+    ) -> Result<Self, Error> {
+        let record = Self::from_persisted(
+            domain,
+            generation,
+            next_send,
+            next_receive,
+            outbound,
+            inbound,
+        )?;
+        let agreement = match &synchronization {
+            Ikev2PersistedProfileSync::Base { agreement }
+            | Ikev2PersistedProfileSync::Negotiated { agreement, .. } => *agreement,
+        };
+        let binding = &record.domain.send;
+        let role = match binding.direction() {
+            Direction::InitiatorToResponder => Role::Initiator,
+            Direction::ResponderToInitiator => Role::Responder,
+        };
+        let sa = Sa::new(binding.initiator_spi(), binding.responder_spi(), role)
+            .map_err(|_| Error::DomainMismatch)?;
+        if agreement.sa() != sa {
+            return Err(Error::DomainMismatch);
+        }
+        match synchronization {
+            Ikev2PersistedProfileSync::Base { .. } => {
+                if agreement.mode() != Mode::BaseFallback {
+                    return Err(Error::InvalidRecord);
+                }
+                Ok(record)
+            }
+            Ikev2PersistedProfileSync::Negotiated {
+                state, recovery, ..
+            } => {
+                if agreement.mode() != Mode::Negotiated
+                    || state.agreement() != agreement
+                    || state.highest_local_proposal().is_some() != recovery.is_some()
+                {
+                    return Err(Error::InvalidRecord);
+                }
+                let record = record.with_sync_state(state)?;
+                match recovery {
+                    Some(recovery) => record.with_sync_recovery(recovery),
+                    None => Ok(record),
+                }
+            }
+        }
     }
 
     /// Attach the same atomic record's persisted synchronization metadata.

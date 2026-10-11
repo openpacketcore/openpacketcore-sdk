@@ -1928,6 +1928,8 @@ struct FixtureConsumer {
     fenced_transition_v2_status_calls: AtomicUsize,
     fenced_transition_v2_history_state_calls: AtomicUsize,
     #[cfg(test)]
+    fail_next_fenced_transition_v2_history_state: AtomicBool,
+    #[cfg(test)]
     last_fenced_transition_v2_request: Mutex<Option<opc_session_store::FencedTransitionV2Request>>,
     #[cfg(test)]
     stall_fenced_transition_v2_status: AtomicBool,
@@ -1971,6 +1973,8 @@ impl FixtureConsumer {
             fenced_transition_v2_calls: AtomicUsize::new(0),
             fenced_transition_v2_status_calls: AtomicUsize::new(0),
             fenced_transition_v2_history_state_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_fenced_transition_v2_history_state: AtomicBool::new(false),
             #[cfg(test)]
             last_fenced_transition_v2_request: Mutex::new(None),
             #[cfg(test)]
@@ -2158,6 +2162,15 @@ impl SessionQuorumConsumer for FixtureConsumer {
         ) {
             self.fenced_transition_v2_history_state_calls
                 .fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if self
+                .fail_next_fenced_transition_v2_history_state
+                .swap(false, Ordering::AcqRel)
+            {
+                return SessionConsumerV2Response::FencedTransitionV2HistoryState(Err(
+                    opc_session_store::SessionConsumerStoreError::Unavailable,
+                ));
+            }
         }
         let response = self.inner.execute_v2(authorization, request).await;
         #[cfg(test)]

@@ -535,7 +535,7 @@ fn first_request_is_committed_before_replay_for_every_gcm_size_and_original_role
 }
 
 #[test]
-fn matching_authenticated_response_settles_once_and_probe_replay_never_repeats_an_outcome() {
+fn matching_authenticated_response_settles_once_and_suppresses_request_replay() {
     for direction in DIRECTIONS {
         let fixture = Fixture::new(ENCRYPTIONS[0], direction);
         let mut window = fixture.window(0, 0);
@@ -551,7 +551,6 @@ fn matching_authenticated_response_settles_once_and_probe_replay_never_repeats_a
                 )
                 .unwrap(),
         );
-        let request_bytes = pending.outbound().unwrap().request().to_vec();
         window = fixture.restore(&pending);
         for (id, exchange) in [(1, Exchange::Informational), (0, Exchange::CreateChildSa)] {
             let packet = fixture.peer(id, true, exchange, empty(), 50 + u64::from(id));
@@ -585,12 +584,10 @@ fn matching_authenticated_response_settles_once_and_probe_replay_never_repeats_a
             Err(Error::Drop)
         ));
         for _ in 0..10 {
-            assert_eq!(
-                window.replay_request().unwrap().unwrap().bytes(),
-                request_bytes
-            );
+            assert!(window.replay_request().unwrap().is_none());
         }
         window = fixture.restore(&settled);
+        assert!(window.replay_request().unwrap().is_none());
         let opened = window
             .open_peer(fixture.profile, &fixture.keys, &packet)
             .unwrap();
@@ -1201,6 +1198,10 @@ fn open_peer_refuses_authenticated_skf_and_every_nonordinary_exchange_type() {
                 let result = window.open_peer(fixture.profile, &fixture.keys, &wire);
                 if kind == ProtectedPayloadKind::Encrypted && matches!(exchange, 35..=37) {
                     assert!(result.is_ok());
+                } else if kind == ProtectedPayloadKind::EncryptedFragment
+                    && matches!(exchange, 35..=37)
+                {
+                    assert!(matches!(result, Err(Error::UnsupportedShape)));
                 } else {
                     assert!(
                         matches!(result, Err(Error::Drop)),
@@ -1432,8 +1433,5 @@ fn unacknowledged_response_settlement_is_pending_until_readback_and_never_repeat
         window.prepare_completion(&response, Bytes::from_static(b"success")),
         Err(Error::Drop)
     ));
-    assert_eq!(
-        window.replay_request().unwrap().unwrap().bytes(),
-        pending.outbound().unwrap().request()
-    );
+    assert!(window.replay_request().unwrap().is_none());
 }

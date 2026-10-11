@@ -365,6 +365,21 @@ pub struct ConsensusCallResponse {
 /// the original call deadline. Old binaries retain their previous request path.
 #[async_trait]
 pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
+    /// Send over a channel that mutually proves the exact incarnation bindings.
+    ///
+    /// The transport verifies the remote's current SVID and incarnation key on
+    /// this channel and supplies a fresh one-use response proof, including for
+    /// application refusals. It passes the independently verified request proof
+    /// to `ConsensusRpcHandler::handle_with_incarnation`. A legacy transport
+    /// must reject before sending application bytes.
+    async fn call_with_incarnation(
+        &self,
+        _request: ConsensusWireRequest,
+        _binding: crate::voter_slots::VoterRpcBinding,
+        _timeout: Duration,
+    ) -> Result<crate::voter_slots::VoterAuthenticatedResponse, ConsensusPeerError> {
+        Err(ConsensusPeerError::ScopeMismatch)
+    }
     /// Canonical ordinal expected for the authenticated remote peer.
     fn node_id(&self) -> ConsensusNodeId;
 
@@ -448,6 +463,18 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
 /// request path.
 #[async_trait]
 pub trait ConsensusRpcHandler: Send + Sync + std::fmt::Debug {
+    /// Handle exact per-call incarnation proof from the authenticated transport.
+    /// Wrappers must preserve this opaque proof; NodeId or SVID alone cannot
+    /// replace it. Legacy consumers fail closed for this distinct profile.
+    async fn handle_with_incarnation(
+        &self,
+        _proof: crate::voter_slots::VerifiedVoterRpc,
+        _request: ConsensusWireRequest,
+    ) -> ConsensusWireResponse {
+        ConsensusWireResponse {
+            result: Err(ConsensusPeerError::ScopeMismatch),
+        }
+    }
     /// Exact consumer profile offered by the optional connection handshake.
     ///
     /// The profile must be immutable for this handler's lifetime. Returning

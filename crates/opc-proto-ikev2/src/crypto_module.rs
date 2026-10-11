@@ -40,6 +40,7 @@ pub struct Ikev2CryptoRequirements {
     integrities: Vec<Ikev2IntegrityAlgorithm>,
     encryptions: Vec<Ikev2EncryptionAlgorithm>,
     dh_groups: Vec<Ikev2DhGroup>,
+    dh_checkpoint_groups: Vec<Ikev2DhGroup>,
     signature_verification: Vec<IkeSignatureAlgorithm>,
     signature_generation: Vec<IkeSignatureAlgorithm>,
     nat_detection: bool,
@@ -55,6 +56,7 @@ impl Ikev2CryptoRequirements {
             integrities: Vec::new(),
             encryptions: Vec::new(),
             dh_groups: Vec::new(),
+            dh_checkpoint_groups: Vec::new(),
             signature_verification: Vec::new(),
             signature_generation: Vec::new(),
             nat_detection: false,
@@ -156,6 +158,18 @@ impl Ikev2CryptoRequirements {
         self
     }
 
+    /// Opt in to initiator private-checkpoint export/import for this KE group.
+    ///
+    /// Call for every group used by the durable recovery profile before admitting
+    /// operations. This also requires ordinary DH support. Ordinary profile/PFS
+    /// requirements and `all_software_supported` do not implicitly permit private
+    /// export. Providers that prohibit it fail startup preflight.
+    pub fn require_dh_checkpoint(&mut self, group: Ikev2DhGroup) -> &mut Self {
+        self.add_dh_group(group);
+        push_unique(&mut self.dh_checkpoint_groups, group);
+        self
+    }
+
     /// Add an IKE_AUTH algorithm for both signing and verification.
     ///
     /// Use [`Self::require_signature_verification`] when a deployment only
@@ -226,6 +240,9 @@ impl Ikev2CryptoRequirements {
             capabilities = capabilities
                 .with(CryptoCapability::IkeDiffieHellman)
                 .with(CryptoCapability::ApprovedEntropy);
+        }
+        if !self.dh_checkpoint_groups.is_empty() {
+            capabilities = capabilities.with(CryptoCapability::IkeDhCheckpoint);
         }
         if !self.signature_verification.is_empty() || !self.signature_generation.is_empty() {
             capabilities = capabilities.with(CryptoCapability::IkeSignature);
@@ -331,7 +348,7 @@ impl Ikev2CryptoModuleError {
         Self::from_operation_code(error.code())
     }
 
-    const fn from_operation_code(operation_code: CryptoOperationErrorCode) -> Self {
+    pub(crate) const fn from_operation_code(operation_code: CryptoOperationErrorCode) -> Self {
         Self {
             code: Ikev2CryptoModuleErrorCode::OperationFailed,
             operation_code: Some(operation_code),
@@ -464,6 +481,10 @@ impl ModuleSelection {
         self.0.requirements.dh_groups.contains(&group)
     }
 
+    fn dh_checkpoint_admitted(&self, group: Ikev2DhGroup) -> bool {
+        self.0.requirements.dh_checkpoint_groups.contains(&group)
+    }
+
     fn signature_verification_admitted(&self, algorithm: IkeSignatureAlgorithm) -> bool {
         self.0
             .requirements
@@ -584,6 +605,12 @@ fn validate_algorithm_support(
     for group in requirements.dh_groups.iter().copied() {
         let mapped = map_dh_group(group);
         if !module.supports_dh_group(mapped) {
+            return Err(unsupported_install(mapped.as_str()));
+        }
+    }
+    for group in requirements.dh_checkpoint_groups.iter().copied() {
+        let mapped = map_dh_group(group);
+        if !module.supports_dh_checkpoint(mapped) {
             return Err(unsupported_install(mapped.as_str()));
         }
     }
@@ -902,6 +929,77 @@ pub(crate) fn execute_dh_generate(
     validate_dh_public_value(group, &public_value)
         .map_err(|_| Ikev2CryptoModuleError::invalid_output())?;
     Ok((keypair, public_value))
+}
+
+fn select_dh_checkpoint(
+    group: Ikev2DhGroup,
+) -> Result<(ModuleSelection, IkeDhGroup), Ikev2CryptoModuleError> {
+    let (_, mapped) = select_dh(group)?;
+    let selected = select_module(CryptoCapability::IkeDhCheckpoint)?;
+    if !selected.dh_checkpoint_admitted(group) {
+        return Err(algorithm_not_admitted());
+    }
+    if !selected.module().supports_dh_checkpoint(mapped) {
+        return Err(algorithm_unsupported());
+    }
+    Ok((selected, mapped))
+}
+
+pub(crate) fn check_dh_checkpoint_admission(
+    group: Ikev2DhGroup,
+) -> Result<(), Ikev2CryptoModuleError> {
+    select_dh_checkpoint(group).map(|_| ())
+}
+
+fn validate_checkpoint_encoding(
+    group: IkeDhGroup,
+    bytes: &[u8],
+) -> Result<(), Ikev2CryptoModuleError> {
+    if bytes.len() != group.checkpoint_len()
+        || bytes[0] != 1
+        || u16::from_be_bytes([bytes[1], bytes[2]]) != group.transform_id()
+    {
+        return Err(Ikev2CryptoModuleError::from_operation_code(
+            CryptoOperationErrorCode::InvalidCheckpoint,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn execute_dh_export_checkpoint(
+    group: Ikev2DhGroup,
+    keypair: &mut dyn IkeDhKeyPair,
+    expected_public_value: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
+    let (_, mapped) = select_dh_checkpoint(group)?;
+    validate_dh_handle(mapped, keypair, expected_public_value)?;
+    let bytes = keypair
+        .export_private_checkpoint()
+        .map_err(|error| Ikev2CryptoModuleError::operation(&error))?;
+    validate_checkpoint_encoding(mapped, &bytes)
+        .map_err(|_| Ikev2CryptoModuleError::invalid_output())?;
+    validate_dh_handle(mapped, keypair, expected_public_value)?;
+    Ok(bytes)
+}
+
+pub(crate) fn execute_dh_import_checkpoint(
+    group: Ikev2DhGroup,
+    checkpoint: &[u8],
+    expected_public_value: &[u8],
+) -> Result<Box<dyn IkeDhKeyPair>, Ikev2CryptoModuleError> {
+    let (selected, mapped) = select_dh_checkpoint(group)?;
+    validate_checkpoint_encoding(mapped, checkpoint)?;
+    validate_dh_public_value(group, expected_public_value).map_err(|_| {
+        Ikev2CryptoModuleError::from_operation_code(
+            CryptoOperationErrorCode::CheckpointPublicValueMismatch,
+        )
+    })?;
+    let keypair = selected
+        .module()
+        .import_keypair_checkpoint(mapped, checkpoint, expected_public_value)
+        .map_err(|error| Ikev2CryptoModuleError::operation(&error))?;
+    validate_dh_handle(mapped, keypair.as_ref(), expected_public_value)?;
+    Ok(keypair)
 }
 
 pub(crate) fn execute_dh_agree(

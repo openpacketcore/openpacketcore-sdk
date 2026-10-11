@@ -139,12 +139,22 @@ pub(super) fn project_operation(
     binding: Binding,
     operation: &Operation,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    project_operation_guarded(state, binding, operation, None)
+}
+
+pub(super) fn project_operation_guarded(
+    state: &mut State,
+    binding: Binding,
+    operation: &Operation,
+    voter_fence: Option<&dyn Fn(&opc_consensus::voter_slots::VoterReplacementRequest) -> bool>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     if let Some(native) = &mut state.native {
-        return native.log.project_reserved(
+        return native.log.project_guarded(
             operation,
             &native.business,
             state.authority.frozen_applied,
             state.async_authority,
+            voter_fence,
         );
     }
     if let Err(error) = validate_applied_prefix(state, binding) {

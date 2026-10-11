@@ -258,7 +258,7 @@ fn legacy_decoders_and_validation_refuse_both_new_tags() {
             CONFIG_CONSENSUS_STORAGE_VERSION,
             CONFIG_CONSENSUS_SNAPSHOT_VERSION
         ),
-        (7, 7, 5, 5)
+        (7, 7, 6, 6)
     );
 }
 

@@ -194,6 +194,7 @@ impl ConsensusConfigStore {
             DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
             None,
             Some(Arc::new(policy)),
+            None,
         )
         .await
     }

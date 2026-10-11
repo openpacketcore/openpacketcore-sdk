@@ -195,6 +195,16 @@ Do not replace the performance deadlines or use RAM-backed database storage.
 A local timing pass qualifies only that local host/storage observation; it does
 not establish that the GitHub-hosted runner meets the limit.
 
+Functional consensus fixtures wait for actual publication with a separate
+wall-clock watchdog. Use the shared controlled clock for successful operations
+that must not expire merely because disk work or another runtime was delayed.
+Keep stores and their Raft/transport tasks on the caller's runtime, and join
+accepted work before the controlled runtime exits. Deadline, interrupted-election,
+and latency tests must retain or explicitly advance their protocol clock.
+For bounded public APIs such as reclamation, continue partial progress within
+the same absolute caller deadline and preserve each report's safety assertions;
+do not give every retry a fresh budget.
+
 If the pull request touches operator-sdk-go or the Helm chart, also run:
 
 ```bash

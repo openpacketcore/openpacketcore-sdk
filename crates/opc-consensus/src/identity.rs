@@ -20,6 +20,7 @@ pub const CONSENSUS_NODE_ID_MAX: u64 = i64::MAX as u64;
 const CLUSTER_ID_DOMAIN: &[u8] = b"openpacketcore/consensus/cluster-id/v1\0";
 const CONFIGURATION_ID_DOMAIN: &[u8] = b"openpacketcore/consensus/configuration-id/v1\0";
 const NODE_ID_DOMAIN: &[u8] = b"openpacketcore/consensus/node-id/v1\0";
+const INSTALLATION_ID_DOMAIN: &[u8] = b"openpacketcore/consensus/installation-id/v1\0";
 
 /// Redaction-safe validation failure for consensus identity material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -41,6 +42,26 @@ pub enum ConsensusIdentityError {
 pub struct ConsensusClusterId([u8; 32]);
 
 impl ConsensusClusterId {
+    /// Derive the identity of a fresh fixed-quorum installation.
+    ///
+    /// Generate a new random nonce once at enrollment and retain it in the
+    /// immutable manifest. Reusing it with the same name reuses the installation;
+    /// this function cannot establish freshness on the caller's behalf.
+    pub fn for_installation(
+        name: impl AsRef<str>,
+        nonce: [u8; 32],
+    ) -> Result<Self, ConsensusIdentityError> {
+        let named = Self::new(name)?;
+        if nonce == [0; 32] {
+            return Err(ConsensusIdentityError::InvalidClusterId);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(INSTALLATION_ID_DOMAIN);
+        hasher.update(named.as_bytes());
+        hasher.update(nonce);
+        Ok(Self(hasher.finalize().into()))
+    }
+
     /// Validate and hash an operator-controlled cluster name.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ConsensusIdentityError> {
         let value = value.as_ref();
@@ -205,6 +226,12 @@ impl fmt::Debug for ConsensusIdentity {
 pub struct ConsensusNodeId(u64);
 
 impl ConsensusNodeId {
+    /// Map checked fixed-quorum slot coordinates injectively into the positive
+    /// signed 63-bit storage domain. Dynamic membership uses [`derive_node_id`].
+    pub const fn from_voter_slot(identity: crate::voter_slots::VoterSlotIdentity) -> Self {
+        Self(((identity.incarnation().get() - 1) << 16) | identity.slot().get() as u64)
+    }
+
     /// Construct a non-zero, storage-portable ordinal.
     pub const fn new(value: u64) -> Result<Self, ConsensusIdentityError> {
         if value == 0 || value > CONSENSUS_NODE_ID_MAX {
