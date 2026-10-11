@@ -11,6 +11,18 @@ enum Scenario {
     PeerClose,
     CutExpiry,
     Promotion,
+    Revision,
+}
+
+#[test]
+fn native_scope_quorum_revision_signals_distinguish_alerts_from_authenticated_frames() {
+    run(
+        Scenario::Revision,
+        concat!(
+            "stateless_quorum_consumer::scope_transport::child_read_guards::",
+            "native_scope_quorum_revision_signals_distinguish_alerts_from_authenticated_frames"
+        ),
+    );
 }
 
 #[test]
@@ -96,11 +108,43 @@ fn run(scenario: Scenario, name: &str) {
             }).unwrap());
             let handle = server.clone().serve([SocketAddr::from(([127, 0, 0, 1], 0)); 5]).await.unwrap();
             let tls = client_tls(&pki, &worker, &follower.to_string());
+            let signal = |role, purpose, direction| {
+                let entry = scope_transport_revision_diagnostics().into_iter().find(|entry|
+                    entry.role == role && entry.purpose == purpose && entry.direction == direction).unwrap();
+                (entry.total, entry.authenticated, entry.active)
+            };
+            if scenario == Scenario::Revision {
+                use crate::scope::{ScopeTransportDirection as Direction, ScopeTransportPurpose as Purpose, ScopeTransportRole as Role};
+                let log = fleet.stores[leader].status().last_log_index;
+                let barriers = fleet.read_barrier_calls();
+                let handshake = tls.begin_handshake().unwrap();
+                let mut config = (*handshake.rustls_config()).clone();
+                config.alpn_protocols = vec![b"opc-scope/1".to_vec()];
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                let socket = tokio::net::TcpStream::connect(handle.addresses()[0]).await.unwrap();
+                assert!(connector.connect(rustls_pki_types::ServerName::try_from("scope.invalid").unwrap(), socket).await.is_err());
+                eventually(|| signal(Role::Quorum, Purpose::Handshake, Direction::Inbound) == (1, 0, true)).await;
+                for proof in [false, true] {
+                    crate::scope::attack_test_support::send_revision_one_scope_frame(&tls, handle.addresses()[0], &scope, proof).await;
+                    let frames = if proof { 2 } else { 1 };
+                    assert_eq!(signal(Role::Quorum, Purpose::ScopeRequest, Direction::Inbound), (frames, frames, true));
+                    assert_eq!(signal(Role::Quorum, Purpose::Handshake, Direction::Inbound), (1, 0, false));
+                }
+                assert_eq!(fleet.stores[leader].status().last_log_index, log);
+                assert_eq!(fleet.read_barrier_calls(), barriers);
+            }
             let initial = ScopeAuthorityRequest::new(scope.clone(), [81; 16], 0,
                 ScopeAuthorityOperation::AdmitInitial { execution: peer.record.execution().clone() }).unwrap();
             let mut admitted = peer.send(&tls, handle.addresses(), &scope, peer.record.execution(), RawCall::Authority(&initial), &ScopeClock).await.unwrap();
             assert_eq!(admitted.pop(), Some(1));
             let stamp = ScopeAuthorityStamp::decode_canonical(&admitted).unwrap();
+            if scenario == Scenario::Revision {
+                use crate::scope::{ScopeTransportDirection as Direction, ScopeTransportPurpose as Purpose, ScopeTransportRole as Role};
+                assert_eq!(signal(Role::Quorum, Purpose::Handshake, Direction::Inbound), (1, 0, false));
+                assert_eq!(signal(Role::Quorum, Purpose::ScopeRequest, Direction::Inbound), (2, 2, false));
+                handle.shutdown().await;
+                return;
+            }
             let request = ScopeChildReadRequest::new(&stamp, vec![ScopeChildKey::new([3; 32]).unwrap()]).unwrap();
             let class = if scenario == Scenario::Promotion { Class::Emergency } else { Class::Normal };
             let socket = tokio::net::TcpStream::connect(handle.addresses()[if class == Class::Emergency { 1 } else { 3 }]).await.unwrap();
