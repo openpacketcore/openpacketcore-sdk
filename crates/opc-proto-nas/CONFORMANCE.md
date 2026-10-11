@@ -7,8 +7,10 @@ TS 24.502 V18.8.0 clause 9.4.
 ## Specification Baseline
 
 - **Document**: 3GPP TS 24.501 (with header formats per TS 24.007)
-- **Release**: Release 18 framing baseline; the authentication subset below is
-  verified against TS 24.501 V17.15.0 (Release 17).
+- **Release**: Release 18 framing baseline. The six optional-element tables
+  below target [TS 24.501 V18.11.1](https://www.etsi.org/deliver/etsi_ts/124500_124599/124501/18.11.01_60/ts_124501v181101p.pdf).
+  The authentication subset below is verified against TS 24.501 V17.15.0
+  (Release 17).
 - **Status**: v2 — experimental; message framing, mobile identity, BCD,
   first-CNF body dispatch, selected 5GMM message bodies, and NAS security
   helper hooks are structured. Procedure state machines are owned by consuming
@@ -106,28 +108,81 @@ Decodes IE *content* (caller strips IEI/length framing):
 - Mandatory IEs decoded: 5GS registration type, follow-on-request pending
   bit, ngKSI, and 5GS mobile identity (via the existing identity decoder).
 - All remaining bytes are parsed as optional IEs and preserved raw so that
-  unknown or future IEs round-trip byte-exactly.
-- Known optional IE formats registered for TLV, TLV-E, type-1 half-octet,
-  and fixed-length type-3 TV IEs used by Registration Request/Accept.
-  Unknown IEIs outside the registry fall back to TLV; this is honest in the
-  test corpus and noted below as a gap.
+  unknown or future IEs round-trip byte-exactly when the context permits them.
+- Its own table registers all 42 optional elements, with type-1, fixed-length
+  type-3 TV, TLV, and TLV-E framing and message-specific length bounds.
 
 #### 5.2 Registration Accept (§8.2.7)
 - Mandatory 5GS registration result decoded (LV, length must be 1).
-- Optional IEs iterated and raw-preserved with the same registry as
-  Registration Request.
+- Its own table registers all 60 optional elements and preserves their bytes.
 
-#### 5.3 Security Mode Command (§8.2.20)
+#### 5.3 Security Mode Command (§8.2.25)
 - Mandatory selected NAS security algorithms decoded into NIA/NEA enums.
 - Mandatory ngKSI decoded and raw-preserved.
 - Mandatory replayed UE security capability LV decoded and raw-preserved;
   zero-length capabilities and truncated LV values are rejected.
-- Optional IEs are iterated and raw-preserved.
+- Its own table registers all 7 optional elements and preserves their bytes.
 
-#### 5.4 Security Mode Complete (§8.2.21)
-- Optional IEs are iterated and raw-preserved.
+#### 5.4 Security Mode Complete (§8.2.26)
+- Its own table registers all 3 optional elements and preserves their bytes.
+- IMEISV has a total wire length of 12 octets (identifier, two length octets,
+  and nine value octets); Strict and ProcedureAware reject shorter forms.
 
-#### 5.5 First-CNF Raw Body Dispatch
+#### 5.5 Configuration Update Command/Complete (§8.2.19/§8.2.20)
+- `ConfigurationUpdateCommand` frames all 44 optional elements from its table,
+  including network names, fixed-length time-zone/time values, and containers.
+- `ConfigurationUpdateComplete` has an empty optional-element table. Strict,
+  ProcedureAware, and `UnknownIePolicy::Reject` require an empty body;
+  permissive contexts can preserve or drop framed unknown elements.
+- Both types expose `optional_ies`, implement borrowed/owned decoding and
+  raw-preserving encoding, check context limits, and redact values in Debug.
+- **API migration:** `MmMessageBody::ConfigurationUpdateCommand` and
+  `MmMessageBody::ConfigurationUpdateComplete` now contain these typed structs
+  instead of `RawMessageBody`. Use the matching `decode_body` method to construct
+  a body from bytes, inspect `optional_ies`, and use `Encode` to recover its
+  retained bytes. `PlainMm.body` still exposes the original complete body.
+
+#### 5.6 Per-message optional-element framing
+
+The following are the complete top-level optional rows in the pinned edition;
+nested type-6 IE containers remain opaque.
+
+| Message | TS 24.501 table | Optional rows |
+| --- | --- | ---: |
+| Registration Request | 8.2.6.1.1 | 42 |
+| Registration Accept | 8.2.7.1.1 | 60 |
+| Security Mode Command | 8.2.25.1.1 | 7 |
+| Security Mode Complete | 8.2.26.1.1 | 3 |
+| Configuration Update Command | 8.2.19.1.1 | 44 |
+| Configuration Update Complete | 8.2.20.1.1 | 0 |
+
+An identifier is registered only for the selected message. Every octet with
+bit 8 set is a one-octet IE (TS 24.007 §11.2.4); table lookup and duplicate
+detection use `iei & 0xf0`, while `OptionalIe.iei` and `raw` retain the original
+octet. Type-1 `value` is empty. Other values exclude identifier/length octets.
+
+Strict and ProcedureAware enforce the table's total wire-length bounds and
+reject unregistered elements even if Preserve or Drop was requested.
+`UnknownIePolicy::Reject` also rejects unregistered elements at other levels.
+Structural and HeaderOnly retain framing-only behavior for registered lengths.
+Permissive unknown framing is described under Known Limitations. Duplicate
+First/Last/Reject policy and element-count limits apply to all six bodies;
+dropped unknown elements still count toward the limit. Framing failures cite
+the known element's clause, while non-critical unknown, duplicate, and count
+failures cite the message clause. Unknown identifiers coded as comprehension
+required (`0x00–0x0F`, `0x7E`, `0x7F`; TS 24.007 §11.2.5) fail with
+`UnknownCriticalIe` under every decode context, citing TS 24.501 §7.5.
+Optional-element error offsets are relative to the start of the optional list.
+
+These tables add no element-content decoding, ordering checks, presence rules,
+or procedure semantics. Encoding writes retained IE bytes in message order.
+`tests/fixtures/optional_elements.rs` contains independently authored synthetic
+wire examples for all 156 rows. `tests/nas_optional_elements.rs` exercises full
+and direct typed round trips, length bounds, truncation, duplicates,
+cross-message rejection, all 128 bit-8 octets, policy choices, and limits.
+The examples qualify framing only, not semantic validity of opaque IE values.
+
+#### 5.7 First-CNF Raw Body Dispatch
 - 5GMM first-CNF messages without field-level parsing are exposed through
   named `MmMessageBody` raw-preserving variants, including Registration
   Complete, UL NAS Transport, and DL NAS Transport.
@@ -146,18 +201,28 @@ Decodes IE *content* (caller strips IEI/length framing):
 - SUCI de-concealment (home-network private key operations).
 - NAS procedure state machines and policy validation.
 - Field-level parsing of 5GSM message bodies and 5GMM messages other than
-  Registration Request/Accept, Security Mode Command/Complete, and the five
-  Authentication messages.
+  Registration Request/Accept, Security Mode Command/Complete, Configuration
+  Update Command/Complete, and the five Authentication messages.
 - Semantic validation of optional IE contents beyond length/format framing.
 - EPS (4G) NAS interworking formats.
 
 ## Known Limitations
 
-- Outside the authentication bodies, optional IE format detection for unknown
-  IEIs uses a conservative heuristic: IEIs `0x70–0x7F` are treated as TLV-E, IEIs with high nibble
-  `0xA–0xF` as type-1 half-octet, and all others as TLV. Adding a new
-  fixed-length type-3 IE to the registry is required for that IE to round
-  trip correctly.
+- For the six per-message tables, permissive decoding of non-critical unknown
+  IEIs retains the existing heuristic: `0x70–0x7D` are treated as TLV-E,
+  `0x80–0xFF` as one-octet type-1 IEs, and all others as TLV. Unknown
+  fixed-length type-3 IEs need an explicit message-table entry to frame
+  correctly. Strict/ProcedureAware and Reject contexts never use this guess.
+- These six bodies frame and bound optional elements; unlike the authentication
+  bodies they do not apply all receiver rules of TS 24.501 clause 7. The default
+  duplicate policy keeps the last repetition; §7.6.3 keeps the first, so a
+  receiver selects `DuplicateIePolicy::First`. Element order is not checked
+  (§7.6.2). Strict and ProcedureAware reject the whole message for a non-critical
+  out-of-table element, a short element, or a type 4 or type 6 element longer
+  than the table maximum, where §7.6.1, §7.7.1 and TS 24.007 §11.4.2 tell a
+  receiver to ignore the element or its extra octets. They check sender
+  conformance against the pinned edition and are not a receiver acceptance
+  test; a later release can add elements or lengths that they reject.
 - The Registration Result `SMS over NAS` flag (bit 4 of the result value)
   is not surfaced separately; the raw value is preserved for byte-exact
   re-encode.

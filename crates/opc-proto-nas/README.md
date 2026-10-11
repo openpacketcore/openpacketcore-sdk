@@ -27,8 +27,9 @@ NAS interworking, or AMF/SMF product policy.
   `MmMessageBody`.
 - `Sm::decode_body` dispatches registered 5GSM bodies into `SmMessageBody`;
   current 5GSM bodies are raw-preserving named variants.
-- `RegistrationRequest`, `RegistrationAccept`, `SecurityModeCommand`, and
-  `SecurityModeComplete`, and Authentication Request/Response/Result/Failure/Reject
+- `RegistrationRequest`, `RegistrationAccept`, `SecurityModeCommand`,
+  `SecurityModeComplete`, `ConfigurationUpdateCommand`,
+  `ConfigurationUpdateComplete`, and Authentication Request/Response/Result/Failure/Reject
   are the structured 5GMM body subset. Authentication bodies use checked
   `NgKsi`, `Abba`, `EapMessage`, and `MmCause` values.
 - `MobileIdentity`, `IdentityView`, `SuciView`, and `GutiView` parse and expose
@@ -84,8 +85,18 @@ but is implemented separately in `opc-proto-ngap`.
 ## Status And Limits
 
 The crate is experimental and `publish = false`. Decode and encode are
-byte-exact for raw-preserved bodies and identity content. Authentication
-encoding is canonical: known IEs in table order, then preserved extensions;
+byte-exact for raw-preserved bodies and identity content. Registration,
+Security Mode, and Configuration Update bodies use separate optional-element
+tables pinned to TS 24.501 V18.11.1. Strict/ProcedureAware check each message's
+identifiers and wire-length bounds; Structural preserves framed values.
+Every identifier with bit 8 set is one octet, with duplicate detection by its
+high nibble. Configuration Update Complete has no registered optional elements.
+The two Configuration Update enum variants now carry typed structs exposing
+`optional_ies`; use their `decode_body` and `Encode` implementations in place of
+`RawMessageBody.raw`. See [CONFORMANCE.md](CONFORMANCE.md) for table counts,
+unknown-element policy, and the API migration.
+
+Authentication encoding is canonical: known IEs in table order, then preserved extensions;
 ignored duplicates and spare bits are not emitted. This also applies when
 `EncodeContext::raw_preserving` is true; retain `PlainMm.body` for the original
 wire image. Default decode follows receiver rules: optional presence is not
@@ -116,7 +127,7 @@ limitations, including the authentication IE matrix, vector sources and migratio
 ## Roadmap
 
 - Add typed 5GMM and 5GSM bodies as consuming NF profiles need them.
-- Replace optional-IE heuristics with explicit registry coverage for more IEs.
+- Extend per-message optional-element tables when adding typed 5GMM bodies.
 - Keep key derivation, SUCI de-concealment and procedure state in higher-level
   security and NF crates.
 
