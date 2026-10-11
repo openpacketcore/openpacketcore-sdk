@@ -87,8 +87,11 @@ impl ScopeChildReadRequest {
         let stamp = ScopeAuthorityStamp::decode_canonical(&bytes[2..2 + stamp_len])
             .map_err(|_| ScopeBatchError::InvalidRequest)?;
         let keys = bytes[3 + stamp_len..]
-            .chunks_exact(32)
-            .map(|key| ScopeChildKey::new(key.try_into().expect("fixed-width key")))
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .copied()
+            .map(ScopeChildKey::new)
             .collect::<Result<Vec<_>, _>>()?;
         Self::new(&stamp, keys)
     }
