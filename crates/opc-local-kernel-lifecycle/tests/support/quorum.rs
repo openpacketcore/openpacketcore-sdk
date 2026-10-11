@@ -142,7 +142,7 @@ impl Drop for Quorum {
     }
 }
 impl Quorum {
-    pub(crate) async fn open_for(native: bool) -> Self {
+    pub(crate) async fn open(native: bool) -> Self {
         #[cfg(not(feature = "native-scope"))]
         assert!(!native, "native fixture requires its explicit feature");
         let directory = tempfile::tempdir().unwrap();

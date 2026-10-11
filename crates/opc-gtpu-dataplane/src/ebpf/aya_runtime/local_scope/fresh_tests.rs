@@ -232,7 +232,7 @@ fn fresh_lifecycle(cancel_shutdown: bool, qualify_sessions: bool, packets: bool,
         }
         super::abandon_tests::exercise(gtpu.inner.local_scope.as_ref().unwrap(), &reset).await;
         let profile = xfrm.admit_scoped_profile(&reset).await.unwrap();
-        let quorum = Quorum::open_for(native).await;
+        let quorum = Quorum::open(native).await;
         let authority = TestAuthority::new(lifecycle.clone(), &quorum)
             .await
             .unwrap();

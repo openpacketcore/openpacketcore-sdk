@@ -5,7 +5,7 @@ use crate::scope::{
     ScopeTransportRole as Role,
 };
 
-pub(super) struct Fixture {
+pub(super) struct ChildReadRevisionFixture {
     pub(super) client: ScopeClient,
     pub(super) authority: Box<CommittedScopeAuthority>,
     pub(super) peer: Arc<Peer>,
@@ -16,7 +16,7 @@ pub(super) struct Fixture {
     _directory: tempfile::TempDir,
 }
 
-impl Fixture {
+impl ChildReadRevisionFixture {
     pub(super) async fn new() -> Self {
         let identity = SessionConsensusIdentity::new(
             SessionConsensusClusterId::from_bytes([1; 32]),
@@ -230,7 +230,7 @@ fn run(scenario: Scenario, name: &str) {
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         timeout(Duration::from_secs(15), async {
-            let fixture = Fixture::new().await;
+            let fixture = ChildReadRevisionFixture::new().await;
             let key = ScopeChildKey::new([8; 32]).unwrap();
             let request = ScopeChildReadRequest::new(fixture.authority.stamp(), vec![key]).unwrap();
             let missing = crate::scope::child_read_wire::encode_observation(&request, &[None]).unwrap();

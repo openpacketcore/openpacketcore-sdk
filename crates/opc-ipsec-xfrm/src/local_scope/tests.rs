@@ -92,7 +92,7 @@ fn exercise_scoped_effect_uses_real_quorum_and_preserves_publication_during_stor
         .block_on(async {
             use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 
-            let quorum = Quorum::open_for(native).await;
+            let quorum = Quorum::open(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
@@ -234,7 +234,7 @@ fn exercise_rebuilt_authority_cannot_reinstall_a_removed_effect(native: bool) {
         .block_on(async {
             use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 
-            let quorum = Quorum::open_for(native).await;
+            let quorum = Quorum::open(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
@@ -308,7 +308,7 @@ fn exercise_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_re
             use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 
             use operations::{TestFault, TestPause};
-            let quorum = Quorum::open_for(native).await;
+            let quorum = Quorum::open(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
@@ -474,7 +474,7 @@ fn exercise_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_in
             use crate::local_scope_quorum::{child_key, value, Quorum, TestAuthority};
             use opc_local_kernel_lifecycle::LocalEffectError;
             use opc_session_store::scope_batch::{ScopeBatchRequest, ScopeChildMutation};
-            let quorum = Quorum::open_for(native).await;
+            let quorum = Quorum::open(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
@@ -681,7 +681,7 @@ fn exercise_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo(native:
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            let quorum = Quorum::open_for(native).await;
+            let quorum = Quorum::open(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await

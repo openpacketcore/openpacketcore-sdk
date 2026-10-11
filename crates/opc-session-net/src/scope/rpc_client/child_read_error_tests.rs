@@ -140,7 +140,7 @@ fn run_child_deadline_case(case: ChildDeadlineCase, name: &str) {
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         timeout(Duration::from_secs(20), async {
-            let fixture = revision::Fixture::new().await;
+            let fixture = revision::ChildReadRevisionFixture::new().await;
             let key = ScopeChildKey::new([8; 32]).unwrap();
             let request = ScopeChildReadRequest::new(fixture.authority.stamp(), vec![key]).unwrap();
             let missing = crate::scope::child_read_wire::encode_observation(&request, &[None]).unwrap();

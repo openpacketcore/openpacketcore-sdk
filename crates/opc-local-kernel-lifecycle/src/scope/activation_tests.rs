@@ -123,7 +123,7 @@ fn exercise_opening(native: bool) {
         .build()
         .unwrap()
         .block_on(async {
-            let quorum = Quorum::open_for(native).await;
+            let quorum = Quorum::open(native).await;
             lifecycle.reset(participants()).await.unwrap();
             let authority = TestAuthority::new(lifecycle.clone(), &quorum)
                 .await
