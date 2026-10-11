@@ -2,6 +2,8 @@
 
 Status: proposed; design review precedes implementation. Resolves the API gap in
 [#1221](https://github.com/openpacketcore/openpacketcore-sdk/issues/1221).
+The follow-on adapter in [#1225](https://github.com/openpacketcore/openpacketcore-sdk/issues/1225)
+uses this read; its implementation follows the reviewed child-read implementation.
 Applies to [RFC 026](026-scope-authenticated-transport.md) and
 [RFC 027](027-scope-batch-lanes.md); coherent restore remains RFC 028.
 
@@ -124,6 +126,54 @@ An untrusted reply cannot turn a transport/parser failure into a definitive
 store refusal. Decode typed errors only after response authentication and full
 request correlation. A fresh read is safe after an unavailable observation;
 exact retry rules for already submitted mutations remain unchanged.
+
+## Follow-on: native kernel authority (#1225)
+
+Add a concrete `ScopeKernelAuthority::from_scope_client` constructor in
+`opc-local-kernel-lifecycle`, once that crate's local authority has landed. An
+optional `native-scope` feature enables `store` and `opc-session-net`. Retain the
+local constructor. Both backends share the private authority/readback checks,
+local effect owner, reset epoch and bounded consumption state; a caller-supplied
+observation provider must not become a capability factory.
+
+The native constructor consumes a real `CommittedScopeAuthority`, the local
+`ScopeExecution` and lifecycle, and a concrete worker `ScopeClient` with a data
+class and bounded attempt budget. It verifies that capability, client, process
+and scope agree. Add a checked current-authority wrapper to `ScopeClient` for
+this binding; it uses the existing full-round `Current` RPC and SafetyControl
+read admission. Child and exact batch-outcome reads use the configured data
+class. The constructor and each effect recheck retain local fence checks and
+the complete current-stamp, retirement and admission-generation checks.
+
+Provide shared verification/recovery of an activation's **original full batch
+request**, using native `batch_outcome(request.attempt())` and this child read.
+Require an authenticated `Applied` outcome matching the complete request,
+lane, sequence and operation index; compare the child's namespace, key, birth,
+generation, sealed bytes and complete claims. Also compare its exposed batch
+revision with the applied outcome revision in both backends. Keep the current
+read before and after child verification. Only this composed check, under the
+held committed authority and local epoch, may yield a local effect token.
+Neither an observed stamp nor a matching child alone is sufficient.
+
+New mutations continue through the shared batch coordinator, with its original
+request and reconciliation ownership; the adapter adds no raw apply shortcut,
+new lane, automatic acknowledgement or rebuilt retry. Preserve the local commit
+entry point and add the shared readback entry point for already submitted
+activations. `NotRecorded` and `Pruned` remain unknown; authenticated `Cancelled`
+and `NotApplied` may prove no effect. Transport/parser failures remain
+`Unavailable` or `OutcomeUnknown` before the existing `LocalEffectError`
+mapping. Rechecks outside a builder use standalone read admission; any predicate
+inside a builder uses the borrowed read context, never a nested reservation.
+
+No further wire method or revision is needed. Run the existing authority
+verification cases unchanged for both adapters, plus native TLS faults for
+wrong principal/process/scope, stale authority, substituted rows/outcomes and
+lost replies. Prove read-only verification appends no application command and
+holds no lane. Preserve cancellation-safe Close, drain and contained reset;
+transport loss prevents new effects without resetting published forwarding.
+The consumer's disruption policy still protects emergency sessions. Restart
+uses the existing local cleanup and fresh committed authority, with no node or
+operator recovery step.
 
 ## Qualification and operation
 
