@@ -64,6 +64,11 @@ EXPLICIT_PATHS = (
     "ci/setup-fsverity-tmp.sh",
     "ci/egress-fence-changes.py",
     "ci/test-egress-fence-changes.py",
+    "ci/egress-fence-tests.py",
+    "ci/test-egress-fence-tests.py",
+    "ci/egress-fence-tools.sh",
+    "ci/egress-fence-kernel.sh",
+    "ci/egress-fence-cleanup.sh",
     ".github/workflows/egress-fence.yml",
     ".cargo/config", ".cargo/config.toml", "rust-toolchain", "rust-toolchain.toml",
     # The eBPF steps run Cargo from crates/opc-egress-fence-ebpf, and Cargo

@@ -205,6 +205,7 @@ jobs:
           python3 ci/test-test-shards.py
           python3 ci/test-performance-tests.py
           python3 ci/test-realtime-qualification.py
+          python3 -I ci/test-egress-fence-tests.py
 
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify

@@ -43,16 +43,14 @@ jobs:
         id: decide
         run: python3 -I ci/egress-fence-changes.py
 
-  root-cgroup-egress:
-    name: Root-cgroup egress fence
+  # Keep the existing required check below as an aggregate. Every workload
+  # uses the original fail-closed changes condition and a 45-minute budget.
+  sources:
+    name: Egress fence sources and eBPF
     needs: changes
-    # Only a successful, explicit skip decision may avoid qualification.
-    # A failed/timed-out decision job or missing output must run the full job.
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-24.04
-    # Cold host builds and the full kernel proof suite can exceed one hour.
-    # This job budget leaves every test and product latency bound unchanged.
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -74,38 +72,27 @@ jobs:
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
-            crates/opc-egress-fence-ebpf
+          shared-key: egress-fence-host
+          workspaces: . -> target/egress-fence-host
+
+      - name: Cache pinned eBPF compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: egress-fence-ebpf
+          workspaces: crates/opc-egress-fence-ebpf -> ../../target/egress-fence-ebpf-clippy
 
       - name: Install pinned kernel build tools
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y iproute2 linux-tools-common linux-tools-generic llvm
-          bpftool_path="$(
-            find /usr/lib/linux-tools \
-              -name bpftool \
-              -perm /111 \
-              -print \
-              | sort -V \
-              | tail -n 1
-          )"
-          if [[ -z "${bpftool_path}" ]]; then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (bpftool unavailable)"
-            exit 2
-          fi
-          sudo install -m 0755 "${bpftool_path}" /usr/local/bin/bpftool
-          bpftool version
-          cargo install bpf-linker --version 0.10.3 --locked
+          bash ci/egress-fence-tools.sh --ebpf
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
+      - name: Test exact host-test partition and required check
+        run: |
+          python3 -I ci/test-egress-fence-tests.py
 
       - name: Gate host sources
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-host-target"
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-host"
           cargo fmt --all --check
           git diff --check
           cargo clippy --locked \
@@ -119,120 +106,11 @@ jobs:
             --all-features \
             -- \
             -D warnings
-          optimized_sqlite_contracts=(
-            sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch
-            sqlite::consensus::tests::due_protected_roster_maintenance_reclaims_the_oldest_bounded_prefix_only
-            sqlite::consensus::tests::fenced_transition_v2_capacity_opens_successor_and_bounds_eight_exact_epochs
-            sqlite::consensus::tests::fenced_transition_v2_floor_reclaims_oldest_while_successor_remains_writable
-            sqlite::consensus::tests::fenced_transition_v2_post_reclaim_deletion_keeps_retired_and_conflict_closed
-            sqlite::consensus::tests::fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch
-            sqlite::consensus::tests::fenced_transition_v2_revoked_authority_masks_nonactive_epoch_in_apply_and_projection
-            sqlite::consensus::tests::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression
-          )
-          broad_test_skips=(
-            consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths
-            consensus::raft_adapter::tests::raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family
-            consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement
-            "${optimized_sqlite_contracts[@]}"
-            lagging_replica_installs_compacted_snapshot_without_losing_committed_state
-            fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
-            compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart
-          )
-          broad_skip_arguments=()
-          for contract in "${broad_test_skips[@]}"; do
-            broad_skip_arguments+=(--skip "${contract}")
-          done
-          cargo test --locked \
-            -p opc-egress-fence \
-            -p opc-egress-fence-common \
-            -p opc-linux-gtpu-sys \
-            -p opc-linux-xfrm-sys \
-            -p opc-runtime \
-            -p opc-session-store \
-            --all-features \
-            --quiet \
-            -- \
-            --test-threads=4 \
-            --exact \
-            "${broad_skip_arguments[@]}"
-          # Snapshot installation owns process-wide test controls and durable
-          # voter state. Match the main CI shard by running these proofs in
-          # fresh, single-test processes outside the shared teardown queue.
-          cargo test --locked \
-            -p opc-session-store \
-            --all-features \
-            --quiet \
-            --test consensus_openraft \
-            -- \
-            --test-threads=1 \
-            --exact \
-            lagging_replica_installs_compacted_snapshot_without_losing_committed_state
-          cargo test --locked \
-            -p opc-session-store \
-            --all-features \
-            --quiet \
-            --test consensus_openraft \
-            -- \
-            --test-threads=1 \
-            --exact \
-            fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
-          # Predecessor compaction commits the production snapshot threshold
-          # before catch-up. Keep that 5-minute command batch off the shared
-          # four-thread binary so host scheduling cannot turn an existing
-          # bound into a teardown-queue timeout.
-          cargo test --locked \
-            -p opc-session-store \
-            --all-features \
-            --quiet \
-            --test consensus_openraft \
-            -- \
-            --test-threads=1 \
-            --exact \
-            compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart
-          # This proof owns a scoped snapshot-promotion gate while it verifies
-          # an unrelated concurrent install. Give that process-global test
-          # control a fresh process without changing its one-second bound.
-          cargo test --locked \
-            -p opc-session-store \
-            --lib \
-            --all-features \
-            --quiet \
-            -- \
-            --test-threads=1 \
-            --exact \
-            consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement
-          # This proof owns a fixed follower Raft runtime through its final
-          # shutdown. Keep that teardown out of the shared libtest process so
-          # every durable-authority assertion runs before one fresh runtime is
-          # stopped, without changing the product or test deadline.
-          cargo test --locked \
-            -p opc-session-store \
-            --lib \
-            --all-features \
-            --quiet \
-            -- \
-            --test-threads=1 \
-            --exact \
-            consensus::raft_adapter::tests::raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family
-          # This proof deliberately binds a one-second attached-consensus
-          # deadline. Run it exactly once outside the multi-minute SQLite
-          # fixtures so host scheduling cannot turn a committed mutation into
-          # a detached response while preserving the production deadline.
-          cargo test --locked \
-            -p opc-session-store \
-            --lib \
-            --all-features \
-            --quiet \
-            -- \
-            --test-threads=1 \
-            --exact \
-            consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths
-          cargo test --locked \
-            -p opc-session-testkit \
-            --test qualification_profile \
-            --quiet \
-            -- \
-            --test-threads=1
+
+      - name: Gate host documentation
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-host"
           RUSTDOCFLAGS="-D warnings" cargo doc --locked \
             -p opc-egress-fence \
             -p opc-egress-fence-common \
@@ -242,21 +120,6 @@ jobs:
             -p opc-session-store \
             --all-features \
             --no-deps
-          # These exact high-cardinality retained-history and reclamation
-          # proofs dominate the shared debug process. Preserve every input,
-          # assertion, and exact selector while running them once each in the
-          # repository's optimized qualification profile.
-          for contract in "${optimized_sqlite_contracts[@]}"; do
-            CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
-              -p opc-session-store \
-              --lib \
-              --all-features \
-              --quiet \
-              -- \
-              --test-threads=1 \
-              --exact \
-              "${contract}"
-          done
 
       - name: Gate every eBPF feature surface
         run: |
@@ -266,7 +129,7 @@ jobs:
             --all \
             -- \
             --check
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-ebpf-clippy"
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-ebpf-clippy"
           export RUSTFLAGS="-C linker=bpf-linker -C link-arg=--btf"
           cd crates/opc-egress-fence-ebpf
           cargo +nightly-2026-06-22 clippy --locked \
@@ -321,11 +184,59 @@ jobs:
           OPC_EBPF_COMPARISON_TARGET_DIR="${RUNNER_TEMP}/egress-fence-gate-b" \
             ./scripts/build-egress-fence-ebpf.sh
 
+      - name: Share verified objects with the oracle job
+        uses: actions/upload-artifact@v7
+        with:
+          name: egress-fence-objects
+          overwrite: true
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/egress-fence-committed.bpf.o
+            ${{ runner.temp }}/egress-fence-production.bpf.o
+            ${{ runner.temp }}/egress-fence-fault.bpf.o
+            ${{ runner.temp }}/egress-fence-deadline-mutation.bpf.o
+            ${{ runner.temp }}/egress-fence-gate-mutation.bpf.o
+
+      - name: Require complete privileged cleanup
+        if: always()
+        run: bash ci/egress-fence-cleanup.sh
+
+  oracles:
+    name: Egress fence object and mutation oracles
+    needs: [changes, sources]
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache independent host oracle compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: egress-fence-oracles
+          workspaces: crates/opc-egress-fence-ebpf -> ../../target/egress-fence-oracles
+
+      - name: Install kernel inspection tools
+        run: |
+          bash ci/egress-fence-tools.sh
+
+      - name: Download verified objects from this run
+        uses: actions/download-artifact@v8
+        with:
+          name: egress-fence-objects
+          path: ${{ runner.temp }}
+
       - name: Build and gate independent host oracles
         run: |
           set -euo pipefail
           host_target="$(rustc -vV | awk '/^host:/ { print $2 }')"
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-oracle-target"
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-oracles"
           cargo test --locked \
             --manifest-path crates/opc-egress-fence-ebpf/Cargo.toml \
             --package opc-egress-fence-object-oracle \
@@ -348,33 +259,13 @@ jobs:
 
       - name: Require the revision-aware host kernel
         run: |
-          set -euo pipefail
-          kernel="$(uname -r)"
-          numeric="${kernel%%-*}"
-          major="${numeric%%.*}"
-          remainder="${numeric#*.}"
-          minor="${remainder%%.*}"
-          if [[ ! "${major}" =~ ^[0-9]+$ || ! "${minor}" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (kernel revision UAPI unavailable)"
-            exit 2
-          fi
-          if (( major < 6 || (major == 6 && minor < 17) )); then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (kernel revision UAPI unavailable)"
-            exit 2
-          fi
-          if [[ "$(stat --file-system --format=%T /sys/fs/cgroup)" != "cgroup2fs" ]]; then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (true cgroup-v2 root unavailable)"
-            exit 2
-          fi
-          if ! mountpoint --quiet /sys/fs/bpf; then
-            sudo mount -t bpf bpf /sys/fs/bpf
-          fi
+          bash ci/egress-fence-kernel.sh
 
       - name: Run actual-object, cleanup-fault, and mutation oracles
         run: |
           set -euo pipefail
           host_target="$(rustc -vV | awk '/^host:/ { print $2 }')"
-          oracle="${RUNNER_TEMP}/egress-fence-oracle-target/${host_target}/debug/opc-egress-fence-object-oracle"
+          oracle="${GITHUB_WORKSPACE}/target/egress-fence-oracles/${host_target}/debug/opc-egress-fence-object-oracle"
           production="${RUNNER_TEMP}/egress-fence-committed.bpf.o"
           fault="${RUNNER_TEMP}/egress-fence-fault.bpf.o"
           deadline="${RUNNER_TEMP}/egress-fence-deadline-mutation.bpf.o"
@@ -388,10 +279,43 @@ jobs:
           OPC_EGRESS_FENCE_DETECTOR_TARGET_DIR="${RUNNER_TEMP}/egress-fence-detector-target" \
             crates/opc-egress-fence-ebpf/oracle/scripts/run-privileged-detector.sh
 
+      - name: Require complete privileged cleanup
+        if: always()
+        run: bash ci/egress-fence-cleanup.sh
+
+  installer:
+    name: Egress fence production installer
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: egress-fence-host
+          workspaces: . -> target/egress-fence-host
+
+      - name: Install kernel inspection tools
+        run: |
+          bash ci/egress-fence-tools.sh
+
+      - name: Require the revision-aware host kernel
+        run: |
+          bash ci/egress-fence-kernel.sh
+
       - name: Run the production installer and adoption proof
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-host-target"
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-host"
           build_log="${RUNNER_TEMP}/egress-fence-privileged-build.jsonl"
           cargo test --locked \
             -p opc-egress-fence \
@@ -433,63 +357,115 @@ jobs:
 
       - name: Require complete privileged cleanup
         if: always()
+        run: bash ci/egress-fence-cleanup.sh
+
+  host-tests:
+    name: Egress fence Rust tests (${{ matrix.shard }})
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: egress-fence-tests-${{ matrix.shard }}
+          workspaces: . -> target/egress-fence-host
+
+      - name: Install kernel inspection tools
+        run: |
+          bash ci/egress-fence-tools.sh
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Run exact host-test shard
         run: |
           set -euo pipefail
-          attachments="$(sudo bpftool cgroup show /sys/fs/cgroup 2>/dev/null)"
-          if [[ -n "${attachments}" ]]; then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (root attachment remained)"
-            exit 2
-          fi
-          if sudo find /sys/fs/bpf \
-            -maxdepth 1 \
-            -name 'opc-egress-fence-*' \
-            -print \
-            -quit \
-            | grep -q .
-          then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (pin inventory remained)"
-            exit 2
-          fi
-          if sudo findmnt \
-            --raw \
-            --noheadings \
-            --output TARGET \
-            --types bpf \
-            | awk '
-                /^\/run\/opc-egress-fence-detector-bpffs-[0-9]+$/ {
-                  found = 1
-                }
-                END { exit !found }
-              '
-          then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (private BPF mount remained)"
-            exit 2
-          fi
-          if sudo find /run \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -name 'opc-egress-fence-detector-bpffs-*' \
-            -print \
-            -quit \
-            | grep -q .
-          then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (private pin directory remained)"
-            exit 2
-          fi
-          netns_inventory="$(sudo ip netns list)"
-          if awk '$1 ~ /^oef[rs]/ { found = 1 } END { exit !found }' \
-            <<< "${netns_inventory}"; then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (network namespace remained)"
-            exit 2
-          fi
-          if sudo find /sys/class/net \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -printf '%f\n' \
-            | grep -Eq '^e[rs][on][0-9a-f]+$'
-          then
-            printf '%s\n' "egress-fence CI: DEFECTIVE (host veth remained)"
-            exit 2
-          fi
-          printf '%s\n' "egress-fence CI cleanup: PASS"
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-host"
+          python3 ci/egress-fence-tests.py \
+            --shard '${{ matrix.shard }}' \
+            --output "${RUNNER_TEMP}/egress-fence-test-map.json"
+
+      - name: Archive the complete test-name mapping
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: egress-fence-test-map-${{ matrix.shard }}
+          overwrite: true
+          path: ${{ runner.temp }}/egress-fence-test-map.json
+          if-no-files-found: error
+
+      - name: Require complete privileged cleanup
+        if: always()
+        run: bash ci/egress-fence-cleanup.sh
+
+  host-proofs:
+    name: Egress fence isolated and O1 proofs
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache isolated proof compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: egress-fence-proofs
+          workspaces: . -> target/egress-fence-proofs
+
+      - name: Install kernel inspection tools
+        run: |
+          bash ci/egress-fence-tools.sh
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Run the six isolated and eight O1 proofs
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-proofs"
+          python3 ci/egress-fence-tests.py \
+            --shard 3 \
+            --output "${RUNNER_TEMP}/egress-fence-test-map.json"
+
+      - name: Require complete privileged cleanup
+        if: always()
+        run: bash ci/egress-fence-cleanup.sh
+
+  # Preserve the old branch-protection check name. A failed, cancelled or
+  # missing matrix member makes host-tests unsuccessful and blocks this gate.
+  # Only the original successful, explicit changes skip can accept skips.
+  root-cgroup-egress:
+    name: Root-cgroup egress fence
+    if: always()
+    needs: [changes, sources, oracles, installer, host-tests, host-proofs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      EGRESS_JOB_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Require every egress-fence job
+        run: python3 ci/egress-fence-tests.py --check-jobs
