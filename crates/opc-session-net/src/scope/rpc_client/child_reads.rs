@@ -143,10 +143,13 @@ impl ScopeClient {
             ResultStatus::BatchError => Err(ScopeBatchError::decode_canonical(&payload.body)
                 .map_err(|_| unavailable())?
                 .into()),
-            _ => Err(payload_error(&payload)
-                .map(batch::batch_error)
-                .map(ScopeChildReadError::from)
-                .unwrap_or_else(|_| unavailable())),
+            ResultStatus::ProvenNoEffect | ResultStatus::OutcomeUnknown => {
+                Err(payload_error(&payload)
+                    .map(batch::batch_error)
+                    .map(ScopeChildReadError::from)
+                    .unwrap_or_else(|_| unavailable()))
+            }
+            _ => Err(unavailable()),
         }
     }
 }
