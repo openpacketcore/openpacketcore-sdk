@@ -2388,14 +2388,17 @@ async fn append_timeout_boundary_drops_one_lane_per_slow_attempt() {
         "a response below 250 ms must preserve the cached lane"
     );
 
+    let mut slow_elapsed = Duration::ZERO;
     for payload in [b"slow-1".as_slice(), b"slow-2", b"slow-3", b"slow-4"] {
         let calls_before = handler.calls.load(Ordering::SeqCst);
         let resolutions_before = resolutions.load(Ordering::SeqCst);
         handler.delay_millis.store(300, Ordering::SeqCst);
+        let started = Instant::now();
         assert_eq!(
             call(payload, Duration::from_millis(250)).await,
             Err(SessionConsensusPeerError::Timeout)
         );
+        slow_elapsed += started.elapsed();
         assert_eq!(
             handler.calls.load(Ordering::SeqCst),
             calls_before + 1,
@@ -2430,6 +2433,12 @@ async fn append_timeout_boundary_drops_one_lane_per_slow_attempt() {
             "the replacement lane must deliver the exact recovery response"
         );
     }
+
+    // Exclude recovery work from the original aggregate timeout lower bound.
+    assert!(
+        slow_elapsed >= Duration::from_secs(1),
+        "four 250 ms slow calls must consume their original combined budget: {slow_elapsed:?}"
+    );
 
     assert_eq!(
         call(b"reuse", Duration::from_millis(250)).await,

@@ -16,8 +16,152 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  privileged-gtpu:
+  # Keep the existing required check name and require both independent jobs.
+  privileged-gtpu-result:
     name: Privileged Linux GTP-U
+    if: always()
+    needs: [privileged-gtpu, privileged-gtpu-regressions]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DATAPATH_RESULT: ${{ needs.privileged-gtpu.result }}
+      REGRESSIONS_RESULT: ${{ needs.privileged-gtpu-regressions.result }}
+    steps:
+      - name: Require both privileged jobs to pass
+        run: |
+          set -euo pipefail
+          test "$DATAPATH_RESULT" = success
+          test "$REGRESSIONS_RESULT" = success
+
+  privileged-gtpu-regressions:
+    name: Privileged Linux GTP-U and route regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ethtool iproute2 iputils-ping kmod nftables procps wireguard-tools
+
+      - name: Check privileged GTP kernel support
+        run: |
+          set -euo pipefail
+          uname -r
+          uname -v
+          if ! sudo modprobe gtp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe gtp
+          fi
+          lsmod | grep '^gtp'
+          sudo modprobe wireguard
+          # The hand-off test on a VRF slave needs the vrf driver, which
+          # ships in the same optional module package as gtp. Create a VRF
+          # in a throwaway namespace rather than look for a module: that
+          # holds for a built-in driver as well.
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe vrf
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
+          fi
+          # The test of the attachment's interface enslaves it to a bridge.
+          sudo unshare -n -- ip link add bridge-probe type bridge
+          # The tests of a device stacked on the attachment's interface, and
+          # of the frames of a VLAN above it, need these drivers.
+          sudo unshare -n -- sh -euc '
+            ip link add lower-probe type dummy
+            ip link add link lower-probe name macvlan-probe type macvlan mode passthru
+            ip link del macvlan-probe
+            ip link add link lower-probe name ipvlan-probe type ipvlan mode l2
+            ip link add link lower-probe name vlan-probe type vlan id 100
+            ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
+          '
+          sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo unshare -n -- ip link set lo up
+
+      - name: Prove empty historical hierarchy normalization and crash recovery
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-empty-normalization-build.jsonl"
+          normalization_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_gtpu_dataplane" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one GTP-U test binary") end
+          ' "${RUNNER_TEMP}/gtpu-empty-normalization-build.jsonl")"
+          normalization_log="${RUNNER_TEMP}/gtpu-empty-normalization.log"
+          sudo env OPC_GTPU_RUN_PRIVILEGED=1 \
+            unshare -mn --propagation private -- bash -euxo pipefail -c '
+              ip link set lo up
+              mount -t bpf bpf /sys/fs/bpf
+              exec "$@"
+            ' gtpu-empty-normalization "${normalization_binary}" --ignored --exact \
+              ebpf::aya_runtime::race_tests::empty_historical_25_hierarchy_normalizes_then_allows_ordinary_create \
+              ebpf::aya_runtime::race_tests::empty_historical_25_hierarchy_normalization_crash_cuts_converge \
+              ebpf::aya_runtime::race_tests::empty_historical_25_normalization_refuses_nested_configured_root_pre_effect \
+              --nocapture --test-threads=1 2>&1 | tee "${normalization_log}"
+          grep -Fq 'test result: ok. 3 passed; 0 failed; 0 ignored;' "${normalization_log}"
+          grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_PROVEN' "${normalization_log}"
+          grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_CRASH_CUTS_PROVEN' "${normalization_log}"
+          grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NESTED_ROOT_REFUSAL_PROVEN' "${normalization_log}"
+
+      - name: Prove route rule families and locked route MTU on the kernel
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-route-steering \
+            --test live_readback_probe --test live_locked_route_mtu \
+            --no-run --message-format=json > "${RUNNER_TEMP}/route-kernel-build.jsonl"
+          for target in live_readback_probe live_locked_route_mtu; do
+            case "${target}" in
+              live_readback_probe)
+                test_name=live_ipv4_and_ipv6_mark_only_rules_are_distinct_kernel_objects ;;
+              live_locked_route_mtu)
+                test_name=live_locked_route_mtu_makes_the_kernel_signal_oversized_packets_for_both_families ;;
+            esac
+            route_binary="$(jq -ers --arg target "${target}" '
+              map(select(.reason == "compiler-artifact" and .profile.test == true
+                and .target.name == $target and .executable != null))
+              | if length == 1 then .[0].executable else error("expected one route test binary") end
+            ' "${RUNNER_TEMP}/route-kernel-build.jsonl")"
+            route_log="${RUNNER_TEMP}/${target}.log"
+            sudo unshare -mn --propagation private -- bash -euxo pipefail -c '
+              # Named child netns mounts must remain inside this test namespace.
+              mount -t tmpfs tmpfs /run
+              mkdir -p /run/netns
+              ip link set lo up
+              exec "$@"
+            ' route-kernel "${route_binary}" --ignored --exact "${test_name}" \
+              --nocapture --test-threads=1 2>&1 | tee "${route_log}"
+            grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${route_log}"
+          done
+          grep -Fq 'OPC_ROUTE_LOCKED_MTU_ICMP_PROVEN:' "${RUNNER_TEMP}/live_locked_route_mtu.log"
+
+      - name: Upload privileged regression logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-privileged-regressions
+          path: |
+            ${{ runner.temp }}/gtpu-empty-normalization-build.jsonl
+            ${{ runner.temp }}/gtpu-empty-normalization.log
+            ${{ runner.temp }}/route-kernel-build.jsonl
+            ${{ runner.temp }}/live_readback_probe.log
+            ${{ runner.temp }}/live_locked_route_mtu.log
+          if-no-files-found: warn
+
+  privileged-gtpu:
+    name: Privileged Linux GTP-U datapath
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -37,7 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ethtool iproute2 kmod nftables wireguard-tools
+          sudo apt-get install -y ethtool iproute2 iputils-ping kmod nftables procps wireguard-tools
 
       - name: Check privileged GTP kernel support
         run: |
@@ -114,6 +258,7 @@ jobs:
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
             "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
@@ -164,6 +309,7 @@ jobs:
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
             "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
