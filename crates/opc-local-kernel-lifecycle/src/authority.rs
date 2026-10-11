@@ -521,6 +521,7 @@ fn child_read_error(error: ScopeChildReadError) -> LocalEffectError {
         ScopeChildReadError::ObservationTooLarge | ScopeChildReadError::ReadBudgetExceeded => {
             LocalEffectError::Unavailable
         }
+        _ => LocalEffectError::Unavailable,
     }
 }
 fn verify_current(
