@@ -67,6 +67,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     } else {
         TokenStream::new()
     };
+    let sort_updates = if has_ordered_projection {
+        // Schema traversal is deterministic; sorting would lose configured row order.
+        TokenStream::new()
+    } else {
+        quote! { updates.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str())); }
+    };
 
     let tokens = quote! {
         #[allow(unused_imports)]
@@ -87,7 +93,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             ) -> Result<Vec<GnmiJsonUpdate>, GnmiJsonProjectionError> {
                 let mut updates = Vec::new();
                 #root_function(config, selection, #root_path, #root_path, &mut updates)?;
-                updates.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
+                #sort_updates
                 Ok(updates)
             }
         }
@@ -294,28 +300,9 @@ fn render_list_fn(
 
     let entry_fn = render_list_entry_fn(node, nodes_by_path, &entry_fn_ident, &entry_type_ident)?;
     let iter_expr = quote! { value.values() };
-    let render_entries = if super::is_user_ordered(node) {
-        quote! {
-            // An RFC 7951 array carries user order even when the surrounding
-            // gNMI updates are sorted or delivered independently. Build rows
-            // only from the authorized, already-redacted child projections.
-            let mut rows = Vec::new();
-            for entry in #iter_expr {
-                let mut children = Vec::new();
-                #entry_fn_ident(entry, selection, schema_path, canonical_path, &mut children)?;
-                if !children.is_empty() {
-                    rows.push(ordered_projection_row(schema_path, children)?);
-                }
-            }
-            if !rows.is_empty() || selection.contains(schema_path) {
-                push_update(updates, canonical_path, to_json(schema_path, &rows)?)?;
-            }
-        }
-    } else {
-        quote! {
-            for entry in #iter_expr {
-                #entry_fn_ident(entry, selection, schema_path, canonical_path, updates)?;
-            }
+    let render_entries = quote! {
+        for entry in #iter_expr {
+            #entry_fn_ident(entry, selection, schema_path, canonical_path, updates)?;
         }
     };
 
@@ -345,7 +332,10 @@ fn ordered_projection_helpers() -> TokenStream {
         // that were not returned by the existing authorized leaf renderers.
         enum OrderedProjection {
             Object(std::collections::BTreeMap<String, OrderedProjection>),
-            List(Vec<(std::collections::BTreeMap<String, String>, OrderedProjection)>),
+            List {
+                rows: Vec<OrderedProjection>,
+                positions: std::collections::HashMap<std::collections::BTreeMap<String, String>, usize>,
+            },
             Value(serde_json::Value),
         }
 
@@ -358,8 +348,8 @@ fn ordered_projection_helpers() -> TokenStream {
                 match self {
                     Self::Object(fields) => serde_json::Value::Object(fields.into_iter()
                         .map(|(name, value)| (name, value.into_json())).collect()),
-                    Self::List(rows) => serde_json::Value::Array(rows.into_iter()
-                        .map(|(_, row)| row.into_json()).collect()),
+                    Self::List { rows, .. } => serde_json::Value::Array(rows.into_iter()
+                        .map(Self::into_json).collect()),
                     Self::Value(value) => value,
                 }
             }
@@ -391,18 +381,44 @@ fn ordered_projection_helpers() -> TokenStream {
                     return field.insert(rest, node, value);
                 }
                 if matches!(field, Self::Object(fields) if fields.is_empty()) {
-                    *field = Self::List(Vec::new());
+                    *field = Self::List { rows: Vec::new(), positions: Default::default() };
                 }
-                let Self::List(rows) = field else {
+                let Self::List { rows, positions } = field else {
                     return Err(GnmiJsonProjectionError::projection("conflicting ordered-list rows"));
                 };
-                let index = rows.iter().position(|(keys, _)| keys == &segment.keys)
-                    .unwrap_or_else(|| {
-                        rows.push((segment.keys.clone(), Self::default()));
-                        rows.len() - 1
-                    });
-                rows[index].1.insert(rest, node, value)
+                let index = if let Some(&index) = positions.get(&segment.keys) {
+                    index
+                } else {
+                    let index = rows.len();
+                    positions.insert(segment.keys.clone(), index);
+                    rows.push(Self::default());
+                    index
+                };
+                rows[index].insert(rest, node, value)
             }
+        }
+
+        fn ordered_collection_selected(
+            selection: ReadSelection<'_>,
+            schema_path: &'static str,
+            canonical_path: &str,
+        ) -> Result<bool, GnmiJsonProjectionError> {
+            if selection.entries().is_empty() {
+                return Ok(selection.contains(schema_path));
+            }
+            let path = YangPath::new(canonical_path)
+                .map_err(|_| GnmiJsonProjectionError::projection("invalid ordered-list entry path"))?;
+            for entry in selection.entries().iter().filter(|entry| entry.schema_path() == schema_path) {
+                let segments = super::patch::parse_path(entry.canonical_path().as_str())
+                    .map_err(|_| GnmiJsonProjectionError::projection("invalid ordered-list selection"))?;
+                if segments.last().is_some_and(|segment| segment.keys.is_empty())
+                    && ReadSelection::with_entries(&[schema_path], std::slice::from_ref(entry))
+                        .contains_path(schema_path, &path)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
 
         fn ordered_projection_row(
@@ -435,6 +451,24 @@ fn render_list_entry_fn(
 ) -> Result<TokenStream, RustGenerationError> {
     let key_stmts = list_key_predicate_stmts(node, nodes_by_path)?;
     let child_stmts = child_render_stmts(node, nodes_by_path)?;
+    let render_children = if super::is_user_ordered(node) {
+        quote! {
+            let mut children = Vec::new();
+            {
+                let updates = &mut children;
+                #(#child_stmts)*
+            }
+            if !children.is_empty() && ordered_collection_selected(selection, schema_path, canonical_path)? {
+                // One bounded value per row, containing only authorized, redacted children.
+                let row = ordered_projection_row(schema_path, children)?;
+                push_update(updates, canonical_path, to_json(schema_path, &row)?)?;
+            } else {
+                updates.extend(children);
+            }
+        }
+    } else {
+        quote! { #(#child_stmts)* }
+    };
 
     Ok(quote! {
         #[allow(dead_code)]
@@ -451,7 +485,7 @@ fn render_list_entry_fn(
             let mut entry_canonical_path = canonical_path.to_string();
             #(#key_stmts)*
             let canonical_path = entry_canonical_path.as_str();
-            #(#child_stmts)*
+            #render_children
             Ok(())
         }
     })

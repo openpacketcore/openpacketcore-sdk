@@ -335,7 +335,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        #[derive(Clone, Copy, Debug, PartialEq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Default, std::hash::Hash)]
         pub struct YangInt64(pub i64);
         impl Serialize for YangInt64 {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -358,6 +358,13 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
         #[derive(Clone, Copy, Debug, PartialEq, Default)]
         pub struct YangDecimal64(pub f64);
+        impl std::hash::Hash for YangDecimal64 {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                // Typed equality considers the two signed zeroes equal.
+                let bits = if self.0 == 0.0 { 0_u64 } else { self.0.to_bits() };
+                std::hash::Hash::hash(&bits, state);
+            }
+        }
         impl Serialize for YangDecimal64 {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
@@ -377,7 +384,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        #[derive(Clone, Copy, Debug, PartialEq, Default, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Default, Eq, std::hash::Hash)]
         pub struct YangEmpty;
         impl Serialize for YangEmpty {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -556,8 +563,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     } else if child.kind == SchemaNodeKind::LeafList
                         && super::is_user_ordered(child)
                     {
-                        quote! {
-                            #[serde(serialize_with = "super::serde::serialize_unique_leaf_list", deserialize_with = "super::serde::deserialize_unique_leaf_list")]
+                        if is_sensitive {
+                            quote! {
+                                #[serde(serialize_with = "super::serde::serialize_unique_secret_leaf_list", deserialize_with = "super::serde::deserialize_unique_secret_leaf_list")]
+                            }
+                        } else {
+                            quote! {
+                                #[serde(serialize_with = "super::serde::serialize_unique_leaf_list", deserialize_with = "super::serde::deserialize_unique_leaf_list")]
+                            }
                         }
                     } else {
                         quote! {}
@@ -606,6 +619,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             // Generate key struct if it's a multi-key list
             if node.kind == SchemaNodeKind::List && node.key_leaves.len() > 1 {
                 let key_struct_ident = format_ident!("{}Key", to_pascal_case(name));
+                let hash_derive = if super::is_user_ordered(node) {
+                    quote! { #[derive(std::hash::Hash)] }
+                } else {
+                    quote! {}
+                };
                 let mut key_fields = TokenStream::new();
                 let mut key_debug_fields = TokenStream::new();
                 let mut key_has_sensitive_field = false;
@@ -639,6 +657,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
                 if key_has_sensitive_field {
                     tokens.extend(quote! {
+                        #hash_derive
                         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
                         pub struct #key_struct_ident {
                             #key_fields
@@ -654,6 +673,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     });
                 } else {
                     tokens.extend(quote! {
+                        #hash_derive
                         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
                         pub struct #key_struct_ident {
                             #key_fields

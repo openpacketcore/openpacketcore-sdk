@@ -1,10 +1,10 @@
 use generated_ordered_test::{collections as model, minimal};
 use model::patch::{apply_patch, ConfigDelta};
 use model::types::{LeafPresence, Root, Server};
-use opc_config_model::{OpcConfig, YangPath};
+use opc_config_model::{ConfigError, OpcConfig, ValidationError, YangPath};
 use opc_gnmi_server::{
-    Encoding, GnmiJsonRenderer, GnmiPatchApplicator, NormalizedSet, NormalizedValue, ReadSelection,
-    ReadSelectionEntry,
+    Encoding, GnmiError, GnmiJsonRenderer, GnmiPatchApplicator, NormalizedSet, NormalizedValue,
+    ReadSelection, ReadSelectionEntry,
 };
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::{
@@ -215,7 +215,13 @@ fn keyed_collection_replacement_and_duplicate_rejection_are_atomic() {
             json!([{"name": "x"}, {"name": "x"}]).to_string(),
         )],
     );
-    assert!(error.is_err());
+    assert_eq!(
+        error,
+        Err(ConfigError::new(
+            "invalid-value",
+            "invalid user-ordered list"
+        ))
+    );
     assert_eq!(value, before);
     apply_patch(
         &mut value,
@@ -252,10 +258,17 @@ fn patch_add_delete_and_entry_replace_keep_other_entries_in_order() {
     );
     apply_patch(
         &mut value,
-        &[ConfigDelta::Delete(path("/oc:root/oc:server[name='a']"))],
+        &[ConfigDelta::Delete(path("/oc:root/oc:server[name='z']"))],
     )
     .unwrap();
-    assert_eq!(names(&value), ["z", "m"]);
+    assert_eq!(names(&value), ["a", "m"]);
+    assert!(!value.server.contains_key("z"));
+    assert_eq!(value.server.get("m").unwrap().port, LeafPresence::Explicit(853));
+    value.server.get_mut("a").unwrap().port = LeafPresence::Explicit(5353);
+    assert_eq!(value.server.get("a").unwrap().port, LeafPresence::Explicit(5353));
+    value.server.entry("m".into()).or_default().port = LeafPresence::Explicit(54);
+    assert_eq!(value.server.get("m").unwrap().port, LeafPresence::Explicit(54));
+    assert_eq!(names(&value), ["a", "m"]);
 }
 
 #[test]
@@ -263,6 +276,7 @@ fn public_keyed_insertion_refuses_duplicates_without_replacing_a_value() {
     let mut value = root(&["z", "a"]);
     let replacement: Server = serde_json::from_value(json!({"name": "z", "port": 853})).unwrap();
     let outcome = value.server.insert("z".to_string(), replacement);
+    assert_eq!(outcome, Err(model::serde::DuplicateListKey));
     assert_eq!(
         value.server.get("z").unwrap().port,
         LeafPresence::Explicit(53),
@@ -297,12 +311,22 @@ fn xml_replacement_append_delete_and_entry_merge_preserve_order() {
     )
     .unwrap();
     assert_eq!(names(&appended), ["z", "a", "m"]);
-    let deleted = apply_xml(
+    let replaced_entry = apply_xml(
         &appended,
-        r#"<server nc:operation="delete"><name>a</name></server>"#,
+        r#"<server nc:operation="replace"><name>z</name><port>5354</port></server>"#,
     )
     .unwrap();
-    assert_eq!(names(&deleted), ["z", "m"]);
+    assert_eq!(names(&replaced_entry), ["z", "a", "m"]);
+    assert_eq!(
+        replaced_entry.server.get("z").unwrap().port,
+        LeafPresence::Explicit(5354)
+    );
+    let deleted = apply_xml(
+        &replaced_entry,
+        r#"<server nc:operation="delete"><name>z</name></server>"#,
+    )
+    .unwrap();
+    assert_eq!(names(&deleted), ["a", "m"]);
     let duplicated = apply_xml(
         &deleted,
         r#"<server><name>x</name></server><server><name>x</name></server>"#,
@@ -313,7 +337,7 @@ fn xml_replacement_append_delete_and_entry_merge_preserve_order() {
             path: "/oc:root/oc:server"
         })
     ));
-    assert_eq!(names(&deleted), ["z", "m"]);
+    assert_eq!(names(&deleted), ["a", "m"]);
 }
 
 #[test]
@@ -357,7 +381,10 @@ fn composite_keys_preserve_order_through_json_xml_diff_and_apply() {
     let duplicate = serde_json::from_value::<Root>(json!({"endpoint": [
         {"region": "z", "name": "a"}, {"region": "z", "name": "a"}
     ]}));
-    assert!(duplicate.is_err());
+    assert_eq!(
+        duplicate.unwrap_err().to_string(),
+        model::serde::DUPLICATE_LIST_KEY_ERROR
+    );
 }
 
 #[test]
@@ -391,7 +418,10 @@ fn gnmi_collection_replace_and_keyed_update_preserve_user_order() {
             ..Default::default()
         },
     );
-    assert!(duplicate.is_err());
+    assert!(
+        matches!(duplicate, Err(GnmiError::InvalidArgument { detail })
+        if detail == "gNMI Set patch application failed")
+    );
     assert_eq!(names(&candidate), ["z", "a", "m"]);
 }
 
@@ -414,13 +444,23 @@ fn gnmi_read_and_redaction_preserve_user_order() {
     let updates = model::gnmi_json::renderer()
         .render_running_json(&value, ReadSelection::with_entries(&schema_paths, &entries))
         .unwrap();
-    let selected = updates
-        .iter()
-        .find(|update| update.path().as_str() == "/oc:root/oc:server")
-        .unwrap();
     assert_eq!(
-        array_names(&serde_json::from_str::<Value>(selected.value_json()).unwrap()),
-        ["z", "a"]
+        updates
+            .iter()
+            .map(|update| update.path().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/oc:root/oc:server[oc:name='z']",
+            "/oc:root/oc:server[oc:name='a']"
+        ]
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(updates[0].value_json()).unwrap(),
+        json!({"name":"z"})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(updates[1].value_json()).unwrap(),
+        json!({"name":"a"})
     );
 }
 
@@ -431,12 +471,40 @@ fn user_leaf_list_json_preserves_order_and_rejects_duplicates() {
     let encoded = serde_json::to_value(&original).unwrap();
     assert_eq!(encoded["ordered-collections:preference"], json!(["z", "a"]));
     assert_eq!(encoded["ordered-collections:priority"], json!([53, 1]));
-    assert!(serde_json::from_value::<Root>(json!({"preference": ["z", "z"]})).is_err());
-    assert!(serde_json::from_value::<Root>(json!({"priority": [53, 53]})).is_err());
-    assert!(serde_json::from_value::<Root>(
-        json!({"server": [{"name":"z", "preference":["a","a"]}]})
-    )
-    .is_err());
+    assert_eq!(
+        serde_json::from_value::<Root>(json!({"preference": ["z", "z"]}))
+            .unwrap_err()
+            .to_string(),
+        model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+    );
+    assert_eq!(
+        serde_json::from_value::<Root>(json!({"priority": [53, 53]}))
+            .unwrap_err()
+            .to_string(),
+        model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+    );
+    assert_eq!(
+        serde_json::from_value::<Root>(json!({"server": [{"name":"z", "preference":["a","a"]}]}))
+            .unwrap_err()
+            .to_string(),
+        model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+    );
+    assert_eq!(
+        serde_json::from_value::<Root>(json!({"ratio": ["0", "-0.00"]}))
+            .unwrap_err()
+            .to_string(),
+        model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+    );
+    let stored = br#"{"ordered-collections:preference":["z","a","z"]}"#;
+    let load_error = serde_json::from_slice::<Root>(stored).unwrap_err();
+    assert_eq!(load_error.classify(), serde_json::error::Category::Data);
+    assert_eq!(
+        load_error.to_string(),
+        format!(
+            "{} at line 1 column 48",
+            model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+        )
+    );
     let reversed: Root =
         serde_json::from_value(json!({"preference": ["a", "z"], "priority": [1, 53]})).unwrap();
     let mut applied = original.clone();
@@ -450,23 +518,33 @@ fn user_leaf_list_json_preserves_order_and_rejects_duplicates() {
 fn user_leaf_list_patch_rejects_duplicate_values_atomically() {
     let original: Root = serde_json::from_value(json!({"preference": ["z", "a"]})).unwrap();
     let mut candidate = original.clone();
-    assert!(apply_patch(
-        &mut candidate,
-        &[ConfigDelta::Replace(
-            path("/oc:root/oc:preference"),
-            r#"["a","a"]"#.into()
-        )]
-    )
-    .is_err());
+    assert_eq!(
+        apply_patch(
+            &mut candidate,
+            &[ConfigDelta::Replace(
+                path("/oc:root/oc:preference"),
+                r#"["a","a"]"#.into()
+            )]
+        ),
+        Err(ConfigError::new(
+            "invalid-value",
+            model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+        ))
+    );
     assert_eq!(candidate, original);
-    assert!(apply_patch(
-        &mut candidate,
-        &[ConfigDelta::Update(
-            path("/oc:root/oc:preference"),
-            "z".into()
-        )]
-    )
-    .is_err());
+    assert_eq!(
+        apply_patch(
+            &mut candidate,
+            &[ConfigDelta::Update(
+                path("/oc:root/oc:preference"),
+                "z".into()
+            )]
+        ),
+        Err(ConfigError::new(
+            "invalid-value",
+            model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+        ))
+    );
     assert_eq!(candidate, original);
     apply_patch(
         &mut candidate,
@@ -485,14 +563,27 @@ fn user_leaf_list_validation_refuses_duplicates_in_typed_state() {
         preference: vec!["z".into(), "z".into()],
         ..Default::default()
     };
-    assert!(candidate.validate_syntax().is_err());
-    assert!(serde_json::to_string(&candidate).is_err());
+    assert_eq!(
+        candidate.validate_syntax(),
+        Err(ValidationError::syntax(
+            "duplicate leaf-list value at /oc:root/oc:preference"
+        ))
+    );
+    assert_eq!(
+        serde_json::to_string(&candidate).unwrap_err().to_string(),
+        model::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR
+    );
     candidate.preference = vec!["z".into(), "a".into()];
     assert!(candidate.validate_syntax().is_ok());
     let mut entry: Server = serde_json::from_value(json!({"name":"a"})).unwrap();
     entry.preference = vec!["a".into(), "a".into()];
-    let _ = candidate.server.insert("a".into(), entry);
-    assert!(candidate.validate_syntax().is_err());
+    assert_eq!(candidate.server.insert("a".into(), entry), Ok(()));
+    assert_eq!(
+        candidate.validate_syntax(),
+        Err(ValidationError::syntax(
+            "duplicate leaf-list value at /oc:root/oc:server/oc:preference"
+        ))
+    );
 }
 
 fn assert_position_rejected(position: &str) {

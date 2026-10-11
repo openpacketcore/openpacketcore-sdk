@@ -210,33 +210,38 @@ The key type MUST be a generated struct when there are multiple key leaves.
 Duplicate keys MUST be rejected during deserialization and patch application.
 
 `UserOrderedMap` stores rows in insertion order and supports key lookup without
-adding a generated-code dependency. Lookup is linear. `insert` returns
+adding a generated-code dependency. A hash index maps keys to positions:
+lookup and append take expected O(1), construction, unchanged-list diff and
+redaction take expected O(n), and iteration and order-preserving removal take
+O(n). `insert` returns
 `DuplicateListKey` without replacing a row; `get_mut` and `entry(...).or_default()`
 update existing rows in place. New rows append, and removal preserves the
-remaining order. Equality and RFC 7951 arrays include order. An order-only diff
-emits a collection replacement, whose application retains the supplied order.
+remaining order. Equality and RFC 7951 arrays include order. Diff always emits
+the keyed entry and leaf changes. When retaining old positions and appending
+new keys cannot produce the requested order, diff also emits a typed
+`ConfigDelta::ReplaceOrderedList` collection replacement. This retains both
+the supplied order and defaulted leaf presence. `changed_paths` includes the
+changed entry/leaf paths and, only when that replacement is needed, the list
+path, so authorization, audit and apply-plan classification retain the detail.
 Collection merge/update retains existing positions and appends new keys in
-payload order. System-ordered keyed lists retain their sorted representation.
+payload order, including recursive merges of nested system-ordered lists.
+System-ordered keyed lists retain their sorted representation.
 As specified by RFC 7950, `ordered-by` is ignored for state data.
 
-Generated gNMI reads represent a user-ordered keyed list as an RFC 7951 array,
-assembled from authorized, redacted child projections. This preserves order
-independently of the order in which gNMI updates are delivered.
+Generated gNMI reads at a user-ordered keyed list path emit one update per
+entry, in configured order, with the entry's keys in its path. Each value is an
+RFC 7951 object assembled from authorized, redacted child projections; the
+value size does not grow with the number of entries in that list. Reads of a
+particular entry or leaf use the same keyed paths as system-ordered lists.
+An empty list emits no updates. Consumers must retain update order to observe
+the configured list order.
 
 The normalized NETCONF `EditConfigNode` currently has no placement field.
 Requests carrying YANG `insert`, `key`, or `value` positioning attributes fail
-with `NetconfEditError::UnsupportedShape`, including `first`, `last`, `before`,
-and `after` insertions or moves. Default append, in-place entry update, delete,
-and parent replacement in XML document order remain supported.
-
-Repository model inventory: the existing `example.yang` IR fixture in
-`crates/opc-yanggen/tests/netconf_xml_edit.rs` declares the user-ordered
-`/ex:system/ex:servers` leaf-list. It remains `Vec<String>` with duplicate
-checks added; no existing fixture expectations change. The
-`ordered_by_user.rs` regression fixture adds `ordered-example` (the minimal
-`/ex:root/ex:server` list) and `ordered-collections` (single-key and composite-key
-user lists, a system-ordered control list, and user-ordered leaf-lists). No
-standalone YANG model files in this repository declare user ordering.
+with `NetconfEditError::UnsupportedShape` (`invalid-value` to the client),
+including `first`, `last`, `before`, and `after` insertions or moves. Default
+append, in-place entry update, delete, and parent replacement in XML document
+order remain supported.
 
 ### 6.4 Leaf-Lists
 
@@ -252,7 +257,16 @@ User-ordered configuration leaf-lists retain their `Vec<T>` public type and
 element order. Generated JSON serialization/deserialization, patch application,
 and syntax validation reject duplicates, including manually constructed nested
 values. NETCONF leaf-list edits retain their existing order and duplicate
-checks.
+checks. Sensitive leaf-lists keep their `SecretLeaf<Vec<T>>` wrapper through
+serialization and deserialization. Uniqueness uses hashing and typed equality
+in expected O(n), resolving hash collisions without conflating distinct values
+and treating decimal64's signed zeroes as equal.
+
+Loading older stored configuration with a repeated user-ordered leaf-list
+value fails with the stable serde data error `leaf-list contains a duplicate
+value`. Such data was already invalid under YANG configuration semantics.
+Other older bytes reload unchanged; an older generator reading newly written
+user-ordered keyed lists sorts them again.
 
 Generated code SHOULD build a temporary set for uniqueness checks rather than
 performing O(n^2) comparisons.

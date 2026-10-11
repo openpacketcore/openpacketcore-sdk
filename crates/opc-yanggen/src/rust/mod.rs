@@ -56,6 +56,13 @@ pub fn generate_rust(
     let schema_digest = schema_digest_from_canonical(&input);
     let opc_config_schema_digest = schema_digest_hex_for_opc_config(&schema_digest);
     let mut files = HashMap::new();
+    let ordered_replacement_changed_path = if input.nodes.iter().any(|node| {
+        node.kind == SchemaNodeKind::List && is_user_ordered(node) && !node.key_leaves.is_empty()
+    }) {
+        "patch::ConfigDelta::ReplaceOrderedList(p, _) => paths.push(p.clone()),"
+    } else {
+        ""
+    };
 
     let mod_rs_content = r#"
 pub mod types;
@@ -100,6 +107,7 @@ impl OpcConfig for types::__ROOT_TYPE__ {
                 patch::ConfigDelta::Delete(p) => paths.push(p.clone()),
                 patch::ConfigDelta::Merge(p, _) => paths.push(p.clone()),
                 patch::ConfigDelta::Remove(p) => paths.push(p.clone()),
+                __ORDERED_REPLACEMENT_CHANGED_PATH__
             }
         }
         paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -132,7 +140,11 @@ impl OpcConfig for types::__ROOT_TYPE__ {
 }
 "#
     .replace("__ROOT_TYPE__", &root_type)
-    .replace("__OPC_CONFIG_SCHEMA_DIGEST__", &opc_config_schema_digest);
+    .replace("__OPC_CONFIG_SCHEMA_DIGEST__", &opc_config_schema_digest)
+    .replace(
+        "__ORDERED_REPLACEMENT_CHANGED_PATH__",
+        ordered_replacement_changed_path,
+    );
 
     files.insert("mod.rs".to_string(), mod_rs_content);
     files.insert("types.rs".to_string(), types::generate(&input)?);

@@ -36,6 +36,88 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         nodes_by_path.insert(node.path.clone(), node);
     }
 
+    let ordered_lists: Vec<_> = input
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == SchemaNodeKind::List
+                && super::is_user_ordered(node)
+                && !node.key_leaves.is_empty()
+        })
+        .collect();
+    let has_ordered_lists = !ordered_lists.is_empty();
+    let apply_segments = if has_ordered_lists {
+        format_ident!("apply_patch_segments_with_order")
+    } else {
+        format_ident!("apply_patch_segments")
+    };
+    let apply_visibility = if has_ordered_lists {
+        quote! {}
+    } else {
+        quote! { pub }
+    };
+    let ordered_parameter = if has_ordered_lists {
+        quote! { , ordered_list: Option<&OrderedListReplacement> }
+    } else {
+        quote! {}
+    };
+    let ordered_argument = if has_ordered_lists {
+        quote! { , ordered_list }
+    } else {
+        quote! {}
+    };
+    let ordered_none = if has_ordered_lists {
+        quote! { , None }
+    } else {
+        quote! {}
+    };
+    let reject_ordered_target = if has_ordered_lists {
+        quote! {
+            if ordered_list.is_some() {
+                return Err(config_error("invalid-path", "ordered-list replacement requires its collection path"));
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let ordered_definitions = if has_ordered_lists {
+        let variants = ordered_lists.iter().map(|node| {
+            let row_type = format_ident!(
+                "{}",
+                to_pascal_case(clean_segment(last_segment(&node.path)))
+            );
+            let key_type = super::types::get_key_type(node, &nodes_by_path);
+            quote! { #row_type(super::serde::UserOrderedMap<#key_type, #row_type>), }
+        });
+        quote! {
+            /// Typed list snapshots used by diff to retain leaf presence during reordering.
+            #[derive(Debug, Clone, PartialEq)]
+            pub enum OrderedListReplacement { #(#variants)* }
+        }
+    } else {
+        quote! {}
+    };
+    let ordered_delta = if has_ordered_lists {
+        quote! {
+            /// Replaces a user-ordered collection without a JSON round trip.
+            ReplaceOrderedList(YangPath, OrderedListReplacement),
+        }
+    } else {
+        quote! {}
+    };
+    let ordered_path_arm = if has_ordered_lists {
+        quote! { ConfigDelta::ReplaceOrderedList(p, _) => p, }
+    } else {
+        quote! {}
+    };
+    let ordered_apply_arm = if has_ordered_lists {
+        quote! {
+            ConfigDelta::ReplaceOrderedList(p, rows) => (p, ConfigOp::Replace, None, Some(rows)),
+        }
+    } else {
+        quote! {}
+    };
+
     let mut impls = TokenStream::new();
 
     for node in &input.nodes {
@@ -120,6 +202,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         SchemaNodeKind::Leaf => {
                             quote! {
                                 #child_name_str => {
+                                    #reject_ordered_target
                                     if segments.len() > 1 {
                                         return Err(config_error("invalid-path", format!("path goes deeper than leaf: {}", cleaned_name)));
                                     }
@@ -157,11 +240,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     } else {
                                         if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                             if let Some(ref mut container) = self.#field_ident {
-                                                container.apply_patch_segments(op, &segments[1..], value)?;
+                                                container.#apply_segments(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         } else {
                                             let container = #get_mut_container;
-                                            container.apply_patch_segments(op, &segments[1..], value)?;
+                                            container.#apply_segments(op, &segments[1..], value #ordered_argument)?;
                                         }
                                     }
                                 }
@@ -169,31 +252,99 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         }
                         SchemaNodeKind::List => {
                             let ty_name = format_ident!("{}", to_pascal_case(child_name));
-                            let collection_patch = if super::is_user_ordered(child)
-                                && !child.key_leaves.is_empty()
-                            {
+                            let collection_patch = if !child.key_leaves.is_empty() {
                                 let key_type = super::types::get_key_type(child, &nodes_by_path);
                                 let access = if is_sensitive {
                                     quote! { self.#field_ident.get_mut() }
                                 } else {
                                     quote! { &mut self.#field_ident }
                                 };
+                                let user_ordered = super::is_user_ordered(child);
+                                let collection_operations = if user_ordered {
+                                    quote! {}
+                                } else {
+                                    // Nested RFC 7951 arrays can merge at a system-list path.
+                                    quote! { && matches!(op, ConfigOp::Update | ConfigOp::Merge) }
+                                };
+                                let replace_rows = if user_ordered {
+                                    quote! { *list = rows; }
+                                } else {
+                                    quote! { *list = rows.into_iter().collect(); }
+                                };
+                                let typed_replacement = if user_ordered {
+                                    let mismatch = if ordered_lists.len() > 1 {
+                                        quote! { _ => return Err(config_error("invalid-value", "ordered-list replacement type does not match its path")), }
+                                    } else {
+                                        quote! {}
+                                    };
+                                    quote! {
+                                        if let Some(replacement) = ordered_list {
+                                            match replacement {
+                                                OrderedListReplacement::#ty_name(rows) => {
+                                                    for (key, row) in rows {
+                                                        let row_key: Option<#key_type> = super::serde::ExtractKey::extract_key(row);
+                                                        if row_key.as_ref() != Some(key) {
+                                                            return Err(config_error("invalid-value", "invalid user-ordered list"));
+                                                        }
+                                                    }
+                                                    // Keep the JSON path's value checks without reloading
+                                                    // defaulted leaves as explicit values.
+                                                    serde_json::to_writer(std::io::sink(), rows)
+                                                        .map_err(|_| config_error("invalid-value", "invalid user-ordered list"))?;
+                                                    *list = rows.clone();
+                                                }
+                                                #mismatch
+                                            }
+                                            return Ok(());
+                                        }
+                                    }
+                                } else {
+                                    reject_ordered_target.clone()
+                                };
+                                let list_error = if user_ordered {
+                                    "invalid user-ordered list"
+                                } else {
+                                    "invalid keyed list"
+                                };
+                                let parse_rows = if user_ordered {
+                                    quote! {
+                                        let rows: super::serde::UserOrderedMap<#key_type, #ty_name> = serde_json::from_str(value)
+                                            .map_err(|_| config_error("invalid-value", #list_error))?;
+                                    }
+                                } else {
+                                    quote! {
+                                        let parsed_rows: Vec<#ty_name> = serde_json::from_str(value)
+                                            .map_err(|_| config_error("invalid-value", #list_error))?;
+                                        let mut keys = std::collections::BTreeSet::new();
+                                        let mut rows = Vec::with_capacity(parsed_rows.len());
+                                        for row in parsed_rows {
+                                            let key: #key_type = super::serde::ExtractKey::extract_key(&row)
+                                                .ok_or_else(|| config_error("invalid-value", #list_error))?;
+                                            if !keys.insert(key.clone()) {
+                                                return Err(config_error("invalid-value", #list_error));
+                                            }
+                                            rows.push((key, row));
+                                        }
+                                    }
+                                };
                                 quote! {
-                                    if segments.len() == 1 && next_seg.keys.is_empty() {
+                                    if segments.len() == 1 && next_seg.keys.is_empty() #collection_operations {
                                         let list = #access;
+                                        #typed_replacement
                                         match op {
                                             ConfigOp::Delete | ConfigOp::Remove => list.clear(),
                                             ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
                                                 let value = value.ok_or_else(|| config_error("missing-value", "Value is required for list"))?;
-                                                let rows: super::serde::UserOrderedMap<#key_type, #ty_name> = serde_json::from_str(value)
-                                                    .map_err(|_| config_error("invalid-value", "invalid user-ordered list"))?;
+                                                #parse_rows
                                                 if op == &ConfigOp::Replace {
-                                                    *list = rows;
+                                                    #replace_rows
                                                 } else {
-                                                    for (key, row) in rows {
-                                                        let value = serde_json::to_string(&row)
-                                                            .map_err(|_| config_error("invalid-value", "invalid list entry"))?;
-                                                        list.entry(key).or_default().apply_patch_segments(op, &[], Some(&value))?;
+                                                    // Keep the caller's field presence, including explicit empty lists.
+                                                    let raw_rows: Vec<serde_json::Value> = serde_json::from_str(value)
+                                                        .map_err(|_| config_error("invalid-value", #list_error))?;
+                                                    for ((key, _), raw_row) in rows.into_iter().zip(raw_rows) {
+                                                        let value = raw_row.to_string();
+                                                        list.entry(key).or_default().#apply_segments(op, &[], Some(&value) #ordered_argument)?;
                                                     }
                                                 }
                                             }
@@ -207,6 +358,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             if child.key_leaves.is_empty() {
                                 quote! {
                                     #child_name_str => {
+                                        #reject_ordered_target
                                         if segments.len() == 1 {
                                             match op {
                                                 ConfigOp::Delete | ConfigOp::Remove => {
@@ -277,6 +429,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         let key_val = next_seg.keys.get(#key_leaf).ok_or_else(|| config_error("missing-key", format!("missing key: {}", #key_leaf)))?;
                                         #parse_key
                                         if segments.len() == 1 {
+                                            #reject_ordered_target
                                             match op {
                                                 ConfigOp::Delete | ConfigOp::Remove => {
                                                     self.#field_ident.remove(&parsed_key);
@@ -293,12 +446,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         } else {
                                             if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                                 if let Some(entry) = self.#field_ident.get_mut(&parsed_key) {
-                                                    entry.apply_patch_segments(op, &segments[1..], value)?;
+                                                    entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(#map_key).or_default();
                                                 #entry_key_assign
-                                                entry.apply_patch_segments(op, &segments[1..], value)?;
+                                                entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         }
                                     }
@@ -371,6 +524,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             #key_fields
                                         };
                                         if segments.len() == 1 {
+                                            #reject_ordered_target
                                             match op {
                                                 ConfigOp::Delete | ConfigOp::Remove => {
                                                     self.#field_ident.remove(&parsed_key);
@@ -387,12 +541,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         } else {
                                             if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                                 if let Some(entry) = self.#field_ident.get_mut(&parsed_key) {
-                                                    entry.apply_patch_segments(op, &segments[1..], value)?;
+                                                    entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
                                                 #(#entry_key_assigns)*
-                                                entry.apply_patch_segments(op, &segments[1..], value)?;
+                                                entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         }
                                     }
@@ -463,6 +617,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             };
                             quote! {
                                 #child_name_str => {
+                                    #reject_ordered_target
                                     if segments.len() == 1 {
                                         match op {
                                             ConfigOp::Delete | ConfigOp::Remove => {
@@ -614,15 +769,26 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     }
                                 };
                                 if super::is_user_ordered(child) {
+                                    let ty_name = format_ident!("{}", to_pascal_case(child_name));
+                                    let list_value = if is_sensitive {
+                                        quote! { self.#field_ident.get().clone() }
+                                    } else {
+                                        quote! { self.#field_ident.clone() }
+                                    };
                                     quote! {
-                                        if !self.#field_ident.keys().eq(previous.#field_ident.keys()) {
+                                        #keyed_diff
+                                        // Keyed edits retain old positions and append new keys. Only
+                                        // replace the collection when that cannot produce the new order.
+                                        let edited_order = previous.#field_ident.keys()
+                                            .filter(|key| self.#field_ident.contains_key(*key))
+                                            .chain(self.#field_ident.keys()
+                                                .filter(|key| !previous.#field_ident.contains_key(*key)));
+                                        if !self.#field_ident.keys().eq(edited_order) {
                                             let path = YangPath::new(format!("{}/{}", _path_prefix, #child_segment_str))
                                                 .map_err(|_| config_error("invalid-path", "invalid list path"))?;
-                                            let value = serde_json::to_string(&self.#field_ident)
-                                                .map_err(|_| config_error("invalid-value", "invalid user-ordered list"))?;
-                                            deltas.push(ConfigDelta::Replace(path, value));
-                                        } else {
-                                            #keyed_diff
+                                            deltas.push(ConfigDelta::ReplaceOrderedList(
+                                                path, OrderedListReplacement::#ty_name(#list_value),
+                                            ));
                                         }
                                     }
                                 } else {
@@ -646,15 +812,31 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
-            impls.extend(quote! {
-                impl #struct_name {
+            let public_apply_wrapper = if has_ordered_lists {
+                quote! {
                     pub fn apply_patch_segments(
                         &mut self,
                         op: &ConfigOp,
                         segments: &[PathSegment],
                         value: Option<&str>,
                     ) -> Result<(), ConfigError> {
+                        self.#apply_segments(op, segments, value, None)
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            impls.extend(quote! {
+                impl #struct_name {
+                    #public_apply_wrapper
+                    #apply_visibility fn #apply_segments(
+                        &mut self,
+                        op: &ConfigOp,
+                        segments: &[PathSegment],
+                        value: Option<&str> #ordered_parameter,
+                    ) -> Result<(), ConfigError> {
                         if segments.is_empty() {
+                            #reject_ordered_target
                             match op {
                                 ConfigOp::Delete | ConfigOp::Remove => {
                                     *self = Self::default();
@@ -678,7 +860,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                     val.to_string()
                                                 };
                                                 let segs = parse_path(&k).map_err(|e| config_error("invalid-path", e))?;
-                                                self.apply_patch_segments(op, &segs, Some(&val_str))?;
+                                                self.#apply_segments(op, &segs, Some(&val_str) #ordered_argument)?;
                                             }
                                             return Ok(());
                                         } else {
@@ -751,7 +933,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             Delete(YangPath),
             Merge(YangPath, String),
             Remove(YangPath),
+            #ordered_delta
         }
+
+        #ordered_definitions
 
         fn config_error(kind: &'static str, message: impl Into<String>) -> ConfigError {
             ConfigError::new(kind, message)
@@ -921,6 +1106,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     ConfigDelta::Delete(p) => p,
                     ConfigDelta::Merge(p, _) => p,
                     ConfigDelta::Remove(p) => p,
+                    #ordered_path_arm
                 };
                 if !super::paths::is_valid_path(path.as_str()) {
                     return Err(config_error("invalid-path", format!("invalid path: {}", path)));
@@ -933,18 +1119,19 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             // Clone and apply to verify transactions succeed before modifying target root
             let mut temp = root.clone();
             for delta in deltas {
-                let (path, op, value) = match delta {
-                    ConfigDelta::Update(p, v) => (p, ConfigOp::Update, Some(v.as_str())),
-                    ConfigDelta::Replace(p, v) => (p, ConfigOp::Replace, Some(v.as_str())),
-                    ConfigDelta::Delete(p) => (p, ConfigOp::Delete, None),
-                    ConfigDelta::Merge(p, v) => (p, ConfigOp::Merge, Some(v.as_str())),
-                    ConfigDelta::Remove(p) => (p, ConfigOp::Remove, None),
+                let (path, op, value #ordered_argument) = match delta {
+                    ConfigDelta::Update(p, v) => (p, ConfigOp::Update, Some(v.as_str()) #ordered_none),
+                    ConfigDelta::Replace(p, v) => (p, ConfigOp::Replace, Some(v.as_str()) #ordered_none),
+                    ConfigDelta::Delete(p) => (p, ConfigOp::Delete, None #ordered_none),
+                    ConfigDelta::Merge(p, v) => (p, ConfigOp::Merge, Some(v.as_str()) #ordered_none),
+                    ConfigDelta::Remove(p) => (p, ConfigOp::Remove, None #ordered_none),
+                    #ordered_apply_arm
                 };
                 let segments = parse_path(path.as_str()).map_err(|e| config_error("invalid-path", e))?;
                 if segments.is_empty() {
                     return Err(config_error("invalid-path", "Path is empty"));
                 }
-                temp.apply_patch_segments(&op, &segments[1..], value)?;
+                temp.#apply_segments(&op, &segments[1..], value #ordered_argument)?;
             }
             *root = temp;
             Ok(())

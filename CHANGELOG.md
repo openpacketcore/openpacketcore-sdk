@@ -378,9 +378,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the SDK-owned `serde::UserOrderedMap<Key, Value>` instead of `BTreeMap`. This
   public API change is limited to user-ordered keyed lists; system-ordered
   lists keep `BTreeMap`. JSON, XML, gNMI reads, canonical configuration, diff,
-  and apply retain user order. Duplicate keys and user-ordered leaf-list values
-  are rejected. NETCONF placement attributes return typed `UnsupportedShape`
-  errors because normalized edits cannot represent explicit insertion or moves.
+  and apply retain user order. A key index gives expected constant-time lookup
+  and linear deserialization, unchanged-list diff and redaction. Diff retains
+  per-entry changed paths for authorization and audit; a reorder or insertion
+  between existing rows also reports the collection path. Its typed
+  `ConfigDelta::ReplaceOrderedList` preserves defaulted leaf presence.
+  gNMI list reads emit one update per entry in configured order, with keys in
+  each path; entry and leaf reads retain their keyed paths, and an empty list
+  emits nothing. Duplicate keys and user-ordered leaf-list values are rejected,
+  including sensitive leaf-lists. **Stored-data boundary:** loading a stored
+  configuration with repeated user-ordered leaf-list values now fails with a
+  serde data error, `leaf-list contains a duplicate value`; older generators
+  accepted this invalid configuration. Other old configuration bytes reload
+  unchanged. New user-ordered list bytes read by an older generator are
+  re-sorted. NETCONF placement attributes still return typed `UnsupportedShape`
+  errors (`invalid-value` to the client for `yang:insert`); normalized edits
+  cannot yet represent explicit insertion or moves.
 
 - `opc-proto-ikev2`: distinguish authenticated, correctly bound SKF packets with
   `Ikev2WindowError::UnsupportedShape` in ordinary recovery windows. Partial
