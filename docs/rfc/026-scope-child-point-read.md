@@ -1,9 +1,9 @@
 # RFC 026 addendum: bounded worker child reads
 
-Status: proposed; design review precedes implementation. Addresses
+Status: implemented locally; final qualification and independent review pending. Addresses
 [#1221](https://github.com/openpacketcore/openpacketcore-sdk/issues/1221) and the
 follow-on authority adapter in [#1225](https://github.com/openpacketcore/openpacketcore-sdk/issues/1225).
-Implement #1221 first, then #1225. Applies to [RFC 026](026-scope-authenticated-transport.md)
+Applies to [RFC 026](026-scope-authenticated-transport.md)
 and [RFC 027](027-scope-batch-lanes.md); [RFC 025](025-local-kernel-lifecycle.md)
 owns the kernel authority contract, and retained restore remains RFC 028.
 
@@ -144,7 +144,7 @@ promise that bound.
 
 ## Wire and errors
 
-[The wire appendix](026-scope-authenticated-transport-wire.md#proposed-revision-2)
+[The wire appendix](026-scope-authenticated-transport-wire.md#revision-2)
 pins changed bytes, full enum tables and revision-2 vectors. Method **17
 ChildRead** takes 1–32 keys. Status **7 ChildObservation** returns all entries
 or typed `ObservationTooLarge`, with **no partial observations**. Preserve the
@@ -190,7 +190,7 @@ matching the batch path. It proves nothing about a different
 or pending mutation. Parser failure, absence and successful reads likewise
 cannot settle that mutation.
 
-## Follow-on: native kernel authority (#1225)
+## Native kernel authority (#1225)
 
 Use sealed backend type state (`ScopeKernelAuthority<B = LocalScopeAuthority>`):
 preserve the local `ScopeKernelAuthority` constructor and

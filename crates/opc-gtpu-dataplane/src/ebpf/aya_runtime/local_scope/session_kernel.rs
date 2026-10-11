@@ -11,6 +11,22 @@ use opc_local_kernel_lifecycle::{
     CleanupAttempt, CommittedScopeEffect, LocalInstalledGraph, LocalOperation,
 };
 
+// A failed authority read never establishes the final state of a kernel
+// operation. Keep revision mismatch observable without authorizing any effect.
+fn authority_error(error: opc_local_kernel_lifecycle::LocalEffectError) -> GtpuError {
+    use opc_local_kernel_lifecycle::LocalEffectError;
+    match error {
+        LocalEffectError::TransportRevisionMismatch => {
+            state_indeterminate("scope_transport_revision_mismatch")
+        }
+        LocalEffectError::Closed
+        | LocalEffectError::Stale
+        | LocalEffectError::WrongRequest
+        | LocalEffectError::RetryableNoEffect
+        | LocalEffectError::OutcomeUnknown
+        | LocalEffectError::Unavailable => uncertain(),
+    }
+}
 pub(super) fn uncertain() -> GtpuError {
     state_indeterminate("ebpf_local_session")
 }
@@ -190,7 +206,7 @@ impl session_effect::Kernel for NativeKernel<'_> {
     }
     async fn current(&self) -> Result<(), GtpuError> {
         self.local()?;
-        self.effect.recheck().await.map_err(|_| uncertain())
+        self.effect.recheck().await.map_err(authority_error)
     }
     fn group(&self) -> Result<Readback, GtpuError> {
         self.with_loaded(|loaded| {

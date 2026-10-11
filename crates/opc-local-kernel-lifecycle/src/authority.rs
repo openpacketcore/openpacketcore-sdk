@@ -1,4 +1,4 @@
-//! The actual untimed store boundary. Public observations never mint effects.
+//! Untimed activation and exact readback. Public observations never mint effects.
 
 use crate::{scope::LocalEffectOwner, LocalKernelLifecycle};
 use opc_session_store::scope_authority::{
@@ -73,12 +73,12 @@ pub struct LocalScopeAuthority {
 pub struct NativeScopeAuthority {
     _sealed: (),
 }
-/// A concrete local adapter to the SDK's durable scope authority and batches.
+/// Committed scope authority bound to one local kernel writer domain.
 ///
-/// Construction consumes the real non-deserializable committed capability and
-/// binds one local boot to the held writer domain. Clone this adapter for every
-/// backend in that domain. The host supplies its independently verified local
-/// execution; this adapter does not authenticate a boot or close peer traffic.
+/// Sealed local-store and native-transport constructors consume the genuine
+/// non-deserializable capability and bind one local boot to the held writer
+/// domain. Clone the adapter for every backend in that domain. Authentication
+/// belongs to the protected scope transport; peer closure remains caller-owned.
 pub struct ScopeKernelAuthority<B = LocalScopeAuthority> {
     inner: Arc<Inner>,
     backend: PhantomData<fn() -> B>,
@@ -208,6 +208,24 @@ impl ScopeKernelAuthority<NativeScopeAuthority> {
     /// The full original request and every child field must match. The receipt
     /// stays pinned throughout this one-cut observation and local epoch check.
     /// Cancellation drops the pin without acknowledging or resubmitting work.
+    ///
+    /// Keep the full original coordinator request through completion, then
+    /// read back before releasing its lane:
+    /// ```no_run
+    /// use opc_local_kernel_lifecycle::{CommittedScopeEffect, LocalEffectError, NativeScopeAuthority, ScopeKernelAuthority};
+    /// use opc_session_store::scope_batch::{ScopeBatchCompletion, ScopeBatchCoordinator, ScopeBatchRequest, ScopeChildKey};
+    /// async fn reconcile(
+    ///     authority: &ScopeKernelAuthority<NativeScopeAuthority>,
+    ///     batches: &ScopeBatchCoordinator,
+    ///     original: ScopeBatchRequest,
+    ///     child: ScopeChildKey,
+    ///     completion: &ScopeBatchCompletion,
+    /// ) -> Result<CommittedScopeEffect, LocalEffectError> {
+    ///     let effect = authority.readback_activation(original, child, completion).await?;
+    ///     assert!(batches.ack(completion.attempt()));
+    ///     Ok(effect)
+    /// }
+    /// ```
     ///
     /// Native authorities cannot submit an activation directly:
     /// ```compile_fail
@@ -541,6 +559,9 @@ impl CurrentChildStore for EffectRead<'_> {
         &self,
         child: ScopeChildKey,
     ) -> Result<Option<ScopeChildRecord>, LocalEffectError> {
+        if self.class == ScopeWorkClass::SafetyControl {
+            return Err(LocalEffectError::WrongRequest);
+        }
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(LocalEffectError::Closed);
         }

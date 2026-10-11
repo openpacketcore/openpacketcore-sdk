@@ -10,7 +10,7 @@ profile integration must compare these vectors with the landed core helpers
 before advertising the profile. Changing a layout changes the wire/profile
 contract; do not infer a layout from a Rust struct's memory representation.
 
-## Proposed revision 2
+## Revision 2
 
 This section specifies the [child-read addendum](026-scope-child-point-read.md),
 pending design review and implementation. The following older sections describe
