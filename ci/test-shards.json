@@ -9,7 +9,9 @@
     "--test/--lib/--doc filter selects which units are built and run, never",
     "which features they are built with.",
     "Weights are seconds measured in CI. They only affect balance, never",
-    "coverage; unlisted targets use default_weight."
+    "coverage; unlisted targets use default_weight.",
+    "recovery_profile: 1009s measured locally with Rust 1.99.0 and 4 test threads;",
+    "its deterministic full matrices remain in required CI. Remeasure when the mix changes."
   ],
   "integration_shards": 3,
   "default_weight": 1.5,
@@ -34,6 +36,7 @@
     ]
   },
   "weights": {
+    "recovery_profile": 1009,
     "qualification_mtls_multiprocess": 784,
     "consensus_transport": 92,
     "authenticated_replica_identity": 76,

@@ -44,6 +44,7 @@ pub use packet::Ikev2AuthenticatedOrdinary;
 pub use profile::{Ikev2CbcRecoveryProfile, Ikev2GcmRecoveryProfile};
 pub use record::{
     Ikev2CommittedExchangeRecord, Ikev2CommittedWindowDomain, Ikev2CommittedWindowRecord,
+    Ikev2PersistedProfileSync,
 };
 
 pub use reservation_retry::{
@@ -71,6 +72,10 @@ pub use sync_responder::{
 pub enum Ikev2WindowError {
     /// Silently drop an unauthenticated, wrong-class, stale or mismatching packet.
     Drop,
+    /// Authenticated SKF in this SA's ordinary exchange classes is outside the
+    /// unfragmented recovery profile. This diagnostic grants no response or
+    /// teardown authority; the consumer must commit its scoped resolution.
+    UnsupportedShape,
     /// Established key/role/SPI/profile binding differs.
     DomainMismatch,
     /// Persisted fields are incomplete, inconsistent or fail packet validation.
@@ -117,6 +122,7 @@ impl fmt::Display for Ikev2WindowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Drop => "ike_committed_window_drop",
+            Self::UnsupportedShape => "ike_committed_window_unsupported_shape",
             Self::DomainMismatch => "ike_committed_window_domain_mismatch",
             Self::InvalidRecord => "ike_committed_window_invalid_record",
             Self::RequestOutstanding => "ike_committed_window_request_outstanding",
@@ -366,8 +372,9 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// or transmission authority. DPD-facing windows must use
     /// [`Self::enable_empty_replies`] and [`Self::reply_empty`]: primitive replies
     /// leave the receive floor behind and can drop the next nonempty request.
-    /// Recheck current admission and [`Self::ready`] for every reply, including
-    /// cached bytes; a minted capability does not track later lifecycle changes.
+    /// Use the window's reply admission on every reply, including cached bytes;
+    /// a minted capability does not track later lifecycle changes. [`Self::ready`]
+    /// is the stricter admission check for new work.
     /// # Errors
     /// Refuses a quiescent, syncing or terminal window, an ineligible marker or
     /// key binding, or unavailable canonical provider policy/qualification.
@@ -396,6 +403,9 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// # Errors
     /// Rejects key/domain mismatches, authentication, framing or inner-chain errors,
     /// and every sync Notify including mixed/malformed sync shapes at ordinary ID 0.
+    /// An otherwise applicable, authenticated SKF returns
+    /// [`Ikev2WindowError::UnsupportedShape`] before parsing its partial inner
+    /// chain. Unauthenticated or foreign packets remain ordinary drops.
     pub fn open_peer(
         &self,
         profile: Ikev2SaInitCryptoProfile,
@@ -405,17 +415,34 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         packet::open(&self.record.domain, profile, keys, wire, true)
     }
 
-    /// Check the window's current ordinary/canonical lifecycle availability.
+    /// Check the window's current ordinary lifecycle availability.
     ///
-    /// Check this and receive admission on every canonical reply, including reuse
-    /// of cached bytes. This snapshot grants no receive or transmission authority;
-    /// the consumer must keep the applicable authority through transmission.
+    /// Read-only replies have a narrower admission check within [`Self::reply_empty`]
+    /// and [`Self::replay_response`], permitting an outbound-only uncertain commit.
+    /// This snapshot grants no receive or transmission authority; the consumer
+    /// must keep the applicable authority through transmission.
     /// # Errors
     /// Refuses an uncertain commit, pending sync, uncertain outcome or closed SA.
     pub fn ready(&self) -> Result<(), Ikev2WindowError> {
         if self.quiescent {
             return Err(Ikev2WindowError::CommitUncertain);
         }
+        self.lifecycle_ready()
+    }
+
+    fn ready_for_reply(&self) -> Result<(), Ikev2WindowError> {
+        if self.quiescent && !self.has_outbound_witness() {
+            return Err(Ikev2WindowError::CommitUncertain);
+        }
+        self.lifecycle_ready()
+    }
+
+    fn ready_for_cached_response(&self) -> Result<(), Ikev2WindowError> {
+        self.ready_for_reply()?;
+        self.receive.check_cached_reply()
+    }
+
+    fn lifecycle_ready(&self) -> Result<(), Ikev2WindowError> {
         if self.sync_closed {
             return Err(Ikev2WindowError::SyncClosed);
         }
@@ -504,6 +531,8 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// nonempty request may skip a lost stateless prefix; its commit ends that mode.
     /// Older durable responses cease to apply when an empty reply advances the
     /// live floor or a new nonempty request locks pending work.
+    /// An outbound-only uncertain write permits only the cached-response branch;
+    /// new work still requires ordinary readiness.
     /// # Errors
     /// Drops wrong direction/domain, forward gaps, stale IDs and same-ID changed
     /// bytes. Use [`Self::reply_empty`] for stateless empty requests.
@@ -511,17 +540,21 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         &self,
         request: &Ikev2AuthenticatedOrdinary<P>,
     ) -> Result<Ikev2OrdinaryRequestDisposition, Ikev2WindowError> {
-        self.ready()?;
+        let cached = self
+            .record
+            .inbound
+            .as_ref()
+            .is_some_and(|entry| entry.request == request.wire);
+        if cached {
+            self.ready_for_cached_response()?;
+        } else {
+            self.ready()?;
+        }
         if request.domain != self.record.domain || request.header.flags.response() {
             return Err(Ikev2WindowError::Drop);
         }
         request.require_work()?;
-        if self
-            .record
-            .inbound
-            .as_ref()
-            .is_some_and(|entry| entry.request == request.wire)
-        {
+        if cached {
             if !self.cached_response_applies(request) {
                 return Err(Ikev2WindowError::Drop);
             }
@@ -585,7 +618,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     ///
     /// # Errors
     /// Drops wrong domain, exchange, ID or response flag, and all delayed/duplicate
-    /// responses after settlement. A replay probe therefore cannot create an outcome.
+    /// responses after settlement. A duplicate response cannot create another outcome.
     pub fn prepare_completion(
         &mut self,
         response: &Ikev2AuthenticatedOrdinary<P>,
@@ -610,29 +643,36 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         Ok(self.prepared(record, Some(outcome), false))
     }
 
-    /// Replay the last committed local request, pending or settled, without new state.
+    /// Replay the committed pending local request without new state.
     ///
-    /// No record means no artificial probe. Even a fresh peer response to these old
-    /// bytes proves no fresh liveness and cannot repeat a settled outcome.
+    /// No request or a settled exchange yields `None`. A peer may forget its
+    /// settled response, so replay is never a local liveness probe.
     /// # Errors
     /// Quiescent runtimes must resolve readback first.
     pub fn replay_request(&self) -> Result<Option<Ikev2ExactReplay<'_>>, Ikev2WindowError> {
         self.ready()?;
-        Ok(self.record.outbound.as_ref().map(|entry| Ikev2ExactReplay {
-            bytes: &entry.request,
-        }))
+        Ok(self
+            .record
+            .outbound
+            .as_ref()
+            .filter(|entry| entry.response.is_none())
+            .map(|entry| Ikev2ExactReplay {
+                bytes: &entry.request,
+            }))
     }
 
     /// Replay only the exact response applicable to this authenticated cached duplicate.
     ///
     /// This lookup never admits pending work or changes synchronization history.
     /// # Errors
-    /// Drops stale/mismatching inputs; refuses unresolved commits.
+    /// Drops stale/mismatching inputs; refuses uncertain inbound/sync commits.
+    /// An outbound-only witness permits this read-only replay while new work
+    /// remains blocked. Enabled canonical policy and revocation are rechecked.
     pub fn replay_response(
         &self,
         request: &Ikev2AuthenticatedOrdinary<P>,
     ) -> Result<Ikev2ExactReplay<'_>, Ikev2WindowError> {
-        self.ready()?;
+        self.ready_for_cached_response()?;
         if request.domain != self.record.domain || request.header.flags.response() {
             return Err(Ikev2WindowError::Drop);
         }
