@@ -53,10 +53,14 @@ fn native_scope_child_read_builder_reuses_running_credit_and_bounds_all_exchange
 
 #[test]
 fn native_scope_completion_provenance_rejects_forged_ports_and_early_ack() {
-    run(false, true, concat!(
-        "stateless_quorum_consumer::scope_transport::child_reads::",
-        "native_scope_completion_provenance_rejects_forged_ports_and_early_ack"
-    ));
+    run(
+        false,
+        true,
+        concat!(
+            "stateless_quorum_consumer::scope_transport::child_reads::",
+            "native_scope_completion_provenance_rejects_forged_ports_and_early_ack"
+        ),
+    );
 }
 
 fn run(builder: bool, provenance: bool, name: &str) {
