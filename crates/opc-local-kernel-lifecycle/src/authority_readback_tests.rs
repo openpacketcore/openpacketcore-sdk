@@ -22,7 +22,10 @@ impl ActivationStore for Store {
     }
     async fn current(&self) -> Result<(), LocalEffectError> {
         let mut events = self.events.lock().unwrap();
-        let number = events.iter().filter(|event| **event == "current").count();
+        let number = events
+            .iter()
+            .filter(|event| matches!(**event, "current" | "read"))
+            .count();
         events.push("current");
         if self.stale_at == Some(number) {
             Err(LocalEffectError::Stale)
@@ -37,12 +40,20 @@ impl ActivationStore for Store {
         self.events.lock().unwrap().push("execute");
         Ok(self.outcome.clone())
     }
-    async fn read(
+    async fn read_current(
         &self,
         child: ScopeChildKey,
     ) -> Result<Option<ScopeChildRecord>, LocalEffectError> {
         assert_eq!(child, ScopeChildKey::new([7; 32]).unwrap());
-        self.events.lock().unwrap().push("read");
+        let mut events = self.events.lock().unwrap();
+        let number = events
+            .iter()
+            .filter(|event| matches!(**event, "current" | "read"))
+            .count();
+        events.push("read");
+        if self.stale_at == Some(number) {
+            return Err(LocalEffectError::Stale);
+        }
         Ok(self.row.clone())
     }
 }
@@ -127,7 +138,7 @@ fn fixture() -> (Store, ScopeBatchRequest, ScopeChildKey) {
 }
 
 #[tokio::test]
-async fn matching_store_readback_follows_current_execute_current_read_current_order() {
+async fn matching_store_readback_preserves_pre_submission_current_and_one_child_cut() {
     let (store, request, child) = fixture();
     let (key, _, _) = commit_readback(&store, request.clone(), child)
         .await
@@ -135,14 +146,11 @@ async fn matching_store_readback_follows_current_execute_current_read_current_or
     assert_eq!(key.request(), &request);
     assert_eq!(
         *store.events.lock().unwrap(),
-        ["current", "execute", "current", "read", "current"]
+        ["current", "execute", "read"]
     );
     store.events.lock().unwrap().clear();
     recheck_record(&store, &key).await.unwrap();
-    assert_eq!(
-        *store.events.lock().unwrap(),
-        ["current", "read", "current"]
-    );
+    assert_eq!(*store.events.lock().unwrap(), ["read"]);
 }
 
 #[tokio::test]
@@ -236,18 +244,28 @@ async fn activation_readback_uses_one_current_child_cut_after_submission() {
 }
 
 #[tokio::test]
-async fn stale_currentness_prevents_submission_and_each_later_read_boundary() {
+async fn stale_currentness_prevents_submission_and_each_later_child_cut() {
     for boundary in 0..3 {
         let (mut store, request, child) = fixture();
         store.stale_at = Some(boundary);
-        assert!(matches!(
-            commit_readback(&store, request, child).await,
-            Err(LocalEffectError::Stale)
-        ));
+        if boundary < 2 {
+            assert!(matches!(
+                commit_readback(&store, request, child).await,
+                Err(LocalEffectError::Stale)
+            ));
+        } else {
+            // A change after a completed atomic read cannot retroactively
+            // invalidate its cut. A later recheck must observe the stale cut.
+            let (key, _, _) = commit_readback(&store, request, child).await.unwrap();
+            assert!(matches!(
+                recheck_record(&store, &key).await,
+                Err(LocalEffectError::Stale)
+            ));
+        }
         let expected: &[&str] = match boundary {
             0 => &["current"],
-            1 => &["current", "execute", "current"],
-            _ => &["current", "execute", "current", "read", "current"],
+            1 => &["current", "execute", "read"],
+            _ => &["current", "execute", "read", "read"],
         };
         assert_eq!(store.events.lock().unwrap().as_slice(), expected);
     }

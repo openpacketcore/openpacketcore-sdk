@@ -7,7 +7,7 @@ use opc_session_store::scope_authority::{
 };
 use opc_session_store::scope_batch::{
     ScopeBatchError, ScopeBatchOutcome, ScopeBatchRequest, ScopeBatchStore, ScopeChildKey,
-    ScopeChildMutation, ScopeChildRecord, ScopeChildRevision,
+    ScopeChildMutation, ScopeChildReadError, ScopeChildRecord, ScopeChildRevision,
 };
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
@@ -36,6 +36,10 @@ pub enum LocalEffectError {
     /// Store or local native identity inspection is currently unavailable.
     #[error("local_effect_unavailable")]
     Unavailable,
+    /// The authenticated scope transport uses another revision. This never
+    /// establishes an activation outcome or requires a process restart.
+    #[error("local_effect_transport_revision_mismatch")]
+    TransportRevisionMismatch,
 }
 struct Inner {
     lifecycle: LocalKernelLifecycle,
@@ -216,6 +220,7 @@ pub struct EffectKey {
     request: Arc<ScopeBatchRequest>,
     child: ScopeChildKey,
     revision: ScopeChildRevision,
+    batch_revision: u64,
 }
 impl std::fmt::Debug for EffectKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -234,6 +239,10 @@ impl EffectKey {
     /// Exact committed child birth and generation.
     pub fn revision(&self) -> ScopeChildRevision {
         self.revision
+    }
+    /// Whole-scope batch revision that committed this exact child activation.
+    pub const fn batch_revision(&self) -> u64 {
+        self.batch_revision
     }
     /// Same request identity, even if changed bytes make the full key unequal.
     pub fn same_request_id(&self, other: &Self) -> bool {
@@ -315,7 +324,7 @@ trait ActivationStore: Sync {
         &self,
         request: &ScopeBatchRequest,
     ) -> Result<ScopeBatchOutcome, LocalEffectError>;
-    async fn read(
+    async fn read_current(
         &self,
         child: ScopeChildKey,
     ) -> Result<Option<ScopeChildRecord>, LocalEffectError>;
@@ -338,15 +347,24 @@ impl ActivationStore for ScopeKernelAuthority {
             .await
             .map_err(batch_error)
     }
-    async fn read(
+    async fn read_current(
         &self,
         child: ScopeChildKey,
     ) -> Result<Option<ScopeChildRecord>, LocalEffectError> {
-        self.inner
+        let mut rows = self
+            .inner
             .batches
-            .read(self.inner.execution.identity(), child)
+            .read_current(
+                self.inner.execution.identity(),
+                self.inner.committed.stamp(),
+                &[child],
+            )
             .await
-            .map_err(batch_error)
+            .map_err(child_read_error)?;
+        if rows.len() != 1 {
+            return Err(LocalEffectError::OutcomeUnknown);
+        }
+        Ok(rows.pop().expect("one complete child observation"))
     }
 }
 async fn commit_readback(
@@ -377,6 +395,7 @@ async fn commit_readback(
         request: Arc::new(request),
         child,
         revision,
+        batch_revision: outcome.revision(),
     };
     recheck_record(store, &key).await?;
     Ok((key, outcome, index))
@@ -385,10 +404,8 @@ async fn recheck_record(
     store: &impl ActivationStore,
     key: &EffectKey,
 ) -> Result<(), LocalEffectError> {
-    store.current().await?;
-    let row = store.read(key.child).await?;
-    verify_record(key, row.as_ref())?;
-    store.current().await
+    let row = store.read_current(key.child).await?;
+    verify_record(key, row.as_ref())
 }
 
 #[cfg(test)]
@@ -483,6 +500,7 @@ fn authority_error(error: ScopeAuthorityError) -> LocalEffectError {
 }
 fn batch_error(error: ScopeBatchError) -> LocalEffectError {
     match error {
+        ScopeBatchError::TransportRevisionMismatch => LocalEffectError::TransportRevisionMismatch,
         ScopeBatchError::OutcomeUnknown => LocalEffectError::OutcomeUnknown,
         ScopeBatchError::Unavailable => LocalEffectError::Unavailable,
         ScopeBatchError::Scope(error) => authority_error(error),
@@ -492,6 +510,17 @@ fn batch_error(error: ScopeBatchError) -> LocalEffectError {
         | ScopeBatchError::Cancelled
         | ScopeBatchError::ScopeGuardStalled => LocalEffectError::RetryableNoEffect,
         _ => LocalEffectError::WrongRequest,
+    }
+}
+fn child_read_error(error: ScopeChildReadError) -> LocalEffectError {
+    match error {
+        ScopeChildReadError::Batch(error) => batch_error(error),
+        ScopeChildReadError::TransportRevisionMismatch => {
+            LocalEffectError::TransportRevisionMismatch
+        }
+        ScopeChildReadError::ObservationTooLarge | ScopeChildReadError::ReadBudgetExceeded => {
+            LocalEffectError::Unavailable
+        }
     }
 }
 fn verify_current(
@@ -525,6 +554,7 @@ fn verify_record(key: &EffectKey, row: Option<&ScopeChildRecord>) -> Result<(), 
     if row.namespace() != key.request.namespace()
         || row.key() != key.child
         || row.revision() != key.revision
+        || row.batch_revision() != key.batch_revision
         || row.value() != Some(value)
         || row.claims() != claims
     {
