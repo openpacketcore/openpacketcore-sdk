@@ -97,7 +97,7 @@ pub use issuer_notice::{IssuedTicketNotice, TicketNoticeEntry, TicketNoticeSourc
 mod rpc;
 pub use rpc::{
     PendingScopeAuthority, ScopeAuthorityReply, ScopeClient, ScopeClientConfig, ScopeRpcError,
-    ScopeServer, ScopeServerConfig, ScopeServerHandle,
+    ScopeServer, ScopeServerConfig, ScopeServerHandle, VerifiedScopeBatchCompletion,
 };
 
 mod rpc_client;

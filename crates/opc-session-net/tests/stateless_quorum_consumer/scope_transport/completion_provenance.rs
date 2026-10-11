@@ -112,8 +112,10 @@ pub(super) async fn check(
                 altered[field][0]["Create"]["value"] = serde_json::to_value(value(99)).unwrap()
             }
             "stamp" => {
+                let mut foreign = *request.scope().slot();
+                foreign[0] ^= 1;
                 altered[field]["namespace"]["scope"]["slot"] =
-                    serde_json::to_value([99_u8; 32]).unwrap()
+                    serde_json::to_value(foreign).unwrap()
             }
             _ => unreachable!(),
         }
