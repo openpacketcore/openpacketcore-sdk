@@ -8,8 +8,10 @@
 //! security-protected envelope framing with algorithm hooks, 5GS mobile
 //! identity decoding, BCD digit unpacking for PLMN/routing indicator/IMEI/
 //! IMEISV, and first-CNF message body dispatch. Registration Request,
-//! Registration Accept, Security Mode Command, and Security Mode Complete are
-//! structurally decoded, as are all five Authentication bodies. The AES
+//! Registration Accept, Security Mode Command, Security Mode Complete,
+//! Configuration Update Command, and Configuration Update Complete are
+//! structurally decoded with per-message optional IE framing pinned to
+//! TS 24.501 V18.11.1. All five Authentication bodies are also typed. The AES
 //! provider implements NIA2/NEA2. Other registered 5GMM/5GSM bodies are named
 //! and preserved raw.
 //!
@@ -42,10 +44,11 @@ pub use authentication::{
 pub use bcd::{unpack_imei, unpack_plmn, unpack_routing_indicator, BcdError, Plmn};
 pub use identity::{GutiView, IdentityType, IdentityView, MobileIdentity, SuciView};
 pub use messages::{
-    decode_mm_message_body, decode_sm_message_body, MmMessageBody, NasKeySetIdentifier, OptionalIe,
-    RawMessageBody, RegistrationAccept, RegistrationRequest, RegistrationResult,
-    RegistrationResultFlags, RegistrationType, SecurityModeCommand, SecurityModeComplete,
-    SelectedNasSecurityAlgorithms, SmMessageBody,
+    decode_mm_message_body, decode_sm_message_body, ConfigurationUpdateCommand,
+    ConfigurationUpdateComplete, MmMessageBody, NasKeySetIdentifier, OptionalIe, RawMessageBody,
+    RegistrationAccept, RegistrationRequest, RegistrationResult, RegistrationResultFlags,
+    RegistrationType, SecurityModeCommand, SecurityModeComplete, SelectedNasSecurityAlgorithms,
+    SmMessageBody,
 };
 pub use security::{
     nea2_cipher, nia2_mac, AesNasSecurityAlgorithms, NasAesKey, NasAesKeyResolver,

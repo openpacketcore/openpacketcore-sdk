@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- `opc-proto-nas`: `MmMessageBody::ConfigurationUpdateCommand` and
+  `MmMessageBody::ConfigurationUpdateComplete` now carry the typed
+  `ConfigurationUpdateCommand` and `ConfigurationUpdateComplete` structs
+  instead of `RawMessageBody`. Use `decode_body`, inspect `optional_ies`, and
+  encode the retained elements; `PlainMm.body` retains the original body bytes.
+  The two types redact values in Debug and enforce decoding/encoding limits.
+
 ### Added
+
+- `opc-proto-nas`: frame optional elements with complete per-message tables
+  from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),
+  Security Mode Command (7), Security Mode Complete (3), Configuration Update
+  Command (44), and Configuration Update Complete (0). Strict/ProcedureAware
+  enforce the selected table's identifiers and wire-length bounds. Every IEI
+  with bit 8 set is one octet, and half-octet duplicates use the high nibble.
+  Correct the Security Mode clause references to 8.2.25 and 8.2.26. (#1238)
 
 - `opc-session-store` and `opc-session-net`: add coherent, paged restore of a
   positively handed-over scope across native and SQLite storage and authenticated
