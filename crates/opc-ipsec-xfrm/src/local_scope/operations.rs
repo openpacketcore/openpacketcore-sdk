@@ -590,3 +590,30 @@ pub(crate) struct TestPause {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) resume: tokio::sync::Notify,
 }
+
+#[cfg(test)]
+#[test]
+fn authority_revision_mismatch_has_a_distinct_local_refusal() {
+    use opc_local_kernel_lifecycle::LocalEffectError;
+    assert!(matches!(
+        authority_error(LocalEffectError::TransportRevisionMismatch),
+        XfrmError::StateIndeterminate {
+            operation: "scope_transport_revision_mismatch"
+        }
+    ));
+    for failure in [
+        LocalEffectError::Closed,
+        LocalEffectError::Stale,
+        LocalEffectError::WrongRequest,
+        LocalEffectError::RetryableNoEffect,
+        LocalEffectError::OutcomeUnknown,
+        LocalEffectError::Unavailable,
+    ] {
+        assert!(matches!(
+            authority_error(failure),
+            XfrmError::StateIndeterminate {
+                operation: "local_scope_effect"
+            }
+        ));
+    }
+}

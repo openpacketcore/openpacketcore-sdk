@@ -306,3 +306,30 @@ impl session_effect::Kernel for NativeKernel<'_> {
         self.local()
     }
 }
+
+#[cfg(test)]
+#[test]
+fn authority_revision_mismatch_has_a_distinct_local_refusal() {
+    use opc_local_kernel_lifecycle::LocalEffectError;
+    assert!(matches!(
+        authority_error(LocalEffectError::TransportRevisionMismatch),
+        GtpuError::StateIndeterminate {
+            operation: "scope_transport_revision_mismatch"
+        }
+    ));
+    for failure in [
+        LocalEffectError::Closed,
+        LocalEffectError::Stale,
+        LocalEffectError::WrongRequest,
+        LocalEffectError::RetryableNoEffect,
+        LocalEffectError::OutcomeUnknown,
+        LocalEffectError::Unavailable,
+    ] {
+        assert!(matches!(
+            authority_error(failure),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_local_session"
+            }
+        ));
+    }
+}
