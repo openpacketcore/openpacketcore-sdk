@@ -40,6 +40,9 @@ impl ActivationStore for Store {
         self.events.lock().unwrap().push("execute");
         Ok(self.outcome.clone())
     }
+}
+#[async_trait::async_trait]
+impl CurrentChildStore for Store {
     async fn read_current(
         &self,
         child: ScopeChildKey,
