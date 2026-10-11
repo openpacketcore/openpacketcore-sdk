@@ -61,6 +61,11 @@ impl PendingScopeAuthority {
     }
 }
 impl ScopeClient {
+    /// Complete process binding established from this client's protected boot,
+    /// ticket and TLS identity. This observation cannot construct authority.
+    pub fn execution(&self) -> &ScopeExecution {
+        &self.0.execution
+    }
     /// Bind the actual configured TLS identity and exact process ticket hints.
     pub fn new(config: ScopeClientConfig) -> Result<Self, ScopeRpcError> {
         config

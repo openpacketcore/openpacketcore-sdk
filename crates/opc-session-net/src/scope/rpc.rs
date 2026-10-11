@@ -98,5 +98,6 @@ pub enum ScopeAuthorityReply {
     Closed(Box<ScopeAuthorityStamp>),
 }
 
+pub use super::rpc_client::batch::VerifiedScopeBatchCompletion;
 pub use super::rpc_client::{PendingScopeAuthority, ScopeClient};
 pub use super::rpc_server::{ScopeServer, ScopeServerHandle};

@@ -142,7 +142,7 @@ pub(super) async fn check(
 
     let local = ScopeBatchStore::new(
         store.clone(),
-        authority.stamp().scope().clone(),
+        authority.stamp().namespace().clone(),
         Arc::new(Admission(authority.stamp().clone())),
     )
     .unwrap();
