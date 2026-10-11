@@ -117,9 +117,11 @@ impl Pki {
     }
 }
 
-pub(super) struct NativeTransport {
+pub(crate) struct NativeTransport {
     pub(super) client: ScopeClient,
     pub(super) committed: CommittedScopeAuthority,
+    // Only the lifecycle crate also exercises admission-class saturation.
+    #[allow(dead_code)]
     pub(super) scheduler: ScopeSchedulerOwner,
     _server_scheduler: ScopeSchedulerOwner,
     pub(super) coordinator: ScopeBatchCoordinator,

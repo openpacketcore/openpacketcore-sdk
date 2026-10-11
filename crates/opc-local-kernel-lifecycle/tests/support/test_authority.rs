@@ -5,6 +5,7 @@ use opc_local_kernel_lifecycle::{
     LocalScopeResetReceipt, ScopeKernelAuthority,
 };
 
+#[derive(Clone)]
 pub(crate) enum TestAuthority {
     Local(ScopeKernelAuthority),
     #[cfg(feature = "native-scope")]
@@ -116,6 +117,8 @@ impl TestAuthority {
         }
     }
 
+    // This shared fixture is included by three crates with different callers.
+    #[allow(dead_code)]
     pub(crate) async fn close_execution(&self) {
         match self {
             Self::Local(authority) => authority.close_execution().await,
@@ -124,6 +127,8 @@ impl TestAuthority {
         }
     }
     #[cfg(feature = "native-scope")]
+    // This shared fixture is included by three crates with different callers.
+    #[allow(dead_code)]
     pub(crate) async fn qualify_native_classes(&self, quorum: &Quorum) {
         use opc_session_store::scope_scheduler::ScopeWorkClass;
         let Self::Native {
@@ -248,6 +253,8 @@ impl TestAuthority {
         drop(hold);
         normal.recheck().await.unwrap();
     }
+    // This shared fixture is included by three crates with different callers.
+    #[allow(dead_code)]
     pub(crate) async fn shutdown_local(
         &self,
         participants: LocalResetParticipants,
