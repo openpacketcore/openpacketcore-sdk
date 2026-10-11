@@ -221,6 +221,20 @@ evidence proves no effect. Preserve unavailable/unknown through existing
 local-effect refusal; expose `LocalEffectError::TransportRevisionMismatch`
 distinctly.
 
+## Integration with the landed contracts
+
+| Contract | Consequence for this proposal |
+| --- | --- |
+| [RFC 028 coherent restore](028-coherent-scope-scans.md) | Retained restore pages and lookups keep their original cut, successor eligibility, claim/tombstone detail and explicit completion. Method 17 supplies fresh bounded predicates; separate calls cannot replace a retained restore. Methods 12–16 and page payload bytes remain unchanged inside revision-2 frames. |
+| [RFC 030 IKE recovery](030-ike-recovery-profile.md#durability-writer-fencing-and-ownership) | Return the complete sealed row and store birth/generation so the consumer can preserve exact child CAS, distinct from the protocol window's generation. A latest read cannot settle a possibly applying predecessor: first resolve or fence its exact attempt as RFC 030 requires. Unsealing, provider-unavailable classification, affine runtime ownership and uncertain-operation resolution remain consumer obligations; observations grant no send or effect token. |
+| [RFC 023 voter replacement](023-voter-slot-incarnations.md#composition-with-untimed-scope-authority) | The full barrier and follower forwarding must retain current-incarnation application admission through Fence and successor admission; an obsolete voter reply cannot complete the read. Scope-profile continuation preserves scope/execution, birth and lane floors. Transport revision 2 changes neither that profile nor the voter incarnation encoding, and requires no extra all-voter reactivation. |
+| [RFC 025 local kernel lifecycle](025-local-kernel-lifecycle.md) | Extend the landed `ScopeKernelAuthority` and its private activation/readback boundary. Replace its surrounding `Current` calls with the one-cut check and add the outcome batch-revision comparison. Preserve the opaque `CommittedScopeEffect` accepted by existing backend/open APIs, with sealed backend dispatch inside the capability. Both adapters retain the lifecycle's single owner, epoch and shared consumption frontier, supervised shutdown and store-independent receipt teardown. The optional native adapter must preserve ordinary XFRM's store-free dependency boundary. |
+
+The configuration-change qualification below includes voter replacement across
+Fence and uniform completion, including delayed replies from the retired voter.
+The local authority regressions must continue to exercise the landed opening,
+reset and cancellation ownership rules with either backend.
+
 ## Qualification: guards, tests and mutations
 
 Write **failing tests first**. Each mutation below must fail its protecting
