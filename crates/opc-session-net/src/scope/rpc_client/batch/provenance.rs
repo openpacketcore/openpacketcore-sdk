@@ -10,7 +10,9 @@ pub(super) struct AppliedFact {
 // Any values or copy a genuine context, but cannot retag its client, original
 // submission class, exact result or core retention identity.
 struct NativeCompletion {
-    client: Arc<Inner>,
+    // Retained result observations must not retain the client's process lock.
+    // Weak identity still names this allocation without keeping the boot alive.
+    client: std::sync::Weak<Inner>,
     fact: AppliedFact,
     class: ScopeWorkClass,
     retention: ScopeBatchCompletionRetention,
@@ -63,7 +65,7 @@ impl ScopeClient {
         let ScopeBatchCompletionOutcome::Applied(outcome) = completion.outcome() else {
             return Err(ScopeBatchError::OutcomeUnknown);
         };
-        if !Arc::ptr_eq(&proof.client, &self.0)
+        if !proof.client.ptr_eq(&Arc::downgrade(&self.0))
             || &proof.fact.attempt != completion.attempt()
             || proof.fact.attempt != request.attempt()?
             || &proof.fact.outcome != outcome.as_ref()
@@ -144,7 +146,7 @@ impl BatchPort {
             return None;
         }
         Some(ScopeBatchCompletionContext::new(NativeCompletion {
-            client: self.client.0.clone(),
+            client: Arc::downgrade(&self.client.0),
             fact: AppliedFact {
                 attempt,
                 outcome: *outcome.clone(),
