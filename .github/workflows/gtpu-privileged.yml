@@ -16,10 +16,27 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Keep the existing required check name and require both independent jobs.
   privileged-gtpu:
     name: Privileged Linux GTP-U
+    if: always()
+    needs: [privileged-gtpu-datapath, privileged-gtpu-regressions]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    env:
+      DATAPATH_RESULT: ${{ needs.privileged-gtpu-datapath.result }}
+      REGRESSIONS_RESULT: ${{ needs.privileged-gtpu-regressions.result }}
+    steps:
+      - name: Require both privileged jobs to pass
+        run: |
+          set -euo pipefail
+          test "$DATAPATH_RESULT" = success
+          test "$REGRESSIONS_RESULT" = success
+
+  privileged-gtpu-regressions:
+    name: Privileged Linux GTP-U and route regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -29,9 +46,6 @@ jobs:
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
-
-      - name: Test eBPF parser and observation contracts on the host
-        run: cargo test --locked --manifest-path crates/opc-gtpu-dataplane-ebpf/Cargo.toml --target x86_64-unknown-linux-gnu
 
       - name: Install kernel tooling
         run: |
@@ -132,6 +146,77 @@ jobs:
             grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${route_log}"
           done
           grep -Fq 'OPC_ROUTE_LOCKED_MTU_ICMP_PROVEN:' "${RUNNER_TEMP}/live_locked_route_mtu.log"
+
+      - name: Upload privileged regression logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-privileged-regressions
+          path: |
+            ${{ runner.temp }}/gtpu-empty-normalization-build.jsonl
+            ${{ runner.temp }}/gtpu-empty-normalization.log
+            ${{ runner.temp }}/route-kernel-build.jsonl
+            ${{ runner.temp }}/live_readback_probe.log
+            ${{ runner.temp }}/live_locked_route_mtu.log
+          if-no-files-found: warn
+
+  privileged-gtpu-datapath:
+    name: Privileged Linux GTP-U datapath
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test eBPF parser and observation contracts on the host
+        run: cargo test --locked --manifest-path crates/opc-gtpu-dataplane-ebpf/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ethtool iproute2 iputils-ping kmod nftables procps wireguard-tools
+
+      - name: Check privileged GTP kernel support
+        run: |
+          set -euo pipefail
+          uname -r
+          uname -v
+          if ! sudo modprobe gtp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe gtp
+          fi
+          lsmod | grep '^gtp'
+          sudo modprobe wireguard
+          # The hand-off test on a VRF slave needs the vrf driver, which
+          # ships in the same optional module package as gtp. Create a VRF
+          # in a throwaway namespace rather than look for a module: that
+          # holds for a built-in driver as well.
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe vrf
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
+          fi
+          # The test of the attachment's interface enslaves it to a bridge.
+          sudo unshare -n -- ip link add bridge-probe type bridge
+          # The tests of a device stacked on the attachment's interface, and
+          # of the frames of a VLAN above it, need these drivers.
+          sudo unshare -n -- sh -euc '
+            ip link add lower-probe type dummy
+            ip link add link lower-probe name macvlan-probe type macvlan mode passthru
+            ip link del macvlan-probe
+            ip link add link lower-probe name ipvlan-probe type ipvlan mode l2
+            ip link add link lower-probe name vlan-probe type vlan id 100
+            ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
+          '
+          sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo unshare -n -- ip link set lo up
 
       - name: Prove map-in-map reader grace
         run: |
