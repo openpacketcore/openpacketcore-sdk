@@ -8,6 +8,11 @@ use opc_ipsec_xfrm_ebpf_common::MarkProfile;
 
 use crate::{XfrmCapability, XfrmError};
 
+mod local_scope;
+#[cfg(target_os = "linux")]
+pub(crate) mod scoped_runtime;
+pub use local_scope::XfrmDscpLocalGraph;
+
 /// Default bpffs root for per-interface XFRM DSCP companion state.
 pub const DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-ipsec-xfrm-dscp";
 /// Default tc egress filter priority for the XFRM DSCP companion.
@@ -141,6 +146,27 @@ pub(crate) trait XfrmDscpRuntime: Send + Sync + std::fmt::Debug {
     fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime>;
     fn ensure_ready(&self, config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError>;
     fn capability(&self, config: &LinuxXfrmDscpMarkingConfig) -> XfrmCapability;
+    fn scoped_graph(
+        &self,
+        _reset: &opc_local_kernel_lifecycle::LocalScopeResetReceipt,
+        _config: &LinuxXfrmDscpMarkingConfig,
+        _ifindex: u32,
+    ) -> Result<Option<opc_local_kernel_lifecycle::LocalInstalledGraph>, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "local_scope_dscp_rebuild",
+        })
+    }
+    fn build_scoped_graph(
+        &self,
+        _guard: &opc_local_kernel_lifecycle::LocalRebuildGuard,
+        _config: &LinuxXfrmDscpMarkingConfig,
+        _observer_closed: &dyn Fn() -> bool,
+    ) -> Result<
+        opc_local_kernel_lifecycle::LocalInstalledGraph,
+        opc_local_kernel_lifecycle::LocalLifecycleError,
+    > {
+        Err(opc_local_kernel_lifecycle::LocalLifecycleError::Indeterminate)
+    }
 }
 
 pub(crate) fn production_runtime() -> Arc<dyn XfrmDscpRuntime> {
@@ -198,7 +224,7 @@ mod aya_runtime {
     use super::{LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
     use crate::{XfrmCapability, XfrmError};
 
-    const DATAPATH_OBJECT: &[u8] = include_bytes!(concat!(
+    pub(super) const DATAPATH_OBJECT: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/bpf/opc-ipsec-xfrm-dscp.bpf.o"
     ));
@@ -382,16 +408,19 @@ mod aya_runtime {
                     return Err(XfrmError::AlreadyExists);
                 }
             }
-            let map_ids = info
-                .map_ids()
-                .map_err(|error| program_error("dscp_program_map_ids", &error))?
-                .ok_or_else(|| {
-                    XfrmError::io(
-                        "dscp_program_map_ids",
-                        invalid_data("kernel did not report program map ids"),
-                    )
-                })?;
-            if !map_ids.contains(&map_id) {
+            // Aya's ProgramInfo::map_ids reopens its ID. The actual loaded or
+            // pinned classifier already supplies a stronger retained descriptor.
+            use std::os::fd::AsFd;
+            let held = sys::bpf::ProgramHandle::from_fd(
+                program
+                    .fd()
+                    .map_err(|error| program_error("dscp_program_fd", &error))?
+                    .as_fd(),
+            )
+            .map_err(|_| XfrmError::StateIndeterminate {
+                operation: "dscp_program_map_ids",
+            })?;
+            if !held.identity().map_ids.contains(&map_id) {
                 return Err(XfrmError::AlreadyExists);
             }
             Ok(CompanionIdentity {
@@ -420,7 +449,7 @@ mod aya_runtime {
                     == Some(expected_profile)
         }
 
-        fn read_profile(ebpf: &Ebpf) -> Result<[u8; MARK_CONFIG_VALUE_LEN], XfrmError> {
+        pub(super) fn read_profile(ebpf: &Ebpf) -> Result<[u8; MARK_CONFIG_VALUE_LEN], XfrmError> {
             let map = ebpf.map(MAP_MARK_CONFIG).ok_or_else(|| {
                 XfrmError::io("dscp_config_map", invalid_data("config map missing"))
             })?;
@@ -431,7 +460,10 @@ mod aya_runtime {
                 .map_err(|_| XfrmError::io("dscp_config_read", invalid_data("map read failed")))
         }
 
-        fn write_profile(ebpf: &mut Ebpf, profile: MarkProfile) -> Result<(), XfrmError> {
+        pub(super) fn write_profile(
+            ebpf: &mut Ebpf,
+            profile: MarkProfile,
+        ) -> Result<(), XfrmError> {
             let map = ebpf.map_mut(MAP_MARK_CONFIG).ok_or_else(|| {
                 XfrmError::io("dscp_config_map", invalid_data("config map missing"))
             })?;

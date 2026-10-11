@@ -2483,9 +2483,12 @@ fn classify_owned_collection(
                 }
                 routes.push(resident);
             }
-            _ => {
+            _ if candidate.family == expected_family && candidate.table == scope.table() => {
+                // The exact route deletion includes family and table. An
+                // equal prefix in a different table cannot alias that key.
                 colliding_route_destinations.insert(candidate.destination);
             }
+            _ => {}
         }
     }
 
@@ -6498,6 +6501,54 @@ mod tests {
                 })
             ));
             assert_eq!(transport.requests().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_collection_reset_preserves_same_prefix_in_another_table() {
+        for (scope, owned) in [
+            (collection_scope(), collection_route(10)),
+            (ipv6_collection_scope(), ipv6_collection_route()),
+        ] {
+            for protocol in [99, LINUX_ROUTE_STEERING_PROTOCOL] {
+                let owned_body = encode_route_request(&owned).unwrap();
+                let mut foreign = owned.clone();
+                foreign.table += 1;
+                let mut foreign_body = encode_route_request(&foreign).unwrap();
+                foreign_body[5] = protocol;
+                let both = vec![owned_body, foreign_body.clone()];
+                let transport = ScriptedTransport::new(vec![
+                    ScriptedResponse::Dump(Ok(both.clone())),
+                    ScriptedResponse::Dump(Ok(Vec::new())),
+                    ScriptedResponse::Dump(Ok(both)),
+                    ScriptedResponse::Dump(Ok(Vec::new())),
+                    ScriptedResponse::Transaction(Ok(None)),
+                    ScriptedResponse::Dump(Ok(vec![foreign_body])),
+                    ScriptedResponse::Dump(Ok(Vec::new())),
+                ]);
+                let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+                let outcome = backend
+                    .reconcile_owned_route_rules(
+                        OwnedRouteRuleSet::new(scope, vec![], vec![]).unwrap(),
+                    )
+                    .await
+                    .expect("another table cannot collide with this exact deletion key");
+                assert_eq!(outcome.removed_routes, 1);
+                assert!(outcome.snapshot.routes().is_empty());
+                let requests = transport.requests();
+                let deletes = requests
+                    .iter()
+                    .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELROUTE)
+                    .collect::<Vec<_>>();
+                assert_eq!(deletes.len(), 1);
+                assert_eq!(
+                    parse_route_candidate(netlink_body(deletes[0]))
+                        .unwrap()
+                        .unwrap()
+                        .resident,
+                    Some(owned.clone())
+                );
+            }
         }
     }
 

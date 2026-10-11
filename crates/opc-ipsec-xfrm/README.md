@@ -1636,6 +1636,46 @@ excludes the old key material needed for rollback.
   also supports a shared non-zero request ID with wildcard policy-template SPI
   for simultaneous old/new Child-SA rekey overlap.
 
+## Scoped local lifecycle
+
+The `scope-store` feature enables store-backed scoped SA installation and its
+receipt APIs. It is off by default, so ordinary XFRM and IKEv2 consumers do not
+build the session store, consensus engine or SQLite. Local containment, reset
+and profile admission remain available without that feature.
+
+`NamespaceBoundLinuxXfrmBackend::for_local_scope` binds one namespace actor to
+the shared [`LocalKernelLifecycle`](../opc-local-kernel-lifecycle/README.md).
+After contained whole-scope reset, `admit_scoped_profile` verifies sole-producer
+exclusion and usable key readback with a private probe. The probe is removed
+and fresh SPD/SAD absence is verified before admission or a key-readback
+refusal. `rebuild_scoped_dscp` builds the declared fresh DSCP graphs under the
+same reset receipt.
+
+`ScopedXfrmRequest` requires a mature ESP SA, nonzero exact lookup mark and
+request ID, and an SPI-zero protective policy template. `install_scoped`
+requires a real committed activation token before any candidate policy or SA
+effect. The actor publishes only after full readback; unpublished failure is
+undone in reverse order while protective policy remains installed.
+
+`read_scoped` and `remove_scoped` accept only this actor's transient receipts.
+Removal compares complete SA identity and keys, retires the SA before its
+policy, and remains supervised after caller cancellation or store loss.
+Deletion-key reservations span child/interface identities and remain held until
+exact cleanup settles. Saturation waits with backpressure. Lost publication
+replies are resolved by exact retry without undoing established forwarding.
+Confirmed removal drops the actor's full request and deletion-key reservation.
+Caller-held receipts retain a retirement marker; recovered activation tokens
+share bounded consumption bits for independent inbound, outbound and forward
+roles, retained by the lifecycle across authority-adapter rebuilds. Completed
+effects cannot be reinstalled by replaying a token, and the actor retains no
+history proportional to session churn.
+
+The scoped actor refuses `allocate_spi` and legacy mutation/reset entry points;
+generic `remove_sa_exact` remains unsupported. It adds no persistent object
+journal. The native expiration/ACQUIRE and readback tests qualify only the
+kernel on which they actually run; supported-kernel matrix qualification remains
+an explicit acceptance gate in [RFC 025](../../docs/rfc/025-local-kernel-lifecycle.md).
+
 ## Roadmap
 
 - Keep additional XFRM algorithm support explicit and validated before encoding

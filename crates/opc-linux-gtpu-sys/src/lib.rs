@@ -18,6 +18,12 @@
 use std::io;
 use std::path::Path;
 
+/// Descriptor-backed BPF object inspection and observational release evidence.
+pub mod bpf;
+
+/// Complete traffic-control inventories and exact filter operations.
+pub mod tc;
+
 #[cfg(all(target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
 mod linux;
 #[cfg_attr(

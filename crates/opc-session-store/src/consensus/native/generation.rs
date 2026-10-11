@@ -501,6 +501,7 @@ impl PreparedDelta {
 
     /// Only byte admission advances here. The integrating WAL owner retains
     /// the old selected cut and all reconstruction rows until CURRENT fsync.
+    #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn append(
         &self,
         owner: &mut VerifiedAppendOwner,

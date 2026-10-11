@@ -1587,6 +1587,7 @@ name = "opc-linux-gtpu-sys"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "linux-raw-sys",
 ]
 
 [[package]]

@@ -4,6 +4,119 @@ use std::time::Duration;
 
 use crate::{BpfXdpLinkInfo, GtpuUdpBind};
 
+use crate::bpf::{InspectionCall, InspectionError, MapIdentity, ProgramIdentity};
+pub struct ObservedProgram;
+impl ObservedProgram {
+    #[cfg(unix)]
+    pub fn from_fd(_fd: std::os::fd::BorrowedFd<'_>) -> Result<Self, InspectionError> {
+        Err(InspectionError::new(
+            InspectionCall::ProgramInfo,
+            unsupported(),
+        ))
+    }
+    pub(crate) fn raw_fd(&self) -> i32 {
+        -1
+    }
+    pub fn open(_id: u32) -> Result<Self, InspectionError> {
+        Err(InspectionError::new(
+            InspectionCall::OpenProgram,
+            unsupported(),
+        ))
+    }
+    pub fn info(&self) -> Result<ProgramIdentity, InspectionError> {
+        Err(InspectionError::new(
+            InspectionCall::ProgramInfo,
+            unsupported(),
+        ))
+    }
+}
+pub struct ObservedMap;
+impl ObservedMap {
+    #[cfg(unix)]
+    pub fn from_fd(_fd: std::os::fd::BorrowedFd<'_>) -> Result<Self, InspectionError> {
+        Err(InspectionError::new(InspectionCall::MapInfo, unsupported()))
+    }
+    #[cfg(unix)]
+    pub fn try_clone_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        Err(unsupported())
+    }
+    pub fn open(_id: u32) -> Result<Self, InspectionError> {
+        Err(InspectionError::new(InspectionCall::OpenMap, unsupported()))
+    }
+    pub fn info(&self) -> Result<MapIdentity, InspectionError> {
+        Err(InspectionError::new(InspectionCall::MapInfo, unsupported()))
+    }
+}
+pub struct LocalScopeHandles;
+
+pub struct LocalPinDirectory;
+pub struct LocalPin;
+impl LocalPinDirectory {
+    pub fn create(
+        _handles: std::sync::Arc<LocalScopeHandles>,
+        _relative: &Path,
+    ) -> Result<std::sync::Arc<Self>, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn verify(&self) -> Result<(), crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn descriptor_path(&self) -> Result<std::path::PathBuf, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn open(
+        _handles: std::sync::Arc<LocalScopeHandles>,
+        _relative: &Path,
+    ) -> Result<Option<std::sync::Arc<Self>>, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn entries(&self) -> Result<Vec<String>, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn inspect(
+        self: &std::sync::Arc<Self>,
+        _name: &str,
+    ) -> Result<LocalPin, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+}
+impl LocalPin {
+    pub fn program(&self) -> Result<ObservedProgram, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn map(&self) -> Result<ObservedMap, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn identity(&self) -> &crate::tc::PinnedIdentity {
+        unreachable!("unsupported pin cannot be constructed")
+    }
+    pub fn verify(&self) -> Result<(), crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn unlink(
+        &self,
+        _handles: &std::sync::Arc<LocalScopeHandles>,
+    ) -> Result<(), crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+}
+
+impl LocalScopeHandles {
+    pub fn root_entries(&self) -> Result<Vec<String>, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn open(_root: &Path, _lock: &Path) -> Result<Self, crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+    pub fn verify(&self) -> Result<(), crate::tc::ScopeError> {
+        Err(crate::tc::ScopeError::Unsupported)
+    }
+}
+
+pub fn tcx_program_count(_ifindex: u32, _ingress: bool) -> io::Result<u32> {
+    Err(unsupported())
+}
+
 #[derive(Debug)]
 pub struct BootTimeTimer {
     _private: (),

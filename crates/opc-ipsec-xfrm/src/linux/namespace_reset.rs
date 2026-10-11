@@ -11,10 +11,22 @@ const OPERATION: &str = "exclusive_namespace_reset_readback";
 
 impl LinuxXfrmBackend {
     pub(crate) fn flush_namespace_policies(&self) -> Result<(), XfrmError> {
+        self.flush_namespace_policies_contained(None)
+    }
+
+    pub(crate) fn flush_namespace_policies_contained(
+        &self,
+        contained: Option<&opc_linux_gtpu_sys::tc::ContainedScope>,
+    ) -> Result<(), XfrmError> {
         for (policy_type, operation) in [
             (XFRM_POLICY_TYPE_MAIN, "reset_namespace_main_policies"),
             (XFRM_POLICY_TYPE_SUB, "reset_namespace_sub_policies"),
         ] {
+            if let Some(contained) = contained {
+                contained
+                    .recheck()
+                    .map_err(crate::local_scope::scope_error)?;
+            }
             let mut body = sensitive_buffer_with_capacity(12);
             // struct xfrm_userpolicy_type has two holes: u8 type, padding,
             // u16 reserved1, u8 reserved2, tail padding (six bytes total).
@@ -73,6 +85,40 @@ pub(super) fn verify_empty(
     sequence: u32,
     config: LinuxXfrmBackendConfig,
 ) -> Result<(), XfrmError> {
+    verify_empty_profile(message_type, sequence, config, false, false)
+}
+
+pub(super) fn verify_empty_scoped(
+    message_type: u16,
+    sequence: u32,
+    config: LinuxXfrmBackendConfig,
+) -> Result<(), XfrmError> {
+    verify_empty_profile(message_type, sequence, config, true, true)
+}
+
+pub(super) fn verify_empty_local(
+    message_type: u16,
+    sequence: u32,
+    config: LinuxXfrmBackendConfig,
+    include_socket_policies: bool,
+) -> Result<(), XfrmError> {
+    verify_empty_profile(
+        message_type,
+        sequence,
+        config,
+        include_socket_policies,
+        true,
+    )
+}
+
+fn verify_empty_profile(
+    message_type: u16,
+    sequence: u32,
+    config: LinuxXfrmBackendConfig,
+    include_socket_policies: bool,
+    bounded: bool,
+) -> Result<(), XfrmError> {
+    let deadline = bounded.then(|| std::time::Instant::now() + std::time::Duration::from_secs(1));
     let socket = open_netlink_socket().map_err(|error| map_open_error(OPERATION, error))?;
     // The dump dispatch parses attributes at offset zero for SA and ignores
     // policy filters. No identity payload or family/protocol filter is sent.
@@ -83,11 +129,18 @@ pub(super) fn verify_empty(
     }
     let mut buffer = Zeroizing::new(vec![0; config.receive_buffer_len]);
     for _ in 0..config.receive_attempts {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(XfrmError::Unavailable);
+        }
         match receive_message_outcome(&socket, &mut buffer) {
             Ok(ReceiveMessageOutcome::Complete { bytes_received: 0 }) => {}
             Ok(ReceiveMessageOutcome::Complete { bytes_received }) => {
                 let datagram = buffer.get(..bytes_received).ok_or(XfrmError::Unavailable)?;
-                if empty_dump_datagram(datagram, message_type, sequence)? {
+                if (if include_socket_policies {
+                    empty_dump_datagram_scoped(datagram, message_type, sequence)
+                } else {
+                    empty_dump_datagram(datagram, message_type, sequence)
+                })? {
                     return Ok(());
                 }
                 continue;
@@ -115,6 +168,15 @@ fn empty_dump_datagram(
     datagram: &[u8],
     request_type: u16,
     sequence: u32,
+) -> Result<bool, XfrmError> {
+    empty_dump_datagram_profile(datagram, request_type, sequence, false)
+}
+
+fn empty_dump_datagram_profile(
+    datagram: &[u8],
+    request_type: u16,
+    sequence: u32,
+    include_socket_policies: bool,
 ) -> Result<bool, XfrmError> {
     let mut offset = 0;
     let mut done = false;
@@ -159,7 +221,7 @@ fn empty_dump_datagram(
                             operation: OPERATION,
                         })
                     }
-                    3..=5 => {}
+                    3..=5 if !include_socket_policies => {}
                     _ => return Err(XfrmError::Unavailable),
                 }
             }
@@ -173,6 +235,14 @@ fn empty_dump_datagram(
         }
     }
     Ok(done)
+}
+
+fn empty_dump_datagram_scoped(
+    datagram: &[u8],
+    request_type: u16,
+    sequence: u32,
+) -> Result<bool, XfrmError> {
+    empty_dump_datagram_profile(datagram, request_type, sequence, true)
 }
 
 #[cfg(test)]
@@ -277,5 +347,24 @@ mod tests {
         assert!(!empty_dump_datagram(&socket_policy_and_done, XFRM_MSG_GETPOLICY, 1).unwrap());
         socket_policy_and_done.extend_from_slice(&done);
         assert!(empty_dump_datagram(&socket_policy_and_done, XFRM_MSG_GETPOLICY, 1).unwrap());
+    }
+
+    #[test]
+    fn scoped_profile_refuses_every_per_socket_policy_direction() {
+        for direction in 3..=5 {
+            let mut policy = vec![0; XFRM_USER_POLICY_INFO_LEN];
+            policy[160] = direction;
+            policy[161] = XFRM_POLICY_BLOCK;
+            let mut reply = frame(XFRM_MSG_NEWPOLICY, 2, &policy).to_vec();
+            reply.extend_from_slice(&frame(NLMSG_DONE, 2, &[0; 4]));
+            assert!(
+                empty_dump_datagram_scoped(&reply, XFRM_MSG_GETPOLICY, 1).is_err(),
+                "a scoped producer cannot admit per-socket policy direction {direction}"
+            );
+            assert!(
+                empty_dump_datagram(&reply, XFRM_MSG_GETPOLICY, 1).unwrap(),
+                "the existing namespace-reset companion contract remains distinct"
+            );
+        }
     }
 }

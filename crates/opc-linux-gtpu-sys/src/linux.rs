@@ -10,6 +10,10 @@ use crate::{BpfCgroupProgramAttachment, BpfXdpLinkInfo, GtpuIpAddress, GtpuUdpBi
 
 mod reader_grace;
 pub use reader_grace::BpfMapReaderGrace;
+mod bpf_observation;
+pub use bpf_observation::{ObservedMap, ObservedProgram};
+mod local_scope;
+pub use local_scope::{LocalPin, LocalPinDirectory, LocalScopeHandles};
 
 const BPF_OBJ_PIN: libc::c_uint = 6;
 const BPF_OBJ_GET: libc::c_uint = 7;
@@ -507,6 +511,64 @@ pub fn probe_cgroup_revision_uapi(cgroup: BorrowedFd<'_>) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     validate_cgroup_revision_probe(query.revision)
+}
+
+pub fn tcx_program_count(ifindex: u32, ingress: bool) -> io::Result<u32> {
+    tcx_program_count_with(ifindex, ingress, |query| {
+        // SAFETY: TCX interprets target_fd as the ifindex in the current netns.
+        // The exact UAPI struct has no user pointers for this count-only query.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_PROG_QUERY,
+                query as *mut BpfProgQueryAttr,
+                mem::size_of::<BpfProgQueryAttr>(),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn tcx_program_count_with(
+    ifindex: u32,
+    ingress: bool,
+    query_kernel: impl FnOnce(&mut BpfProgQueryAttr) -> io::Result<()>,
+) -> io::Result<u32> {
+    if ifindex == 0 || ifindex > i32::MAX as u32 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut query = BpfProgQueryAttr {
+        target_fd: ifindex,
+        attach_type: if ingress { 46 } else { 47 },
+        revision: u64::MAX,
+        ..BpfProgQueryAttr::default()
+    };
+    if let Err(error) = query_kernel(&mut query) {
+        return Err(
+            // The fixed count-only request has already validated its ifindex.
+            // EINVAL means the TCX query ABI is absent; ENOENT is the older
+            // ABI without empty-hook revision readback. Neither proves empty.
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOENT | libc::ENOSYS | libc::EOPNOTSUPP)
+            ) {
+                io::Error::new(io::ErrorKind::Unsupported, "tcx_query")
+            } else {
+                error
+            },
+        );
+    }
+    if query.revision == u64::MAX {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "tcx_query"));
+    }
+    if query.attach_flags != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "tcx_query"));
+    }
+    Ok(query.program_count)
 }
 
 pub fn attach_cgroup_skb_egress(
@@ -1472,6 +1534,92 @@ fn sockaddr_in6(octets: [u8; 16], port: u16) -> libc::sockaddr_in6 {
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, OwnedFd};
+
+    #[test]
+    fn tcx_query_missing_capability_is_typed_unsupported() {
+        for ingress in [true, false] {
+            for errno in [libc::EINVAL, libc::ENOENT, libc::ENOSYS, libc::EOPNOTSUPP] {
+                let error = tcx_program_count_with(17, ingress, |query| {
+                    assert_eq!(query.target_fd, 17);
+                    assert_eq!(query.attach_type, if ingress { 46 } else { 47 });
+                    assert_eq!(query.query_flags, 0);
+                    assert_eq!(query.attach_flags, 0);
+                    assert_eq!(query.program_count, 0);
+                    assert_eq!(query.program_ids, 0);
+                    assert_eq!(query.program_attach_flags, 0);
+                    assert_eq!(query.link_ids, 0);
+                    assert_eq!(query.link_attach_flags, 0);
+                    assert_eq!(query.revision, u64::MAX);
+                    Err(io::Error::from_raw_os_error(errno))
+                })
+                .expect_err("an unsupported query cannot prove the hook empty");
+                assert_eq!(
+                    crate::tc::ScopeError::from(error),
+                    crate::tc::ScopeError::Unsupported,
+                    "TCX query errno {errno} must be a capability refusal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tcx_query_inspection_failures_are_not_capability_refusals() {
+        for errno in [libc::EPERM, libc::EACCES, libc::EIO, libc::ENODEV] {
+            let error =
+                tcx_program_count_with(17, true, |_| Err(io::Error::from_raw_os_error(errno)))
+                    .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(
+                crate::tc::ScopeError::from(error),
+                crate::tc::ScopeError::Inspection
+            );
+        }
+        // EINVAL has the capability meaning only for this validated TCX request.
+        assert_eq!(
+            crate::tc::ScopeError::from(io::Error::from_raw_os_error(libc::EINVAL)),
+            crate::tc::ScopeError::Inspection
+        );
+        for ifindex in [0, u32::MAX] {
+            assert_eq!(
+                tcx_program_count_with(ifindex, true, |_| panic!("invalid query submitted"))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn tcx_query_requires_revision_readback_and_preserves_nonempty_counts() {
+        assert_eq!(
+            tcx_program_count_with(17, true, |_| Ok(()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported,
+            "a kernel without revision readback cannot prove a TCX hook empty"
+        );
+        for count in [0, 3] {
+            assert_eq!(
+                tcx_program_count_with(17, true, |query| {
+                    query.revision = 1;
+                    query.program_count = count;
+                    Ok(())
+                })
+                .unwrap(),
+                count
+            );
+        }
+        assert_eq!(
+            tcx_program_count_with(17, true, |query| {
+                query.revision = 1;
+                query.attach_flags = 1;
+                Ok(())
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn kernel_addr_is_netlink_family() {

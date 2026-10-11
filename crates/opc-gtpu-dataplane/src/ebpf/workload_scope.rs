@@ -303,6 +303,9 @@ impl EbpfGtpuDataplaneBackend {
         interface: &str,
         mode: WorkloadReset,
     ) -> Result<EbpfStrictWorkloadResetReport, GtpuError> {
+        if self.inner.local_scope.is_some() {
+            return Err(GtpuError::LegacyResetOnLocalScope);
+        }
         if self.inner.config.bpffs_pin_root != scope.bpffs_pin_root() {
             return Err(GtpuError::invalid_config(
                 "ebpf.workload_scope",
