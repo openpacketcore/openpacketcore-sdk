@@ -54,7 +54,7 @@ struct Inner {
 enum Backend {
     Local {
         authority: ScopeAuthorityStore,
-        batches: ScopeBatchStore,
+        batches: Box<ScopeBatchStore>,
     },
     #[cfg(feature = "native-scope")]
     Native {
@@ -121,7 +121,10 @@ impl ScopeKernelAuthority {
                 _owner: owner,
                 execution,
                 committed,
-                backend: Backend::Local { authority, batches },
+                backend: Backend::Local {
+                    authority,
+                    batches: Box::new(batches),
+                },
                 closed: AtomicBool::new(false),
             }),
             backend: PhantomData,
