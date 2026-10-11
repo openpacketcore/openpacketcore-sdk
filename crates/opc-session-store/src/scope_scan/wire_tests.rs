@@ -258,6 +258,15 @@ fn scope_scan_wire_keeps_every_retry_and_final_error_typed() {
     );
 }
 #[test]
+fn scope_scan_wire_refuses_local_transport_revision_mismatch() {
+    assert!(ScopeScanResponse::Failure(ScopeScanRequestFailure::Final(
+        ScopeScanError::TransportRevisionMismatch
+    ))
+    .encode_canonical()
+    .is_err());
+}
+
+#[test]
 fn scope_scan_wire_actual_page_preserves_final_failures_tombstones_and_held_claims() {
     let mut f = fixture(PageLimits::default());
     let mut source = Source::default();
