@@ -209,6 +209,33 @@ async fn changed_or_missing_child_readback_never_authorizes_an_effect() {
 }
 
 #[tokio::test]
+async fn activation_readback_rejects_a_different_batch_revision() {
+    let (mut store, request, child) = fixture();
+    let mut row = serde_json::to_value(store.row.as_ref().unwrap()).unwrap();
+    row["batch_revision"] = json!(2);
+    store.row = Some(serde_json::from_value(row).unwrap());
+    assert!(matches!(
+        commit_readback(&store, request, child).await,
+        Err(LocalEffectError::Stale)
+    ), "the exact birth, generation, value and claims cannot substitute for the activation outcome's batch revision");
+}
+
+#[tokio::test]
+async fn activation_readback_uses_one_current_child_cut_after_submission() {
+    let (store, request, child) = fixture();
+    let (key, _, _) = commit_readback(&store, request, child).await.unwrap();
+    assert_eq!(*store.events.lock().unwrap(), ["current", "execute", "read"],
+        "the local pre-submission current check stays; child readback supplies one current-authority cut");
+    store.events.lock().unwrap().clear();
+    recheck_record(&store, &key).await.unwrap();
+    assert_eq!(
+        *store.events.lock().unwrap(),
+        ["read"],
+        "effect rechecks use the child cut without surrounding Current reads"
+    );
+}
+
+#[tokio::test]
 async fn stale_currentness_prevents_submission_and_each_later_read_boundary() {
     for boundary in 0..3 {
         let (mut store, request, child) = fixture();
