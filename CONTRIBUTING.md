@@ -182,14 +182,17 @@ The script selects each ignored test exactly once, retains the original
 deadline, and fails on any failed measurement. Logs and a JSON result are
 written under `target/performance/PROFILE` (or `--output DIRECTORY`).
 
-Run the **CNF performance** workflow manually in Actions. It defaults to the
-existing GitHub-hosted `ubuntu-latest` runners. Set repository variable
+The **CNF performance** workflow runs every night on main at 04:41 UTC,
+independently of repository variables, and can also run manually in Actions.
+It defaults to the existing GitHub-hosted `ubuntu-latest` runners. Set repository variable
 `OPC_PERFORMANCE_RUNNER` to an available Linux x64 runner label to qualify a
 different runner; the manual `runner` input overrides that variable. Set
-`OPC_PERFORMANCE_GATES=true` to run qualification automatically after pushes to
-`main`. It is separate from required PR checks and fails normally when a limit
-is missed. Do not make it a required merge check until the chosen runner is
-qualified. Each profile uploads its raw logs, host details, and result.
+`OPC_PERFORMANCE_GATES=true` to add qualification after pushes to `main`.
+It is separate from required PR checks and fails normally when a limit is missed.
+Each profile uploads its raw logs, host details, and result. A failed or incomplete
+nightly opens or updates the same `nightly-qualification` classification issue
+as real-time qualification. The Rust gates hold merges until every failure is
+classified; a later green nightly does not clear that hold.
 
 Do not replace the performance deadlines or use RAM-backed database storage.
 A local timing pass qualifies only that local host/storage observation; it does

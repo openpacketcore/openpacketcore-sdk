@@ -13,6 +13,10 @@ import subprocess
 import sys
 
 LABEL = "nightly-qualification"
+PERFORMANCE_PROFILES = (
+    "core-protected", "core-selector", "native-protected",
+    "i686-protected", "unsupported-selector",
+)
 
 
 def api(path: str, payload: dict | None = None):
@@ -43,13 +47,17 @@ def check(repository: str) -> int:
     return 0
 
 
-def report_body(result: dict | None, run_url: str, conclusion: str) -> str:
-    lines = [
-        f"Nightly real-time qualification is **{conclusion}**: [workflow run]({run_url}).",
+def report_header(kind: str, run_url: str, conclusion: str) -> list[str]:
+    return [
+        f"Nightly {kind} qualification is **{conclusion}**: [workflow run]({run_url}).",
         "", "**Merge hold:** classify every failure before closing this issue. "
         "Link the known flake issue, or the regression's fix/revert and its verification. "
         "A later passing repetition or nightly does not clear this hold.", "",
     ]
+
+
+def report_body(result: dict | None, run_url: str, conclusion: str) -> str:
+    lines = report_header("real-time", run_url, conclusion)
     if result is None:
         lines.append("No result artifact was available. Inspect the run for setup, build, "
                      "runner, or artifact failures; the missing report is not a passing qualification.")
@@ -70,7 +78,35 @@ def report_body(result: dict | None, run_url: str, conclusion: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def report(repository: str, result_path: Path, conclusion: str) -> int:
+def performance_report_body(directory: Path, run_url: str, conclusion: str) -> str:
+    lines = report_header("CNF performance", run_url, conclusion)
+    lines += ["Profile results (original caller budgets):", ""]
+    for profile in PERFORMANCE_PROFILES:
+        path = directory / f"cnf-performance-{profile}" / "result.json"
+        if not path.exists():
+            # gh can extract a single downloaded artifact directly into --dir.
+            # Its embedded profile still has to match the expected matrix row.
+            path = directory / "result.json"
+        try:
+            result = json.loads(path.read_text())
+            if (not isinstance(result, dict) or result.get("profile") != profile
+                    or not isinstance(result.get("head"), str)
+                    or not isinstance(result.get("test"), str)
+                    or type(result.get("exit_code")) is not int
+                    or result.get("budget_us") != (100_000 if profile.endswith("protected") else 1_000_000)):
+                raise ValueError("incomplete or mismatched performance result")
+        except (OSError, ValueError, TypeError):
+            lines.append(f"- `{profile}`: no usable result artifact; inspect setup, build, runner and artifact logs.")
+            continue
+        outcome = "passed" if result["exit_code"] == 0 else f"failed (exit {result['exit_code']})"
+        lines.append(f"- `{profile}`: **{outcome}**; `{result['test']}`; "
+                     f"budget {result['budget_us']} us; source `{result['head']}`.")
+    lines += ["", "A passing profile does not clear this failed nightly. "
+              "Classify failed measurements and any setup, runner, or reporting failure in the linked run."]
+    return "\n".join(lines) + "\n"
+
+
+def report(repository: str, result_path: Path, conclusion: str, kind: str = "real-time") -> int:
     # PR code, including code from forks, never receives the issue-write path.
     if os.environ.get("GITHUB_EVENT_NAME") != "schedule" or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("nightly issue reporting is restricted to scheduled main runs")
@@ -78,11 +114,18 @@ def report(repository: str, result_path: Path, conclusion: str) -> int:
     if not run_id.isdigit() or conclusion == "success":
         raise ValueError("report requires a failed nightly run and its run ID")
     run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
-    try:
-        result = json.loads(result_path.read_text())
-        body = report_body(result, run_url, conclusion)
-    except (OSError, ValueError, KeyError, TypeError):
-        body = report_body(None, run_url, conclusion)
+    if kind == "performance":
+        body = performance_report_body(result_path, run_url, conclusion)
+        title = "Nightly CNF performance qualification needs classification"
+    elif kind == "real-time":
+        try:
+            result = json.loads(result_path.read_text())
+            body = report_body(result, run_url, conclusion)
+        except (OSError, ValueError, KeyError, TypeError):
+            body = report_body(None, run_url, conclusion)
+        title = "Nightly real-time qualification needs classification"
+    else:
+        raise ValueError("unknown qualification kind")
     # The workflow token needs issues:write only in this scheduled-main job.
     subprocess.run([
         "gh", "label", "create", LABEL, "--repo", repository, "--force",
@@ -95,7 +138,7 @@ def report(repository: str, result_path: Path, conclusion: str) -> int:
         print(f"updated nightly merge hold: {issue['html_url']}")
     else:
         issue = api(f"repos/{repository}/issues", {
-            "title": "Nightly real-time qualification needs classification",
+            "title": title,
             "body": body, "labels": [LABEL],
         })
         print(f"created nightly merge hold: {issue['html_url']}")
@@ -108,12 +151,13 @@ def main() -> int:
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--result", type=Path, default=Path("qualification-results/result.json"))
     parser.add_argument("--conclusion", default="failure")
+    parser.add_argument("--kind", choices=["real-time", "performance"], default="real-time")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         parser.error("repository must be owner/name")
     if args.command == "check":
         return check(args.repository)
-    return report(args.repository, args.result, args.conclusion)
+    return report(args.repository, args.result, args.conclusion, args.kind)
 
 
 if __name__ == "__main__":

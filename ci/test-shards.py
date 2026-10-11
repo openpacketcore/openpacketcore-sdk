@@ -85,6 +85,7 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_drains_after_the_leader_loses_authority_during_the_original_call",
     "consumer_void_unknown_response_retains_until_exact_status_confirms_it",
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
+    "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",

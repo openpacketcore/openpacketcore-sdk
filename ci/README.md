@@ -6,6 +6,22 @@ shards in [ci.yml](../.github/workflows/ci.yml). Use
 to reproduce the shards with the profile and disk setup in
 [CONTRIBUTING](../CONTRIBUTING.md#validation-gates).
 
+## Privileged regression coverage
+
+The **Rust SCTP cold multihoming** lane in [ci.yml](../.github/workflows/ci.yml)
+runs both pending-blackhole connection-progress tests in a fresh network
+namespace. The **Privileged Linux GTP-U** lane in
+[gtpu-privileged.yml](../.github/workflows/gtpu-privileged.yml) runs the three
+empty historical hierarchy normalization tests on a private bpffs mount, plus
+the route-steering tests for distinct IPv4/IPv6 mark-only rules and locked-MTU
+ICMP signaling in both families. Both lanes run on PRs and main pushes.
+
+These commands select exact ignored names and require their exact executed
+counts with zero ignored tests. Normalization and locked-MTU tests must also
+emit their success markers, so an unset privileged flag cannot produce a
+passing gate without exercising the kernel. Build as the ordinary user, then
+run the resulting test binary with the namespace privileges it needs.
+
 ## Exact, temporary qualification manifest
 
 [realtime-qualification.json](realtime-qualification.json) is the complete list
@@ -48,6 +64,13 @@ environment, four test threads, logs, commands, source revision, and per-run
 results. Nightly repetitions measure frequency; a later pass never erases an
 earlier failure. Setup errors, partial runs, and missing artifacts are failures.
 
+The [CNF performance workflow](../.github/workflows/performance.yml) separately
+runs all five latency profiles nightly on main at 04:41 UTC, without requiring
+`OPC_PERFORMANCE_GATES`. That variable enables additional push runs. The original
+100 ms protected-request and one-second selector limits remain unchanged.
+Any failed, cancelled or incomplete scheduled matrix uses the same classification
+hold below, including failures that leave no result artifact.
+
 ## Decisions before merging
 
 A red PR qualification job is a review signal that requires classification.
@@ -79,6 +102,8 @@ authenticated GitHub CLI and inspect completed scheduled workflow results:
 python3 ci/nightly_qualification.py check --repository openpacketcore/openpacketcore-sdk
 gh run list --repo openpacketcore/openpacketcore-sdk \
   --workflow realtime-qualification.yml --event schedule --branch main
+gh run list --repo openpacketcore/openpacketcore-sdk \
+  --workflow performance.yml --event schedule --branch main
 ```
 
 Verify that every red nightly since the last classification is accounted for.

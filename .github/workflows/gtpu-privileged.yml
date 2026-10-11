@@ -37,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ethtool iproute2 kmod nftables wireguard-tools
+          sudo apt-get install -y ethtool iproute2 iputils-ping kmod nftables procps wireguard-tools
 
       - name: Check privileged GTP kernel support
         run: |
@@ -73,6 +73,65 @@ jobs:
           '
           sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo unshare -n -- ip link set lo up
+
+      - name: Prove empty historical hierarchy normalization and crash recovery
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-empty-normalization-build.jsonl"
+          normalization_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_gtpu_dataplane" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one GTP-U test binary") end
+          ' "${RUNNER_TEMP}/gtpu-empty-normalization-build.jsonl")"
+          normalization_log="${RUNNER_TEMP}/gtpu-empty-normalization.log"
+          sudo env OPC_GTPU_RUN_PRIVILEGED=1 \
+            unshare -mn --propagation private -- bash -euxo pipefail -c '
+              ip link set lo up
+              mount -t bpf bpf /sys/fs/bpf
+              exec "$@"
+            ' gtpu-empty-normalization "${normalization_binary}" --ignored --exact \
+              ebpf::aya_runtime::race_tests::empty_historical_25_hierarchy_normalizes_then_allows_ordinary_create \
+              ebpf::aya_runtime::race_tests::empty_historical_25_hierarchy_normalization_crash_cuts_converge \
+              ebpf::aya_runtime::race_tests::empty_historical_25_normalization_refuses_nested_configured_root_pre_effect \
+              --nocapture --test-threads=1 2>&1 | tee "${normalization_log}"
+          grep -Fq 'test result: ok. 3 passed; 0 failed; 0 ignored;' "${normalization_log}"
+          grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_PROVEN' "${normalization_log}"
+          grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_CRASH_CUTS_PROVEN' "${normalization_log}"
+          grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NESTED_ROOT_REFUSAL_PROVEN' "${normalization_log}"
+
+      - name: Prove route rule families and locked route MTU on the kernel
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-route-steering \
+            --test live_readback_probe --test live_locked_route_mtu \
+            --no-run --message-format=json > "${RUNNER_TEMP}/route-kernel-build.jsonl"
+          for target in live_readback_probe live_locked_route_mtu; do
+            case "${target}" in
+              live_readback_probe)
+                test_name=live_ipv4_and_ipv6_mark_only_rules_are_distinct_kernel_objects ;;
+              live_locked_route_mtu)
+                test_name=live_locked_route_mtu_makes_the_kernel_signal_oversized_packets_for_both_families ;;
+            esac
+            route_binary="$(jq -ers --arg target "${target}" '
+              map(select(.reason == "compiler-artifact" and .profile.test == true
+                and .target.name == $target and .executable != null))
+              | if length == 1 then .[0].executable else error("expected one route test binary") end
+            ' "${RUNNER_TEMP}/route-kernel-build.jsonl")"
+            route_log="${RUNNER_TEMP}/${target}.log"
+            sudo unshare -mn --propagation private -- bash -euxo pipefail -c '
+              # Named child netns mounts must remain inside this test namespace.
+              mount -t tmpfs tmpfs /run
+              mkdir -p /run/netns
+              ip link set lo up
+              exec "$@"
+            ' route-kernel "${route_binary}" --ignored --exact "${test_name}" \
+              --nocapture --test-threads=1 2>&1 | tee "${route_log}"
+            grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${route_log}"
+          done
+          grep -Fq 'OPC_ROUTE_LOCKED_MTU_ICMP_PROVEN:' "${RUNNER_TEMP}/live_locked_route_mtu.log"
 
       - name: Prove map-in-map reader grace
         run: |

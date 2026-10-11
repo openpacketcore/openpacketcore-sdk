@@ -466,7 +466,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y iproute2 kmod nftables
+          sudo apt-get install -y iproute2 iptables kmod nftables
           if ! sudo modprobe sctp; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)"
             sudo modprobe sctp
@@ -476,6 +476,26 @@ jobs:
             ip link set lo up
             ss -H -n -a -A sctp
           '
+
+      - name: Require pending SCTP connection progress through blackholes
+        run: |
+          set -euo pipefail
+          cargo test --locked -p opc-sctp --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/sctp-progress-build.jsonl"
+          progress_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_sctp" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one SCTP test binary") end
+          ' "${RUNNER_TEMP}/sctp-progress-build.jsonl")"
+          progress_log="${RUNNER_TEMP}/sctp-progress.log"
+          sudo unshare -n -- bash -euxo pipefail -c '
+            ip link set lo up
+            exec "$@"
+          ' sctp-progress "${progress_binary}" --ignored --exact \
+            tests::connect_progress_survives_pending_blackhole_timeout \
+            tests::diameter_full_policy_progress_survives_multihomed_blackhole_timeout \
+            --nocapture --test-threads=1 2>&1 | tee "${progress_log}"
+          grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored;' "${progress_log}"
 
       - name: Build cold SCTP multihoming regression fixture
         run: |

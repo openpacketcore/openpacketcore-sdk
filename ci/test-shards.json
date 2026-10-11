@@ -49,6 +49,7 @@
     "consumer_void_drains_after_the_leader_loses_authority_during_the_original_call": "heavy-1",
     "consumer_void_unknown_response_retains_until_exact_status_confirms_it": "heavy-1",
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps": "heavy-1",
+    "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap": "heavy-1",
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum": "it-0",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction": "it-0",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof": "it-0",

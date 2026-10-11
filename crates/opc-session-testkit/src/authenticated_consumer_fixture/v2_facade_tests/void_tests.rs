@@ -280,6 +280,68 @@ async fn consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap() {
+    let fixture = Arc::new(
+        AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])
+            .await
+            .unwrap(),
+    );
+    let result = std::panic::AssertUnwindSafe(async {
+        let journal = fixture.open_recovery_journal().unwrap();
+        let provider = CountingProvider::new();
+        let activated = SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(fixture.persistent_clients().unwrap()).await.unwrap();
+        let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, Arc::clone(&provider), "void-cursor", Arc::clone(&journal)).unwrap();
+        drop(facade.prepare_fenced_transition(create(request_id(911), 911, PAYLOAD), budget(soon())).await.unwrap());
+        for voter in &fixture.voters { voter.service.stall_fenced_transition_v2_void_response.store(true, Ordering::Release); }
+        let unknown = facade.reclaim_resolved_fenced_transitions(8, budget(soon())).await.unwrap();
+        assert_eq!(unknown.reclaimed(), 0);
+        assert_eq!(unknown.retained(), 1);
+        drop(facade);
+        for voter in &fixture.voters {
+            voter.service.stall_fenced_transition_v2_void_response.store(false, Ordering::Release);
+            voter.service.unavailable_fenced_transition_v2_capability.store(true, Ordering::Release);
+        }
+        let activated = SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(fixture.persistent_clients().unwrap()).await.unwrap();
+        let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, Arc::clone(&provider), "void-cursor", Arc::clone(&journal)).unwrap();
+        for ordinal in [910, 912] { drop(facade.prepare_fenced_transition(create(request_id(ordinal), ordinal, PAYLOAD), budget(soon())).await.unwrap()); }
+        let report = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
+        assert!(!report.interrupted(), "{report:?}");
+        assert_eq!(report.examined(), 3, "{report:?}");
+        assert_eq!(report.voided(), 1, "{report:?}");
+        assert_eq!(report.reclaimed(), 1, "recorded status behind the unavailable first row");
+        assert_eq!(report.retained(), 2, "{report:?}");
+        let wrapped = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
+        assert_eq!(wrapped.examined(), 0, "finish the cursor page and wrap");
+        for voter in &fixture.voters { voter.service.unavailable_fenced_transition_v2_capability.store(false, Ordering::Release); }
+        drop(facade);
+        // With available void capability and no held response, one sweep
+        // must reach and remove both rows on either side of the old cursor.
+        // Reopen the same journal with clients created on the frozen runtime,
+        // so host scheduling cannot spend a void attempt's protocol deadline.
+        let fixture = Arc::clone(&fixture);
+        with_fixture_protocol_clock("one available void sweep", async move {
+            let activated = SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(fixture.persistent_clients().unwrap()).await.unwrap();
+            let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(activated, provider, "void-cursor", journal).unwrap();
+            let drained = facade.reclaim_resolved_fenced_transitions(3, budget(soon())).await.unwrap();
+            assert!(!drained.interrupted(), "one available sweep completes: {drained:?}");
+            assert_eq!(drained.examined(), 2, "one available sweep reaches both rows: {drained:?}");
+            assert_eq!(drained.voided(), 2, "one available sweep voids both rows: {drained:?}");
+            assert_eq!(drained.reclaimed(), 2, "both rows are removed in the same sweep: {drained:?}");
+            assert_eq!(drained.retained(), 0, "{drained:?}");
+            assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0, "{drained:?}");
+        }).await;
+    }).catch_unwind().await;
+    Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("the frozen client released the fixture"))
+        .shutdown()
+        .await
+        .unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_void_lost_before_bind_drains_the_row_and_resolves_the_live_handle() {
     let fixture =
         AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])

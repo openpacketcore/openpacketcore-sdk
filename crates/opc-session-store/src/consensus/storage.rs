@@ -38,6 +38,8 @@ use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
 use super::snapshot::rename_noreplace_in_directory;
 #[cfg(target_os = "linux")]
 use super::snapshot::snapshot_cleanup_unlink_guard_name_authenticates_metadata;
+#[cfg(any(test, all(feature = "test-control", target_os = "linux")))]
+use super::snapshot::SnapshotArtifactGate;
 use super::snapshot::{
     acknowledge_unpublished_snapshot_cleanup_failure,
     create_unpublished_snapshot_file_in_namespace, fixed_verity_is_exactly_unsealed,
@@ -47,9 +49,7 @@ use super::snapshot::{
     SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES, SNAPSHOT_MAX_BYTES,
 };
 #[cfg(test)]
-use super::snapshot::{
-    fixed_prepublication_scan_boundary, FixedPrepublicationScanGateGuard, SnapshotArtifactGate,
-};
+use super::snapshot::{fixed_prepublication_scan_boundary, FixedPrepublicationScanGateGuard};
 #[cfg(target_os = "linux")]
 use super::snapshot::{
     pending_snapshot_namespace_recovery_authority, PendingSnapshotNamespaceRecoveryAuthority,
@@ -2166,7 +2166,7 @@ async fn wait_before_fixed_prepublication_verify(final_path: &Path) {
 /// that precedes durable current-snapshot publication. It lets a causal test
 /// terminalize an already Active remote recovery latch after the builder has
 /// selected S1 but before it could publish S2.
-#[cfg(test)]
+#[cfg(any(test, all(feature = "test-control", target_os = "linux")))]
 fn recovery_publication_fence_gates(
 ) -> &'static std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>> {
     static GATES: std::sync::OnceLock<
@@ -2175,13 +2175,13 @@ fn recovery_publication_fence_gates(
     GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(all(test, target_os = "linux"))]
-struct RecoveryPublicationFenceGateGuard {
+#[cfg(all(any(test, feature = "test-control"), target_os = "linux"))]
+pub(crate) struct RecoveryPublicationFenceGateGuard {
     snapshot_directory: PathBuf,
     gate: std::sync::Arc<SnapshotArtifactGate>,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-control"), target_os = "linux"))]
 impl RecoveryPublicationFenceGateGuard {
     fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
         recovery_publication_fence_gates()
@@ -2195,7 +2195,7 @@ impl RecoveryPublicationFenceGateGuard {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-control"), target_os = "linux"))]
 impl Drop for RecoveryPublicationFenceGateGuard {
     fn drop(&mut self) {
         self.gate.release();
@@ -2211,7 +2211,7 @@ impl Drop for RecoveryPublicationFenceGateGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(feature = "test-control", target_os = "linux")))]
 async fn wait_before_recovery_publication_fence(snapshot_directory: &Path) {
     let gate = recovery_publication_fence_gates()
         .lock()
@@ -2722,6 +2722,14 @@ async fn derive_private_wal_install_source(
 }
 
 impl LiveTerminalRecoveryHandoffConsumer {
+    #[cfg(all(feature = "test-control", target_os = "linux"))]
+    pub(crate) fn pause_snapshot_publication_for_test(
+        &self,
+        gate: Arc<SnapshotArtifactGate>,
+    ) -> RecoveryPublicationFenceGateGuard {
+        RecoveryPublicationFenceGateGuard::install(self.core.snapshot_dir.as_ref().clone(), gate)
+    }
+
     pub(crate) fn snapshot_integrity_policy(&self) -> SnapshotIntegrityPolicy {
         self.core.snapshot_integrity
     }
@@ -7235,7 +7243,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 )
             })?
         };
-        #[cfg(test)]
+        #[cfg(any(test, all(feature = "test-control", target_os = "linux")))]
         wait_before_recovery_publication_fence(self.core.snapshot_dir.as_ref()).await;
         #[cfg(feature = "test-control")]
         self.core

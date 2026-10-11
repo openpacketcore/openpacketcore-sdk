@@ -1,6 +1,8 @@
 name: CNF performance
 
 on:
+  schedule:
+    - cron: '41 4 * * *'
   workflow_dispatch:
     inputs:
       runner:
@@ -13,13 +15,13 @@ on:
 permissions:
   contents: read
 
-# This workflow is independent of required functional CI. Enable automatic
-# main-branch qualification with OPC_PERFORMANCE_GATES=true, or run manually.
+# Scheduled main qualification always runs. OPC_PERFORMANCE_GATES enables
+# additional push qualification; manual dispatch remains available.
 # Every enabled measurement fails normally when its original limit is missed.
 jobs:
   latency:
     name: CNF latency (${{ matrix.profile }})
-    if: github.event_name == 'workflow_dispatch' || vars.OPC_PERFORMANCE_GATES == 'true'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.OPC_PERFORMANCE_GATES == 'true'
     runs-on: ${{ inputs.runner || vars.OPC_PERFORMANCE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
@@ -78,3 +80,30 @@ jobs:
           name: cnf-performance-${{ matrix.profile }}
           path: performance-results/
           if-no-files-found: error
+
+  report-nightly:
+    name: Report nightly latency qualification failure
+    needs: latency
+    if: always() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.latency.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Checkout scheduled main revision
+        uses: actions/checkout@v7
+
+      - name: Open or update the classification issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFICATION_RESULT: ${{ needs.latency.result }}
+        run: |
+          # Missing setup/build/runner artifacts still require classification.
+          if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'cnf-performance-*' --dir performance-results; then
+            echo "Some latency qualification artifacts could not be downloaded; reporting the job failure."
+          fi
+          python3 ci/nightly_qualification.py report --kind performance \
+            --result performance-results --conclusion "$QUALIFICATION_RESULT"
