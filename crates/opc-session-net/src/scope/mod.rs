@@ -9,6 +9,8 @@ mod clock;
 mod notice;
 mod policy;
 mod pool;
+#[cfg(test)]
+mod revision_tests;
 mod proof;
 mod socket;
 mod wire;

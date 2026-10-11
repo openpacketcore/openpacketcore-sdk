@@ -1,4 +1,6 @@
 use super::{boot::BootIdentity, clock::*, policy::*, proof::*, startup::*, wire::*};
+#[path = "startup_revision_tests.rs"]
+mod revision;
 use opc_identity::{build_identity_state, IdentityState, TrustBundle, TrustBundleSet, TrustDomain};
 use opc_tls::{AuthenticationTimeInterval, PeerPolicy, TlsConfigBuilder};
 use opc_types::{InstanceId, NetworkFunctionKind, SpiffeId, TenantId, Timestamp};

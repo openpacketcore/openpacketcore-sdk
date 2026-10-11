@@ -16,6 +16,8 @@ use std::sync::{
     Arc, Mutex,
 };
 use tokio::sync::watch;
+#[path = "issuer_revision_tests.rs"]
+mod revision;
 struct IssuerClock(AtomicI64);
 impl super::AuthenticationClock for IssuerClock {
     fn interval(
