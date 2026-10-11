@@ -6,7 +6,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "17 8 * * 1"
+    - cron: "17 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,6 +20,8 @@ jobs:
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
     env:
       GITLEAKS_VERSION: "8.30.1"
     steps:
@@ -47,6 +49,7 @@ jobs:
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Run gitleaks
+        id: scan
         shell: bash
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -55,14 +58,24 @@ jobs:
           set -euo pipefail
           case "$GITHUB_EVENT_NAME" in
             pull_request)
-              log_opts="${PR_BASE_SHA:?}..${PR_HEAD_SHA:?}"
+              for revision in "${PR_BASE_SHA:?}" "${PR_HEAD_SHA:?}"; do
+                git rev-parse --verify --quiet "${revision}^{commit}" >/dev/null || {
+                  echo "::error::Secret scan cannot find pull request commit ${revision}"
+                  exit 1
+                }
+              done
+              log_opts="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+              if ! git diff --quiet "${PR_BASE_SHA}...${PR_HEAD_SHA}" -- .gitleaksignore .gitleaks.toml; then
+                echo "::warning title=Secret scan exceptions changed::This pull request changes .gitleaksignore or .gitleaks.toml. Check that each added line pins one false positive by commit, file, rule and line."
+              fi
               ;;
-            push|workflow_dispatch)
+            push)
               # A single revision includes its entire reachable history.
               log_opts="--full-history ${GITHUB_SHA:?}"
               ;;
-            schedule)
-              git fetch --force --prune origin '+refs/*:refs/secret-scan/*'
+            schedule|workflow_dispatch)
+              git fetch --force --prune origin \
+                '+refs/heads/*:refs/secret-scan/heads/*' '+refs/tags/*:refs/secret-scan/tags/*'
               log_opts="--full-history --all"
               ;;
             *)
@@ -70,7 +83,16 @@ jobs:
               exit 1
               ;;
           esac
-          gitleaks detect --source . --redact --no-banner --log-opts "$log_opts"
+          report="${RUNNER_TEMP}/gitleaks-report.json"
+          status=0
+          # Exit 2 means findings. Any other non-zero status means the scan did not complete.
+          gitleaks detect --source . --redact --no-banner --exit-code 2 \
+            --report-format json --report-path "$report" --log-opts "$log_opts" || status=$?
+          if [[ "$status" -eq 2 ]]; then
+            count="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$report")"
+            echo "findings=${count}" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
 
   report-scheduled-secret-scan:
     name: Report scheduled secret scan failure
@@ -88,6 +110,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SCAN_RESULT: ${{ needs.secret-scan.result }}
+          SCAN_FINDINGS: ${{ needs.secret-scan.outputs.findings }}
         shell: bash
         run: |
           set -euo pipefail
@@ -97,11 +120,16 @@ jobs:
           issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
           body_file="${RUNNER_TEMP}/secret-scan-issue.md"
+          if [[ "$SCAN_FINDINGS" =~ ^[0-9]+$ ]]; then
+            detail="Findings: ${SCAN_FINDINGS}."
+          else
+            detail='No finding count was passed on: the scan found something or did not complete. This is not a clean result.'
+          fi
           printf '%s\n' \
-            "Scheduled all-ref secret scan: **${SCAN_RESULT}**." \
+            "Scheduled all-ref secret scan: **${SCAN_RESULT}**. ${detail}" \
             "[Workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})." \
             '' \
-            'Review the redacted scan log for findings or setup failures. This issue does not block unrelated pull requests.' \
+            'The run log shows only the total and redacts values. To list the findings, fetch all refs as the workflow does and run the same gitleaks command with --verbose. This issue does not block unrelated pull requests.' \
             > "$body_file"
           if [[ -n "$issue" ]]; then
             gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"

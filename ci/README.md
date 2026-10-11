@@ -9,14 +9,32 @@ to reproduce the shards with the profile and disk setup in
 ## Secret scan scope
 
 The [security workflow](../.github/workflows/security.yml) scans a pull request's
-exact `base.sha..head.sha` range with the head's `.gitleaksignore`. Pushes to
-`main` scan the pushed commit's full reachable history, so every commit that
-reaches `main` is scanned in its pull request and again on the push to `main`.
-Scheduled runs fetch and scan all refs, including branches without pull requests;
-findings or scan failures open or update a `secret-scan` issue with the run link.
+exact `base.sha..head.sha` range with the head's `.gitleaksignore`.
+Pushes to `main` scan the pushed commit's full reachable history. A commit that
+reaches `main` through a pull request against `main` is scanned in that pull
+request and again on the push to `main`. The push to `main` is the only scan for
+the merge commit GitHub creates, for a direct push, and for commits that were
+already on a pull request's base branch when that base was not `main`; changing
+a pull request's base does not scan it again. gitleaks reads `git log -p`, which
+prints no diff for a merge commit, so text that exists only in a merge commit's
+conflict resolution is not scanned by any run.
+
+Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
+the `.gitleaksignore` on `main`, including branches without pull requests.
+They do not fetch pull request heads; those are scanned by their own runs.
+Findings or scan failures open or update a `secret-scan` issue with the run link
+and a finding count when available; missing results are never reported as clean.
 That issue does not impose a merge hold on unrelated pull requests. Manual runs
-scan the dispatched commit's full history. Required workflow regressions in
+scan all refs like the scheduled run, with the dispatched commit's
+`.gitleaksignore`, and do not open an issue. Required workflow regressions in
 `ci/test-test-inventory.py` pin these scopes and scheduled issue reporting.
+
+A pull request is scanned with its own `.gitleaksignore`, so it can silence a
+finding that it adds. Review every change to `.gitleaksignore`, and any new
+`.gitleaks.toml`, as a security change: each added line pins one false positive
+by commit, file, rule and line and says why the value is not a secret. Do not
+add path or rule allowlists. The scan emits a warning when either file changes;
+the warning does not fail the scan.
 
 ## Test inventory guard
 
