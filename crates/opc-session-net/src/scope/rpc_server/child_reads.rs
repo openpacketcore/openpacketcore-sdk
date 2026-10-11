@@ -30,9 +30,9 @@ impl ScopeServer {
                     *reply_deadline = Some(deadline);
                     async move {
                         admission.check().map_err(ScopeBatchError::from)?;
-                        let public_key = admission.public_key.ok_or_else(|| {
-                            ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized)
-                        })?;
+                        let public_key = admission
+                            .public_key
+                            .ok_or(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized))?;
                         // Independent of the carried execution check: bind the
                         // actual current execution at this cut to the proven key.
                         if current.execution().identity().as_str()
