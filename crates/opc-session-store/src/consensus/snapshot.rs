@@ -628,7 +628,7 @@ const _: () = assert!(
 const SNAPSHOT_REPLAY_VERIFY_BYTES: usize = 64 * 1024;
 
 /// Test-only coordination around a snapshot artifact lifecycle boundary.
-#[cfg(test)]
+#[cfg(any(test, all(feature = "test-control", target_os = "linux")))]
 pub(crate) struct SnapshotArtifactGate {
     armed: AtomicBool,
     started: AtomicBool,
@@ -639,7 +639,7 @@ pub(crate) struct SnapshotArtifactGate {
     blocking_release: std::sync::Condvar,
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(feature = "test-control", target_os = "linux")))]
 impl SnapshotArtifactGate {
     pub(crate) fn new() -> Self {
         Self {
@@ -701,6 +701,7 @@ impl SnapshotArtifactGate {
 
     /// Hold a synchronous descriptor-scan boundary. This is test-only so
     /// production retains no gate or registry.
+    #[cfg(test)]
     pub(crate) fn block_if_armed_blocking(&self) {
         if !self.armed.load(Ordering::Acquire) {
             return;

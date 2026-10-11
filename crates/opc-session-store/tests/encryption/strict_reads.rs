@@ -80,13 +80,18 @@ impl Protection {
     }
 }
 
-/// A physical adapter fixture that returns the same immutable stored row on
-/// every surface. Calls are recorded so read rejection cannot hide a repair,
-/// delete, fallback, or retry mutation. CAS always conflicts; a batch returns
-/// its read/CAS slots after delegation, just as the public contract permits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PhysicalState {
+    record: Option<StoredSessionRecord>,
+    entries: Vec<ReplicationEntry>,
+    mutations: usize,
+}
+
+/// A physical adapter with mutable storage and an independent call log.
+/// Requested CAS operations conflict with the seeded generation; unexpected
+/// writes, deletes, refreshes and replication repairs change the snapshot.
 struct PhysicalReads {
-    record: StoredSessionRecord,
-    entry: ReplicationEntry,
+    state: StdMutex<PhysicalState>,
     calls: StdMutex<Vec<&'static str>>,
 }
 
@@ -102,20 +107,34 @@ impl PhysicalReads {
             }
         }
         Self {
-            record,
-            entry,
+            state: StdMutex::new(PhysicalState {
+                record: Some(record),
+                entries: vec![entry],
+                mutations: 0,
+            }),
             calls: StdMutex::new(Vec::new()),
         }
+    }
+
+    fn snapshot(&self) -> PhysicalState {
+        self.state.lock().expect("physical storage").clone()
     }
 
     fn note(&self, call: &'static str) {
         self.calls.lock().expect("call log").push(call);
     }
 
-    fn conflict(&self) -> CompareAndSetResult {
-        CompareAndSetResult::Conflict {
-            current: Some(self.record.clone()),
+    fn apply_cas(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        op.new_record.payload.validate_envelope()?;
+        let mut state = self.state.lock().expect("physical storage");
+        if state.record.as_ref().map(|record| record.generation) != op.expected_generation {
+            return Ok(CompareAndSetResult::Conflict {
+                current: state.record.clone(),
+            });
         }
+        state.record = Some(op.new_record);
+        state.mutations += 1;
+        Ok(CompareAndSetResult::Success)
     }
 }
 
@@ -129,22 +148,30 @@ impl SessionBackend for PhysicalReads {
 
     async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         self.note("get");
-        Ok(Some(self.record.clone()))
+        Ok(self.snapshot().record)
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         self.note("cas");
-        op.new_record.payload.validate_envelope()?;
-        Ok(self.conflict())
+        self.apply_cas(op)
     }
 
     async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
         self.note("delete");
+        let mut state = self.state.lock().expect("physical storage");
+        state.record = None;
+        state.mutations += 1;
         Ok(())
     }
 
-    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
         self.note("refresh");
+        let expires_at = checked_session_deadline(Timestamp::now_utc(), ttl)?;
+        let mut state = self.state.lock().expect("physical storage");
+        if let Some(record) = state.record.as_mut() {
+            record.expires_at = Some(expires_at);
+        }
+        state.mutations += 1;
         Ok(())
     }
 
@@ -152,10 +179,9 @@ impl SessionBackend for PhysicalReads {
         self.note("batch");
         ops.into_iter()
             .map(|op| match op {
-                SessionOp::Get { .. } => Ok(SessionOpResult::Get(Ok(Some(self.record.clone())))),
+                SessionOp::Get { .. } => Ok(SessionOpResult::Get(Ok(self.snapshot().record))),
                 SessionOp::CompareAndSet(cas) => {
-                    cas.new_record.payload.validate_envelope()?;
-                    Ok(SessionOpResult::CompareAndSet(Ok(self.conflict())))
+                    Ok(SessionOpResult::CompareAndSet(Ok(self.apply_cas(cas)?)))
                 }
                 _ => panic!("fixture accepts only the requested read and conflicting CAS"),
             })
@@ -167,7 +193,11 @@ impl SessionBackend for PhysicalReads {
         _request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
         self.note("scan");
-        Ok(RestoreScanPage::new(vec![self.record.clone()], 0, None))
+        Ok(RestoreScanPage::new(
+            self.snapshot().record.into_iter().collect(),
+            0,
+            None,
+        ))
     }
 
     async fn get_replication_log(
@@ -176,19 +206,33 @@ impl SessionBackend for PhysicalReads {
         _limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         self.note("log");
-        Ok(vec![self.entry.clone()])
+        Ok(self.snapshot().entries)
     }
 
-    async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         self.note("replicate");
+        let mut state = self.state.lock().expect("physical storage");
+        if let Some(record) = replication_cas_records(&entry.op).last() {
+            state.record = Some((*record).clone());
+        }
+        state.entries.push(entry);
+        state.mutations += 1;
         Ok(())
     }
 
     async fn rebuild_replication_state(
         &self,
-        _entries: Vec<ReplicationEntry>,
+        entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
         self.note("rebuild");
+        let mut state = self.state.lock().expect("physical storage");
+        state.record = entries
+            .iter()
+            .flat_map(|entry| replication_cas_records(&entry.op))
+            .last()
+            .cloned();
+        state.entries = entries;
+        state.mutations += 1;
         Ok(())
     }
 
@@ -197,7 +241,7 @@ impl SessionBackend for PhysicalReads {
         _start_sequence: u64,
     ) -> Result<stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
         self.note("watch");
-        Ok(stream::iter(vec![Ok(self.entry.clone())]).boxed())
+        Ok(stream::iter(self.snapshot().entries.into_iter().map(Ok)).boxed())
     }
 
     fn fenced_transition_preserves_protected_payloads(&self) -> bool {
@@ -215,9 +259,10 @@ impl SessionBackend for PhysicalReads {
         _key: &SessionKey,
     ) -> Result<FencedTransitionObservation, StoreError> {
         self.note("observe");
+        let record = self.snapshot().record.expect("seeded physical observation");
         Ok(serde_json::from_value(serde_json::json!({
-            "record": self.record,
-            "current_fence": self.record.fence,
+            "record": record,
+            "current_fence": record.fence,
         }))
         .expect("synthetic physical observation"))
     }
@@ -313,6 +358,7 @@ async fn rejects_non_envelopes(protection: Protection) {
             ..test_record(test_key(), 1, &lease)
         };
         let inner = Arc::new(PhysicalReads::new(physical));
+        let before_storage = inner.snapshot();
         let before_calls = protection.calls();
         let results = ordinary_reads(
             protection.backend(
@@ -323,6 +369,11 @@ async fn rejects_non_envelopes(protection: Protection) {
             &lease,
         )
         .await;
+        assert_eq!(
+            inner.snapshot(),
+            before_storage,
+            "strict reads changed physical storage"
+        );
         // Only the two caller-requested replacement bodies may invoke a
         // provider. No raw read result may reach provider/application decode.
         assert_eq!(protection.calls() - before_calls, 2);
@@ -676,6 +727,33 @@ async fn rejects_late_ordinary_record(protection: Protection) {
     );
 }
 
+async fn seed_replication_log(inner: &SqliteSessionBackend) {
+    let now = inner
+        .record_expiry_reference()
+        .expect("standalone authority clock");
+    let mut key = test_key();
+    key.stable_id = Bytes::from_static(b"strict-read-replication-canary")
+        .try_into()
+        .unwrap();
+    let ttl = Duration::from_secs(60);
+    let entry = ReplicationEntry {
+        sequence: 1,
+        tx_id: "strict-read-replication-canary".try_into().unwrap(),
+        timestamp: now,
+        op: ReplicationOp::AcquireLease {
+            key,
+            owner: OwnerId::new("replication-canary").unwrap(),
+            fence: FenceToken::new(100),
+            credential_id: 100,
+            ttl,
+            expires_at: checked_session_deadline(now, ttl).unwrap(),
+        },
+    };
+    inner.replicate_entry(entry.clone()).await.unwrap();
+    assert_eq!(inner.max_replication_sequence().await.unwrap(), 1);
+    assert_eq!(inner.get_replication_log(1, 8).await.unwrap(), vec![entry]);
+}
+
 async fn batch_preserves_sibling_results(protection: Protection) {
     let inner = Arc::new(SqliteSessionBackend::in_memory().expect("SQLite batch backend"));
     let mut good_key = test_key();
@@ -727,6 +805,9 @@ async fn batch_preserves_sibling_results(protection: Protection) {
             .unwrap(),
         CompareAndSetResult::Success
     );
+    seed_replication_log(inner.as_ref()).await;
+    let sequence = inner.max_replication_sequence().await.unwrap();
+    let log = inner.get_replication_log(1, 8).await.unwrap();
     let updated_record = test_record(good_key.clone(), 2, &good_lease);
     let results = backend
         .batch(vec![
@@ -756,6 +837,16 @@ async fn batch_preserves_sibling_results(protection: Protection) {
         SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
     );
     assert_eq!(inner.get(&test_key()).await.unwrap(), Some(raw_record));
+    assert_eq!(
+        inner.max_replication_sequence().await.unwrap(),
+        sequence,
+        "strict batch changed the replication sequence"
+    );
+    assert_eq!(
+        inner.get_replication_log(1, 8).await.unwrap(),
+        log,
+        "strict batch changed the replication log"
+    );
     assert_eq!(backend.get(&good_key).await.unwrap(), Some(updated_record));
     assert_eq!(
         results[0],
@@ -816,8 +907,13 @@ async fn ordinary_envelope_controls(protection: Protection) {
     let plain = application_record(&lease, 1);
     let sealed = protection.sealed(plain.clone(), NAMESPACE).await;
     let inner = Arc::new(PhysicalReads::new(sealed.clone()));
+    let before_storage = inner.snapshot();
     for result in ordinary_reads(
-        protection.backend(inner, Some(EnvelopeReadPolicy::RequireEnvelopeV1), None),
+        protection.backend(
+            inner.clone(),
+            Some(EnvelopeReadPolicy::RequireEnvelopeV1),
+            None,
+        ),
         &lease,
     )
     .await
@@ -828,6 +924,11 @@ async fn ordinary_envelope_controls(protection: Protection) {
             assert_eq!(record, plain);
         }
     }
+    assert_eq!(
+        inner.snapshot(),
+        before_storage,
+        "authenticated reads changed physical storage"
+    );
     for invalid in unauthentic_records(&protection, &plain, &sealed).await {
         for result in ordinary_reads(
             protection.backend(
@@ -923,12 +1024,18 @@ async fn protected_observation_controls(protection: Protection) {
                 ..plain.clone()
             };
             let inner = Arc::new(PhysicalReads::new(physical));
+            let before_storage = inner.snapshot();
             let before = protection.calls();
             let error = protection
                 .backend(inner.clone(), policy, Some(journal.clone()))
                 .observe_fenced_transition(&test_key())
                 .await
                 .expect_err("existing stronger physical guard");
+            assert_eq!(
+                inner.snapshot(),
+                before_storage,
+                "protected observation changed physical storage"
+            );
             assert_eq!(
                 error,
                 StoreError::CapabilityNotSupported("atomic_fenced_transition_v2".into())
@@ -995,7 +1102,10 @@ async fn sqlite_preserves_unexpired_raw_record(protection: Protection) {
             CompareAndSetResult::Success
         );
         let connection = rusqlite::Connection::open(&path).unwrap();
+        seed_replication_log(inner.as_ref()).await;
         let before = stored_sqlite_row(&connection);
+        let log = inner.get_replication_log(1, 8).await.unwrap();
+        let sequence = inner.max_replication_sequence().await.unwrap();
         let before_calls = protection.calls();
         let backend = protection.backend(
             inner.clone(),
@@ -1017,6 +1127,16 @@ async fn sqlite_preserves_unexpired_raw_record(protection: Protection) {
         assert_eq!(protection.calls(), before_calls);
         assert_eq!(stored_sqlite_row(&connection), before);
         assert_eq!(inner.get(&test_key()).await.unwrap(), Some(physical));
+        assert_eq!(
+            inner.max_replication_sequence().await.unwrap(),
+            sequence,
+            "strict SQLite reads changed the replication sequence"
+        );
+        assert_eq!(
+            inner.get_replication_log(1, 8).await.unwrap(),
+            log,
+            "strict SQLite reads changed the replication log"
+        );
     }
 }
 
