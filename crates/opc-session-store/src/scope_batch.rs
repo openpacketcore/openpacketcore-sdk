@@ -28,6 +28,7 @@ mod child_read;
 pub(crate) mod child_read_control;
 mod codec;
 mod completion;
+mod completion_context;
 mod coordinator;
 mod cut;
 mod lane;
@@ -48,6 +49,9 @@ pub use child_read_control::ScopeChildReadControl;
 #[cfg(any(test, feature = "test-control"))]
 pub use child_read_control::{ScopeChildReadPause, ScopeChildReadStage};
 pub use completion::{ScopeBatchCompletion, ScopeBatchCompletionOutcome, ScopeBatchNoApplyProof};
+pub use completion_context::{
+    ScopeBatchCompletionContext, ScopeBatchCompletionReadGuard, ScopeBatchCompletionRetention,
+};
 pub use coordinator::{
     ScopeBatchBuildContext, ScopeBatchCompletions, ScopeBatchCoordinator, ScopeBatchHandle,
     ScopeBatchLaneStatus, ScopeBatchPort, ScopeBatchReadBudget, ScopeBatchReadContext,

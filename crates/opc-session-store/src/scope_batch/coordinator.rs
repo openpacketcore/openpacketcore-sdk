@@ -37,6 +37,19 @@ fn scheduler_error(error: ScopeSchedulerError) -> ScopeBatchError {
 /// peer and response; decoding a claim alone never proves committed application.
 #[async_trait]
 pub trait ScopeBatchPort: Send + Sync {
+    /// Attach opaque adapter facts to this exact terminal result. `class` is
+    /// the original resident submission class, never inherited running priority.
+    /// The native adapter authenticates its own observed result before sealing
+    /// these facts. Arbitrary public port implementations grant no authority.
+    fn completion_context(
+        &self,
+        _request: &ScopeBatchRequest,
+        _class: ScopeWorkClass,
+        _outcome: &ScopeBatchCompletionOutcome,
+        _retention: ScopeBatchCompletionRetention,
+    ) -> Option<ScopeBatchCompletionContext> {
+        None
+    }
     /// Observe this exact current stamp and every ordered key at one full-barrier
     /// cut. Reuse the builder's running entitlement and supplied effective class;
     /// reserve no second resident credit, running credit or replay lane. Enforce
@@ -131,6 +144,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 struct Control {
+    retention: ScopeBatchCompletionRetention,
     cancelled: AtomicBool,
     changed: Notify,
     result: watch::Sender<Option<ScopeBatchCompletion>>,
@@ -139,6 +153,7 @@ struct Control {
 impl Control {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            retention: ScopeBatchCompletionRetention::new(),
             cancelled: AtomicBool::new(false),
             changed: Notify::new(),
             result: watch::channel(None).0,
@@ -349,7 +364,10 @@ impl ScopeBatchCoordinator {
             else {
                 return false;
             };
-            if slot.attempt != *attempt || slot.terminal.is_none() {
+            if slot.attempt != *attempt
+                || slot.terminal.is_none()
+                || !slot.control.retention.acknowledge()
+            {
                 return false;
             }
             let binding = slot.binding;

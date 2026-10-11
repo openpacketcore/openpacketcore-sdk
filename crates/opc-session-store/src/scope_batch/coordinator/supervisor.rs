@@ -133,10 +133,22 @@ pub(super) async fn run(
         }
         let resident = permit.finish_unknown();
         if let Some(outcome) = completed {
+            let context = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                backend.completion_context(
+                    &request,
+                    resident.class(),
+                    &outcome,
+                    control.retention.clone(),
+                )
+            }))
+            .ok()
+            .flatten();
             let completion = ScopeBatchCompletion {
                 attempt: attempt.clone(),
                 outcome,
                 refusal,
+                context,
+                retention: Some(control.retention.clone()),
             };
             {
                 let mut state = lock(&inner.state);
