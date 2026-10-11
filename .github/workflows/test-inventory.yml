@@ -1,0 +1,48 @@
+name: Test inventory guard
+
+on:
+  workflow_call:
+  push:
+    branches:
+      - 'train/**'
+  merge_group:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  test-inventory:
+    name: Test inventory guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout comparison history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned syntax parsers
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/test-inventory"
+          "${RUNNER_TEMP}/test-inventory/bin/pip" install --require-hashes --only-binary=:all: \
+            -r ci/test-inventory-requirements.txt
+
+      - name: Test the inventory guard
+        run: '"${RUNNER_TEMP}/test-inventory/bin/python" ci/test-test-inventory.py'
+
+      - name: Require declarations for reduced test coverage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "${RUNNER_TEMP}/test-inventory/bin/python" ci/test-inventory.py \
+            --json "${RUNNER_TEMP}/test-inventory-report.json"
+
+      - name: Retain every finding, including declared changes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-inventory-report
+          path: ${{ runner.temp }}/test-inventory-report.json
+          if-no-files-found: ignore

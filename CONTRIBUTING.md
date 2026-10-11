@@ -247,6 +247,62 @@ helm lint operators/helm/sdk-reference-operator
 helm template test operators/helm/sdk-reference-operator > /dev/null
 ```
 
+## Declaring changes to test coverage
+
+The required **Rust workspace** check includes **Test inventory guard** on every
+pull request. The same guard runs on every `train/**` push. It compares Git
+revisions without building or executing the changed tests, and reports:
+
+- Removed or renamed Rust, Python, and Go tests.
+- Added ignores, feature/configuration or environment gates, and CI skip entries,
+  including tests introduced with an ignore already present.
+- Decreased assertion counts, including assertions in local test helpers, and
+  removed assertion-bearing scenario helpers. Assertions in constant-false
+  branches, trivially successful checks, and unused closures do not count.
+- Removed required jobs, matrix lanes, or required test commands, including
+  moving their execution outside the **Rust workspace** aggregate.
+
+An intentional reduction needs an entry in `ci/test-changes.json`, with the exact
+name printed by the guard, a change kind, a reason, and an existing GitHub issue
+number in this repository. Reviewers see the finding even when it is declared.
+Do not use a pull-request number in place of an issue. For example:
+
+```json
+{
+  "version": 1,
+  "changes": [
+    {
+      "test": "rust:crates/example::test=contract::checks::records_value",
+      "kind": "assertions-decreased",
+      "reason": "The obsolete cache assertion is replaced by the durable-read contract.",
+      "issue": 1234
+    }
+  ]
+}
+```
+
+The file is a permanent, append-only record. Keep the base's entries unchanged
+and in order; editing, deleting, or reordering them fails the guard. Historical
+entries are ignored without warnings and cannot authorize a new reduction.
+Only newly appended entries declare the current change. If the same test needs
+another declaration later, append a new entry rather than editing its history.
+A removal always needs a reason and an existing issue. When the behavior still
+exists, name its replacing head tests in `replacements`; a rename instead uses
+`renamed_to` naming the test at the head. When the behavior was deleted, set
+`behavior_deleted` to `true` and cite the deleting commit, PR, or source change
+in `deleting_change`. Deleted behavior needs no unrelated replacement test.
+A rename does not waive a separate assertion decrease or new gate.
+
+Local runs default to the merge base of `HEAD` and `origin/main`. An explicit
+base must be an ancestor of both, so a branch-only base cannot hide the change.
+Fetch the remote history and commit the candidate before running the guard.
+
+See [the inventory guard documentation](ci/README.md#test-inventory-guard) for
+the declaration format, local command, and parsing boundaries. A passing static
+inventory is evidence about the listed structural checks, not a proof that two
+tests exercise the same behavior. Keep reviewing the tested properties.
+Ordinary assertion edits are compared by count, not by assertion text.
+
 ## Commit conventions
 
 We use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `ci:`, `chore:`, `refactor:`, `test:`). The scope should be the crate name without the `opc-` prefix where sensible (e.g., `feat(runtime):`, `fix(sbi):`).

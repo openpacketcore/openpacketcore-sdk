@@ -24,6 +24,15 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Also runs independently on train/** pushes through the reusable workflow.
+  # Every PR reaches it here, and Rust workspace requires its success below.
+  test-inventory:
+    name: Test inventory guard
+    uses: ./.github/workflows/test-inventory.yml
+    permissions:
+      contents: read
+      issues: read
+
   # The former single "Rust workspace" job ran fmt, clippy, the whole test
   # suite and the isolated lanes back to back for ~42 minutes, with the test
   # step alone taking ~34 (451 test binaries executed one after another).
@@ -684,6 +693,7 @@ jobs:
     timeout-minutes: 10
     if: always()
     needs:
+      - test-inventory
       - rust-gates
       - rust-clippy
       - rust-tests
