@@ -1,0 +1,41 @@
+{
+  "opc-gtpu-dataplane": [
+    "ebpf::aya_runtime::local_scope::combined_tests::native_pinless_gtpu_and_dscp_retire_together_after_xfrm_routes_and_companions",
+    "ebpf::aya_runtime::local_scope::combined_tests::native_recreated_bpffs_in_retained_namespace_resets_and_rebuilds_both_backends",
+    "ebpf::aya_runtime::local_scope::coverage_tests::native_containment_refuses_live_tcx_xdp_and_earlier_foreign_classifiers",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_arp_and_packets_cross_only_the_intended_lifecycle_boundaries",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_fresh_gtpu_dscp_graphs_open_only_together_under_real_activation",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_scoped_sessions_keep_undo_publication_and_backpressure_owned",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_shutdown_owns_reset_after_caller_cancellation_while_draining",
+    "ebpf::aya_runtime::local_scope::tests::native_all_three_legacy_resets_refuse_a_bound_local_scope",
+    "ebpf::aya_runtime::local_scope::tests::native_changed_occupant_invalidates_prior_artifact_inventory",
+    "ebpf::aya_runtime::local_scope::tests::native_current_graph_retires_locally_with_external_program_fd",
+    "ebpf::aya_runtime::local_scope::tests::native_local_graph_preserves_selector_control_history",
+    "ebpf::aya_runtime::local_scope::tests::native_local_graph_preserves_selector_stamp_history",
+    "ebpf::aya_runtime::local_scope::tests::native_pinless_graph_preserves_foreign_reference_and_neighbor",
+    "ebpf::aya_runtime::local_scope::tests::native_pinless_partial_graph_retires_with_external_program_fd"
+  ],
+  "opc-ipsec-xfrm": [
+    "dscp::local_scope::tests::native_pinless_dscp_is_retired_with_an_outside_program_fd",
+    "local_scope::tests::native_empty_startup_needs_no_containment_but_reset_covers_dscp_disabled_egress",
+    "local_scope::tests::native_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo",
+    "local_scope::tests::native_profile_proves_keys_cleans_probe_and_refuses_allocspi",
+    "local_scope::tests::native_readonly_inspection_classifies_predecessor_banks_without_kernel_effects",
+    "local_scope::tests::native_rebuilt_authority_cannot_reinstall_a_removed_effect",
+    "local_scope::tests::native_scope_refuses_duplicate_coordinator",
+    "local_scope::tests::native_scope_refuses_independent_xfrm_producer_until_actor_stops",
+    "local_scope::tests::native_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply",
+    "local_scope::tests::native_scoped_actor_refuses_legacy_reset_and_dscp_activation",
+    "local_scope::tests::native_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss",
+    "local_scope::tests::native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install",
+    "local_scope::tests::native_unknown_root_contents_refuse_empty_observation_and_reset_before_effects"
+  ],
+  "opc-local-kernel-lifecycle": [
+    "scope::activation_tests::native_opening_owns_interrupted_filter_removal_and_publication"
+  ],
+  "opc-linux-gtpu-sys": [
+    "tc::tests::private_netns_gact_round_trip_preserves_foreign_filter",
+    "tc::scope_tests::private_netns_topology_checks_native_qdisc_tcx_and_xdp",
+    "tc::scope_tests::private_namespace_scope_retains_lock_across_bpffs_replacement"
+  ]
+}

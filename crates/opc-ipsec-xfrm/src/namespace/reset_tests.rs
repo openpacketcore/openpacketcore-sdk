@@ -315,6 +315,7 @@ mod exclusive_reset {
             .inner
             .sender
             .send(NamespaceCommand::ResetExclusivelyOwnedNamespace {
+                contained: None,
                 reply,
                 observed: observation,
             })
@@ -445,6 +446,7 @@ mod exclusive_reset {
             let (observed, observation) = oneshot::channel();
             observed.send(()).unwrap();
             NamespaceCommand::ResetExclusivelyOwnedNamespace {
+                contained: None,
                 reply,
                 observed: observation,
             }
@@ -649,6 +651,7 @@ mod exclusive_reset {
             .inner
             .sender
             .send(NamespaceCommand::ResetExclusivelyOwnedNamespace {
+                contained: None,
                 reply,
                 observed: observation,
             })

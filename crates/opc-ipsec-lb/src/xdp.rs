@@ -4135,9 +4135,25 @@ mod aya_runtime {
         }
 
         fn program_info(program_id: u32) -> Result<ProgramInfo, IpsecLbError> {
-            for result in loaded_programs() {
-                let info =
-                    result.map_err(|error| program_error("xdp_upgrade_program_info", &error))?;
+            Self::program_info_from(program_id, loaded_programs())
+        }
+
+        fn program_info_from(
+            program_id: u32,
+            programs: impl IntoIterator<Item = Result<ProgramInfo, ProgramError>>,
+        ) -> Result<ProgramInfo, IpsecLbError> {
+            for result in programs {
+                let info = match result {
+                    Err(ProgramError::SyscallError(error))
+                        if error.call == "bpf_prog_get_fd_by_id"
+                            && error.io_error.raw_os_error() == Some(2) =>
+                    {
+                        continue
+                    }
+                    result => {
+                        result.map_err(|error| program_error("xdp_upgrade_program_info", &error))?
+                    }
+                };
                 if info.id() == program_id {
                     return Ok(info);
                 }
@@ -5572,6 +5588,74 @@ mod aya_runtime {
             && value_size == 4
             && max_entries == 1
             && map_flags == AUXILIARY_RODATA_FLAGS
+    }
+
+    #[cfg(test)]
+    mod program_scan_tests {
+        use super::*;
+
+        #[test]
+        fn program_info_accepts_only_reopen_enoent_as_retirement() {
+            for (call, errno, retired) in [
+                ("bpf_prog_get_fd_by_id", 2, true),
+                ("bpf_prog_get_fd_by_id", 1, false),
+                ("bpf_prog_get_fd_by_id", 5, false),
+                ("bpf_prog_get_info_by_fd", 2, false),
+                ("bpf_prog_get_next_id", 2, false),
+            ] {
+                let error = ProgramError::SyscallError(aya::sys::SyscallError {
+                    call,
+                    io_error: io::Error::from_raw_os_error(errno),
+                });
+                let result = AyaHostXdpRuntime::program_info_from(u32::MAX, [Err(error)]);
+                assert_eq!(
+                    matches!(result, Err(IpsecLbError::XdpUpgradeIndeterminate)),
+                    retired,
+                    "{call}/{errno}"
+                );
+                if !retired {
+                    assert!(matches!(result, Err(IpsecLbError::Io { .. })));
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF and writable private bpffs"]
+        fn program_info_skips_real_unrelated_retirement_and_keeps_selected_fd() {
+            assert_eq!(std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+            let root = PathBuf::from(format!(
+                "/sys/fs/bpf/opc-xdp-s11-scan-{}",
+                std::process::id()
+            ));
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(root.clone());
+            let mut owned = AyaHostXdpRuntime::load_fresh(&root.join("owned")).unwrap();
+            let program = AyaHostXdpRuntime::xdp_program(&mut owned).unwrap();
+            program.load().unwrap();
+            let selected = program.info().unwrap();
+            let held = selected.fd().unwrap();
+            let mut unrelated = AyaHostXdpRuntime::load_fresh(&root.join("unrelated")).unwrap();
+            let program = AyaHostXdpRuntime::xdp_program(&mut unrelated).unwrap();
+            program.load().unwrap();
+            let enumerated = program.info().unwrap();
+            drop(unrelated);
+            let error = enumerated
+                .fd()
+                .expect_err("final unrelated descriptor closed");
+            let selected_id = selected.id();
+            let selected_tag = selected.tag();
+            let result =
+                AyaHostXdpRuntime::program_info_from(selected_id, [Err(error), Ok(selected)])
+                    .unwrap();
+            assert_eq!((result.id(), result.tag()), (selected_id, selected_tag));
+            let _ = held.as_fd();
+            assert!(result.fd().is_ok());
+        }
     }
 
     #[cfg(test)]

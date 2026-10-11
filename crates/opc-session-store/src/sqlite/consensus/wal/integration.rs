@@ -87,9 +87,11 @@ pub(super) struct FlushCosts {
     intent_maximum_us: u128,
     data_sync_maximum_us: u128,
     publication_maximum_us: u128,
+    #[cfg(any(test, feature = "test-control"))]
     slowest_request: SlowestFlushRequest,
 }
 
+#[cfg(any(test, feature = "test-control"))]
 #[derive(Default)]
 struct SlowestFlushRequest {
     #[cfg(feature = "test-control")]
@@ -104,6 +106,7 @@ struct SlowestFlushRequest {
     publication_us: u128,
 }
 
+#[cfg(any(test, feature = "test-control"))]
 impl SlowestFlushRequest {
     fn json(&self) -> serde_json::Value {
         let observation = serde_json::json!({
@@ -162,22 +165,23 @@ impl FlushCosts {
         self.publication_maximum_us = self
             .publication_maximum_us
             .max(group.publication.as_micros());
-        for ((admission, queue_wait), submit_to_callback) in group
+        for (queued_admission, submit_to_callback) in group
             .admission
             .iter()
             .zip(&group.queue_wait)
             .zip(&group.submit_to_callback)
         {
-            let queue_wait_us = queue_wait.as_micros();
+            let queue_wait_us = queued_admission.1.as_micros();
             let submit_to_callback_us = submit_to_callback.as_micros();
             self.queue_wait_us += queue_wait_us;
             self.queue_wait_maximum_us = self.queue_wait_maximum_us.max(queue_wait_us);
             self.submit_to_callback_us += submit_to_callback_us;
+            #[cfg(any(test, feature = "test-control"))]
             if submit_to_callback_us > self.slowest_request.submit_to_callback_us {
                 self.slowest_request = SlowestFlushRequest {
                     #[cfg(feature = "test-control")]
                     io_timing: group.io_timing.clone(),
-                    operation: admission.operation,
+                    operation: queued_admission.0.operation,
                     queue_wait_us,
                     submit_to_callback_us,
                     rollover_us: group.rollover.as_micros(),
@@ -203,6 +207,7 @@ pub(super) struct CacheCosts {
     pub(super) total: Duration,
 }
 
+#[cfg(any(test, feature = "test-control"))]
 impl CacheCosts {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -234,6 +239,7 @@ pub(super) struct ApplicationCosts {
     pub(super) total: Duration,
 }
 
+#[cfg(any(test, feature = "test-control"))]
 impl ApplicationCosts {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -535,11 +541,13 @@ impl SqliteConsensusCore {
 }
 
 impl Wal {
+    #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn integration_cost_snapshot(&self) -> io::Result<serde_json::Value> {
         let state = super::lock_state(&self.shared)?;
         Ok(self.integration_cost_snapshot_locked(&state))
     }
 
+    #[cfg(any(test, feature = "test-control"))]
     fn integration_cost_snapshot_locked(&self, state: &super::State) -> serde_json::Value {
         let totals = &state.observation_totals;
         let checkpoint = serde_json::json!({

@@ -97,6 +97,7 @@ impl NativeStorage {
     /// Prepare both transfers before moving either journal. Preflight checks
     /// only exact certificates, bounded frontiers, counts, endpoints and at
     /// most five log witnesses; it never visits historical or dirty rows.
+    #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn take_changes(&mut self) -> io::Result<super::NativeChanges> {
         let slot_projections = self.log.slot_projections.clone();
         let log = self.log.prepare_transfer(&self.business)?;

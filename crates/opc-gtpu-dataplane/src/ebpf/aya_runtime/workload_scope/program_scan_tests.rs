@@ -473,5 +473,40 @@ fn sibling_scan_workload_references_tolerates_retirement() {
             );
         }
     }
+    exclusive_workload_references_tolerate_retirement();
     println!("OPC_GTPU_SIBLING_SCAN_PROVEN site=workload_references");
+}
+
+fn exclusive_workload_references_tolerate_retirement() {
+    for stage in [ProgramScanStage::Enumeration, ProgramScanStage::MapIds] {
+        for live_reference in [false, true] {
+            let mut fixture = Fixture::new();
+            let owned = fixture.attach();
+            let maps = if live_reference {
+                owned.map_ids().unwrap().unwrap().into_iter().collect()
+            } else {
+                HashSet::from([u32::MAX])
+            };
+            fixture.retire_during(stage);
+            let result = exclusive_workload_scope::map_references(&maps);
+            fixture.finish_scan();
+            let references = result.expect("unrelated retirement must not refuse the scan");
+            assert!(!references.contains(&fixture.unrelated_id));
+            if live_reference {
+                assert!(references.contains(&owned.id()), "keep every live owner");
+            } else {
+                assert!(references.is_empty());
+            }
+            assert_inspection_errors_fail_closed(stage, || {
+                exclusive_workload_scope::map_references(&maps)
+            });
+            assert_eq!(
+                slot_owner(fixture.ifindex, TcAttachType::Egress, 50)
+                    .unwrap()
+                    .unwrap()
+                    .program_id,
+                Some(owned.id())
+            );
+        }
+    }
 }

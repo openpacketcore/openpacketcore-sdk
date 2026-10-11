@@ -63,9 +63,14 @@ POST_V2_SOURCE_BUILD_ONLY_ADDITIONS = {
     "opc-gtpu-dataplane",
     "opc-mgmt-audit-store",
 }
-SOURCE_BUILD_ONLY = (
+# Historical profiles retain the package inventory that they qualified.
+FROZEN_SESSION_HA_V6_SOURCE_BUILD_ONLY = (
     FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY | POST_V2_SOURCE_BUILD_ONLY_ADDITIONS
 )
+SOURCE_BUILD_ONLY = FROZEN_SESSION_HA_V6_SOURCE_BUILD_ONLY | {
+    "opc-ipsec-xfrm",
+    "opc-local-kernel-lifecycle",
+}
 SOURCE_BUILD_REMOVAL_CONDITION = (
     "official stable Openraft release containing the fix, registry pin and "
     "checksum, and full issue #143 requalification"
@@ -162,16 +167,16 @@ def main() -> int:
     if source_gate.get("crates_io_exact_matches") != []:
         errors.append("session HA profile must not claim an exact crates.io match")
 
-    current_profile_path = Path(
+    frozen_v6_profile_path = Path(
         "crates/opc-session-testkit/qualification/v6/session-ha-profile.json"
     )
-    current_profile = json.loads(current_profile_path.read_text(encoding="utf-8"))
-    current_source_gate = current_profile.get("source_build_gate", {})
+    frozen_v6_profile = json.loads(frozen_v6_profile_path.read_text(encoding="utf-8"))
+    frozen_v6_source_gate = frozen_v6_profile.get("source_build_gate", {})
     if (
-        set(current_source_gate.get("affected_workspace_crates", []))
-        != SOURCE_BUILD_ONLY
+        set(frozen_v6_source_gate.get("affected_workspace_crates", []))
+        != FROZEN_SESSION_HA_V6_SOURCE_BUILD_ONLY
     ):
-        errors.append("current v6 session HA profile source-build crate closure drifted")
+        errors.append("frozen v6 session HA profile source-build crate closure drifted")
 
     profiled_publish = {
         artifact.get("crate_name"): artifact.get("publish")

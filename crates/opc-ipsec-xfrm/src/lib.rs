@@ -258,6 +258,10 @@ mod exclusive_reset;
 pub mod ikev2;
 pub mod installed_child_sa;
 pub mod linux;
+mod local_scope;
+#[cfg(all(test, target_os = "linux", feature = "scope-store"))]
+#[path = "../../opc-local-kernel-lifecycle/tests/support/quorum.rs"]
+mod local_scope_quorum;
 pub mod mock;
 pub mod model;
 mod namespace;
@@ -285,7 +289,8 @@ pub use counter_resume::{
     MAX_ESP_COUNTER_RECEIPTS, MAX_ESP_COUNTER_TARGET_SET_SIZE,
 };
 pub use dscp::{
-    LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,
+    LinuxXfrmDscpMarkingConfig, XfrmDscpLocalGraph, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT,
+    DEFAULT_XFRM_DSCP_TC_PRIORITY,
 };
 #[cfg(unix)]
 pub use durable_install::{XfrmObjectInstallDurableOutcome, XfrmObjectInstallRestartOutcome};
@@ -336,6 +341,9 @@ pub use installed_child_sa::{
     InstalledChildSaRoster, InstalledChildSaSelection,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
+pub use local_scope::LocalXfrmProfile;
+#[cfg(feature = "scope-store")]
+pub use local_scope::{ScopedXfrmReceipt, ScopedXfrmRequest};
 pub use mock::{MockExclusiveNamespaceReset, MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,
