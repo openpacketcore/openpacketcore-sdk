@@ -7,6 +7,112 @@ use crate::scope_batch::*;
 use std::sync::atomic::AtomicU64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_child_read_current_uses_one_cut_before_and_after_concurrent_commits() {
+    for native in [false, true] {
+        let snapshots =
+            tempfile::tempdir_in(std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").unwrap()).unwrap();
+        let mut fleet = Fleet::new_with_mode("scope_child_read_cut", native);
+        fleet.snapshot_root = Some(snapshots.path().to_path_buf());
+        fleet.clock = Some(Arc::new(Clock(AtomicU64::new(0))));
+        fleet.open().await;
+        let result = AssertUnwindSafe(async {
+            let leader = fleet.stores.iter().position(|store| {
+                store.status().leader_id == Some(store.status().node_id)
+            }).unwrap();
+            let store = &fleet.stores[leader];
+            for (case, stage) in [
+                ScopeChildReadStage::BeforeCapture,
+                ScopeChildReadStage::AfterCapture,
+                ScopeChildReadStage::BetweenKeys,
+            ].into_iter().enumerate() {
+                let scope = ScopeId::new(
+                    fleet.topologies[0].consensus_identity().unwrap(),
+                    TenantId::from_static("child-cut"),
+                    NetworkFunctionKind::smf(),
+                    [case as u8 + 1; 32],
+                ).unwrap();
+                let authority = ScopeAuthorityStore::new(
+                    Arc::new(store.clone()), scope.clone(), Arc::new(Admission),
+                ).unwrap();
+                let granted = authority.admit(
+                    &identity("worker-1"),
+                    &ScopeAuthorityRequest::new(scope, [1; 16], 0,
+                        ScopeAuthorityOperation::AdmitInitial { execution: execution(1) },
+                    ).unwrap(),
+                ).await.unwrap();
+                let writer = ScopeBatchStore::new(
+                    Arc::new(store.clone()), granted.stamp().namespace().clone(), Arc::new(Admission),
+                ).unwrap();
+                let created = writer.execute(
+                    &identity("worker-1"),
+                    &ScopeBatchRequest::in_lane(granted.stamp(), [2; 16], 0, 1,
+                        vec![create(1, &[1]), create(2, &[2])], vec![],
+                    ).unwrap(),
+                ).await.unwrap();
+                let barriers = store.scope_read_barrier_count_for_test();
+                let pause = store.pause_next_scope_child_read_for_test(stage);
+                let reader = writer.clone();
+                let stamp = granted.stamp().clone();
+                let read = tokio::spawn(async move {
+                    reader.read_current(&identity("worker-1"), &stamp, &[key(1), key(2)]).await
+                });
+                tokio::time::timeout(Duration::from_secs(10), pause.reached()).await.unwrap();
+                assert_eq!(store.scope_read_barrier_count_for_test(), barriers + 1);
+
+                // Both replacements commit atomically while the reader is at
+                // the named boundary. A per-key cut would mix generations.
+                if stage != ScopeChildReadStage::BeforeCapture {
+                    writer.execute(
+                        &identity("worker-1"),
+                        &ScopeBatchRequest::in_lane(granted.stamp(), [3; 16], 0, 2,
+                            (1..=2).map(|n| ScopeChildMutation::CompareAndSet {
+                                key: key(n), expected: created.rows()[usize::from(n - 1)],
+                                value: value(n + 10), claims: vec![claim(n + 10)],
+                            }).collect(), vec![],
+                        ).unwrap(),
+                    ).await.unwrap();
+                }
+                // Close before capture must fail. Close after capture cannot
+                // change that cut's authority or force a later child snapshot.
+                if stage != ScopeChildReadStage::BetweenKeys {
+                    authority.execute(
+                        &identity("worker-1"),
+                        &ScopeAuthorityRequest::new(granted.stamp().scope().clone(), [4; 16],
+                            granted.stamp().revision(), ScopeAuthorityOperation::Close {
+                                current: granted.stamp().clone(),
+                                evidence: ScopeClosureEvidence::new(
+                                    ScopeClosureKind::LocalQuiescence, [4; 32],
+                                ).unwrap(),
+                            },
+                        ).unwrap(),
+                    ).await.unwrap();
+                }
+                pause.release();
+                let observation = read.await.unwrap();
+                if stage == ScopeChildReadStage::BeforeCapture {
+                    assert!(matches!(observation, Err(ScopeChildReadError::Batch(
+                        ScopeBatchError::Scope(ScopeAuthorityError::StaleAuthority)
+                    ))));
+                } else {
+                    let rows = observation.unwrap();
+                    assert_eq!(rows.len(), 2);
+                    for (n, row) in (1..=2).zip(rows) {
+                        let row = row.unwrap();
+                        assert_eq!(row.key(), key(n));
+                        assert_eq!(row.revision(), created.rows()[usize::from(n - 1)]);
+                        assert_eq!(row.batch_revision(), created.revision());
+                        assert_eq!(row.value(), Some(&value(n)));
+                        assert_eq!(row.claims(), &[claim(n)]);
+                    }
+                }
+            }
+        }).catch_unwind().await;
+        fleet.close().await;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scope_child_read_current_is_complete_ordered_read_only_and_authority_bound() {
     for native in [false, true] {
         let snapshots =
@@ -95,6 +201,7 @@ async fn scope_child_read_current_is_complete_ordered_read_only_and_authority_bo
             let applied = fleet.stores[leader].status().applied_index;
             for index in 0..3 {
                 let reader = service(index);
+                let barriers = fleet.stores[index].scope_read_barrier_count_for_test();
                 let rows = reader
                     .read_current(
                         &identity("worker-1"),
@@ -103,6 +210,11 @@ async fn scope_child_read_current_is_complete_ordered_read_only_and_authority_bo
                     )
                     .await
                     .unwrap();
+                assert_eq!(
+                    fleet.stores[index].scope_read_barrier_count_for_test(),
+                    barriers + 1,
+                    "all keys and authority use exactly one complete barrier"
+                );
                 assert_eq!(rows.len(), 4);
                 assert!(rows[1].is_none(), "tombstone is absent");
                 assert!(rows[2].is_none(), "missing key is absent");
@@ -123,6 +235,17 @@ async fn scope_child_read_current_is_complete_ordered_read_only_and_authority_bo
                         ScopeAuthorityError::Unauthorized
                     )))
                 ));
+                for keys in [vec![], vec![key(1), key(1)], (1..=33).map(key).collect()] {
+                    assert!(matches!(
+                        reader.read_current(&identity("worker-1"), granted.stamp(), &keys).await,
+                        Err(ScopeChildReadError::Batch(ScopeBatchError::InvalidRequest))
+                    ));
+                }
+                assert_eq!(
+                    fleet.stores[index].scope_read_barrier_count_for_test(),
+                    barriers + 1,
+                    "invalid or unauthorized requests enter no barrier"
+                );
             }
             assert_eq!(
                 fleet.stores[leader].status().applied_index,

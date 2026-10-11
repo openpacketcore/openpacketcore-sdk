@@ -103,7 +103,7 @@ fn child_read_record_rejects_noncanonical_invalid_and_deleted_records() {
             5 => invalid.claims = (1..=9).map(claim).collect(),
             6 => invalid.claims = vec![ScopeClaimKey([0; 32])],
             7 => invalid.value = None,
-            _ => invalid.value = Some(ScopeSealedValue(vec![0; 8])),
+            _ => invalid.value = Some(ScopeSealedValue(Zeroizing::new(vec![0; 8]))),
         }
         assert!(invalid.encode_canonical().is_err(), "field {field}");
         let raw = postcard::to_allocvec(&invalid).unwrap();
