@@ -3105,6 +3105,7 @@ dependencies = [
  "opc-key",
  "opc-linux-gtpu-sys",
  "opc-route-steering",
+ "opc-session-net",
  "opc-session-store",
  "opc-types",
  "rand 0.10.3",

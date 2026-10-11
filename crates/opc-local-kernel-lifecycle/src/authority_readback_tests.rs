@@ -339,3 +339,35 @@ async fn committed_readback_rejects_wrong_outcome_before_current_child_observati
         assert!(store.events.lock().unwrap().is_empty(), "{field}");
     }
 }
+
+#[cfg(feature = "native-scope")]
+#[test]
+fn native_authority_readback_keeps_the_backend_effect_type_concrete() {
+    async fn construct(
+        lifecycle: LocalKernelLifecycle,
+        execution: ScopeExecution,
+        committed: CommittedScopeAuthority,
+        client: opc_session_net::scope::ScopeClient,
+    ) -> Result<ScopeKernelAuthority<NativeScopeAuthority>, LocalEffectError> {
+        ScopeKernelAuthority::from_scope_client(
+            lifecycle,
+            execution,
+            committed,
+            client,
+            opc_session_store::scope_scheduler::ScopeWorkClass::Normal,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+    }
+    async fn readback(
+        authority: ScopeKernelAuthority<NativeScopeAuthority>,
+        request: ScopeBatchRequest,
+        child: ScopeChildKey,
+        completion: opc_session_store::scope_batch::ScopeBatchCompletion,
+    ) -> Result<CommittedScopeEffect, LocalEffectError> {
+        authority
+            .readback_activation(request, child, &completion)
+            .await
+    }
+    let _ = (construct, readback);
+}
