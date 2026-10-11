@@ -246,9 +246,11 @@ def main() -> int:
                 command.extend(["-p", crate])
             features = []
             if "opc-local-kernel-lifecycle" in selected:
-                features.append("opc-local-kernel-lifecycle/store")
+                features.append("opc-local-kernel-lifecycle/native-scope")
             if "opc-ipsec-xfrm" in selected:
-                features.append("opc-ipsec-xfrm/scope-store")
+                features.append("opc-ipsec-xfrm/native-scope")
+            if "opc-gtpu-dataplane" in selected:
+                features.append("opc-gtpu-dataplane/native-scope")
             if features:
                 command.extend(["--features", ",".join(features)])
             command.extend(["--lib", "--no-run", "--message-format=json"])

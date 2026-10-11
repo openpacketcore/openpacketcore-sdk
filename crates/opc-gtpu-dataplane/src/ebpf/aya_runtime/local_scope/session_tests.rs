@@ -1,9 +1,9 @@
 use super::fresh_tests::session_request;
 use super::sessions::{TestFault, TestPause};
 use super::*;
-use crate::local_scope_quorum::{child_key, execution, Quorum};
+use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 use crate::{EbpfGtpuDataplaneBackend, GtpuSessionDeviceId, ScopedGtpuReceipt};
-use opc_local_kernel_lifecycle::{LocalInstalledGraph, ScopeKernelAuthority};
+use opc_local_kernel_lifecycle::LocalInstalledGraph;
 use std::time::Duration;
 
 type Groups =
@@ -36,7 +36,7 @@ async fn online(quorum: &Quorum) {
     quorum.set_available(true);
     while quorum
         .authority
-        .current(execution().identity())
+        .current(quorum.execution().identity())
         .await
         .is_err()
     {
@@ -46,7 +46,7 @@ async fn online(quorum: &Quorum) {
 pub(super) struct Fixture<'a> {
     pub(super) backend: &'a EbpfGtpuDataplaneBackend,
     pub(super) graph: &'a LocalInstalledGraph,
-    pub(super) authority: &'a ScopeKernelAuthority,
+    pub(super) authority: &'a TestAuthority,
     pub(super) quorum: &'a Quorum,
     pub(super) device: GtpuSessionDeviceId,
     pub(super) ifindex: u32,

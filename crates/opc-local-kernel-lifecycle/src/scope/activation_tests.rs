@@ -1,7 +1,7 @@
 use super::activation::{TestFault, TestPause};
 use super::*;
-use crate::native_quorum::{child_key, execution, Quorum};
-use crate::ScopeKernelAuthority;
+use crate::native_quorum::{child_key, Quorum, TestAuthority};
+
 use opc_linux_gtpu_sys::tc::{ContainmentBank, LocalHookSpec, TcSlot};
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
@@ -56,7 +56,7 @@ async fn online(quorum: &Quorum) {
     quorum.set_available(true);
     while quorum
         .authority
-        .current(execution().identity())
+        .current(quorum.execution().identity())
         .await
         .is_err()
     {
@@ -71,6 +71,15 @@ async fn settled(lifecycle: &LocalKernelLifecycle) {
 #[test]
 #[ignore = "requires private network/mount namespaces, bpffs and CAP_NET_ADMIN"]
 fn native_opening_owns_interrupted_filter_removal_and_publication() {
+    exercise_opening(false);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires private network/mount namespaces, bpffs and CAP_NET_ADMIN"]
+fn native_transport_opening_owns_interrupted_filter_removal_and_publication() {
+    exercise_opening(true);
+}
+fn exercise_opening(native: bool) {
     assert_eq!(std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
     let root = std::path::PathBuf::from(format!("/sys/fs/bpf/opc-open-{}", std::process::id()));
     let locks = std::env::temp_dir().join(format!("opc-open-{}", std::process::id()));
@@ -114,17 +123,11 @@ fn native_opening_owns_interrupted_filter_removal_and_publication() {
         .build()
         .unwrap()
         .block_on(async {
-            let quorum = Quorum::open().await;
+            let quorum = Quorum::open_for(native).await;
             lifecycle.reset(participants()).await.unwrap();
-            let authority = ScopeKernelAuthority::new(
-                lifecycle.clone(),
-                execution(),
-                quorum.committed.clone(),
-                quorum.authority.clone(),
-                quorum.batches.clone(),
-            )
-            .await
-            .unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
             // Resolve a genuinely lost committed response before local opening.
             let request = quorum.create_request(89).await;
             quorum.lose_next_commit_reply();
@@ -247,6 +250,10 @@ fn native_opening_owns_interrupted_filter_removal_and_publication() {
                     .recheck()
                     .unwrap();
                 online(&quorum).await;
+            }
+            #[cfg(feature = "native-scope")]
+            if native {
+                authority.qualify_native_classes(&quorum).await;
             }
             authority.shutdown_local(participants()).await.unwrap();
             quorum.close().await;

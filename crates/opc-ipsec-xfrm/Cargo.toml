@@ -17,6 +17,7 @@ publish = false
 default = []
 ikev2 = ["dep:opc-proto-ikev2"]
 scope-store = ["opc-local-kernel-lifecycle/store"]
+native-scope = ["scope-store", "opc-local-kernel-lifecycle/native-scope"]
 
 [dependencies]
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }
@@ -42,6 +43,11 @@ sha1 = { workspace = true }
 nix = { workspace = true, features = ["net", "socket"] }
 
 [dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+rcgen = { workspace = true }
+time = { workspace = true }
+opc-session-net = { path = "../opc-session-net", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }

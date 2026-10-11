@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as opc_local_kernel_lifecycle;
 #[cfg(feature = "store")]
 mod authority;
 mod layout;

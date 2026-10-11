@@ -1,12 +1,10 @@
 use super::*;
-use crate::local_scope_quorum::{child_key, execution, Quorum};
+use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 use opc_ipsec_xfrm::{
     ExclusiveNamespaceResetAcknowledgement, LinuxXfrmBackendConfig, LinuxXfrmDscpMarkingConfig,
     NamespaceBoundLinuxXfrmBackend, XfrmDscpLocalGraph,
 };
-use opc_local_kernel_lifecycle::{
-    LocalKernelLifecycle, LocalResetParticipants, NoLocalCompanions, ScopeKernelAuthority,
-};
+use opc_local_kernel_lifecycle::{LocalKernelLifecycle, LocalResetParticipants, NoLocalCompanions};
 use std::os::unix::fs::PermissionsExt;
 use sys::tc::{ContainmentBank, LocalHookSpec, LocalKernelScope, LocalScopeSpec};
 
@@ -92,24 +90,48 @@ impl Drop for Cleanup {
 #[test]
 #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_fresh_gtpu_dscp_graphs_open_only_together_under_real_activation() {
-    fresh_lifecycle(false, false, false);
+    fresh_lifecycle(false, false, false, false);
 }
 #[test]
 #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_shutdown_owns_reset_after_caller_cancellation_while_draining() {
-    fresh_lifecycle(true, false, false);
+    fresh_lifecycle(true, false, false, false);
 }
 #[test]
 #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_scoped_sessions_keep_undo_publication_and_backpressure_owned() {
-    fresh_lifecycle(false, true, false);
+    fresh_lifecycle(false, true, false, false);
 }
 #[test]
 #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_arp_and_packets_cross_only_the_intended_lifecycle_boundaries() {
-    fresh_lifecycle(false, false, true);
+    fresh_lifecycle(false, false, true, false);
 }
-fn fresh_lifecycle(cancel_shutdown: bool, qualify_sessions: bool, packets: bool) {
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_fresh_gtpu_dscp_graphs_open_only_together_under_real_activation() {
+    fresh_lifecycle(false, false, false, true);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_shutdown_owns_reset_after_caller_cancellation_while_draining() {
+    fresh_lifecycle(true, false, false, true);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_scoped_sessions_keep_undo_publication_and_backpressure_owned() {
+    fresh_lifecycle(false, true, false, true);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_BPF/CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_arp_and_packets_cross_only_the_intended_lifecycle_boundaries() {
+    fresh_lifecycle(false, false, true, true);
+}
+fn fresh_lifecycle(cancel_shutdown: bool, qualify_sessions: bool, packets: bool, native: bool) {
     assert_eq!(std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
     assert!(std::process::Command::new("ip")
         .args(["link", "set", "lo", "up"])
@@ -210,16 +232,10 @@ fn fresh_lifecycle(cancel_shutdown: bool, qualify_sessions: bool, packets: bool)
         }
         super::abandon_tests::exercise(gtpu.inner.local_scope.as_ref().unwrap(), &reset).await;
         let profile = xfrm.admit_scoped_profile(&reset).await.unwrap();
-        let quorum = Quorum::open().await;
-        let authority = ScopeKernelAuthority::new(
-            lifecycle.clone(),
-            execution(),
-            quorum.committed.clone(),
-            quorum.authority.clone(),
-            quorum.batches.clone(),
-        )
-        .await
-        .unwrap();
+        let quorum = Quorum::open_for(native).await;
+        let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+            .await
+            .unwrap();
         let activation = quorum.create_request(70).await;
         quorum.lose_next_commit_reply();
         assert!(authority
@@ -230,7 +246,7 @@ fn fresh_lifecycle(cancel_shutdown: bool, qualify_sessions: bool, packets: bool)
         quorum.set_available(true);
         while quorum
             .authority
-            .current(execution().identity())
+            .current(quorum.execution().identity())
             .await
             .is_err()
         {
@@ -423,14 +439,7 @@ fn fresh_lifecycle(cancel_shutdown: bool, qualify_sessions: bool, packets: bool)
         drop(authority);
         assert!(
             matches!(
-                ScopeKernelAuthority::new(
-                    lifecycle.clone(),
-                    execution(),
-                    quorum.committed.clone(),
-                    quorum.authority.clone(),
-                    quorum.batches.clone()
-                )
-                .await,
+                TestAuthority::new(lifecycle.clone(), &quorum).await,
                 Err(opc_local_kernel_lifecycle::LocalEffectError::Closed)
             ),
             "reconstructing an adapter cannot reopen the closed local execution"

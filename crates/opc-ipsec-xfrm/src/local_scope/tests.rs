@@ -72,6 +72,17 @@ fn participants(
 #[test]
 #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss() {
+    exercise_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss(false);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss() {
+    exercise_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss(true);
+}
+fn exercise_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss(
+    native: bool,
+) {
     let (_cleanup, lifecycle) = scope();
     let backend = backend(&lifecycle);
     tokio::runtime::Builder::new_current_thread()
@@ -79,23 +90,17 @@ fn native_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_
         .build()
         .unwrap()
         .block_on(async {
-            use crate::local_scope_quorum::{child_key, execution, Quorum};
-            use opc_local_kernel_lifecycle::ScopeKernelAuthority;
-            let quorum = Quorum::open().await;
+            use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
+
+            let quorum = Quorum::open_for(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
                 .unwrap();
             let profile = backend.admit_scoped_profile(&reset).await.unwrap();
-            let authority = ScopeKernelAuthority::new(
-                lifecycle.clone(),
-                execution(),
-                quorum.committed.clone(),
-                quorum.authority.clone(),
-                quorum.batches.clone(),
-            )
-            .await
-            .unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
             let activation = quorum.create_request(10).await;
             assert!(backend.local_namespace_empty().await.unwrap());
             let effect = authority
@@ -211,6 +216,15 @@ fn native_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_
 #[test]
 #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_rebuilt_authority_cannot_reinstall_a_removed_effect() {
+    exercise_rebuilt_authority_cannot_reinstall_a_removed_effect(false);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_rebuilt_authority_cannot_reinstall_a_removed_effect() {
+    exercise_rebuilt_authority_cannot_reinstall_a_removed_effect(true);
+}
+fn exercise_rebuilt_authority_cannot_reinstall_a_removed_effect(native: bool) {
     let (_cleanup, lifecycle) = scope();
     let backend = backend(&lifecycle);
     tokio::runtime::Builder::new_current_thread()
@@ -218,9 +232,9 @@ fn native_rebuilt_authority_cannot_reinstall_a_removed_effect() {
         .build()
         .unwrap()
         .block_on(async {
-            use crate::local_scope_quorum::{child_key, execution, Quorum};
-            use opc_local_kernel_lifecycle::ScopeKernelAuthority;
-            let quorum = Quorum::open().await;
+            use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
+
+            let quorum = Quorum::open_for(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
@@ -230,15 +244,9 @@ fn native_rebuilt_authority_cannot_reinstall_a_removed_effect() {
             let (sa, policy) = request::fixture();
             let request = ScopedXfrmRequest::new(sa, policy).unwrap();
             {
-                let authority = ScopeKernelAuthority::new(
-                    lifecycle.clone(),
-                    execution(),
-                    quorum.committed.clone(),
-                    quorum.authority.clone(),
-                    quorum.batches.clone(),
-                )
-                .await
-                .unwrap();
+                let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                    .await
+                    .unwrap();
                 let effect = authority
                     .commit_activation(activation.clone(), child_key(19))
                     .await
@@ -255,15 +263,9 @@ fn native_rebuilt_authority_cannot_reinstall_a_removed_effect() {
             // All tokens, receipts and adapter clones are gone. The same
             // lifecycle and store outcome remain, without another reset.
             assert!(backend.local_namespace_empty().await.unwrap());
-            let rebuilt = ScopeKernelAuthority::new(
-                lifecycle.clone(),
-                execution(),
-                quorum.committed.clone(),
-                quorum.authority.clone(),
-                quorum.batches.clone(),
-            )
-            .await
-            .expect("dropping the old adapter releases its owner registration");
+            let rebuilt = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .expect("dropping the old adapter releases its owner registration");
             let replay = rebuilt
                 .commit_activation(activation, child_key(19))
                 .await
@@ -287,6 +289,15 @@ fn native_rebuilt_authority_cannot_reinstall_a_removed_effect() {
 #[test]
 #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply() {
+    exercise_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply(false);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply() {
+    exercise_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply(true);
+}
+fn exercise_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply(native: bool) {
     let (_cleanup, lifecycle) = scope();
     let backend = backend(&lifecycle);
     tokio::runtime::Builder::new_current_thread()
@@ -294,24 +305,18 @@ fn native_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_repl
         .build()
         .unwrap()
         .block_on(async {
-            use crate::local_scope_quorum::{child_key, execution, Quorum};
-            use opc_local_kernel_lifecycle::ScopeKernelAuthority;
+            use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
+
             use operations::{TestFault, TestPause};
-            let quorum = Quorum::open().await;
+            let quorum = Quorum::open_for(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
                 .unwrap();
             let profile = backend.admit_scoped_profile(&reset).await.unwrap();
-            let authority = ScopeKernelAuthority::new(
-                lifecycle.clone(),
-                execution(),
-                quorum.committed.clone(),
-                quorum.authority.clone(),
-                quorum.batches.clone(),
-            )
-            .await
-            .unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
             let healthy_effect = authority
                 .commit_activation(quorum.create_request(20).await, child_key(20))
                 .await
@@ -397,7 +402,7 @@ fn native_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_repl
                 quorum.set_available(true);
                 while quorum
                     .authority
-                    .current(execution().identity())
+                    .current(quorum.execution().identity())
                     .await
                     .is_err()
                 {
@@ -448,6 +453,17 @@ fn native_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_repl
 #[test]
 #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install() {
+    exercise_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install(false);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install() {
+    exercise_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install(true);
+}
+fn exercise_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install(
+    native: bool,
+) {
     let (_cleanup, lifecycle) = scope();
     let backend = backend(&lifecycle);
     tokio::runtime::Builder::new_current_thread()
@@ -455,24 +471,18 @@ fn native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_inst
         .build()
         .unwrap()
         .block_on(async {
-            use crate::local_scope_quorum::{child_key, execution, value, Quorum};
-            use opc_local_kernel_lifecycle::{LocalEffectError, ScopeKernelAuthority};
+            use crate::local_scope_quorum::{child_key, value, Quorum, TestAuthority};
+            use opc_local_kernel_lifecycle::LocalEffectError;
             use opc_session_store::scope_batch::{ScopeBatchRequest, ScopeChildMutation};
-            let quorum = Quorum::open().await;
+            let quorum = Quorum::open_for(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
                 .unwrap();
             let profile = backend.admit_scoped_profile(&reset).await.unwrap();
-            let authority = ScopeKernelAuthority::new(
-                lifecycle.clone(),
-                execution(),
-                quorum.committed.clone(),
-                quorum.authority.clone(),
-                quorum.batches.clone(),
-            )
-            .await
-            .unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
             let activation = ScopeBatchRequest::in_lane(
                 quorum.committed.stamp(),
                 [30; 16],
@@ -507,7 +517,7 @@ fn native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_inst
             loop {
                 if quorum
                     .authority
-                    .current(execution().identity())
+                    .current(quorum.execution().identity())
                     .await
                     .is_ok()
                 {
@@ -518,7 +528,7 @@ fn native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_inst
             assert!(
                 quorum
                     .batches
-                    .read(execution().identity(), child_key(30))
+                    .read(quorum.execution().identity(), child_key(30))
                     .await
                     .unwrap()
                     .is_some(),
@@ -606,6 +616,15 @@ fn native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_inst
 #[test]
 #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo() {
+    exercise_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo(false);
+}
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo() {
+    exercise_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo(true);
+}
+fn exercise_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo(native: bool) {
     fn ip(arguments: &[&str]) -> String {
         let output = std::process::Command::new("ip")
             .args(arguments)
@@ -642,8 +661,8 @@ fn native_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo() {
         .build()
         .unwrap()
         .block_on(async {
-            use crate::local_scope_quorum::{child_key, execution, Quorum};
-            use opc_local_kernel_lifecycle::ScopeKernelAuthority;
+            use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
+
             use operations::{TestFault, TestPause};
             loop {
                 let joined = fs::read_to_string("/proc/net/netlink")
@@ -662,21 +681,15 @@ fn native_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo() {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            let quorum = Quorum::open().await;
+            let quorum = Quorum::open_for(native).await;
             let reset = lifecycle
                 .reset(participants(&lifecycle, &backend))
                 .await
                 .unwrap();
             let profile = backend.admit_scoped_profile(&reset).await.unwrap();
-            let authority = ScopeKernelAuthority::new(
-                lifecycle.clone(),
-                execution(),
-                quorum.committed.clone(),
-                quorum.authority.clone(),
-                quorum.batches.clone(),
-            )
-            .await
-            .unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
             let healthy_effect = authority
                 .commit_activation(quorum.create_request(40).await, child_key(40))
                 .await

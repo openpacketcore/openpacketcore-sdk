@@ -1,6 +1,13 @@
 //! Real durable three-voter fixture. Only admission and loopback transport are
 //! test policy; opaque committed capabilities come from production services.
 
+#[cfg(feature = "native-scope")]
+#[path = "native_transport.rs"]
+mod native_transport;
+#[path = "test_authority.rs"]
+mod test_authority;
+pub(crate) use test_authority::TestAuthority;
+
 use async_trait::async_trait;
 use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity};
 use opc_session_store::scope_authority::*;
@@ -84,7 +91,7 @@ pub(crate) fn execution() -> ScopeExecution {
     )
     .unwrap()
 }
-struct Admission(ScopeId);
+struct Admission(ScopeId, ScopeExecution);
 #[async_trait]
 impl ScopeAuthorityAdmission for Admission {
     async fn authorize(
@@ -95,10 +102,10 @@ impl ScopeAuthorityAdmission for Admission {
         _: ScopeAuthorityAction,
         _: Option<[u8; 32]>,
     ) -> Result<ScopeAuthorityRole, ScopeAuthorityError> {
-        let boot = execution();
+        let boot = &self.1;
         if scope != &self.0
             || authenticated != boot.identity()
-            || claim.is_some_and(|claim| claim != &boot)
+            || claim.is_some_and(|claim| claim != boot)
         {
             return Err(ScopeAuthorityError::Unauthorized);
         }
@@ -123,6 +130,8 @@ pub(crate) struct Quorum {
     pub(crate) authority: ScopeAuthorityStore,
     pub(crate) batches: ScopeBatchStore,
     pub(crate) committed: CommittedScopeAuthority,
+    #[cfg(feature = "native-scope")]
+    native: Option<Arc<native_transport::NativeTransport>>,
     _directory: tempfile::TempDir,
 }
 impl Drop for Quorum {
@@ -133,7 +142,9 @@ impl Drop for Quorum {
     }
 }
 impl Quorum {
-    pub(crate) async fn open() -> Self {
+    pub(crate) async fn open_for(native: bool) -> Self {
+        #[cfg(not(feature = "native-scope"))]
+        assert!(!native, "native fixture requires its explicit feature");
         let directory = tempfile::tempdir().unwrap();
         let members = (0..3).map(member).collect::<Vec<_>>();
         let cluster = ConsensusClusterId::new("local-kernel-lifecycle-tests").unwrap();
@@ -244,28 +255,53 @@ impl Quorum {
             [27; 32],
         )
         .unwrap();
-        let admission = Arc::new(Admission(scope.clone()));
+        #[cfg(feature = "native-scope")]
+        let native = if native {
+            Some(Arc::new(
+                native_transport::NativeTransport::start(stores[serving].clone(), scope.clone())
+                    .await,
+            ))
+        } else {
+            None
+        };
+        #[cfg(feature = "native-scope")]
+        let execution = native
+            .as_ref()
+            .map_or_else(execution, |native| native.client.execution().clone());
+        #[cfg(not(feature = "native-scope"))]
+        let execution = execution();
+        let admission = Arc::new(Admission(scope.clone(), execution.clone()));
         let authority = ScopeAuthorityStore::new(
             Arc::new(stores[serving].clone()),
             scope.clone(),
             admission.clone(),
         )
         .unwrap();
-        let committed = authority
-            .admit(
-                execution().identity(),
-                &ScopeAuthorityRequest::new(
-                    scope,
-                    [1; 16],
-                    0,
-                    ScopeAuthorityOperation::AdmitInitial {
-                        execution: execution(),
-                    },
+        let admit = || async {
+            authority
+                .admit(
+                    execution.identity(),
+                    &ScopeAuthorityRequest::new(
+                        scope,
+                        [1; 16],
+                        0,
+                        ScopeAuthorityOperation::AdmitInitial {
+                            execution: execution.clone(),
+                        },
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .unwrap()
+        };
+        #[cfg(feature = "native-scope")]
+        let committed = if let Some(native) = &native {
+            native.committed.clone()
+        } else {
+            admit().await
+        };
+        #[cfg(not(feature = "native-scope"))]
+        let committed = admit().await;
         let batches = ScopeBatchStore::new(
             Arc::new(stores[serving].clone()),
             committed.stamp().namespace().clone(),
@@ -278,8 +314,13 @@ impl Quorum {
             authority,
             batches,
             committed,
+            #[cfg(feature = "native-scope")]
+            native,
             _directory: directory,
         }
+    }
+    pub(crate) fn execution(&self) -> &ScopeExecution {
+        self.committed.stamp().execution()
     }
     pub(crate) fn lose_next_commit_reply(&self) {
         self.paths
@@ -304,6 +345,10 @@ impl Quorum {
         }
     }
     pub(crate) async fn close(&self) {
+        #[cfg(feature = "native-scope")]
+        if let Some(native) = &self.native {
+            native.close().await;
+        }
         for peer in self.paths.values() {
             *peer.handler.write().unwrap() = None;
         }
@@ -317,7 +362,7 @@ impl Quorum {
     pub(crate) async fn create_request(&self, child: u8) -> ScopeBatchRequest {
         let revision = self
             .batches
-            .current(execution().identity())
+            .current(self.execution().identity())
             .await
             .unwrap()
             .revision();
