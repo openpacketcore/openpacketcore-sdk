@@ -203,10 +203,13 @@ identity/scope/process binding. A checked `Current` wrapper may run at
 construction. A caller-supplied observation provider is not a capability factory.
 `CommittedScopeEffect` stays concrete and non-generic in GTP-U and XFRM APIs;
 erase the sealed backend internally and retain the effect's trusted class there.
-Default and `store`-only consumers, including XFRM's `scope-store`, must not
-depend on `opc-session-net` or `opc-tls`. Extend the dependency-contract check,
-`ci/local-kernel-lifecycle-cases.json` and the native shard case list for
-`native-scope` when implementing #1225.
+Default and `store`-only consumers, including XFRM's `scope-store`, do not
+depend on `opc-session-net`. Default lifecycle and XFRM consumers also remain
+free of storage and TLS dependencies. The existing store adapter already
+depends on `opc-tls` through `opc-key`; `native-scope` preserves that baseline
+and makes the scope transport opt-in. The dependency-contract check,
+`ci/local-kernel-lifecycle-cases.json` and the native shard case list cover
+these boundaries and both authority adapters.
 
 The consumer commits through the **shared batch coordinator**, retains the
 original full request and supplies its committed completion to

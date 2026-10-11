@@ -353,11 +353,13 @@ kernel or activation outcome. A later authenticated
 revision-2 handshake clears the mismatch condition; it never proves an
 unresolved mutation's outcome or authorizes a kernel effect.
 
-The proposed `native-scope` feature alone adds `opc-session-net`/`opc-tls`.
-Default and `store`-only consumers, including XFRM's `scope-store`, retain their
-current dependency boundary. Extend `ci/check-xfrm-dependency-contract.py`,
-`ci/local-kernel-lifecycle-cases.json` and the native shard case list to cover
-that boundary and both authority adapters when implementing #1225.
+The opt-in `native-scope` feature adds `opc-session-net`. Default lifecycle
+and XFRM consumers remain free of storage and TLS dependencies. Store-only
+consumers, including XFRM's `scope-store`, retain the existing `opc-key` to
+`opc-tls` dependency without adding the scope transport.
+`ci/check-xfrm-dependency-contract.py`, the native shard case list and
+`ci/local-kernel-lifecycle-cases.json` cover these boundaries and both
+authority adapters.
 
 Undo runs in reverse effect order and verifies each object still matches its
 receipt. It cannot delete a successor birth, widen to whole-scope reset, send
