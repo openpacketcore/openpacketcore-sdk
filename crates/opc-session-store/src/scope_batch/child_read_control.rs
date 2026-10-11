@@ -56,8 +56,11 @@ mod gates {
     /// Deterministic pause locations for qualification of the sole read cut.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ScopeChildReadStage {
+        /// The complete barrier returned; no backend cut has opened yet.
         BeforeCapture,
+        /// The sole backend cut is open, before its authority or children are read.
         AfterCapture,
+        /// The first key was materialized; the second still belongs to that cut.
         BetweenKeys,
     }
 

@@ -214,6 +214,7 @@ impl ScopeBatchStore {
         G: Send + 'static,
     {
         use crate::consensus::store::scope_child_read::before;
+        child_read::validate_keys(keys)?;
         let request = ScopeChildReadRequest::new(stamp, keys.to_vec())?;
         if stamp.namespace() != &self.namespace || stamp.execution().identity() != authenticated {
             return Err(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized).into());
