@@ -1,10 +1,191 @@
 # CI and real-time qualification
 
-The required **Rust workspace** check aggregates the gates, clippy, and test
+The required **Rust workspace** check aggregates the inventory guard, gates, clippy, and test
 shards in [ci.yml](../.github/workflows/ci.yml). Use
 `python3 ci/test-shards.py ids`, `plan --shard ID`, and `precheck --shard ID`
 to reproduce the shards with the profile and disk setup in
 [CONTRIBUTING](../CONTRIBUTING.md#validation-gates).
+
+## Test inventory guard
+
+**Test inventory guard** is a dependency of **Rust workspace**, whose aggregate
+rejects failed, skipped, and cancelled dependencies. The reusable
+[`test-inventory.yml`](../.github/workflows/test-inventory.yml) job also runs on
+`train/**` pushes and merge-group events. On a PR it compares the event's head
+with the merge base of the event's base/head revisions. On a train push it
+compares with the default branch's merge base; on a main push it compares the
+event's before/after revisions. A missing revision or parser error fails the job.
+
+The guard reads immutable Git blobs. It does not check out either compared tree,
+run its generators, compile the workspace, or execute its tests. Rust and Go use
+pinned Tree-sitter grammars, Python uses its standard AST parser, and workflow
+YAML uses a loader that rejects duplicate keys. Comments and quoted examples do
+not count as assertions or test declarations.
+
+The checks are:
+
+| Change kind | What requires a declaration |
+| --- | --- |
+| `removed` | A Rust test attribute, Python `test_*`, or Go `Test*` function disappears from its full inventory path. Rust module declarations and Cargo target configuration determine reachability. |
+| `disabled` | A test gains an ignore, conditional compilation/feature gate, environment-dependent early return, or CI skip/qualification entry. A newly added ignored test is also reported. |
+| `assertions-decreased` | A test's assertion count falls, including assertions in resolved local test helpers; or an assertion-bearing scenario helper disappears without a matching relocation or retained assertion expressions. |
+| `required-ci-removed` | A job leaves the aggregate's dependency graph, a matrix lane disappears, a required execution platform/container changes, a test command or its literal shell-loop selection changes, or a job/step/trigger gains a condition that can omit its tests. |
+
+Rust counts `assert!`, `assert_eq!`, `assert_ne!`, `assert_matches!` and their
+`debug_assert*` forms, including invocations inside other macros. Result
+`unwrap`/`expect` and their error-result forms count too; a diagnostic
+`unwrap_or_else` that panics retains that check. Fixture mutex poison handling
+does not count as a result-under-test assertion. An inline fallible callback
+whose enclosing call checks success can express checks with `?` and conditional
+`return Err(...)`; those checks retain their count. Discarded callback results
+do not. As with other closure assertions, review must verify that a custom
+wrapper actually invokes the callback and propagates its errors.
+Python counts `assert`,
+assertion methods, exception/warning assertions, and explicit failure calls.
+Go counts testing failure calls and `assert`/`require` calls. Local checked
+helpers are followed within a test target/package when their names resolve
+unambiguously. Rust distinguishes free functions, qualified calls, and methods;
+explicit receiver types, declared factory return types, simple constructors and
+`self` identify fixture methods.
+Unknown receiver types are limited to the same lexical module. Standard atomic
+operations and result assertions do not resolve to unrelated fixture methods.
+Moving assertions into a resolved helper preserves their count. A removed
+helper can relocate under the same method name with at least as many checks,
+or preserve its named expectations/assertion expressions in reachable helpers.
+Other removed checked helpers remain visible even if unrelated checks are added.
+
+In Rust, Python, and Go, assertions in a constant-false branch or an unreachable
+side of a constant conditional do not count. Trivially successful checks such
+as `assert!(true)`, `assert_eq!(value, value)`, Python `assert True`, or Go
+`require.Equal(t, value, value)` do not count either. This recognizes literal
+conditions and obvious self comparisons; it does not solve arbitrary predicates.
+Repeated function calls are not treated as the same value.
+
+Locally stored closures contribute checks only when called or passed as
+callbacks to a reachable call. A closure called only from a dead branch or
+another unused closure contributes nothing. Ordinary Rust expressions and
+braced blocks inside macro token trees receive the same checks. Custom macro
+expansion and whether an arbitrary callback consumer invokes a closure still
+require review. Ordinary assertion edits use counts, without comparing assertion
+text across revisions; reviewers must assess changes to the checked property.
+
+Repeated required commands retain their execution counts. Moving a command
+between required jobs preserves coverage automatically only in the same
+execution environment with an unconditional destination step; an existing run
+on another platform cannot replace a deleted run.
+New platform-specific or child-process tests add coverage and do not require a
+declaration merely for their initial scope; explicit ignores/skips still do.
+The checked child-process idiom must launch the same exact libtest name, set
+its recursion marker, and assert the child's successful exit. A plain
+environment-dependent early return still requires a declaration.
+
+### Declarations
+
+`ci/test-changes.json` has version `1` and a `changes` array. Each entry contains
+exactly one `test` or `job` identity printed by the guard, `kind`, a nonempty
+`reason`, and a positive integer `issue`. The issue must exist in this GitHub
+repository; pull requests do not substitute for issues. API failures fail the
+guard rather than waiving validation. Every flagged change is printed with its
+file and line, including declared changes and their reason/issue.
+
+```json
+{
+  "version": 1,
+  "changes": [
+    {
+      "test": "rust:crates/example::test=contract::checks::old_name",
+      "kind": "removed",
+      "reason": "Renamed to checks::new_name to match the supported contract.",
+      "issue": 1234,
+      "renamed_to": "rust:crates/example::test=contract::checks::new_name"
+    }
+  ]
+}
+```
+
+`renamed_to` must identify an existing head test. The renamed test is still
+compared for fewer assertions or new gates, which need their own declarations.
+Every removal needs a reason and an existing issue. When the tested behavior
+still exists, use `replacements` to list its exact replacing head test identities
+(or `renamed_to` for a rename). Every named replacement must exist at the head.
+When the behavior was deleted, explicitly set `behavior_deleted` to `true` and
+cite the deleting commit, PR, or source change in a nonempty `deleting_change`:
+
+```json
+{
+  "test": "rust:crates/example::test=contract::checks::legacy_adapter",
+  "kind": "removed",
+  "reason": "The legacy adapter and its supported behavior have been deleted.",
+  "issue": 1234,
+  "behavior_deleted": true,
+  "deleting_change": "This PR: crates/example/src/legacy.rs removes the legacy adapter."
+}
+```
+
+This form needs no replacement test. The two deleted-behavior fields are valid
+only together on a removed test and cannot be combined with replacement or
+rename fields. Reviewers verify that replacing tests cover the retained behavior,
+or that the cited change actually deletes it. A required job/lane entry uses `job` in place of `test`,
+for example `ci:.github/workflows/ci.yml::rust-tests[shard=it-2]`.
+
+The file is a permanent, append-only record. The head's `changes` array must
+start with every base entry unchanged and in the same order. Editing, deleting,
+or reordering history fails the guard; JSON formatting and object-key order
+may change. Historical entries match nothing, produce no error or warning, and
+need no repeat issue or replacement-target lookup. An unrelated later PR passes
+with this history present.
+
+Only entries appended after that unchanged prefix can declare the current PR's
+changes. To declare another reduction of the same test or job later, append a
+new entry. Duplicate subject/kind pairs within the new entries, unused or
+misspelled new entries, and wildcards are rejected. The initial file contents
+are `{"version": 1, "changes": []}`; keep all records after their changes land.
+
+### Local validation and boundaries
+
+Use Python 3.11–3.14 on Linux and a stable worktree-local environment:
+
+```bash
+python3 -m venv target/test-inventory-venv
+target/test-inventory-venv/bin/pip install --require-hashes --only-binary=:all: \
+  -r ci/test-inventory-requirements.txt
+target/test-inventory-venv/bin/python ci/test-test-inventory.py
+target/test-inventory-venv/bin/python ci/test-inventory.py \
+  --json test-inventory-report.json
+```
+
+Outside GitHub Actions, the default comparison is `git merge-base HEAD
+origin/main` to `HEAD`. Fetch the remote history first; a missing `origin/main`
+fails with guidance to fetch it. An explicit `--base` must be an ancestor of
+both the checked-out `HEAD` and `origin/main`. For example, `--base HEAD` is
+rejected on a branch with unmerged commits. A main-only or unrelated base is
+also rejected. This applies even when `--head` is supplied.
+When both `--base` and `--head` are explicitly supplied, they must resolve to
+different commits, including when different refs name the same commit.
+Default, base-only and event comparisons with identical revisions pass as
+"nothing to compare", including local runs on unchanged main and train pushes
+at main's tip. Their JSON report sets `nothing_to_compare` to `true` and uses
+null inventory counts because no inventory comparison is needed.
+
+Commit the candidate before comparing: the guard reads committed trees, not the
+working tree. For a historical proof, supply both `--base BASE` and `--head HEAD`;
+the base must also be an ancestor of that comparison head. The selected revisions
+are printed so a historical result can be distinguished from validation of the
+checked-out candidate. GitHub Actions uses its event revisions and verifies
+that the event head is in the checked-out history.
+
+Set `GH_TOKEN` when declarations need authenticated issue lookup;
+the token is used only for read-only issue requests. No issue request is needed
+when there are no newly appended declarations.
+
+These are static structural checks, not semantic equivalence proofs. They do
+not expand arbitrary user-defined Rust macros, perform compiler type inference,
+resolve dynamic Python imports, or prove what an arbitrary shell command runs.
+The guard follows the repository's explicit test targets, common test attributes,
+local helpers, required workflow dependencies and literal skip selections.
+Review still has to establish that changed conditions, values, or helper behavior
+preserve the property under test. The separate policy on wall-clock assertions
+continues to apply; this guard does not replace it.
 
 ## Exact, temporary qualification manifest
 
