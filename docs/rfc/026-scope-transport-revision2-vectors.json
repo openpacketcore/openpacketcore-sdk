@@ -1,6 +1,6 @@
 {
-  "format": "rfc026-transport-revision-2-design-vectors",
-  "notice": "Proposed design only. Synthetic public inputs and unauthenticated envelope ciphertext; not credentials, a real TLS transcript, or runtime qualification.",
+  "format": "rfc026-transport-revision-2-vectors",
+  "notice": "Implementation fixtures with synthetic public inputs and unauthenticated envelope ciphertext; not credentials, a real TLS transcript, or runtime qualification.",
   "sources": {
     "026-scope-authenticated-transport-vectors.json": "8d5943d4209ff35f0b1fa796768058321b70ca488851f1d280b073941608e14d",
     "026-scope-authenticated-transport-batch-vectors.json": "38643780413b49e7e217ea252da1820d08de376beb7f89fac7f7012c6e0b38ff"

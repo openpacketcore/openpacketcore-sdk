@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent RFC 026 revision-2 design vectors; Python standard library only.
+"""Independent RFC 026 revision-2 implementation vectors; Python standard library only.
 
 This is a reference byte generator, not a production protocol/crypto library.
 Scalar 1/2 and the exporter secret come from public synthetic revision-1
@@ -368,8 +368,8 @@ def generate():
     for item in positives + [item for item in negatives if "frame_hex" in item]:
         assert item["frame_length"] <= FRAME_CAP
     return dict(
-        format="rfc026-transport-revision-2-design-vectors",
-        notice="Proposed design only. Synthetic public inputs and unauthenticated envelope ciphertext; not credentials, a real TLS transcript, or runtime qualification.",
+        format="rfc026-transport-revision-2-vectors",
+        notice="Implementation fixtures with synthetic public inputs and unauthenticated envelope ciphertext; not credentials, a real TLS transcript, or runtime qualification.",
         sources={path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in [AUTH, BATCH]},
         authority_startup=revised, batch=revised_batch,
         child_read=dict(
@@ -392,8 +392,8 @@ def main():
     encoded = json.dumps(generate(), indent=2) + "\n"
     if args.check:
         if not OUTPUT.exists() or OUTPUT.read_text() != encoded:
-            raise SystemExit("revision-2 design vectors differ")
-        print("revision-2 design vectors match")
+            raise SystemExit("revision-2 implementation vectors differ")
+        print("revision-2 implementation vectors match")
     else:
         OUTPUT.write_text(encoded)
         print("wrote " + OUTPUT.name)

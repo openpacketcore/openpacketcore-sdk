@@ -1,6 +1,6 @@
 # RFC 026 addendum: bounded worker child reads
 
-Status: implemented locally; final qualification and independent review pending. Addresses
+Status: implemented. Addresses
 [#1221](https://github.com/openpacketcore/openpacketcore-sdk/issues/1221) and the
 follow-on authority adapter in [#1225](https://github.com/openpacketcore/openpacketcore-sdk/issues/1225).
 Applies to [RFC 026](026-scope-authenticated-transport.md)
@@ -235,9 +235,9 @@ The local adapter also uses `ScopeBatchStore::read_current`; its pre-submission
 submit a new activation.
 
 Each readback/recheck takes the effect's **trusted work class from its activation
-submission**, matching bound provenance. Constructor class is only a default
-for unrelated setup/recovery. Refuse SafetyControl. Normal never spends
-Emergency capacity; Emergency rechecks must progress while Normal is saturated.
+submission**, matching bound provenance. Construction uses Current on its
+reserved control path; the constructor takes no effect class. Readback and
+rechecks refuse SafetyControl. Normal never spends Emergency capacity; Emergency rechecks must progress while Normal is saturated.
 Keep the effect's original trusted class distinct from the scheduler's inherited
 running class: a temporary lane priority boost cannot promote an ordinary
 effect's later standalone rechecks into Emergency capacity.
@@ -282,13 +282,14 @@ tests; preserve all existing assertions and deadlines.
 | Record namespace/key | Correct echo, wrong record: `Batch(Unavailable)` | Remove each record/request comparison |
 | Canonical bytes, versions, claims, envelope | Overlong/trailing bytes, zero/overflow birth/generation/batch revision, duplicate/ninth claim, malformed envelope: `Batch(Unavailable)` | Bypass each validator/re-encoding |
 | Presence/result tags | Unknown tag or present-without-value: `Batch(Unavailable)` | Accept unknown tag or present tombstone |
-| Bounds before allocation | Counts 0/33, excessive LP lengths, oversized frame; bounded allocator sees no prohibited allocation. Raw-peer duplicate/zero keys and counts 0/33 are refused before any barrier | Allocate before each bound or bypass server key-set validation |
-| Atomic aggregate | Mixed presence, 1/17/32 keys; too large gives only `ObservationTooLarge`; split calls use separate cuts | Truncate, silently mark missing, exceed cap |
+| Bounded decoding | Counts 0/33, excessive length prefixes, oversized frames and noncanonical records are refused by the header, length and canonical-codec checks. Raw-peer duplicate/zero keys and counts 0/33 are refused before any barrier | Bypass a header, length, canonical-record or server key-set check |
+| Atomic aggregate | Mixed presence, 1/17/32 keys; on native and SQLite stores, two near-1-MiB children fit and three give only `ObservationTooLarge`, with one barrier and unchanged application log; split calls use separate cuts | Truncate, silently mark missing, exceed cap |
+| Retired incarnation | A validated monotonic retirement seeded in the SQLite store makes a public read of the old incarnation return exactly `Batch(Scope(Retired))` after one barrier | Collapse Retired to stale authority, unavailable or absence |
 | Exact stamp at one cut | Hold after full barrier **before opening cut**, commit Close (separately succession), release: `Batch(Scope(StaleAuthority))`, no records, on native and SQLite | Check authority before the held gate |
 | Cut retained after capture | A second gate **after opening the cut** holds materialization; commit a child update, and separately Close, then release: return the records from the original cut, on both backends | Fetch children from another cut or refresh Current after capture |
 | All keys share the cut | Hold between materializing two keys, commit one batch changing both, release: both returned entries have the original values/revisions | Open a new cut per key |
-| Full barrier/configuration | Ordered write through follower; held replacement from Fence to successor admission gives `Batch(Unavailable)`, never `StaleAuthority`; delayed retired-voter replies cannot release the read; exactly one full barrier per success | Skip round/applied/config/incarnation check, misclassify cutover or add Current |
-| Both boot-key comparisons | Add method 17 to `native_scope_shared_identity_cannot_sign_for_another_slots_boot`: A's key signing B's stamp gets Unauthorized **before any read barrier**, unchanged log/frontiers; A's stamp on B's scope also Unauthorized. Retain inconsistent-retained-record case and B positive controls | In method 17's own path remove **both** carried-execution/key and cut-level current-execution/key checks: A can read B's children and the test must fail. Retain existing independent single-removal mutations on the generic path; a redundant cut check alone is not claimed to be killed |
+| Full barrier/configuration | Ordered write through follower; reads held at AfterCapture and BetweenKeys across a committed Fence return `Batch(Unavailable)`. Across a leader change they return the original-cut rows or `Batch(Unavailable)`, never later rows; exactly one full barrier per success | Skip round/applied/config/incarnation check, misclassify cutover or add Current |
+| Both boot-key comparisons | Add method 17 to `native_scope_shared_identity_cannot_sign_for_another_slots_boot`: A's key signing B's stamp gets Unauthorized **before any read barrier**, unchanged log/frontiers; A's stamp on B's scope is Invalid before proof. Retain inconsistent-retained-record case and B positive controls | In method 17's own path remove **both** carried-execution/key and cut-level current-execution/key checks: A can read B's children and the test must fail. Retain existing independent single-removal mutations on the generic path; a redundant cut check alone is not claimed to be killed |
 | Live policy/process/generation | Held revocation/wrong process/principal/scope: Unauthorized; stale generation: StaleAuthority | Reuse cached grant or compare only namespace |
 | Class/currentness | SafetyControl/wrong listener: Unauthorized; stale Emergency boot spends no Emergency dispatch credit; #1225 Emergency progresses with Normal full | Ignore class/listener/currentness or force one fixed class |
 | Method-17 proof share/promotion | Unpromoted calls spend only `WorkerUnproven`; success promotes; stale hint or key mismatch clears it, so a second call cannot use `WorkerCurrent` | Treat unpromoted as current, omit promotion or retain a stale hint |
@@ -304,8 +305,9 @@ tests; preserve all existing assertions and deadlines.
 | Activation provenance/ack | Reject forged outcome/port completion, altered request/row/batch revision/class, early-ack Pruned, epoch change, duplicate consumption; compile-fail native commit_activation | Remove each provenance/readback/fence/consumption guard or expose raw commit |
 | Independent bytes | Reference script `--check` runs in required CI and reproduces all revision-2 frames, exporters, proof/bindings and child positive/negative vectors; implementation matches | Change version, unchanged domain/input version, order or bound, or omit the CI check |
 
-Run existing local authority cases against both adapters, plus native failures,
-Close/drain/reset/restart. Run full local gates on the candidate before handoff.
+Qualification covers the existing local authority cases against both adapters,
+native failures, Close, drain, reset and restart. The repository validation gates
+include the privileged lifecycle manifest.
 
 ## Installation and lifecycle
 

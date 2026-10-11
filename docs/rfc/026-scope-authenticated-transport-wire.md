@@ -12,11 +12,11 @@ contract; do not infer a layout from a Rust struct's memory representation.
 
 ## Revision 2
 
-This section specifies the [child-read addendum](026-scope-child-point-read.md),
-pending design review and implementation. The following older sections describe
-revision 1 unless overridden here. Existing authority/startup and batch JSON
-files remain revision-1 implementation fixtures during design review; their
-`format` labels are fixture-schema versions, **not** transport revisions.
+This section specifies the implemented
+[child-read addendum](026-scope-child-point-read.md). The following older sections
+describe revision 1 unless overridden here. Existing authority/startup and batch
+JSON files retain the historical revision-1 fixtures; their `format` labels are
+fixture-schema versions, **not** transport revisions.
 The separate [revision-2 vectors](026-scope-transport-revision2-vectors.json)
 regenerate all their scope frames and affected cryptographic inputs. Reproduce
 them with `python3 docs/rfc/026-scope-transport-revision2-vectors.py --check`.
