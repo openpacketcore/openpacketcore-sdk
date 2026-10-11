@@ -17,14 +17,14 @@ env:
 
 jobs:
   # Keep the existing required check name and require both independent jobs.
-  privileged-gtpu:
+  privileged-gtpu-result:
     name: Privileged Linux GTP-U
     if: always()
-    needs: [privileged-gtpu-datapath, privileged-gtpu-regressions]
+    needs: [privileged-gtpu, privileged-gtpu-regressions]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      DATAPATH_RESULT: ${{ needs.privileged-gtpu-datapath.result }}
+      DATAPATH_RESULT: ${{ needs.privileged-gtpu.result }}
       REGRESSIONS_RESULT: ${{ needs.privileged-gtpu-regressions.result }}
     steps:
       - name: Require both privileged jobs to pass
@@ -160,7 +160,7 @@ jobs:
             ${{ runner.temp }}/live_locked_route_mtu.log
           if-no-files-found: warn
 
-  privileged-gtpu-datapath:
+  privileged-gtpu:
     name: Privileged Linux GTP-U datapath
     runs-on: ubuntu-latest
     timeout-minutes: 30
