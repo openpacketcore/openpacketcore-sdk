@@ -8,6 +8,58 @@ pub(crate) struct RawChildResponse {
     pub(crate) body: Vec<u8>,
 }
 
+pub(crate) async fn reject_before_proof(
+    tls: &opc_tls::AuthenticatedClientConfig,
+    address: std::net::SocketAddr,
+    scope: &ScopeId,
+    canonical: Vec<u8>,
+) -> ScopeRpcError {
+    let binding = ScopeBinding::from_scope(scope).unwrap();
+    let id = [69; 16];
+    let nonce = [69; 32];
+    let digest = transport_request_digest(Method::ChildRead, &id, &canonical).unwrap();
+    let bytes = CallPayload { nonce, canonical }
+        .encode(Method::ChildRead)
+        .unwrap();
+    let call = Header {
+        kind: FrameKind::Call,
+        class: Class::Normal,
+        method: Method::ChildRead,
+        installation: *binding.installation(),
+        scope: binding.commitment(),
+        request_id: id,
+        digest,
+        payload_len: bytes.len(),
+    };
+    let mut stream = tls
+        .begin_handshake()
+        .unwrap()
+        .connect_scope(
+            TcpStream::connect(address).await.unwrap(),
+            binding.tls_domain().unwrap(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(&call.encode().unwrap()).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut fixed = [0; HEADER_BYTES];
+    stream.read_exact(&mut fixed).await.unwrap();
+    let result = Header::decode(&fixed).unwrap();
+    assert_eq!(
+        result.kind,
+        FrameKind::Result,
+        "malformed key sets cannot reserve a challenge or reach a native read"
+    );
+    assert!(result.matches_attempt(&call));
+    let mut body = vec![0; result.payload_len];
+    stream.read_exact(&mut body).await.unwrap();
+    let payload = ResultPayload::decode(&body).unwrap();
+    assert_eq!(payload.nonce, nonce);
+    assert_eq!(payload.status, ResultStatus::ProvenNoEffect);
+    super::super::super::rpc_client::payload_error(&payload).unwrap()
+}
+
 impl RawPeer {
     pub(crate) async fn child_read_on(
         &self,

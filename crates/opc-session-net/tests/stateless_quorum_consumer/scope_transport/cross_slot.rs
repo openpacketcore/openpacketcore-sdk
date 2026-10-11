@@ -131,6 +131,26 @@ fn native_scope_shared_identity_cannot_sign_for_another_slots_boot() {
             let before = peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::BatchReopen(stamp_b), &ScopeClock).await.unwrap();
             let cut = ScopeBatchReopen::decode_canonical(&before).unwrap();
             assert!(matches!(cut, ScopeBatchReopen::Initialized(ref state) if state.authority().is_active()));
+            let encoded = child_read.encode_canonical().unwrap();
+            let count = 2 + usize::from(u16::from_be_bytes(encoded[..2].try_into().unwrap()));
+            let mut malformed = Vec::new();
+            for keys in [vec![], vec![key_b.as_bytes().to_vec(); 2], vec![vec![0; 32]], (1..=33).map(|tag| vec![tag; 32]).collect()] {
+                let mut bytes = encoded[..count].to_vec();
+                bytes.push(keys.len() as u8);
+                bytes.extend(keys.into_iter().flatten());
+                malformed.push(bytes);
+            }
+            // A valid stamp from A is still an invalid request on B's bound scope.
+            malformed.push(ScopeChildReadRequest::new(&stamps[0], vec![key_b]).unwrap().encode_canonical().unwrap());
+            for bytes in malformed {
+                let reads = fleet.read_barrier_calls();
+                let log = fleet.stores[leader].status().last_log_index;
+                assert_eq!(crate::scope::attack_test_support::cross_slot::reject_before_proof(
+                    &tls, addresses[3], scope_b, bytes).await, ScopeRpcError::Invalid);
+                assert_eq!(fleet.read_barrier_calls(), reads);
+                assert_eq!(fleet.stores[leader].status().last_log_index, log);
+            }
+            assert_eq!(peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::BatchReopen(stamp_b), &ScopeClock).await.unwrap(), before);
             for call in attacks {
                 let reads = fleet.read_barrier_calls();
                 let log = fleet.stores[leader].status().last_log_index;
@@ -174,6 +194,8 @@ fn native_scope_shared_identity_cannot_sign_for_another_slots_boot() {
             assert_eq!(observed.namespace(), stamp_b.namespace());
             assert_eq!(observed.key(), key_b);
             assert_eq!(observed.revision(), seeded.rows()[0]);
+            assert_eq!(observed.batch_revision(), seeded.revision());
+            assert!(observed.claims().is_empty());
             assert_eq!(observed.value(), Some(&value_b));
             for call in attacks.into_iter().filter(|call| !call.carries_execution()) {
                 peers[1].send(&tls, addresses, scope_b, execution_b, call, &ScopeClock).await.unwrap();
