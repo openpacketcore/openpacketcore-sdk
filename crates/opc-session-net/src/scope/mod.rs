@@ -25,6 +25,9 @@ pub use wire::{Class, ScopeBinding, WireError};
 mod wire_tests;
 
 #[cfg(test)]
+mod child_read_tests;
+
+#[cfg(test)]
 mod proof_tests;
 
 #[cfg(test)]
