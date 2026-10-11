@@ -270,3 +270,72 @@ async fn stale_currentness_prevents_submission_and_each_later_child_cut() {
         assert_eq!(store.events.lock().unwrap().as_slice(), expected);
     }
 }
+
+#[tokio::test]
+async fn committed_readback_checks_every_child_field_without_submitting_again() {
+    for field in [
+        "valid",
+        "missing",
+        "namespace",
+        "key",
+        "birth",
+        "generation",
+        "batch_revision",
+        "value",
+        "claims",
+    ] {
+        let (mut store, request, child) = fixture();
+        let mut row = serde_json::to_value(store.row.as_ref().unwrap()).unwrap();
+        match field {
+            "valid" => {}
+            "missing" => row = Value::Null,
+            "namespace" => row["namespace"]["incarnation"] = json!(2),
+            "key" => row["key"] = json!(vec![99; 32]),
+            "birth" | "generation" => row["revision"][field] = json!(2),
+            "batch_revision" => row[field] = json!(2),
+            "value" => row[field] = serde_json::to_value(value(99)).unwrap(),
+            "claims" => row[field] = json!([]),
+            _ => unreachable!(),
+        }
+        store.row = serde_json::from_value(row).unwrap();
+        let result = readback_applied(
+            &store,
+            &store.stamp,
+            request.clone(),
+            child,
+            store.outcome.clone(),
+        )
+        .await;
+        if field == "valid" {
+            let (key, outcome, index) = result.unwrap();
+            assert_eq!(key.request(), &request);
+            assert_eq!(key.batch_revision(), outcome.revision());
+            assert_eq!(index, 0);
+        } else {
+            assert!(matches!(result, Err(LocalEffectError::Stale)), "{field}");
+        }
+        assert_eq!(*store.events.lock().unwrap(), ["read"], "{field}");
+    }
+}
+
+#[tokio::test]
+async fn committed_readback_rejects_wrong_outcome_before_current_child_observation() {
+    for field in ["request_digest", "lane", "sequence", "rows"] {
+        let (mut store, request, child) = fixture();
+        let mut outcome = serde_json::to_value(&store.outcome).unwrap();
+        outcome[field] = match field {
+            "request_digest" => json!(vec![99; 32]),
+            "rows" => json!([]),
+            _ => json!(2),
+        };
+        store.outcome = serde_json::from_value(outcome).unwrap();
+        assert!(
+            matches!(
+                readback_applied(&store, &store.stamp, request, child, store.outcome.clone()).await,
+                Err(LocalEffectError::OutcomeUnknown)
+            ),
+            "{field}"
+        );
+        assert!(store.events.lock().unwrap().is_empty(), "{field}");
+    }
+}
