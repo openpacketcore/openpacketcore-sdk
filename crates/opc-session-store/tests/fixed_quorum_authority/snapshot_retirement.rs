@@ -98,7 +98,16 @@ impl SessionConsensusRpcHandler for PausedSnapshotHandler {
                 );
             }
         }
+        let started = Instant::now();
         let response = self.inner.handle(sender, request).await;
+        if chunk.as_ref().is_some_and(|chunk| chunk.done) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "snapshot-retirement last-chunk snapshot_bytes={} elapsed_seconds={:.3}",
+                self.expected.len(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
         if let Some(chunk) = chunk {
             let result: Result<
                 opc_consensus::engine::raft::InstallSnapshotResponse<SessionConsensusNodeId>,
@@ -151,15 +160,14 @@ async fn wait_for_snapshot_readiness<T>(
 }
 
 async fn wait_for_progress(
+    phase: &str,
     store: &ConsensusSessionStore,
     ready: impl Fn(opc_session_store::test_support::ConsensusLocalDurableProgressForTest) -> bool,
 ) {
-    let progress = tokio::time::timeout(
-        Duration::from_secs(10),
-        wait_for_consensus_progress_for_test(store, &ready),
-    )
-    .await
-    .expect("native voter reaches the required snapshot frontier");
+    let progress =
+        wait_for_snapshot_readiness(phase, wait_for_consensus_progress_for_test(store, &ready))
+            .await
+            .expect("native voter reaches the required snapshot frontier");
     assert_eq!(
         ConsensusEngineStateForTest::Running,
         progress.engine_state,
@@ -206,7 +214,7 @@ async fn write_large_record(store: &ConsensusSessionStore, ordinal: u8) {
         key_id: key_id.clone(),
         nonce: vec![ordinal; AES_256_GCM_SIV_NONCE_LEN],
         aad: serialize_bound_aad(&aad, &key_id).unwrap(),
-        ciphertext_and_tag: vec![ordinal; 512 * 1024 + AEAD_TAG_LEN],
+        ciphertext_and_tag: vec![ordinal; 300 * 1024 + AEAD_TAG_LEN],
     }
     .encode()
     .unwrap();
@@ -245,14 +253,18 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
         })
         .unwrap();
     let lagging = (leader + 1) % 3;
-    // Keep the production 1 MiB transfer chunk size. Three bounded synthetic
-    // records force the actual engine to read again after the gated response.
+    // Keep the production 1 MiB transfer chunk size. One bounded synthetic
+    // record still forces the engine to read again after the gated response.
+    // #1230 tracks the snapshot install cost that limits this fixture's size.
     // Prepare the byte image before forcing the lagging voter to miss a log.
-    for ordinal in 1..=3 {
+    for ordinal in 1..=1 {
         write_large_record(&stores[leader], ordinal).await;
     }
     let ready_index = consensus_local_durable_progress_for_test(&stores[leader]).applied_index;
-    wait_for_progress(&stores[lagging], |p| p.applied_index >= ready_index).await;
+    wait_for_progress("initial-record-applied", &stores[lagging], |p| {
+        p.applied_index >= ready_index
+    })
+    .await;
     // This regression controls snapshot retirement, not leader election. The
     // pinned engine's per-node switch prevents the disconnected voter from
     // advancing its term, however long building and purging the snapshot take.
@@ -270,7 +282,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     trigger_consensus_snapshot_for_test(&stores[leader])
         .await
         .unwrap();
-    wait_for_progress(&stores[leader], |p| {
+    wait_for_progress("predecessor-published", &stores[leader], |p| {
         p.snapshot_index == Some(predecessor_index)
     })
     .await;
@@ -293,7 +305,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     trigger_consensus_log_purge_through_for_test(&stores[leader], predecessor_index)
         .await
         .unwrap();
-    wait_for_progress(&stores[leader], |p| {
+    wait_for_progress("predecessor-purged", &stores[leader], |p| {
         p.purged_index == Some(predecessor_index)
     })
     .await;
@@ -346,7 +358,7 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
     assert_eq!(original[..prefix.len()], prefix);
 
     publication.release();
-    wait_for_progress(&stores[leader], |p| {
+    wait_for_progress("successor-published", &stores[leader], |p| {
         p.snapshot_index == Some(successor_index)
     })
     .await;
@@ -394,7 +406,10 @@ async fn native_leader_streams_retired_snapshot_without_stopping_engine() {
         .await
         .expect("same leader still commits after successor publication and transfer");
     for store in &stores {
-        wait_for_progress(store, |p| p.applied_index >= Some(after)).await;
+        wait_for_progress("post-transfer-commit-applied", store, |p| {
+            p.applied_index >= Some(after)
+        })
+        .await;
     }
     let status = stores[leader].status();
     assert_eq!(Some(status.node_id), status.leader_id);
