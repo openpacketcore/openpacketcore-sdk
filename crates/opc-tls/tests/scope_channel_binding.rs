@@ -429,6 +429,40 @@ async fn silent_peer_expires_the_bounded_handshake() {
 }
 
 #[tokio::test]
+async fn revision_one_alpn_is_typed_and_does_not_latch_later_handshakes() {
+    let pair = pair();
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let mut legacy = (*pair.server.rustls_config()).clone();
+    legacy.alpn_protocols = vec![b"opc-scope/1".to_vec()];
+    let (client, server) = tokio::join!(
+        pair.client.connect_scope(client_io, domain()),
+        tokio_rustls::TlsAcceptor::from(Arc::new(legacy)).accept(server_io),
+    );
+    assert_eq!(client.unwrap_err(), ScopeTlsError::TransportRevisionMismatch);
+    assert!(server.is_err());
+
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let mut legacy = (*pair.client.rustls_config()).clone();
+    legacy.alpn_protocols = vec![b"opc-scope/1".to_vec()];
+    let (client, server) = tokio::join!(
+        TlsConnector::from(Arc::new(legacy)).connect(
+            ServerName::try_from("ignored.example.test").unwrap(), client_io),
+        pair.server.accept_scope(server_io, domain()),
+    );
+    assert!(client.is_err());
+    assert_eq!(server.unwrap_err(), ScopeTlsError::TransportRevisionMismatch);
+
+    // Reuse the same material and handshake handles after both mismatches.
+    // A fresh, authenticated revision-2 connection must immediately recover.
+    let (client, server) = connect(&pair).await;
+    let bounds = interval(pair.start, pair.end - time::Duration::seconds(1));
+    for purpose in [ChannelBindingPurpose::ScopeRequest, ChannelBindingPurpose::ScopeResponse,
+        ChannelBindingPurpose::BootLiveness, ChannelBindingPurpose::BootCandidate] {
+        assert_eq!(client.channel_binding(purpose, bounds).unwrap(), server.channel_binding(purpose, bounds).unwrap());
+    }
+}
+
+#[tokio::test]
 async fn tls12_compatibility_configuration_cannot_admit_scope_traffic() {
     let mut pair = pair();
     pair.server = TlsConfigBuilder::new(pair._server_source.subscribe())
