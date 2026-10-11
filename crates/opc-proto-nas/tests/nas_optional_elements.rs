@@ -464,10 +464,12 @@ fn unknown_half_octet_duplicates_use_the_high_nibble_in_permissive_contexts() {
 
 #[test]
 fn unknown_full_octet_elements_retain_permissive_framing_and_policy() {
-    // Neither identifier occurs in any of the six pinned message tables.
-    for wire in [&[0x4d, 2, 0xab, 0xcd][..], &[0x7f, 0, 2, 0xab, 0xcd][..]] {
+    // Non-critical identifiers retain permissive framing where unassigned.
+    for wire in [&[0x4d, 2, 0xab, 0xcd][..], &[0x7d, 0, 2, 0xab, 0xcd][..]] {
         for message in fixtures::MESSAGES {
-            assert!(!fixture_contains(message, wire[0]));
+            if fixture_contains(message, wire[0]) {
+                continue;
+            }
             let body = body_with(message, wire);
             let decoded =
                 decode_mm_message_body(message.kind, &body, DecodeContext::default()).unwrap();
@@ -499,6 +501,68 @@ fn unknown_full_octet_elements_retain_permissive_framing_and_policy() {
                 decode_mm_message_body(message.kind, &short, DecodeContext::default()).unwrap_err(),
                 expected_error(DecodeErrorCode::Truncated, 0, message.section),
             );
+        }
+    }
+}
+
+#[test]
+fn every_full_octet_identifier_outside_the_table_is_rejected_by_rejecting_contexts() {
+    let rejecting = [
+        DecodeContext::conservative(),
+        DecodeContext {
+            validation_level: ValidationLevel::ProcedureAware,
+            ..DecodeContext::default()
+        },
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        },
+    ];
+    for message in fixtures::MESSAGES {
+        for octet in 0x00..=0x7f_u8 {
+            if fixture_contains(message, octet) {
+                continue;
+            }
+            let expected = if octet <= 0x0f || matches!(octet, 0x7e | 0x7f) {
+                expected_error(DecodeErrorCode::UnknownCriticalIe, 0, "7.5")
+            } else {
+                unknown_ie(0, message.section)
+            };
+            for ctx in rejecting {
+                assert_eq!(
+                    decode_mm_message_body(message.kind, &body_with(message, &[octet, 0, 0]), ctx)
+                        .unwrap_err(),
+                    expected,
+                    "kind={:02x} ie={octet:02x}",
+                    message.kind,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_comprehension_required_identifiers_fail_closed_in_all_six_bodies() {
+    let contexts = [
+        DecodeContext::default(),
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+        DecodeContext::conservative(),
+    ];
+    for message in fixtures::MESSAGES {
+        for octet in (0x00..=0x0f).chain([0x7e, 0x7f]) {
+            assert!(!fixture_contains(message, octet));
+            for ctx in contexts {
+                assert_eq!(
+                    decode_mm_message_body(message.kind, &body_with(message, &[octet, 0, 0]), ctx)
+                        .unwrap_err(),
+                    expected_error(DecodeErrorCode::UnknownCriticalIe, 0, "7.5"),
+                    "kind={:02x} ie={octet:02x} ctx={ctx:?}",
+                    message.kind,
+                );
+            }
         }
     }
 }

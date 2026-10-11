@@ -16,6 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encode the retained elements; `PlainMm.body` retains the original body bytes.
   The two types redact values in Debug and enforce decoding/encoding limits.
 
+- `opc-proto-nas`: optional-element decoding of Registration Request/Accept and
+  Security Mode Command/Complete changed. Strict, ProcedureAware and
+  `UnknownIePolicy::Reject` now reject identifiers outside the message's own
+  table that the former shared registry accepted (all of `0x70–0x7F` and
+  `0xA0–0xFF`, and the registry's TLV identifiers in messages that do not list
+  them); Strict and ProcedureAware also reject lengths outside the table
+  bounds. `UnknownIePolicy::Drop` now drops those non-critical out-of-table
+  identifiers. Unknown identifiers coded as comprehension required
+  (`0x00–0x0F`, `0x7E`, `0x7F`) now fail with `UnknownCriticalIe` under every
+  decode context, including Preserve and Drop. `0x80–0x9F` are framed as one
+  octet instead of TLV. Optional-element errors cite the message or element
+  clause instead of `8.2`, or `7.5` for an unknown comprehension-required
+  identifier. `PlainMm::decode_body` and `decode_mm_message_body` can now return
+  an error for Configuration Update Command/Complete bodies.
+
 ### Added
 
 - `opc-proto-nas`: frame optional elements with complete per-message tables

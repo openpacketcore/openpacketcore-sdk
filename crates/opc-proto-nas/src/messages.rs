@@ -697,6 +697,11 @@ fn decode_optional_ies(
             .entries
             .iter()
             .find(|entry| entry.iei == duplicate_key);
+        if descriptor.is_none() && (iei <= 0x0F || matches!(iei, 0x7E | 0x7F)) {
+            // TS 24.007 §11.2.5 comprehension required; TS 24.501 §7.5.1.
+            return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, offset)
+                .with_spec_ref(message_spec_ref("7.5")));
+        }
         if descriptor.is_none() && rejects_unknown_optional_ie(ctx) {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {

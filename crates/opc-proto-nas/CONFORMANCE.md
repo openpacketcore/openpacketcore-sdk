@@ -168,9 +168,11 @@ Structural and HeaderOnly retain framing-only behavior for registered lengths.
 Permissive unknown framing is described under Known Limitations. Duplicate
 First/Last/Reject policy and element-count limits apply to all six bodies;
 dropped unknown elements still count toward the limit. Framing failures cite
-the known element's clause, while unknown, duplicate, and count failures cite
-the message clause. Optional-element error offsets are relative to the start
-of the optional list.
+the known element's clause, while non-critical unknown, duplicate, and count
+failures cite the message clause. Unknown identifiers coded as comprehension
+required (`0x00–0x0F`, `0x7E`, `0x7F`; TS 24.007 §11.2.5) fail with
+`UnknownCriticalIe` under every decode context, citing TS 24.501 §7.5.
+Optional-element error offsets are relative to the start of the optional list.
 
 These tables add no element-content decoding, ordering checks, presence rules,
 or procedure semantics. Encoding writes retained IE bytes in message order.
@@ -206,11 +208,21 @@ The examples qualify framing only, not semantic validity of opaque IE values.
 
 ## Known Limitations
 
-- For the six per-message tables, permissive decoding of genuinely unknown
-  IEIs retains the existing heuristic: `0x70–0x7F` are treated as TLV-E,
+- For the six per-message tables, permissive decoding of non-critical unknown
+  IEIs retains the existing heuristic: `0x70–0x7D` are treated as TLV-E,
   `0x80–0xFF` as one-octet type-1 IEs, and all others as TLV. Unknown
   fixed-length type-3 IEs need an explicit message-table entry to frame
   correctly. Strict/ProcedureAware and Reject contexts never use this guess.
+- These six bodies frame and bound optional elements; unlike the authentication
+  bodies they do not apply all receiver rules of TS 24.501 clause 7. The default
+  duplicate policy keeps the last repetition; §7.6.3 keeps the first, so a
+  receiver selects `DuplicateIePolicy::First`. Element order is not checked
+  (§7.6.2). Strict and ProcedureAware reject the whole message for a non-critical
+  out-of-table element, a short element, or a type 4 or type 6 element longer
+  than the table maximum, where §7.6.1, §7.7.1 and TS 24.007 §11.4.2 tell a
+  receiver to ignore the element or its extra octets. They check sender
+  conformance against the pinned edition and are not a receiver acceptance
+  test; a later release can add elements or lengths that they reject.
 - The Registration Result `SMS over NAS` flag (bit 4 of the result value)
   is not surfaced separately; the raw value is preserved for byte-exact
   re-encode.
