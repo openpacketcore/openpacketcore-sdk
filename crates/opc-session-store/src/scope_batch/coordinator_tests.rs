@@ -14,6 +14,8 @@ const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[path = "coordinator_read_tests.rs"]
 mod child_reads;
+#[path = "coordinator_revision_tests.rs"]
+mod revision;
 
 struct Model {
     state: Mutex<State>,
