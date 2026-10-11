@@ -83,23 +83,46 @@ fn registration_request_bcd_views() {
 
 #[test]
 fn registration_request_preserves_unknown_optional_ie() {
-    // Append an unknown TLV IE (IEI 0x99, length 2).
+    // TS 24.501 V18.11.1 Table 8.2.6.1.1 does not assign IEI 0x4D.
+    // Unlike 0x99 (Network slicing indication, one octet), it can exercise
+    // the decoder's unknown full-octet TLV preservation policy.
     let mut body = vec![
         0x01, 0x00, 0x0A, 0x01, 0x02, 0xF8, 0x39, 0x21, 0xF3, 0x00, 0x00, 0x13, 0x57,
     ];
-    body.extend_from_slice(&[0x99, 0x02, 0xAB, 0xCD]);
+    body.extend_from_slice(&[0x4D, 0x02, 0xAB, 0xCD]);
 
     let (_, req) = RegistrationRequest::decode_body(&body, DecodeContext::default()).unwrap();
     let unknown = req
         .optional_ies
         .iter()
-        .find(|ie| ie.iei == 0x99)
+        .find(|ie| ie.iei == 0x4D)
         .expect("unknown IE preserved");
     assert_eq!(&unknown.value[..], &[0xAB, 0xCD]);
 
     let mut encoded = BytesMut::new();
     req.encode(&mut encoded, EncodeContext::default()).unwrap();
     assert_eq!(&encoded[..], body);
+}
+
+#[test]
+fn registration_request_network_slicing_indication_is_one_octet() {
+    // TS 24.501 V18.11.1 Table 8.2.6.1.1 assigns 9-; the low nibble is
+    // the value, not a length. A following UE security capability must
+    // start a separate IE (TS 24.007 section 11.2.4).
+    let body = [
+        0x01, 0x00, 0x0A, 0x01, 0x02, 0xF8, 0x39, 0x21, 0xF3, 0x00, 0x00, 0x13, 0x57, 0x99, 0x2E,
+        0x02, 0x80, 0x00,
+    ];
+    let (_, req) = RegistrationRequest::decode_body(&body, DecodeContext::conservative()).unwrap();
+    assert_eq!(req.optional_ies.len(), 2);
+    assert_eq!(req.optional_ies[0].iei, 0x99);
+    assert!(req.optional_ies[0].value.is_empty());
+    assert_eq!(&req.optional_ies[0].raw[..], &[0x99]);
+    assert_eq!(req.optional_ies[1].iei, 0x2E);
+    assert_eq!(&req.optional_ies[1].value[..], &[0x80, 0x00]);
+    let mut encoded = BytesMut::new();
+    req.encode(&mut encoded, EncodeContext::default()).unwrap();
+    assert_eq!(&encoded[..], &body);
 }
 
 #[test]

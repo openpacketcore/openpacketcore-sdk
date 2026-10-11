@@ -1,12 +1,16 @@
 //! Parsed 5GMM message bodies (TS 24.501 §8.2).
 //!
 //! v2 adds first-CNF message body dispatch plus selected IE-level decoding for
-//! Registration Request, Registration Accept, Security Mode Command, and
-//! Security Mode Complete. Authentication bodies are typed in
+//! Registration Request, Registration Accept, Security Mode Command,
+//! Security Mode Complete, Configuration Update Command, and Configuration
+//! Update Complete. Their optional IE tables are pinned to TS 24.501 V18.11.1.
+//! Authentication bodies are typed in
 //! [`crate::authentication`]. Message bodies outside the typed subset are
 //! raw-preserved through named variants.
 
 use std::fmt;
+
+mod optional_ie_tables;
 
 use crate::authentication::{
     AuthenticationFailure, AuthenticationReject, AuthenticationRequest, AuthenticationResponse,
@@ -200,7 +204,7 @@ impl Encode for RawMessageBody {
     }
 }
 
-/// Decoded Security Mode Command body (TS 24.501 §8.2.20).
+/// Decoded Security Mode Command body (TS 24.501 §8.2.25).
 ///
 /// Mandatory fields are structurally decoded; optional IEs remain
 /// raw-preserved.
@@ -225,11 +229,11 @@ impl SecurityModeCommand {
     pub fn decode_body(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Self> {
         if input.len() > ctx.max_message_len {
             return Err(DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 0)
-                .with_spec_ref(message_spec_ref("8.2.20")));
+                .with_spec_ref(message_spec_ref("8.2.25")));
         }
         if input.len() < 4 {
             return Err(DecodeError::new(DecodeErrorCode::Truncated, 0)
-                .with_spec_ref(message_spec_ref("8.2.20")));
+                .with_spec_ref(message_spec_ref("8.2.25")));
         }
 
         let selected_algorithms = SelectedNasSecurityAlgorithms::from_octet(input[0])?;
@@ -257,7 +261,11 @@ impl SecurityModeCommand {
         let raw_replayed_ue_security_capability_lv =
             Bytes::copy_from_slice(&input[2..capability_end]);
         let replayed_ue_security_capability = Bytes::copy_from_slice(&input[3..capability_end]);
-        let (_, optional_ies) = decode_optional_ies(&input[capability_end..], ctx)?;
+        let (_, optional_ies) = decode_optional_ies(
+            &input[capability_end..],
+            ctx,
+            MmMessageType::SecurityModeCommand,
+        )?;
 
         Ok((
             &[],
@@ -309,7 +317,7 @@ impl Encode for SecurityModeCommand {
     }
 }
 
-/// Decoded Security Mode Complete body (TS 24.501 §8.2.21).
+/// Decoded Security Mode Complete body (TS 24.501 §8.2.26).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityModeComplete {
     /// Optional IEs in message order, raw-preserved.
@@ -321,9 +329,10 @@ impl SecurityModeComplete {
     pub fn decode_body(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Self> {
         if input.len() > ctx.max_message_len {
             return Err(DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 0)
-                .with_spec_ref(message_spec_ref("8.2.21")));
+                .with_spec_ref(message_spec_ref("8.2.26")));
         }
-        let (_, optional_ies) = decode_optional_ies(input, ctx)?;
+        let (_, optional_ies) =
+            decode_optional_ies(input, ctx, MmMessageType::SecurityModeComplete)?;
         Ok((&[], Self { optional_ies }))
     }
 }
@@ -361,6 +370,135 @@ impl Encode for SecurityModeComplete {
     }
 }
 
+/// Decoded Configuration Update Command body (TS 24.501 §8.2.19).
+///
+/// All fields are optional and retain their original bytes. Their framing and
+/// lengths follow Table 8.2.19.1.1; element contents remain opaque. Debug output
+/// redacts values, which can contain identities and network configuration.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfigurationUpdateCommand {
+    /// Optional IEs in message order, raw-preserved.
+    pub optional_ies: Vec<OptionalIe>,
+}
+
+impl fmt::Debug for ConfigurationUpdateCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigurationUpdateCommand")
+            .field("optional_ies_len", &self.optional_ies.len())
+            .finish()
+    }
+}
+
+impl ConfigurationUpdateCommand {
+    /// Decode a Configuration Update Command from its body bytes.
+    pub fn decode_body(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Self> {
+        if input.len() > ctx.max_message_len {
+            return Err(DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 0)
+                .with_spec_ref(message_spec_ref("8.2.19")));
+        }
+        let (_, optional_ies) =
+            decode_optional_ies(input, ctx, MmMessageType::ConfigurationUpdateCommand)?;
+        Ok((&[], Self { optional_ies }))
+    }
+}
+
+impl<'a> BorrowDecode<'a> for ConfigurationUpdateCommand {
+    fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
+        Self::decode_body(input, ctx)
+    }
+}
+
+impl OwnedDecode for ConfigurationUpdateCommand {
+    fn decode_owned(input: Bytes, ctx: DecodeContext) -> Result<Self, DecodeError> {
+        let (_, msg) = Self::decode(&input, ctx)?;
+        Ok(msg)
+    }
+}
+
+impl Encode for ConfigurationUpdateCommand {
+    fn encode(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        let len = self.wire_len(ctx)?;
+        ctx.check_capacity(len)?;
+        dst.reserve(len);
+        for ie in &self.optional_ies {
+            dst.extend_from_slice(&ie.raw);
+        }
+        Ok(())
+    }
+
+    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
+        Ok(self
+            .optional_ies
+            .iter()
+            .fold(0usize, |len, ie| len.saturating_add(ie.raw.len())))
+    }
+}
+
+/// Decoded Configuration Update Complete body (TS 24.501 §8.2.20).
+///
+/// Table 8.2.20.1.1 has no optional elements. Strict and ProcedureAware decoding,
+/// and [`UnknownIePolicy::Reject`], therefore require an empty body. Structural
+/// decoding can preserve or drop unknown elements according to the context.
+/// Debug output reports only the element count.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfigurationUpdateComplete {
+    /// Unknown optional IEs retained by permissive decoding, in message order.
+    pub optional_ies: Vec<OptionalIe>,
+}
+
+impl fmt::Debug for ConfigurationUpdateComplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigurationUpdateComplete")
+            .field("optional_ies_len", &self.optional_ies.len())
+            .finish()
+    }
+}
+
+impl ConfigurationUpdateComplete {
+    /// Decode a Configuration Update Complete from its body bytes.
+    pub fn decode_body(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Self> {
+        if input.len() > ctx.max_message_len {
+            return Err(DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 0)
+                .with_spec_ref(message_spec_ref("8.2.20")));
+        }
+        let (_, optional_ies) =
+            decode_optional_ies(input, ctx, MmMessageType::ConfigurationUpdateComplete)?;
+        Ok((&[], Self { optional_ies }))
+    }
+}
+
+impl<'a> BorrowDecode<'a> for ConfigurationUpdateComplete {
+    fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
+        Self::decode_body(input, ctx)
+    }
+}
+
+impl OwnedDecode for ConfigurationUpdateComplete {
+    fn decode_owned(input: Bytes, ctx: DecodeContext) -> Result<Self, DecodeError> {
+        let (_, msg) = Self::decode(&input, ctx)?;
+        Ok(msg)
+    }
+}
+
+impl Encode for ConfigurationUpdateComplete {
+    fn encode(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        let len = self.wire_len(ctx)?;
+        ctx.check_capacity(len)?;
+        dst.reserve(len);
+        for ie in &self.optional_ies {
+            dst.extend_from_slice(&ie.raw);
+        }
+        Ok(())
+    }
+
+    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
+        Ok(self
+            .optional_ies
+            .iter()
+            .fold(0usize, |len, ie| len.saturating_add(ie.raw.len())))
+    }
+}
+
 /// Decoded 5GMM message body for the first-CNF subset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmMessageBody {
@@ -379,9 +517,9 @@ pub enum MmMessageBody {
     /// Service Reject.
     ServiceReject(RawMessageBody),
     /// Configuration Update Command.
-    ConfigurationUpdateCommand(RawMessageBody),
+    ConfigurationUpdateCommand(ConfigurationUpdateCommand),
     /// Configuration Update Complete.
-    ConfigurationUpdateComplete(RawMessageBody),
+    ConfigurationUpdateComplete(ConfigurationUpdateComplete),
     /// Authentication Request.
     AuthenticationRequest(AuthenticationRequest),
     /// Authentication Response.
@@ -471,7 +609,8 @@ pub struct NasKeySetIdentifier {
 /// A raw optional IE, preserving its original bytes for byte-exact re-encode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionalIe {
-    /// Information-element identifier.
+    /// Original information-element identifier octet, including the low-nibble
+    /// value for type-1 IEs. Their lookup and duplicate key is `iei & 0xF0`.
     pub iei: u8,
     /// Value bytes excluding IEI and length octets.
     ///
@@ -496,38 +635,25 @@ enum OptionalIeFormat {
     Type6,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OptionalIeDescriptor {
-    format: OptionalIeFormat,
-    registered: bool,
-}
-
-fn optional_ie_descriptor(iei: u8) -> OptionalIeDescriptor {
-    let (format, registered) = match iei {
-        // Known TLV-E IEs used by Registration Request/Accept.
-        0x72 | 0x75 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C => (OptionalIeFormat::Type6, true),
-        // Known type-3 TV IEs (value length after the IEI octet).
-        0x52 => (OptionalIeFormat::Type3(6), true), // Last visited registered TAI
-        // Known type-4 TLV IEs.
-        0x10 | 0x11 | 0x15 | 0x17 | 0x18 | 0x21 | 0x25 | 0x26 | 0x27 | 0x2B | 0x2E | 0x2F
-        | 0x31 | 0x34 | 0x40 | 0x4A | 0x50 | 0x54 | 0x5D | 0x5E => (OptionalIeFormat::Type4, true),
-        // Type-1 half-octet IEIs have the high nibble in the range A-F.
-        _ if (iei >> 4) >= 0x0A => (OptionalIeFormat::Type1, true),
-        // Extended-length IEIs occupy the 0x70-0x7F range.
-        _ if (0x70..=0x7F).contains(&iei) => (OptionalIeFormat::Type6, true),
-        // Default: assume type-4 TLV only for contexts that explicitly allow
-        // unknown IE preservation/drop. Strict or reject contexts fail before
-        // this ambiguous length guess is used.
-        _ => (OptionalIeFormat::Type4, false),
-    };
-    OptionalIeDescriptor { format, registered }
-}
-
-fn optional_ie_duplicate_key(iei: u8, format: OptionalIeFormat) -> u8 {
-    if matches!(format, OptionalIeFormat::Type1) {
+fn optional_ie_key(iei: u8) -> u8 {
+    // TS 24.007 §11.2.4: bit 8 marks a one-octet IE. Its low nibble is
+    // the value, so both table lookup and duplicate detection use the high nibble.
+    if iei & 0x80 != 0 {
         iei & 0xF0
     } else {
         iei
+    }
+}
+
+fn unknown_optional_ie_format(iei: u8) -> OptionalIeFormat {
+    if iei & 0x80 != 0 {
+        OptionalIeFormat::Type1
+    } else if (0x70..=0x7F).contains(&iei) {
+        OptionalIeFormat::Type6
+    } else {
+        // Preserve the existing permissive framing guess for unknown full-octet
+        // IEs. Rejecting contexts fail before this guess is used.
+        OptionalIeFormat::Type4
     }
 }
 
@@ -539,7 +665,20 @@ fn rejects_unknown_optional_ie(ctx: DecodeContext) -> bool {
         )
 }
 
-fn decode_optional_ies(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Vec<OptionalIe>> {
+fn decode_optional_ies(
+    input: &[u8],
+    ctx: DecodeContext,
+    message_type: MmMessageType,
+) -> DecodeResult<'_, Vec<OptionalIe>> {
+    let table = optional_ie_tables::for_message(message_type).ok_or_else(|| {
+        DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "message has no optional IE table",
+            },
+            0,
+        )
+        .with_spec_ref(spec_ref())
+    })?;
     let mut out: Vec<OptionalIe> = Vec::new();
     let mut rest = input;
     let mut offset = 0usize;
@@ -549,97 +688,91 @@ fn decode_optional_ies(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Vec
     while !rest.is_empty() {
         if ie_count >= ctx.max_ies {
             return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
-                .with_spec_ref(spec_ref()));
+                .with_spec_ref(message_spec_ref(table.section)));
         }
         ie_count += 1;
         let iei = rest[0];
-        let descriptor = optional_ie_descriptor(iei);
-        if !descriptor.registered && rejects_unknown_optional_ie(ctx) {
+        let duplicate_key = optional_ie_key(iei);
+        let descriptor = table
+            .entries
+            .iter()
+            .find(|entry| entry.iei == duplicate_key);
+        if descriptor.is_none() && (iei <= 0x0F || matches!(iei, 0x7E | 0x7F)) {
+            // TS 24.007 §11.2.5 comprehension required; TS 24.501 §7.5.1.
+            return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, offset)
+                .with_spec_ref(message_spec_ref("7.5")));
+        }
+        if descriptor.is_none() && rejects_unknown_optional_ie(ctx) {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {
                     reason: "unknown optional IE",
                 },
                 offset,
             )
-            .with_spec_ref(spec_ref()));
+            .with_spec_ref(message_spec_ref(table.section)));
         }
-        let duplicate_key = optional_ie_duplicate_key(iei, descriptor.format);
         let duplicate = seen[usize::from(duplicate_key)];
         if duplicate && matches!(ctx.duplicate_ie_policy, DuplicateIePolicy::Reject) {
-            return Err(
-                DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref())
-            );
+            return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+                .with_spec_ref(message_spec_ref(table.section)));
         }
-        let ie = match descriptor.format {
-            OptionalIeFormat::Type1 => {
-                let raw = Bytes::copy_from_slice(&rest[..1]);
-                rest = &rest[1..];
-                offset += 1;
-                OptionalIe {
-                    iei,
-                    value: Bytes::new(),
-                    raw,
-                }
-            }
-            OptionalIeFormat::Type3(value_len) => {
-                let total = 1usize.saturating_add(value_len);
-                if rest.len() < total {
-                    return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
-                        .with_spec_ref(spec_ref()));
-                }
-                let raw = Bytes::copy_from_slice(&rest[..total]);
-                let value = Bytes::copy_from_slice(&rest[1..total]);
-                rest = &rest[total..];
-                offset += total;
-                OptionalIe { iei, value, raw }
-            }
+        let format = descriptor.map_or_else(|| unknown_optional_ie_format(iei), |ie| ie.format);
+        let section = descriptor.map_or(table.section, |ie| ie.section);
+        let (header_len, total) = match format {
+            OptionalIeFormat::Type1 => (1, 1),
+            OptionalIeFormat::Type3(value_len) => (1, 1 + value_len),
             OptionalIeFormat::Type4 => {
                 if rest.len() < 2 {
                     return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
-                        .with_spec_ref(spec_ref()));
+                        .with_spec_ref(message_spec_ref(section)));
                 }
                 let value_len = usize::from(rest[1]);
-                let total = 2usize.saturating_add(value_len);
-                if rest.len() < total {
-                    return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
-                        .with_spec_ref(spec_ref()));
-                }
-                let raw = Bytes::copy_from_slice(&rest[..total]);
-                let value = Bytes::copy_from_slice(&rest[2..total]);
-                rest = &rest[total..];
-                offset += total;
-                OptionalIe { iei, value, raw }
+                (2, 2 + value_len)
             }
             OptionalIeFormat::Type6 => {
                 if rest.len() < 3 {
                     return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
-                        .with_spec_ref(spec_ref()));
+                        .with_spec_ref(message_spec_ref(section)));
                 }
                 let value_len = usize::from(u16::from_be_bytes([rest[1], rest[2]]));
-                let total = 3usize.saturating_add(value_len);
-                if rest.len() < total {
-                    return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
-                        .with_spec_ref(spec_ref()));
-                }
-                let raw = Bytes::copy_from_slice(&rest[..total]);
-                let value = Bytes::copy_from_slice(&rest[3..total]);
-                rest = &rest[total..];
-                offset += total;
-                OptionalIe { iei, value, raw }
+                (3, 3 + value_len)
             }
         };
-        if !descriptor.registered && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) {
+        if rest.len() < total {
+            return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
+                .with_spec_ref(message_spec_ref(section)));
+        }
+        if matches!(
+            ctx.validation_level,
+            ValidationLevel::Strict | ValidationLevel::ProcedureAware
+        ) && descriptor.is_some_and(|ie| !(ie.min_len..=ie.max_len).contains(&total))
+        {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "optional IE length outside message bounds",
+                },
+                offset,
+            )
+            .with_spec_ref(message_spec_ref(section)));
+        }
+        let ie = OptionalIe {
+            iei,
+            value: Bytes::copy_from_slice(&rest[header_len..total]),
+            raw: Bytes::copy_from_slice(&rest[..total]),
+        };
+        rest = &rest[total..];
+        offset += total;
+        if descriptor.is_none() && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) {
             continue;
         }
         if duplicate {
             match ctx.duplicate_ie_policy {
                 DuplicateIePolicy::First => continue,
                 DuplicateIePolicy::Last => {
-                    if let Some(position) = out.iter().position(|existing| {
-                        let existing_descriptor = optional_ie_descriptor(existing.iei);
-                        optional_ie_duplicate_key(existing.iei, existing_descriptor.format)
-                            == duplicate_key
-                    }) {
+                    if let Some(position) = out
+                        .iter()
+                        .position(|existing| optional_ie_key(existing.iei) == duplicate_key)
+                    {
                         out.remove(position);
                     }
                 }
@@ -747,7 +880,8 @@ impl RegistrationRequest {
             )
         })?;
 
-        let (_, optional_ies) = decode_optional_ies(&input[mi_end..], ctx)?;
+        let (_, optional_ies) =
+            decode_optional_ies(&input[mi_end..], ctx, MmMessageType::RegistrationRequest)?;
 
         Ok((
             &[],
@@ -859,7 +993,8 @@ impl RegistrationAccept {
         let registration_result_flags =
             RegistrationResultFlags::from_octet(registration_result_octet);
 
-        let (_, optional_ies) = decode_optional_ies(&input[result_end..], ctx)?;
+        let (_, optional_ies) =
+            decode_optional_ies(&input[result_end..], ctx, MmMessageType::RegistrationAccept)?;
 
         Ok((
             &[],
@@ -938,10 +1073,12 @@ pub fn decode_mm_message_body(
         Some(MmMessageType::ServiceAccept) => MmMessageBody::ServiceAccept(raw_body(body)),
         Some(MmMessageType::ServiceReject) => MmMessageBody::ServiceReject(raw_body(body)),
         Some(MmMessageType::ConfigurationUpdateCommand) => {
-            MmMessageBody::ConfigurationUpdateCommand(raw_body(body))
+            let (_, msg) = ConfigurationUpdateCommand::decode_body(body, ctx)?;
+            MmMessageBody::ConfigurationUpdateCommand(msg)
         }
         Some(MmMessageType::ConfigurationUpdateComplete) => {
-            MmMessageBody::ConfigurationUpdateComplete(raw_body(body))
+            let (_, msg) = ConfigurationUpdateComplete::decode_body(body, ctx)?;
+            MmMessageBody::ConfigurationUpdateComplete(msg)
         }
         Some(MmMessageType::AuthenticationRequest) => {
             MmMessageBody::AuthenticationRequest(AuthenticationRequest::decode_body(body, ctx)?.1)
@@ -1057,13 +1194,13 @@ impl Encode for MmMessageBody {
         match self {
             Self::RegistrationRequest(body) => body.encode(dst, ctx),
             Self::RegistrationAccept(body) => body.encode(dst, ctx),
+            Self::ConfigurationUpdateCommand(body) => body.encode(dst, ctx),
+            Self::ConfigurationUpdateComplete(body) => body.encode(dst, ctx),
             Self::RegistrationComplete(body)
             | Self::RegistrationReject(body)
             | Self::ServiceRequest(body)
             | Self::ServiceAccept(body)
             | Self::ServiceReject(body)
-            | Self::ConfigurationUpdateCommand(body)
-            | Self::ConfigurationUpdateComplete(body)
             | Self::IdentityRequest(body)
             | Self::IdentityResponse(body)
             | Self::SecurityModeReject(body)
@@ -1087,13 +1224,13 @@ impl Encode for MmMessageBody {
         match self {
             Self::RegistrationRequest(body) => body.wire_len(ctx),
             Self::RegistrationAccept(body) => body.wire_len(ctx),
+            Self::ConfigurationUpdateCommand(body) => body.wire_len(ctx),
+            Self::ConfigurationUpdateComplete(body) => body.wire_len(ctx),
             Self::RegistrationComplete(body)
             | Self::RegistrationReject(body)
             | Self::ServiceRequest(body)
             | Self::ServiceAccept(body)
             | Self::ServiceReject(body)
-            | Self::ConfigurationUpdateCommand(body)
-            | Self::ConfigurationUpdateComplete(body)
             | Self::IdentityRequest(body)
             | Self::IdentityResponse(body)
             | Self::SecurityModeReject(body)
@@ -1180,12 +1317,14 @@ mod tests {
     #[test]
     fn optional_ies_honor_unknown_ie_policy() {
         let unknown_type4_guess = &[0x53, 0x01, 0xAA];
+        let message_type = MmMessageType::SecurityModeComplete;
 
         let preserve = DecodeContext {
             unknown_ie_policy: UnknownIePolicy::Preserve,
             ..DecodeContext::default()
         };
-        let (_, preserved) = decode_optional_ies(unknown_type4_guess, preserve).unwrap();
+        let (_, preserved) =
+            decode_optional_ies(unknown_type4_guess, preserve, message_type).unwrap();
         assert_eq!(preserved.len(), 1);
         assert_eq!(preserved[0].iei, 0x53);
         assert_eq!(&preserved[0].value[..], &[0xAA]);
@@ -1194,14 +1333,14 @@ mod tests {
             unknown_ie_policy: UnknownIePolicy::Drop,
             ..DecodeContext::default()
         };
-        let (_, dropped) = decode_optional_ies(unknown_type4_guess, drop).unwrap();
+        let (_, dropped) = decode_optional_ies(unknown_type4_guess, drop, message_type).unwrap();
         assert!(dropped.is_empty());
 
         let reject = DecodeContext {
             unknown_ie_policy: UnknownIePolicy::Reject,
             ..DecodeContext::default()
         };
-        let err = decode_optional_ies(unknown_type4_guess, reject).unwrap_err();
+        let err = decode_optional_ies(unknown_type4_guess, reject, message_type).unwrap_err();
         assert!(matches!(
             err.code(),
             DecodeErrorCode::Structural {
@@ -1214,18 +1353,19 @@ mod tests {
             validation_level: ValidationLevel::Strict,
             ..DecodeContext::default()
         };
-        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve).is_err());
+        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve, message_type).is_err());
     }
 
     #[test]
     fn optional_ies_honor_duplicate_ie_policy() {
         let duplicate = &[0x2E, 0x01, 0xAA, 0x2E, 0x01, 0xBB];
+        let message_type = MmMessageType::RegistrationRequest;
 
         let first = DecodeContext {
             duplicate_ie_policy: DuplicateIePolicy::First,
             ..DecodeContext::default()
         };
-        let (_, first_ies) = decode_optional_ies(duplicate, first).unwrap();
+        let (_, first_ies) = decode_optional_ies(duplicate, first, message_type).unwrap();
         assert_eq!(first_ies.len(), 1);
         assert_eq!(&first_ies[0].value[..], &[0xAA]);
 
@@ -1233,7 +1373,7 @@ mod tests {
             duplicate_ie_policy: DuplicateIePolicy::Last,
             ..DecodeContext::default()
         };
-        let (_, last_ies) = decode_optional_ies(duplicate, last).unwrap();
+        let (_, last_ies) = decode_optional_ies(duplicate, last, message_type).unwrap();
         assert_eq!(last_ies.len(), 1);
         assert_eq!(&last_ies[0].value[..], &[0xBB]);
 
@@ -1241,7 +1381,7 @@ mod tests {
             duplicate_ie_policy: DuplicateIePolicy::Reject,
             ..DecodeContext::default()
         };
-        let err = decode_optional_ies(duplicate, reject).unwrap_err();
+        let err = decode_optional_ies(duplicate, reject, message_type).unwrap_err();
         assert_eq!(err.code(), &DecodeErrorCode::DuplicateIe);
     }
 
@@ -1384,14 +1524,55 @@ mod tests {
     #[test]
     fn security_mode_complete_round_trip() {
         let body: &[u8] = &[
-            0x77, 0x00, 0x02, 0x12, 0x34, // TLV-E optional IE
+            // IMEISV 1234567890123456: 12 total octets, Table 8.2.26.1.1.
+            0x77, 0x00, 0x09, 0x15, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xF6,
         ];
         let (_, complete) =
             SecurityModeComplete::decode_body(body, DecodeContext::default()).unwrap();
         assert_eq!(complete.optional_ies.len(), 1);
         assert_eq!(complete.optional_ies[0].iei, 0x77);
-        assert_eq!(&complete.optional_ies[0].value[..], &[0x12, 0x34]);
+        assert_eq!(
+            &complete.optional_ies[0].value[..],
+            &[0x15, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xF6]
+        );
         round_trip_body::<SecurityModeComplete>(body);
+    }
+
+    #[test]
+    fn security_mode_complete_short_imeisv_is_rejected_under_strict_validation() {
+        for body in [
+            &[0x77, 0x00, 0x02, 0x12, 0x34][..],
+            &[0x77, 0x00, 0x01, 0xAA][..],
+        ] {
+            let err =
+                SecurityModeComplete::decode_body(body, DecodeContext::conservative()).unwrap_err();
+            assert_eq!(
+                err,
+                DecodeError::new(
+                    DecodeErrorCode::InvalidLength {
+                        reason: "optional IE length outside message bounds",
+                    },
+                    0,
+                )
+                .with_spec_ref(message_spec_ref("9.11.3.4"))
+            );
+        }
+    }
+
+    #[test]
+    fn security_mode_complete_short_imeisv_is_framed_under_structural_validation() {
+        for body in [
+            &[0x77, 0x00, 0x02, 0x12, 0x34][..],
+            &[0x77, 0x00, 0x01, 0xAA][..],
+        ] {
+            let (_, complete) =
+                SecurityModeComplete::decode_body(body, DecodeContext::default()).unwrap();
+            assert_eq!(complete.optional_ies.len(), 1);
+            assert_eq!(complete.optional_ies[0].iei, 0x77);
+            assert_eq!(&complete.optional_ies[0].value[..], &body[3..]);
+            assert_eq!(&complete.optional_ies[0].raw[..], body);
+            round_trip_body::<SecurityModeComplete>(body);
+        }
     }
 
     #[test]
@@ -1427,7 +1608,9 @@ mod tests {
 
         let complete = decode_mm_message_body(
             MmMessageType::SecurityModeComplete as u8,
-            &[0x77, 0x00, 0x01, 0xAA],
+            &[
+                0x77, 0x00, 0x09, 0x15, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xF6,
+            ],
             DecodeContext::default(),
         )
         .unwrap();

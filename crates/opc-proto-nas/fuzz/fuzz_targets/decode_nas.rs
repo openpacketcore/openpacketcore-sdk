@@ -2,7 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use opc_proto_nas::{
-    decode_mm_message_body, decode_sm_message_body, MobileIdentity, NasMessage, RegistrationAccept,
+    decode_mm_message_body, decode_sm_message_body, ConfigurationUpdateCommand,
+    ConfigurationUpdateComplete, MobileIdentity, NasMessage, RegistrationAccept,
     RegistrationRequest, SecurityModeCommand, SecurityModeComplete,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
@@ -38,6 +39,10 @@ fuzz_target!(|data: &[u8]| {
     let _ = RegistrationAccept::decode_body(data, DecodeContext::default());
     let _ = SecurityModeCommand::decode_body(data, DecodeContext::default());
     let _ = SecurityModeComplete::decode_body(data, DecodeContext::default());
+    let _ = ConfigurationUpdateCommand::decode_body(data, DecodeContext::default());
+    let _ = ConfigurationUpdateComplete::decode_body(data, DecodeContext::default());
+    let _ = ConfigurationUpdateCommand::decode_body(data, ctx_strict);
+    let _ = ConfigurationUpdateComplete::decode_body(data, ctx_strict);
     if let Some((&message_type, body)) = data.split_first() {
         let _ = decode_mm_message_body(message_type, body, DecodeContext::default());
         let _ = decode_sm_message_body(message_type, body, DecodeContext::default());
