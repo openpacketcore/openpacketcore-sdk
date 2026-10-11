@@ -4,7 +4,7 @@ use super::*;
 use crate::scope_authority::CommittedScopeAuthority;
 use crate::scope_scheduler::{
     ScopeLane, ScopeLaneGuard, ScopeScheduler, ScopeSchedulerError, ScopeSchedulerKey,
-    ScopeWorkClass, ScopeWorkReservation,
+    ScopeWorkClass, ScopeWorkPermit, ScopeWorkReservation,
 };
 use crate::SessionConsumerIdentity;
 use async_trait::async_trait;
@@ -16,8 +16,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, OnceCell};
 
+mod read_context;
 mod reservation;
 mod supervisor;
+pub use read_context::{ScopeBatchReadBudget, ScopeBatchReadContext};
 pub use reservation::{ScopeBatchBuildContext, ScopeBatchReservation};
 
 fn scheduler_error(error: ScopeSchedulerError) -> ScopeBatchError {
@@ -35,6 +37,19 @@ fn scheduler_error(error: ScopeSchedulerError) -> ScopeBatchError {
 /// peer and response; decoding a claim alone never proves committed application.
 #[async_trait]
 pub trait ScopeBatchPort: Send + Sync {
+    /// Observe this exact current stamp and every ordered key at one full-barrier
+    /// cut. Reuse the builder's running entitlement and supplied effective class;
+    /// reserve no second resident credit, running credit or replay lane. Enforce
+    /// the absolute deadline and authenticate the complete canonical response.
+    /// Older adapters fail closed until they implement current child reads.
+    async fn read_current(
+        &self,
+        _request: &ScopeChildReadRequest,
+        _class: ScopeWorkClass,
+        _deadline: tokio::time::Instant,
+    ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError> {
+        Err(ScopeBatchError::Unavailable.into())
+    }
     /// Return authority and every lane from one backend snapshot after a full
     /// current-configuration read barrier. Never synthesize a missing ledger.
     async fn reopen(&self, class: ScopeWorkClass) -> Result<ScopeBatchReopen, ScopeBatchError>;
@@ -59,6 +74,33 @@ struct StoreBackend {
 }
 #[async_trait]
 impl ScopeBatchPort for StoreBackend {
+    async fn read_current(
+        &self,
+        request: &ScopeChildReadRequest,
+        _class: ScopeWorkClass,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ScopeBatchError::Unavailable.into());
+        }
+        let control = ScopeChildReadControl::default();
+        let reading = self.store.read_current_with_admission(
+            &self.authenticated,
+            request.stamp(),
+            request.keys(),
+            control.clone(),
+            |_, _| async { Ok(()) },
+        );
+        tokio::pin!(reading);
+        match tokio::time::timeout_at(deadline, &mut reading).await {
+            Ok(result) => result,
+            Err(_) => {
+                control.cancel();
+                let _ = reading.await;
+                Err(ScopeBatchError::Unavailable.into())
+            }
+        }
+    }
     async fn reopen(&self, _class: ScopeWorkClass) -> Result<ScopeBatchReopen, ScopeBatchError> {
         // Untimed scope reads use the complete ReadIndex round, with no TTL or
         // Maintenance proposal. The caller already holds its running credit.

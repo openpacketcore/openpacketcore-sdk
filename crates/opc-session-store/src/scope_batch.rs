@@ -50,7 +50,8 @@ pub use child_read_control::{ScopeChildReadPause, ScopeChildReadStage};
 pub use completion::{ScopeBatchCompletion, ScopeBatchCompletionOutcome, ScopeBatchNoApplyProof};
 pub use coordinator::{
     ScopeBatchBuildContext, ScopeBatchCompletions, ScopeBatchCoordinator, ScopeBatchHandle,
-    ScopeBatchLaneStatus, ScopeBatchPort, ScopeBatchReservation,
+    ScopeBatchLaneStatus, ScopeBatchPort, ScopeBatchReadBudget, ScopeBatchReadContext,
+    ScopeBatchReservation,
 };
 pub(crate) use cut::ScopeBatchReadCut;
 pub use cut::{ScopeBatchLaneView, ScopeBatchReopen, ScopeBatchReopenState};
