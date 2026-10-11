@@ -148,8 +148,9 @@ impl TestAuthority {
         );
         assert!(futures_util::poll!(&mut inherited).is_pending());
         let command = std::sync::Mutex::new(None);
+        let saved = &command;
         let handle = reservation
-            .submit(|context| async {
+            .submit(|context| async move {
                 let request = context.request(
                     [201; 16],
                     vec![ScopeChildMutation::Create {
@@ -159,7 +160,7 @@ impl TestAuthority {
                     }],
                     vec![],
                 )?;
-                *command.lock().unwrap() = Some(request.clone());
+                *saved.lock().unwrap() = Some(request.clone());
                 Ok(request)
             })
             .await
@@ -212,12 +213,13 @@ impl TestAuthority {
             "ordinary recheck retains the original class"
         );
         let command = std::sync::Mutex::new(None);
+        let saved = &command;
         let handle = transport
             .coordinator
             .reserve_lane(7, ScopeWorkClass::Emergency)
             .await
             .unwrap()
-            .submit(|context| async {
+            .submit(|context| async move {
                 let request = context.request(
                     [202; 16],
                     vec![ScopeChildMutation::Create {
@@ -227,7 +229,7 @@ impl TestAuthority {
                     }],
                     vec![],
                 )?;
-                *command.lock().unwrap() = Some(request.clone());
+                *saved.lock().unwrap() = Some(request.clone());
                 Ok(request)
             })
             .await
