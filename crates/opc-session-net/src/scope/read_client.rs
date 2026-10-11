@@ -160,6 +160,7 @@ impl ScopeReadClient {
         canonical: Vec<u8>,
         attempt: Duration,
     ) -> Result<ResultPayload, ScopeRpcError> {
+        use super::revision::{self, OBSERVER_RESPONSE};
         if attempt.is_zero() {
             return Err(ScopeRpcError::Invalid);
         }
@@ -179,7 +180,9 @@ impl ScopeReadClient {
             .await
             .map_err(|_| ScopeRpcError::Retry)?;
         let mut slot = self.connections[class.index()].lock().await;
-        let mut connection = match slot.take() {
+        let cached = slot.take();
+        let fresh = cached.is_none();
+        let mut connection = match cached {
             Some(connection) => connection,
             None => {
                 let handshake = self.class_tls[class.index()]
@@ -198,7 +201,13 @@ impl ScopeReadClient {
                                 .map_err(|_| ScopeRpcError::Invalid)?,
                         )
                         .await
-                        .map_err(|_| ScopeRpcError::Retry)
+                        .map_err(|error| {
+                            revision::rpc_handshake_error(
+                                OBSERVER_RESPONSE,
+                                error,
+                                ScopeRpcError::Retry,
+                            )
+                        })
                 })
                 .await
                 .map_err(|_| ScopeRpcError::Retry)??
@@ -206,6 +215,17 @@ impl ScopeReadClient {
         };
         if connection.peer_identity().spiffe_id() != &self.config.server {
             return Err(ScopeRpcError::Unauthorized);
+        }
+        if fresh {
+            let authentication = connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            revision::authenticated_handshake(OBSERVER_RESPONSE, &authentication);
         }
         let result = timeout(attempt, async {
             let request_id = super::boot::random_nonzero().map_err(|_| ScopeRpcError::Retry)?;
@@ -248,7 +268,20 @@ impl ScopeReadClient {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let authentication = connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            let header = revision::rpc_header(
+                &fixed,
+                &authentication,
+                OBSERVER_RESPONSE,
+                ScopeRpcError::Invalid,
+            )?;
             if header.kind != FrameKind::Result || !header.matches_attempt(&call) {
                 return Err(ScopeRpcError::Unauthorized);
             }

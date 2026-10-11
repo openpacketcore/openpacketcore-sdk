@@ -258,6 +258,7 @@ pub(in crate::scope) fn batch_error(error: ScopeRpcError) -> ScopeBatchError {
         }
         ScopeRpcError::Retired => ScopeAuthorityError::Retired.into(),
         ScopeRpcError::ProfileUnavailable => ScopeAuthorityError::ProfileNotActivated.into(),
+        ScopeRpcError::TransportRevisionMismatch => ScopeBatchError::TransportRevisionMismatch,
         _ => ScopeBatchError::OutcomeUnknown,
     }
 }

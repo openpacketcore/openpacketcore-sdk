@@ -4,6 +4,7 @@ use super::{
     policy::{RoutedCall, ScopeRole},
     pool::{ProofPools, ProofShare},
     proof::{PossessionClaims, PossessionProof},
+    revision::{self, QUORUM_REQUEST},
     rpc::*,
     wire::*,
 };
@@ -226,16 +227,37 @@ impl ScopeServer {
             .begin_handshake()
             .map_err(|_| ScopeRpcError::Retry)?;
         let (connection, first, scope) = timeout(Duration::from_secs(5), async {
-            let mut connection = handshake
-                .accept_scope_unbound(io)
-                .await
-                .map_err(|_| ScopeRpcError::Unauthorized)?;
+            let mut connection = handshake.accept_scope_unbound(io).await.map_err(|error| {
+                revision::rpc_handshake_error(QUORUM_REQUEST, error, ScopeRpcError::Unauthorized)
+            })?;
+            let authentication = connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            revision::authenticated_handshake(QUORUM_REQUEST, &authentication);
             let mut fixed = [0; HEADER_BYTES];
             connection
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let authentication = connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            let header = revision::rpc_header(
+                &fixed,
+                &authentication,
+                QUORUM_REQUEST,
+                ScopeRpcError::Invalid,
+            )?;
             if header.kind != FrameKind::Call || header.class != class {
                 return Err(ScopeRpcError::Invalid);
             }
@@ -285,7 +307,20 @@ impl ScopeServer {
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?
                 .map_err(|_| ScopeRpcError::Retry)?;
-            header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let authentication = connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            header = revision::rpc_header(
+                &fixed,
+                &authentication,
+                QUORUM_REQUEST,
+                ScopeRpcError::Invalid,
+            )?;
         }
     }
     async fn call(
@@ -485,11 +520,33 @@ impl ScopeServer {
         };
         let (mut status, mut own, mut body, mut current) = match outcome {
             Ok(value) => value,
-            Err(error) => (error_status(error).0, [0; 32], error_status(error).1, None),
+            Err(error) => {
+                let (status, body) = error_status(error)?;
+                (status, [0; 32], body, None)
+            }
         };
-        admission.check().map_err(authority_error)?;
+        if let Err(error) = admission.check() {
+            if header.method != Method::ChildRead || error != ScopeAuthorityError::Unauthorized {
+                return Err(authority_error(error));
+            }
+            // The read has drained its cut and class credit. A revoked caller
+            // can receive a correlated refusal only while TLS remains live.
+            connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            (status, body) = error_status(ScopeRpcError::Unauthorized)?;
+            own = [0; 32];
+            current = None;
+            *promoted = None;
+            child_reply_deadline = None;
+        }
         if child_reply_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            (status, body) = error_status(ScopeRpcError::Retry);
+            (status, body) = error_status(ScopeRpcError::Retry)?;
             own = [0; 32];
             current = None;
             child_reply_deadline = None;
@@ -634,7 +691,20 @@ impl ScopeServer {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let proof_header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let authentication = connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            let proof_header = revision::rpc_header(
+                &fixed,
+                &authentication,
+                QUORUM_REQUEST,
+                ScopeRpcError::Invalid,
+            )?;
             if proof_header.kind != FrameKind::Proof || !proof_header.matches_attempt(header) {
                 return Err(ScopeRpcError::Invalid);
             }
@@ -1404,7 +1474,7 @@ async fn refuse_before_dispatch(
     reply: RefusalReply,
     error: ScopeRpcError,
 ) -> Result<(), ScopeRpcError> {
-    let (status, body) = error_status(error);
+    let (status, body) = error_status(error)?;
     if matches!(reply, RefusalReply::Silent) || status != ResultStatus::ProvenNoEffect {
         return Ok(());
     }
@@ -1447,8 +1517,9 @@ async fn refuse_before_dispatch(
     .map_err(|_| ScopeRpcError::Retry)?
 }
 
-fn error_status(error: ScopeRpcError) -> (ResultStatus, Vec<u8>) {
-    match error {
+fn error_status(error: ScopeRpcError) -> Result<(ResultStatus, Vec<u8>), ScopeRpcError> {
+    Ok(match error {
+        ScopeRpcError::TransportRevisionMismatch => return Err(error),
         ScopeRpcError::OutcomeUnknown => (ResultStatus::OutcomeUnknown, Vec::new()),
         ScopeRpcError::Superseded => (ResultStatus::Obsolete, vec![1]),
         ScopeRpcError::Closed => (ResultStatus::Obsolete, vec![2]),
@@ -1467,7 +1538,7 @@ fn error_status(error: ScopeRpcError) -> (ResultStatus, Vec<u8>) {
                 },
             ],
         ),
-    }
+    })
 }
 /// Supervised class listeners; drop requests shutdown, explicit shutdown joins.
 pub struct ScopeServerHandle {

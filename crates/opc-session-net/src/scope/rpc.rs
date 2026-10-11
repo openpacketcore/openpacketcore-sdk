@@ -41,6 +41,10 @@ pub enum ScopeRpcError {
     /// An exact old receipt is no longer retained; this is not NotApplied.
     #[error("scope RPC receipt unavailable")]
     ReceiptUnavailable,
+    /// Local revision diagnostic; never evidence of a pending mutation's outcome.
+    /// A later call may try a fresh handshake without restarting the process.
+    #[error("scope transport revision mismatch")]
+    TransportRevisionMismatch,
 }
 
 /// Locally configured independent readers and scheduling for a scope server.

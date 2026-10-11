@@ -357,16 +357,7 @@ impl<S> ScopeTlsConnection<S> {
         &self,
         time: AuthenticationTimeInterval,
     ) -> Result<ScopeTlsAuthentication, ScopeTlsError> {
-        let state = ScopeTlsAuthentication {
-            material: self.material.clone(),
-            local_validity: self.local_validity,
-            peer_validity: CertificateValidity {
-                not_before: self.peer.certificate_chain_valid_from(),
-                not_after: self.peer.certificate_chain_expires_at(),
-            },
-        };
-        state.revalidate(time)?;
-        Ok(state)
+        ScopeTlsAuthentication::capture(&self.material, self.local_validity, &self.peer, time)
     }
     /// The peer authenticated on this exact stream.
     pub const fn peer_identity(&self) -> &PeerTlsIdentity {
@@ -408,6 +399,23 @@ pub struct ScopeTlsAuthentication {
     peer_validity: CertificateValidity,
 }
 impl ScopeTlsAuthentication {
+    fn capture(
+        material: &Material,
+        local_validity: CertificateValidity,
+        peer: &PeerTlsIdentity,
+        time: AuthenticationTimeInterval,
+    ) -> Result<Self, ScopeTlsError> {
+        let state = Self {
+            material: material.clone(),
+            local_validity,
+            peer_validity: CertificateValidity {
+                not_before: peer.certificate_chain_valid_from(),
+                not_after: peer.certificate_chain_expires_at(),
+            },
+        };
+        state.revalidate(time)?;
+        Ok(state)
+    }
     /// Recheck authentication immediately before and after awaited verification.
     pub fn revalidate(&self, time: AuthenticationTimeInterval) -> Result<(), ScopeTlsError> {
         self.material.admit()?;
@@ -538,6 +546,14 @@ pub struct UnboundScopeTlsConnection<S> {
     material: Material,
 }
 impl<S> UnboundScopeTlsConnection<S> {
+    /// Recheck the completed handshake's material and certificate interval
+    /// before interpreting an application header. This confers no scope access.
+    pub fn authentication_state(
+        &self,
+        time: AuthenticationTimeInterval,
+    ) -> Result<ScopeTlsAuthentication, ScopeTlsError> {
+        ScopeTlsAuthentication::capture(&self.material, self.local_validity, &self.peer, time)
+    }
     /// Identity authenticated by this stream's immutable material snapshot.
     pub const fn peer_identity(&self) -> &PeerTlsIdentity {
         &self.peer

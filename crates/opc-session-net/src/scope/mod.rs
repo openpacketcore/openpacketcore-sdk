@@ -9,6 +9,7 @@ mod clock;
 mod notice;
 mod policy;
 mod pool;
+mod revision;
 #[cfg(test)]
 mod revision_tests;
 mod proof;
@@ -22,6 +23,10 @@ pub use clock::{
 };
 pub use policy::{PolicyError, PrincipalGrant, ScopePolicy, ScopeRole};
 pub use pool::{ProofBudgets, ProofPoolError};
+pub use revision::{
+    scope_transport_revision_diagnostics, ScopeTransportDirection, ScopeTransportPurpose,
+    ScopeTransportRevisionDiagnostic, ScopeTransportRole, SCOPE_TRANSPORT_REVISION_MISMATCH_COUNTER,
+};
 pub use wire::{Class, ScopeBinding, WireError};
 
 #[cfg(test)]
