@@ -2,10 +2,11 @@ use super::*;
 use opc_session_store::scope_batch::{ScopeBatchError, ScopeBatchRequest, ScopeCounterMutation};
 
 fn stamp() -> ScopeAuthorityStamp {
-    let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    let vectors: serde_json::Value = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap();
+    .unwrap()["authority_startup"]
+        .clone();
     let encoded = vectors["authority_requests"][1]["canonical_postcard_hex"]
         .as_str()
         .unwrap();
@@ -138,10 +139,11 @@ fn batch_methods_pin_native_codecs_and_complete_frozen_frames() {
     use opc_session_store::scope_batch::{
         ScopeBatchLookup, ScopeBatchOutcome, ScopeBatchReceipt, ScopeBatchReopen,
     };
-    let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../docs/rfc/026-scope-authenticated-transport-batch-vectors.json"
+    let vectors: serde_json::Value = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap();
+    .unwrap()["batch"]
+        .clone();
     let decode = |value: &serde_json::Value| {
         let value = value.as_str().unwrap();
         (0..value.len())

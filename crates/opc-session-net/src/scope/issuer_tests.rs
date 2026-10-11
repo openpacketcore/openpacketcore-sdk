@@ -137,10 +137,11 @@ impl super::TicketNoticeSource for Snapshot {
     }
 }
 fn predecessor_snapshot(change_between_passes: bool) -> Snapshot {
-    let v: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    let v: serde_json::Value = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap();
+    .unwrap()["authority_startup"]
+        .clone();
     let encoded: Vec<_> = v["ticket_notice"]["page_hex"]
         .as_str()
         .unwrap()

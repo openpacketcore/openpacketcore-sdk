@@ -4,6 +4,7 @@
 //! The store owns request canonicalization, durable authority and capabilities.
 
 mod boot;
+pub(crate) mod child_read_wire;
 mod clock;
 mod notice;
 mod policy;

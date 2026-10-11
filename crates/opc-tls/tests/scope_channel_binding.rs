@@ -273,10 +273,11 @@ async fn unsupported_or_missing_alpn_never_creates_an_admitted_scope_connection(
 
 #[test]
 fn canonical_context_matches_the_normative_vector_and_binds_both_identities() {
-    let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    let vectors = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap();
+    .unwrap()["authority_startup"]
+        .clone();
     let decode = |s: &str| -> Vec<u8> {
         s.as_bytes()
             .as_chunks::<2>()
@@ -438,7 +439,10 @@ async fn revision_one_alpn_is_typed_and_does_not_latch_later_handshakes() {
         pair.client.connect_scope(client_io, domain()),
         tokio_rustls::TlsAcceptor::from(Arc::new(legacy)).accept(server_io),
     );
-    assert_eq!(client.unwrap_err(), ScopeTlsError::TransportRevisionMismatch);
+    assert_eq!(
+        client.unwrap_err(),
+        ScopeTlsError::TransportRevisionMismatch
+    );
     assert!(server.is_err());
 
     let (client_io, server_io) = tokio::io::duplex(8192);
@@ -446,19 +450,31 @@ async fn revision_one_alpn_is_typed_and_does_not_latch_later_handshakes() {
     legacy.alpn_protocols = vec![b"opc-scope/1".to_vec()];
     let (client, server) = tokio::join!(
         TlsConnector::from(Arc::new(legacy)).connect(
-            ServerName::try_from("ignored.example.test").unwrap(), client_io),
+            ServerName::try_from("ignored.example.test").unwrap(),
+            client_io
+        ),
         pair.server.accept_scope(server_io, domain()),
     );
     assert!(client.is_err());
-    assert_eq!(server.unwrap_err(), ScopeTlsError::TransportRevisionMismatch);
+    assert_eq!(
+        server.unwrap_err(),
+        ScopeTlsError::TransportRevisionMismatch
+    );
 
     // Reuse the same material and handshake handles after both mismatches.
     // A fresh, authenticated revision-2 connection must immediately recover.
     let (client, server) = connect(&pair).await;
     let bounds = interval(pair.start, pair.end - time::Duration::seconds(1));
-    for purpose in [ChannelBindingPurpose::ScopeRequest, ChannelBindingPurpose::ScopeResponse,
-        ChannelBindingPurpose::BootLiveness, ChannelBindingPurpose::BootCandidate] {
-        assert_eq!(client.channel_binding(purpose, bounds).unwrap(), server.channel_binding(purpose, bounds).unwrap());
+    for purpose in [
+        ChannelBindingPurpose::ScopeRequest,
+        ChannelBindingPurpose::ScopeResponse,
+        ChannelBindingPurpose::BootLiveness,
+        ChannelBindingPurpose::BootCandidate,
+    ] {
+        assert_eq!(
+            client.channel_binding(purpose, bounds).unwrap().as_bytes(),
+            server.channel_binding(purpose, bounds).unwrap().as_bytes()
+        );
     }
 }
 
@@ -491,7 +507,7 @@ async fn tls12_compatibility_configuration_cannot_admit_scope_traffic() {
     .with_client_cert_resolver(Arc::clone(
         &pair.client.rustls_config().client_auth_cert_resolver,
     ));
-    client.alpn_protocols = vec![b"opc-scope/1".to_vec()];
+    client.alpn_protocols = vec![b"opc-scope/2".to_vec()];
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (_, server) = tokio::join!(

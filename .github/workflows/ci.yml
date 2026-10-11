@@ -129,6 +129,9 @@ jobs:
       - name: Check independent NWu GRE reference vectors
         run: python3 crates/opc-proto-gre/tests/reference.py --check
 
+      - name: Check scope transport revision-2 reference vectors
+        run: python3 docs/rfc/026-scope-transport-revision2-vectors.py --check
+
       - name: Check GTP-U extension-list reference vectors
         run: python3 crates/opc-proto-gtpu/tests/fixtures/extension_list.py --check
 
