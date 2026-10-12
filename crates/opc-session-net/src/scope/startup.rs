@@ -5,6 +5,7 @@ use super::{
     lifecycle::{ScopeEffectPermit, ScopeGateError},
     policy::ScopePolicy,
     pool::ProofBudgets,
+    revision::{self, RESPONDER_CALL},
     wire::ScopeBinding,
 };
 use opc_types::SpiffeId;
@@ -32,6 +33,9 @@ pub enum StartupError {
     /// Local effect or process-protection conditions no longer permit the proof.
     #[error("scope startup gate closed")]
     GateClosed,
+    /// Local revision diagnostic. A later startup attempt may connect again.
+    #[error("scope transport revision mismatch")]
+    TransportRevisionMismatch,
 }
 /// Confidential projected credential, kept out of diagnostic and serialization APIs.
 pub struct BootstrapCredential(Zeroizing<Vec<u8>>);
@@ -243,13 +247,28 @@ impl BootProofResponder {
             let mut stream = handshake
                 .accept_scope_unbound(io)
                 .await
-                .map_err(|_| StartupError::Unavailable)?;
+                .map_err(|error| revision::startup_handshake_error(RESPONDER_CALL, error))?;
+            let authentication = stream
+                .authentication_state(
+                    self.clock
+                        .interval()
+                        .map_err(|_| StartupError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| StartupError::AuthTimeUnavailable)?;
+            revision::authenticated_handshake(RESPONDER_CALL, &authentication);
             let mut fixed = [0; HEADER_BYTES];
             stream
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| StartupError::Unavailable)?;
-            let header = Header::decode(&fixed).map_err(|_| StartupError::Invalid)?;
+            let authentication = stream
+                .authentication_state(
+                    self.clock
+                        .interval()
+                        .map_err(|_| StartupError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| StartupError::AuthTimeUnavailable)?;
+            let header = revision::startup_header(&fixed, &authentication, RESPONDER_CALL)?;
             if header.kind != FrameKind::Call
                 || header.installation != *self.process.scope.installation()
                 || header.scope != self.process.scope.commitment()
@@ -548,7 +567,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StartupSession<S> {
                     .read_exact(&mut fixed)
                     .await
                     .map_err(|_| StartupError::Unavailable)?;
-                let header = Header::decode(&fixed).map_err(|_| StartupError::Invalid)?;
+                let authentication = self
+                    .connection
+                    .authentication_state(
+                        self.clock
+                            .interval()
+                            .map_err(|_| StartupError::AuthTimeUnavailable)?,
+                    )
+                    .map_err(|_| StartupError::AuthTimeUnavailable)?;
+                let header = revision::startup_header(&fixed, &authentication, RESPONDER_CALL)?;
                 if header.kind != FrameKind::TicketNotice || !header.matches_attempt(&self.header) {
                     return Err(StartupError::Invalid);
                 }

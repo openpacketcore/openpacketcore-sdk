@@ -1641,7 +1641,11 @@ excludes the old key material needed for rollback.
 The `scope-store` feature enables store-backed scoped SA installation and its
 receipt APIs. It is off by default, so ordinary XFRM and IKEv2 consumers do not
 build the session store, consensus engine or SQLite. Local containment, reset
-and profile admission remain available without that feature.
+and profile admission remain available without that feature. Enable
+`native-scope` for a stateless worker using the authenticated scope transport;
+it includes `scope-store` and the lifecycle's concrete native authority adapter.
+Both authority adapters yield the same `CommittedScopeEffect` accepted by these
+backend APIs. Native activation readback precedes coordinator acknowledgement.
 
 `NamespaceBoundLinuxXfrmBackend::for_local_scope` binds one namespace actor to
 the shared [`LocalKernelLifecycle`](../opc-local-kernel-lifecycle/README.md).

@@ -14,13 +14,14 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, Notify},
+    sync::{Mutex, MutexGuard, Notify},
     time::{timeout, timeout_at, Instant},
 };
 
 pub(super) mod batch;
 #[cfg(test)]
 mod batch_tests;
+mod child_reads;
 pub(super) mod scans;
 
 struct Inner {
@@ -60,6 +61,11 @@ impl PendingScopeAuthority {
     }
 }
 impl ScopeClient {
+    /// Complete process binding established from this client's protected boot,
+    /// ticket and TLS identity. This observation cannot construct authority.
+    pub fn execution(&self) -> &ScopeExecution {
+        &self.0.execution
+    }
     /// Bind the actual configured TLS identity and exact process ticket hints.
     pub fn new(config: ScopeClientConfig) -> Result<Self, ScopeRpcError> {
         config
@@ -531,11 +537,50 @@ impl ScopeClient {
         close: Option<&LocalClosureRecord>,
         attempt: Duration,
     ) -> Result<VerifiedResponse, ScopeRpcError> {
-        let mut slot = self.0.connections[class.index()].lock().await;
+        // Existing methods receive a full attempt after connection acquisition.
+        let slot = self.0.connections[class.index()].lock().await;
         let deadline = Instant::now()
             .checked_add(attempt)
             .ok_or(ScopeRpcError::Invalid)?;
+        self.roundtrip_with_slot(method, class, id, digest, canonical, close, deadline, slot)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn roundtrip_at(
+        &self,
+        method: Method,
+        class: Class,
+        id: [u8; 16],
+        digest: [u8; 32],
+        canonical: &[u8],
+        close: Option<&LocalClosureRecord>,
+        deadline: Instant,
+    ) -> Result<VerifiedResponse, ScopeRpcError> {
+        // Child reads own one absolute deadline, including connection ownership.
+        let slot = timeout_at(deadline, self.0.connections[class.index()].lock())
+            .await
+            .map_err(|_| ScopeRpcError::Retry)?;
+        self.roundtrip_with_slot(method, class, id, digest, canonical, close, deadline, slot)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn roundtrip_with_slot(
+        &self,
+        method: Method,
+        class: Class,
+        id: [u8; 16],
+        digest: [u8; 32],
+        canonical: &[u8],
+        close: Option<&LocalClosureRecord>,
+        deadline: Instant,
+        mut slot: MutexGuard<'_, Option<PooledConnection>>,
+    ) -> Result<VerifiedResponse, ScopeRpcError> {
         for reconnect in [false, true] {
+            if method == Method::ChildRead && Instant::now() >= deadline {
+                return Err(ScopeRpcError::Retry);
+            }
             // The server closes after five seconds without a new call. Leave a
             // margin, and retry a raced close only while no proof was transmitted.
             let cached = slot
@@ -558,7 +603,7 @@ impl ScopeClient {
                 exchange.await
             } else {
                 timeout_at(deadline, exchange).await.unwrap_or_else(|_| {
-                    Err(if proof_started {
+                    Err(if proof_started && method != Method::ChildRead {
                         ScopeRpcError::OutcomeUnknown
                     } else {
                         ScopeRpcError::Retry
@@ -574,7 +619,7 @@ impl ScopeClient {
                     return Ok(reply);
                 }
                 Err(ScopeRpcError::Retry | ScopeRpcError::AuthTimeUnavailable)
-                    if !proof_started && !reconnect => {}
+                    if !proof_started && !reconnect && method != Method::ChildRead => {}
                 Err(error) => return Err(error),
             }
         }
@@ -593,6 +638,8 @@ impl ScopeClient {
         close: Option<&LocalClosureRecord>,
         proof_started: &mut bool,
     ) -> Result<(VerifiedResponse, ScopeTlsConnection<TcpStream>), ScopeRpcError> {
+        use super::revision::{self, WORKER_RESPONSE};
+        let fresh = cached.is_none();
         let mut connection = match cached {
             Some(connection) => connection.stream,
             None => {
@@ -614,7 +661,13 @@ impl ScopeClient {
                                 .map_err(|_| ScopeRpcError::Invalid)?,
                         )
                         .await
-                        .map_err(|_| ScopeRpcError::Retry)
+                        .map_err(|error| {
+                            revision::rpc_handshake_error(
+                                WORKER_RESPONSE,
+                                error,
+                                ScopeRpcError::Retry,
+                            )
+                        })
                 })
                 .await
                 .map_err(|_| ScopeRpcError::Retry)??
@@ -624,6 +677,18 @@ impl ScopeClient {
             || connection.local_identity().as_str() != self.0.execution.identity().as_str()
         {
             return Err(ScopeRpcError::Unauthorized);
+        }
+        if fresh {
+            let authentication = connection
+                .authentication_state(
+                    self.0
+                        .config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            revision::authenticated_handshake(WORKER_RESPONSE, &authentication);
         }
         let result = async {
             let nonce = super::boot::random_nonzero().map_err(|_| ScopeRpcError::Retry)?;
@@ -665,24 +730,40 @@ impl ScopeClient {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let malformed_before_proof = if method == Method::ChildRead {
+                ScopeRpcError::Retry
+            } else {
+                ScopeRpcError::Invalid
+            };
+            let header =
+                revision::rpc_header(&fixed, WORKER_RESPONSE, malformed_before_proof, || {
+                    connection
+                        .authentication_state(
+                            self.0
+                                .config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if !header.matches_attempt(&call) {
-                return Err(ScopeRpcError::Invalid);
+                return Err(malformed_before_proof);
             }
             if header.kind == FrameKind::Result {
                 // A pre-challenge refusal is correlated to this call, but can
                 // never deliver a result or capability for an unproved request.
                 if header.payload_len != 71 {
-                    return Err(ScopeRpcError::Invalid);
+                    return Err(malformed_before_proof);
                 }
                 let mut bytes = [0; 71];
                 connection
                     .read_exact(&mut bytes)
                     .await
                     .map_err(|_| ScopeRpcError::Retry)?;
-                let payload = ResultPayload::decode(&bytes).map_err(|_| ScopeRpcError::Invalid)?;
+                let payload = ResultPayload::decode(&bytes).map_err(|_| malformed_before_proof)?;
                 if payload.nonce != nonce || payload.status != ResultStatus::ProvenNoEffect {
-                    return Err(ScopeRpcError::Invalid);
+                    return Err(malformed_before_proof);
                 }
                 connection
                     .authentication_state(
@@ -693,13 +774,13 @@ impl ScopeClient {
                             .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
                     )
                     .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-                return Err(payload_error(&payload)?);
+                return Err(payload_error(&payload).map_err(|_| malformed_before_proof)?);
             }
             if header.kind != FrameKind::Challenge
                 || header.payload_len != 32
                 || !header.matches_attempt(&call)
             {
-                return Err(ScopeRpcError::Invalid);
+                return Err(malformed_before_proof);
             }
             let mut challenge = [0; 32];
             connection
@@ -748,37 +829,52 @@ impl ScopeClient {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::OutcomeUnknown)?;
-            let header = Header::decode(&fixed).map_err(|_| ScopeRpcError::OutcomeUnknown)?;
+            let malformed_after_proof = if method == Method::ChildRead {
+                ScopeRpcError::Retry
+            } else {
+                ScopeRpcError::OutcomeUnknown
+            };
+            let header =
+                revision::rpc_header(&fixed, WORKER_RESPONSE, malformed_after_proof, || {
+                    connection
+                        .authentication_state(
+                            self.0
+                                .config
+                                .clock
+                                .interval()
+                                .map_err(|_| malformed_after_proof)?,
+                        )
+                        .map_err(|_| malformed_after_proof)
+                })?;
             if header.kind != FrameKind::Result || !header.matches_attempt(&call) {
-                return Err(ScopeRpcError::OutcomeUnknown);
+                return Err(malformed_after_proof);
             }
             let mut bytes = vec![0; header.payload_len];
             connection
                 .read_exact(&mut bytes)
                 .await
                 .map_err(|_| ScopeRpcError::OutcomeUnknown)?;
-            let payload =
-                ResultPayload::decode(&bytes).map_err(|_| ScopeRpcError::OutcomeUnknown)?;
+            let payload = ResultPayload::decode(&bytes).map_err(|_| malformed_after_proof)?;
             if payload.nonce != nonce {
-                return Err(ScopeRpcError::OutcomeUnknown);
+                return Err(malformed_after_proof);
             }
             let interval = self
                 .0
                 .config
                 .clock
                 .interval()
-                .map_err(|_| ScopeRpcError::OutcomeUnknown)?;
+                .map_err(|_| malformed_after_proof)?;
             let binding = *connection
                 .channel_binding(ChannelBindingPurpose::ScopeResponse, interval)
-                .map_err(|_| ScopeRpcError::OutcomeUnknown)?
+                .map_err(|_| malformed_after_proof)?
                 .as_bytes();
             let correlation = hash(
                 &response_binding_input(&header, &payload, &binding)
-                    .map_err(|_| ScopeRpcError::OutcomeUnknown)?,
+                    .map_err(|_| malformed_after_proof)?,
             );
             let authentication = connection
                 .authentication_state(interval)
-                .map_err(|_| ScopeRpcError::OutcomeUnknown)?;
+                .map_err(|_| malformed_after_proof)?;
             Ok(VerifiedResponse {
                 payload,
                 authentication,

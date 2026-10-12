@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 #[path = "cancel_tests.rs"]
 mod cancel;
+#[path = "child_read_tests.rs"]
+mod child_read;
 #[path = "codec_tests.rs"]
 mod codec;
 #[path = "coordinator_tests.rs"]

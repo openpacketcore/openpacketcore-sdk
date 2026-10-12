@@ -2184,6 +2184,10 @@ impl ConsensusSessionStore {
             scope_views,
             #[cfg(any(test, feature = "test-control"))]
             scope_read_barriers_for_test: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-control"))]
+            scope_child_read_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-control"))]
+            scope_child_read_cuts_for_test: AtomicU64::new(0),
             scope_database,
             #[cfg(target_os = "linux")]
             private_wal: None,

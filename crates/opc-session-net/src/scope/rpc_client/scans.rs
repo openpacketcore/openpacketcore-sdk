@@ -249,6 +249,9 @@ fn unavailable() -> ScopeScanRequestFailure {
 }
 fn rpc_failure(error: ScopeRpcError) -> ScopeScanRequestFailure {
     match error {
+        ScopeRpcError::TransportRevisionMismatch => {
+            ScopeScanRequestFailure::Final(ScopeScanError::TransportRevisionMismatch)
+        }
         ScopeRpcError::Closed | ScopeRpcError::Superseded => {
             ScopeScanRequestFailure::Final(ScopeScanError::StaleAuthority)
         }
