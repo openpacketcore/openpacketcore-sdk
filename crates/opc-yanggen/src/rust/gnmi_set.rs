@@ -25,6 +25,40 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         "{}",
         to_pascal_case(clean_segment(last_segment(&root.path)))
     );
+    let user_ordered_lists = input
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == SchemaNodeKind::List
+                && !node.key_leaves.is_empty()
+                && super::is_user_ordered(node)
+        })
+        .map(|node| node.path.as_str())
+        .collect::<Vec<_>>();
+    let (list_path_parameter, list_path_argument, ordered_list_value) = if user_ordered_lists
+        .is_empty()
+    {
+        (quote! {}, quote! {}, quote! {})
+    } else {
+        (
+            quote! { path: &str, },
+            quote! { path, },
+            quote! {
+                let ordered_paths: &[&str] = &[#(#user_ordered_lists),*];
+                if ordered_paths.contains(&node.path) {
+                    let segments = super::patch::parse_path(path)
+                        .map_err(|_| GnmiError::invalid("gNMI Set path is invalid"))?;
+                    if segments.last().is_some_and(|segment| segment.keys.is_empty()) {
+                        if !value.is_array() {
+                            return Err(GnmiError::invalid("gNMI Set user-ordered list value must be a JSON array"));
+                        }
+                        return serde_json::to_string(value)
+                            .map_err(|_| GnmiError::invalid("gNMI Set value is not valid JSON"));
+                    }
+                }
+            },
+        )
+    };
 
     let tokens = quote! {
         use opc_gnmi_server::{
@@ -104,7 +138,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     leaf_list_patch_value(leaf_type, registry.numeric_range(path), &parsed)
                 }
                 NodeKind::Container => object_patch_value(&parsed),
-                NodeKind::List => list_patch_value(node, &parsed),
+                NodeKind::List => list_patch_value(node, #list_path_argument &parsed),
             }
         }
 
@@ -116,7 +150,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 .map_err(|_| GnmiError::invalid("gNMI Set value is not valid JSON"))
         }
 
-        fn list_patch_value(node: &NodeMeta, value: &Value) -> Result<String, GnmiError> {
+        fn list_patch_value(node: &NodeMeta, #list_path_parameter value: &Value) -> Result<String, GnmiError> {
+            #ordered_list_value
             if node.key_leaves.is_empty() {
                 if !value.is_array() {
                     return Err(GnmiError::invalid("gNMI Set keyless-list value must be a JSON array"));

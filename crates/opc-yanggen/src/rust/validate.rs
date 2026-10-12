@@ -22,6 +22,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let root_type = format_ident!("{}", to_pascal_case(root_name));
 
     let mut validation_checks = TokenStream::new();
+    let mut syntax_checks = TokenStream::new();
+    for node in &input.nodes {
+        if node.kind == SchemaNodeKind::LeafList && super::is_user_ordered(node) {
+            syntax_checks.extend(generate_leaf_list_uniqueness_check(node, input)?);
+        }
+    }
 
     // 1. Generate must/when constraints
     for constraint in &input.constraints {
@@ -50,6 +56,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         use super::types::*;
 
         pub fn validate_syntax(_root: &#root_type) -> Result<(), ValidationError> {
+            #syntax_checks
             Ok(())
         }
 
@@ -63,6 +70,50 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
 
     Ok(tokens.to_string())
+}
+
+fn generate_leaf_list_uniqueness_check(
+    node: &SchemaNode,
+    input: &CanonicalInput,
+) -> Result<TokenStream, RustGenerationError> {
+    let parent_path = node.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let ancestors = get_ancestors_along_path(parent_path, input)?;
+    let field = format_ident!("{}", to_snake_case(clean_segment(last_segment(&node.path))));
+    let access = if super::types::is_sensitive_node(node) {
+        quote! { current.#field.get() }
+    } else {
+        quote! { &current.#field }
+    };
+    let path = &node.path;
+    let mut block = quote! {
+        if super::serde::has_duplicate_values(#access) {
+            return Err(ValidationError::syntax(concat!("duplicate leaf-list value at ", #path)));
+        }
+    };
+    for ancestor in ancestors.iter().rev() {
+        let field = format_ident!(
+            "{}",
+            to_snake_case(clean_segment(last_segment(&ancestor.path)))
+        );
+        let access = if super::types::is_sensitive_node(ancestor) {
+            quote! { current.#field.get() }
+        } else {
+            quote! { &current.#field }
+        };
+        block = match ancestor.kind {
+            SchemaNodeKind::Container => quote! {
+                if let Some(current) = #access { #block }
+            },
+            SchemaNodeKind::List if ancestor.key_leaves.is_empty() => quote! {
+                for current in #access { #block }
+            },
+            SchemaNodeKind::List => quote! {
+                for current in (#access).values() { #block }
+            },
+            _ => block,
+        };
+    }
+    Ok(quote! { { let current = _root; #block } })
 }
 
 fn generate_path_access(

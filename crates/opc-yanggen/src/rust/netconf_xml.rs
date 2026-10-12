@@ -643,7 +643,11 @@ fn sequence_field_type(
                 quote! { Vec<super::types::#type_ident> }
             } else {
                 let key_type = list_key_type(node, nodes_by_path);
-                quote! { std::collections::BTreeMap<#key_type, super::types::#type_ident> }
+                if super::is_user_ordered(node) {
+                    quote! { super::serde::UserOrderedMap<#key_type, super::types::#type_ident> }
+                } else {
+                    quote! { std::collections::BTreeMap<#key_type, super::types::#type_ident> }
+                }
             }
         }
         SchemaNodeKind::LeafList => {
