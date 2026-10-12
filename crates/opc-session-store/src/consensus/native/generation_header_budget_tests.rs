@@ -5,7 +5,7 @@
 use super::*;
 use crate::consensus::native::{async_recovery::Boundary, voter_slot_tests as slots_fixture};
 use opc_consensus::voter_slots::*;
-use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch};
+use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, CONSENSUS_NODE_ID_MAX};
 
 fn largest_slots() -> voter_slots::Table {
     let mut genesis = slots_fixture::genesis(9);
@@ -111,8 +111,10 @@ fn largest_slots() -> voter_slots::Table {
 fn full_context(slots: bool) -> Context {
     let (storage, _, _) = fixture();
     let mut context = Version::capture(&storage).unwrap().context();
+    // The roundtrip needs valid typed ordinals; widen the JSON scalars only
+    // after it succeeds when computing the conservative encoded-size bound.
     let nodes: BTreeSet<_> = (1..=if slots { 10 } else { 5 })
-        .map(|n| SessionConsensusNodeId::new(u64::MAX - n).unwrap())
+        .map(|n| SessionConsensusNodeId::new(CONSENSUS_NODE_ID_MAX - (n - 1)).unwrap())
         .collect();
     let membership = StoredMembership::new(
         Some(slots_fixture::cut(COUNTER_MAX)),
@@ -123,7 +125,7 @@ fn full_context(slots: bool) -> Context {
     );
     let identity = context.business.identity;
     context.business.members = (1..=if slots { 9 } else { 5 })
-        .map(|n| SessionConsensusNodeId::new(u64::MAX - n).unwrap())
+        .map(|n| SessionConsensusNodeId::new(CONSENSUS_NODE_ID_MAX - (n - 1)).unwrap())
         .collect();
     let frontiers = &mut context.business.frontiers;
     frontiers.membership = membership.clone();
@@ -337,4 +339,33 @@ fn native_compact_frontier_preserves_image_json_and_rejects_trailing_or_oversize
             expected
         );
     }
+}
+
+#[test]
+fn native_compact_frontier_roundtrips_unprotected_recovery_without_changing_image_json() {
+    let mut context = full_context(false);
+    let boundary = context.business.frontiers.async_recovery.as_mut().unwrap();
+    boundary.protected = None;
+    let image_json = serde_json::to_value(&*boundary).unwrap();
+    assert!(image_json.get("protected").is_none());
+
+    let encoded = serde_json::to_vec(&context).unwrap();
+    let recovered: Context = serde_json::from_slice(&encoded).unwrap();
+    assert!(
+        context == recovered,
+        "an unprotected recovery boundary survives the generation carrier"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            recovered
+                .business
+                .frontiers
+                .async_recovery
+                .as_ref()
+                .unwrap()
+        )
+        .unwrap(),
+        image_json,
+        "portable image JSON keeps its existing omitted optional proof"
+    );
 }

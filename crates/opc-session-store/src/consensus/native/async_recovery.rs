@@ -21,7 +21,7 @@ pub(super) fn check_log_reservation(
     Ok(())
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Boundary {
     pub(crate) era: u64,
@@ -29,8 +29,29 @@ pub(crate) struct Boundary {
     pub(crate) applied: LogId<SessionConsensusNodeId>,
     watch_before: u64,
     history: HistoryRetirement,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub(crate) protected: Option<Box<crate::consensus::protected_recovery::ProtectedRecoveryProof>>,
+}
+
+impl Serialize for Boundary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        // JSON omits an absent named proof. Positional generation carriers
+        // must retain its option marker so the decoder consumes every field.
+        let include_protected = !serializer.is_human_readable() || self.protected.is_some();
+        let mut value =
+            serializer.serialize_struct("Boundary", 5 + usize::from(include_protected))?;
+        value.serialize_field("era", &self.era)?;
+        value.serialize_field("plan", &self.plan)?;
+        value.serialize_field("applied", &self.applied)?;
+        value.serialize_field("watch_before", &self.watch_before)?;
+        value.serialize_field("history", &self.history)?;
+        if include_protected {
+            value.serialize_field("protected", &self.protected)?;
+        }
+        value.end()
+    }
 }
 
 // Cumulative discontinuities keep the ordinary lifecycle conservation law
