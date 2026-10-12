@@ -700,20 +700,31 @@ from pathlib import Path
 args = sys.argv[1:]
 opts = args[args.index('--log-opts') + 1] if '--log-opts' in args else '--all'
 history = subprocess.run(['git', 'rev-list', *shlex.split(opts)], capture_output=True, text=True)
+patches = subprocess.run(['git', 'log', '-p', '-U0', *shlex.split(opts)], capture_output=True, text=True)
 record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text())
 with Path(os.environ['SCAN_RECORD']).open('a') as output:
     output.write(json.dumps(record) + '\\n')
-if history.returncode:
-    sys.stderr.write(history.stderr)
-    sys.exit(1)
+if history.returncode or patches.returncode or patches.stderr:
+    error = history.stderr or patches.stderr
+    level = os.environ.get('FAKE_GIT_LEVEL', 'ERR')
+    print(f'0:00AM {level} [git] ' + error.splitlines()[0], file=sys.stderr)
+    print(f'0:00AM {level} error="stderr is not empty"', file=sys.stderr)
+    print('0:00AM INF no leaks found', file=sys.stderr)
+    sys.exit(0)
+count = int(os.environ.get('FAKE_FINDINGS', '3'))
+exit_code = int(os.environ.get('SCAN_EXIT', '0'))
+if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
+    count, exit_code = 1, 2
+    print('0:00AM WRN leaks found: 1', file=sys.stderr)
+sys.stderr.write(os.environ.get('FAKE_SCAN_LOG', ''))
 if '--report-path' in args:
     report = Path(args[args.index('--report-path') + 1])
     if os.environ.get('SCAN_REPORT') == 'invalid':
         report.write_text('not JSON')
     elif os.environ.get('SCAN_REPORT') != 'missing':
         report.write_text(json.dumps([{'Secret': 'fixture-value-must-not-be-published'}]
-                                    * int(os.environ.get('FAKE_FINDINGS', '3'))))
-sys.exit(int(os.environ.get('SCAN_EXIT', '0')))
+                                    * count))
+sys.exit(exit_code)
 ''')
         self.program('gh', '''import json, os, sys
 from pathlib import Path
@@ -755,6 +766,16 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
     def scan_event(self, event, **env):
         return self.run_step(self.scan, **{'GITHUB_EVENT_NAME': event, 'GITHUB_SHA': self.base,
                                           'PR_BASE_SHA': self.base, 'PR_HEAD_SHA': self.head, **env})
+
+    def attributes_fixture(self, attributes):
+        self.git('checkout', '-q', '--detach', self.base, repo=self.origin)
+        (self.origin / '.gitattributes').write_text(attributes)
+        for index in range(1, 10):
+            (self.origin / f'file-{index:02d}.txt').write_text('ordinary fixture content\n')
+        head = self.commit('file-10.txt', 'SCOPE_FIXTURE_' + 'A' * 12)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+        return head
 
     def test_required_guard_runs_the_security_workflow_regressions(self):
         root = Path(__file__).resolve().parents[1]
@@ -853,13 +874,50 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                 self.assertEqual(self.git('for-each-ref', '--format=%(refname)', 'refs/secret-scan/pull'), '')
 
     def test_scanner_findings_and_errors_fail_every_scan(self):
+        harmless_log = '0:00AM INF message mentions ERR and FTL\n0:00AM WRN fixture warning\n'
         for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
             for exit_code in (0, 1, 2, 7):
                 with self.subTest(event=event, exit_code=exit_code):
-                    result, records = self.scan_event(event, SCAN_EXIT=str(exit_code), FAKE_FINDINGS='3')
+                    result, records = self.scan_event(event, SCAN_EXIT=str(exit_code), FAKE_FINDINGS='3',
+                                                      FAKE_SCAN_LOG=harmless_log)
                     self.assertEqual(result.returncode, exit_code, result.stderr)
                     self.assertEqual(len(records), 1)
                     self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
+                    self.assertIn(harmless_log, result.stderr)
+
+    def test_git_failure_inside_the_scanner_is_never_a_clean_result(self):
+        absent = '0' * 39 + '1'
+        for level in ('ERR', 'FTL'):
+            with self.subTest(level=level):
+                result, records = self.scan_event('push', GITHUB_SHA=absent, FAKE_GIT_LEVEL=level)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['commits'], [])
+                self.assertIn(f'{level} [git] fatal:', result.stderr)
+                self.assertEqual(result.stdout,
+                                 '::error::The scanner logged an error; this is not a clean result.\n')
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_malformed_attributes_never_produce_a_clean_scan(self):
+        head = self.attributes_fixture('* @bad\n')
+        result, records = self.scan_event('pull_request', PR_HEAD_SHA=head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['commits'], [head])
+        self.assertIn('ERR [git] @bad is not a valid attribute name: .gitattributes:1', result.stderr)
+        self.assertEqual(result.stdout,
+                         '::error::The scanner logged an error; this is not a clean result.\n')
+        self.assertEqual(self.output.read_text(), '')
+
+    def test_valid_attributes_still_report_a_finding(self):
+        head = self.attributes_fixture('* text\n')
+        result, records = self.scan_event('pull_request', PR_HEAD_SHA=head)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['commits'], [head])
+        self.assertEqual(result.stderr, '0:00AM WRN leaks found: 1\n')
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_finding_count_uses_report_length_and_never_reports_a_broken_report_as_clean(self):
         for count in (1, 5):
