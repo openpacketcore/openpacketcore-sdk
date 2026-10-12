@@ -88,7 +88,9 @@ async fn scope_child_read_three_large_children_refuse_the_whole_observation() {
                         .unwrap(),
                     )
                     .await
-                    .unwrap();
+                    .unwrap_or_else(|error| {
+                        panic!("large child {tag} setup (native={native}): {error}")
+                    });
             }
             let pair = reader
                 .read_current(&identity("worker-1"), granted.stamp(), &[key(1), key(2)])
