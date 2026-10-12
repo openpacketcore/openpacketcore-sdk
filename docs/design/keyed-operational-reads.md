@@ -92,6 +92,24 @@ but do not retain per-denied-event activity counts as part of a no-disclosure
 claim. ON_CHANGE change detection uses authorized content without fresh
 observation timestamps; hidden-only changes must not create visible updates.
 
+Exact and expanded Subscribe selections follow #1269's subscription authorization
+and revocation contract. Access-policy and resolved-principal-context changes
+independently wake every affected active stream, including idle operational-only
+ON_CHANGE streams without SAMPLE or heartbeat; periodic authorization polling is not
+used. Reevaluate requested nodes, identifying keys, aggregate-descendant
+dependencies and the previously permitted schema/dependency set together against one
+fresh policy context. Loss of any previously permitted node or dependency ends the
+stream with the fixed, value-free status and no keyed delete, without waiting for
+another data event. Preserve #1269's atomic notification registration and initial
+revision capture, ordered lossless control delivery, revision-completion
+acknowledgement, output gating and fail-closed delivery/refresh behavior. Provider
+work, hidden events, audit writes and output backpressure must not gate this control
+path.
+
+The SDK applies the subscription re-establishment rule in
+[RFC 8641 section 3.9](https://www.rfc-editor.org/rfc/rfc8641.html#section-3.9)
+to gNMI; the client re-subscribes under the current policy.
+
 **NETCONF.** Carry instance constraints through XML filter parsing, schema
 selection, `ReadSelection`, `get` and operational `get-data`, including binding
 and generated-renderer contracts. An unkeyed subtree selector selects all
@@ -193,9 +211,9 @@ Before server-side parsing/projection or allocating per-entry indexes, reject a 
 response with more than N = `max_paths_per_request` reported values. Then, before
 parsing any entry, reject a reported canonical path or encoded JSON value longer than V
 = `max_value_bytes` bytes. Apply the count check to both servers and every Subscribe
-snapshot, and the path and value checks also to each operational event. Overflow fails
-the whole read or ends the subscription with the existing protocol limit classification
-and fixed detail without counts or lengths; it never truncates. One accepted read or
+snapshot. Overflow fails the whole read or ends the subscription with the existing
+protocol limit classification and fixed detail without counts or lengths; it never
+truncates. One accepted read or
 snapshot therefore holds at most N paths and N values of at most V bytes each (2 GiB at
 the defaults N = 1024, V = 1 MiB), and server copies, escaping and rendering stay linear
 in that. `OperationalRequest` carries N; the `OperationalStateProvider` documentation
@@ -206,6 +224,15 @@ application's responsibility. gNMI queues keep their object-count bound,
 clamp(floor(`max_subscriber_queue_bytes` / 4096), 1, 1024), and await capacity on send;
 charging actual message bytes against `max_subscriber_queue_bytes` remains an existing
 gap outside this change.
+
+For operational events, apply the #1269 schema-path and dependency authorization
+gate before event validation, JSON validation and size limits. Drop a denied event
+silently, even if its path or value exceeds the byte limit; that event must not end
+the stream or wait on per-event audit work. Apply the path and value limits to
+events that pass this gate, before instance/JSON parsing and projection; their
+overflow ends the subscription with the fixed protocol-limit status. This event
+ordering does not relax whole-response rejection of invalid or oversized provider
+responses to a read or snapshot.
 
 ## Failing tests first
 
@@ -236,6 +263,23 @@ Give the regressions explicit names and exact outcomes. Required test contracts:
   update/delete, updates_only, partial-key planning, Read versus Subscribe, policy
   failure/revocation, a provider that reorders unchanged instances without causing an
   update, and controlled hidden-change observations.
+  Include #1269's `idle_on_change_revocation_terminates_on_context_change` with an
+  expanded selector through an authenticated server: receive a permitted entry on an
+  operational-only ON_CHANGE stream without SAMPLE or heartbeat, then revoke its
+  identifying key in separate access-policy and resolved-principal-context variants.
+  At the change-completion acknowledgement, require fixed, value-free termination
+  without another data event or keyed delete. With controlled notification and
+  scheduler barriers, hold the control notification after revocation, inject hidden
+  events and verify silent drops without termination; release it and require the same
+  termination boundary with zero, one and continuously queued hidden events. Hidden
+  events must not initiate, accelerate or delay termination. Use no sleeps or visible
+  data event to drive the assertion. Assert one policy call for the complete requested
+  and previously permitted schema/dependency batch on control-triggered reevaluation.
+  Apply #1269's `authorization_change_delivery_fails_closed` cases to expanded selectors:
+  registration races, consecutive revoke/restore revisions, channel closure/loss,
+  revision gaps, principal invalidation and policy-source failure. Require the
+  acknowledgement boundary and no further output; blocked provider work, per-event
+  audit work or output backpressure must not prevent server-side termination.
 - `netconf_keyed_get_preserves_instance_tree` and
   `netconf_keyed_xpath_and_operational_get_data`: subtree key subsets and branch
   correlation, supported XPath expansion and predicate rejection, operational get-data
@@ -246,9 +290,14 @@ Give the regressions explicit names and exact outcomes. Required test contracts:
   counts at and over the XML limits, including text split across parser events; overflow
   rejects before provider access with no partial result.
 - `operational_expansion_limits_are_checked_before_projection`: N and V boundaries for
-  values and paths in gNMI Get, Subscribe snapshots and events and NETCONF get and
-  get-data, overflow from one broad selector, a provider that stops at N + 1, no
-  renderer call or partial success after overflow, and fixed diagnostics.
+  values and paths in gNMI Get, Subscribe snapshots and authorized events and NETCONF
+  get and get-data, overflow from one broad selector, a provider that stops at N + 1,
+  no renderer call or partial success after overflow, and fixed diagnostics.
+- `operational_hidden_event_overflow_does_not_end_stream`: with no policy change, an
+  already-denied event with valid JSON and an oversized path or value leaves an
+  otherwise visible stream open with no new output or activity diagnostics. Cover path
+  and value overflow separately; an oversized authorized event produces the fixed
+  protocol-limit failure.
 - `operational_non_cleartext_key_class_is_refused`: security-secret, lawful-intercept
   and secret-like-name keys under a full grant give a fixed gNMI refusal and masked
   NETCONF keys; denied keys omit the entry.
@@ -263,7 +312,9 @@ changes for exact-only matching/result lookup, missing strict path validation, l
 comparison of integer or boolean keys, a literal gNMI `*` key, one backslash-escaping
 producer or consumer, dropping predicates/branch constraints, bypassing leaf or identity
 authorization, reloading policy between dependencies, skipping event enforcement,
-removing the opaque-aggregate guard, timestamp- or order-sensitive change detection,
+checking event limits before authorization, removing the independent policy/context
+notification trigger or making it depend on data events, removing the opaque-aggregate
+guard, timestamp- or order-sensitive change detection,
 per-event denial records, unmasked gNMI operational payloads, bypassing response or
 filter-text limits and removing diagnostic redaction. Existing exact-read, denied-leaf,
 duplicate/origin, unsupported-filter and Debug tests are preservation controls: they may
