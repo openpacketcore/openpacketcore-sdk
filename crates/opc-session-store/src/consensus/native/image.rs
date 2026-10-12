@@ -417,19 +417,20 @@ impl NativeStorage {
         };
         // A later local envelope can cover the same installed cut. Its
         // filename/checksum are distinct, while the original source still
-        // supplies the exact missing LogId and membership witnesses.
+        // supplies the exact missing LogId and membership witnesses. At a
+        // purged cut, an installed origin still requires this local binding
+        // or its exact incoming envelope, never altered foreign metadata.
+        let origin = self.business.snapshot_origin.as_deref();
         if self
             .log
             .entries
             .get(&applied.index)
             .is_none_or(|entry| entry.id() != applied)
             && !(self.log.entries.get(&applied.index).is_none()
-                && (self.log.purged == Some(applied)
-                    || self
-                        .business
-                        .snapshot_origin
-                        .as_ref()
-                        .is_some_and(|origin| origin.matches_snapshot_lineage(snapshot))))
+                && ((self.log.purged == Some(applied)
+                    && origin
+                        .is_none_or(|origin| origin.matches_local_snapshot_binding(snapshot)))
+                    || origin.is_some_and(|origin| origin.matches_snapshot_lineage(snapshot))))
         {
             return Err(invalid(
                 "native snapshot applied lineage differs from retained log",

@@ -291,7 +291,9 @@ pub(in crate::consensus::native) fn validate_context_metadata(
         if let Some(id) = snapshot.0.last_log_id {
             if row(id.index) != Some(id)
                 && !(row(id.index).is_none()
-                    && (frontiers.purged == Some(id)
+                    && ((frontiers.purged == Some(id)
+                        && origin
+                            .is_none_or(|origin| origin.matches_local_snapshot_binding(snapshot)))
                         || origin.is_some_and(|origin| origin.matches_snapshot_lineage(snapshot))))
             {
                 return Err(invalid(
