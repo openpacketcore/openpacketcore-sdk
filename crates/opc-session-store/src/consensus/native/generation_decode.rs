@@ -608,6 +608,7 @@ pub(super) fn verify_generic(
 
 // Full images omit the generation's optional-row marker. Share the same
 // borrowed shape check and reservation before decoding either binary version.
+#[cfg(test)]
 pub(in crate::consensus::native) fn full_generic(
     bytes: &[u8],
     format: Format,

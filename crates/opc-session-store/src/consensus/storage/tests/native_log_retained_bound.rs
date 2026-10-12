@@ -146,7 +146,7 @@ async fn bounded_cycles(mode: SessionPersistenceMode, cycles: u64) {
     let _return_gate = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
     for start in (0..total).step_by(profile.max_payload_entries as usize) {
         let end = (start + profile.max_payload_entries).min(total);
-        if end % profile.logs_per_snapshot == 0 {
+        if end.is_multiple_of(profile.logs_per_snapshot) {
             gate.arm();
         }
         assert_eq!(
@@ -160,7 +160,7 @@ async fn bounded_cycles(mode: SessionPersistenceMode, cycles: u64) {
             .applied_index_at_least(Some(end - 1), "real state machine applies committed blanks")
             .await
             .expect("normal apply completes");
-        if end % profile.logs_per_snapshot != 0 {
+        if !end.is_multiple_of(profile.logs_per_snapshot) {
             continue;
         }
         tokio::time::timeout(WAIT, gate.wait_started())

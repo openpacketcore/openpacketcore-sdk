@@ -113,7 +113,7 @@ async fn leader_cycles(cycles: u64) {
                 business_digest,
                 "re-proposals never bind fresh business rows"
             );
-            if (start + count) % DURABLE_OPENRAFT_PROFILE.logs_per_snapshot == 0 {
+            if (start + count).is_multiple_of(DURABLE_OPENRAFT_PROFILE.logs_per_snapshot) {
                 let minimum = last
                     .index
                     .saturating_sub(DURABLE_OPENRAFT_PROFILE.logs_per_snapshot);
