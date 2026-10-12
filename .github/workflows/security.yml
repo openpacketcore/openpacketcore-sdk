@@ -87,13 +87,20 @@ jobs:
           log="${RUNNER_TEMP}/gitleaks.log"
           status=0
           # Exit 2 means findings. Any other non-zero status means the scan did not complete.
-          gitleaks detect --source . --redact --no-banner --exit-code 2 \
+          # gitleaks colours its log lines unless NO_COLOR is set, also when stderr is a file.
+          NO_COLOR=1 gitleaks detect --source . --redact --no-banner --exit-code 2 \
             --report-format json --report-path "$report" --log-opts "$log_opts" 2> "$log" || status=$?
           cat "$log" >&2
           # gitleaks 8.30.1 exits 0 when its git log fails; it only logs the failure.
-          if [[ "$status" -eq 0 ]] && grep -q -E '^[^ ]+ (ERR|FTL) ' "$log"; then
-            echo "::error::The scanner logged an error; this is not a clean result."
-            status=1
+          # A clean result has the scanner's "no leaks found" line and no error line.
+          if [[ "$status" -eq 0 ]]; then
+            if grep -q -E '^[^ ]+ (ERR|FTL) ' "$log"; then
+              echo "::error::The scanner logged an error; this is not a clean result."
+              status=1
+            elif ! grep -q -E '^[^ ]+ INF no leaks found$' "$log"; then
+              echo "::error::The scanner did not log \"no leaks found\"; this is not a clean result."
+              status=1
+            fi
           fi
           if [[ "$status" -eq 2 ]]; then
             count="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$report")"

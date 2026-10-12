@@ -682,6 +682,8 @@ class SecretScanWorkflowTests(unittest.TestCase):
                     'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
                     'SCAN_RECORD': str(self.record), 'RUNNER_TEMP': str(self.root),
                     'GITHUB_OUTPUT': str(self.output), 'LC_ALL': 'C'}
+        # The workflow itself must turn the scanner's colours off; do not inherit that from the caller.
+        self.env.pop('NO_COLOR', None)
         self.git('init', '-q', '--initial-branch=main', repo=self.origin)
         self.git('config', 'user.name', 'Fixture', repo=self.origin)
         self.git('config', 'user.email', 'fixture@example.invalid', repo=self.origin)
@@ -702,21 +704,29 @@ opts = args[args.index('--log-opts') + 1] if '--log-opts' in args else '--all'
 history = subprocess.run(['git', 'rev-list', *shlex.split(opts)], capture_output=True, text=True)
 patches = subprocess.run(['git', 'log', '-p', '-U0', *shlex.split(opts)], capture_output=True, text=True)
 record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text())
+plain = bool(os.environ.get('NO_COLOR')) and not os.environ.get('FAKE_IGNORES_NO_COLOR')
+def line(level, text):
+    # gitleaks 8.30.1 colours every log line unless NO_COLOR is not empty.
+    if plain:
+        return f'0:00AM {level} {text}\\n'
+    colour = dict(INF=32, WRN=33).get(level, 31)
+    return f'\\x1b[90m0:00AM\\x1b[0m \\x1b[{colour}m{level}\\x1b[0m \\x1b[1m{text}\\x1b[0m\\n'
 with Path(os.environ['SCAN_RECORD']).open('a') as output:
     output.write(json.dumps(record) + '\\n')
 if history.returncode or patches.returncode or patches.stderr:
     error = history.stderr or patches.stderr
     level = os.environ.get('FAKE_GIT_LEVEL', 'ERR')
-    print(f'0:00AM {level} [git] ' + error.splitlines()[0], file=sys.stderr)
-    print(f'0:00AM {level} error="stderr is not empty"', file=sys.stderr)
-    print('0:00AM INF no leaks found', file=sys.stderr)
+    sys.stderr.write(line(level, '[git] ' + error.splitlines()[0]) + line(level, 'error="stderr is not empty"')
+                     + line('INF', 'no leaks found'))
     sys.exit(0)
 count = int(os.environ.get('FAKE_FINDINGS', '3'))
 exit_code = int(os.environ.get('SCAN_EXIT', '0'))
 if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
     count, exit_code = 1, 2
-    print('0:00AM WRN leaks found: 1', file=sys.stderr)
+    sys.stderr.write(line('WRN', 'leaks found: 1'))
 sys.stderr.write(os.environ.get('FAKE_SCAN_LOG', ''))
+if exit_code == 0:
+    sys.stderr.write(line('INF', 'no leaks found'))
 if '--report-path' in args:
     report = Path(args[args.index('--report-path') + 1])
     if os.environ.get('SCAN_REPORT') == 'invalid':
@@ -896,6 +906,30 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                 self.assertIn(f'{level} [git] fatal:', result.stderr)
                 self.assertEqual(result.stdout,
                                  '::error::The scanner logged an error; this is not a clean result.\n')
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_logged_error_does_not_replace_findings_or_another_failure(self):
+        late_error = '0:00AM ERR [git] fixture error after the first finding\n'
+        for exit_code in (1, 2, 7):
+            with self.subTest(exit_code=exit_code):
+                result, records = self.scan_event('push', SCAN_EXIT=str(exit_code), FAKE_FINDINGS='3',
+                                                  FAKE_SCAN_LOG=late_error)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(result.stderr, late_error)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
+
+    def test_scanner_log_in_another_format_is_never_a_clean_result(self):
+        absent = '0' * 39 + '1'
+        for name, env in (('clean scan', {}), ('git failure', {'GITHUB_SHA': absent})):
+            with self.subTest(name=name):
+                result, records = self.scan_event('push', FAKE_IGNORES_NO_COLOR='1', **env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn('\x1b[32mINF\x1b[0m \x1b[1mno leaks found\x1b[0m\n', result.stderr)
+                self.assertEqual(result.stdout, '::error::The scanner did not log "no leaks found"; '
+                                                'this is not a clean result.\n')
                 self.assertEqual(self.output.read_text(), '')
 
     def test_malformed_attributes_never_produce_a_clean_scan(self):

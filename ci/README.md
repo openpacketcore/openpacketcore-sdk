@@ -29,7 +29,7 @@ They do not fetch pull request heads; those are scanned by their own runs.
 Findings or scan failures open or update a `secret-scan` issue with the run link
 and, when available, the number of findings; without a count the issue says that
 the result is not clean. gitleaks 8.30.1 exits 0 when its `git log` fails, so the
-scan step also fails when the scanner logs an error.
+scan step also fails when the scanner logs an error or does not log `no leaks found`.
 That issue does not impose a merge hold on unrelated pull requests. Manual runs
 scan all refs like the scheduled run, with the dispatched commit's
 `.gitleaksignore`, and do not open an issue. Required workflow regressions in
