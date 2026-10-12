@@ -164,6 +164,44 @@ fn base_input() -> GenerationInput {
         .expect("base YANG should ingest")
 }
 
+#[test]
+fn system_ordered_models_keep_all_generated_file_digests() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    // All thirteen files, captured from 1d880a21c before user ordering support.
+    let expected: BTreeMap<String, BTreeMap<String, String>> =
+        serde_json::from_str(include_str!("fixtures/system_ordered_digests.json")).unwrap();
+    let models = [
+        ("base", BASE_YANG),
+        ("comments", COMMENT_ONLY_YANG),
+        ("enum", ENUM_YANG),
+        ("range", RANGE_YANG),
+    ];
+    assert_eq!(expected.len(), models.len());
+    for (name, yang) in models {
+        let input =
+            generation_input_from_yang_sources("review", &[source(yang.trim_start())]).unwrap();
+        let generated = opc_yanggen::rust::generate_rust(&input.to_canonical()).unwrap();
+        let actual: BTreeMap<_, _> = generated
+            .into_iter()
+            .map(|(file, content)| {
+                let mut digest = String::with_capacity(64);
+                for byte in Sha256::digest(content.as_bytes()) {
+                    write!(digest, "{byte:02x}").unwrap();
+                }
+                (file, digest)
+            })
+            .collect();
+        assert_eq!(expected[name].len(), 13);
+        assert_eq!(
+            actual, expected[name],
+            "generated output changed for {name}"
+        );
+    }
+}
+
 fn assert_source_mismatch(input: &GenerationInput) {
     let err = validate_generation_input_yang_sources(input, &[source(BASE_YANG)])
         .expect_err("input/source mismatch should be rejected");

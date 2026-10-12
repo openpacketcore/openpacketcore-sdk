@@ -211,6 +211,25 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         });
     }
 
+    let hash_derive = if super::has_user_ordered_collections(input) {
+        quote! { #[derive(std::hash::Hash)] }
+    } else {
+        quote! {}
+    };
+    let decimal_hash = if super::has_user_ordered_collections(input) {
+        quote! {
+            impl std::hash::Hash for YangDecimal64 {
+                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                    // Typed equality considers the two signed zeroes equal.
+                    let bits = if self.0 == 0.0 { 0_u64 } else { self.0.to_bits() };
+                    std::hash::Hash::hash(&bits, state);
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // Emit helper types
     tokens.extend(quote! {
         use serde::{Serialize, Deserialize};
@@ -335,7 +354,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        #[derive(Clone, Copy, Debug, PartialEq, Default, std::hash::Hash)]
+        #hash_derive
+        #[derive(Clone, Copy, Debug, PartialEq, Default)]
         pub struct YangInt64(pub i64);
         impl Serialize for YangInt64 {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -358,13 +378,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
         #[derive(Clone, Copy, Debug, PartialEq, Default)]
         pub struct YangDecimal64(pub f64);
-        impl std::hash::Hash for YangDecimal64 {
-            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                // Typed equality considers the two signed zeroes equal.
-                let bits = if self.0 == 0.0 { 0_u64 } else { self.0.to_bits() };
-                std::hash::Hash::hash(&bits, state);
-            }
-        }
+        #decimal_hash
         impl Serialize for YangDecimal64 {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
@@ -384,7 +398,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        #[derive(Clone, Copy, Debug, PartialEq, Default, Eq, std::hash::Hash)]
+        #hash_derive
+        #[derive(Clone, Copy, Debug, PartialEq, Default, Eq)]
         pub struct YangEmpty;
         impl Serialize for YangEmpty {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

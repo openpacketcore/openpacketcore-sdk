@@ -90,6 +90,23 @@ module ordered-secrets {
 }
 "#;
 
+const SENSITIVE_KEYS: &str = r#"
+module ordered-sensitive-keys {
+  yang-version 1.1;
+  namespace "urn:example:ordered-sensitive-keys";
+  prefix ok;
+  revision 2026-10-11;
+  container root {
+    list account {
+      key "token";
+      ordered-by user;
+      leaf token { type uint16; }
+      leaf label { type string; }
+    }
+  }
+}
+"#;
+
 fn generate_module(directory: &Path, name: &str, source: &str) {
     let input = generation_input_from_yang_sources(
         "ordered-collections",
@@ -98,7 +115,32 @@ fn generate_module(directory: &Path, name: &str, source: &str) {
     .unwrap();
     let output = directory.join(name);
     fs::create_dir(&output).unwrap();
-    for (file, content) in generate_rust(&input.to_canonical()).unwrap() {
+    for (file, mut content) in generate_rust(&input.to_canonical()).unwrap() {
+        if name == "collections" && file == "types.rs" {
+            // Count comparisons in the actual generated composite key. Only
+            // its equality implementation changes; the generated collections,
+            // diff and apply code are exercised without instrumentation edits.
+            let derived = "# [derive (Debug , Clone , PartialEq , Eq , PartialOrd , Ord , Serialize , Deserialize , Default)] pub struct EndpointKey";
+            let counted = "# [derive (Debug , Clone , Eq , PartialOrd , Ord , Serialize , Deserialize , Default)] pub struct EndpointKey";
+            assert_eq!(content.matches(derived).count(), 1);
+            content = content.replace(derived, counted);
+            content.push_str(
+                r#"
+std::thread_local! {
+    static KEY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub fn take_key_comparisons() -> usize {
+    KEY_COMPARISONS.with(|count| count.replace(0))
+}
+impl PartialEq for EndpointKey {
+    fn eq(&self, other: &Self) -> bool {
+        KEY_COMPARISONS.with(|count| count.set(count.get() + 1));
+        self.region == other.region && self.name == other.name
+    }
+}
+"#,
+            );
+        }
         fs::write(output.join(file), content).unwrap();
     }
 }
@@ -110,6 +152,7 @@ fn generated_user_ordered_collections() {
             ("minimal", MINIMAL),
             ("collections", COLLECTIONS),
             ("defaults", DEFAULTS),
+            ("sensitive_keys", SENSITIVE_KEYS),
         ],
         &[
             ("ordered", include_str!("fixtures/ordered_by_user_test.rs")),

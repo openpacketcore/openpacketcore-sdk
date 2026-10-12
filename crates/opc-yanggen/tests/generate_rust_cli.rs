@@ -308,3 +308,81 @@ fn generate_rust_missing_required_flags_are_rejected() {
         assert_eq!(json["diagnostic"]["code"], "yang-source-syntax-error");
     }
 }
+
+#[test]
+fn system_ordered_model_keeps_all_generated_file_digests() {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    // Captured from the generator before user ordering support (1d880a21c).
+    // Changing unaffected generated output requires an explicit baseline update.
+    let expected = [
+        (
+            "gnmi_json.rs",
+            "15ae5aabae1c48947fd78110cab9253da759172c3585dc9ccbcf83d67dce44df",
+        ),
+        (
+            "gnmi_set.rs",
+            "44d8054c5e0487ebbc45731b525a78d6f6f84363c652b63207362cafed0671f2",
+        ),
+        (
+            "metadata.rs",
+            "495fa1fed834545dae179353807296e6348b08407d4afc8d38e76525349042af",
+        ),
+        (
+            "mod.rs",
+            "3f775be9ce2a372626eb7b451b05a8eb0ae714f16c40a497d2e9d956b13ba2b8",
+        ),
+        (
+            "netconf_xml.rs",
+            "4b8b4259e265d7a2d4ec1f86ba0c97bec684d400a43040fd869c33f055f9c09e",
+        ),
+        (
+            "netconf_xml_edit.rs",
+            "8a074295566f9aba912957c936426c12eb4a09c22ba7f7742e7c09efe437e021",
+        ),
+        (
+            "patch.rs",
+            "5f5d286da75e8b7648bb2d1ade4de6f69b295a8c6d0e796ac3defa1862621a48",
+        ),
+        (
+            "paths.rs",
+            "b495af2bf7495054e5a0a3b76fd81c6ffc4b7158dd148d690297e333746fa66b",
+        ),
+        (
+            "redaction.rs",
+            "d65423aa71cb4165450848080d5b69c0f3e6a4e96d7979fa48a56fed90184f07",
+        ),
+        (
+            "schema_registry.rs",
+            "85f0f52bd04dfb2757edbfd8073f387079478089ec95eba805851cfd0d0b642b",
+        ),
+        (
+            "serde.rs",
+            "d21e3ad8d2e3b9f2739a49d75d1658fded7ff6b0adeb90fbbc0f257b46e8028a",
+        ),
+        (
+            "types.rs",
+            "e0ad76b62b3e5eea0c0009c2d8762129ecfa3f9f5d840a460ee73a29871ac0f7",
+        ),
+        (
+            "validate.rs",
+            "015d1dbfaf08e401371c27d5e20b738291f0fc6d5771969e0ae572545ec990c4",
+        ),
+    ];
+    let dir = tempdir().expect("tempdir");
+    let yang_path = write_yang(dir.path(), TEST_YANG.trim_start());
+    let out_dir = dir.path().join("generated");
+    let mut args = generate_args(&yang_path, &out_dir);
+    args[2] = "review".into();
+    assert_success_json(run(&args));
+    let generated = read_expected_files(&out_dir);
+    assert_eq!(generated.len(), expected.len());
+    for (name, expected_digest) in expected {
+        let mut actual = String::with_capacity(64);
+        for byte in Sha256::digest(&generated[name]) {
+            write!(actual, "{byte:02x}").unwrap();
+        }
+        assert_eq!(actual, expected_digest, "generated output changed: {name}");
+    }
+}

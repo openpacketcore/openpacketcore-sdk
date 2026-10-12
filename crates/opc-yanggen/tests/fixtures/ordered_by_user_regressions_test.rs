@@ -66,6 +66,145 @@ fn collection_delete_and_remove_clear_every_row() {
 }
 
 #[test]
+fn keyed_lookup_and_mutation_stay_consistent_after_removal_and_compaction() {
+    let mut value = root(&["z", "a", "m"]);
+    apply_patch(&mut value, &[ConfigDelta::Delete(path("/oc:root/oc:server[name='z']"))])
+        .unwrap();
+    for key in ["a", "m"] {
+        assert_eq!(value.server.get(key).unwrap().name, LeafPresence::Explicit(key.into()));
+    }
+    value.server.get_mut("a").unwrap().port = LeafPresence::Explicit(5353);
+    assert_eq!(
+        value.server.values().map(|row| row.port.clone()).collect::<Vec<_>>(),
+        [LeafPresence::Explicit(5353), LeafPresence::Explicit(53)]
+    );
+
+    // More than half the slots are now dead, so an implementation with lazy
+    // removal can compact. The remaining row must still have the right index.
+    value.server.remove("a").unwrap();
+    assert_eq!(names(&value), ["m"]);
+    assert_eq!(value.server.get("m").unwrap().name, LeafPresence::Explicit("m".into()));
+    value.server.get_mut("m").unwrap().port = LeafPresence::Explicit(853);
+    value.server.entry("m".into()).or_default().port = LeafPresence::Explicit(5354);
+    assert_eq!(value.server.values().next().unwrap().port, LeafPresence::Explicit(5354));
+    assert!(!value.server.contains_key("z"));
+    assert!(!value.server.contains_key("a"));
+    assert!(value.server.remove("absent").is_none());
+    value.server.remove("m").unwrap();
+    assert!(value.server.is_empty());
+    let row = root(&["z"]).server.remove("z").unwrap();
+    value.server.insert("z".into(), row).unwrap();
+    assert_eq!(names(&value), ["z"]);
+    assert_eq!(value.server.get("z").unwrap().name, LeafPresence::Explicit("z".into()));
+}
+
+#[test]
+fn clearing_a_collection_removes_its_key_index() {
+    let mut value = root(&["z", "a"]);
+    apply_patch(&mut value, &[ConfigDelta::Delete(path("/oc:root/oc:server"))]).unwrap();
+    assert!(!value.server.contains_key("z"));
+    assert!(value.server.get("z").is_none());
+    let row = root(&["z"]).server.remove("z").unwrap();
+    assert_eq!(value.server.insert("z".into(), row), Ok(()));
+    assert_eq!(names(&value), ["z"]);
+}
+
+#[test]
+fn reinserting_a_removed_key_appends_instead_of_reusing_its_position() {
+    let mut value = root(&["z", "a", "m"]);
+    let removed = value.server.remove("z").unwrap();
+    value.server.insert("z".into(), removed).unwrap();
+    assert_eq!(names(&value), ["a", "m", "z"]);
+    for key in ["a", "m", "z"] {
+        assert_eq!(value.server.get(key).unwrap().name, LeafPresence::Explicit(key.into()));
+    }
+    value.server.remove("m").unwrap();
+    value.server.entry("m".into()).or_default().name = LeafPresence::Explicit("m".into());
+    assert_eq!(names(&value), ["a", "z", "m"]);
+}
+
+#[test]
+fn equality_includes_row_order_but_not_removed_slots() {
+    assert_ne!(root(&["z", "a"]), root(&["a", "z"]));
+    assert_ne!(root(&["z", "a"]).server, root(&["a", "z"]).server);
+    let mut removed = root(&["z", "a", "m"]);
+    removed.server.remove("a").unwrap();
+    let fresh = root(&["z", "m"]);
+    assert_eq!(removed, fresh);
+    let expected_debug = format!("{{{:?}: {:?}, {:?}: {:?}}}",
+        "z", removed.server.get("z").unwrap(), "m", removed.server.get("m").unwrap());
+    assert_eq!(format!("{:?}", removed.server), expected_debug);
+    assert_eq!(format!("{:?}", removed.server), format!("{:?}", fresh.server));
+    assert_eq!(format!("{:?}", removed.server), format!("{:?}", removed.server.clone()));
+}
+
+#[test]
+fn ordered_iterators_count_only_remaining_live_rows() {
+    let mut value = root(&["z", "a", "m", "n"]);
+    value.server.remove("a").unwrap();
+    value.server.remove("n").unwrap();
+    assert_eq!(value.server.len(), 2);
+    {
+        let mut keys = value.server.keys();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.size_hint(), (2, Some(2)));
+        assert_eq!(keys.next().map(String::as_str), Some("z"));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.next().map(String::as_str), Some("m"));
+        assert_eq!(keys.len(), 0);
+        assert_eq!(keys.next(), None);
+    }
+    assert_eq!(value.server.values().len(), 2);
+    {
+        let mut rows = value.server.values_mut();
+        assert_eq!(rows.len(), 2);
+        rows.next().unwrap().port = LeafPresence::Explicit(853);
+        assert_eq!(rows.len(), 1);
+        rows.next().unwrap().port = LeafPresence::Explicit(5353);
+        assert_eq!(rows.len(), 0);
+        assert!(rows.next().is_none());
+    }
+    {
+        let mut borrowed = (&value.server).into_iter();
+        assert_eq!(borrowed.len(), 2);
+        assert_eq!(borrowed.next().unwrap().0, "z");
+        assert_eq!(borrowed.len(), 1);
+        assert_eq!(borrowed.next().unwrap().0, "m");
+        assert_eq!(borrowed.len(), 0);
+        assert!(borrowed.next().is_none());
+    }
+    let wire = serde_json::to_value(&value).unwrap();
+    assert_eq!(wire, json!({"ordered-collections:server":[
+        {"name":"z","port":853}, {"name":"m","port":5353}
+    ]}));
+    let mut owned = value.server.into_iter();
+    assert_eq!(owned.len(), 2);
+    assert_eq!(owned.next().unwrap().0, "z");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned.next().unwrap().0, "m");
+    assert_eq!(owned.len(), 0);
+    assert!(owned.next().is_none());
+
+    let mut sparse = root(&["z", "a", "m", "n"]);
+    sparse.server.remove("z").unwrap();
+    sparse.server.remove("m").unwrap();
+    {
+        let mut borrowed = (&sparse.server).into_iter();
+        assert_eq!(borrowed.next_back().unwrap().0, "n");
+        assert_eq!(borrowed.len(), 1);
+        assert_eq!(borrowed.next().unwrap().0, "a");
+        assert_eq!(borrowed.len(), 0);
+        assert!(borrowed.next_back().is_none());
+    }
+    let mut owned = sparse.server.into_iter();
+    assert_eq!(owned.next_back().unwrap().0, "n");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned.next().unwrap().0, "a");
+    assert_eq!(owned.len(), 0);
+    assert!(owned.next_back().is_none());
+}
+
+#[test]
 fn typed_ordered_replacement_refuses_invalid_rows_and_wrong_targets_atomically() {
     let initial = root(&["z", "a"]);
     for (target, expected) in [
@@ -133,6 +272,38 @@ fn collection_merge_and_update_retain_nested_system_ordered_lists() {
         );
         assert_eq!(row.hop.get("new").unwrap().cost, LeafPresence::Explicit(3));
         assert_eq!(row.hop.get("old").unwrap().cost, LeafPresence::Explicit(9));
+    }
+}
+
+#[test]
+fn nested_system_list_merge_refuses_duplicate_keys_atomically() {
+    for delta in [ConfigDelta::Update, ConfigDelta::Merge] {
+        let mut value = root(&["z", "a"]);
+        let before = value.clone();
+        assert_eq!(
+            apply_patch(&mut value, &[delta(
+                path("/oc:root/oc:server[name='z']/oc:hop"),
+                json!([{"name":"q","cost":1},{"name":"q","cost":2}]).to_string(),
+            )]),
+            Err(ConfigError::new("invalid-value", "invalid keyed list"))
+        );
+        assert_eq!(value, before);
+    }
+}
+
+#[test]
+fn unrelated_system_list_keeps_its_existing_list_path_refusal() {
+    for delta in [ConfigDelta::Update, ConfigDelta::Merge] {
+        let mut value = root(&["z", "a"]);
+        let before = value.clone();
+        assert_eq!(
+            apply_patch(&mut value, &[delta(
+                path("/oc:root/oc:system-server"),
+                json!([{"name":"q","port":1},{"name":"q","port":2}]).to_string(),
+            )]),
+            Err(ConfigError::new("missing-key", "missing key: name"))
+        );
+        assert_eq!(value, before);
     }
 }
 
@@ -292,6 +463,76 @@ fn gnmi_empty_user_list_emits_no_value() {
         .render_running_json(&Root::default(), ReadSelection::new(&selected))
         .unwrap();
     assert!(updates.is_empty());
+}
+
+#[test]
+fn gnmi_row_without_selected_children_emits_nothing() {
+    let value = root(&["z", "a"]);
+    let selected = ["/oc:root/oc:server"];
+    let updates = model::gnmi_json::renderer()
+        .render_running_json(&value, ReadSelection::new(&selected))
+        .unwrap();
+    assert!(updates.is_empty());
+    let entries = [ReadSelectionEntry::new(selected[0], path(selected[0]))];
+    let updates = model::gnmi_json::renderer()
+        .render_running_json(&value, ReadSelection::with_entries(&selected, &entries))
+        .unwrap();
+    assert!(updates.is_empty());
+}
+
+fn endpoints(first: usize, last: usize) -> Root {
+    serde_json::from_value(json!({"endpoint": (first..last)
+        .map(|key| json!({"region":"region", "name":key.to_string(), "port":53}))
+        .collect::<Vec<_>>()}))
+        .unwrap()
+}
+
+#[test]
+fn unchanged_keyed_diff_uses_linear_comparisons() {
+    const ROWS: usize = 2048;
+    let previous = endpoints(0, ROWS);
+    let current = previous.clone();
+    model::types::take_key_comparisons();
+    let deltas = current.diff(&previous).unwrap();
+    let comparisons = model::types::take_key_comparisons();
+    assert!(deltas.is_empty());
+    assert!(comparisons < 16 * ROWS, "{comparisons} comparisons for {ROWS} rows");
+}
+
+#[test]
+fn bulk_deletion_through_diff_and_apply_uses_linear_comparisons() {
+    const ROWS: usize = 2048;
+    for deleted in [ROWS / 2, 3 * ROWS / 4, ROWS] {
+        let mut previous = endpoints(0, ROWS);
+        let current = endpoints(deleted, ROWS);
+        model::types::take_key_comparisons();
+        let deltas = current.diff(&previous).unwrap();
+        let diff_comparisons = model::types::take_key_comparisons();
+        assert_eq!(deltas.len(), deleted);
+        assert!(deltas.iter().all(|delta| matches!(delta, ConfigDelta::Delete(_))));
+        assert!(diff_comparisons < 16 * ROWS, "{diff_comparisons} diff comparisons for {ROWS} rows");
+        apply_patch(&mut previous, &deltas).unwrap();
+        let apply_comparisons = model::types::take_key_comparisons();
+        assert!(apply_comparisons < 16 * ROWS, "{apply_comparisons} apply comparisons for {ROWS} rows, {deleted} deleted");
+        assert_eq!(previous, current);
+        assert_eq!(previous.endpoint.keys().map(|key| key.name.clone()).collect::<Vec<_>>(),
+            (deleted..ROWS).map(|key| key.to_string()).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn redacted_key_collisions_suppress_the_collection() {
+    use generated_ordered_test::sensitive_keys::{redaction::{DeterministicHash, Redactable}, types};
+    // Distinct u16 keys with the same truncated deterministic hash.
+    assert_ne!(10427_u16, 33024_u16);
+    assert_eq!(10427_u16.deterministic_hash(), 33024_u16.deterministic_hash());
+    let mut value: types::Root = serde_json::from_value(json!({"account": [
+        {"token":10427, "label":"first"}, {"token":33024, "label":"second"}
+    ]})).unwrap();
+    assert_eq!(value.account.len(), 2);
+    value.redact_sensitive();
+    assert!(value.account.is_empty());
+    assert_eq!(serde_json::to_value(value).unwrap(), json!({}));
 }
 
 thread_local! { static COMPARISONS: Cell<usize> = const { Cell::new(0) }; }

@@ -19056,6 +19056,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yang_insert_returns_invalid_value_without_mutating_running() {
+        let (server, bus) = leaf_list_demo_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+        let before = bus.current_snapshot();
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"
+                xmlns:yang="urn:ietf:params:xml:ns:yang:1">
+                <sys:servers yang:insert="first">new-server</sys:servers>
+            </sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>invalid-value</error-tag>"),
+            "{}",
+            result.reply_xml
+        );
+        let after = bus.current_snapshot();
+        assert_eq!(after.config.servers, before.config.servers);
+        assert_eq!(after.config.aliases, before.config.aliases);
+    }
+
+    #[tokio::test]
     async fn malformed_edit_config_returns_invalid_value_without_mutating_running() {
         let (server, bus, _audit) = generated_edit_server_fixture().await;
         let registry = SessionRegistry::new();

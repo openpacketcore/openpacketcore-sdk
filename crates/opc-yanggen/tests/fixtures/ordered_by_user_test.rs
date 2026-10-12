@@ -256,6 +256,18 @@ fn patch_add_delete_and_entry_replace_keep_other_entries_in_order() {
         value.server.get("z").unwrap().port,
         LeafPresence::Explicit(5353)
     );
+    for (deleted, expected) in [("a", vec!["z", "m"]), ("m", vec!["z", "a"])] {
+        let mut candidate = value.clone();
+        apply_patch(&mut candidate, &[ConfigDelta::Delete(path(&format!(
+            "/oc:root/oc:server[name='{deleted}']"
+        )))])
+        .unwrap();
+        assert_eq!(names(&candidate), expected);
+        assert!(!candidate.server.contains_key(deleted));
+        for key in expected {
+            assert_eq!(candidate.server.get(key).unwrap().name, LeafPresence::Explicit(key.into()));
+        }
+    }
     apply_patch(
         &mut value,
         &[ConfigDelta::Delete(path("/oc:root/oc:server[name='z']"))],
@@ -321,6 +333,18 @@ fn xml_replacement_append_delete_and_entry_merge_preserve_order() {
         replaced_entry.server.get("z").unwrap().port,
         LeafPresence::Explicit(5354)
     );
+    for (deleted, expected) in [("a", vec!["z", "m"]), ("m", vec!["z", "a"])] {
+        let candidate = apply_xml(
+            &replaced_entry,
+            &format!(r#"<server nc:operation="delete"><name>{deleted}</name></server>"#),
+        )
+        .unwrap();
+        assert_eq!(names(&candidate), expected);
+        assert!(!candidate.server.contains_key(deleted));
+        for key in expected {
+            assert_eq!(candidate.server.get(key).unwrap().name, LeafPresence::Explicit(key.into()));
+        }
+    }
     let deleted = apply_xml(
         &replaced_entry,
         r#"<server nc:operation="delete"><name>z</name></server>"#,

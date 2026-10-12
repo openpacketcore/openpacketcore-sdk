@@ -372,28 +372,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a privileged process-loss proof. Never combine reset with predecessor
   adoption or recovery; stop plaintext sources until protection is reinstalled.
 
-### Changed
+### Breaking
 
-- `opc-yanggen`: generated configuration lists with `ordered-by user` now use
-  the SDK-owned `serde::UserOrderedMap<Key, Value>` instead of `BTreeMap`. This
-  public API change is limited to user-ordered keyed lists; system-ordered
-  lists keep `BTreeMap`. JSON, XML, gNMI reads, canonical configuration, diff,
-  and apply retain user order. A key index gives expected constant-time lookup
-  and linear deserialization, unchanged-list diff and redaction. Diff retains
-  per-entry changed paths for authorization and audit; a reorder or insertion
-  between existing rows also reports the collection path. Its typed
-  `ConfigDelta::ReplaceOrderedList` preserves defaulted leaf presence.
-  gNMI list reads emit one update per entry in configured order, with keys in
-  each path; entry and leaf reads retain their keyed paths, and an empty list
-  emits nothing. Duplicate keys and user-ordered leaf-list values are rejected,
-  including sensitive leaf-lists. **Stored-data boundary:** loading a stored
+- `opc-yanggen`: generated configuration lists with `ordered-by user` use the
+  SDK-owned `serde::UserOrderedMap<Key, Value>` instead of `BTreeMap`.
+  Their generated `ConfigDelta` also gains a `ReplaceOrderedList` variant;
+  exhaustive matches must handle it. System-ordered lists retain `BTreeMap`.
+- `opc-yanggen` stored-data boundary: loading a stored
   configuration with repeated user-ordered leaf-list values now fails with a
   serde data error, `leaf-list contains a duplicate value`; older generators
   accepted this invalid configuration. Other old configuration bytes reload
   unchanged. New user-ordered list bytes read by an older generator are
-  re-sorted. NETCONF placement attributes still return typed `UnsupportedShape`
-  errors (`invalid-value` to the client for `yang:insert`); normalized edits
-  cannot yet represent explicit insertion or moves.
+  re-sorted.
+
+### Changed
+
+- `opc-yanggen`: JSON, XML, gNMI reads, canonical configuration, diff and apply
+  retain user order. A key index gives expected constant-time lookup and
+  amortized constant-time removal; deserialization, unchanged-list diff,
+  bulk deletion and redaction take expected linear work. Diff retains per-entry
+  changed paths for authorization and audit; a reorder or insertion between
+  existing rows also reports the collection path. Typed ordered replacement
+  preserves defaulted leaf presence. gNMI list reads emit one update per entry
+  in configured order, with keys in each path; entry and leaf reads retain their
+  keyed paths, and an empty list emits nothing. Duplicate keys and user-ordered
+  leaf-list values are rejected, including sensitive leaf-lists. Models without
+  user-ordered configuration collections generate byte-identical output.
+  System-ordered keyed lists below a user-ordered keyed list now accept list
+  arrays for Update and Merge, so merging a user-ordered row can retain its
+  nested system-list entries. Other system-list paths retain their existing
+  behavior.
+- `opc-netconf-server`: NETCONF placement attributes return typed
+  `UnsupportedShape` errors (`invalid-value` to the client for `yang:insert`);
+  normalized edits cannot yet represent explicit insertion or moves.
 
 - `opc-proto-ikev2`: distinguish authenticated, correctly bound SKF packets with
   `Ikev2WindowError::UnsupportedShape` in ordinary recovery windows. Partial

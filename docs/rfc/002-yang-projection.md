@@ -211,9 +211,10 @@ Duplicate keys MUST be rejected during deserialization and patch application.
 
 `UserOrderedMap` stores rows in insertion order and supports key lookup without
 adding a generated-code dependency. A hash index maps keys to positions:
-lookup and append take expected O(1), construction, unchanged-list diff and
-redaction take expected O(n), and iteration and order-preserving removal take
-O(n). `insert` returns
+lookup and append take expected O(1), and removal takes amortized expected
+O(1). Removed slots are compacted once they outnumber live rows. Construction,
+unchanged-list diff, bulk deletion and redaction take expected O(n); iteration
+takes O(n). `insert` returns
 `DuplicateListKey` without replacing a row; `get_mut` and `entry(...).or_default()`
 update existing rows in place. New rows append, and removal preserves the
 remaining order. Equality and RFC 7951 arrays include order. Diff always emits
@@ -225,7 +226,11 @@ changed entry/leaf paths and, only when that replacement is needed, the list
 path, so authorization, audit and apply-plan classification retain the detail.
 Collection merge/update retains existing positions and appends new keys in
 payload order, including recursive merges of nested system-ordered lists.
-System-ordered keyed lists retain their sorted representation.
+Only system-ordered keyed lists below a user-ordered keyed list gain list-path
+array Update/Merge support; other system-list paths retain their existing
+behavior. System-ordered keyed lists retain their sorted representation.
+Models without user-ordered configuration collections retain byte-identical
+generated output.
 As specified by RFC 7950, `ordered-by` is ignored for state data.
 
 Generated gNMI reads at a user-ordered keyed list path emit one update per

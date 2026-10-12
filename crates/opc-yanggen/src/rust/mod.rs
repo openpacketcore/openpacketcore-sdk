@@ -46,6 +46,14 @@ fn is_user_ordered(node: &SchemaNode) -> bool {
     node.config && node.ordered_by.as_deref() == Some("user")
 }
 
+fn has_user_ordered_collections(input: &CanonicalInput) -> bool {
+    input.nodes.iter().any(|node| {
+        is_user_ordered(node)
+            && (node.kind == SchemaNodeKind::LeafList
+                || (node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()))
+    })
+}
+
 pub fn generate_rust(
     input: &CanonicalInput,
 ) -> Result<HashMap<String, String>, RustGenerationError> {
@@ -59,7 +67,7 @@ pub fn generate_rust(
     let ordered_replacement_changed_path = if input.nodes.iter().any(|node| {
         node.kind == SchemaNodeKind::List && is_user_ordered(node) && !node.key_leaves.is_empty()
     }) {
-        "patch::ConfigDelta::ReplaceOrderedList(p, _) => paths.push(p.clone()),"
+        "                patch::ConfigDelta::ReplaceOrderedList(p, _) => paths.push(p.clone()),\n"
     } else {
         ""
     };
@@ -107,8 +115,7 @@ impl OpcConfig for types::__ROOT_TYPE__ {
                 patch::ConfigDelta::Delete(p) => paths.push(p.clone()),
                 patch::ConfigDelta::Merge(p, _) => paths.push(p.clone()),
                 patch::ConfigDelta::Remove(p) => paths.push(p.clone()),
-                __ORDERED_REPLACEMENT_CHANGED_PATH__
-            }
+__ORDERED_REPLACEMENT_CHANGED_PATH__            }
         }
         paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         paths.dedup();

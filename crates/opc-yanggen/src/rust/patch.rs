@@ -252,7 +252,17 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         }
                         SchemaNodeKind::List => {
                             let ty_name = format_ident!("{}", to_pascal_case(child_name));
-                            let collection_patch = if !child.key_leaves.is_empty() {
+                            // Collection merges are needed for RFC 7951 arrays inside
+                            // user-ordered rows. Other system lists retain their API.
+                            let below_ordered_list = ordered_lists.iter().any(|ancestor| {
+                                child
+                                    .path
+                                    .strip_prefix(&ancestor.path)
+                                    .is_some_and(|suffix| suffix.starts_with('/'))
+                            });
+                            let collection_patch = if !child.key_leaves.is_empty()
+                                && (super::is_user_ordered(child) || below_ordered_list)
+                            {
                                 let key_type = super::types::get_key_type(child, &nodes_by_path);
                                 let access = if is_sensitive {
                                     quote! { self.#field_ident.get_mut() }
