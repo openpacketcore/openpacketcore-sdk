@@ -65,11 +65,11 @@ pub(super) struct Format {
 }
 
 impl Format {
-    const V2: Self = Self {
+    pub(super) const V2: Self = Self {
         vocabulary: 2,
         profile: VoterProfile::Fixed,
     };
-    const V3: Self = Self {
+    pub(super) const V3: Self = Self {
         vocabulary: 3,
         profile: VoterProfile::Fixed,
     };
