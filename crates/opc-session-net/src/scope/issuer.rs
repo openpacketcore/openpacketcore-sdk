@@ -6,6 +6,7 @@ use super::{
     },
     platform::{KubernetesBootReader, PodEnrollment},
     pool::ProofBudgets,
+    revision::{self, ISSUER_PROOF},
     startup::StartupError,
 };
 use std::sync::Arc;
@@ -160,13 +161,21 @@ impl BootstrapIssuerClient {
                         .map_err(|_| StartupError::Invalid)?,
                 )
                 .await
-                .map_err(|_| StartupError::Unavailable)
+                .map_err(|error| revision::startup_handshake_error(ISSUER_PROOF, error))
         })
         .await
         .map_err(|_| StartupError::Unavailable)??;
         if connection.peer_identity().spiffe_id() != &enrollment.worker {
             return Err(StartupError::Unauthorized);
         }
+        let authentication = connection
+            .authentication_state(
+                self.clock
+                    .interval()
+                    .map_err(|_| StartupError::AuthTimeUnavailable)?,
+            )
+            .map_err(|_| StartupError::AuthTimeUnavailable)?;
+        revision::authenticated_handshake(ISSUER_PROOF, &authentication);
         let mode = match mode {
             BootstrapProofMode::Liveness => StartupMode::Liveness,
             BootstrapProofMode::Candidate => StartupMode::Candidate,
@@ -246,7 +255,15 @@ impl BootstrapIssuerClient {
                             .read_exact(&mut fixed)
                             .await
                             .map_err(|_| StartupError::Unavailable)?;
-                        let response = Header::decode(&fixed).map_err(|_| StartupError::Invalid)?;
+                        let authentication = connection
+                            .authentication_state(
+                                self.clock
+                                    .interval()
+                                    .map_err(|_| StartupError::AuthTimeUnavailable)?,
+                            )
+                            .map_err(|_| StartupError::AuthTimeUnavailable)?;
+                        let response =
+                            revision::startup_header(&fixed, &authentication, ISSUER_PROOF)?;
                         if response.kind != FrameKind::Proof || !response.matches_attempt(&header) {
                             return Err(StartupError::Invalid);
                         }
