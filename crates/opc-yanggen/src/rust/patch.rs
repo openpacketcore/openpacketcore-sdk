@@ -28,18 +28,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let root_path = &root.path;
 
     let nodes_by_path = NodeIndex::new(&input.nodes);
-    let (json_error, json_error_helper) = if super::strings::has_constraints(input) {
+    let normalize_errors =
+        super::has_extended_integers(input) || super::strings::has_constraints(input);
+    let (json_error, json_error_helper) = if normalize_errors {
         (
-            quote! { string_json_error },
+            quote! { scalar_json_error },
             quote! {
-                fn string_json_error(error: serde_json::Error) -> ConfigError {
-                    let detail = error.to_string();
-                    let reason = if detail.starts_with("string violates YANG constraints") {
-                        "string violates YANG constraints"
-                    } else if detail.starts_with("leaf-list contains a duplicate value") {
-                        "leaf-list contains a duplicate value"
-                    } else { "invalid JSON configuration" };
-                    config_error("invalid-value", reason)
+                fn scalar_json_error(error: serde_json::Error) -> ConfigError {
+                    config_error("invalid-value", super::types::json_error_reason(&error.to_string()))
                 }
             },
         )
@@ -48,6 +44,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             quote! { |e| config_error("invalid-value", e.to_string()) },
             quote! {},
         )
+    };
+    let integer_error = if normalize_errors {
+        quote! { |_| config_error("invalid-value", "invalid integer value") }
+    } else {
+        quote! { |e| config_error("invalid-value", e.to_string()) }
+    };
+    let validate_merge = if normalize_errors {
+        quote! { let _: Self = serde_json::from_str(v).map_err(#json_error)?; }
+    } else {
+        quote! {}
     };
 
     let root_type = format_ident!("{}", nodes_by_path.type_name(root));
@@ -164,28 +170,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             };
                         },
                         Some(TypeRef::Uint8) => quote! {
-                            let parsed = _v.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                            let parsed = _v.parse::<u8>().map_err(#integer_error)?;
                         },
                         Some(TypeRef::Int8) => quote! {
-                            let parsed = _v.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                            let parsed = _v.parse::<i8>().map_err(#integer_error)?;
                         },
                         Some(TypeRef::Int16) => quote! {
-                            let parsed = _v.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                            let parsed = _v.parse::<i16>().map_err(#integer_error)?;
                         },
                         Some(TypeRef::Int32) => quote! {
-                            let parsed = _v.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                            let parsed = _v.parse::<i32>().map_err(#integer_error)?;
                         },
                         Some(TypeRef::Uint16) => quote! {
-                            let parsed = _v.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                            let parsed = _v.parse::<u16>().map_err(#integer_error)?;
                         },
                         Some(TypeRef::Uint32) => quote! {
-                            let parsed = _v.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                            let parsed = _v.parse::<u32>().map_err(#integer_error)?;
                         },
                         Some(TypeRef::Uint64) => quote! {
-                            let parsed = YangUint64(_v.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                            let parsed = YangUint64(_v.parse::<u64>().map_err(#integer_error)?);
                         },
                         Some(TypeRef::Int64) => quote! {
-                            let parsed = YangInt64(_v.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                            let parsed = YangInt64(_v.parse::<i64>().map_err(#integer_error)?);
                         },
                         Some(TypeRef::Decimal64) => quote! {
                             let parsed = YangDecimal64(_v.parse::<f64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
@@ -443,28 +449,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     .as_ref()
                                 {
                                     Some(TypeRef::Uint8) => quote! {
-                                        let parsed_key = key_val.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        let parsed_key = key_val.parse::<u8>().map_err(#integer_error)?;
                                     },
                                     Some(TypeRef::Int8) => quote! {
-                                        let parsed_key = key_val.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        let parsed_key = key_val.parse::<i8>().map_err(#integer_error)?;
                                     },
                                     Some(TypeRef::Int16) => quote! {
-                                        let parsed_key = key_val.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        let parsed_key = key_val.parse::<i16>().map_err(#integer_error)?;
                                     },
                                     Some(TypeRef::Int32) => quote! {
-                                        let parsed_key = key_val.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        let parsed_key = key_val.parse::<i32>().map_err(#integer_error)?;
                                     },
                                     Some(TypeRef::Uint16) => quote! {
-                                        let parsed_key = key_val.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        let parsed_key = key_val.parse::<u16>().map_err(#integer_error)?;
                                     },
                                     Some(TypeRef::Uint32) => quote! {
-                                        let parsed_key = key_val.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        let parsed_key = key_val.parse::<u32>().map_err(#integer_error)?;
                                     },
                                     Some(TypeRef::Uint64) => quote! {
-                                        let parsed_key = YangUint64(key_val.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                        let parsed_key = YangUint64(key_val.parse::<u64>().map_err(#integer_error)?);
                                     },
                                     Some(TypeRef::Int64) => quote! {
-                                        let parsed_key = YangInt64(key_val.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                        let parsed_key = YangInt64(key_val.parse::<i64>().map_err(#integer_error)?);
                                     },
                                     _ => quote! {
                                         let parsed_key = key_val.clone();
@@ -556,28 +562,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         .as_ref()
                                     {
                                         Some(TypeRef::Uint8) => quote! {
-                                            let #key_ident = key_val.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            let #key_ident = key_val.parse::<u8>().map_err(#integer_error)?;
                                         },
                                         Some(TypeRef::Int8) => quote! {
-                                            let #key_ident = key_val.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            let #key_ident = key_val.parse::<i8>().map_err(#integer_error)?;
                                         },
                                         Some(TypeRef::Int16) => quote! {
-                                            let #key_ident = key_val.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            let #key_ident = key_val.parse::<i16>().map_err(#integer_error)?;
                                         },
                                         Some(TypeRef::Int32) => quote! {
-                                            let #key_ident = key_val.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            let #key_ident = key_val.parse::<i32>().map_err(#integer_error)?;
                                         },
                                         Some(TypeRef::Uint16) => quote! {
-                                            let #key_ident = key_val.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            let #key_ident = key_val.parse::<u16>().map_err(#integer_error)?;
                                         },
                                         Some(TypeRef::Uint32) => quote! {
-                                            let #key_ident = key_val.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            let #key_ident = key_val.parse::<u32>().map_err(#integer_error)?;
                                         },
                                         Some(TypeRef::Uint64) => quote! {
-                                            let #key_ident = YangUint64(key_val.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                            let #key_ident = YangUint64(key_val.parse::<u64>().map_err(#integer_error)?);
                                         },
                                         Some(TypeRef::Int64) => quote! {
-                                            let #key_ident = YangInt64(key_val.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                            let #key_ident = YangInt64(key_val.parse::<i64>().map_err(#integer_error)?);
                                         },
                                         _ => quote! {
                                             let #key_ident = key_val.clone();
@@ -676,28 +682,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     };
                                 },
                                 Some(TypeRef::Uint8) => quote! {
-                                    let parsed_elem = v.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    let parsed_elem = v.parse::<u8>().map_err(#integer_error)?;
                                 },
                                 Some(TypeRef::Int8) => quote! {
-                                    let parsed_elem = v.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    let parsed_elem = v.parse::<i8>().map_err(#integer_error)?;
                                 },
                                 Some(TypeRef::Int16) => quote! {
-                                    let parsed_elem = v.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    let parsed_elem = v.parse::<i16>().map_err(#integer_error)?;
                                 },
                                 Some(TypeRef::Int32) => quote! {
-                                    let parsed_elem = v.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    let parsed_elem = v.parse::<i32>().map_err(#integer_error)?;
                                 },
                                 Some(TypeRef::Uint16) => quote! {
-                                    let parsed_elem = v.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    let parsed_elem = v.parse::<u16>().map_err(#integer_error)?;
                                 },
                                 Some(TypeRef::Uint32) => quote! {
-                                    let parsed_elem = v.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    let parsed_elem = v.parse::<u32>().map_err(#integer_error)?;
                                 },
                                 Some(TypeRef::Uint64) => quote! {
-                                    let parsed_elem = YangUint64(v.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                    let parsed_elem = YangUint64(v.parse::<u64>().map_err(#integer_error)?);
                                 },
                                 Some(TypeRef::Int64) => quote! {
-                                    let parsed_elem = YangInt64(v.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                    let parsed_elem = YangInt64(v.parse::<i64>().map_err(#integer_error)?);
                                 },
                                 Some(TypeRef::Decimal64) => quote! {
                                     let parsed_elem = YangDecimal64(v.parse::<f64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
@@ -994,6 +1000,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 }
                                 ConfigOp::Update | ConfigOp::Merge => {
                                     if let Some(v) = value {
+                                        #validate_merge
                                         if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(v) {
                                             for (k, val) in map {
                                                 let val_str = if val.is_string() {

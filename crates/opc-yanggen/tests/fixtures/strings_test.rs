@@ -34,7 +34,7 @@ fn boundaries_and_xsd_semantics_roundtrip_every_path() {
         ("nonspace", vec!["abc123", "é+"], vec!["_", "-", " "]),
         ("choice", vec!["ab", "cdabx", "abcd"], vec!["ababc", "abcdab", "x"]),
         ("reference", vec!["123"], vec!["12", "1234"]),
-        ("secret", vec!["123"], vec!["private-value"]),
+        ("secret", vec!["123"], vec!["private-value", "1234", "abc"]),
     ] {
         let path: &'static str = Box::leak(format!("/ex:root/ex:{name}").into_boxed_str());
         for value in accepted {
@@ -63,7 +63,7 @@ fn boundaries_and_xsd_semantics_roundtrip_every_path() {
         }
     }
     assert!(set(&baseline.clone(), "name", json!("😀".repeat(150))).is_ok());
-    assert!(set(&baseline.clone(), "name", json!("😀".repeat(151))).is_err());
+    assert_eq!(set(&baseline.clone(), "name", json!("😀".repeat(151))).unwrap_err(), opc_gnmi_server::GnmiError::invalid("string violates YANG constraints"));
 }
 
 #[test]
@@ -80,6 +80,7 @@ fn subtree_list_leaf_list_and_secret_constraints_are_not_bypassed() {
         let mut candidate = Root::default();
         let error = patch::apply_patch(&mut candidate, &[patch::ConfigDelta::Replace(YangPath::new("/ex:root").unwrap(), value.to_string())]).unwrap_err();
         assert_eq!(error.kind(), "invalid-value");
+        assert_eq!(error.message(), "string violates YANG constraints");
         assert!(!format!("{error:?}").contains("bad-value"));
         assert_eq!(candidate, Root::default());
     }
@@ -108,19 +109,23 @@ fn sensitive_keys_keep_redacted_debug_and_fixed_errors() {
     let config: Root = serde_json::from_value(json!({"example:account": [{"secret-id": "987", "value": "x"}]})).unwrap();
     assert!(!format!("{config:?}").contains("987"));
     assert!(!format!("{:?}", config.account.keys().next().unwrap()).contains("987"));
-    let mut candidate = config.clone();
-    let error = patch::apply_patch(&mut candidate, &[patch::ConfigDelta::Update(YangPath::new("/ex:root/ex:account[secret-id='private-value']/ex:value").unwrap(), "x".into())]).unwrap_err();
-    assert_eq!(error.kind(), "invalid-value");
-    assert!(!format!("{error:?}").contains("private-value"));
-    assert_eq!(candidate, config);
+    for rejected in ["private-value", "1234", "abc"] {
+        let mut candidate = config.clone();
+        let error = patch::apply_patch(&mut candidate, &[patch::ConfigDelta::Update(YangPath::new(format!("/ex:root/ex:account[secret-id='{rejected}']/ex:value")).unwrap(), "x".into())]).unwrap_err();
+        assert_eq!(error.kind(), "invalid-value");
+        assert_eq!(error.message(), "string violates YANG constraints");
+        assert!(!format!("{error:?}").contains("private-value"));
+        assert!(!format!("{error:?}").contains(rejected));
+        assert_eq!(candidate, config);
+    }
 }
 
 #[test]
 fn defaults_and_ordered_uniqueness_survive_constraints() {
     assert_eq!(Root::default().defaulted, LeafPresence::Defaulted("123".into()));
     assert!(Root::default().validate_syntax().is_ok());
-    assert!(serde_json::from_value::<Root>(json!({"example:preferences": ["same", "same"]})).is_err());
-    assert!(serde_json::from_value::<Root>(json!({"example:api-token": ["123", "123"]})).is_err());
+    assert_eq!(serde_json::from_value::<Root>(json!({"example:preferences": ["same", "same"]})).unwrap_err().to_string(), "leaf-list contains a duplicate value");
+    assert_eq!(serde_json::from_value::<Root>(json!({"example:api-token": ["123", "123"]})).unwrap_err().to_string(), "leaf-list contains a duplicate value");
 }
 
 #[test]
@@ -135,6 +140,7 @@ fn malformed_payloads_keep_value_free_rejections() {
         assert_eq!(error.to_string(), "string violates YANG constraints");
         let error = set(&Root::default(), name, value).unwrap_err();
         assert!(matches!(error, opc_gnmi_server::GnmiError::InvalidArgument { .. }));
+        assert_eq!(error, opc_gnmi_server::GnmiError::invalid("gNMI string leaf value must be a JSON string"));
         assert!(!format!("{error:?}").contains("private-value"));
         assert!(!format!("{error:?}").contains("123456789"));
         let mut candidate = Root::default();

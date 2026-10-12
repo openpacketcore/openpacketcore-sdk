@@ -845,6 +845,71 @@ fn resolve_path_node(
     }
 }
 
+// Each operand uses one owned, lossless domain. All integer leaf values and
+// all currently supported IR number literals fit in i128, including u64::MAX.
+fn integer_operand(
+    expr: &ConstraintExpr,
+    context_var: &str,
+    target_path: &str,
+    context_path: &str,
+    input: &CanonicalInput,
+) -> Result<Option<TokenStream>, RustGenerationError> {
+    let resolved = match expr {
+        ConstraintExpr::Literal(Literal::Number(value)) => {
+            let value = i128::from(*value);
+            return Ok(Some(quote! { Some(#value) }));
+        }
+        ConstraintExpr::Function(function) if function.name == FunctionName::Count => {
+            let value = evaluate_expr(expr, context_var, target_path, context_path, input, 0)?;
+            return Ok(Some(quote! { Some((#value) as i128) }));
+        }
+        ConstraintExpr::Path(path) => {
+            resolve_path_node(target_path, path, &input.nodes).map_err(|error| {
+                RustGenerationError::new(format!(
+                    "integer comparison path resolution error: {error}"
+                ))
+            })?
+        }
+        ConstraintExpr::Function(function) if function.name == FunctionName::Current => {
+            if !function.args.is_empty() {
+                return Err(RustGenerationError::new("current() expects no arguments"));
+            }
+            input
+                .nodes
+                .iter()
+                .find(|node| node.path == target_path)
+                .ok_or_else(|| RustGenerationError::new("integer comparison target not found"))?
+                .clone()
+        }
+        _ => return Ok(None),
+    };
+    let nodes = super::NodeIndex::new(&input.nodes);
+    let scalar = nodes.scalar_node(&resolved);
+    let Some(ty) = scalar
+        .type_ref
+        .as_ref()
+        .filter(|ty| ty.integer_bounds().is_some())
+    else {
+        return Ok(None);
+    };
+    if resolved.kind != SchemaNodeKind::Leaf {
+        return Err(RustGenerationError::new(
+            "integer comparisons require scalar leaf operands",
+        ));
+    }
+    let access = generate_path_access(&resolved, context_path, input)?;
+    let value = if matches!(ty, TypeRef::Uint64 | TypeRef::Int64) {
+        quote! { i128::from(value.0) }
+    } else {
+        quote! { i128::from(*value) }
+    };
+    Ok(Some(if resolved.config {
+        quote! { #access.as_option().map(|value| #value) }
+    } else {
+        quote! { #access.as_ref().map(|value| #value) }
+    }))
+}
+
 fn get_path_expr_type(
     target_path: &str,
     path: &PathExpr,
@@ -928,6 +993,29 @@ fn evaluate_expr(
                 CompareOp::Gte => quote! { >= },
                 CompareOp::Lte => quote! { <= },
             };
+
+            if super::has_extended_integers(input) {
+                let left_integer =
+                    integer_operand(left, context_var, target_path, context_path, input)?;
+                let right_integer =
+                    integer_operand(right, context_var, target_path, context_path, input)?;
+                match (left_integer, right_integer) {
+                    (Some(left), Some(right)) => {
+                        return Ok(quote! {
+                            match (#left, #right) {
+                                (Some(left), Some(right)) => left #op_token right,
+                                _ => false,
+                            }
+                        })
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(RustGenerationError::new(
+                            "integer comparisons require integer leaf or number operands",
+                        ))
+                    }
+                    (None, None) => {}
+                }
+            }
 
             let path_type = if let ConstraintExpr::Path(path) = &**left {
                 get_path_expr_type(target_path, path, input)

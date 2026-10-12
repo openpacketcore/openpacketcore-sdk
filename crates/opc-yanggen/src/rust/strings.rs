@@ -14,6 +14,15 @@ pub(super) fn generate(input: &CanonicalInput) -> Result<String, RustGenerationE
     let nodes = NodeIndex::new(&input.nodes);
     let mut patterns = TokenStream::new();
     let mut arms = TokenStream::new();
+    // Allocate in the emitted namespace: case-sensitive paths must never share
+    // a cache after a helper name is converted to upper case.
+    let mut pattern_paths = input
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.type_ref, Some(TypeRef::RestrictedString { .. })))
+        .map(|node| node.path.as_str())
+        .collect::<Vec<_>>();
+    pattern_paths.sort_unstable();
     for node in &input.nodes {
         let scalar = nodes.scalar_node(node);
         let Some((length, restrictions)) = scalar
@@ -35,7 +44,8 @@ pub(super) fn generate(input: &CanonicalInput) -> Result<String, RustGenerationE
             quote! { { let length = value.chars().count() as u64; #(#intervals)||* } }
         };
         let checks = restrictions.iter().enumerate().map(|(i, pattern)| {
-            let name = format_ident!("PATTERN_{}_{}", nodes.helper_name(&scalar.path).to_uppercase(), i);
+            let scalar_index = pattern_paths.binary_search(&scalar.path.as_str()).expect("declared pattern node");
+            let name = format_ident!("PATTERN_{}_{}", scalar_index, i);
             let expression = &pattern.expression;
             let inverted = pattern.invert_match;
             if scalar.path == node.path {

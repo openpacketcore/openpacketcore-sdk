@@ -1,10 +1,10 @@
 use generated_test::{gnmi_json, gnmi_set, netconf_xml, netconf_xml_edit, patch, types::*};
-use opc_config_model::{OpcConfig, YangPath};
+use opc_config_model::{OpcConfig, ValidationError, YangPath};
 use opc_gnmi_server::{
-    Encoding, GnmiJsonRenderer, GnmiPatchApplicator, NormalizedSet, NormalizedValue, ReadSelection,
+    Encoding, GnmiError, GnmiJsonRenderer, GnmiPatchApplicator, NormalizedSet, NormalizedValue, ReadSelection,
 };
 use opc_mgmt_schema::{
-    DefaultReport, EditConfigNode, EditOperation, NetconfXmlEditApplicator, NetconfXmlRenderer,
+    DefaultReport, EditConfigNode, EditOperation, NetconfEditError, NetconfXmlEditApplicator, NetconfXmlRenderer,
 };
 use serde_json::{json, Value};
 
@@ -76,6 +76,7 @@ fn integer_boundaries_roundtrip_across_protocols() {
         ),
     ] {
         let path: &'static str = Box::leak(format!("/n:system/n:{name}").into_boxed_str());
+        let ty = format!("{}int{}", if name.starts_with('u') { "u" } else { "" }, &name[1..]);
         for value in [low, high] {
             let wire = if name.ends_with("64") {
                 json!(value)
@@ -122,17 +123,22 @@ fn integer_boundaries_roundtrip_across_protocols() {
             } else {
                 serde_json::from_str(value).unwrap()
             };
-            assert!(
-                set(&System::default(), name, wire.clone()).is_err(),
-                "{name} {wire}"
-            );
-            assert!(
-                edit(&System::default(), path, value).is_err(),
-                "{name} {value}"
-            );
-            assert!(
-                serde_json::from_value::<System>(json!({ format!("n:{name}"): wire })).is_err()
-            );
+            let reason = if name.ends_with("64") {
+                format!("gNMI {ty} leaf value is invalid")
+            } else if name.starts_with('u') && value == below {
+                format!("gNMI {ty} leaf value must be a JSON number")
+            } else {
+                format!("gNMI {ty} leaf value is out of range")
+            };
+            assert_eq!(set(&System::default(), name, wire.clone()).unwrap_err(), GnmiError::invalid(reason));
+            assert_eq!(edit(&System::default(), path, value).unwrap_err(), NetconfEditError::InvalidValue { path });
+            assert_eq!(serde_json::from_value::<System>(json!({ format!("n:{name}"): wire })).unwrap_err().to_string(), "invalid integer value");
+            let baseline = System::default();
+            let mut candidate = baseline.clone();
+            let error = patch::apply_patch(&mut candidate, &[patch::ConfigDelta::Update(YangPath::new(path).unwrap(), value.into())]).unwrap_err();
+            assert_eq!(error.kind(), "invalid-value");
+            assert_eq!(error.message(), "invalid integer value");
+            assert_eq!(candidate, baseline);
         }
         let wrong_shape = if name.ends_with("64") {
             json!(0)
@@ -142,11 +148,9 @@ fn integer_boundaries_roundtrip_across_protocols() {
         if name.ends_with("64") {
             assert!(set(&System::default(), name, wrong_shape.clone()).is_ok());
         } else {
-            assert!(set(&System::default(), name, wrong_shape.clone()).is_err());
+            assert_eq!(set(&System::default(), name, wrong_shape.clone()).unwrap_err(), GnmiError::invalid(format!("gNMI {ty} leaf value must be a JSON number")));
         }
-        assert!(
-            serde_json::from_value::<System>(json!({ format!("n:{name}"): wrong_shape })).is_err()
-        );
+        assert_eq!(serde_json::from_value::<System>(json!({ format!("n:{name}"): wrong_shape })).unwrap_err().to_string(), "invalid integer value");
     }
 }
 
@@ -157,23 +161,23 @@ fn ranges_are_exact_and_validated_for_leaves_and_lists() {
     assert_eq!(range[0].max.to_string(), u64::MAX.to_string());
     let config = set(&System::default(), "bounded", json!("18446744073709551615")).unwrap();
     assert!(config.validate_syntax().is_ok());
-    assert!(set(&config, "bounded", json!("9223372036854775807")).is_err());
-    assert!(edit(&config, "/n:system/n:bounded", "9223372036854775807").is_err());
+    assert_eq!(set(&config, "bounded", json!("9223372036854775807")).unwrap_err(), GnmiError::invalid("gNMI numeric leaf value is outside YANG range"));
+    assert_eq!(edit(&config, "/n:system/n:bounded", "9223372036854775807").unwrap_err(), NetconfEditError::InvalidValue { path: "/n:system/n:bounded" });
     let mut invalid = config.clone();
     invalid.bounded = LeafPresence::Explicit(YangUint64(0));
-    assert!(invalid.validate_syntax().is_err());
-    assert!(set(&config, "signed", json!(0)).is_err());
+    assert_eq!(invalid.validate_syntax(), Err(ValidationError::syntax("numeric value at /n:system/n:bounded is outside YANG range")));
+    assert_eq!(set(&config, "signed", json!(0)).unwrap_err(), GnmiError::invalid("gNMI numeric leaf value is outside YANG range"));
     assert!(set(
         &config,
         "unsigned-values",
         json!(["1", "18446744073709551615"])
     )
     .is_ok());
-    assert!(set(&config, "unsigned-values", json!(["0"])).is_err());
+    assert_eq!(set(&config, "unsigned-values", json!(["0"])).unwrap_err(), GnmiError::invalid("gNMI numeric leaf value is outside YANG range"));
     assert!(set(&config, "signed-values", json!([-100, 100])).is_ok());
     invalid.signed_values = vec![101];
     invalid.bounded = LeafPresence::Absent;
-    assert!(invalid.validate_syntax().is_err());
+    assert_eq!(invalid.validate_syntax(), Err(ValidationError::syntax("numeric value at /n:system/n:signed-values is outside YANG range")));
     assert!(set(&config, "reference", json!("18446744073709551615")).is_ok());
     assert!(set(&config, "reference", json!(12)).is_ok());
 }
@@ -259,8 +263,7 @@ fn range_rejections_are_atomic_and_cover_subtrees_references_and_secrets() {
         ("bounded-references", "0"),
     ] {
         let mut candidate = baseline.clone();
-        assert!(
-            patch::apply_patch(
+        let error = patch::apply_patch(
                 &mut candidate,
                 &[
                     patch::ConfigDelta::Update(
@@ -272,10 +275,9 @@ fn range_rejections_are_atomic_and_cover_subtrees_references_and_secrets() {
                         invalid.into()
                     ),
                 ]
-            )
-            .is_err(),
-            "{name}"
-        );
+            ).unwrap_err();
+        assert_eq!(error.kind(), "invalid-value");
+        assert_eq!(error.message(), format!("numeric value at /n:system/n:{name} is outside YANG range"));
         assert_eq!(candidate, baseline, "{name}");
     }
     for bad in [
@@ -286,10 +288,11 @@ fn range_rejections_are_atomic_and_cover_subtrees_references_and_secrets() {
         json!({"n:bounded-reference": "0"}),
         json!({"n:chained-reference": "0"}),
     ] {
-        assert!(serde_json::from_value::<System>(bad.clone()).is_err());
+        let name = bad.as_object().unwrap().keys().next().unwrap();
+        assert_eq!(serde_json::from_value::<System>(bad.clone()).unwrap_err().to_string(), format!("numeric value at /n:system/{name} is outside YANG range"));
         let operation =
             NormalizedValue::new(Encoding::JsonIetf, bad.to_string(), &Default::default()).unwrap();
-        assert!(gnmi_set::patcher()
+        assert_eq!(gnmi_set::patcher()
             .apply_set(
                 &baseline,
                 &NormalizedSet {
@@ -297,16 +300,16 @@ fn range_rejections_are_atomic_and_cover_subtrees_references_and_secrets() {
                     ..Default::default()
                 }
             )
-            .is_err());
+            .unwrap_err(), GnmiError::invalid("gNMI Set patch application failed"));
     }
     let mut invalid = baseline.clone();
     invalid.secret_values = SecretLeaf::new(vec![2]);
-    assert!(invalid.validate_syntax().is_err());
+    assert_eq!(invalid.validate_syntax(), Err(ValidationError::syntax("numeric value at /n:system/n:secret-values is outside YANG range")));
     invalid.secret_values = SecretLeaf::new(vec![]);
     invalid.state = Some(State {
         count: Some(YangUint64(0)),
     });
-    assert!(invalid.validate_syntax().is_err());
+    assert_eq!(invalid.validate_syntax(), Err(ValidationError::syntax("numeric value at /n:system/n:state/n:count is outside YANG range")));
     for name in [
         "bounded-reference",
         "chained-reference",
@@ -315,7 +318,7 @@ fn range_rejections_are_atomic_and_cover_subtrees_references_and_secrets() {
         assert!(set(&baseline, name, json!("18446744073709551615")).is_ok());
         let path: &'static str = Box::leak(format!("/n:system/n:{name}").into_boxed_str());
         assert!(edit(&baseline, path, "18446744073709551615").is_ok());
-        assert!(edit(&baseline, path, "0").is_err());
+        assert_eq!(edit(&baseline, path, "0").unwrap_err(), NetconfEditError::InvalidValue { path });
     }
     assert_eq!(
         serde_json::to_value(set(&baseline, "u64", json!(u64::MAX)).unwrap()).unwrap()["n:u64"],

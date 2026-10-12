@@ -1,4 +1,6 @@
 mod common;
+#[path = "scalars_and_names/regressions.rs"]
+mod regressions;
 
 use opc_yanggen::{generation_input_from_yang_sources, rust::generate_rust, YangSource};
 use std::{fs, path::Path, process::Command};
@@ -41,11 +43,20 @@ fn source_supports_all_integer_widths_and_exact_ranges() {
             "min..max",
             &format!("{min}..{}", max.parse::<i128>().unwrap() + 1),
         );
-        assert!(generation_input_from_yang_sources(
+        let error = generation_input_from_yang_sources(
             "example",
-            &[YangSource::new("example.yang", invalid)]
+            &[YangSource::new("example.yang", invalid)],
         )
-        .is_err());
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            opc_yanggen::DiagnosticCode::YangSourceSyntaxError
+        );
+        assert_eq!(
+            error.message,
+            "range interval exceeds the base integer type bounds"
+        );
+        assert!(error.source.is_some());
     }
 }
 
@@ -183,18 +194,42 @@ fn string_restrictions_survive_ir_and_change_the_digest() {
 
 #[test]
 fn malformed_and_unsupported_string_restrictions_fail_closed() {
-    for restriction in [
-        "length '-1';",
-        "length '5..1';",
-        "length '2..4 | 4..7';",
-        "length '5 | 1';",
-        "length '1'; length '2';",
-        "length '18446744073709551616';",
-        "pattern '(?i)secret';",
-        "pattern '[z-a]';",
-        "pattern 'a+?';",
-        "pattern 'a' { modifier invalid; }",
-        "pattern 'a' { modifier invert-match; modifier invert-match; }",
+    for (restriction, reason) in [
+        (
+            "length '-1';",
+            "range interval exceeds the base integer type bounds",
+        ),
+        (
+            "length '5..1';",
+            "range lower bound must not exceed upper bound",
+        ),
+        (
+            "length '2..4 | 4..7';",
+            "string length intervals must be ascending and disjoint",
+        ),
+        (
+            "length '5 | 1';",
+            "string length intervals must be ascending and disjoint",
+        ),
+        (
+            "length '1'; length '2';",
+            "duplicate string length statement",
+        ),
+        (
+            "length '18446744073709551616';",
+            "range interval exceeds the base integer type bounds",
+        ),
+        ("pattern '(?i)secret';", "invalid XSD regular expression"),
+        ("pattern '[z-a]';", "invalid XSD regular expression"),
+        ("pattern 'a+?';", "invalid XSD regular expression"),
+        (
+            "pattern 'a' { modifier invalid; }",
+            "pattern modifier must be one invert-match statement",
+        ),
+        (
+            "pattern 'a' { modifier invert-match; modifier invert-match; }",
+            "pattern modifier must be one invert-match statement",
+        ),
     ] {
         let source = format!("module example {{ namespace 'urn:example'; prefix ex; container root {{ leaf value {{ type string {{ {restriction} }} }} }} }}");
         let error = generation_input_from_yang_sources(
@@ -207,6 +242,7 @@ fn malformed_and_unsupported_string_restrictions_fail_closed() {
             opc_yanggen::DiagnosticCode::YangSourceSyntaxError,
             "{restriction}: {error:?}"
         );
+        assert_eq!(error.message, reason);
         assert!(error.source.is_some());
     }
     for pattern in [r"\i\c*", r"\p{IsBasicLatin}"] {
@@ -240,6 +276,14 @@ fn invalid_defaults_and_raw_ir_restrictions_are_rejected() {
         let error = generate_rust(&input(&source).to_canonical()).unwrap_err();
         assert!(error.message().contains("default"));
         assert!(!error.message().contains(value));
+        assert_eq!(
+            error.message(),
+            if ty.starts_with("string") {
+                "string default violates YANG constraints"
+            } else {
+                "integer default at /ex:root/ex:value is invalid or outside its type or declared range"
+            }
+        );
     }
     let original = input(include_str!("fixtures/strings.yang")).to_canonical();
     for restricted in [
@@ -265,6 +309,12 @@ fn invalid_defaults_and_raw_ir_restrictions_are_rejected() {
             ],
         },
     ] {
+        let reason = if matches!(&restricted, TypeRef::RestrictedString { patterns, .. } if patterns.first().is_some_and(|pattern| pattern.expression.starts_with("(?i)")))
+        {
+            "invalid XSD regular expression"
+        } else {
+            "invalid or excessive string restrictions"
+        };
         let mut changed = original.clone();
         changed
             .nodes
@@ -274,6 +324,7 @@ fn invalid_defaults_and_raw_ir_restrictions_are_rejected() {
             .type_ref = Some(restricted);
         let error = generate_rust(&changed).unwrap_err();
         assert!(!error.message().contains("private-value"));
+        assert_eq!(error.message(), reason);
     }
 }
 
@@ -328,6 +379,17 @@ fn constrained_models_have_deterministic_cli_check() {
             .output()
             .unwrap();
         assert!(!result.status.success());
+        assert_eq!(result.status.code(), Some(1));
+        let diagnostic: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+        assert_eq!(diagnostic["status"], "error");
+        assert_eq!(diagnostic["diagnostic"]["code"], "yang-source-mismatch");
+        assert_eq!(
+            diagnostic["diagnostic"]["message"],
+            format!(
+                "generated Rust artifact `{}` differs from expected output",
+                file.file_name().unwrap().to_str().unwrap()
+            )
+        );
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             "changed generated source"
@@ -345,10 +407,28 @@ fn constrained_models_have_deterministic_cli_check() {
 fn compile_fixture(name: &str, source: &str, tests: &str, expected_tests: usize) {
     let parsed = input(source);
     let canonical = parsed.to_canonical();
-    let files = generate_rust(&canonical).unwrap();
+    compile_canonical_fixture(name, &canonical, tests, expected_tests);
+}
+
+fn compile_canonical_fixture(
+    name: &str,
+    canonical: &opc_yanggen::CanonicalInput,
+    tests: &str,
+    expected_tests: usize,
+) {
+    let files = generate_rust(canonical).unwrap();
     let mut reversed = canonical.clone();
     reversed.nodes.reverse();
     assert_eq!(files, generate_rust(&reversed).unwrap());
+    compile_generated_fixture(name, files, tests, expected_tests);
+}
+
+fn compile_generated_fixture(
+    name: &str,
+    files: std::collections::HashMap<String, String>,
+    tests: &str,
+    expected_tests: usize,
+) {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

@@ -58,10 +58,7 @@ impl CompiledYangPattern {
         if parser.peek().is_some() {
             return Err(PatternError::Syntax);
         }
-        RegexBuilder::new(&format!(r"\A(?:{expression})\z"))
-            .size_limit(MAX_PATTERN_COMPILED_BYTES)
-            .dfa_size_limit(MAX_PATTERN_COMPILED_BYTES)
-            .nest_limit((MAX_PATTERN_DEPTH * 4) as u32)
+        bounded_regex_builder(&expression)
             .build()
             .map(Self)
             .map_err(|_| PatternError::Limit)
@@ -71,6 +68,15 @@ impl CompiledYangPattern {
     pub fn is_match(&self, value: &str) -> bool {
         self.0.is_match(value)
     }
+}
+
+fn bounded_regex_builder(expression: &str) -> RegexBuilder {
+    let mut builder = RegexBuilder::new(&format!(r"\A(?:{expression})\z"));
+    builder
+        .size_limit(MAX_PATTERN_COMPILED_BYTES)
+        .dfa_size_limit(MAX_PATTERN_COMPILED_BYTES)
+        .nest_limit((MAX_PATTERN_DEPTH * 4) as u32);
+    builder
 }
 
 struct Parser {
@@ -378,5 +384,70 @@ mod tests {
                 PatternError::Limit
             );
         }
+    }
+
+    #[test]
+    fn parser_rejects_trailing_input_reversed_quantifiers_and_interior_dashes() {
+        for (valid, invalid) in [("a", "a)"), ("a{1,2}", "a{2,1}"), ("[a-c]", "[a-b-c]")] {
+            CompiledYangPattern::compile(valid).unwrap();
+            assert_eq!(
+                CompiledYangPattern::compile(invalid).unwrap_err(),
+                PatternError::Syntax
+            );
+        }
+    }
+
+    #[test]
+    fn repetition_bound_is_checked_before_regex_compilation() {
+        for (source, expected) in [
+            ("1000000", Ok(1_000_000)),
+            ("1000001", Err(PatternError::Limit)),
+        ] {
+            let mut parser = Parser {
+                chars: source.chars().collect(),
+                position: 0,
+            };
+            assert_eq!(parser.number(), expected);
+        }
+    }
+
+    #[test]
+    fn source_and_nesting_limits_have_accepted_boundary_cases() {
+        CompiledYangPattern::compile(&"a".repeat(MAX_PATTERN_BYTES)).unwrap();
+        assert_eq!(
+            CompiledYangPattern::compile(&"a".repeat(MAX_PATTERN_BYTES + 1)).unwrap_err(),
+            PatternError::Limit
+        );
+        let nested = |depth| format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+        CompiledYangPattern::compile(&nested(MAX_PATTERN_DEPTH)).unwrap();
+        assert_eq!(
+            CompiledYangPattern::compile(&nested(MAX_PATTERN_DEPTH + 1)).unwrap_err(),
+            PatternError::Limit
+        );
+    }
+
+    #[test]
+    fn compiled_size_limit_rejects_before_the_engine_default_limit() {
+        let source = "a{50000}";
+        RegexBuilder::new(source)
+            .size_limit(MAX_PATTERN_COMPILED_BYTES * 2)
+            .build()
+            .unwrap();
+        assert_eq!(
+            CompiledYangPattern::compile(source).unwrap_err(),
+            PatternError::Limit
+        );
+    }
+
+    #[test]
+    fn matching_cache_uses_the_configured_bound_instead_of_the_engine_default() {
+        // Matching has identical semantics at either cache size. Inspect the
+        // actual builder configuration because allocator/RSS timing would not
+        // reliably distinguish this resource contract. The engine is locked.
+        let configured = format!("{:?}", bounded_regex_builder("a"));
+        let engine_default = format!("{:?}", RegexBuilder::new("a"));
+        let expected = format!("hybrid_cache_capacity: Some({MAX_PATTERN_COMPILED_BYTES})");
+        assert!(configured.contains(&expected), "{configured}");
+        assert!(!engine_default.contains(&expected), "{engine_default}");
     }
 }

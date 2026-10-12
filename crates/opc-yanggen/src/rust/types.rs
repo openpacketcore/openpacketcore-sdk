@@ -106,9 +106,57 @@ fn is_root_path(path: &str) -> bool {
     !trimmed.is_empty() && !trimmed.contains('/')
 }
 
+fn normalized_deserializer(struct_name: &proc_macro2::Ident, fields: &TokenStream) -> TokenStream {
+    let remote_name = struct_name.to_string();
+    quote! {
+        impl<'de> Deserialize<'de> for #struct_name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where D: serde::Deserializer<'de> {
+                #[derive(Deserialize)]
+                #[serde(remote = #remote_name)]
+                struct __YanggenFields { #fields }
+                __YanggenFields::deserialize(deserializer).map_err(|error| {
+                    serde::de::Error::custom(json_error_reason(&error.to_string()))
+                })
+            }
+        }
+    }
+}
+
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut tokens = TokenStream::new();
     let nodes_by_path = NodeIndex::new(&input.nodes);
+    let normalize_errors =
+        super::has_extended_integers(input) || super::strings::has_constraints(input);
+    if normalize_errors {
+        let range_reasons = input
+            .nodes
+            .iter()
+            .filter(|node| !nodes_by_path.scalar_node(node).numeric_range.is_empty())
+            .map(|node| format!("numeric value at {} is outside YANG range", node.path));
+        tokens.extend(quote! {
+            pub(super) fn json_error_reason(detail: &str) -> &'static str {
+                for reason in [
+                    "invalid integer value",
+                    "string violates YANG constraints",
+                    "leaf-list contains a duplicate value",
+                    "keyed-list entry is missing a required key leaf",
+                    "keyed-list contains a duplicate key",
+                    #(#range_reasons),*
+                ] {
+                    if detail == reason || detail.strip_prefix(reason).is_some_and(|suffix| suffix.starts_with(" at line ")) {
+                        return reason;
+                    }
+                }
+                "invalid JSON configuration"
+            }
+        });
+    }
+    let normalize_json_error = if normalize_errors {
+        quote! { .map_err(|error| serde::de::Error::custom(json_error_reason(&error.to_string()))) }
+    } else {
+        quote! {}
+    };
 
     let has_sensitive_single_key = input.nodes.iter().any(|node| {
         node.kind == SchemaNodeKind::List
@@ -134,6 +182,22 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     }
 
     if has_sensitive_single_key {
+        let (derive_deserialize, manual_deserialize) = if normalize_errors {
+            (
+                quote! {},
+                quote! {
+                    impl<'de, T: Deserialize<'de>> Deserialize<'de> for SensitiveKey<T> {
+                        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                        where D: serde::Deserializer<'de> {
+                            let inner = T::deserialize(deserializer)#normalize_json_error?;
+                            Ok(Self { inner })
+                        }
+                    }
+                },
+            )
+        } else {
+            (quote! { Deserialize, }, quote! {})
+        };
         tokens.extend(quote! {
             /// Ordered single-list key that never exposes its value through `Debug`.
             #[derive(
@@ -145,13 +209,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 Ord,
                 std::hash::Hash,
                 Serialize,
-                Deserialize,
+                #derive_deserialize
                 Default,
             )]
             #[serde(transparent)]
             pub struct SensitiveKey<T> {
                 inner: T,
             }
+
+            #manual_deserialize
 
             impl<T> SensitiveKey<T> {
                 /// Wraps a sensitive key value without changing its wire representation.
@@ -246,8 +312,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 where
                     D: serde::Deserializer<'de>,
                 {
-                    let s = String::deserialize(deserializer)?;
-                    let val = s.parse::<u64>().map_err(serde::de::Error::custom)?;
+                    let s = String::deserialize(deserializer)
+                        .map_err(|_| serde::de::Error::custom("invalid integer value"))?;
+                    let val = s.parse::<u64>()
+                        .map_err(|_| serde::de::Error::custom("invalid integer value"))?;
                     Ok(YangUint64(val))
                 }
             }
@@ -277,6 +345,19 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     } else {
         quote! {}
     };
+    let int64_deserialize = if normalize_errors {
+        quote! {
+            let s = String::deserialize(deserializer)
+                .map_err(|_| serde::de::Error::custom("invalid integer value"))?;
+            let val = s.parse::<i64>()
+                .map_err(|_| serde::de::Error::custom("invalid integer value"))?;
+        }
+    } else {
+        quote! {
+            let s = String::deserialize(deserializer)?;
+            let val = s.parse::<i64>().map_err(serde::de::Error::custom)?;
+        }
+    };
 
     // Emit helper types
     tokens.extend(quote! {
@@ -304,7 +385,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             where
                 D: serde::Deserializer<'de>,
             {
-                let inner = T::deserialize(deserializer)?;
+                let inner = T::deserialize(deserializer)#normalize_json_error?;
                 Ok(SecretLeaf { inner })
             }
         }
@@ -394,7 +475,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             where
                 D: serde::Deserializer<'de>,
             {
-                let opt = Option::<T>::deserialize(deserializer)?;
+                let opt = Option::<T>::deserialize(deserializer)#normalize_json_error?;
                 match opt {
                     Some(v) => Ok(Self::Explicit(v)),
                     None => Ok(Self::Absent),
@@ -419,8 +500,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             where
                 D: serde::Deserializer<'de>,
             {
-                let s = String::deserialize(deserializer)?;
-                let val = s.parse::<i64>().map_err(serde::de::Error::custom)?;
+                #int64_deserialize
                 Ok(YangInt64(val))
             }
         }
@@ -628,7 +708,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         quote! {
                             #[serde(serialize_with = "super::serde::serialize_list", deserialize_with = "super::serde::deserialize_list")]
                         }
-                    } else if has_scalar_constraints(child, &nodes_by_path) {
+                    } else if has_scalar_constraints(child, &nodes_by_path)
+                        || (normalize_errors
+                            && nodes_by_path
+                                .scalar_node(child)
+                                .type_ref
+                                .as_ref()
+                                .and_then(TypeRef::integer_bounds)
+                                .is_some())
+                    {
                         let helper_ident = format_ident!("deserialize_{}", field_ident);
                         let helper_path = format!("{struct_name}::{helper_ident}");
                         let checks = scalar_constraint_check(
@@ -643,19 +731,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         );
                         let deserialize = if constrained_string {
                             quote! { <#field_type>::deserialize(deserializer).map_err(|_| serde::de::Error::custom("string violates YANG constraints"))? }
-                        } else if child.kind == SchemaNodeKind::LeafList
-                            && super::is_user_ordered(child)
-                        {
-                            if is_sensitive {
-                                quote! { super::serde::deserialize_unique_secret_leaf_list(deserializer)? }
-                            } else {
-                                quote! { super::serde::deserialize_unique_leaf_list(deserializer)? }
-                            }
                         } else {
-                            quote! { <#field_type>::deserialize(deserializer)? }
+                            quote! { <#field_type>::deserialize(deserializer).map_err(|_| serde::de::Error::custom("invalid integer value"))? }
                         };
-                        let uniqueness = if constrained_string
-                            && child.kind == SchemaNodeKind::LeafList
+                        let uniqueness = if child.kind == SchemaNodeKind::LeafList
                             && super::is_user_ordered(child)
                         {
                             let values = if is_sensitive {
@@ -722,9 +801,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
+            let deserialize_derive = if normalize_errors {
+                quote! {}
+            } else {
+                quote! { , Deserialize }
+            };
             if has_defaults {
                 tokens.extend(quote! {
-                    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+                    #[derive(Debug, Clone, PartialEq, Serialize #deserialize_derive)]
                     pub struct #struct_name {
                         #fields
                     }
@@ -738,11 +822,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 });
             } else {
                 tokens.extend(quote! {
-                    #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+                    #[derive(Debug, Clone, PartialEq, Default, Serialize #deserialize_derive)]
                     pub struct #struct_name {
                         #fields
                     }
                 });
+            }
+
+            if normalize_errors {
+                tokens.extend(normalized_deserializer(&struct_name, &fields));
             }
 
             if !deserialize_helpers.is_empty() {
@@ -795,7 +883,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 if key_has_sensitive_field {
                     tokens.extend(quote! {
                         #hash_derive
-                        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+                        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize #deserialize_derive, Default)]
                         pub struct #key_struct_ident {
                             #key_fields
                         }
@@ -811,11 +899,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 } else {
                     tokens.extend(quote! {
                         #hash_derive
-                        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+                        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize #deserialize_derive, Default)]
                         pub struct #key_struct_ident {
                             #key_fields
                         }
                     });
+                }
+                if normalize_errors {
+                    tokens.extend(normalized_deserializer(&key_struct_ident, &key_fields));
                 }
             }
 

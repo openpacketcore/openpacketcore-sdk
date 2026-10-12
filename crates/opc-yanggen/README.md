@@ -76,10 +76,18 @@ Generated `YangInt64` and `YangUint64` wrappers encode RFC 7951 JSON values as
 strings; smaller integers encode as numbers. XML uses decimal text. Declared
 ranges are checked during JSON load, syntax validation, patches, gNMI Set, and
 NETCONF edits, including list keys, leaf-lists, and resolved leafrefs.
+In models using the new scalar constructs, malformed integer values and JSON
+structures receive fixed reasons that never include a supplied value. Subtree
+merges validate their typed JSON before applying fields. Models that use any of
+the added integer widths compare integer operands in an `i128` domain, including
+public constraint IR constants outside a leaf's storage range and chained
+references.
 
 Containers and lists with a shared local name receive deterministic names
 qualified by their parents, with stable suffixes for remaining collisions.
 Composite-key names and generated helper functions use the same name index.
+Case-distinct paths have separate pattern caches; references reuse the cache of
+their resolved scalar declaration.
 Previously valid models using none of the new constructs retain every generated
 file byte for byte.
 

@@ -422,6 +422,17 @@ __ORDERED_REPLACEMENT_CHANGED_PATH__            }
     } else {
         mod_rs_content
     };
+    let mod_rs_content = if nodes_by_path.expanded_profile
+        && input.nodes.iter().any(|node| {
+            clean_segment(last_segment(&node.path))
+                .chars()
+                .any(char::is_uppercase)
+        }) {
+        // Rust fields retain YANG's case-sensitive identifiers, including a/A.
+        format!("// Preserve case-sensitive YANG field names.\n#![allow(non_snake_case)]\n{mod_rs_content}")
+    } else {
+        mod_rs_content
+    };
     files.insert("mod.rs".to_string(), mod_rs_content);
     files.insert("types.rs".to_string(), types::generate(&input)?);
     files.insert("serde.rs".to_string(), serde::generate(&input)?);
@@ -975,4 +986,40 @@ pub fn is_sensitive_name(name: &str) -> bool {
         || name.contains("token")
         || name.contains("credential")
         || name.contains("private-key")
+}
+
+#[cfg(test)]
+mod scalar_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn cyclic_leafrefs_terminate_without_losing_the_declared_node() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for targets in [["/t:a", "/t:b"], ["/t:b", "/t:a"]] {
+                let nodes = ["/t:a", "/t:b"]
+                    .into_iter()
+                    .zip(targets)
+                    .map(|(path, target)| SchemaNode {
+                        path: path.into(),
+                        kind: SchemaNodeKind::Leaf,
+                        type_ref: Some(TypeRef::LeafRef {
+                            target_path: target.into(),
+                        }),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                let index = NodeIndex::new(&nodes);
+                for node in &nodes {
+                    assert_eq!(index.scalar_node(node).path, node.path);
+                }
+            }
+            sender.send(()).unwrap();
+        });
+        // A removed cycle guard must fail this test instead of hanging the
+        // test process. The worker owns only these synthetic schema nodes.
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+    }
 }
