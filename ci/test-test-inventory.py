@@ -658,6 +658,411 @@ class RepositoryWorkflowTests(unittest.TestCase):
                 self.assertNotEqual(run(status).returncode, 0)
 
 
+class SecretScanWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(__file__).resolve().parents[1]
+        path = '.github/workflows/security.yml'
+        self.workflow = documents({path: (root / path).read_text()})[path]
+        self.job = self.workflow['jobs']['secret-scan']
+        self.scan = next(step for step in self.job['steps'] if step['name'] == 'Run gitleaks')
+        self.report_job = self.workflow['jobs']['report-scheduled-secret-scan']
+        (self.report_step,) = self.report_job['steps']
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.origin = self.root / 'origin'
+        self.origin.mkdir()
+        self.repo = self.root / 'checkout'
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.record = self.root / 'calls.jsonl'
+        self.output = self.root / 'github-output'
+        self.scan_report = self.root / 'gitleaks-report.json'
+        self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
+                    'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
+                    'SCAN_RECORD': str(self.record), 'RUNNER_TEMP': str(self.root),
+                    'GITHUB_OUTPUT': str(self.output), 'LC_ALL': 'C'}
+        # The workflow itself must turn the scanner's colours off; do not inherit that from the caller.
+        self.env.pop('NO_COLOR', None)
+        self.git('init', '-q', '--initial-branch=main', repo=self.origin)
+        self.git('config', 'user.name', 'Fixture', repo=self.origin)
+        self.git('config', 'user.email', 'fixture@example.invalid', repo=self.origin)
+        (self.origin / '.gitleaksignore').write_text('base fingerprint\n')
+        self.first = self.commit('first', 'first')
+        self.base = self.commit('base', 'base')
+        self.git('checkout', '-qb', 'pull-request', repo=self.origin)
+        (self.origin / '.gitleaksignore').write_text('PR head fingerprint\n')
+        self.head = self.commit('pull-request', 'PR change')
+        self.git('checkout', '-qb', 'unrelated', self.base, repo=self.origin)
+        self.unrelated = self.commit('unrelated', 'unrelated branch')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.git('clone', '-q', '--no-local', str(self.origin), str(self.repo), repo=self.origin)
+        self.program('gitleaks', '''import json, os, shlex, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+opts = args[args.index('--log-opts') + 1] if '--log-opts' in args else '--all'
+history = subprocess.run(['git', 'rev-list', *shlex.split(opts)], capture_output=True, text=True)
+patches = subprocess.run(['git', 'log', '-p', '-U0', *shlex.split(opts)], capture_output=True, text=True)
+record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text())
+plain = bool(os.environ.get('NO_COLOR')) and not os.environ.get('FAKE_IGNORES_NO_COLOR')
+def line(level, text):
+    # gitleaks 8.30.1 colours every log line unless NO_COLOR is not empty.
+    if plain:
+        return f'0:00AM {level} {text}\\n'
+    colour = dict(INF=32, WRN=33).get(level, 31)
+    return f'\\x1b[90m0:00AM\\x1b[0m \\x1b[{colour}m{level}\\x1b[0m \\x1b[1m{text}\\x1b[0m\\n'
+with Path(os.environ['SCAN_RECORD']).open('a') as output:
+    output.write(json.dumps(record) + '\\n')
+if history.returncode or patches.returncode or patches.stderr:
+    error = history.stderr or patches.stderr
+    level = os.environ.get('FAKE_GIT_LEVEL', 'ERR')
+    sys.stderr.write(line(level, '[git] ' + error.splitlines()[0]) + line(level, 'error="stderr is not empty"')
+                     + line('INF', 'no leaks found'))
+    sys.exit(0)
+count = int(os.environ.get('FAKE_FINDINGS', '3'))
+exit_code = int(os.environ.get('SCAN_EXIT', '0'))
+if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
+    count, exit_code = 1, 2
+    sys.stderr.write(line('WRN', 'leaks found: 1'))
+sys.stderr.write(os.environ.get('FAKE_SCAN_LOG', ''))
+if exit_code == 0:
+    sys.stderr.write(line('INF', 'no leaks found'))
+if '--report-path' in args:
+    report = Path(args[args.index('--report-path') + 1])
+    if os.environ.get('SCAN_REPORT') == 'invalid':
+        report.write_text('not JSON')
+    elif os.environ.get('SCAN_REPORT') != 'missing':
+        report.write_text(json.dumps([{'Secret': 'fixture-value-must-not-be-published'}]
+                                    * count))
+sys.exit(exit_code)
+''')
+        self.program('gh', '''import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+record = dict(args=args)
+if '--body-file' in args:
+    record['body'] = Path(args[args.index('--body-file') + 1]).read_text()
+with Path(os.environ['SCAN_RECORD']).open('a') as output:
+    output.write(json.dumps(record) + '\\n')
+if args[:2] == ['issue', 'list']:
+    print(os.environ.get('EXISTING_ISSUE', ''))
+sys.exit(int(os.environ.get('GH_EXIT', '0')))
+''')
+
+    def git(self, *args, repo=None):
+        return subprocess.check_output(['git', '-C', str(repo or self.repo), *args],
+                                       env=self.env, text=True, stderr=subprocess.PIPE).strip()
+
+    def commit(self, name, text):
+        (self.origin / name).write_text(text + '\n')
+        self.git('add', '.', repo=self.origin)
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', name, repo=self.origin)
+        return self.git('rev-parse', 'HEAD', repo=self.origin)
+
+    def program(self, name, source):
+        path = self.bin / name
+        path.write_text('#!/usr/bin/env python3\n' + source)
+        path.chmod(0o755)
+
+    def run_step(self, step, **env):
+        self.record.unlink(missing_ok=True)
+        self.output.write_text('')
+        self.scan_report.unlink(missing_ok=True)
+        result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step['run']],
+                                cwd=self.repo, env={**self.env, **env}, capture_output=True, text=True, check=False)
+        records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        return result, records
+
+    def scan_event(self, event, **env):
+        return self.run_step(self.scan, **{'GITHUB_EVENT_NAME': event, 'GITHUB_SHA': self.base,
+                                          'PR_BASE_SHA': self.base, 'PR_HEAD_SHA': self.head, **env})
+
+    def attributes_fixture(self, attributes):
+        self.git('checkout', '-q', '--detach', self.base, repo=self.origin)
+        (self.origin / '.gitattributes').write_text(attributes)
+        for index in range(1, 10):
+            (self.origin / f'file-{index:02d}.txt').write_text('ordinary fixture content\n')
+        head = self.commit('file-10.txt', 'SCOPE_FIXTURE_' + 'A' * 12)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+        return head
+
+    def test_required_guard_runs_the_security_workflow_regressions(self):
+        root = Path(__file__).resolve().parents[1]
+        path = '.github/workflows/test-inventory.yml'
+        job = documents({path: (root / path).read_text()})[path]['jobs']['test-inventory']
+        step = next(step for step in job['steps'] if 'ci/test-test-inventory.py' in step.get('run', ''))
+        for value in (job, step):
+            self.assertNotIn('if', value)
+            self.assertNotIn('continue-on-error', value)
+
+    def test_triggers_checkout_and_verified_gitleaks_pin_remain_required(self):
+        events = self.workflow['on']
+        self.assertEqual(set(events), {'pull_request', 'push', 'schedule', 'workflow_dispatch'})
+        self.assertIn(events['pull_request'], (None, ''))
+        self.assertEqual(events['push'], {'branches': ['main']})
+        self.assertEqual(events['schedule'], [{'cron': '17 8 * * *'}])
+        checkout = self.job['steps'][0]
+        self.assertEqual(checkout['uses'], 'actions/checkout@v7')
+        self.assertEqual(checkout['with'], {'fetch-depth': '0', 'persist-credentials': 'false',
+                                          'ref': '${{ github.event.pull_request.head.sha || github.sha }}'})
+        self.assertEqual(self.job['env']['GITLEAKS_VERSION'], '8.30.1')
+        install = next(step for step in self.job['steps'] if step['name'] == 'Install gitleaks')
+        self.assertEqual(set(install), {'name', 'shell', 'run'})
+        self.assertEqual(install['shell'], 'bash')
+        self.assertEqual(install['run'], '''set -euo pipefail
+cd "${RUNNER_TEMP}"
+asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+curl -fsSLO "${base}/${asset}"
+curl -fsSLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+grep " ${asset}$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" > "${asset}.sha256"
+sha256sum -c "${asset}.sha256"
+tar -xzf "${asset}" gitleaks
+chmod +x gitleaks
+echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+''')
+        self.assertEqual(self.scan.get('id'), 'scan')
+        self.assertEqual(self.job.get('outputs'), {'findings': '${{ steps.scan.outputs.findings }}'})
+        self.assertEqual(self.scan['shell'], 'bash')
+        self.assertEqual(self.scan['env'], {'PR_BASE_SHA': '${{ github.event.pull_request.base.sha }}',
+                                           'PR_HEAD_SHA': '${{ github.event.pull_request.head.sha }}'})
+        for value in [self.job, *self.job['steps']]:
+            self.assertNotIn('if', value)
+            self.assertNotIn('continue-on-error', value)
+
+    def test_pull_request_scans_only_its_range_with_its_head_ignore(self):
+        self.git('checkout', '-q', self.head)
+        result, records = self.scan_event('pull_request', GITHUB_SHA=self.unrelated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(records), 1)
+        scan = records[0]
+        self.assertEqual(scan['args'], ['detect', '--source', '.', '--redact', '--no-banner',
+                                        '--exit-code', '2', '--report-format', 'json',
+                                        '--report-path', str(self.scan_report),
+                                        '--log-opts', f'{self.base}..{self.head}'])
+        self.assertEqual(scan['commits'], [self.head])
+        self.assertEqual(scan['ignore'], 'PR head fingerprint\n')
+
+    def test_main_push_scans_full_pushed_history_only(self):
+        result, records = self.scan_event('push')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(records), 1)
+        scan = records[0]
+        self.assertEqual(scan['args'], ['detect', '--source', '.', '--redact', '--no-banner',
+                                        '--exit-code', '2', '--report-format', 'json',
+                                        '--report-path', str(self.scan_report),
+                                        '--log-opts', f'--full-history {self.base}'])
+        self.assertEqual(set(scan['commits']), {self.first, self.base})
+
+    def test_schedule_fetches_and_scans_all_refs_including_unopened_branches_and_tags(self):
+        for event in ('schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                self.git('checkout', '-qb', f'without-pr-{event}', 'main', repo=self.origin)
+                without_pr = self.commit(f'without-pr-{event}', 'branch created after checkout')
+                self.git('checkout', '-q', '--detach', self.base, repo=self.origin)
+                tag_only = self.commit(f'tag-only-{event}', 'commit only reachable through a tag')
+                self.git('tag', f'tag-only-{event}', repo=self.origin)
+                self.git('checkout', '-q', '--detach', self.base, repo=self.origin)
+                pull_only = self.commit(f'pull-only-{event}', 'closed or fork pull request head')
+                self.git('update-ref', 'refs/pull/42/head', pull_only, repo=self.origin)
+                self.git('checkout', '-q', 'main', repo=self.origin)
+                before = set(self.git('rev-list', '--all').splitlines())
+                result, records = self.scan_event(event)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(records), 1)
+                scan = records[0]
+                self.assertEqual(scan['args'], ['detect', '--source', '.', '--redact', '--no-banner',
+                                                '--exit-code', '2', '--report-format', 'json',
+                                                '--report-path', str(self.scan_report),
+                                                '--log-opts', '--full-history --all'])
+                self.assertEqual(set(scan['commits']), before | {without_pr, tag_only})
+                self.assertEqual(self.git('for-each-ref', '--format=%(objectname)',
+                                          f'refs/secret-scan/heads/without-pr-{event}'), without_pr)
+                self.assertEqual(self.git('for-each-ref', '--format=%(objectname)',
+                                          f'refs/secret-scan/tags/tag-only-{event}'), tag_only)
+                self.assertEqual(self.git('for-each-ref', '--format=%(refname)', 'refs/secret-scan/pull'), '')
+
+    def test_scanner_findings_and_errors_fail_every_scan(self):
+        harmless_log = '0:00AM INF message mentions ERR and FTL\n0:00AM WRN fixture warning\n'
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            for exit_code in (0, 1, 2, 7):
+                with self.subTest(event=event, exit_code=exit_code):
+                    result, records = self.scan_event(event, SCAN_EXIT=str(exit_code), FAKE_FINDINGS='3',
+                                                      FAKE_SCAN_LOG=harmless_log)
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
+                    self.assertIn(harmless_log, result.stderr)
+
+    def test_git_failure_inside_the_scanner_is_never_a_clean_result(self):
+        absent = '0' * 39 + '1'
+        for level in ('ERR', 'FTL'):
+            with self.subTest(level=level):
+                result, records = self.scan_event('push', GITHUB_SHA=absent, FAKE_GIT_LEVEL=level)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['commits'], [])
+                self.assertIn(f'{level} [git] fatal:', result.stderr)
+                self.assertEqual(result.stdout,
+                                 '::error::The scanner logged an error; this is not a clean result.\n')
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_logged_error_does_not_replace_findings_or_another_failure(self):
+        late_error = '0:00AM ERR [git] fixture error after the first finding\n'
+        for exit_code in (1, 2, 7):
+            with self.subTest(exit_code=exit_code):
+                result, records = self.scan_event('push', SCAN_EXIT=str(exit_code), FAKE_FINDINGS='3',
+                                                  FAKE_SCAN_LOG=late_error)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(result.stderr, late_error)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
+
+    def test_scanner_log_in_another_format_is_never_a_clean_result(self):
+        absent = '0' * 39 + '1'
+        for name, env in (('clean scan', {}), ('git failure', {'GITHUB_SHA': absent})):
+            with self.subTest(name=name):
+                result, records = self.scan_event('push', FAKE_IGNORES_NO_COLOR='1', **env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn('\x1b[32mINF\x1b[0m \x1b[1mno leaks found\x1b[0m\n', result.stderr)
+                self.assertEqual(result.stdout, '::error::The scanner did not log "no leaks found"; '
+                                                'this is not a clean result.\n')
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_malformed_attributes_never_produce_a_clean_scan(self):
+        head = self.attributes_fixture('* @bad\n')
+        result, records = self.scan_event('pull_request', PR_HEAD_SHA=head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['commits'], [head])
+        self.assertIn('ERR [git] @bad is not a valid attribute name: .gitattributes:1', result.stderr)
+        self.assertEqual(result.stdout,
+                         '::error::The scanner logged an error; this is not a clean result.\n')
+        self.assertEqual(self.output.read_text(), '')
+
+    def test_valid_attributes_still_report_a_finding(self):
+        head = self.attributes_fixture('* text\n')
+        result, records = self.scan_event('pull_request', PR_HEAD_SHA=head)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['commits'], [head])
+        self.assertEqual(result.stderr, '0:00AM WRN leaks found: 1\n')
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(self.output.read_text(), 'findings=1\n')
+
+    def test_finding_count_uses_report_length_and_never_reports_a_broken_report_as_clean(self):
+        for count in (1, 5):
+            with self.subTest(count=count):
+                result, records = self.scan_event('schedule', SCAN_EXIT='2', FAKE_FINDINGS=str(count))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(self.output.read_text(), f'findings={count}\n')
+        for report, message in (('invalid', 'JSONDecodeError'), ('missing', 'FileNotFoundError')):
+            with self.subTest(report=report):
+                result, records = self.scan_event('schedule', SCAN_EXIT='2', SCAN_REPORT=report)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_missing_pr_revisions_or_failed_ref_fetch_never_pass(self):
+        for key in ('PR_BASE_SHA', 'PR_HEAD_SHA'):
+            with self.subTest(key=key):
+                result, records = self.scan_event('pull_request', **{key: ''})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'{key}: parameter null or not set', result.stderr)
+                self.assertEqual(records, [])
+        absent = '0' * 39 + '1'
+        for key in ('PR_BASE_SHA', 'PR_HEAD_SHA'):
+            with self.subTest(key=key, value=absent):
+                result, records = self.scan_event('pull_request', **{key: absent})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f'::error::Secret scan cannot find pull request commit {absent}', result.stdout)
+                self.assertEqual(records, [])
+        result, records = self.scan_event('merge_group')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('::error::Unsupported secret-scan event: merge_group', result.stdout)
+        self.assertEqual(records, [])
+        self.git('remote', 'set-url', 'origin', str(self.root / 'missing'))
+        for event in ('schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('does not appear to be a git repository', result.stderr)
+                self.assertEqual(records, [])
+
+    def test_pull_request_exception_changes_warn_without_failing_the_scan(self):
+        warning = ('::warning title=Secret scan exceptions changed::This pull request changes '
+                   '.gitleaksignore or .gitleaks.toml. Check that each added line pins one false '
+                   'positive by commit, file, rule and line.\n')
+        for path in ('.gitleaksignore', '.gitleaks.toml', 'ordinary.txt'):
+            with self.subTest(path=path):
+                self.git('checkout', '-q', '--detach', self.base, repo=self.origin)
+                head = self.commit(path, 'reviewed exception' if path != 'ordinary.txt' else 'ordinary edit')
+                self.git('fetch', '-q', 'origin', head)
+                self.git('checkout', '-q', head)
+                result, records = self.scan_event('pull_request', PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['commits'], [head])
+                self.assertEqual(result.stdout, warning if path != 'ordinary.txt' else '')
+
+    def test_issue_reporting_is_only_for_failed_schedules_with_its_own_permissions(self):
+        self.assertEqual(self.workflow['permissions'], {'contents': 'read'})
+        self.assertNotIn('permissions', self.job)
+        self.assertEqual(self.report_job['needs'], 'secret-scan')
+        self.assertEqual(self.report_job['if'],
+                         "always() && github.event_name == 'schedule' && needs.secret-scan.result != 'success'")
+        self.assertEqual(self.report_job['permissions'], {'contents': 'read', 'issues': 'write'})
+        self.assertEqual(self.report_job['concurrency'], {'group': 'scheduled-secret-scan-report',
+                                                        'cancel-in-progress': 'false'})
+        self.assertEqual(self.report_step['env'], {'GH_TOKEN': '${{ github.token }}',
+                                                 'SCAN_RESULT': '${{ needs.secret-scan.result }}',
+                                                 'SCAN_FINDINGS': '${{ needs.secret-scan.outputs.findings }}'})
+        for value in (self.report_job, self.report_step):
+            self.assertNotIn('continue-on-error', value)
+        self.assertNotIn('if', self.report_step)
+
+    def test_scheduled_failure_opens_or_updates_an_issue_with_the_run_link(self):
+        for existing in ('', '42'):
+            for findings in ('3', '', 'not-a-count'):
+                with self.subTest(existing=existing, findings=findings):
+                    result, calls = self.run_step(
+                        self.report_step, EXISTING_ISSUE=existing, SCAN_RESULT='failure', SCAN_FINDINGS=findings,
+                        GITHUB_REPOSITORY='owner/repository', GITHUB_RUN_ID='123', GITHUB_SERVER_URL='https://github.com')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(calls), 3)
+                    repository = ['--repo', 'owner/repository']
+                    body_file = str(self.root / 'secret-scan-issue.md')
+                    self.assertEqual(calls[0]['args'], ['label', 'create', 'secret-scan', *repository, '--force',
+                                                      '--color', 'B60205', '--description',
+                                                      'Scheduled all-ref secret scan findings or failures'])
+                    self.assertEqual(calls[1]['args'], ['issue', 'list', *repository, '--state', 'open',
+                                                      '--label', 'secret-scan', '--limit', '1',
+                                                      '--json', 'number', '--jq', '.[0].number // empty'])
+                    self.assertEqual(calls[2]['args'],
+                                     ['issue', 'comment', existing, *repository, '--body-file', body_file] if existing else
+                                     ['issue', 'create', *repository, '--label', 'secret-scan',
+                                      '--title', 'Scheduled secret scan needs review', '--body-file', body_file])
+                    detail = ('Findings: 3.' if findings == '3' else
+                              'No finding count was passed on: the scan found something or did not complete. '
+                              'This is not a clean result.')
+                    self.assertEqual(calls[2]['body'],
+                                     f'Scheduled all-ref secret scan: **failure**. {detail}\n'
+                                     '[Workflow run](https://github.com/owner/repository/actions/runs/123).\n\n'
+                                     'The run log shows only the total and redacts values. To list the findings, '
+                                     'fetch all refs as the workflow does and run the same gitleaks command '
+                                     'with --verbose. This issue does not block unrelated pull requests.\n')
+
+    def test_issue_api_errors_fail_the_reporting_job(self):
+        result, calls = self.run_step(self.report_step, GH_EXIT='7', GITHUB_REPOSITORY='owner/repository')
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(len(calls), 1)
+
+
 class DeclarationTests(unittest.TestCase):
     def test_declared_removal_is_still_printable(self):
         result = report(rust(), declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''},
