@@ -16,6 +16,20 @@ pub fn is_sensitive_node(node: &SchemaNode) -> bool {
     }
 }
 
+/// Wrap a parsed leaf value in the same representation as its generated field.
+pub(super) fn explicit_leaf_value(node: &SchemaNode, value: TokenStream) -> TokenStream {
+    let presence = if node.config {
+        quote! { LeafPresence::Explicit(#value) }
+    } else {
+        quote! { Some(#value) }
+    };
+    if is_sensitive_node(node) {
+        quote! { SecretLeaf::new(#presence) }
+    } else {
+        presence
+    }
+}
+
 fn get_raw_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     get_raw_type_internal(node, nodes_by_path, &mut std::collections::HashSet::new())
 }
@@ -927,16 +941,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     }
                     let child = child_node.unwrap();
                     let is_sensitive = is_sensitive_node(child);
+                    let accessor = if child.config {
+                        format_ident!("as_option")
+                    } else {
+                        format_ident!("as_ref")
+                    };
                     if is_sensitive {
                         quote! {
                             self.#field_ident
                                 .get()
-                                .as_option()
+                                .#accessor()
                                 .cloned()
                                 .map(SensitiveKey::from)
                         }
                     } else {
-                        quote! { self.#field_ident.as_option().cloned() }
+                        quote! { self.#field_ident.#accessor().cloned() }
                     }
                 } else {
                     let key_struct_ident = format_ident!("{}Key", nodes_by_path.type_name(node));
@@ -954,10 +973,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         let child = child_node.unwrap();
                         let is_sensitive = is_sensitive_node(child);
                         let field_ident = format_ident!("{}", to_snake_case(key_field));
-                        let val_expr = if is_sensitive {
-                            quote! { self.#field_ident.get().as_option().cloned()? }
+                        let accessor = if child.config {
+                            format_ident!("as_option")
                         } else {
-                            quote! { self.#field_ident.as_option().cloned()? }
+                            format_ident!("as_ref")
+                        };
+                        let val_expr = if is_sensitive {
+                            quote! { self.#field_ident.get().#accessor().cloned()? }
+                        } else {
+                            quote! { self.#field_ident.#accessor().cloned()? }
                         };
                         key_constructors.extend(quote! {
                             #field_ident: #val_expr,

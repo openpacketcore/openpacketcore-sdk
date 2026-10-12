@@ -58,6 +58,13 @@ key is rejected instead of replacing the earlier row in the generated
 `BTreeMap`. Both failures use stable diagnostics that never include key
 values.
 
+Keyed lists under `config false` retain `Option<T>` key leaves and the same
+scalar or composite map-key types as configuration lists. Generated key
+extraction and edit helpers use that optional representation, including
+sensitive key wrappers. Read-only rows with no configuration differences
+emit warning-free no-op diff helpers. Normal patch and NETCONF XML admission
+continue to reject writes to state paths.
+
 Key leaves with a non-public `opc:data-class` remain available to serde,
 ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`
 implementations redact them. A sensitive single key uses the generated

@@ -682,6 +682,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes. Row, authority, projection and final stored-byte audits remain intact,
   with the original operation deadline.
 
+- `opc-yanggen`: use the declared optional key-leaf representation when
+  extracting or assigning keys of `config false` lists, including composite
+  and sensitive keys. Avoid unused inputs in their generated diff and XML
+  edit helpers; compile generated state-list fixtures and check them with
+  Clippy warnings denied (#1268).
+
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at
   `Complete` or `Acquired` can be recovered or committed without a spurious

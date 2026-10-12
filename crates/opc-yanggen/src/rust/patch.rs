@@ -479,16 +479,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                 let key_field_ident = format_ident!("{}", to_snake_case(key_leaf));
                                 let key_is_sensitive = is_sensitive_node(key_leaf_node);
-                                let key_assign = if key_is_sensitive {
-                                    quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
-                                } else {
-                                    quote! { parsed_item.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
-                                };
-                                let entry_key_assign = if key_is_sensitive {
-                                    quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
-                                } else {
-                                    quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
-                                };
+                                let key_value = super::types::explicit_leaf_value(
+                                    key_leaf_node,
+                                    quote! { parsed_key.clone() },
+                                );
+                                let key_assign =
+                                    quote! { parsed_item.#key_field_ident = #key_value; };
+                                let entry_key_assign =
+                                    quote! { entry.#key_field_ident = #key_value; };
                                 let valueless_key_assign = if has_scalar_constraints {
                                     quote! { else { #entry_key_assign } }
                                 } else {
@@ -606,14 +604,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     key_fields.extend(quote! {
                                         #key_field_ident: #key_ident.clone(),
                                     });
-                                    let is_sensitive = is_sensitive_node(key_leaf_node);
-                                    if is_sensitive {
-                                        key_assigns.push(quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
-                                        entry_key_assigns.push(quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
-                                    } else {
-                                        key_assigns.push(quote! { parsed_item.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
-                                        entry_key_assigns.push(quote! { entry.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
-                                    }
+                                    let key_value = super::types::explicit_leaf_value(
+                                        key_leaf_node,
+                                        quote! { #key_ident.clone() },
+                                    );
+                                    key_assigns.push(
+                                        quote! { parsed_item.#key_field_ident = #key_value; },
+                                    );
+                                    entry_key_assigns
+                                        .push(quote! { entry.#key_field_ident = #key_value; });
                                 }
                                 let valueless_key_assign = if has_scalar_constraints {
                                     quote! { else { #(#entry_key_assigns)* } }
@@ -935,9 +934,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
+            // State-only rows and expanded-profile no-op diffs need no inputs.
+            let empty_state_diff = !node.config
+                && node.kind == SchemaNodeKind::List
+                && !node.key_leaves.is_empty()
+                && diff_fields.is_empty();
             let previous_param = format_ident!(
                 "{}",
-                if nodes_by_path.expanded_profile && diff_fields.is_empty() {
+                if (nodes_by_path.expanded_profile && diff_fields.is_empty()) || empty_state_diff {
                     "_previous"
                 } else {
                     "previous"
@@ -945,7 +949,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             );
             let deltas_param = format_ident!(
                 "{}",
-                if nodes_by_path.expanded_profile && diff_fields.is_empty() {
+                if (nodes_by_path.expanded_profile && diff_fields.is_empty()) || empty_state_diff {
                     "_deltas"
                 } else {
                     "deltas"

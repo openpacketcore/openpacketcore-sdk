@@ -404,13 +404,22 @@ fn apply_children_fn(
         }
     };
 
+    let rejects_every_child = !node.config
+        && node.kind == SchemaNodeKind::List
+        && !node.key_leaves.is_empty()
+        && node.child_paths.iter().all(|path| {
+            nodes_by_path
+                .get(path)
+                .is_some_and(|child| child.kind == SchemaNodeKind::Leaf && !child.config)
+        });
     let value_param = format_ident!(
         "{}",
-        if !nodes_by_path.expanded_profile
-            || node
-                .child_paths
-                .iter()
-                .any(|path| { nodes_by_path.get(path).is_some_and(|child| child.config) })
+        if !rejects_every_child
+            && (!nodes_by_path.expanded_profile
+                || node
+                    .child_paths
+                    .iter()
+                    .any(|path| { nodes_by_path.get(path).is_some_and(|child| child.config) }))
         {
             "value"
         } else {
@@ -685,12 +694,13 @@ fn apply_list_fn(
         });
         let is_sensitive = is_sensitive_node(key_leaf_node);
         single_key_is_sensitive = is_sensitive;
-        let assign = if is_sensitive {
-            quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed.clone())); }
+        let raw_key = if is_sensitive {
+            quote! { parsed.clone() }
         } else {
-            quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
+            quote! { parsed_key.clone() }
         };
-        key_assigns.push(assign);
+        let key_value = super::types::explicit_leaf_value(key_leaf_node, raw_key);
+        key_assigns.push(quote! { entry.#key_field_ident = #key_value; });
     } else {
         for key_leaf in &node.key_leaves {
             let key_bare = clean_segment(key_leaf);
@@ -713,13 +723,11 @@ fn apply_list_fn(
                 let #key_field_ident = parsed;
             });
             key_struct_fields.push(quote! { #key_field_ident: #key_field_ident.clone() });
-            let is_sensitive = is_sensitive_node(key_leaf_node);
-            let assign = if is_sensitive {
-                quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_field_ident.clone())); }
-            } else {
-                quote! { entry.#key_field_ident = LeafPresence::Explicit(#key_field_ident.clone()); }
-            };
-            key_assigns.push(assign);
+            let key_value = super::types::explicit_leaf_value(
+                key_leaf_node,
+                quote! { #key_field_ident.clone() },
+            );
+            key_assigns.push(quote! { entry.#key_field_ident = #key_value; });
         }
     }
 
