@@ -176,6 +176,97 @@ impl ScopeBatchStore {
         .map_err(|_| ScopeBatchError::Unavailable)?
     }
 
+    /// Observe this exact active authority and 1–32 ordered children at one
+    /// backend cut after a complete current-configuration barrier. No command,
+    /// replay lane, sequence or effect capability is created by this read.
+    pub async fn read_current(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        stamp: &ScopeAuthorityStamp,
+        keys: &[ScopeChildKey],
+    ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError> {
+        self.read_current_with_admission(
+            authenticated,
+            stamp,
+            keys,
+            ScopeChildReadControl::default(),
+            |_, _| async { Ok(()) },
+        )
+        .await
+    }
+
+    /// Native transport hook: validate the sole cut before established-class
+    /// admission, and retain its returned entitlement through materialization.
+    /// On peer closure, cancel `control` and await this call before releasing
+    /// proof credit. The callback receives comparison facts and the cut's fixed
+    /// deadline, never authority; no response may be released after that deadline.
+    #[doc(hidden)]
+    pub async fn read_current_with_admission<F, Fut, G>(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        stamp: &ScopeAuthorityStamp,
+        keys: &[ScopeChildKey],
+        control: ScopeChildReadControl,
+        admit: F,
+    ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError>
+    where
+        F: FnOnce(ScopeAuthorityStamp, tokio::time::Instant) -> Fut,
+        Fut: std::future::Future<Output = Result<G, ScopeChildReadError>>,
+        G: Send + 'static,
+    {
+        use crate::consensus::store::scope_child_read::before;
+        child_read::validate_keys(keys)?;
+        let request = ScopeChildReadRequest::new(stamp, keys.to_vec())?;
+        if stamp.namespace() != &self.namespace || stamp.execution().identity() != authenticated {
+            return Err(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized).into());
+        }
+        let _cancel = child_read_control::CancelOnDrop(control.clone());
+        let opening_deadline =
+            tokio::time::Instant::now() + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+        before(
+            &control,
+            opening_deadline,
+            self.authorize_current_read(authenticated, stamp),
+        )
+        .await?;
+        let cut = self
+            .store
+            .scope_child_read_cut(request, control.clone())
+            .await?;
+        let deadline = cut.deadline();
+        let admission = before(&control, deadline, admit(cut.stamp().clone(), deadline)).await?;
+        let rows = cut.materialize(admission).await?;
+        before(
+            &control,
+            deadline,
+            self.authorize_current_read(authenticated, stamp),
+        )
+        .await?;
+        Ok(rows)
+    }
+
+    async fn authorize_current_read(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        stamp: &ScopeAuthorityStamp,
+    ) -> Result<(), ScopeChildReadError> {
+        let role = self
+            .admission
+            .authorize(
+                authenticated,
+                self.namespace.scope(),
+                Some(stamp.execution()),
+                ScopeAuthorityAction::Read,
+                None,
+            )
+            .await
+            .map_err(ScopeBatchError::from)?;
+        if role != ScopeAuthorityRole::Worker {
+            return Err(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized).into());
+        }
+        Ok(())
+    }
+
     /// Commit every child, claim and counter change in one application command,
     /// or return a no-effect conflict. Initial profile activation is a separate
     /// cluster prerequisite. On `OutcomeUnknown`, including configuration

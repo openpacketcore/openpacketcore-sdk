@@ -4,7 +4,9 @@ Local reset, containment and backend coordination are available without a
 durable store dependency. Enable the opt-in `store` feature for
 `ScopeKernelAuthority`, committed effects and activation-bound opening. XFRM
 consumers enable that adapter through `opc-ipsec-xfrm`'s `scope-store` feature;
-ordinary XFRM builds remain independent of consensus and SQLite.
+ordinary XFRM builds remain independent of consensus and SQLite. The opt-in
+`native-scope` feature adds the authenticated `ScopeClient` adapter for workers
+that do not embed a store. GTP-U and XFRM expose the same feature name.
 
 This package is source-build-only (`publish = false`) while its optional
 store adapter depends on the SDK's source-only consensus packages.
@@ -47,12 +49,18 @@ authenticate a worker, select an incarnation or authorize disruption.
    profile and rebuild each current-image GTP-U/DSCP graph. The receipt grants
    structural rebuild only. Pin-less predecessors are reset together; no
    retained-graph adoption or historical object reader is used.
-4. Construct `ScopeKernelAuthority` from the actual committed authority,
-   independently verified execution and store services. `commit_activation`
-   executes or recovers the exact child batch, uses the store's canonical
-   outcome matcher, and verifies current authority, birth/revision and sealed
-   payload before yielding a `CommittedScopeEffect`. The consumer defines the
-   encrypted activation phase.
+4. Bind `ScopeKernelAuthority` to the genuine committed authority and the
+   local lifecycle/execution. The local constructor takes store services;
+   `commit_activation` executes or recovers the exact child batch and verifies
+   its result. With `native-scope`, `from_scope_client` takes the worker's actual
+   protected client and returns `ScopeKernelAuthority<NativeScopeAuthority>`.
+   Submit through `ScopeClient::batches`, retain the full request built after
+   the coordinator grants its lane, then pass that request, child key and
+   completion to `readback_activation` **before** `batches.ack(attempt)`.
+   The native adapter has no `commit_activation`. Both paths return the same
+   concrete `CommittedScopeEffect` only after one current-authority/child cut
+   matches the namespace, key, birth, generation, batch revision, sealed bytes
+   and claims. The consumer defines the encrypted activation phase.
 5. Install the required backend effects with that token, then call
    `LocalKernelLifecycle::open`. Every containment removal rechecks current
    execution and all declared graphs. Successful publication returns
@@ -65,6 +73,18 @@ authenticate a worker, select an incarnation or authorize disruption.
 `close_execution` only closes and drains local effect admission. Neither close
 method certifies that peer-control paths stopped; the consumer must establish
 that separately before committing durable execution closure.
+
+Native readback accepts only completion provenance from the bound native client
+and its original supervised request. Serialized outcomes and arbitrary public
+batch ports cannot supply it. Readback pins the coordinator receipt through the
+remote read and final local epoch check; acknowledgement refuses while that pin
+is held. A receipt acknowledged too early cannot later mint an effect. After
+successful readback and acknowledgement, the effect retains its original trusted
+work class for each standalone recheck. Emergency uses its reserved capacity;
+a Normal activation that temporarily inherited Emergency scheduling priority
+still uses Normal capacity. Each readback/recheck is one observation exchange,
+with no application append or additional batch lane. The local adapter retains
+its pre-submission `Current` check.
 
 ## Failure and retry
 
@@ -86,6 +106,9 @@ The consumer remains responsible for durable identity non-reuse.
 proven no-effect results from `Stale`, `WrongRequest` and `OutcomeUnknown`.
 Re-read and replan conflicts; cancelled attempts require a successor, inactive
 profiles permit exact retry, and uncertain outcomes need exact-request recovery.
+`TransportRevisionMismatch` is a distinct native call failure. It never proves
+an uncertain activation's result, retries immediately or latches until restart.
+A later authenticated revision-2 handshake clears the transport diagnostic.
 
 New mutations require fresh untimed currentness checks. Exact local readback,
 published retry and receipt-bound teardown do not require a reachable store.
@@ -132,7 +155,10 @@ no program/map ID reopen or added `CAP_SYS_ADMIN` privilege is required. See the
 
 Deterministic tests cover failure boundaries and retry pacing. Ignored native
 tests use private network/mount namespaces, actual BPF/XFRM objects and real
-three-voter authority. The [qualification runner](../../ci/qualify-local-kernel-lifecycle.py)
+three-voter authority through both local and authenticated native adapters. The
+same scenario assertions cover unknown replies, cancellation, reset epochs,
+shared consumption, published retry and store-independent teardown. The
+[qualification runner](../../ci/qualify-local-kernel-lifecycle.py)
 uses `libseccomp.so.2` to deny program/map ID enumeration and reopening in every case.
 This includes steady-state readback, retirement and predecessor discovery. It
 builds and runs the required manifest in the existing privileged host CI job

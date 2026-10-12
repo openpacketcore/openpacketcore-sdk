@@ -24,8 +24,11 @@ use crate::scope_authority::{
 use crate::SessionKey;
 
 mod attempt;
+mod child_read;
+pub(crate) mod child_read_control;
 mod codec;
 mod completion;
+mod completion_context;
 mod coordinator;
 mod cut;
 mod lane;
@@ -37,10 +40,22 @@ pub use attempt::{
     ScopeBatchAttempt, ScopeBatchCancelCommand, ScopeBatchLookup, ScopeBatchReceipt,
     ScopeBatchTerminal,
 };
+pub use child_read::{
+    ScopeChildReadError, ScopeChildReadRequest, MAX_SCOPE_CHILD_OBSERVATION_BYTES,
+    MAX_SCOPE_CHILD_READ_KEYS, MAX_SCOPE_CHILD_READ_REQUEST_BYTES, MAX_SCOPE_CHILD_RECORD_BYTES,
+    SCOPE_CHILD_READ_MAX_CUT_LIFETIME,
+};
+pub use child_read_control::ScopeChildReadControl;
+#[cfg(any(test, feature = "test-control"))]
+pub use child_read_control::{ScopeChildReadPause, ScopeChildReadStage};
 pub use completion::{ScopeBatchCompletion, ScopeBatchCompletionOutcome, ScopeBatchNoApplyProof};
+pub use completion_context::{
+    ScopeBatchCompletionContext, ScopeBatchCompletionReadGuard, ScopeBatchCompletionRetention,
+};
 pub use coordinator::{
     ScopeBatchBuildContext, ScopeBatchCompletions, ScopeBatchCoordinator, ScopeBatchHandle,
-    ScopeBatchLaneStatus, ScopeBatchPort, ScopeBatchReservation,
+    ScopeBatchLaneStatus, ScopeBatchPort, ScopeBatchReadBudget, ScopeBatchReadContext,
+    ScopeBatchReservation,
 };
 pub(crate) use cut::ScopeBatchReadCut;
 pub use cut::{ScopeBatchLaneView, ScopeBatchReopen, ScopeBatchReopenState};
@@ -555,6 +570,10 @@ pub enum ScopeBatchError {
     /// This is a local progress result, never a committed batch refusal.
     #[error("scope_guard_stalled")]
     ScopeGuardStalled,
+    /// Local transport incompatibility, never a stored error or mutation outcome.
+    #[serde(skip)]
+    #[error("scope_transport_revision_mismatch")]
+    TransportRevisionMismatch,
 }
 impl From<ScopeAuthorityError> for ScopeBatchError {
     fn from(value: ScopeAuthorityError) -> Self {
@@ -742,7 +761,9 @@ impl ScopeBatchCommand {
 
     pub(crate) fn matches_error(&self, error: &ScopeBatchError) -> bool {
         match error {
-            ScopeBatchError::ScopeGuardStalled => false,
+            ScopeBatchError::ScopeGuardStalled | ScopeBatchError::TransportRevisionMismatch => {
+                false
+            }
             ScopeBatchError::Conflict(conflicts) => {
                 let unique = |len, count| len == count;
                 (!conflicts.children.is_empty()
@@ -839,6 +860,7 @@ redacted_debug!(
     ScopeBatchResolution,
     ScopeBatchView,
     ScopeChildRecord,
+    ScopeChildReadRequest,
     ScopeBatchCommand,
     ScopeBatchCheckpoint,
     ScopeBatchLaneCheckpoint

@@ -245,10 +245,12 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(code=code, output=output):
                 self.assertFalse(RUNNER.case_passed(code, output))
 
-    def run_guest(self, code=0, listed=None, kernel="5.14.0-427.20.1.el9_4.x86_64"):
+    def run_guest(self, code=0, listed=None, kernel="5.14.0-427.20.1.el9_4.x86_64", keep_going=False):
         evidence = self.root / "evidence"
         argv = ["qualify", "--run-bundle", str(self.bundle), "--evidence-dir", str(evidence),
                 "--require-kernel", r"5\.14\.0-427\..*\.el9_4\.x86_64"]
+        if keep_going:
+            argv.append("--keep-going")
         invocations = []
 
         def check_output(command, **_kwargs):
@@ -261,9 +263,10 @@ class QualificationTests(unittest.TestCase):
             self.assertIn("OPC_GTPU_RUN_PRIVILEGED=1", command)
             self.assertIn(str(self.bundle / "ci/deny-bpf-enumeration.py"), command)
             self.assertIn("--exact", command)
-            stdout.write("test result: ok. 1 passed; 0 failed; 0 ignored;\n" if code == 0
+            exit_code = code[len(invocations) - 1] if isinstance(code, list) else code
+            stdout.write("test result: ok. 1 passed; 0 failed; 0 ignored;\n" if exit_code == 0
                          else "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n")
-            return subprocess.CompletedProcess(command, code)
+            return subprocess.CompletedProcess(command, exit_code)
 
         with patch.object(RUNNER.sys, "argv", argv), patch.object(RUNNER.platform, "release", return_value=kernel), \
                 patch.object(RUNNER.platform, "system", return_value="Linux"), \
@@ -290,6 +293,20 @@ class QualificationTests(unittest.TestCase):
         self.assertFalse(record["complete"] or record["passed"])
         self.assertEqual(record["cases"][0]["exit_code"], 101)
         self.assertTrue((self.root / "evidence" / record["cases"][0]["log"]).is_file())
+
+    def test_keep_going_runs_later_cases_and_retains_the_failed_result(self):
+        code, record, invocations = self.run_guest(code=[101, 0], keep_going=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(invocations), 2)
+        self.assertEqual([case["test"] for case in record["cases"]], self.cases["crate-a"])
+        self.assertEqual([case["exit_code"] for case in record["cases"]], [101, 0])
+        self.assertEqual([case["passed"] for case in record["cases"]], [False, True])
+        self.assertTrue(record["complete"] and record["bundle_unchanged"])
+        self.assertFalse(record["passed"])
+        for case in record["cases"]:
+            log = self.root / "evidence" / case["log"]
+            self.assertTrue(log.is_file())
+            self.assertEqual(case["log_sha256"], RUNNER.sha256(log))
 
     def test_guest_refuses_a_binary_missing_a_committed_case(self):
         code, record, invocations = self.run_guest(listed=["native::first"])

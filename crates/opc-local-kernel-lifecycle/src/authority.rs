@@ -1,4 +1,4 @@
-//! The actual untimed store boundary. Public observations never mint effects.
+//! Untimed activation and exact readback. Public observations never mint effects.
 
 use crate::{scope::LocalEffectOwner, LocalKernelLifecycle};
 use opc_session_store::scope_authority::{
@@ -7,8 +7,10 @@ use opc_session_store::scope_authority::{
 };
 use opc_session_store::scope_batch::{
     ScopeBatchError, ScopeBatchOutcome, ScopeBatchRequest, ScopeBatchStore, ScopeChildKey,
-    ScopeChildMutation, ScopeChildRecord, ScopeChildRevision,
+    ScopeChildMutation, ScopeChildReadError, ScopeChildRecord, ScopeChildRevision,
 };
+use opc_session_store::scope_scheduler::ScopeWorkClass;
+use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     Arc,
@@ -36,27 +38,60 @@ pub enum LocalEffectError {
     /// Store or local native identity inspection is currently unavailable.
     #[error("local_effect_unavailable")]
     Unavailable,
+    /// The authenticated scope transport uses another revision. This never
+    /// establishes an activation outcome or requires a process restart.
+    #[error("local_effect_transport_revision_mismatch")]
+    TransportRevisionMismatch,
 }
 struct Inner {
     lifecycle: LocalKernelLifecycle,
     _owner: LocalEffectOwner,
     execution: ScopeExecution,
     committed: CommittedScopeAuthority,
-    authority: ScopeAuthorityStore,
-    batches: ScopeBatchStore,
+    backend: Backend,
     closed: AtomicBool,
 }
-/// A concrete local adapter to the SDK's durable scope authority and batches.
-///
-/// Construction consumes the real non-deserializable committed capability and
-/// binds one local boot to the held writer domain. Clone this adapter for every
-/// backend in that domain. The host supplies its independently verified local
-/// execution; this adapter does not authenticate a boot or close peer traffic.
-#[derive(Clone)]
-pub struct ScopeKernelAuthority {
-    inner: Arc<Inner>,
+enum Backend {
+    Local {
+        authority: ScopeAuthorityStore,
+        batches: Box<ScopeBatchStore>,
+    },
+    #[cfg(feature = "native-scope")]
+    Native {
+        client: opc_session_net::scope::ScopeClient,
+        attempt: std::time::Duration,
+    },
 }
-impl std::fmt::Debug for ScopeKernelAuthority {
+/// Sealed type state for the local store adapter. Construct it through
+/// [`ScopeKernelAuthority::new`]; callers cannot supply another backend.
+pub struct LocalScopeAuthority {
+    _sealed: (),
+}
+/// Sealed type state for authenticated native readback. Mutation submission
+/// remains with the shared batch coordinator; this adapter has no raw commit.
+#[cfg(feature = "native-scope")]
+pub struct NativeScopeAuthority {
+    _sealed: (),
+}
+/// Committed scope authority bound to one local kernel writer domain.
+///
+/// Sealed local-store and native-transport constructors consume the genuine
+/// non-deserializable capability and bind one local boot to the held writer
+/// domain. Clone the adapter for every backend in that domain. Authentication
+/// belongs to the protected scope transport; peer closure remains caller-owned.
+pub struct ScopeKernelAuthority<B = LocalScopeAuthority> {
+    inner: Arc<Inner>,
+    backend: PhantomData<fn() -> B>,
+}
+impl<B> Clone for ScopeKernelAuthority<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            backend: PhantomData,
+        }
+    }
+}
+impl<B> std::fmt::Debug for ScopeKernelAuthority<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ScopeKernelAuthority")
     }
@@ -86,34 +121,16 @@ impl ScopeKernelAuthority {
                 _owner: owner,
                 execution,
                 committed,
-                authority,
-                batches,
+                backend: Backend::Local {
+                    authority,
+                    batches: Box::new(batches),
+                },
                 closed: AtomicBool::new(false),
             }),
+            backend: PhantomData,
         };
         value.current().await?;
         Ok(value)
-    }
-    async fn current(&self) -> Result<(), LocalEffectError> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(LocalEffectError::Closed);
-        }
-        self.inner
-            .lifecycle
-            .local_scope()
-            .verify()
-            .map_err(|_| LocalEffectError::Unavailable)?;
-        let view = self
-            .inner
-            .authority
-            .current(self.inner.execution.identity())
-            .await
-            .map_err(authority_error)?;
-        verify_current(self.inner.committed.stamp(), &view)?;
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(LocalEffectError::Closed);
-        }
-        Ok(())
     }
     /// Commit or recover the exact consumer activation batch and verify this
     /// child's resulting birth/revision and sealed body before yielding an
@@ -134,28 +151,121 @@ impl ScopeKernelAuthority {
             .current_effect_epoch()
             .map_err(|_| LocalEffectError::Stale)?;
         let (key, outcome, index) = commit_readback(self, request, child).await?;
-        let consumed = self
+        self.inner
+            .effect(epoch, key, outcome, index, ScopeWorkClass::Normal)
+    }
+}
+
+#[cfg(feature = "native-scope")]
+impl ScopeKernelAuthority<NativeScopeAuthority> {
+    /// Bind a stateless worker to its actual protected native client and genuine
+    /// committed capability. Construction verifies Current once; readback and
+    /// later rechecks use one current-child cut and the activation's trusted class.
+    /// The existing Current method uses its reserved control path and cannot
+    /// establish an effect class; the verified completion supplies that class.
+    pub async fn from_scope_client(
+        lifecycle: LocalKernelLifecycle,
+        execution: ScopeExecution,
+        committed: CommittedScopeAuthority,
+        client: opc_session_net::scope::ScopeClient,
+        attempt: std::time::Duration,
+    ) -> Result<Self, LocalEffectError> {
+        committed
+            .check_execution(&execution)
+            .map_err(|_| LocalEffectError::Stale)?;
+        if client.execution() != &execution || attempt.is_zero() {
+            return Err(LocalEffectError::WrongRequest);
+        }
+        if lifecycle.effects_closed() {
+            return Err(LocalEffectError::Closed);
+        }
+        let owner = lifecycle
+            .register_effect_owner()
+            .map_err(|_| LocalEffectError::WrongRequest)?;
+        let value = Self {
+            inner: Arc::new(Inner {
+                lifecycle,
+                _owner: owner,
+                execution,
+                committed,
+                backend: Backend::Native { client, attempt },
+                closed: AtomicBool::new(false),
+            }),
+            backend: PhantomData,
+        };
+        value.current().await?;
+        Ok(value)
+    }
+
+    /// Read back a genuinely supervised native Applied completion before ack.
+    /// The full original request and every child field must match. The receipt
+    /// stays pinned throughout this one-cut observation and local epoch check.
+    /// Cancellation drops the pin without acknowledging or resubmitting work.
+    ///
+    /// Keep the full original coordinator request through completion, then
+    /// read back before releasing its lane:
+    /// ```no_run
+    /// use opc_local_kernel_lifecycle::{CommittedScopeEffect, LocalEffectError, NativeScopeAuthority, ScopeKernelAuthority};
+    /// use opc_session_store::scope_batch::{ScopeBatchCompletion, ScopeBatchCoordinator, ScopeBatchRequest, ScopeChildKey};
+    /// async fn reconcile(
+    ///     authority: &ScopeKernelAuthority<NativeScopeAuthority>,
+    ///     batches: &ScopeBatchCoordinator,
+    ///     original: ScopeBatchRequest,
+    ///     child: ScopeChildKey,
+    ///     completion: &ScopeBatchCompletion,
+    /// ) -> Result<CommittedScopeEffect, LocalEffectError> {
+    ///     let effect = authority.readback_activation(original, child, completion).await?;
+    ///     assert!(batches.ack(completion.attempt()));
+    ///     Ok(effect)
+    /// }
+    /// ```
+    ///
+    /// Native authorities cannot submit an activation directly:
+    /// ```compile_fail
+    /// use opc_local_kernel_lifecycle::{NativeScopeAuthority, ScopeKernelAuthority};
+    /// use opc_session_store::scope_batch::{ScopeBatchRequest, ScopeChildKey};
+    /// async fn raw_commit(a: &ScopeKernelAuthority<NativeScopeAuthority>, r: ScopeBatchRequest, k: ScopeChildKey) {
+    ///     a.commit_activation(r, k).await;
+    /// }
+    /// ```
+    pub async fn readback_activation(
+        &self,
+        request: ScopeBatchRequest,
+        child: ScopeChildKey,
+        completion: &opc_session_store::scope_batch::ScopeBatchCompletion,
+    ) -> Result<CommittedScopeEffect, LocalEffectError> {
+        let epoch = self
             .inner
             .lifecycle
-            .effect_consumption()
-            .lock()
-            .map_err(|_| LocalEffectError::Unavailable)?
-            .child(
-                outcome.lane(),
-                outcome.sequence(),
-                outcome.revision(),
-                outcome.rows().len(),
-                index,
-            )?;
-        let effect = CommittedScopeEffect {
-            authority: self.clone(),
-            epoch,
-            key,
-            _outcome: outcome,
-            consumed,
+            .current_effect_epoch()
+            .map_err(|_| LocalEffectError::Stale)?;
+        let Backend::Native { client, .. } = &self.inner.backend else {
+            return Err(LocalEffectError::WrongRequest);
         };
-        effect.recheck_local_execution()?;
+        let verified = client
+            .verify_batch_completion(&self.inner.committed, &request, completion)
+            .map_err(batch_error)?;
+        let class = verified.class();
+        let (key, outcome, index) = readback_applied(
+            &EffectRead {
+                inner: &self.inner,
+                class,
+            },
+            self.inner.committed.stamp(),
+            request,
+            child,
+            verified.outcome().clone(),
+        )
+        .await?;
+        let effect = self.inner.effect(epoch, key, outcome, index, class)?;
+        drop(verified);
         Ok(effect)
+    }
+}
+
+impl<B> ScopeKernelAuthority<B> {
+    async fn current(&self) -> Result<(), LocalEffectError> {
+        self.inner.current().await
     }
     /// Stop new local effects and drain admitted kernel work. This does not
     /// retire forwarding or prove peer-control closure; the consumer must also
@@ -177,7 +287,7 @@ impl ScopeKernelAuthority {
         self.inner.lifecycle.local_scope().verify()?;
         self.inner.lifecycle.close_effects();
         self.inner.closed.store(true, Ordering::Release);
-        let authority = self.clone();
+        let authority = self.inner.clone();
         let (reply, observed) = tokio::sync::oneshot::channel();
         // Transfer ownership before the first await. In particular, dropping
         // the caller while a prior effect still holds a read guard cannot
@@ -195,13 +305,74 @@ impl ScopeKernelAuthority {
                         return;
                     }
                 };
-                let result = runtime.block_on(authority.inner.lifecycle.reset(participants));
+                let result = runtime.block_on(authority.lifecycle.reset(participants));
                 let _ = reply.send(result);
             })
             .map_err(|_| LocalLifecycleError::Indeterminate)?;
         observed
             .await
             .map_err(|_| LocalLifecycleError::Indeterminate)?
+    }
+}
+
+impl Inner {
+    async fn current(&self) -> Result<(), LocalEffectError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LocalEffectError::Closed);
+        }
+        self.lifecycle
+            .local_scope()
+            .verify()
+            .map_err(|_| LocalEffectError::Unavailable)?;
+        let view = match &self.backend {
+            Backend::Local { authority, .. } => authority
+                .current(self.execution.identity())
+                .await
+                .map_err(authority_error)?,
+            #[cfg(feature = "native-scope")]
+            Backend::Native { client, attempt } => {
+                tokio::time::timeout(*attempt, client.current(*attempt))
+                    .await
+                    .map_err(|_| LocalEffectError::Unavailable)?
+                    .map_err(rpc_error)?
+            }
+        };
+        verify_current(self.committed.stamp(), &view)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LocalEffectError::Closed);
+        }
+        Ok(())
+    }
+    fn effect(
+        self: &Arc<Self>,
+        epoch: crate::LocalScopeEpoch,
+        key: EffectKey,
+        outcome: ScopeBatchOutcome,
+        index: usize,
+        class: ScopeWorkClass,
+    ) -> Result<CommittedScopeEffect, LocalEffectError> {
+        let consumed = self
+            .lifecycle
+            .effect_consumption()
+            .lock()
+            .map_err(|_| LocalEffectError::Unavailable)?
+            .child(
+                outcome.lane(),
+                outcome.sequence(),
+                outcome.revision(),
+                outcome.rows().len(),
+                index,
+            )?;
+        let effect = CommittedScopeEffect {
+            authority: self.clone(),
+            epoch,
+            key,
+            _outcome: outcome,
+            consumed,
+            class,
+        };
+        effect.recheck_local_execution()?;
+        Ok(effect)
     }
 }
 
@@ -216,6 +387,7 @@ pub struct EffectKey {
     request: Arc<ScopeBatchRequest>,
     child: ScopeChildKey,
     revision: ScopeChildRevision,
+    batch_revision: u64,
 }
 impl std::fmt::Debug for EffectKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +407,10 @@ impl EffectKey {
     pub fn revision(&self) -> ScopeChildRevision {
         self.revision
     }
+    /// Whole-scope batch revision that committed this exact child activation.
+    pub const fn batch_revision(&self) -> u64 {
+        self.batch_revision
+    }
     /// Same request identity, even if changed bytes make the full key unequal.
     pub fn same_request_id(&self, other: &Self) -> bool {
         self.request.scope() == other.request.scope()
@@ -245,11 +421,12 @@ impl EffectKey {
 /// There is no constructor from serialized claims or a successful observation.
 #[derive(Clone)]
 pub struct CommittedScopeEffect {
-    authority: ScopeKernelAuthority,
+    authority: Arc<Inner>,
     epoch: crate::LocalScopeEpoch,
     key: EffectKey,
     _outcome: ScopeBatchOutcome,
     consumed: Arc<AtomicU8>,
+    class: ScopeWorkClass,
 }
 impl std::fmt::Debug for CommittedScopeEffect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -273,7 +450,7 @@ impl CommittedScopeEffect {
     /// useful for cancellation and the final synchronous publication decision;
     /// it never replaces the full-round check before a new effect.
     pub fn recheck_local_execution(&self) -> Result<(), LocalEffectError> {
-        if self.authority.inner.closed.load(Ordering::Acquire) {
+        if self.authority.closed.load(Ordering::Acquire) {
             return Err(LocalEffectError::Closed);
         }
         self.epoch.recheck().map_err(|_| LocalEffectError::Stale)
@@ -290,7 +467,6 @@ impl CommittedScopeEffect {
     /// Verify the capability names the held local scope of the backend.
     pub fn matches_local_scope(&self, scope: &opc_linux_gtpu_sys::tc::LocalKernelScope) -> bool {
         self.authority
-            .inner
             .lifecycle
             .local_scope()
             .is_same_instance(scope)
@@ -299,7 +475,14 @@ impl CommittedScopeEffect {
     /// publication. Loss of the store cannot expire already published effects.
     pub async fn recheck(&self) -> Result<(), LocalEffectError> {
         self.recheck_local_execution()?;
-        recheck_record(&self.authority, &self.key).await?;
+        recheck_record(
+            &EffectRead {
+                inner: &self.authority,
+                class: self.class,
+            },
+            &self.key,
+        )
+        .await?;
         self.recheck_local_execution()
     }
 }
@@ -308,17 +491,20 @@ impl CommittedScopeEffect {
 // checks used by production, without constructing either opaque capability or
 // exposing an alternative authority provider to callers.
 #[async_trait::async_trait]
-trait ActivationStore: Sync {
+trait CurrentChildStore: Sync {
+    async fn read_current(
+        &self,
+        child: ScopeChildKey,
+    ) -> Result<Option<ScopeChildRecord>, LocalEffectError>;
+}
+#[async_trait::async_trait]
+trait ActivationStore: CurrentChildStore {
     fn stamp(&self) -> &ScopeAuthorityStamp;
     async fn current(&self) -> Result<(), LocalEffectError>;
     async fn execute(
         &self,
         request: &ScopeBatchRequest,
     ) -> Result<ScopeBatchOutcome, LocalEffectError>;
-    async fn read(
-        &self,
-        child: ScopeChildKey,
-    ) -> Result<Option<ScopeChildRecord>, LocalEffectError>;
 }
 #[async_trait::async_trait]
 impl ActivationStore for ScopeKernelAuthority {
@@ -332,21 +518,77 @@ impl ActivationStore for ScopeKernelAuthority {
         &self,
         request: &ScopeBatchRequest,
     ) -> Result<ScopeBatchOutcome, LocalEffectError> {
-        self.inner
-            .batches
-            .execute(self.inner.execution.identity(), request)
-            .await
-            .map_err(batch_error)
+        match &self.inner.backend {
+            Backend::Local { batches, .. } => batches
+                .execute(self.inner.execution.identity(), request)
+                .await
+                .map_err(batch_error),
+            #[cfg(feature = "native-scope")]
+            Backend::Native { .. } => Err(LocalEffectError::WrongRequest),
+        }
     }
-    async fn read(
+}
+#[async_trait::async_trait]
+impl CurrentChildStore for ScopeKernelAuthority {
+    async fn read_current(
         &self,
         child: ScopeChildKey,
     ) -> Result<Option<ScopeChildRecord>, LocalEffectError> {
+        EffectRead {
+            inner: &self.inner,
+            class: ScopeWorkClass::Normal,
+        }
+        .read_current(child)
+        .await
+    }
+}
+struct EffectRead<'a> {
+    inner: &'a Inner,
+    class: ScopeWorkClass,
+}
+#[async_trait::async_trait]
+impl CurrentChildStore for EffectRead<'_> {
+    async fn read_current(
+        &self,
+        child: ScopeChildKey,
+    ) -> Result<Option<ScopeChildRecord>, LocalEffectError> {
+        if self.class == ScopeWorkClass::SafetyControl {
+            return Err(LocalEffectError::WrongRequest);
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(LocalEffectError::Closed);
+        }
         self.inner
-            .batches
-            .read(self.inner.execution.identity(), child)
-            .await
-            .map_err(batch_error)
+            .lifecycle
+            .local_scope()
+            .verify()
+            .map_err(|_| LocalEffectError::Unavailable)?;
+        match &self.inner.backend {
+            Backend::Local { batches, .. } => {
+                let mut rows = batches
+                    .read_current(
+                        self.inner.execution.identity(),
+                        self.inner.committed.stamp(),
+                        &[child],
+                    )
+                    .await
+                    .map_err(child_read_error)?;
+                if rows.len() != 1 {
+                    return Err(LocalEffectError::OutcomeUnknown);
+                }
+                rows.pop().ok_or(LocalEffectError::OutcomeUnknown)
+            }
+            #[cfg(feature = "native-scope")]
+            Backend::Native { client, attempt } => client
+                .read_child(
+                    &self.inner.committed,
+                    child,
+                    self.class,
+                    tokio::time::Instant::now() + *attempt,
+                )
+                .await
+                .map_err(child_read_error),
+        }
     }
 }
 async fn commit_readback(
@@ -357,15 +599,32 @@ async fn commit_readback(
     // The post-execution reads cannot replace this check: stale local authority
     // must not submit a new activation, even if it would later withhold a token.
     store.current().await?;
-    if request.stamp() != store.stamp() {
+    activation_index(store.stamp(), &request, child)?;
+    let outcome = store.execute(&request).await?;
+    readback_applied(store, store.stamp(), request, child, outcome).await
+}
+fn activation_index(
+    stamp: &ScopeAuthorityStamp,
+    request: &ScopeBatchRequest,
+    child: ScopeChildKey,
+) -> Result<usize, LocalEffectError> {
+    if request.stamp() != stamp {
         return Err(LocalEffectError::WrongRequest);
     }
-    let index = request
+    request
         .operations()
         .iter()
         .position(|op| op.key() == child && !matches!(op, ScopeChildMutation::Delete { .. }))
-        .ok_or(LocalEffectError::WrongRequest)?;
-    let outcome = store.execute(&request).await?;
+        .ok_or(LocalEffectError::WrongRequest)
+}
+async fn readback_applied(
+    store: &impl CurrentChildStore,
+    stamp: &ScopeAuthorityStamp,
+    request: ScopeBatchRequest,
+    child: ScopeChildKey,
+    outcome: ScopeBatchOutcome,
+) -> Result<(EffectKey, ScopeBatchOutcome, usize), LocalEffectError> {
+    let index = activation_index(stamp, &request, child)?;
     if !outcome.matches_request(&request) {
         return Err(LocalEffectError::OutcomeUnknown);
     }
@@ -377,18 +636,17 @@ async fn commit_readback(
         request: Arc::new(request),
         child,
         revision,
+        batch_revision: outcome.revision(),
     };
     recheck_record(store, &key).await?;
     Ok((key, outcome, index))
 }
 async fn recheck_record(
-    store: &impl ActivationStore,
+    store: &impl CurrentChildStore,
     key: &EffectKey,
 ) -> Result<(), LocalEffectError> {
-    store.current().await?;
-    let row = store.read(key.child).await?;
-    verify_record(key, row.as_ref())?;
-    store.current().await
+    let row = store.read_current(key.child).await?;
+    verify_record(key, row.as_ref())
 }
 
 #[cfg(test)]
@@ -483,6 +741,7 @@ fn authority_error(error: ScopeAuthorityError) -> LocalEffectError {
 }
 fn batch_error(error: ScopeBatchError) -> LocalEffectError {
     match error {
+        ScopeBatchError::TransportRevisionMismatch => LocalEffectError::TransportRevisionMismatch,
         ScopeBatchError::OutcomeUnknown => LocalEffectError::OutcomeUnknown,
         ScopeBatchError::Unavailable => LocalEffectError::Unavailable,
         ScopeBatchError::Scope(error) => authority_error(error),
@@ -491,6 +750,32 @@ fn batch_error(error: ScopeBatchError) -> LocalEffectError {
         | ScopeBatchError::SequenceConflict
         | ScopeBatchError::Cancelled
         | ScopeBatchError::ScopeGuardStalled => LocalEffectError::RetryableNoEffect,
+        _ => LocalEffectError::WrongRequest,
+    }
+}
+fn child_read_error(error: ScopeChildReadError) -> LocalEffectError {
+    match error {
+        ScopeChildReadError::Batch(error) => batch_error(error),
+        ScopeChildReadError::TransportRevisionMismatch => {
+            LocalEffectError::TransportRevisionMismatch
+        }
+        ScopeChildReadError::ObservationTooLarge | ScopeChildReadError::ReadBudgetExceeded => {
+            LocalEffectError::Unavailable
+        }
+        _ => LocalEffectError::Unavailable,
+    }
+}
+#[cfg(feature = "native-scope")]
+fn rpc_error(error: opc_session_net::scope::ScopeRpcError) -> LocalEffectError {
+    use opc_session_net::scope::ScopeRpcError;
+    match error {
+        ScopeRpcError::TransportRevisionMismatch => LocalEffectError::TransportRevisionMismatch,
+        ScopeRpcError::OutcomeUnknown => LocalEffectError::OutcomeUnknown,
+        ScopeRpcError::Retry | ScopeRpcError::AuthTimeUnavailable => LocalEffectError::Unavailable,
+        ScopeRpcError::Closed | ScopeRpcError::Retired | ScopeRpcError::Superseded => {
+            LocalEffectError::Stale
+        }
+        ScopeRpcError::ProfileUnavailable => LocalEffectError::RetryableNoEffect,
         _ => LocalEffectError::WrongRequest,
     }
 }
@@ -525,6 +810,7 @@ fn verify_record(key: &EffectKey, row: Option<&ScopeChildRecord>) -> Result<(), 
     if row.namespace() != key.request.namespace()
         || row.key() != key.child
         || row.revision() != key.revision
+        || row.batch_revision() != key.batch_revision
         || row.value() != Some(value)
         || row.claims() != claims
     {

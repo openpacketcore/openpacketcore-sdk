@@ -57,6 +57,10 @@ pub enum ScopeScanError {
     /// reopening cannot resolve this permanent admission refusal.
     #[error("scope restore exceeds configured retention capacity")]
     CapacityRefused,
+    /// Local transport diagnostic, never encoded as a peer operation failure.
+    /// A later call may recover through a fresh authenticated connection.
+    #[error("scope transport revision mismatch")]
+    TransportRevisionMismatch,
 }
 
 /// The scope-level header that prevents a coherent inventory from opening.

@@ -1,4 +1,79 @@
 {
   "version": 1,
-  "changes": []
+  "changes": [
+    {
+      "test": "rust:crates/opc-local-kernel-lifecycle::lib=lib::authority::readback_tests::matching_store_readback_follows_current_execute_current_read_current_order",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-local-kernel-lifecycle::lib=lib::authority::readback_tests::matching_store_readback_preserves_pre_submission_current_and_one_child_cut",
+      "reason": "Rename the ordering contract for atomic current-child readback. The local pre-submission Current check remains; each readback and recheck now proves authority and child contents at one cut instead of surrounding a child read with separate Current calls. The result and ordering assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-local-kernel-lifecycle::lib=lib::authority::readback_tests::stale_currentness_prevents_submission_and_each_later_read_boundary",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-local-kernel-lifecycle::lib=lib::authority::readback_tests::stale_currentness_prevents_submission_and_each_later_child_cut",
+      "reason": "Rename the stale-authority contract around atomic current-child cuts. It still rejects stale authority before submission and at readback; a change after a completed cut must be rejected by the next recheck. All three boundaries retain refusal and event-order assertions.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::aya_runtime::local_scope::fresh_tests::native_transport_arp_and_packets_cross_only_the_intended_lifecycle_boundaries",
+      "kind": "disabled",
+      "reason": "Add the authenticated native-scope variant of the existing packet-boundary scenario. It needs CAP_BPF/CAP_NET_ADMIN and private network/bpffs namespaces, so ordinary cargo test ignores it. The required local-kernel-lifecycle manifest explicitly executes it; the original local-store case and shared scenario assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::aya_runtime::local_scope::fresh_tests::native_transport_fresh_gtpu_dscp_graphs_open_only_together_under_real_activation",
+      "kind": "disabled",
+      "reason": "Add authenticated native-scope coverage of coordinated GTP-U/DSCP opening. The new case requires privileged private kernel namespaces and is explicitly executed by the required local-kernel-lifecycle manifest. The ordinary-test ignore does not remove the original local-store case or its shared assertions.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::aya_runtime::local_scope::fresh_tests::native_transport_scoped_sessions_keep_undo_publication_and_backpressure_owned",
+      "kind": "disabled",
+      "reason": "Add the native-scope adapter to the existing session ownership, undo, publication and backpressure scenario. Privileged private kernel namespaces require an ordinary-test ignore; the required local-kernel-lifecycle manifest executes the new case and retains its local-store counterpart.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::aya_runtime::local_scope::fresh_tests::native_transport_shutdown_owns_reset_after_caller_cancellation_while_draining",
+      "kind": "disabled",
+      "reason": "Add native-scope coverage of cancellation-safe shutdown and reset ownership. It requires privileged private kernel namespaces and runs explicitly in the required local-kernel-lifecycle manifest. The original local-store case and the shared cancellation/drain assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_transport_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo",
+      "kind": "disabled",
+      "reason": "Add native-scope authority to the existing XFRM expiration/acquire/undo scenario. The required local-kernel-lifecycle manifest explicitly runs this privileged private-namespace case; it is ignored only by ordinary cargo test. The original local-store case and shared assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_transport_rebuilt_authority_cannot_reinstall_a_removed_effect",
+      "kind": "disabled",
+      "reason": "Add native-scope coverage that rebuilding an authority adapter cannot reinstall a retired effect. Privileged private-namespace execution is owned by the required local-kernel-lifecycle manifest. The original local-store test and the shared consumption/reinstall assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_transport_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply",
+      "kind": "disabled",
+      "reason": "Add native-scope coverage to the existing XFRM partial-effect, panic, cancellation and lost-publication-reply scenario. This new privileged private-namespace case is explicitly run by the required local-kernel-lifecycle manifest. Its local-store counterpart and shared assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_transport_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss",
+      "kind": "disabled",
+      "reason": "Add the authenticated native-scope variant of the real-quorum XFRM publication/store-loss scenario. The required local-kernel-lifecycle manifest runs it with its necessary kernel privileges and private namespaces. The original local-store case and its scenario assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_transport_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install",
+      "kind": "disabled",
+      "reason": "Add native-scope coverage of unknown committed replies and stale-child refusal. The case requires kernel privileges/private namespaces and is explicitly included in the required local-kernel-lifecycle manifest. The original local-store test and its shared refusal assertions remain.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-local-kernel-lifecycle::lib=lib::scope::activation_tests::native_transport_opening_owns_interrupted_filter_removal_and_publication",
+      "kind": "disabled",
+      "reason": "Add native-scope authority to the existing opening, interrupted containment removal and publication scenario, including native work-class checks. The required local-kernel-lifecycle manifest runs this privileged private-namespace case. The original local-store case and its shared assertions remain.",
+      "issue": 1225
+    }
+  ]
 }

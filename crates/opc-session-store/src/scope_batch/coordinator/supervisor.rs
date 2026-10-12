@@ -52,6 +52,7 @@ pub(super) async fn run(
                             failure,
                             ScopeBatchError::OutcomeUnknown
                                 | ScopeBatchError::Unavailable
+                                | ScopeBatchError::TransportRevisionMismatch
                                 | ScopeBatchError::Scope(
                                     ScopeAuthorityError::Unavailable
                                         | ScopeAuthorityError::OutcomeUnknown
@@ -132,10 +133,22 @@ pub(super) async fn run(
         }
         let resident = permit.finish_unknown();
         if let Some(outcome) = completed {
+            let context = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                backend.completion_context(
+                    &request,
+                    resident.class(),
+                    &outcome,
+                    control.retention.clone(),
+                )
+            }))
+            .ok()
+            .flatten();
             let completion = ScopeBatchCompletion {
                 attempt: attempt.clone(),
                 outcome,
                 refusal,
+                context,
+                retention: Some(control.retention.clone()),
             };
             {
                 let mut state = lock(&inner.state);
@@ -169,6 +182,7 @@ pub(super) async fn run(
             inner.changed.notify_waiters();
             return;
         }
+        let revision_mismatch = error == Some(ScopeBatchError::TransportRevisionMismatch);
         if let Some(error) = error {
             if let Some(slot) = lock(&inner.state).slots[usize::from(attempt.lane())].as_mut() {
                 slot.last_error = Some(error);
@@ -176,7 +190,14 @@ pub(super) async fn run(
         }
         // This is liveness-only pacing. Time never clears the slot, replaces
         // request bytes, or converts absence into a terminal result.
-        tokio::select! { _ = control.changed.notified() => {}, _ = tokio::time::sleep(delay) => {} }
+        if revision_mismatch {
+            // A mismatch never decides this attempt. Retain its exact bytes and
+            // resident entitlement; even a cancellation wake cannot turn a
+            // mixed-revision endpoint into a hot reconnect/probe loop.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        } else {
+            tokio::select! { _ = control.changed.notified() => {}, _ = tokio::time::sleep(delay) => {} }
+        }
         delay = delay.saturating_mul(2).min(Duration::from_secs(1));
         match resident.start_in_lane(&guard).await {
             Ok(next) => permit = next,

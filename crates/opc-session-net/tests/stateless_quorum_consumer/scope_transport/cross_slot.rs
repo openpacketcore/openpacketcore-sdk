@@ -101,6 +101,18 @@ fn native_scope_shared_identity_cannot_sign_for_another_slots_boot() {
             let scope_b = &scopes[1];
             let stamp_b = &stamps[1];
             let execution_b = peers[1].record.execution();
+            let key_b = ScopeChildKey::new([68; 32]).unwrap();
+            let envelope_b = opc_crypto::CryptoEnvelopeV1 {
+                algorithm: opc_key::AeadAlgorithm::Aes256GcmSiv,
+                key_id: opc_key::KeyId::new("slot-b-child-fixture").unwrap(),
+                nonce: vec![68; 12], aad: vec![68; 32], ciphertext_and_tag: vec![68; 32],
+            }.encode().unwrap();
+            let value_b = ScopeSealedValue::new(envelope_b).unwrap();
+            let seed = ScopeBatchRequest::in_lane(stamp_b, [67; 16], 2, 1,
+                vec![ScopeChildMutation::Create { key: key_b, value: value_b.clone(), claims: vec![] }], vec![]).unwrap();
+            let seeded = peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::ApplyBatch(&seed), &ScopeClock).await.unwrap();
+            let seeded = ScopeBatchOutcome::decode_canonical(&seeded).unwrap();
+            let child_read = ScopeChildReadRequest::new(stamp_b, vec![key_b]).unwrap();
             let apply = ScopeBatchRequest::in_lane(stamp_b, [63; 16], 0, 1, Vec::new(),
                 vec![ScopeCounterMutation::new(0, 0, 1).unwrap()]).unwrap();
             let cancel = ScopeBatchRequest::in_lane(stamp_b, [64; 16], 1, 1, Vec::new(),
@@ -114,10 +126,31 @@ fn native_scope_shared_identity_cannot_sign_for_another_slots_boot() {
                 ScopeAuthorityOperation::Close { current: stamp_b.clone(),
                     evidence: ScopeClosureEvidence::new(ScopeClosureKind::LocalQuiescence, digest).unwrap() }).unwrap();
             let attacks = [RawCall::ApplyBatch(&apply), RawCall::BatchCancel(&cancel), RawCall::Authority(&close),
-                RawCall::Current, RawCall::Outcome(&admissions[1]), RawCall::BatchReopen(stamp_b), RawCall::BatchLookup(&cancel)];
+                RawCall::Current, RawCall::Outcome(&admissions[1]), RawCall::BatchReopen(stamp_b), RawCall::BatchLookup(&cancel),
+                RawCall::ChildRead(&child_read)];
             let before = peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::BatchReopen(stamp_b), &ScopeClock).await.unwrap();
             let cut = ScopeBatchReopen::decode_canonical(&before).unwrap();
             assert!(matches!(cut, ScopeBatchReopen::Initialized(ref state) if state.authority().is_active()));
+            let encoded = child_read.encode_canonical().unwrap();
+            let count = 2 + usize::from(u16::from_be_bytes(encoded[..2].try_into().unwrap()));
+            let mut malformed = Vec::new();
+            for keys in [vec![], vec![key_b.as_bytes().to_vec(); 2], vec![vec![0; 32]], (1..=33).map(|tag| vec![tag; 32]).collect()] {
+                let mut bytes = encoded[..count].to_vec();
+                bytes.push(keys.len() as u8);
+                bytes.extend(keys.into_iter().flatten());
+                malformed.push(bytes);
+            }
+            // A valid stamp from A is still an invalid request on B's bound scope.
+            malformed.push(ScopeChildReadRequest::new(&stamps[0], vec![key_b]).unwrap().encode_canonical().unwrap());
+            for bytes in malformed {
+                let reads = fleet.read_barrier_calls();
+                let log = fleet.stores[leader].status().last_log_index;
+                assert_eq!(crate::scope::attack_test_support::cross_slot::reject_before_proof(
+                    &tls, addresses[3], scope_b, bytes).await, ScopeRpcError::Invalid);
+                assert_eq!(fleet.read_barrier_calls(), reads);
+                assert_eq!(fleet.stores[leader].status().last_log_index, log);
+            }
+            assert_eq!(peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::BatchReopen(stamp_b), &ScopeClock).await.unwrap(), before);
             for call in attacks {
                 let reads = fleet.read_barrier_calls();
                 let log = fleet.stores[leader].status().last_log_index;
@@ -150,6 +183,20 @@ fn native_scope_shared_identity_cannot_sign_for_another_slots_boot() {
             // Positive controls use the identical wire payloads with B's key.
             // A still observes its own slot, and all four B reads succeed.
             peers[0].send(&tls, addresses, &scopes[0], peers[0].record.execution(), RawCall::Current, &ScopeClock).await.unwrap();
+            let reads = fleet.read_barrier_calls();
+            let log = fleet.stores[leader].status().last_log_index;
+            let observed = peers[1].send(&tls, addresses, scope_b, execution_b, RawCall::ChildRead(&child_read), &ScopeClock).await.unwrap();
+            assert_eq!(fleet.read_barrier_calls(), reads + 1, "one full forwarded barrier for the complete fresh-connection child RPC");
+            assert_eq!(fleet.stores[leader].status().last_log_index, log, "child observations append no application command");
+            let observed = crate::scope::child_read_wire::decode_observation(&child_read, &observed).unwrap();
+            assert_eq!(observed.len(), 1);
+            let observed = observed[0].as_ref().unwrap();
+            assert_eq!(observed.namespace(), stamp_b.namespace());
+            assert_eq!(observed.key(), key_b);
+            assert_eq!(observed.revision(), seeded.rows()[0]);
+            assert_eq!(observed.batch_revision(), seeded.revision());
+            assert!(observed.claims().is_empty());
+            assert_eq!(observed.value(), Some(&value_b));
             for call in attacks.into_iter().filter(|call| !call.carries_execution()) {
                 peers[1].send(&tls, addresses, scope_b, execution_b, call, &ScopeClock).await.unwrap();
             }
