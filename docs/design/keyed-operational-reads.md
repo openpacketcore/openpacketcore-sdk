@@ -1,6 +1,6 @@
 # Keyed operational-state reads
 
-Status: proposed for review. Addresses [SDK issue #1270](https://github.com/openpacketcore/openpacketcore-sdk/issues/1270).
+Addresses [SDK issue #1270](https://github.com/openpacketcore/openpacketcore-sdk/issues/1270).
 Source baseline: `d50c92ad1fabeea13aae248b1851a8d7d5d217bb`.
 
 Operational reads must support a list selection with no keys, some keys, or all
@@ -15,10 +15,11 @@ first, then preserve those instances through each server's selection and rendere
 path when it is an instance of at least one requested path:
 
 - Both paths have the same number of segments and the same qualified node names.
-- At every segment, every requested key is present with the same literal value.
-  Omitted keys select any value; an asterisk has no special meaning.
-- Keys added by the response identify the concrete instance. They cannot change
-  a supplied key, another segment, a module, or the path depth.
+- At every segment, every requested key is present with the same value under the
+  canonical key rules below. Omitted keys select any value; an asterisk inside a
+  canonical path is literal.
+- Keys added by the response identify the concrete instance. They cannot change a
+  supplied key, another segment, a module, or the path depth.
 
 For a synthetic list keyed by `site` and `name`, a request for
 `/ex:system/ex:peer/ex:state/ex:up` can receive
@@ -35,36 +36,49 @@ with otherwise valid values. Existing unexpected-origin rejection and omission
 for absent state remain; provider failures remain errors. `value_for` keeps its
 exact-lookup semantics.
 
-Put the canonical path parser/comparator in `opc-mgmt-path`. Use it for
-operational response and event validation, gNMI read selection and wire-path
-conversion, and NETCONF instance selection/grouping. Do not leave a consumer
-that interprets backslashes as escapes: the canonical builder uses literal
-single-quoted values, preserves backslashes, and rejects embedded apostrophes.
-Malformed paths, invalid names and duplicate predicates fail closed. Matching
-uses equal qualified segment names and literal key values, not string prefixes,
-predicate stripping, XPath evaluation or typed-value coercion.
+Servers order accepted entries by canonical path, never by provider order, so equal
+authorized content always renders and fingerprints identically; NETCONF keeps
+configuration order for instances present in configuration.
 
-The opstate matcher is protocol-neutral and validates syntax and the instance
-relation. Before accepting a reported instance, each server must resolve its
-parsed segments with the complete-key resolver and require the re-encoded
-canonical path to equal the supplied path. This verifies declared keys, key
-order, node kind, qualified names and complete tuples at every ancestor list.
-Unknown keys/nodes, missing keys, keys on non-lists and non-canonical aliases
-invalidate the whole response. Schema lookup alone is insufficient. Existing
-schema-specific key/value type and range validation remains the model/binding's
-responsibility; syntax matching must not be described as proving those checks.
-Duplicate detection uses the validated concrete identity. `value_for` remains
-an exact lookup. Partial-key resolution is a read-selection mode only; writes
-and reported concrete instances continue to require complete declared keys.
+Put the canonical path parser/comparator in `opc-mgmt-path`. Use it for operational
+response and event validation, gNMI read selection and wire-path conversion, and NETCONF
+instance selection/grouping. The generated gNMI renderer uses this shared builder for
+its key predicates. Do not leave a consumer that interprets backslashes as escapes or a
+producer that writes them, including the generated gNMI renderer's key predicates. The
+canonical builder writes literal values and preserves backslashes, in single quotes, or
+in double quotes when the value contains an apostrophe, as XPath literals allow; a value
+containing both quote characters fails closed. Malformed paths, invalid names and
+duplicate predicates fail closed. Matching uses equal qualified segment names and equal
+key values, not string prefixes, predicate stripping or XPath evaluation. Integer and
+boolean keys (a leafref key takes its target's type) compare in their RFC 7950 canonical
+form: read selection canonicalizes requested values, a requested value invalid for its
+type selects nothing, and a reported key that is not already canonical invalidates the
+whole response. Other key types compare literally. A reported value at a key leaf must
+equal that instance's key, and renderers emit each key once, from the validated
+identity.
+
+The opstate matcher is protocol-neutral and validates syntax and the instance relation.
+Before accepting a reported instance, each server must resolve its parsed segments with
+the complete-key resolver and require the re-encoded canonical path to equal the
+supplied path. This verifies declared keys, key order, node kind, qualified names and
+complete tuples at every ancestor list. Unknown keys/nodes, missing keys, keys on
+non-lists and non-canonical aliases invalidate the whole response. Schema lookup alone
+is insufficient. Other type, range and pattern validation remains the model/binding's
+responsibility; syntax matching must not be described as proving those checks. Duplicate
+detection uses the validated concrete identity. `value_for` remains an exact lookup.
+Partial-key resolution is a read-selection mode only; writes and reported concrete
+instances continue to require complete declared keys.
 
 ## Server integration
 
-**gNMI.** Use the partial-key read-selection mode for both prefix and path
-resolution in Get and Subscribe planning. Replace exact operational-result
-filtering with concrete `ReadSelectionEntry` values carrying the resolved schema
-path and complete provider instance path. Preserve them through binding selection,
-rendering and wire-path conversion; deduplicate overlapping selectors without
-accepting duplicate provider values.
+**gNMI.** Use the partial-key read-selection mode for both prefix and path resolution in
+Get and Subscribe planning. In gNMI read selection, a key value of exactly `*` is the
+gNMI wildcard and selects as if that key were omitted; element-name wildcards remain
+rejected. Canonical paths and NETCONF keep `*` literal. Replace exact operational-result
+filtering with concrete `ReadSelectionEntry` values carrying the resolved schema path
+and complete provider instance path. Preserve them through binding selection, rendering
+and wire-path conversion; deduplicate overlapping selectors without accepting duplicate
+provider values.
 
 Apply the same matching, strict instance validation, identity dependencies,
 payload filtering and limits to Get, ONCE/POLL, initial snapshots, SAMPLE,
@@ -137,16 +151,29 @@ the retained schema decisions and original key/model/origin/data-type/protocol
 constraints. Expansion supplies new instances, never new schema permissions.
 The policy remains schema-node scoped; this introduces no per-instance NACM.
 
-For Get and Subscribe, apply the #1269 identity rule: an otherwise permitted
-sensitive key may identify the real instance in a gNMI path. Sensitivity alone
-must not restore blanket list suppression. Keep selected sensitive key and
-non-key payloads masked. For NETCONF, preserve the existing data-class masking
-of key-leaf payloads. Group and merge by the complete authorized identity before
-redaction, never by masked key text. A denied key omits the dependent operational
-entry in exact and expanded reads; no incomplete identity or invented row is
-rendered. This does not authorize unmasking XML payloads or changing unrelated
-configuration-renderer missing-key behavior. Generated/custom binding hooks must
-honor concrete selections and the same payload contract.
+For Get and Subscribe, apply the #1269 identity rule. For a permitted entry whose key
+leaves all have a data class that allows cleartext (DataClass::allows_cleartext), encode
+the real key in the canonical gNMI path through explicit inner-value access, as #1269
+requires, and render a selected key leaf with that same value, as NETCONF does. A key
+whose class forbids cleartext (security-secret, lawful-intercept, or the security-secret
+class assigned to a secret-like name) never enters a gNMI path, real, masked or hashed:
+when its keys are allowed, a selected non-empty list keeps today's fixed, schema-only
+refusal; when a key is denied, the list is omitted like any other. NETCONF keeps
+rendering such a key masked, because an XML key element can carry a masked value and a
+gNMI path cannot. Non-key payload values keep their data-class masking.
+
+The baseline gNMI operational path passes provider JSON through unmasked. In Get, every
+snapshot and every event, mask each accepted operational payload, key leaves included,
+whose schema data class does not allow cleartext, with the redaction the generated gNMI
+renderer applies to configuration leaves.
+
+For NETCONF, preserve the existing data-class masking of key-leaf payloads. Group and
+merge by the complete authorized identity before redaction, never by masked key text. A
+denied key omits the dependent operational entry in exact and expanded reads; no
+incomplete identity or invented row is rendered. This does not authorize unmasking XML
+payloads or changing unrelated configuration-renderer missing-key behavior.
+Generated/custom binding hooks must honor concrete selections and the same payload
+contract.
 
 Normal authorization omission reveals no refused instance through paths,
 prefixes, payloads, deletes, placeholders, error detail, Debug/log output, audit
@@ -162,79 +189,89 @@ Malformed, duplicate, unsolicited or out-of-request provider output still fails
 the whole response with fixed, value-free and observed-count-free diagnostics;
 it must not be silently converted to successful omission.
 
-Before server-side parsing/projection or allocating per-entry indexes, reject
-a provider response with more than N = `max_paths_per_request` reported values.
-Then reject any JSON value whose encoded byte length exceeds
-V = `max_value_bytes` before projection. Apply the same checks to both servers and
-Subscribe snapshots; retain per-update limits for operational events. Overflow
-fails the whole read with no truncated success, using the existing protocol limit
-classification and fixed diagnostic detail without actual counts or key lengths.
-The defaults are N = 1024 and V = 1 MiB: N times V permits up to 1 GiB of raw JSON
-payload alone. These acceptance checks are new requirements on expanded output,
-not proof that the baseline already applies them there.
-
-The synchronous provider returns an already allocated vector and receives no
-SDK result budget, paging credit or allocation limit. Provider result construction
-and peak memory are unbounded by this interface. This design also sets no bound
-on canonical response-path bytes, total rendered output, custom renderer work or
-overall server memory. Count/per-JSON-value checks do not supply those bounds.
-Existing input transport/XML limits do not cap provider allocations or replies.
-gNMI queues bound object count using
-clamp(floor(`max_subscriber_queue_bytes` / 4096), 1, 1024), default 1024, and await
-capacity on send. They do not enforce the configured byte value against actual
-expanded messages. A hard end-to-end memory bound would require a separate
-provider-budget/streaming and retained-byte/output-limit contract.
+Before server-side parsing/projection or allocating per-entry indexes, reject a provider
+response with more than N = `max_paths_per_request` reported values. Then, before
+parsing any entry, reject a reported canonical path or encoded JSON value longer than V
+= `max_value_bytes` bytes. Apply the count check to both servers and every Subscribe
+snapshot, and the path and value checks also to each operational event. Overflow fails
+the whole read or ends the subscription with the existing protocol limit classification
+and fixed detail without counts or lengths; it never truncates. One accepted read or
+snapshot therefore holds at most N paths and N values of at most V bytes each (2 GiB at
+the defaults N = 1024, V = 1 MiB), and server copies, escaping and rendering stay linear
+in that. `OperationalRequest` carries N; the `OperationalStateProvider` documentation
+states that an omitted key asks for every instance, that each instance is reported once
+even when requested paths overlap, and that a provider stops after N + 1 values. A
+provider that ignores this is still refused; what it allocates before returning is the
+application's responsibility. gNMI queues keep their object-count bound,
+clamp(floor(`max_subscriber_queue_bytes` / 4096), 1, 1024), and await capacity on send;
+charging actual message bytes against `max_subscriber_queue_bytes` remains an existing
+gap outside this change.
 
 ## Failing tests first
 
 Give the regressions explicit names and exact outcomes. Required test contracts:
 
-- `operational_response_matches_key_subsets`: no/partial/all keys, nested
-  composite lists, literal asterisk, overlap and unchanged exact lookup.
+- `operational_response_matches_key_subsets`: no/partial/all keys, nested composite
+  lists, literal asterisk, overlap and unchanged exact lookup.
 - `operational_response_rejects_invalid_members_atomically`: wrong
-  key/module/node/depth, malformed/duplicate predicates, duplicate values,
-  unsolicited origin and valid-plus-invalid mixtures.
+  key/module/node/depth, malformed/duplicate predicates, duplicate values, unsolicited
+  origin and valid-plus-invalid mixtures.
 - `operational_paths_round_trip_canonical_literals` and
-  `operational_instances_require_complete_declared_keys`: all parser/encoder
-  consumers, literal/trailing backslashes, delimiters, strict concrete paths,
-  canonical ordering and unchanged complete-key write rejection.
-- `gnmi_operational_get_expands_instances`: real root/prefix/collection/leaf
-  requests return exactly zero/one/many selected instances, without fabrication.
+  `operational_instances_require_complete_declared_keys`: all parser/encoder consumers,
+  literal/trailing backslashes, delimiters, configuration and provider keys with
+  backslashes or apostrophes read without keys, strict concrete paths, canonical
+  ordering, non-canonical integer and boolean keys, one key in two encodings, a key-leaf
+  value that differs from its path key and unchanged complete-key write rejection.
+- `gnmi_operational_get_expands_instances`: real root/prefix/collection/leaf requests
+  return exactly zero/one/many selected instances, a `[key=*]` request returns exactly
+  the omitted-key result in Get and Subscribe, without fabrication.
 - `operational_reads_use_one_policy_context`,
   `operational_denied_key_prunes_allowed_child`,
   `operational_denial_diagnostics_do_not_count_instances` and
-  `operational_expansion_preserves_filters`: one context including effective
-  groups and all keys, pre-provider pruning, unchanged allowed siblings,
-  model/type/origin/branch constraints and no instance-dependent diagnostics.
+  `operational_expansion_preserves_filters`: one context including effective groups and
+  all keys, pre-provider pruning, unchanged allowed siblings, model/type/origin/branch
+  constraints and no instance-dependent diagnostics.
 - `gnmi_keyed_subscribe_snapshots_and_events` and
-  `gnmi_keyed_subscribe_revocation_and_hidden_changes`: every snapshot mode,
-  ON_CHANGE update/delete, updates_only, partial-key planning, Read versus
-  Subscribe, policy failure/revocation and controlled hidden-change observations.
+  `gnmi_keyed_subscribe_revocation_and_hidden_changes`: every snapshot mode, ON_CHANGE
+  update/delete, updates_only, partial-key planning, Read versus Subscribe, policy
+  failure/revocation, a provider that reorders unchanged instances without causing an
+  update, and controlled hidden-change observations.
 - `netconf_keyed_get_preserves_instance_tree` and
   `netconf_keyed_xpath_and_operational_get_data`: subtree key subsets and branch
-  correlation, supported XPath expansion and predicate rejection, operational
-  get-data filters, nested/sibling identities, config/state merge, namespaces,
-  escaped keys, no defaults/placeholders for absent instances and no widening.
-- `operational_expansion_limits_are_checked_before_projection`: configured N/V
-  boundaries, overflow from one broad selector, no renderer call or partial
-  success after overflow, fixed diagnostics, and an explicit control documenting
-  the absence of a canonical-path-byte bound.
+  correlation, supported XPath expansion and predicate rejection, operational get-data
+  filters, nested/sibling identities, config/state merge, namespaces, escaped keys,
+  content-match text at and over the XML limits, including text split across parser
+  events, no defaults/placeholders for absent instances and no widening.
+- `netconf_keyed_content_match_text_is_bounded`: accumulated content-match text and node
+  counts at and over the XML limits, including text split across parser events; overflow
+  rejects before provider access with no partial result.
+- `operational_expansion_limits_are_checked_before_projection`: N and V boundaries for
+  values and paths in gNMI Get, Subscribe snapshots and events and NETCONF get and
+  get-data, overflow from one broad selector, a provider that stops at N + 1, no
+  renderer call or partial success after overflow, and fixed diagnostics.
+- `operational_non_cleartext_key_class_is_refused`: security-secret, lawful-intercept
+  and secret-like-name keys under a full grant give a fixed gNMI refusal and masked
+  NETCONF keys; denied keys omit the entry.
 - `operational_opaque_aggregate_cannot_bypass_selection` and
-  `operational_expansion_preserves_sensitive_encoding_and_debug`: child access
-  inside aggregates, permitted sensitive identities, unchanged payload masking
-  and #435 Debug/Display/serialization protection.
+  `operational_expansion_preserves_sensitive_encoding_and_debug`: child access inside
+  aggregates, permitted sensitive identities, operational payloads of non-cleartext
+  classes masked in gNMI Get, snapshots and events as in NETCONF and #435
+  Debug/Display/serialization protection.
 
-After the quiet window, record each test's exact command and candidate revision.
-Demonstrate separate failing changes for exact-only matching/result lookup,
-missing strict path validation, dropping predicates/branch constraints, bypassing
-leaf or identity authorization, reloading policy between dependencies, skipping
-event enforcement, bypassing response limits and removing diagnostic redaction.
-Existing exact-read, denied-leaf, duplicate/origin, unsupported-filter and Debug
-tests are preservation controls: they may already pass at baseline and must fail
-when their own guard is removed, not necessarily when expansion alone is absent.
-Inspect complete decoded paths/payloads, error detail/Debug, logs, audit and metric
-observations, including counts. Renderer-only fixtures cannot prove authenticated
-server behavior. Record intentional test replacements in the required inventory.
+Record each test's exact command and candidate revision. Demonstrate separate failing
+changes for exact-only matching/result lookup, missing strict path validation, literal
+comparison of integer or boolean keys, a literal gNMI `*` key, one backslash-escaping
+producer or consumer, dropping predicates/branch constraints, bypassing leaf or identity
+authorization, reloading policy between dependencies, skipping event enforcement,
+removing the opaque-aggregate guard, timestamp- or order-sensitive change detection,
+per-event denial records, unmasked gNMI operational payloads, bypassing response or
+filter-text limits and removing diagnostic redaction. Existing exact-read, denied-leaf,
+duplicate/origin, unsupported-filter and Debug tests are preservation controls: they may
+already pass at baseline and must fail when their own guard is removed, not necessarily
+when expansion alone is absent. Inspect complete decoded paths/payloads, error
+detail/Debug, logs, audit and metric observations, including counts. Renderer-only
+fixtures cannot prove authenticated server behavior. Record intentional test
+replacements in the required inventory.
 
 Run the focused contract/server/codegen regressions, then the repository's
 required final gates on the implementation candidate. This note changes no stored
