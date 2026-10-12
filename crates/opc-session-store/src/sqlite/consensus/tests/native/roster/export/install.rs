@@ -231,15 +231,19 @@ fn native_snapshot_origin_original_install_preserves_local_vote_suffix_and_every
                     .unwrap();
                 let direct = storage.validate_snapshot(&changed);
                 let context = contextual.log.validate(&contextual.business);
-                assert!(
-                    direct.is_err() && context.is_err(),
-                    "same cut with different metadata is not the admitted incoming snapshot: field {field}, direct {direct:?}, context {context:?}"
-                );
+                for (route, result) in [("direct", direct), ("context", context)] {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "native snapshot applied lineage differs from retained log",
+                        "same cut with different metadata is not the admitted incoming snapshot: field {field}, route {route}"
+                    );
+                }
             }
             let mut changed = incoming.candidate.clone();
             changed.0.last_log_id.as_mut().unwrap().leader_id.term += 1;
-            assert!(
-                storage.validate_snapshot(&changed).is_err(),
+            assert_eq!(
+                storage.validate_snapshot(&changed).unwrap_err().to_string(),
+                "native snapshot is ahead of applied state",
                 "the complete LogId remains exact"
             );
             let mut local_export = incoming.candidate.clone();
@@ -815,8 +819,9 @@ fn native_snapshot_origin_purge_removes_covered_prefix_through_export_and_cold_c
         .expect("the selected snapshot covers the removed prefix after an install");
     let mut hole = storage.clone();
     hole.log.entries.remove(&7);
-    assert!(
-        hole.validate_image().is_err(),
+    assert_eq!(
+        hole.validate_image().unwrap_err().to_string(),
+        "native log pointer lacks exact retained lineage",
         "the installed origin cannot authorize a missing retained applied row"
     );
     let target = empty(&signed);
