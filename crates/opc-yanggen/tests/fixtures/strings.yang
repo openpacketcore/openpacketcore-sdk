@@ -1,0 +1,31 @@
+module example {
+  yang-version 1.1;
+  namespace "urn:example:strings";
+  prefix ex;
+  revision 2026-10-12;
+  container root {
+    leaf code { type string { pattern '[0-9]{3}'; } }
+    leaf label { type string { length '1..3 | 5'; } }
+    leaf name { type string { length '1..150'; } }
+    leaf word { type string { pattern '[a-z]+'; pattern 'bad' { modifier invert-match; } } }
+    leaf consonants { type string { pattern '[a-z-[aeiou]]+'; } }
+    leaf literal { type string { pattern '^[$]$'; } }
+    leaf unicode { type string { pattern '\p{L}+'; } }
+    leaf whitespace { type string { pattern '\s'; } }
+    leaf nonspace { type string { pattern '\w+'; } }
+    leaf choice { type string { pattern '(ab|cd){1,2}x?'; } }
+    leaf defaulted { type string { length '3'; pattern '[0-9]+'; } default '123'; }
+    leaf reference { type leafref { path '/ex:root/ex:code'; } }
+    leaf-list labels { type string { length '2..3'; } }
+    leaf-list preferences { type string { pattern '[a-z]+'; } ordered-by user; }
+    leaf secret { type string { length '3'; pattern '[0-9]+'; } }
+    leaf-list api-token { type string { length '3'; } ordered-by user; }
+    container child { leaf code { type string { pattern '[0-9]{3}'; } } }
+    list account {
+      key 'secret-id';
+      leaf secret-id { type string { length '3'; pattern '[0-9]+'; } }
+      leaf value { type string { length '1'; } }
+    }
+    container state { config false; leaf label { type string { length '2'; } } }
+  }
+}

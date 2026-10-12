@@ -1,0 +1,72 @@
+module n {
+  yang-version 1.1;
+  namespace "urn:integers";
+  prefix n;
+  container system {
+    leaf u8 { type uint8 { range "min..max"; } default 255; }
+    leaf u16 { type uint16 { range "min..max"; } }
+    leaf u32 { type uint32 { range "min..max"; } }
+    leaf u64 { type uint64 { range "min..max"; } default 18446744073709551615; }
+    leaf i8 { type int8 { range "min..max"; } default -128; }
+    leaf i16 { type int16 { range "min..max"; } default -32768; }
+    leaf i32 { type int32 { range "min..max"; } default -2147483648; }
+    leaf i64 { type int64 { range "min..max"; } }
+    leaf bounded { type uint64 { range "9223372036854775808..max"; } }
+    leaf signed { type int8 { range "min..-1 | 1..max"; } }
+    leaf-list unsigned-values { type uint64 { range "1..max"; } }
+    leaf-list signed-values { type int16 { range "-100..100"; } }
+    leaf reference { type leafref { path "/n:system/n:u64"; } }
+    container left {
+      container stats { leaf value { type int32 { range "min..max"; } } }
+      list row { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int8 { range "min..max"; } } }
+    }
+    container right {
+      container stats { leaf value { type uint8 { range "min..max"; } } }
+      list row { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int16 { range "min..max"; } } }
+    }
+    leaf-list uint8-values { type uint8 { range "min..max"; } }
+    list by-uint8 { key "id"; leaf id { type uint8 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list uint16-values { type uint16 { range "min..max"; } }
+    list by-uint16 { key "id"; leaf id { type uint16 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list uint32-values { type uint32 { range "min..max"; } }
+    list by-uint32 { key "id"; leaf id { type uint32 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list uint64-values { type uint64 { range "min..max"; } }
+    list by-uint64 { key "id"; leaf id { type uint64 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list int8-values { type int8 { range "min..max"; } }
+    list by-int8 { key "id"; leaf id { type int8 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list int16-values { type int16 { range "min..max"; } }
+    list by-int16 { key "id"; leaf id { type int16 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list int32-values { type int32 { range "min..max"; } }
+    list by-int32 { key "id"; leaf id { type int32 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf-list int64-values { type int64 { range "min..max"; } }
+    list by-int64 { key "id"; leaf id { type int64 { range "min..max"; } } leaf value { type uint8 { range "min..max"; } } }
+    leaf bounded-reference { type leafref { path "/n:system/n:bounded"; } }
+    leaf chained-reference { type leafref { path "/n:system/n:bounded-reference"; } }
+    leaf-list bounded-references { type leafref { path "/n:system/n:bounded"; } }
+    leaf secret-count { type uint64 { range "1..max"; } }
+    leaf-list secret-values { type int32 { range "-1..1"; } }
+    container state { config false; leaf count { type uint64 { range "1..max"; } } }
+    list restricted { key "secret-id"; leaf secret-id { type uint64 { range "1..max"; } } }
+    container names {
+      container default { leaf value { type uint8; } }
+      container box { leaf value { type uint8; } }
+      container from { leaf value { type uint8; } }
+      container into-iterator { leaf value { type uint8; } }
+      container config-error { leaf value { type uint8; } }
+      container node-kind { leaf value { type uint8; } }
+
+      container alpha { list shared { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int64 { range "min..max"; } } } }
+      container beta { list shared { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int64 { range "min..max"; } } } }
+      container alpha-shared { leaf value { type uint8 { range "min..max"; } } }
+      container gamma { list item { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int64 { range "min..max"; } } } }
+      container delta { list item { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int64 { range "min..max"; } } } }
+      container gamma-item-key { leaf value { type uint8 { range "min..max"; } } }
+      list unique { key "id slot"; leaf id { type uint64 { range "min..max"; } } leaf slot { type int64 { range "min..max"; } } }
+      container unique-key { leaf value { type uint8 { range "min..max"; } } }
+      container yang-int64 { leaf value { type uint8 { range "min..max"; } } }
+      container yang-uint64 { leaf value { type uint8 { range "min..max"; } } }
+      container leaf-presence { leaf value { type uint8 { range "min..max"; } } }
+      container sensitive-key { leaf value { type uint8 { range "min..max"; } } }
+    }
+  }
+}

@@ -3213,6 +3213,7 @@ dependencies = [
  "opc-config-model",
  "opc-data-governance",
  "opc-redaction",
+ "regex",
 ]
 
 [[package]]
@@ -3934,6 +3935,7 @@ dependencies = [
 name = "opc-yanggen"
 version = "0.2.0"
 dependencies = [
+ "opc-mgmt-schema",
  "proc-macro2",
  "quote",
  "serde",

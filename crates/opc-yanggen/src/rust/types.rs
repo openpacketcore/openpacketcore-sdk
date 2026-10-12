@@ -1,3 +1,4 @@
+use super::NodeIndex;
 use super::{
     clean_segment, is_sensitive_name, last_segment, to_pascal_case, to_snake_case,
     RustGenerationError,
@@ -6,7 +7,6 @@ use crate::emit::CanonicalInput;
 use crate::ir::{AllocationStrategy, SchemaNode, SchemaNodeKind, TypeRef};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 
 pub fn is_sensitive_node(node: &SchemaNode) -> bool {
     if let Some(ref dc) = node.data_class {
@@ -16,13 +16,13 @@ pub fn is_sensitive_node(node: &SchemaNode) -> bool {
     }
 }
 
-fn get_raw_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
+fn get_raw_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     get_raw_type_internal(node, nodes_by_path, &mut std::collections::HashSet::new())
 }
 
 fn get_raw_type_internal(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
     visited: &mut std::collections::HashSet<String>,
 ) -> TokenStream {
     if visited.contains(&node.path) {
@@ -31,9 +31,15 @@ fn get_raw_type_internal(
     visited.insert(node.path.clone());
     match &node.type_ref {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
+        | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::Uint8) => quote! { u8 },
+        Some(TypeRef::Int8) => quote! { i8 },
+        Some(TypeRef::Int16) => quote! { i16 },
+        Some(TypeRef::Int32) => quote! { i32 },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
+        Some(TypeRef::Uint64) => quote! { YangUint64 },
         Some(TypeRef::Int64) => quote! { YangInt64 },
         Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
         Some(TypeRef::Empty) => quote! { YangEmpty },
@@ -53,10 +59,7 @@ fn get_raw_type_internal(
     }
 }
 
-pub(super) fn get_key_type(
-    list_node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
-) -> TokenStream {
+pub(super) fn get_key_type(list_node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     if list_node.key_leaves.len() == 1 {
         let key_name = &list_node.key_leaves[0];
         let mut key_ty = quote! { String };
@@ -74,8 +77,7 @@ pub(super) fn get_key_type(
         }
         key_ty
     } else {
-        let name = clean_segment(last_segment(&list_node.path));
-        let struct_name = format_ident!("{}Key", to_pascal_case(name));
+        let struct_name = format_ident!("{}Key", nodes_by_path.type_name(list_node));
         quote! { #struct_name }
     }
 }
@@ -83,7 +85,7 @@ pub(super) fn get_key_type(
 fn key_leaf_node<'a>(
     list_node: &SchemaNode,
     key_name: &str,
-    nodes_by_path: &HashMap<String, &'a SchemaNode>,
+    nodes_by_path: &NodeIndex<'a>,
 ) -> Option<&'a SchemaNode> {
     list_node.child_paths.iter().find_map(|child_path| {
         nodes_by_path
@@ -93,7 +95,7 @@ fn key_leaf_node<'a>(
     })
 }
 
-fn has_sensitive_key(list_node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> bool {
+fn has_sensitive_key(list_node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> bool {
     list_node.key_leaves.iter().any(|key_name| {
         key_leaf_node(list_node, key_name, nodes_by_path).is_some_and(is_sensitive_node)
     })
@@ -106,10 +108,7 @@ fn is_root_path(path: &str) -> bool {
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut tokens = TokenStream::new();
-    let mut nodes_by_path = HashMap::new();
-    for node in &input.nodes {
-        nodes_by_path.insert(node.path.clone(), node);
-    }
+    let nodes_by_path = NodeIndex::new(&input.nodes);
 
     let has_sensitive_single_key = input.nodes.iter().any(|node| {
         node.kind == SchemaNodeKind::List
@@ -226,6 +225,55 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
         }
+    } else {
+        quote! {}
+    };
+
+    let uint64_wrapper = if super::has_extended_integers(input) {
+        quote! {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+            pub struct YangUint64(pub u64);
+            impl Serialize for YangUint64 {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    serializer.serialize_str(&self.0.to_string())
+                }
+            }
+            impl<'de> Deserialize<'de> for YangUint64 {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    let s = String::deserialize(deserializer)?;
+                    let val = s.parse::<u64>().map_err(serde::de::Error::custom)?;
+                    Ok(YangUint64(val))
+                }
+            }
+
+            impl std::fmt::Display for YangUint64 {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    self.0.fmt(f)
+                }
+            }
+
+        }
+    } else {
+        quote! {}
+    };
+    let int64_derive = if super::has_extended_integers(input) {
+        quote! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)] }
+    } else {
+        quote! { #hash_derive #[derive(Clone, Copy, Debug, PartialEq, Default)] }
+    };
+    let int64_display = if super::has_extended_integers(input) {
+        quote! {
+        impl std::fmt::Display for YangInt64 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }    }
     } else {
         quote! {}
     };
@@ -354,8 +402,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        #hash_derive
-        #[derive(Clone, Copy, Debug, PartialEq, Default)]
+        #uint64_wrapper
+
+        #int64_derive
         pub struct YangInt64(pub i64);
         impl Serialize for YangInt64 {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -375,6 +424,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 Ok(YangInt64(val))
             }
         }
+
+        #int64_display
 
         #[derive(Clone, Copy, Debug, PartialEq, Default)]
         pub struct YangDecimal64(pub f64);
@@ -442,12 +493,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     for node in &input.nodes {
         if node.kind == SchemaNodeKind::Container || node.kind == SchemaNodeKind::List {
-            let name = clean_segment(last_segment(&node.path));
-            let struct_name = format_ident!("{}", to_pascal_case(name));
+            let struct_name = format_ident!("{}", nodes_by_path.type_name(node));
 
             let mut fields = TokenStream::new();
             let mut default_fields = Vec::new();
             let mut has_defaults = false;
+            let mut deserialize_helpers = TokenStream::new();
 
             for child_path in &node.child_paths {
                 if let Some(child) = nodes_by_path.get(child_path) {
@@ -464,7 +515,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             }
                         }
                         SchemaNodeKind::Container => {
-                            let ty_name = format_ident!("{}", to_pascal_case(child_name));
+                            let ty_name = format_ident!("{}", nodes_by_path.type_name(child));
                             let mut is_boxed = false;
                             for shape in &input.stack_shapes {
                                 if shape.yang_path == child.path
@@ -480,7 +531,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             }
                         }
                         SchemaNodeKind::List => {
-                            let ty_name = format_ident!("{}", to_pascal_case(child_name));
+                            let ty_name = format_ident!("{}", nodes_by_path.type_name(child));
                             if child.key_leaves.is_empty() {
                                 quote! { Vec<#ty_name> }
                             } else {
@@ -493,19 +544,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             }
                         }
                         SchemaNodeKind::LeafList => {
-                            let mut resolved_elem_ty = child.type_ref.as_ref();
-                            if let Some(TypeRef::LeafRef { target_path }) = resolved_elem_ty {
-                                if let Some(target_node) = nodes_by_path.get(target_path) {
-                                    resolved_elem_ty = target_node.type_ref.as_ref();
-                                }
-                            }
+                            let resolved_elem_ty =
+                                nodes_by_path.legacy_or_resolved(child).type_ref.as_ref();
                             let elem_ty = match resolved_elem_ty {
                                 Some(TypeRef::Boolean) => quote! { bool },
-                                Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => {
+                                Some(TypeRef::String | TypeRef::RestrictedString { .. })
+                                | Some(TypeRef::Enumeration { .. }) => {
                                     quote! { String }
                                 }
+                                Some(TypeRef::Uint8) => quote! { u8 },
+                                Some(TypeRef::Int8) => quote! { i8 },
+                                Some(TypeRef::Int16) => quote! { i16 },
+                                Some(TypeRef::Int32) => quote! { i32 },
                                 Some(TypeRef::Uint16) => quote! { u16 },
                                 Some(TypeRef::Uint32) => quote! { u32 },
+                                Some(TypeRef::Uint64) => quote! { YangUint64 },
                                 Some(TypeRef::Int64) => quote! { YangInt64 },
                                 Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
                                 Some(TypeRef::Empty) => quote! { YangEmpty },
@@ -575,6 +628,67 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         quote! {
                             #[serde(serialize_with = "super::serde::serialize_list", deserialize_with = "super::serde::deserialize_list")]
                         }
+                    } else if has_scalar_constraints(child, &nodes_by_path) {
+                        let helper_ident = format_ident!("deserialize_{}", field_ident);
+                        let helper_path = format!("{struct_name}::{helper_ident}");
+                        let checks = scalar_constraint_check(
+                            child,
+                            &nodes_by_path,
+                            quote! { field },
+                            quote! { serde::de::Error::custom },
+                        );
+                        let constrained_string = matches!(
+                            nodes_by_path.scalar_node(child).type_ref,
+                            Some(TypeRef::RestrictedString { .. })
+                        );
+                        let deserialize = if constrained_string {
+                            quote! { <#field_type>::deserialize(deserializer).map_err(|_| serde::de::Error::custom("string violates YANG constraints"))? }
+                        } else if child.kind == SchemaNodeKind::LeafList
+                            && super::is_user_ordered(child)
+                        {
+                            if is_sensitive {
+                                quote! { super::serde::deserialize_unique_secret_leaf_list(deserializer)? }
+                            } else {
+                                quote! { super::serde::deserialize_unique_leaf_list(deserializer)? }
+                            }
+                        } else {
+                            quote! { <#field_type>::deserialize(deserializer)? }
+                        };
+                        let uniqueness = if constrained_string
+                            && child.kind == SchemaNodeKind::LeafList
+                            && super::is_user_ordered(child)
+                        {
+                            let values = if is_sensitive {
+                                quote! { field.get() }
+                            } else {
+                                quote! { &field }
+                            };
+                            quote! {
+                                if super::serde::has_duplicate_values(#values) {
+                                    return Err(serde::de::Error::custom(super::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR));
+                                }
+                            }
+                        } else {
+                            quote! {}
+                        };
+                        deserialize_helpers.extend(quote! {
+                            fn #helper_ident<'de, D>(deserializer: D) -> Result<#field_type, D::Error>
+                            where D: serde::Deserializer<'de> {
+                                let field: #field_type = #deserialize;
+                                #uniqueness
+                                #checks
+                                Ok(field)
+                            }
+                        });
+                        if child.kind == SchemaNodeKind::LeafList && super::is_user_ordered(child) {
+                            if is_sensitive {
+                                quote! { #[serde(serialize_with = "super::serde::serialize_unique_secret_leaf_list", deserialize_with = #helper_path)] }
+                            } else {
+                                quote! { #[serde(serialize_with = "super::serde::serialize_unique_leaf_list", deserialize_with = #helper_path)] }
+                            }
+                        } else {
+                            quote! { #[serde(deserialize_with = #helper_path)] }
+                        }
                     } else if child.kind == SchemaNodeKind::LeafList
                         && super::is_user_ordered(child)
                     {
@@ -631,9 +745,17 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 });
             }
 
+            if !deserialize_helpers.is_empty() {
+                tokens.extend(quote! {
+                    impl #struct_name {
+                        #deserialize_helpers
+                    }
+                });
+            }
+
             // Generate key struct if it's a multi-key list
             if node.kind == SchemaNodeKind::List && node.key_leaves.len() > 1 {
-                let key_struct_ident = format_ident!("{}Key", to_pascal_case(name));
+                let key_struct_ident = format_ident!("{}Key", nodes_by_path.type_name(node));
                 let hash_derive = if super::is_user_ordered(node) {
                     quote! { #[derive(std::hash::Hash)] }
                 } else {
@@ -726,7 +848,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         quote! { self.#field_ident.as_option().cloned() }
                     }
                 } else {
-                    let key_struct_ident = format_ident!("{}Key", to_pascal_case(name));
+                    let key_struct_ident = format_ident!("{}Key", nodes_by_path.type_name(node));
                     let mut key_constructors = TokenStream::new();
                     for key_field in &node.key_leaves {
                         let mut child_node = None;
@@ -771,21 +893,108 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     Ok(tokens.to_string())
 }
 
-fn get_field_default_expr(
-    child: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+pub(super) fn has_scalar_constraints(node: &SchemaNode, nodes: &NodeIndex<'_>) -> bool {
+    let scalar = nodes.scalar_node(node);
+    (nodes.extended_integers && !scalar.numeric_range.is_empty())
+        || matches!(scalar.type_ref, Some(TypeRef::RestrictedString { .. }))
+}
+
+pub(super) fn scalar_constraint_check(
+    node: &SchemaNode,
+    nodes: &NodeIndex<'_>,
+    access: TokenStream,
+    error: TokenStream,
 ) -> TokenStream {
-    if let Some(ref def_str) = child.default {
-        let mut resolved_type = child.type_ref.as_ref();
-        if let Some(TypeRef::LeafRef { target_path }) = resolved_type {
-            if let Some(target_node) = nodes_by_path.get(target_path) {
-                resolved_type = target_node.type_ref.as_ref();
-            }
+    let mut checks = numeric_range_check(node, nodes, access.clone(), error.clone());
+    if !matches!(
+        nodes.scalar_node(node).type_ref,
+        Some(TypeRef::RestrictedString { .. })
+    ) {
+        return checks;
+    }
+    let access = if is_sensitive_node(node) {
+        quote! { #access.get() }
+    } else {
+        access
+    };
+    let path = &node.path;
+    let check = quote! { if !super::strings::valid(#path, value) { return Err(#error("string violates YANG constraints")); } };
+    checks.extend(match node.kind {
+        SchemaNodeKind::LeafList => quote! { for value in #access.iter() { #check } },
+        SchemaNodeKind::Leaf if node.config => {
+            quote! { if let Some(value) = #access.as_option() { #check } }
         }
+        SchemaNodeKind::Leaf => quote! { if let Some(value) = #access.as_ref() { #check } },
+        _ => TokenStream::new(),
+    });
+    checks
+}
+
+pub(super) fn numeric_range_check(
+    node: &SchemaNode,
+    nodes: &NodeIndex<'_>,
+    access: TokenStream,
+    error: TokenStream,
+) -> TokenStream {
+    let scalar = nodes.scalar_node(node);
+    if !nodes.extended_integers || scalar.numeric_range.is_empty() {
+        return TokenStream::new();
+    }
+    let access = if is_sensitive_node(node) {
+        quote! { #access.get() }
+    } else {
+        access
+    };
+    let numeric_value = if matches!(scalar.type_ref, Some(TypeRef::Uint64 | TypeRef::Int64)) {
+        quote! { i128::from(value.0) }
+    } else {
+        quote! { i128::from(*value) }
+    };
+    let checks = scalar.numeric_range.iter().map(|interval| {
+        let min = interval.min;
+        let max = interval.max;
+        quote! { (#min..=#max).contains(&numeric_value) }
+    });
+    let message = format!("numeric value at {} is outside YANG range", node.path);
+    let check = quote! {
+        let numeric_value = #numeric_value;
+        if !(#(#checks)||*) {
+            return Err(#error(#message));
+        }
+    };
+    match node.kind {
+        SchemaNodeKind::LeafList => quote! { for value in #access.iter() { #check } },
+        SchemaNodeKind::Leaf if node.config => quote! {
+            if let Some(value) = #access.as_option() { #check }
+        },
+        SchemaNodeKind::Leaf => quote! { if let Some(value) = #access.as_ref() { #check } },
+        _ => TokenStream::new(),
+    }
+}
+
+fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
+    if let Some(ref def_str) = child.default {
+        let resolved_type = nodes_by_path.legacy_or_resolved(child).type_ref.as_ref();
         let val_expr = match resolved_type {
             Some(TypeRef::Boolean) => {
                 let b = def_str == "true";
                 quote! { #b }
+            }
+            Some(TypeRef::Uint8) => {
+                let val = def_str.parse::<u8>().unwrap_or(0);
+                quote! { #val }
+            }
+            Some(TypeRef::Int8) => {
+                let val = def_str.parse::<i8>().unwrap_or(0);
+                quote! { #val }
+            }
+            Some(TypeRef::Int16) => {
+                let val = def_str.parse::<i16>().unwrap_or(0);
+                quote! { #val }
+            }
+            Some(TypeRef::Int32) => {
+                let val = def_str.parse::<i32>().unwrap_or(0);
+                quote! { #val }
             }
             Some(TypeRef::Uint16) => {
                 let val = def_str.parse::<u16>().unwrap_or(0);
@@ -794,6 +1003,10 @@ fn get_field_default_expr(
             Some(TypeRef::Uint32) => {
                 let val = def_str.parse::<u32>().unwrap_or(0);
                 quote! { #val }
+            }
+            Some(TypeRef::Uint64) => {
+                let val = def_str.parse::<u64>().unwrap_or(0);
+                quote! { YangUint64(#val) }
             }
             Some(TypeRef::Int64) => {
                 let val = def_str.parse::<i64>().unwrap_or(0);

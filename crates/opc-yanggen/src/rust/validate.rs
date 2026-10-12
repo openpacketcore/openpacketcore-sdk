@@ -1,4 +1,4 @@
-use super::{clean_segment, last_segment, to_pascal_case, to_snake_case, RustGenerationError};
+use super::{clean_segment, last_segment, to_snake_case, RustGenerationError};
 use crate::emit::{format_constraint_expr, CanonicalInput};
 use crate::ir::{
     BooleanOp, CompareOp, ConstraintBinding, ConstraintExpr, FunctionName, Literal, PathAnchor,
@@ -18,12 +18,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         .ok_or_else(|| {
             RustGenerationError::new("root node not found while generating validation module")
         })?;
-    let root_name = clean_segment(last_segment(&root.path));
-    let root_type = format_ident!("{}", to_pascal_case(root_name));
+    let nodes_by_path = super::NodeIndex::new(&input.nodes);
+    let root_type = format_ident!("{}", nodes_by_path.type_name(root));
 
     let mut validation_checks = TokenStream::new();
     let mut syntax_checks = TokenStream::new();
     for node in &input.nodes {
+        if super::types::has_scalar_constraints(node, &nodes_by_path) {
+            syntax_checks.extend(generate_range_check(node, input, &nodes_by_path)?);
+        }
         if node.kind == SchemaNodeKind::LeafList && super::is_user_ordered(node) {
             syntax_checks.extend(generate_leaf_list_uniqueness_check(node, input)?);
         }
@@ -114,6 +117,41 @@ fn generate_leaf_list_uniqueness_check(
         };
     }
     Ok(quote! { { let current = _root; #block } })
+}
+
+fn generate_range_check(
+    node: &SchemaNode,
+    input: &CanonicalInput,
+    nodes: &super::NodeIndex<'_>,
+) -> Result<TokenStream, RustGenerationError> {
+    let parent = node.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let ancestors = get_ancestors_along_path(parent, input)?;
+    let field = format_ident!("{}", to_snake_case(clean_segment(last_segment(&node.path))));
+    let mut body = super::types::scalar_constraint_check(
+        node,
+        nodes,
+        quote! { current.#field },
+        quote! { ValidationError::syntax },
+    );
+    for ancestor in ancestors.into_iter().rev() {
+        let field = format_ident!(
+            "{}",
+            to_snake_case(clean_segment(last_segment(&ancestor.path)))
+        );
+        body = match ancestor.kind {
+            SchemaNodeKind::Container => quote! {
+                if let Some(current) = &current.#field { #body }
+            },
+            SchemaNodeKind::List if ancestor.key_leaves.is_empty() => quote! {
+                for current in &current.#field { #body }
+            },
+            SchemaNodeKind::List => quote! {
+                for current in current.#field.values() { #body }
+            },
+            _ => body,
+        };
+    }
+    Ok(quote! { { let current = _root; #body } })
 }
 
 fn generate_path_access(
@@ -824,8 +862,13 @@ fn get_path_expr_type(
     }
     match resolved_type {
         Some(TypeRef::Boolean) => Some(quote! { bool }),
+        Some(TypeRef::Uint8) => Some(quote! { u8 }),
+        Some(TypeRef::Int8) => Some(quote! { i8 }),
+        Some(TypeRef::Int16) => Some(quote! { i16 }),
+        Some(TypeRef::Int32) => Some(quote! { i32 }),
         Some(TypeRef::Uint16) => Some(quote! { u16 }),
         Some(TypeRef::Uint32) => Some(quote! { u32 }),
+        Some(TypeRef::Uint64) => Some(quote! { u64 }),
         Some(TypeRef::Int64) => Some(quote! { i64 }),
         Some(TypeRef::Decimal64) => Some(quote! { f64 }),
         _ => Some(quote! { String }),
@@ -861,7 +904,7 @@ fn evaluate_expr(
             let access = generate_path_access(&resolved_node, context_path, input)?;
             let is_custom_wrapper = matches!(
                 resolved_node.type_ref,
-                Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
+                Some(TypeRef::Uint64) | Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
             );
 
             if resolved_node.kind == SchemaNodeKind::Leaf && resolved_node.config {
@@ -1065,7 +1108,7 @@ fn evaluate_expr(
                 let access = generate_path_access(resolved_node, context_path, input)?;
                 let is_custom_wrapper = matches!(
                     resolved_node.type_ref,
-                    Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
+                    Some(TypeRef::Uint64) | Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
                 );
                 if resolved_node.kind == SchemaNodeKind::Leaf && resolved_node.config {
                     if is_custom_wrapper {

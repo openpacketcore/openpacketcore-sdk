@@ -1,12 +1,9 @@
-use super::{
-    clean_segment, is_sensitive_name, last_segment, to_pascal_case, to_snake_case,
-    RustGenerationError,
-};
+use super::NodeIndex;
+use super::{clean_segment, is_sensitive_name, last_segment, to_snake_case, RustGenerationError};
 use crate::emit::CanonicalInput;
 use crate::ir::{AllocationStrategy, SchemaNode, SchemaNodeKind, TypeRef};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 
 fn is_sensitive_node(node: &SchemaNode) -> bool {
     if let Some(ref dc) = node.data_class {
@@ -27,14 +24,35 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         .ok_or_else(|| {
             RustGenerationError::new("root node not found while generating patch module")
         })?;
-    let root_name = clean_segment(last_segment(&root.path));
-    let root_type = format_ident!("{}", to_pascal_case(root_name));
+
     let root_path = &root.path;
 
-    let mut nodes_by_path = HashMap::new();
-    for node in &input.nodes {
-        nodes_by_path.insert(node.path.clone(), node);
-    }
+    let nodes_by_path = NodeIndex::new(&input.nodes);
+    let (json_error, json_error_helper) = if super::strings::has_constraints(input) {
+        (
+            quote! { string_json_error },
+            quote! {
+                fn string_json_error(error: serde_json::Error) -> ConfigError {
+                    let detail = error.to_string();
+                    let reason = if detail.starts_with("string violates YANG constraints") {
+                        "string violates YANG constraints"
+                    } else if detail.starts_with("leaf-list contains a duplicate value") {
+                        "leaf-list contains a duplicate value"
+                    } else { "invalid JSON configuration" };
+                    config_error("invalid-value", reason)
+                }
+            },
+        )
+    } else {
+        (
+            quote! { |e| config_error("invalid-value", e.to_string()) },
+            quote! {},
+        )
+    };
+
+    let root_type = format_ident!("{}", nodes_by_path.type_name(root));
+    let has_scalar_constraints =
+        super::has_extended_integers(input) || super::strings::has_constraints(input);
 
     let ordered_lists: Vec<_> = input
         .nodes
@@ -48,10 +66,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let has_ordered_lists = !ordered_lists.is_empty();
     let apply_segments = if has_ordered_lists {
         format_ident!("apply_patch_segments_with_order")
+    } else if has_scalar_constraints {
+        format_ident!("apply_patch_segments_inner")
     } else {
         format_ident!("apply_patch_segments")
     };
-    let apply_visibility = if has_ordered_lists {
+    let apply_visibility = if has_ordered_lists || has_scalar_constraints {
         quote! {}
     } else {
         quote! { pub }
@@ -82,10 +102,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
     let ordered_definitions = if has_ordered_lists {
         let variants = ordered_lists.iter().map(|node| {
-            let row_type = format_ident!(
-                "{}",
-                to_pascal_case(clean_segment(last_segment(&node.path)))
-            );
+            let row_type = format_ident!("{}", nodes_by_path.type_name(node));
             let key_type = super::types::get_key_type(node, &nodes_by_path);
             quote! { #row_type(super::serde::UserOrderedMap<#key_type, #row_type>), }
         });
@@ -122,10 +139,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     for node in &input.nodes {
         if node.kind == SchemaNodeKind::Container || node.kind == SchemaNodeKind::List {
-            let struct_name = format_ident!(
-                "{}",
-                to_pascal_case(clean_segment(last_segment(&node.path)))
-            );
+            let struct_name = format_ident!("{}", nodes_by_path.type_name(node));
             let mut field_arms = TokenStream::new();
             let mut diff_fields = TokenStream::new();
 
@@ -136,7 +150,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     let child_name_str = child_name;
                     let is_sensitive = is_sensitive_node(child);
 
-                    let parse_and_assign = match &child.type_ref {
+                    let scalar_path = &child.path;
+                    let parse_and_assign = match &nodes_by_path.patch_scalar_node(child).type_ref {
+                        Some(TypeRef::RestrictedString { .. }) => quote! {
+                            if !super::strings::valid(#scalar_path, _v) { return Err(config_error("invalid-value", "string violates YANG constraints")); }
+                            let parsed = _v.to_string();
+                        },
                         Some(TypeRef::Boolean) => quote! {
                             let parsed = match _v {
                                 "true" => true,
@@ -144,11 +163,26 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 _ => return Err(config_error("invalid-value", "invalid boolean value")),
                             };
                         },
+                        Some(TypeRef::Uint8) => quote! {
+                            let parsed = _v.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                        },
+                        Some(TypeRef::Int8) => quote! {
+                            let parsed = _v.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                        },
+                        Some(TypeRef::Int16) => quote! {
+                            let parsed = _v.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                        },
+                        Some(TypeRef::Int32) => quote! {
+                            let parsed = _v.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                        },
                         Some(TypeRef::Uint16) => quote! {
                             let parsed = _v.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
                         },
                         Some(TypeRef::Uint32) => quote! {
                             let parsed = _v.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                        },
+                        Some(TypeRef::Uint64) => quote! {
+                            let parsed = YangUint64(_v.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
                         },
                         Some(TypeRef::Int64) => quote! {
                             let parsed = YangInt64(_v.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
@@ -251,7 +285,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             }
                         }
                         SchemaNodeKind::List => {
-                            let ty_name = format_ident!("{}", to_pascal_case(child_name));
+                            let ty_name = format_ident!("{}", nodes_by_path.type_name(child));
                             // Collection merges are needed for RFC 7951 arrays inside
                             // user-ordered rows. Other system lists retain their API.
                             let below_ordered_list = ordered_lists.iter().any(|ancestor| {
@@ -376,7 +410,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 }
                                                 ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
                                                     let v = value.ok_or_else(|| config_error("missing-value", "Value is required"))?;
-                                                    self.#field_ident = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                                    self.#field_ident = serde_json::from_str(v).map_err(#json_error)?;
                                                 }
                                             }
                                         } else {
@@ -403,12 +437,34 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         child.path, key_leaf
                                     ))
                                 })?;
-                                let parse_key = match key_leaf_node.type_ref.as_ref() {
+                                let parse_key = match nodes_by_path
+                                    .patch_scalar_node(key_leaf_node)
+                                    .type_ref
+                                    .as_ref()
+                                {
+                                    Some(TypeRef::Uint8) => quote! {
+                                        let parsed_key = key_val.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    },
+                                    Some(TypeRef::Int8) => quote! {
+                                        let parsed_key = key_val.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    },
+                                    Some(TypeRef::Int16) => quote! {
+                                        let parsed_key = key_val.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    },
+                                    Some(TypeRef::Int32) => quote! {
+                                        let parsed_key = key_val.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    },
                                     Some(TypeRef::Uint16) => quote! {
                                         let parsed_key = key_val.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
                                     },
                                     Some(TypeRef::Uint32) => quote! {
                                         let parsed_key = key_val.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                    },
+                                    Some(TypeRef::Uint64) => quote! {
+                                        let parsed_key = YangUint64(key_val.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                    },
+                                    Some(TypeRef::Int64) => quote! {
+                                        let parsed_key = YangInt64(key_val.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
                                     },
                                     _ => quote! {
                                         let parsed_key = key_val.clone();
@@ -447,7 +503,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
                                                     let entry = self.#field_ident.entry(#map_key).or_default();
                                                     if let Some(v) = value {
-                                                        let mut parsed_item: #ty_name = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                                        let mut parsed_item: #ty_name = serde_json::from_str(v).map_err(#json_error)?;
                                                         #key_assign
                                                         *entry = parsed_item;
                                                     }
@@ -469,7 +525,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             } else {
                                 // Multi-key list lookup
                                 let key_struct_name =
-                                    format_ident!("{}Key", to_pascal_case(child_name));
+                                    format_ident!("{}Key", nodes_by_path.type_name(child));
                                 let mut parse_keys = Vec::new();
                                 let mut key_idents = Vec::new();
                                 let mut key_assigns = Vec::new();
@@ -494,12 +550,34 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             child.path, key_leaf
                                         ))
                                     })?;
-                                    let parse_key = match key_leaf_node.type_ref.as_ref() {
+                                    let parse_key = match nodes_by_path
+                                        .patch_scalar_node(key_leaf_node)
+                                        .type_ref
+                                        .as_ref()
+                                    {
+                                        Some(TypeRef::Uint8) => quote! {
+                                            let #key_ident = key_val.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        },
+                                        Some(TypeRef::Int8) => quote! {
+                                            let #key_ident = key_val.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        },
+                                        Some(TypeRef::Int16) => quote! {
+                                            let #key_ident = key_val.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        },
+                                        Some(TypeRef::Int32) => quote! {
+                                            let #key_ident = key_val.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        },
                                         Some(TypeRef::Uint16) => quote! {
                                             let #key_ident = key_val.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
                                         },
                                         Some(TypeRef::Uint32) => quote! {
                                             let #key_ident = key_val.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        },
+                                        Some(TypeRef::Uint64) => quote! {
+                                            let #key_ident = YangUint64(key_val.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                        },
+                                        Some(TypeRef::Int64) => quote! {
+                                            let #key_ident = YangInt64(key_val.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
                                         },
                                         _ => quote! {
                                             let #key_ident = key_val.clone();
@@ -542,7 +620,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
                                                     let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
                                                     if let Some(v) = value {
-                                                        let mut parsed_item: #ty_name = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                                        let mut parsed_item: #ty_name = serde_json::from_str(v).map_err(#json_error)?;
                                                         #(#key_assigns)*
                                                         *entry = parsed_item;
                                                     }
@@ -582,13 +660,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             // Match the element type emitted by `types`: a
                             // leafref carries its target's scalar type, not
                             // necessarily a string.
-                            let mut element_type = child.type_ref.as_ref();
-                            if let Some(TypeRef::LeafRef { target_path }) = element_type {
-                                if let Some(target) = nodes_by_path.get(target_path) {
-                                    element_type = target.type_ref.as_ref();
-                                }
-                            }
+                            let element_type =
+                                nodes_by_path.legacy_or_resolved(child).type_ref.as_ref();
+                            let scalar_path = &child.path;
                             let parse_elem = match element_type {
+                                Some(TypeRef::RestrictedString { .. }) => quote! {
+                                    if !super::strings::valid(#scalar_path, v) { return Err(config_error("invalid-value", "string violates YANG constraints")); }
+                                    let parsed_elem = v.to_string();
+                                },
                                 Some(TypeRef::Boolean) => quote! {
                                     let parsed_elem = match v {
                                         "true" => true,
@@ -596,11 +675,26 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         _ => return Err(config_error("invalid-value", "invalid boolean value")),
                                     };
                                 },
+                                Some(TypeRef::Uint8) => quote! {
+                                    let parsed_elem = v.parse::<u8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                },
+                                Some(TypeRef::Int8) => quote! {
+                                    let parsed_elem = v.parse::<i8>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                },
+                                Some(TypeRef::Int16) => quote! {
+                                    let parsed_elem = v.parse::<i16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                },
+                                Some(TypeRef::Int32) => quote! {
+                                    let parsed_elem = v.parse::<i32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                },
                                 Some(TypeRef::Uint16) => quote! {
                                     let parsed_elem = v.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
                                 },
                                 Some(TypeRef::Uint32) => quote! {
                                     let parsed_elem = v.parse::<u32>().map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                },
+                                Some(TypeRef::Uint64) => quote! {
+                                    let parsed_elem = YangUint64(v.parse::<u64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
                                 },
                                 Some(TypeRef::Int64) => quote! {
                                     let parsed_elem = YangInt64(v.parse::<i64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
@@ -643,7 +737,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 let values = #list_access;
                                                 let v = value.ok_or_else(|| config_error("missing-value", "Value is required"))?;
                                                 if v.starts_with('[') {
-                                                    *values = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                                    *values = serde_json::from_str(v).map_err(#json_error)?;
                                                 } else {
                                                     #parse_elem
                                                     values.push(parsed_elem);
@@ -779,7 +873,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     }
                                 };
                                 if super::is_user_ordered(child) {
-                                    let ty_name = format_ident!("{}", to_pascal_case(child_name));
+                                    let ty_name =
+                                        format_ident!("{}", nodes_by_path.type_name(child));
                                     let list_value = if is_sensitive {
                                         quote! { self.#field_ident.get().clone() }
                                     } else {
@@ -822,7 +917,44 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
-            let public_apply_wrapper = if has_ordered_lists {
+            let previous_param = format_ident!(
+                "{}",
+                if nodes_by_path.expanded_profile && diff_fields.is_empty() {
+                    "_previous"
+                } else {
+                    "previous"
+                }
+            );
+            let deltas_param = format_ident!(
+                "{}",
+                if nodes_by_path.expanded_profile && diff_fields.is_empty() {
+                    "_deltas"
+                } else {
+                    "deltas"
+                }
+            );
+            let public_apply_wrapper = if has_scalar_constraints {
+                let checks = subtree_constraint_checks(node, &nodes_by_path);
+                quote! {
+                    pub fn apply_patch_segments(
+                        &mut self,
+                        op: &ConfigOp,
+                        segments: &[PathSegment],
+                        value: Option<&str>,
+                    ) -> Result<(), ConfigError> {
+                        let mut candidate = self.clone();
+                        candidate.#apply_segments(op, segments, value #ordered_none)?;
+                        candidate.validate_patch_constraints()?;
+                        *self = candidate;
+                        Ok(())
+                    }
+
+                    fn validate_patch_constraints(&self) -> Result<(), ConfigError> {
+                        #checks
+                        Ok(())
+                    }
+                }
+            } else if has_ordered_lists {
                 quote! {
                     pub fn apply_patch_segments(
                         &mut self,
@@ -854,7 +986,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 }
                                 ConfigOp::Replace => {
                                     if let Some(v) = value {
-                                        *self = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                        *self = serde_json::from_str(v).map_err(#json_error)?;
                                         return Ok(());
                                     } else {
                                         return Err(config_error("missing-value", "Value is required for replace"));
@@ -874,7 +1006,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             }
                                             return Ok(());
                                         } else {
-                                            *self = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                            *self = serde_json::from_str(v).map_err(#json_error)?;
                                             return Ok(());
                                         }
                                     } else {
@@ -897,9 +1029,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                     pub fn diff_segments(
                         &self,
-                        previous: &Self,
+                        #previous_param: &Self,
                         _path_prefix: &str,
-                        deltas: &mut Vec<ConfigDelta>,
+                        #deltas_param: &mut Vec<ConfigDelta>,
                     ) -> Result<(), ConfigError> {
                         #diff_fields
                         Ok(())
@@ -923,6 +1055,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         quote! {}
     };
 
+    let scalar_validation = if has_scalar_constraints {
+        quote! { super::validate::validate_syntax(&temp).map_err(|error| config_error("invalid-value", error.message))?; }
+    } else {
+        quote! {}
+    };
     let tokens = quote! {
         use opc_config_model::{ConfigError, YangPath};
         use super::types::*;
@@ -1143,6 +1280,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
                 temp.#apply_segments(&op, &segments[1..], value #ordered_argument)?;
             }
+            #scalar_validation
             *root = temp;
             Ok(())
         }
@@ -1151,10 +1289,52 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             YangPath::new(#root_path).expect("opc-yanggen emitted an invalid root YANG path")
         }
 
+        #json_error_helper
         #impls
     };
 
     Ok(tokens.to_string())
+}
+
+// Public subtree methods need the same admission checks as the root transaction.
+// Internal recursion stays in-place on the already-cloned transaction candidate.
+fn subtree_constraint_checks(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
+    let mut checks = TokenStream::new();
+    for child_path in &node.child_paths {
+        let Some(child) = nodes.get(child_path) else {
+            continue;
+        };
+        let field = format_ident!("{}", to_snake_case(clean_segment(last_segment(child_path))));
+        checks.extend(super::types::scalar_constraint_check(
+            child,
+            nodes,
+            quote! { self.#field },
+            quote! { (|reason| config_error("invalid-value", reason)) },
+        ));
+        let access = if is_sensitive_node(child) {
+            quote! { self.#field.get() }
+        } else {
+            quote! { &self.#field }
+        };
+        checks.extend(match child.kind {
+            SchemaNodeKind::Container => quote! {
+                if let Some(child) = #access { child.validate_patch_constraints()?; }
+            },
+            SchemaNodeKind::List if child.key_leaves.is_empty() => quote! {
+                for child in #access { child.validate_patch_constraints()?; }
+            },
+            SchemaNodeKind::List => quote! {
+                { let children = #access; for child in children.values() { child.validate_patch_constraints()?; } }
+            },
+            SchemaNodeKind::LeafList if super::is_user_ordered(child) => quote! {
+                if super::serde::has_duplicate_values(#access) {
+                    return Err(config_error("invalid-value", super::serde::DUPLICATE_LEAF_LIST_VALUE_ERROR));
+                }
+            },
+            _ => TokenStream::new(),
+        });
+    }
+    checks
 }
 
 #[cfg(test)]
