@@ -200,7 +200,8 @@ async fn scope_child_read_retired_incarnation_has_the_exact_store_error() {
             .unwrap()
             .unwrap();
         let previous = ScopeAuthorityCheckpoint::from_record(&record).unwrap();
-        let retired = crate::scope_authority::tests::retired_fixture(&previous.state().unwrap(), 2);
+        let retired =
+            crate::scope_authority::tests::retired_store_fixture(&previous.state().unwrap(), 2);
         let body = retired.encode().unwrap();
         let mut bytes = (body.len() as u16).to_le_bytes().to_vec();
         bytes.extend_from_slice(&body);
