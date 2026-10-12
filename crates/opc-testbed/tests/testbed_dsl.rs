@@ -2,6 +2,24 @@ mod testbed_common;
 use testbed_common::*;
 
 #[test]
+fn committed_yaml_fixture_preserves_authored_values_and_scenario_roundtrip() {
+    let yaml = include_str!("fixtures/ue_registration.yaml");
+    let json = include_str!("fixtures/ue_registration.json");
+    let expected: serde_json::Value = serde_json::from_str(json).unwrap();
+    let authored: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(serde_json::to_value(authored).unwrap(), expected);
+
+    let scenario = Scenario::from_yaml(yaml).unwrap();
+    let expected_scenario = Scenario::from_json(json).unwrap();
+    let expected_scenario = serde_json::to_value(expected_scenario).unwrap();
+    assert_eq!(serde_json::to_value(&scenario).unwrap(), expected_scenario);
+
+    let serialized = serde_yaml::to_string(&scenario).unwrap();
+    let restored = Scenario::from_yaml(&serialized).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), expected_scenario);
+}
+
+#[test]
 fn scenario_yaml_roundtrip_and_validate() {
     let yaml = include_str!("fixtures/ue_registration.yaml");
     let scenario = Scenario::from_yaml(yaml).expect("parse scenario yaml");
