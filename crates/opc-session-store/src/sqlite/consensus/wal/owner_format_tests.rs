@@ -48,6 +48,7 @@ impl RootFixture {
             generation_hook: Mutex::new(None),
             root_hook: Mutex::new(None),
             io_hook: Mutex::new(None),
+            preflight_hook: Mutex::new(None),
         };
         Self {
             _directory: directory,

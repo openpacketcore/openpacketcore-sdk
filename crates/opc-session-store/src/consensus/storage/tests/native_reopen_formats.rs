@@ -10,6 +10,8 @@ use std::os::unix::fs::MetadataExt;
 const DATABASE: &str = "retained-bound.sqlite";
 const ROOT_SELECTION: &str = "user.opc.native-root-v1";
 
+mod responsiveness;
+
 #[derive(Debug, PartialEq, Eq)]
 struct FileObservation {
     mode: u32,

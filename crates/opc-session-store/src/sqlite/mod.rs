@@ -1584,6 +1584,8 @@ impl SqliteSessionBackend {
     /// Validate the selected native root before comparing caller scope. Only
     /// a root that also verifies against its original SQLite identity can
     /// distinguish a different requested identity from corrupt recovery input.
+    /// Generation scans finish on a blocking worker before snapshot inspection
+    /// or SQL initialization can proceed.
     #[cfg(target_os = "linux")]
     pub(crate) async fn native_persistence_preflight<F, Fut>(
         &self,
@@ -1607,9 +1609,12 @@ impl SqliteSessionBackend {
         match owner.persistence_mode(expected) {
             Ok(mode) => {
                 if mode.is_some() {
-                    let snapshots = owner
-                        .preflight_formats(expected)
-                        .map_err(SessionConsensusStorageError::from_validation_error)?;
+                    let scan_owner = Arc::clone(owner);
+                    let snapshots =
+                        tokio::task::spawn_blocking(move || scan_owner.preflight_formats(expected))
+                            .await
+                            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+                            .map_err(SessionConsensusStorageError::from_validation_error)?;
                     preflight_snapshots(snapshots).await?;
                 }
                 Ok(mode)
@@ -1625,9 +1630,13 @@ impl SqliteSessionBackend {
                 Err(SessionConsensusStorageError::PersistenceFormatMismatch)
             }
             Err(_) => {
-                let snapshots = owner
-                    .preflight_formats_before_scope_lookup()
-                    .map_err(SessionConsensusStorageError::from_validation_error)?;
+                let scan_owner = Arc::clone(owner);
+                let snapshots = tokio::task::spawn_blocking(move || {
+                    scan_owner.preflight_formats_before_scope_lookup()
+                })
+                .await
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+                .map_err(SessionConsensusStorageError::from_validation_error)?;
                 preflight_snapshots(snapshots).await?;
                 let conn = self.conn.lock().await;
                 let persisted = consensus::read_storage_identity_sync(&conn)

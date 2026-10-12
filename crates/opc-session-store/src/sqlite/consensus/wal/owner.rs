@@ -30,6 +30,9 @@ type GenerationHookForTest = Arc<dyn Fn(&'static str) -> io::Result<()> + Send +
 pub(crate) type IoHookForTest = Arc<dyn Fn(super::Point) -> io::Result<()> + Send + Sync>;
 
 #[cfg(test)]
+type PreflightHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RootPointForTest {
     BeforeCreate,
@@ -104,6 +107,8 @@ pub(crate) struct NativeOwner {
     root_hook: Mutex<Option<RootHookForTest>>,
     #[cfg(test)]
     io_hook: Mutex<Option<IoHookForTest>>,
+    #[cfg(test)]
+    preflight_hook: Mutex<Option<PreflightHookForTest>>,
 }
 
 impl NativeOwner {
@@ -148,6 +153,8 @@ impl NativeOwner {
             root_hook: Mutex::new(None),
             #[cfg(test)]
             io_hook: Mutex::new(None),
+            #[cfg(test)]
+            preflight_hook: Mutex::new(None),
         })
     }
 
@@ -200,6 +207,12 @@ impl NativeOwner {
     pub(crate) fn set_io_hook_for_test(&self, hook: IoHookForTest) {
         assert!(self.current.lock().unwrap().upgrade().is_none());
         *self.io_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_preflight_hook_for_test(&self, hook: PreflightHookForTest) {
+        assert!(self.current.lock().unwrap().upgrade().is_none());
+        *self.preflight_hook.lock().unwrap() = Some(hook);
     }
 
     #[cfg(test)]
@@ -317,7 +330,7 @@ impl NativeOwner {
         let directory = directory_path(&pin);
         let anchor = super::checkpoint::read(&directory, binding, Limits::default())?
             .ok_or_else(|| invalid_data("native selected generation is missing"))?;
-        Self::preflight_generation_format(&directory, &anchor)
+        self.preflight_generation_format(&directory, &anchor)
     }
 
     /// Compatibility inspection precedes even the SQLite query that classifies
@@ -338,13 +351,16 @@ impl NativeOwner {
             Limits::default(),
         )?
         .ok_or_else(|| invalid_data("native selected generation is missing"))?;
-        Self::preflight_generation_format(&directory, &anchor)
+        self.preflight_generation_format(&directory, &anchor)
     }
 
     fn preflight_generation_format(
+        &self,
         directory: &Path,
         anchor: &super::checkpoint::Anchor,
     ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
+        #[cfg(test)]
+        let hook = self.preflight_hook.lock().unwrap().clone();
         let prefix = anchor
             .native_prefix()?
             .ok_or_else(|| invalid_data("native generation discriminator differs"))?;
@@ -353,7 +369,13 @@ impl NativeOwner {
             prefix,
             super::MAX_BASIS,
             anchor.native_cut_binding()?,
-            &|| Ok(()),
+            &|| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook()?;
+                }
+                Ok(())
+            },
         )?;
         let mut snapshots = anchor
             .native_snapshots
