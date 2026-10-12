@@ -42,31 +42,69 @@ pub(crate) use catalog::preflight_format;
 pub(crate) use catalog::{Catalog, CatalogScope};
 pub(crate) use sqlite::SqlitePreparedBase;
 
-const MAGIC: &[u8; 8] = b"OPCNJD06";
-const SLOT_MAGIC: &[u8; 8] = b"OPCNJD07";
+// Six-byte frame family, one vocabulary byte, one independent profile byte.
+// Profile 0 is fixed membership; profile 1 carries voter slots. Future
+// vocabularies retain this layout and compare only the vocabulary byte.
+const MAGIC: &[u8; 8] = b"OPCNJD\x06\x00";
+const SLOT_MAGIC: &[u8; 8] = b"OPCNJD\x06\x01";
 const V4_MAGIC: &[u8; 8] = b"OPCNJD04";
 const V5_MAGIC: &[u8; 8] = b"OPCNJD05";
 const V3_MAGIC: &[u8; 8] = b"OPCNJD03";
 const LEGACY_MAGIC: &[u8; 8] = b"OPCNJD02";
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Format {
-    V2,
-    V3,
-    V4,
-    V5,
-    V6,
-    V7,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VoterProfile {
+    Fixed,
+    Slots,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Format {
+    vocabulary: u8,
+    profile: VoterProfile,
 }
 
 impl Format {
+    const V2: Self = Self {
+        vocabulary: 2,
+        profile: VoterProfile::Fixed,
+    };
+    const V3: Self = Self {
+        vocabulary: 3,
+        profile: VoterProfile::Fixed,
+    };
+    const V4: Self = Self {
+        vocabulary: 4,
+        profile: VoterProfile::Fixed,
+    };
+    const V5: Self = Self {
+        vocabulary: 5,
+        profile: VoterProfile::Slots,
+    };
+    const V6: Self = Self {
+        vocabulary: 6,
+        profile: VoterProfile::Fixed,
+    };
+    const V6_SLOTS: Self = Self {
+        vocabulary: 6,
+        profile: VoterProfile::Slots,
+    };
+
     fn read(reader: &mut dyn Read, base: bool) -> io::Result<Self> {
         let mut magic = [0; 8];
         reader.read_exact(&mut magic)?;
-        if &magic == if base { base::SLOT_MAGIC } else { SLOT_MAGIC } {
-            Ok(Self::V7)
-        } else if &magic == if base { base::MAGIC } else { MAGIC } {
-            Ok(Self::V6)
+        if &magic[..6] == if base { b"OPCNJB" } else { b"OPCNJD" }
+            && magic[6] == Self::V6.vocabulary
+        {
+            let profile = match magic[7] {
+                0 => VoterProfile::Fixed,
+                1 => VoterProfile::Slots,
+                _ => return Err(invalid("native generation voter profile differs")),
+            };
+            Ok(Self {
+                vocabulary: magic[6],
+                profile,
+            })
         } else if &magic == if base { base::V5_MAGIC } else { V5_MAGIC } {
             Ok(Self::V5)
         } else if &magic == if base { base::V4_MAGIC } else { V4_MAGIC } {
@@ -87,7 +125,14 @@ impl Format {
     }
 
     fn has_voter_slots(self) -> bool {
-        matches!(self, Self::V5 | Self::V7)
+        self.profile == VoterProfile::Slots
+    }
+
+    fn validate_successor(self, next: Self) -> io::Result<()> {
+        if next.vocabulary < self.vocabulary {
+            return Err(invalid("native generation delta format regressed"));
+        }
+        Ok(())
     }
 
     fn validate_context(self, context: &Context) -> io::Result<()> {
@@ -96,7 +141,7 @@ impl Format {
         {
             return Err(invalid("native generation voter-slot format differs"));
         }
-        if self < Self::V4
+        if self.vocabulary < Self::V4.vocabulary
             && (context.business.roster.is_some()
                 || context.business.frontiers.roster_v1_namespace
                 || context.business.frontiers.roster_v2_activation.is_some())
@@ -105,7 +150,7 @@ impl Format {
                 "native roster context requires its complete generation vocabulary",
             ));
         }
-        if self >= Self::V4
+        if self.vocabulary >= Self::V4.vocabulary
             && context.business.roster.is_none()
             && (context.business.frontiers.roster_v1_namespace
                 || context.business.frontiers.roster_v2_activation.is_some())

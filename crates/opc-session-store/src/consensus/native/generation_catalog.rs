@@ -121,7 +121,7 @@ impl Catalog {
     /// New native roots cannot select a vocabulary with logical-only purge.
     /// The format-order check during reconstruction covers every later delta.
     pub(crate) fn require_reclamation_format(&self) -> io::Result<()> {
-        if self.rows.base_format < Format::V6 {
+        if self.rows.base_format.vocabulary < Format::V6.vocabulary {
             return Err(invalid("native generation discriminator differs"));
         }
         Ok(())
@@ -745,7 +745,7 @@ impl Rows {
             &mut ordinals,
             check,
         )?;
-        if format >= Format::V4 {
+        if format.vocabulary >= Format::V4.vocabulary {
             rows.rosters.read(
                 &mut reader,
                 roster_index::Section {
@@ -779,7 +779,7 @@ impl Rows {
         while reader.position < expected.length {
             check()?;
             let next_format = Format::read(&mut reader, false)?;
-            if next_format < format {
+            if next_format.vocabulary < format.vocabulary {
                 return Err(invalid("native generation format regressed"));
             }
             format = next_format;
@@ -789,7 +789,7 @@ impl Rows {
             format.validate_context(&delta.after)?;
             roster_index::validate_context(&delta.before, root)?;
             roster_index::validate_context(&delta.after, root)?;
-            if delta.roster_changed.is_some() != (format >= Format::V4) {
+            if delta.roster_changed.is_some() != (format.vocabulary >= Format::V4.vocabulary) {
                 return Err(invalid(
                     "native generation roster frame counts differ from its format",
                 ));

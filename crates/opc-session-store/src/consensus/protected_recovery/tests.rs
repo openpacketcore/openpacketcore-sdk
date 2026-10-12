@@ -150,6 +150,33 @@ fn proof(inventory: ProtectedRecoveryInventory, selection: &Selection) -> Protec
     }
 }
 
+pub(super) fn maximum_proof() -> ProtectedRecoveryProof {
+    let (seed, mut selection) = fixture();
+    let voters = selection.round.participants.keys().copied().collect();
+    let owners: Vec<_> = (1..=MAX_PROTECTED_RECOVERY_OWNERS as u8)
+        .map(|id| ProtectedRecoveryOwner::new([id; 32], public(0x40 + id)).unwrap())
+        .collect();
+    let signature = sign(
+        0x31,
+        ProtectedRecoveryInventory::signing_digest(seed.identity, &voters, &seed.root, &owners)
+            .unwrap(),
+    );
+    let inventory = ProtectedRecoveryInventory::from_signed_parts(
+        seed.identity,
+        &voters,
+        seed.root,
+        owners,
+        signature,
+    )
+    .unwrap();
+    for participant in selection.round.participants.values_mut() {
+        participant.protected_inventory = Some(inventory.commitment().unwrap());
+    }
+    let value = proof(inventory, &selection);
+    value.verify().unwrap();
+    value
+}
+
 #[test]
 fn complete_proof_binds_every_owner_and_exact_scope_round_and_selection() {
     let (inventory, selection) = fixture();

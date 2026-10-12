@@ -1585,13 +1585,20 @@ impl SqliteSessionBackend {
     /// a root that also verifies against its original SQLite identity can
     /// distinguish a different requested identity from corrupt recovery input.
     #[cfg(target_os = "linux")]
-    pub(crate) async fn native_persistence_preflight(
+    pub(crate) async fn native_persistence_preflight<F, Fut>(
         &self,
         expected: crate::consensus::SessionConsensusIdentity,
+        preflight_snapshots: F,
     ) -> Result<
         Option<crate::consensus::SessionPersistenceMode>,
         crate::consensus::storage::SessionConsensusStorageError,
-    > {
+    >
+    where
+        F: FnOnce(Vec<consensus::CurrentSnapshot>) -> Fut,
+        Fut: std::future::Future<
+            Output = Result<(), crate::consensus::storage::SessionConsensusStorageError>,
+        >,
+    {
         use crate::consensus::storage::SessionConsensusStorageError;
 
         let Some(owner) = &self.native_owner else {
@@ -1600,9 +1607,10 @@ impl SqliteSessionBackend {
         match owner.persistence_mode(expected) {
             Ok(mode) => {
                 if mode.is_some() {
-                    owner
+                    let snapshots = owner
                         .preflight_formats(expected)
                         .map_err(SessionConsensusStorageError::from_validation_error)?;
+                    preflight_snapshots(snapshots).await?;
                 }
                 Ok(mode)
             }
@@ -1617,9 +1625,10 @@ impl SqliteSessionBackend {
                 Err(SessionConsensusStorageError::PersistenceFormatMismatch)
             }
             Err(_) => {
-                owner
+                let snapshots = owner
                     .preflight_formats_before_scope_lookup()
                     .map_err(SessionConsensusStorageError::from_validation_error)?;
+                preflight_snapshots(snapshots).await?;
                 let conn = self.conn.lock().await;
                 let persisted = consensus::read_storage_identity_sync(&conn)
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;

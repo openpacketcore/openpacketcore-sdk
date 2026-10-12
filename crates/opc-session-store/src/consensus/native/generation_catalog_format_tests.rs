@@ -1,12 +1,75 @@
 use super::*;
 
+#[test]
+fn native_generation_magic_separates_vocabulary_from_voter_profile() {
+    for (base_frame, fixed, slots) in [
+        (true, base::MAGIC, base::SLOT_MAGIC),
+        (false, MAGIC, SLOT_MAGIC),
+    ] {
+        assert_eq!(&fixed[..7], &slots[..7]);
+        assert_eq!((fixed[6], fixed[7], slots[7]), (6, 0, 1));
+        let fixed_format = Format::read(&mut &fixed[..], base_frame).unwrap();
+        let slot_format = Format::read(&mut &slots[..], base_frame).unwrap();
+        assert!(!fixed_format.has_voter_slots());
+        assert!(slot_format.has_voter_slots());
+        // Profiles are checked against their contexts, never ranked. A future
+        // level may follow either profile; no pair of release markers is needed.
+        for previous in [fixed_format, slot_format] {
+            for profile in [VoterProfile::Fixed, VoterProfile::Slots] {
+                previous
+                    .validate_successor(Format {
+                        vocabulary: 6,
+                        profile,
+                    })
+                    .unwrap();
+                previous
+                    .validate_successor(Format {
+                        vocabulary: 7,
+                        profile,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    previous
+                        .validate_successor(Format {
+                            vocabulary: 5,
+                            profile
+                        })
+                        .unwrap_err()
+                        .to_string(),
+                    "native generation delta format regressed"
+                );
+            }
+        }
+        for original in [fixed, slots] {
+            let mut future = *original;
+            future[6] = 7;
+            assert_eq!(
+                Format::read(&mut &future[..], base_frame)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "native generation discriminator differs"
+            );
+        }
+        let mut unknown_profile = *fixed;
+        unknown_profile[7] = 2;
+        assert_eq!(
+            Format::read(&mut &unknown_profile[..], base_frame)
+                .err()
+                .unwrap()
+                .to_string(),
+            "native generation voter profile differs"
+        );
+    }
+}
+
 fn preflight(bytes: &[u8], identity: PrefixIdentity, cut: [u8; 32]) -> io::Result<()> {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("selected.native");
     std::fs::write(&path, bytes).unwrap();
     let result = preflight_format(&path, identity, MAXIMUM, cut, &|| Ok(()));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
-    result
+    result.map(|_| ())
 }
 
 #[test]
@@ -20,7 +83,7 @@ fn native_format_preflight_refuses_old_and_unknown_base_discriminators_without_w
         base::V3_MAGIC,
         base::V4_MAGIC,
         base::V5_MAGIC,
-        b"OPCNJ008",
+        b"OPCNJB\x07\x00",
         b"OPCNAT01",
         b"OPCNAT02",
     ] {
@@ -85,7 +148,7 @@ fn native_format_preflight_reads_delta_discriminators_and_preserves_format_order
     )
     .unwrap();
     for (magic, message) in [
-        (b"OPCNJD08", "native generation discriminator differs"),
+        (b"OPCNJD\x07\x00", "native generation discriminator differs"),
         (V4_MAGIC, "native generation delta format regressed"),
     ] {
         let bytes = wire.encode(magic, files.bytes());

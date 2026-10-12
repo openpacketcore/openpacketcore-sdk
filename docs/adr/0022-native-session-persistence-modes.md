@@ -170,21 +170,68 @@ binding hash domains. `OPCNR001` and `OPCNA001` through `OPCNA003` are refused
 with typed `PersistenceFormatMismatch`, exposed by the public store as
 `FreshInstallationRequired`. No in-place migration or silent legacy behavior
 is supported. A pre-boundary reader also refuses the new root discriminator.
-Root markers are written only at creation. Current plain generation bases and
-deltas are `OPCNJ006` / `OPCNJD06`; voter-slot variants are `OPCNJ007` /
-`OPCNJD07`. A new root refuses older generation vocabularies and full-image
-fallbacks. Portable snapshots, the Raft wire and WAL operation records retain
-their existing formats.
+Root markers are written only at creation. Generation magic is an eight-byte
+record: the six ASCII bytes `OPCNJB` for a base or `OPCNJD` for a delta, followed
+by a vocabulary byte and an independent voter-profile byte. The current
+vocabulary is `0x06`; profile `0x00` is fixed membership and profile `0x01`
+carries voter slots. Readers compare only the vocabulary level for monotonic
+format order and validate the profile separately against each context.
+Unknown levels and profiles are refused. A new root refuses older generation
+vocabularies and full-image fallbacks. Portable snapshots, the Raft wire and
+WAL operation records retain their existing formats.
 
 The root contract reserves future generation vocabularies in place. A later
 format may be appended monotonically within a file; a new state-machine
 vocabulary requires committed activation and supported optional frontier
-fields. A reader refuses an unknown discriminator or field before SQL
-initialization, snapshot-directory probes, recovery repair or other writes.
+fields. A later vocabulary may add optional command fields, intents and image
+tables; each arrives by a committed activation. A reader refuses an unknown
+discriminator, frontier field, undecodable log command or image schema before
+SQL initialization, snapshot-directory probes, recovery repair or other writes.
+Unknown generation vocabulary returns typed `CorruptState`; an unknown image
+schema returns typed `SchemaVersionMismatch`. Read-only schema inspection
+uses pinned snapshot descriptors and immutable SQLite readers.
 Format preflight does not grant storage or consensus authority: full selected
 state, scope, membership and snapshot admission still run afterward. Later
 log-file rollover and sibling-table retirement need no second fresh-install
 boundary under this contract.
+
+The public reopen regressions
+`native_unknown_frontier_public_reopen_refuses_before_backend_or_snapshot_writes`,
+`native_unknown_command_public_reopen_refuses_before_backend_or_snapshot_writes`
+and `native_unknown_image_schema_public_reopen_refuses_before_backend_or_snapshot_writes`
+exercise both persistence modes. They require the exact typed error twice,
+compare the complete database and snapshot namespaces before and after refusal,
+and admit a corresponding supported fixture. The image fixture has a valid
+envelope checksum, fs-verity seal and selected metadata, so only its schema
+version explains refusal.
+
+The 64 KiB JSON header budget includes **both** contexts in every delta:
+
+| Encoded component | Budget |
+| --- | ---: |
+| Current frontier vocabulary, per context | 20 KiB |
+| Future optional frontier fields, per context | 4 KiB |
+| Complete frontier, per context | 24 KiB |
+| Identity, membership set, table summaries and log metadata, per context | 4 KiB |
+| Complete context | 28 KiB |
+| Previous selection, cut binding and other outer delta metadata | 8 KiB |
+| Complete delta header: two contexts plus outer metadata | 64 KiB |
+
+The 4 KiB future allowance is an aggregate reservation for later optional
+frontiers, including receipt and notification retirement. Each later vocabulary
+must demonstrate that its complete frontier and context stay within these
+budgets in both copies; the existing header ceiling does not increase.
+Generation headers use padded base64 for the slot tables' existing canonical
+binary bytes. With nine slots, all terminal results and a complete active
+replacement, the genesis/current tables occupy at most 916/8,072 binary bytes;
+their combined JSON carrier fits in 12 KiB. The generation-only Async recovery
+carrier uses padded base64 over canonical postcard, bounded at 8 KiB before
+base64. This includes the complete 32-owner proof. Slot and Async profiles are
+mutually exclusive. Command and SQLite image encodings retain their existing
+named fields. The budget regression
+`native_delta_header_budgets_both_maximum_frontiers_and_future_fields` includes
+both profiles, maximum memberships, escaped snapshot strings, all activation
+metadata, wide counters and the reserved future bytes in both contexts.
 
 A generation file may be replaced by another file epoch carrying the same context. Bindings inside a file are historical and only the last is compared.
 

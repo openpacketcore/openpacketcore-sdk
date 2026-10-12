@@ -35447,6 +35447,28 @@ fn pinned_snapshot_uri(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn preflight_snapshot_schema(
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> Result<(), SessionConsensusStorageError> {
+    // Compatibility only: no import, schema initialization, temporary table
+    // or write pragma. The later full snapshot audit still grants authority.
+    pinned
+        .verify_immutable_generation()
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    let conn = Connection::open_with_flags(
+        pinned_snapshot_uri(pinned, true),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    read_storage_identity_sync(&conn)?;
+    pinned
+        .verify_immutable_generation()
+        .map_err(|_| SessionConsensusStorageError::CorruptState)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn open_pinned_snapshot_database(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<Connection> {

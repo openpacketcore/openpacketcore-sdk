@@ -3530,6 +3530,63 @@ async fn preflight_fs_verity(
     .map_err(|_| SessionConsensusStorageError::SnapshotIntegrityUnavailable)
 }
 
+/// Inspect selected image vocabulary before SQL setup, directory creation or
+/// fs-verity probes. Retain the caller's directory capability, open children
+/// without following symlinks, and use only immutable read connections.
+/// These pins grant no recovery authority; full admission still runs later.
+#[cfg(target_os = "linux")]
+async fn preflight_native_snapshot_schemas(
+    source: &SnapshotDirectory,
+    snapshots: Vec<consensus::CurrentSnapshot>,
+    policy: SnapshotIntegrityPolicy,
+) -> Result<(), SessionConsensusStorageError> {
+    use std::os::fd::AsRawFd as _;
+
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let directory = match &source.0 {
+        SnapshotDirectorySource::Path(path) => open_snapshot_directory(path),
+        SnapshotDirectorySource::Pinned { directory, .. } => directory.try_clone(),
+    }
+    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    tokio::task::spawn_blocking(move || {
+        for (_, name, _, length) in snapshots {
+            let mut components = Path::new(&name).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+                || length > SNAPSHOT_ENVELOPE_MAX_BYTES
+            {
+                return Err(SessionConsensusStorageError::CorruptState);
+            }
+            let file = nix::fcntl::openat(
+                &directory,
+                Path::new(&name),
+                nix::fcntl::OFlag::O_RDONLY
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_CLOEXEC
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            if !metadata.is_file() || metadata.len() != length {
+                return Err(SessionConsensusStorageError::CorruptState);
+            }
+            let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+            let pin = PinnedSqliteFile::from_file_and_verify(file, path, policy)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            consensus::preflight_snapshot_schema(&pin)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_with_member_bindings_for_profile(
     backend: &SqliteSessionBackend,
@@ -3559,7 +3616,12 @@ async fn open_with_member_bindings_for_profile(
     // Reject an existing mode mismatch before initialization, filesystem
     // probes, or cleanup can mutate either storage namespace.
     #[cfg(target_os = "linux")]
-    if let Some(selected) = backend.native_persistence_preflight(identity).await? {
+    if let Some(selected) = backend
+        .native_persistence_preflight(identity, |snapshots| {
+            preflight_native_snapshot_schemas(&snapshot_dir, snapshots, snapshot_integrity)
+        })
+        .await?
+    {
         if selected != persistence {
             return Err(SessionConsensusStorageError::PersistenceModeMismatch);
         }

@@ -12,6 +12,7 @@ mod business;
 mod changes;
 mod expiry;
 mod export;
+mod frontier_encoding;
 mod history_order;
 mod image;
 #[cfg(all(test, target_os = "linux"))]
@@ -337,7 +338,7 @@ struct NativeFrontierValues {
     roster_v1_namespace: bool,
     #[serde(default)]
     roster_v2_activation: Option<NativeActivation>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "frontier_encoding::recovery")]
     async_recovery: Option<async_recovery::Boundary>,
     current_snapshot: Option<crate::sqlite::consensus::CurrentSnapshot>,
 }
@@ -394,7 +395,10 @@ impl Serialize for NativeFrontierValues {
             value.serialize_field("roster_v2_activation", &self.roster_v2_activation)?;
         }
         if include_async_recovery {
-            value.serialize_field("async_recovery", &self.async_recovery)?;
+            value.serialize_field(
+                "async_recovery",
+                &frontier_encoding::Recovery(&self.async_recovery),
+            )?;
         }
         if include_fenced_profile {
             value.serialize_field("fenced_transition_profile", &self.fenced_transition_profile)?;

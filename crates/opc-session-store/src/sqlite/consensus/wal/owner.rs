@@ -311,7 +311,7 @@ impl NativeOwner {
     pub(crate) fn preflight_formats(
         &self,
         identity_expected: consensus::SessionConsensusIdentity,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
         let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
         let binding = self.read_root(&pin, identity_expected)?;
         let directory = directory_path(&pin);
@@ -323,7 +323,9 @@ impl NativeOwner {
     /// Compatibility inspection precedes even the SQLite query that classifies
     /// a caller identity mismatch. ROOT's checksum, selection and inode binding
     /// are checked here; its scope binding remains the ordinary opener's job.
-    pub(crate) fn preflight_formats_before_scope_lookup(&self) -> io::Result<()> {
+    pub(crate) fn preflight_formats_before_scope_lookup(
+        &self,
+    ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
         let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
         let (bytes, persistence) = self.read_root_record(&pin)?;
         let mut root = [0; 32];
@@ -342,17 +344,27 @@ impl NativeOwner {
     fn preflight_generation_format(
         directory: &Path,
         anchor: &super::checkpoint::Anchor,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
         let prefix = anchor
             .native_prefix()?
             .ok_or_else(|| invalid_data("native generation discriminator differs"))?;
-        crate::consensus::native::generation::preflight_format(
+        let current = crate::consensus::native::generation::preflight_format(
             &anchor.basis_path(directory),
             prefix,
             super::MAX_BASIS,
             anchor.native_cut_binding()?,
             &|| Ok(()),
-        )
+        )?;
+        let mut snapshots = anchor
+            .native_snapshots
+            .as_ref()
+            .map_or_else(Vec::new, |snapshots| snapshots.retained());
+        if let Some(current) = current {
+            if !snapshots.contains(&current) {
+                snapshots.push(current);
+            }
+        }
+        Ok(snapshots)
     }
 
     fn verify_database(&self, core: &SqliteConsensusCore) -> io::Result<()> {

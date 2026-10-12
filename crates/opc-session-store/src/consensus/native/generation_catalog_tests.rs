@@ -17,6 +17,9 @@ mod compat_tests;
 #[path = "generation_catalog_format_tests.rs"]
 mod format_tests;
 
+#[path = "generation_header_budget_tests.rs"]
+mod header_budget_tests;
+
 #[path = "generation_roster_tests.rs"]
 mod roster_tests;
 

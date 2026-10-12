@@ -1,6 +1,7 @@
 //! Read-only vocabulary admission before database or snapshot initialization.
-//! This walks framing and canonical headers only. It grants no row or recovery
-//! authority: the complete cold catalog and strict snapshot checks still run.
+//! This walks framing, canonical headers and the log command vocabulary.
+//! It grants no row or recovery authority: the complete cold catalog and
+//! strict snapshot checks still run.
 
 use super::*;
 
@@ -10,7 +11,8 @@ pub(crate) fn preflight_format(
     maximum: u64,
     cut_binding: [u8; 32],
     check: &impl Fn() -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<Option<crate::sqlite::consensus::CurrentSnapshot>> {
+    let mut snapshot = None;
     let _owner = VerifiedAppendOwner::open(path, expected, maximum, check, |source| {
         let _memory = VerificationMemory::reserve(HEADER_MEMORY)?;
         let mut reader = Cursor {
@@ -20,7 +22,7 @@ pub(crate) fn preflight_format(
             hash: Sha256::new(),
         };
         let mut format = Format::read(&mut reader, true)?;
-        if format < Format::V6 {
+        if format.vocabulary < Format::V6.vocabulary {
             return Err(invalid("native generation discriminator differs"));
         }
         let loaded = header::base(&mut reader, format)?;
@@ -51,6 +53,7 @@ pub(crate) fn preflight_format(
                 .roster
                 .as_ref()
                 .map_or([0; 2], |roster| roster.counts),
+            &context.business,
             check,
         )?;
         reader.boundary(base.block_bytes, check)?;
@@ -64,9 +67,7 @@ pub(crate) fn preflight_format(
         while reader.position < expected.length {
             check()?;
             let next_format = Format::read(&mut reader, false)?;
-            if next_format < format {
-                return Err(invalid("native generation delta format regressed"));
-            }
+            format.validate_successor(next_format)?;
             format = next_format;
             let loaded = header::delta(&mut reader, format)?;
             let delta = &loaded.value;
@@ -84,7 +85,13 @@ pub(crate) fn preflight_format(
             let roster = delta.roster_changed.ok_or_else(|| {
                 invalid("native generation roster frame counts differ from its format")
             })?;
-            skip_rows(&mut reader, delta.changed, roster, check)?;
+            skip_rows(
+                &mut reader,
+                delta.changed,
+                roster,
+                &delta.after.business,
+                check,
+            )?;
             reader.boundary(base.block_bytes, check)?;
             context = delta.after.clone();
             previous = reader.identity(
@@ -101,9 +108,11 @@ pub(crate) fn preflight_format(
                 "native generation selected final extent or cut differs",
             ));
         }
+        snapshot = context.business.frontiers.current_snapshot.clone();
         check()
     })?;
-    check()
+    check()?;
+    Ok(snapshot)
 }
 
 fn skip_bytes(
@@ -140,6 +149,7 @@ fn skip_rows(
     reader: &mut Cursor<'_>,
     counts: [usize; 5],
     roster: [usize; 2],
+    context: &BusinessContext,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
     if counts
@@ -169,9 +179,19 @@ fn skip_rows(
                     skip_bytes(reader, MAX_ITEM, check)?;
                 }
                 4 => {
-                    reader.scalar::<8>()?;
+                    let index = u64::from_le_bytes(reader.scalar()?);
                     reader.before()?;
-                    optional_bytes(reader, sql::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES, check)?;
+                    if reader.present()? {
+                        let (_, input) = reader.bytes(sql::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES)?;
+                        decode::inspect_log_profile(
+                            input.bytes(),
+                            index,
+                            context.identity,
+                            &context.members,
+                            context.frontiers.voter_slots.is_some(),
+                            check,
+                        )?;
+                    }
                 }
                 _ => return Err(invalid("native generation table tag differs")),
             }
