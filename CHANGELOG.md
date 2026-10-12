@@ -636,6 +636,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-testbed`: replace deprecated `serde_yaml` and unmaintained `unsafe-libyaml`
+  with the YAML Organization's `yaml_serde` and `libyaml-rs`, resolving
+  RUSTSEC-2024-0449. Preserve the scenario fixture's complete parsed values and
+  serialization roundtrip in a compatibility regression.
+
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at
   `Complete` or `Acquired` can be recovered or committed without a spurious
