@@ -98,6 +98,7 @@ pub(crate) fn retired_fixture(before: &ScopeState, n: u8) -> ScopeState {
 }
 
 /// Model retirement for a scope admitted by a real consensus-store fixture.
+#[cfg(target_os = "linux")]
 pub(crate) fn retired_store_fixture(before: &ScopeState, n: u8) -> ScopeState {
     let request = ScopeAuthorityRequest::new(
         before.view.scope().clone(),
