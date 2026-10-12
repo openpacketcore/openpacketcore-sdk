@@ -1,0 +1,26 @@
+module state-keys {
+  yang-version 1.1;
+  namespace "urn:example:state-keys";
+  prefix sk;
+  revision 2026-10-12;
+  container state {
+    config false;
+    list endpoint {
+      key "region name";
+      leaf region { type uint16; }
+      leaf name { type string; }
+      leaf active { type boolean; }
+    }
+    list account {
+      key "token";
+      leaf token { type string; }
+      leaf count { type uint32; }
+    }
+    list session {
+      key "token region";
+      leaf token { type string; }
+      leaf region { type uint16; }
+      leaf active { type boolean; }
+    }
+  }
+}
