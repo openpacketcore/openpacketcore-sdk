@@ -1,22 +1,255 @@
 mod testbed_common;
+use std::path::{Path, PathBuf};
 use testbed_common::*;
+
+fn workspace_yaml_fixtures() -> Vec<PathBuf> {
+    fn collect(directory: &Path, fixtures: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                if entry.file_name() != "target" && entry.file_name() != ".git" {
+                    collect(&path, fixtures);
+                }
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
+                })
+            {
+                fixtures.push(path);
+            }
+        }
+    }
+
+    // Crate YAML files form the scenario corpus, including consumers of this
+    // crate. Discover the files rather than maintaining a list of known callers.
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut fixtures = Vec::new();
+    collect(crates, &mut fixtures);
+    fixtures.sort();
+    assert!(!fixtures.is_empty(), "the scenario fixture corpus is empty");
+    fixtures
+}
+
+#[test]
+fn every_workspace_yaml_fixture_has_a_json_counterpart() {
+    for yaml in workspace_yaml_fixtures() {
+        let json = yaml.with_extension("json");
+        assert!(
+            json.is_file(),
+            "YAML fixture {} is missing its JSON counterpart {}",
+            yaml.display(),
+            json.display(),
+        );
+    }
+}
 
 #[test]
 fn committed_yaml_fixture_preserves_authored_values_and_scenario_roundtrip() {
-    let yaml = include_str!("fixtures/ue_registration.yaml");
-    let json = include_str!("fixtures/ue_registration.json");
-    let expected: serde_json::Value = serde_json::from_str(json).unwrap();
-    let authored: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-    assert_eq!(serde_json::to_value(authored).unwrap(), expected);
+    for path in workspace_yaml_fixtures() {
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let json_path = path.with_extension("json");
+        let json = std::fs::read_to_string(&json_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", json_path.display()));
+        let expected: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let authored: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            serde_json::to_value(authored).unwrap(),
+            expected,
+            "{}: authored values",
+            path.display(),
+        );
 
-    let scenario = Scenario::from_yaml(yaml).unwrap();
-    let expected_scenario = Scenario::from_json(json).unwrap();
-    let expected_scenario = serde_json::to_value(expected_scenario).unwrap();
-    assert_eq!(serde_json::to_value(&scenario).unwrap(), expected_scenario);
+        let scenario = Scenario::from_yaml(&yaml).unwrap();
+        let expected_scenario = Scenario::from_json(&json).unwrap();
+        let expected_scenario = serde_json::to_value(expected_scenario).unwrap();
+        assert_eq!(
+            serde_json::to_value(&scenario).unwrap(),
+            expected_scenario,
+            "{}: typed scenario",
+            path.display(),
+        );
 
+        let serialized = serde_yaml::to_string(&scenario).unwrap();
+        let restored = Scenario::from_yaml(&serialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            expected_scenario,
+            "{}: scenario roundtrip",
+            path.display(),
+        );
+    }
+}
+
+fn yaml_semantics_scenario(extra: &str) -> String {
+    format!("schema_version: '0.1.0'\nid: BASE\ntitle: base\ntopology: {{nfs: {{}}}}\nsteps:\n  - kind: send_ngap\n    from: a\n    to: b\n    message: m\n{extra}")
+}
+
+fn yaml_semantics_authored_value() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "0.1.0",
+        "id": "BASE",
+        "title": "base",
+        "topology": {"nfs": {}},
+        "steps": [{"kind": "send_ngap", "from": "a", "to": "b", "message": "m"}],
+    })
+}
+
+#[test]
+fn accepted_yaml_semantics_match_parent_parser_values_and_roundtrips() {
+    // Expected values were captured with serde_yaml 0.9.34+deprecated. Keep
+    // that parser out of the dependency graph: the explicit values are the oracle.
+    let mut cases = Vec::new();
+    let mut aliases = yaml_semantics_authored_value();
+    aliases["title"] = serde_json::json!("BASE");
+    cases.push((
+        "anchor-alias".to_owned(),
+        yaml_semantics_scenario("")
+            .replace("id: BASE\ntitle: base", "id: &label BASE\ntitle: *label"),
+        aliases,
+    ));
+    let mut tagged = yaml_semantics_authored_value();
+    tagged["title"] = serde_json::json!("yes");
+    cases.push((
+        "standard-string-tag".to_owned(),
+        yaml_semantics_scenario("").replace("title: base", "title: !!str yes"),
+        tagged,
+    ));
+    for word in ["yes", "no", "on", "off", "Yes", "NO"] {
+        let mut expected = yaml_semantics_authored_value();
+        expected["title"] = serde_json::json!(word);
+        cases.push((
+            format!("text-{word}"),
+            yaml_semantics_scenario("").replace("title: base", &format!("title: {word}")),
+            expected,
+        ));
+    }
+    for (seed, value) in [("0o7", 7_u64), ("0x10", 16), ("7", 7)] {
+        let mut expected = yaml_semantics_authored_value();
+        expected["seed"] = serde_json::json!(value);
+        cases.push((
+            format!("numeric-{seed}"),
+            yaml_semantics_scenario(&format!("seed: {seed}\n")),
+            expected,
+        ));
+    }
+    cases.push((
+        "one-explicit-document".to_owned(),
+        format!("---\n{}...\n", yaml_semantics_scenario("")),
+        yaml_semantics_authored_value(),
+    ));
+
+    for (name, yaml, authored_expected) in cases {
+        let raw: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            serde_json::to_value(raw).unwrap(),
+            authored_expected,
+            "{name}: raw values"
+        );
+
+        let mut expected = authored_expected;
+        expected["requirements"] = serde_json::json!([]);
+        expected["assertions"] = serde_json::json!([]);
+        let scenario = Scenario::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            serde_json::to_value(&scenario).unwrap(),
+            expected,
+            "{name}: typed values"
+        );
+        let serialized = serde_yaml::to_string(&scenario).unwrap();
+        let restored = Scenario::from_yaml(&serialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            expected,
+            "{name}: roundtrip"
+        );
+    }
+}
+
+#[test]
+fn rejected_yaml_semantics_match_parent_parser_errors_and_raw_values() {
+    let mut custom_tag = serde_yaml::to_value(yaml_semantics_authored_value()).unwrap();
+    custom_tag["title"] = serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+        tag: serde_yaml::value::Tag::new("!custom"),
+        value: serde_yaml::Value::String("base".to_owned()),
+    }));
+    let mut boolean = yaml_semantics_authored_value();
+    boolean["title"] = serde_json::json!(true);
+    let mut cases = vec![
+        (
+            "undefined-alias".to_owned(),
+            yaml_semantics_scenario("").replace("title: base", "title: *missing"),
+            Err("unknown anchor at line 3 column 8".to_owned()),
+            "unknown anchor at line 3 column 8",
+        ),
+        (
+            "local-tag".to_owned(),
+            yaml_semantics_scenario("").replace("title: base", "title: !custom base"),
+            Ok(custom_tag),
+            "title: invalid type: enum, expected any valid JSON value at line 3 column 8",
+        ),
+        (
+            "boolean-not-text".to_owned(),
+            yaml_semantics_scenario("").replace("title: base", "title: true"),
+            Ok(serde_yaml::to_value(boolean).unwrap()),
+            "validation error: $.title: expected type string, got boolean",
+        ),
+        (
+            "multiple-documents".to_owned(),
+            format!(
+                "{}\n---\n{}",
+                yaml_semantics_scenario(""),
+                yaml_semantics_scenario("")
+            ),
+            Err(
+                "deserializing from YAML containing more than one document is not supported"
+                    .to_owned(),
+            ),
+            "deserializing from YAML containing more than one document is not supported",
+        ),
+    ];
+    for seed in ["007", "00", "0123"] {
+        let mut raw = yaml_semantics_authored_value();
+        raw["seed"] = serde_json::json!(seed);
+        cases.push((
+            format!("leading-zero-{seed}"),
+            yaml_semantics_scenario(&format!("seed: {seed}\n")),
+            Ok(serde_yaml::to_value(raw).unwrap()),
+            "validation error: $.seed: expected type integer, got string",
+        ));
+    }
+
+    for (name, yaml, raw_expected, expected_error) in cases {
+        let raw =
+            serde_yaml::from_str::<serde_yaml::Value>(&yaml).map_err(|error| error.to_string());
+        assert_eq!(raw, raw_expected, "{name}: raw value or exact error");
+        let error = Scenario::from_yaml(&yaml).unwrap_err();
+        let TestbedError::ScenarioParse(actual) = error else {
+            panic!("{name}: expected ScenarioParse, got {error}");
+        };
+        assert_eq!(actual, expected_error, "{name}: public scenario error");
+    }
+}
+
+#[test]
+fn duplicate_yaml_keys_preserve_distinct_raw_and_scenario_behavior() {
+    let yaml = yaml_semantics_scenario("id: LAST\n");
+    let raw_error = serde_yaml::from_str::<serde_yaml::Value>(&yaml).unwrap_err();
+    assert_eq!(raw_error.to_string(), "duplicate entry with key \"id\"");
+
+    // Scenario first deserializes through serde_json::Value, whose last value
+    // wins. The old parser accepted this even though raw YAML Value rejects it.
+    let mut expected = yaml_semantics_authored_value();
+    expected["id"] = serde_json::json!("LAST");
+    expected["requirements"] = serde_json::json!([]);
+    expected["assertions"] = serde_json::json!([]);
+    let scenario = Scenario::from_yaml(&yaml).unwrap();
+    assert_eq!(serde_json::to_value(&scenario).unwrap(), expected);
     let serialized = serde_yaml::to_string(&scenario).unwrap();
     let restored = Scenario::from_yaml(&serialized).unwrap();
-    assert_eq!(serde_json::to_value(restored).unwrap(), expected_scenario);
+    assert_eq!(serde_json::to_value(restored).unwrap(), expected);
 }
 
 #[test]
