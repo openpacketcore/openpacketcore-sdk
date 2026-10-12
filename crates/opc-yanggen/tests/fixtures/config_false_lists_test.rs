@@ -97,7 +97,7 @@ fn state_list_missing_and_duplicate_keys_are_rejected() {
 fn state_list_gnmi_read_emits_the_selected_entry() {
     let state = sample();
     let schema_path = "/ms:state/ms:error/ms:count";
-    let path = YangPath::new("/ms:state/ms:error[reason='temporary']/ms:count").unwrap();
+    let path = YangPath::new("/ms:state/ms:error[ms:reason='temporary']/ms:count").unwrap();
     let selection = [ReadSelectionEntry::new(schema_path, path.clone())];
     let updates = minimal::gnmi_json::renderer()
         .render_running_json(
