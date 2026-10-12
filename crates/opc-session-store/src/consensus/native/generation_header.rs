@@ -107,14 +107,14 @@ fn read<T: serde::de::DeserializeOwned + Serialize, S: serde::de::DeserializeOwn
 }
 
 pub(super) fn base(reader: &mut dyn Read, format: Format) -> io::Result<Loaded<BaseHeader>> {
-    if format == Format::V5 {
+    if format.has_voter_slots() {
         read::<BaseHeader, BaseShape<9, 10, 2>>(reader)
     } else {
         read::<BaseHeader, BaseShape<5, 5, 1>>(reader)
     }
 }
 pub(super) fn delta(reader: &mut dyn Read, format: Format) -> io::Result<Loaded<Header>> {
-    if format == Format::V5 {
+    if format.has_voter_slots() {
         read::<Header, DeltaShape<9, 10, 2>>(reader)
     } else {
         read::<Header, DeltaShape<5, 5, 1>>(reader)

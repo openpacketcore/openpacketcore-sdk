@@ -410,11 +410,12 @@ impl NativeStorage {
             .get(&applied.index)
             .is_none_or(|entry| entry.id() != applied)
             && !(self.log.entries.get(&applied.index).is_none()
-                && self
-                    .business
-                    .snapshot_origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.matches_snapshot_lineage(snapshot)))
+                && (self.log.purged == Some(applied)
+                    || self
+                        .business
+                        .snapshot_origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.matches_snapshot_lineage(snapshot))))
         {
             return Err(invalid(
                 "native snapshot applied lineage differs from retained log",

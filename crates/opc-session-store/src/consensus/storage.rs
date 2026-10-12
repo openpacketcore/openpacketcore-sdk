@@ -2364,6 +2364,10 @@ pub enum SessionConsensusStorageError {
     /// This boundary requires new storage, never an in-place migration.
     #[error("session consensus scope format changed; fresh installation required")]
     FreshInstallationRequired,
+    /// The native root predates physical log reclamation or names an unknown
+    /// persistence format. Reopening requires a fresh installation.
+    #[error("native root persistence format differs")]
+    PersistenceFormatMismatch,
     /// A required row, constraint, or typed high-water mark is invalid.
     #[error("session consensus durable state is corrupt")]
     CorruptState,
@@ -2382,6 +2386,7 @@ impl SessionConsensusStorageError {
             .and_then(|source| source.downcast_ref::<Self>())
         {
             Some(Self::FreshInstallationRequired) => Self::FreshInstallationRequired,
+            Some(Self::PersistenceFormatMismatch) => Self::PersistenceFormatMismatch,
             _ => Self::CorruptState,
         }
     }
@@ -3551,12 +3556,6 @@ async fn open_with_member_bindings_for_profile(
     {
         return Err(SessionConsensusStorageError::PersistenceModeMismatch);
     }
-    if backend.voter_profile_preflight().await?
-        && (authority_profile != ConsensusAuthorityProfile::FixedImmutable
-            || persistence != SessionPersistenceMode::Durable)
-    {
-        return Err(SessionConsensusStorageError::PersistenceModeMismatch);
-    }
     // Reject an existing mode mismatch before initialization, filesystem
     // probes, or cleanup can mutate either storage namespace.
     #[cfg(target_os = "linux")]
@@ -3564,6 +3563,17 @@ async fn open_with_member_bindings_for_profile(
         if selected != persistence {
             return Err(SessionConsensusStorageError::PersistenceModeMismatch);
         }
+    }
+    #[cfg(target_os = "linux")]
+    backend
+        .finish_native_reopen_after_preflight()
+        .await
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    if backend.voter_profile_preflight().await?
+        && (authority_profile != ConsensusAuthorityProfile::FixedImmutable
+            || persistence != SessionPersistenceMode::Durable)
+    {
+        return Err(SessionConsensusStorageError::PersistenceModeMismatch);
     }
     let snapshot_directory_lease = acquire_snapshot_directory(backend, snapshot_dir)
         .await
@@ -8520,6 +8530,10 @@ fn reject_indeterminate_snapshot_publication(core: &SqliteConsensusCore) -> io::
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod native_log_retained_bound;
+    #[cfg(target_os = "linux")]
+    mod native_reopen_formats;
     #[cfg(all(target_os = "linux", feature = "test-control"))]
     mod scope_scans;
     #[cfg(all(target_os = "linux", feature = "test-control"))]

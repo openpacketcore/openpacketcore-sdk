@@ -14,11 +14,11 @@ use std::sync::Arc;
 mod frames;
 
 #[derive(Clone)]
-pub(in crate::consensus::native) struct GenerationLogVersion(Arc<LogProof>);
+pub(in crate::consensus::native) struct GenerationLogVersion(LogProof);
 
 impl GenerationLogVersion {
     pub(in crate::consensus::native) fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.0.same(&other.0)
     }
 }
 
@@ -55,6 +55,20 @@ struct Stamp {
 }
 
 impl Summary {
+    fn subtract(&mut self, removed: Self) -> io::Result<()> {
+        self.count = self
+            .count
+            .checked_sub(removed.count)
+            .ok_or_else(|| invalid("native log prefix removal count differs"))?;
+        for (slot, byte) in self.content.iter_mut().zip(removed.content) {
+            *slot ^= byte;
+        }
+        for (slot, byte) in self.revisions.iter_mut().zip(removed.revisions) {
+            *slot ^= byte;
+        }
+        Ok(())
+    }
+
     fn replace(&mut self, before: Option<Stamp>, after: Option<Stamp>) -> io::Result<()> {
         self.count = self
             .count
@@ -86,42 +100,62 @@ fn stamp(index: u64, row: &SharedRow<NativeLogEntry>) -> io::Result<Stamp> {
     })
 }
 
-pub(super) struct LogProof {
+// Variable-sized scope is immutable and charged once at full admission.
+// Process proofs remain inline in their charged owner/capture containers, so
+// a metadata-only purge needs neither a fresh scope nor a proof allocation.
+struct LogScope {
     slots: bool,
     identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     snapshot_origin: Option<Arc<NativeSnapshotAuthority>>,
+    _memory: VerificationMemory,
+}
+
+#[derive(Clone)]
+pub(super) struct LogProof {
+    scope: Arc<LogScope>,
     frontiers: LogFrontiers,
     summary: Summary,
     first: Option<LogId<SessionConsensusNodeId>>,
     last: Option<LogId<SessionConsensusNodeId>>,
     revision: u64,
-    _memory: VerificationMemory,
 }
 
 impl LogProof {
+    fn same(&self, other: &Self) -> bool {
+        self.revision == other.revision && Arc::ptr_eq(&self.scope, &other.scope)
+    }
+
     fn new(
         state: &NativeState,
         frontiers: LogFrontiers,
         summary: Summary,
         first: Option<LogId<SessionConsensusNodeId>>,
         last: Option<LogId<SessionConsensusNodeId>>,
-        revision: u64,
-    ) -> io::Result<Arc<Self>> {
-        let memory =
-            VerificationMemory::reserve(64 * 1024 + size_of::<Self>() + 2 * size_of::<usize>())?;
-        Ok(Arc::new(Self {
-            slots: state.frontiers.voter_slots.is_some(),
-            identity: state.identity,
-            members: state.members.clone(),
-            snapshot_origin: state.snapshot_origin.clone(),
+    ) -> io::Result<Self> {
+        // Include the live inline proof and its journal. Detached captures
+        // charge their own containers before copying these bounded values.
+        let memory = VerificationMemory::reserve(
+            64 * 1024
+                + size_of::<LogScope>()
+                + 2 * size_of::<usize>()
+                + size_of::<NativeLog>()
+                + size_of::<LogChanges>(),
+        )?;
+        Ok(Self {
+            scope: Arc::new(LogScope {
+                slots: state.frontiers.voter_slots.is_some(),
+                identity: state.identity,
+                members: state.members.clone(),
+                snapshot_origin: state.snapshot_origin.clone(),
+                _memory: memory,
+            }),
             frontiers,
             summary,
             first,
             last,
-            revision,
-            _memory: memory,
-        }))
+            revision: crate::consensus::native::shared::issue_revision()?.get(),
+        })
     }
 }
 
@@ -178,12 +212,17 @@ pub(in crate::consensus::native) fn validate_context_metadata(
     row: impl Fn(u64) -> Option<LogId<SessionConsensusNodeId>>,
     membership_matches: impl Fn(u64) -> bool,
 ) -> io::Result<()> {
-    if let (Some(origin), Some(purged)) = (origin, frontiers.purged) {
-        if row(purged.index).is_none() && !origin.matches_cut(purged) {
-            return Err(invalid(
-                "native missing purge witness differs from admitted snapshot cut",
-            ));
-        }
+    if let Some(purged) = frontiers.purged {
+        let snapshot = business
+            .current_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.0.last_log_id)
+            .ok_or_else(|| invalid("native purge frontier exceeds selected snapshot"))?;
+        sql::ensure_log_id_not_after(
+            &purged,
+            &snapshot,
+            "native purge frontier exceeds selected snapshot",
+        )?;
     }
     for pointer in [frontiers.committed, frontiers.purged, business.applied]
         .into_iter()
@@ -192,12 +231,34 @@ pub(in crate::consensus::native) fn validate_context_metadata(
         exact(pointer, frontiers, &row)?;
     }
     if let Some(membership_id) = business.membership.log_id() {
-        let installed = row(membership_id.index).is_none()
-            && origin.is_some_and(|origin| origin.matches_membership(&business.membership));
-        if !installed {
+        let missing = row(membership_id.index).is_none();
+        let installed =
+            missing && origin.is_some_and(|origin| origin.matches_membership(&business.membership));
+        let removed = missing
+            && frontiers.purged.is_some_and(|purged| {
+                membership_id.index <= purged.index
+                    && sql::ensure_log_id_not_after(
+                        membership_id,
+                        &purged,
+                        "native membership payload differs from exact log witness",
+                    )
+                    .is_ok()
+            });
+        if !installed
+            && removed
+            && business
+                .current_snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.0.last_membership != business.membership)
+        {
+            return Err(invalid(
+                "native membership payload differs from exact log witness",
+            ));
+        }
+        if !installed && !removed {
             exact(*membership_id, frontiers, &row)?;
         }
-        if !membership_matches(membership_id.index) && !installed {
+        if !membership_matches(membership_id.index) && !installed && !removed {
             return Err(invalid(
                 "native membership payload differs from exact log witness",
             ));
@@ -230,7 +291,8 @@ pub(in crate::consensus::native) fn validate_context_metadata(
         if let Some(id) = snapshot.0.last_log_id {
             if row(id.index) != Some(id)
                 && !(row(id.index).is_none()
-                    && origin.is_some_and(|origin| origin.matches_snapshot_lineage(snapshot)))
+                    && (frontiers.purged == Some(id)
+                        || origin.is_some_and(|origin| origin.matches_snapshot_lineage(snapshot))))
             {
                 return Err(invalid(
                     "native snapshot applied lineage differs from retained log",
@@ -248,6 +310,43 @@ struct RowChange {
     after_stamp: Option<Stamp>,
 }
 
+/// One cut covers all removed predecessor rows in a capture window. The
+/// immutable map shares its tree with the predecessor; verification uses only
+/// admitted content facts and process revisions, never removed row payloads.
+struct PrefixCut {
+    through: LogId<SessionConsensusNodeId>,
+    removed: Summary,
+    rows: OrdMap<u64, SharedRow<NativeLogEntry>>,
+}
+
+struct PreparedCut {
+    through: LogId<SessionConsensusNodeId>,
+    entries: OrdMap<u64, SharedRow<NativeLogEntry>>,
+    slots: OrdMap<u64, SharedRow<NativeLogEntry>>,
+    journal: Option<PrefixCut>,
+}
+
+fn retain_after(
+    rows: &OrdMap<u64, SharedRow<NativeLogEntry>>,
+    through: u64,
+    removed: usize,
+) -> OrdMap<u64, SharedRow<NativeLogEntry>> {
+    if removed > rows.len() / 2 {
+        rows.range((
+            std::ops::Bound::Excluded(through),
+            std::ops::Bound::Unbounded,
+        ))
+        .map(|(index, row)| (*index, row.clone()))
+        .collect()
+    } else {
+        let mut retained = rows.clone();
+        for (index, _) in rows.range(..=through) {
+            retained.remove(index);
+        }
+        retained
+    }
+}
+
 fn same(
     left: Option<&SharedRow<NativeLogEntry>>,
     right: Option<&SharedRow<NativeLogEntry>>,
@@ -260,17 +359,21 @@ fn same(
 }
 
 pub(super) struct LogChanges {
-    base: Arc<LogProof>,
-    target: Arc<LogProof>,
+    base: LogProof,
+    base_rows: OrdMap<u64, SharedRow<NativeLogEntry>>,
+    target: LogProof,
+    cut: Option<PrefixCut>,
     rows: HashMap<u64, RowChange>,
     memory: Vec<Arc<VerificationMemory>>,
 }
 
 impl LogChanges {
-    fn empty(proof: Arc<LogProof>) -> Self {
+    fn empty(proof: LogProof, rows: &OrdMap<u64, SharedRow<NativeLogEntry>>) -> Self {
         Self {
-            base: Arc::clone(&proof),
+            base: proof.clone(),
+            base_rows: rows.clone(),
             target: proof,
+            cut: None,
             rows: HashMap::new(),
             memory: Vec::new(),
         }
@@ -278,7 +381,7 @@ impl LogChanges {
 
     #[cfg(test)]
     fn validate(&self, log: &NativeLog, state: &NativeState) -> io::Result<()> {
-        if !Arc::ptr_eq(&self.target, log.require_proof(state)?) {
+        if !self.target.same(log.require_proof(state)?) {
             return Err(invalid("native log capture target differs"));
         }
         for (index, change) in &self.rows {
@@ -304,15 +407,33 @@ impl LogChanges {
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
         check()?;
-        if self.base.identity != self.target.identity
-            || self.base.members != self.target.members
+        if self.base.scope.identity != self.target.scope.identity
+            || self.base.scope.members != self.target.scope.members
             || self.base.revision > self.target.revision
-            || self.target.identity != identity
-            || &self.target.members != members
+            || self.target.scope.identity != identity
+            || &self.target.scope.members != members
         {
             return Err(invalid("native captured log predecessor differs"));
         }
         let mut summary = self.base.summary;
+        if let Some(cut) = &self.cut {
+            if self.target.frontiers.purged != Some(cut.through)
+                || self.rows.keys().any(|index| *index <= cut.through.index)
+            {
+                return Err(invalid("native log capture prefix frontier differs"));
+            }
+            let mut removed = Summary::default();
+            for (index, row) in cut.rows.range(..=cut.through.index) {
+                check()?;
+                removed.replace(None, Some(stamp(*index, row)?))?;
+            }
+            if removed != cut.removed {
+                return Err(invalid("native log capture prefix aggregate differs"));
+            }
+            summary.subtract(removed)?;
+        } else if self.base.frontiers.purged != self.target.frontiers.purged {
+            return Err(invalid("native log capture prefix cut missing"));
+        }
         for (index, change) in &self.rows {
             check()?;
             let before = change
@@ -427,12 +548,13 @@ impl LogTransfer<'_> {
 }
 
 pub(super) struct Publication {
-    predecessor: Arc<LogProof>,
+    predecessor: LogProof,
     business_predecessor: Arc<crate::consensus::native::changes::BusinessProof>,
-    proof: Arc<LogProof>,
+    proof: LogProof,
     rows: BTreeMap<u64, RowChange>,
+    cut: Option<PreparedCut>,
     tracking: bool,
-    memory: Arc<VerificationMemory>,
+    memory: Option<Arc<VerificationMemory>>,
 }
 
 impl Publication {
@@ -503,7 +625,7 @@ impl Publication {
         state: &NativeState,
         frozen_applied: Option<LogId<SessionConsensusNodeId>>,
     ) -> io::Result<Self> {
-        let predecessor = Arc::clone(log.require_proof(state)?);
+        let predecessor = log.require_proof(state)?.clone();
         validate_context(
             &predecessor.frontiers,
             &state.members,
@@ -525,8 +647,16 @@ impl Publication {
             .checked_mul(8 * (size_of::<(u64, RowChange)>() + 1))
             .and_then(|bytes| bytes.checked_add(256))
             .ok_or_else(|| invalid("native log change reservation overflow"))?;
-        let memory = Arc::new(VerificationMemory::reserve(bytes)?);
+        let memory = if matches!(operation, Operation::Purge(_)) {
+            // The prefix cut, proof and empty row map are inline. Existing
+            // journal storage is reused; purge cannot wait for verifier space.
+            None
+        } else {
+            Some(Arc::new(VerificationMemory::reserve(bytes)?))
+        };
         let mut rows = BTreeMap::new();
+        let mut cut = None;
+        let mut removed = Summary::default();
         let mut frontiers = predecessor.frontiers;
         if frontiers.slot_intent.is_some_and(|id| {
             state
@@ -730,15 +860,67 @@ impl Publication {
                         &frozen,
                         "native purge exceeds selected applied basis",
                     )?;
+                    let snapshot = state
+                        .frontiers
+                        .current_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.0.last_log_id)
+                        .ok_or_else(|| {
+                            invalid("native purge frontier exceeds selected snapshot")
+                        })?;
+                    sql::ensure_log_id_not_after(
+                        through,
+                        &snapshot,
+                        "native purge frontier exceeds selected snapshot",
+                    )?;
                     log.exact(*through)?;
-                    // Physical prefix reclamation needs the later explicit
-                    // membership/snapshot boundary-witness implementation.
+                    let mut journal_removed = log
+                        .changes
+                        .as_ref()
+                        .and_then(|dirty| dirty.cut.as_ref())
+                        .map_or(Summary::default(), |cut| cut.removed);
+                    for (index, row) in log.entries.range(..=through.index) {
+                        let current = stamp(*index, row)?;
+                        removed.replace(None, Some(current))?;
+                        let before =
+                            match log.changes.as_ref().and_then(|dirty| dirty.rows.get(index)) {
+                                Some(dirty) => {
+                                    if !same(Some(row), dirty.after.as_ref())
+                                        || dirty.after_stamp != Some(current)
+                                    {
+                                        return Err(invalid(
+                                            "native log dirty predecessor changed",
+                                        ));
+                                    }
+                                    dirty.before_stamp
+                                }
+                                None => Some(current),
+                            };
+                        journal_removed.replace(None, before)?;
+                    }
+                    cut = Some(PreparedCut {
+                        through: *through,
+                        entries: retain_after(&log.entries, through.index, removed.count),
+                        slots: retain_after(
+                            &log.slot_projections,
+                            through.index,
+                            log.slot_projections.range(..=through.index).count(),
+                        ),
+                        journal: log.changes.as_ref().map(|dirty| PrefixCut {
+                            through: *through,
+                            removed: journal_removed,
+                            rows: dirty.base_rows.clone(),
+                        }),
+                    });
                     frontiers.purged = Some(*through);
                 }
             }
             Operation::Barrier => {}
         }
         let lookup = |index| {
+            if cut.is_some() && frontiers.purged.is_some_and(|purged| index <= purged.index) {
+                return None;
+            }
             rows.get(&index)
                 .map_or_else(|| log.entries.get(&index), |change| change.after.as_ref())
         };
@@ -750,16 +932,22 @@ impl Publication {
             lookup,
         )?;
         let mut summary = predecessor.summary;
+        summary.subtract(removed)?;
         for change in rows.values() {
             summary.replace(change.before_stamp, change.after_stamp)?;
         }
         let (first, last) = if summary.count == 0 {
             (None, None)
         } else {
-            let first = predecessor.first.or_else(|| {
-                rows.first_key_value()
-                    .and_then(|(_, change)| change.after.as_ref().map(|row| row.id()))
-            });
+            let first = cut
+                .as_ref()
+                .map_or(predecessor.first, |cut| {
+                    cut.entries.get_min().map(|(_, row)| row.id())
+                })
+                .or_else(|| {
+                    rows.first_key_value()
+                        .and_then(|(_, change)| change.after.as_ref().map(|row| row.id()))
+                });
             let last = match operation {
                 Operation::Truncate(since) => log
                     .entries
@@ -775,16 +963,22 @@ impl Publication {
             };
             (first, last)
         };
-        let revision = predecessor
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("native log revision exhausted"))?;
-        let proof = LogProof::new(state, frontiers, summary, first, last, revision)?;
+        let proof = LogProof {
+            scope: Arc::clone(&predecessor.scope),
+            frontiers,
+            summary,
+            first,
+            last,
+            // Global uniqueness preserves exact fork/predecessor checks even
+            // for equal-byte publications, with no per-publication allocation.
+            revision: crate::consensus::native::shared::issue_revision()?.get(),
+        };
         Ok(Self {
             predecessor,
             business_predecessor: Arc::clone(state.require_business_proof()?),
             proof,
             rows,
+            cut,
             tracking: log.changes.is_some(),
             memory,
         })
@@ -795,13 +989,13 @@ impl Publication {
         log: &mut NativeLog,
         state: &NativeState,
     ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
-        if !Arc::ptr_eq(&self.predecessor, log.require_proof(state)?)
+        if !self.predecessor.same(log.require_proof(state)?)
             || !Arc::ptr_eq(&self.business_predecessor, state.require_business_proof()?)
             || self.tracking != log.changes.is_some()
             || log
                 .changes
                 .as_ref()
-                .is_some_and(|dirty| !Arc::ptr_eq(&dirty.target, &self.predecessor))
+                .is_some_and(|dirty| !dirty.target.same(&self.predecessor))
         {
             return Err(invalid("native log publication predecessor changed"));
         }
@@ -822,18 +1016,30 @@ impl Publication {
             }
         }
         if let Some(dirty) = &mut log.changes {
-            dirty
-                .rows
-                .try_reserve(self.rows.len())
-                .map_err(|_| invalid("native log dirty allocation failed"))?;
-            dirty
-                .memory
-                .try_reserve(1)
-                .map_err(|_| invalid("native log dirty reservation allocation failed"))?;
+            if !self.rows.is_empty() {
+                dirty
+                    .rows
+                    .try_reserve(self.rows.len())
+                    .map_err(|_| invalid("native log dirty allocation failed"))?;
+            }
+            if self.memory.is_some() {
+                dirty
+                    .memory
+                    .try_reserve(1)
+                    .map_err(|_| invalid("native log dirty reservation allocation failed"))?;
+            }
         }
         // All recoverable checks/reservations and row allocations precede
         // publication. As in the original log, immutable tree node allocation can
         // abort or unwind; the enclosing owner mutex fences any unwind.
+        if let Some(cut) = self.cut {
+            log.entries = cut.entries;
+            log.slot_projections = cut.slots;
+            if let Some(dirty) = &mut log.changes {
+                dirty.rows.retain(|index, _| *index > cut.through.index);
+                dirty.cut = cut.journal;
+            }
+        }
         for (index, change) in self.rows {
             log.slot_projections.remove(&index);
             if let Some(after) = &change.after {
@@ -858,8 +1064,10 @@ impl Publication {
             }
         }
         if let Some(dirty) = &mut log.changes {
-            dirty.target = Arc::clone(&self.proof);
-            dirty.memory.push(self.memory);
+            dirty.target = self.proof.clone();
+            if let Some(memory) = self.memory {
+                dirty.memory.push(memory);
+            }
         }
         log.vote = self.proof.frontiers.vote;
         log.committed = self.proof.frontiers.committed;
@@ -891,14 +1099,14 @@ impl NativeLog {
         row.validate_context(index, identity, members)
     }
 
-    pub(super) fn require_proof(&self, state: &NativeState) -> io::Result<&Arc<LogProof>> {
+    pub(super) fn require_proof(&self, state: &NativeState) -> io::Result<&LogProof> {
         self.require_proofs(state).map(|(_, log)| log)
     }
 
     pub(super) fn require_proofs<'a>(
         &self,
         state: &'a NativeState,
-    ) -> io::Result<(&'a Arc<BusinessProof>, &Arc<LogProof>)> {
+    ) -> io::Result<(&'a Arc<BusinessProof>, &LogProof)> {
         // Both immutable borrows span the complete admission. Return the
         // business proof already checked here when a caller needs both roots;
         // recapturing it cannot observe a different state within this borrow.
@@ -907,14 +1115,14 @@ impl NativeLog {
             .proof
             .as_ref()
             .ok_or_else(|| invalid("native log has no process admission proof"))?;
-        if proof.identity != state.identity
-            || proof.slots != state.frontiers.voter_slots.is_some()
-            || proof.members != state.members
+        if proof.scope.identity != state.identity
+            || proof.scope.slots != state.frontiers.voter_slots.is_some()
+            || proof.scope.members != state.members
             || proof.frontiers != LogFrontiers::of(self)
             || proof.summary.count != self.entries.len()
             || proof.first != self.entries.get_min().map(|(_, row)| row.id())
             || proof.last != self.entries.get_max().map(|(_, row)| row.id())
-            || match (&proof.snapshot_origin, &state.snapshot_origin) {
+            || match (&proof.scope.snapshot_origin, &state.snapshot_origin) {
                 (None, None) => false,
                 (Some(left), Some(right)) => !Arc::ptr_eq(left, right),
                 _ => true,
@@ -944,7 +1152,6 @@ impl NativeLog {
             summary,
             self.entries.get_min().map(|(_, row)| row.id()),
             self.entries.get_max().map(|(_, row)| row.id()),
-            0,
         )?);
         Ok(())
     }
@@ -956,7 +1163,7 @@ impl NativeLog {
         if self.changes.is_some() {
             return Err(invalid("native log capture already active"));
         }
-        let proof = Arc::clone(self.require_proof(state)?);
+        let proof = self.require_proof(state)?.clone();
         validate_context(
             &proof.frontiers,
             &state.members,
@@ -964,7 +1171,7 @@ impl NativeLog {
             state.snapshot_origin.as_deref(),
             |index| self.entries.get(&index),
         )?;
-        self.changes = Some(LogChanges::empty(proof));
+        self.changes = Some(LogChanges::empty(proof, &self.entries));
         Ok(())
     }
 
@@ -974,7 +1181,7 @@ impl NativeLog {
             .as_ref()
             .ok_or_else(|| invalid("native log capture inactive"))?
             .validate(self, state)?;
-        let next = LogChanges::empty(Arc::clone(self.require_proof(state)?));
+        let next = LogChanges::empty(self.require_proof(state)?.clone(), &self.entries);
         self.changes
             .replace(next)
             .ok_or_else(|| invalid("native log capture disappeared"))
@@ -993,11 +1200,11 @@ impl NativeLog {
         state: &NativeState,
         snapshot: Option<&crate::consensus::native::changes::SnapshotSelection>,
     ) -> io::Result<LogTransfer<'_>> {
-        let proof = Arc::clone(self.require_proof(state)?);
+        let proof = self.require_proof(state)?.clone();
         if self
             .changes
             .as_ref()
-            .is_none_or(|dirty| !Arc::ptr_eq(&dirty.target, &proof))
+            .is_none_or(|dirty| !dirty.target.same(&proof))
         {
             return Err(invalid(
                 "native log transfer target differs or capture inactive",
@@ -1047,7 +1254,7 @@ impl NativeLog {
             .ok_or_else(|| invalid("native log transfer capture disappeared"))?;
         Ok(LogTransfer {
             dirty,
-            next: LogChanges::empty(proof),
+            next: LogChanges::empty(proof, &self.entries),
             business,
             witnesses,
             memory,

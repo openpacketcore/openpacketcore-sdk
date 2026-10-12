@@ -1,0 +1,176 @@
+use super::*;
+
+fn preflight(bytes: &[u8], identity: PrefixIdentity, cut: [u8; 32]) -> io::Result<()> {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected.native");
+    std::fs::write(&path, bytes).unwrap();
+    let result = preflight_format(&path, identity, MAXIMUM, cut, &|| Ok(()));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    result
+}
+
+#[test]
+fn native_format_preflight_refuses_old_and_unknown_base_discriminators_without_writes() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    let original = files.bytes();
+    preflight(&original, catalog.identity(), CUT).unwrap();
+    for magic in [
+        base::LEGACY_MAGIC,
+        base::V3_MAGIC,
+        base::V4_MAGIC,
+        base::V5_MAGIC,
+        b"OPCNJ008",
+        b"OPCNAT01",
+        b"OPCNAT02",
+    ] {
+        let mut bytes = original.clone();
+        bytes[..8].copy_from_slice(magic);
+        assert_eq!(
+            preflight(
+                &bytes,
+                rebound(&bytes, catalog.identity(), &catalog.rows.context),
+                CUT
+            )
+            .unwrap_err()
+            .to_string(),
+            "native generation discriminator differs"
+        );
+    }
+    // The explicit historical reader remains testable, but its result cannot
+    // satisfy a current native root's vocabulary boundary.
+    let mut legacy = original.clone();
+    legacy[..8].copy_from_slice(base::V4_MAGIC);
+    let path = files._directory.path().join("historical.native");
+    std::fs::write(&path, &legacy).unwrap();
+    let (_, legacy) = Catalog::open(
+        &path,
+        rebound(&legacy, catalog.identity(), &catalog.rows.context),
+        MAXIMUM,
+        CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: None,
+        },
+        CUT,
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy.require_reclamation_format().unwrap_err().to_string(),
+        "native generation discriminator differs"
+    );
+    catalog.require_reclamation_format().unwrap();
+}
+
+#[test]
+fn native_format_preflight_reads_delta_discriminators_and_preserves_format_order() {
+    let (mut storage, _, _) = fixture();
+    let (files, _) = Files::new(&storage);
+    storage.begin_changes().unwrap();
+    let prepared = files.prepare(&mut storage, 19);
+    let mut delta = Vec::new();
+    prepared.write_payload(&mut delta, &|| Ok(())).unwrap();
+    let wire = Wire::<Header>::read(&delta);
+    let identity = PrefixIdentity {
+        checkpoint_epoch: wire.header.checkpoint_epoch,
+        operation_sequence: wire.header.operation_sequence,
+        ..files.owner.current().identity()
+    };
+    let positive = wire.encode(MAGIC, files.bytes());
+    preflight(
+        &positive,
+        rebound(&positive, identity, &wire.header.after),
+        wire.header.cut_binding,
+    )
+    .unwrap();
+    for (magic, message) in [
+        (b"OPCNJD08", "native generation discriminator differs"),
+        (V4_MAGIC, "native generation delta format regressed"),
+    ] {
+        let bytes = wire.encode(magic, files.bytes());
+        assert_eq!(
+            preflight(
+                &bytes,
+                rebound(&bytes, identity, &wire.header.after),
+                wire.header.cut_binding
+            )
+            .unwrap_err()
+            .to_string(),
+            message
+        );
+    }
+}
+
+#[test]
+fn native_format_preflight_refuses_unknown_context_fields_in_base_and_delta() {
+    let (mut storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    let original = files.bytes();
+    let base = Wire::<BaseHeader>::read(&original);
+    let mut header = serde_json::to_value(&base.header).unwrap();
+    header["context"]["business"]["frontiers"]["future_retirement_frontier"] = serde_json::json!(1);
+    let mut bytes = base::MAGIC.to_vec();
+    write_bytes(
+        &mut bytes,
+        &serde_json::to_vec(&header).unwrap(),
+        MAX_HEADER,
+    )
+    .unwrap();
+    bytes.extend_from_slice(&base.body);
+    bytes.resize(bytes.len().div_ceil(BLOCK) * BLOCK, 0);
+    assert_eq!(
+        preflight(
+            &bytes,
+            rebound(&bytes, catalog.identity(), &base.header.context),
+            CUT
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation cold header invalid"
+    );
+    preflight(&original, catalog.identity(), CUT).unwrap();
+
+    storage.begin_changes().unwrap();
+    let prepared = files.prepare(&mut storage, 19);
+    let mut delta = Vec::new();
+    prepared.write_payload(&mut delta, &|| Ok(())).unwrap();
+    let wire = Wire::<Header>::read(&delta);
+    let identity = PrefixIdentity {
+        checkpoint_epoch: wire.header.checkpoint_epoch,
+        operation_sequence: wire.header.operation_sequence,
+        ..catalog.identity()
+    };
+    let positive = wire.encode(MAGIC, original.clone());
+    preflight(
+        &positive,
+        rebound(&positive, identity, &wire.header.after),
+        wire.header.cut_binding,
+    )
+    .unwrap();
+    for context in ["before", "after"] {
+        let mut header = serde_json::to_value(&wire.header).unwrap();
+        header[context]["business"]["frontiers"]["future_retirement_frontier"] =
+            serde_json::json!(1);
+        let mut bytes = original.clone();
+        bytes.extend_from_slice(MAGIC);
+        write_bytes(
+            &mut bytes,
+            &serde_json::to_vec(&header).unwrap(),
+            MAX_HEADER,
+        )
+        .unwrap();
+        bytes.extend_from_slice(&wire.body);
+        bytes.resize(bytes.len().div_ceil(BLOCK) * BLOCK, 0);
+        assert_eq!(
+            preflight(
+                &bytes,
+                rebound(&bytes, identity, &wire.header.after),
+                wire.header.cut_binding
+            )
+            .unwrap_err()
+            .to_string(),
+            "native generation cold header invalid"
+        );
+    }
+}

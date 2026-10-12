@@ -2,6 +2,8 @@ use super::*;
 use crate::consensus::native::voter_slot_tests as fixture;
 use opc_consensus::voter_slots::*;
 
+mod purge_install;
+
 fn initialize(
     conn: &Connection,
     initial: &VoterSlotTable,

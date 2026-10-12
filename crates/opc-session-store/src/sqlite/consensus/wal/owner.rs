@@ -17,12 +17,10 @@ use crate::consensus::SessionPersistenceMode;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 
 pub(super) const ROOT_BYTES: u64 = 168;
-const ROOT_MAGIC: &[u8; 8] = b"OPCNR001";
-const ASYNC_ROOT_MAGIC: &[u8; 8] = b"OPCNA001";
-// V1 readers must fail before participating: they do not consume a closed
-// incarnation proof and could otherwise leave it beside new volatile work.
-const ASYNC_CLOSED_ROOT_MAGIC: &[u8; 8] = b"OPCNA002";
-const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA003";
+// Readers predating frontier-implied log removal must fail before reading
+// CURRENT. Both formats retain the existing selector and root record layout.
+const ROOT_MAGIC: &[u8; 8] = b"OPCNR002";
+const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA004";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[cfg(any(test, feature = "test-control"))]
@@ -307,6 +305,56 @@ impl NativeOwner {
             .ok_or_else(|| invalid_data("native owner unavailable"))
     }
 
+    /// Refuse unknown generation vocabularies before initialization can write.
+    /// This compatibility pass does not admit rows or replace the later full
+    /// catalog, WAL suffix and strict snapshot verification during attachment.
+    pub(crate) fn preflight_formats(
+        &self,
+        identity_expected: consensus::SessionConsensusIdentity,
+    ) -> io::Result<()> {
+        let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
+        let binding = self.read_root(&pin, identity_expected)?;
+        let directory = directory_path(&pin);
+        let anchor = super::checkpoint::read(&directory, binding, Limits::default())?
+            .ok_or_else(|| invalid_data("native selected generation is missing"))?;
+        Self::preflight_generation_format(&directory, &anchor)
+    }
+
+    /// Compatibility inspection precedes even the SQLite query that classifies
+    /// a caller identity mismatch. ROOT's checksum, selection and inode binding
+    /// are checked here; its scope binding remains the ordinary opener's job.
+    pub(crate) fn preflight_formats_before_scope_lookup(&self) -> io::Result<()> {
+        let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
+        let (bytes, persistence) = self.read_root_record(&pin)?;
+        let mut root = [0; 32];
+        root.copy_from_slice(&bytes[104..136]);
+        let directory = directory_path(&pin);
+        let anchor = super::checkpoint::read_for_native_format_preflight(
+            &directory,
+            root,
+            persistence,
+            Limits::default(),
+        )?
+        .ok_or_else(|| invalid_data("native selected generation is missing"))?;
+        Self::preflight_generation_format(&directory, &anchor)
+    }
+
+    fn preflight_generation_format(
+        directory: &Path,
+        anchor: &super::checkpoint::Anchor,
+    ) -> io::Result<()> {
+        let prefix = anchor
+            .native_prefix()?
+            .ok_or_else(|| invalid_data("native generation discriminator differs"))?;
+        crate::consensus::native::generation::preflight_format(
+            &anchor.basis_path(directory),
+            prefix,
+            super::MAX_BASIS,
+            anchor.native_cut_binding()?,
+            &|| Ok(()),
+        )
+    }
+
     fn verify_database(&self, core: &SqliteConsensusCore) -> io::Result<()> {
         let database = core
             .database_file
@@ -425,13 +473,14 @@ impl NativeOwner {
         let mut bytes = [0; ROOT_BYTES as usize];
         bytes[..8].copy_from_slice(match wal.binding.persistence {
             SessionPersistenceMode::Durable => ROOT_MAGIC,
-            SessionPersistenceMode::Async if wal.binding.async_recovery_format => {
+            SessionPersistenceMode::Async
+                if wal.binding.async_recovery_format && wal.binding.async_closed_format =>
+            {
                 ASYNC_RECOVERY_ROOT_MAGIC
             }
-            SessionPersistenceMode::Async if wal.binding.async_closed_format => {
-                ASYNC_CLOSED_ROOT_MAGIC
+            SessionPersistenceMode::Async => {
+                return Err(invalid_data("asynchronous recovery root format differs"));
             }
-            SessionPersistenceMode::Async => ASYNC_ROOT_MAGIC,
         });
         for (chunk, value) in bytes[8..40].as_chunks_mut::<8>().0.iter_mut().zip([
             self.database_identity.0,
@@ -481,11 +530,10 @@ impl NativeOwner {
         Ok(())
     }
 
-    fn read_root(
+    fn read_root_record(
         &self,
         directory: &File,
-        identity_expected: consensus::SessionConsensusIdentity,
-    ) -> io::Result<Binding> {
+    ) -> io::Result<([u8; ROOT_BYTES as usize], SessionPersistenceMode)> {
         let mut file = super::file_read(&directory_path(directory).join("ROOT"))?;
         let metadata = file.metadata()?;
         if metadata.len() != ROOT_BYTES
@@ -509,10 +557,13 @@ impl NativeOwner {
         }
         let persistence = match &bytes[..8] {
             magic if magic == ROOT_MAGIC => SessionPersistenceMode::Durable,
-            magic if magic == ASYNC_ROOT_MAGIC => SessionPersistenceMode::Async,
-            magic if magic == ASYNC_CLOSED_ROOT_MAGIC => SessionPersistenceMode::Async,
             magic if magic == ASYNC_RECOVERY_ROOT_MAGIC => SessionPersistenceMode::Async,
-            _ => return Err(invalid_data("native root persistence format differs")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    crate::consensus::storage::SessionConsensusStorageError::PersistenceFormatMismatch,
+                ));
+            }
         };
         let directory_identity = identity(&directory.metadata()?);
         for (chunk, expected) in bytes[8..40].as_chunks::<8>().0.iter().zip([
@@ -525,6 +576,15 @@ impl NativeOwner {
                 return Err(invalid_data("native root namespace identity differs"));
             }
         }
+        Ok((bytes, persistence))
+    }
+
+    fn read_root(
+        &self,
+        directory: &File,
+        identity_expected: consensus::SessionConsensusIdentity,
+    ) -> io::Result<Binding> {
+        let (bytes, persistence) = self.read_root_record(directory)?;
         let mut generation = [0; 32];
         let mut basis = [0; 32];
         generation.copy_from_slice(&bytes[40..72]);
@@ -535,8 +595,7 @@ impl NativeOwner {
             basis,
             native: true,
             persistence,
-            async_closed_format: &bytes[..8] == ASYNC_CLOSED_ROOT_MAGIC
-                || &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
+            async_closed_format: &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
             async_recovery_format: &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
         };
         if binding.digest()? != bytes[104..136] {
@@ -545,3 +604,7 @@ impl NativeOwner {
         Ok(binding)
     }
 }
+
+#[cfg(test)]
+#[path = "owner_format_tests.rs"]
+mod format_tests;

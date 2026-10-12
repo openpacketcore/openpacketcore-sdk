@@ -167,6 +167,7 @@ impl Fixture {
 
     fn empty(&self) -> Rows {
         Rows {
+            base_format: Format::V3,
             context: self.after.clone(),
             keys: HashMap::new(),
             receipts: HashMap::new(),

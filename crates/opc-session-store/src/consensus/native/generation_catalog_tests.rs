@@ -8,6 +8,15 @@ use std::path::PathBuf;
 #[path = "generation_catalog_lifecycle_tests.rs"]
 mod lifecycle;
 
+#[path = "generation_catalog_purge_tests.rs"]
+mod purge_tests;
+
+#[path = "generation_catalog_compat_tests.rs"]
+mod compat_tests;
+
+#[path = "generation_catalog_format_tests.rs"]
+mod format_tests;
+
 #[path = "generation_roster_tests.rs"]
 mod roster_tests;
 
@@ -427,6 +436,7 @@ impl Files {
         .unwrap();
         let identity = prepared.write_to(&mut file, &|| Ok(())).unwrap();
         file.sync_all().unwrap();
+        preflight_format(&path, identity, MAXIMUM, CUT, &|| Ok(())).unwrap();
         let (owner, catalog) = Catalog::open(
             &path,
             identity,
@@ -470,6 +480,14 @@ impl Files {
         prepared.append(&mut self.owner, &|| Ok(())).unwrap();
         self.version = prepared.target_version();
         self.cut = prepared.header.cut_binding;
+        preflight_format(
+            &self.path,
+            self.owner.current().identity(),
+            MAXIMUM,
+            self.cut,
+            &|| Ok(()),
+        )
+        .unwrap();
         let (_, catalog) = Catalog::open(
             &self.path,
             self.owner.current().identity(),

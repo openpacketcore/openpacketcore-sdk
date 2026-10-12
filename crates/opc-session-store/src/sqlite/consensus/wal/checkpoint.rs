@@ -102,7 +102,22 @@ impl Anchor {
     }
 
     pub(super) fn validate(&self, binding: Binding, limits: Limits) -> io::Result<()> {
-        if self.async_cut.is_some() != (binding.persistence == SessionPersistenceMode::Async) {
+        self.validate_root(
+            binding.digest()?,
+            binding.native,
+            binding.persistence,
+            limits,
+        )
+    }
+
+    fn validate_root(
+        &self,
+        root: [u8; 32],
+        native: bool,
+        persistence: SessionPersistenceMode,
+        limits: Limits,
+    ) -> io::Result<()> {
+        if self.async_cut.is_some() != (persistence == SessionPersistenceMode::Async) {
             return Err(invalid_data("native selector persistence mode differs"));
         }
         if let Some(cut) = self.async_cut {
@@ -130,8 +145,8 @@ impl Anchor {
                 )?;
             }
         }
-        if self.root != binding.digest()?
-            || self.native != binding.native
+        if self.root != root
+            || self.native != native
             || self.epoch == 0
             || self.epoch == u64::MAX
             || self.basis_bytes == 0
@@ -414,6 +429,30 @@ pub(super) fn read(
     binding: Binding,
     limits: Limits,
 ) -> io::Result<Option<Anchor>> {
+    let anchor = read_selector(directory)?;
+    if let Some(anchor) = &anchor {
+        anchor.validate(binding, limits)?;
+    }
+    Ok(anchor)
+}
+
+/// Inspect the selected vocabulary before reading the SQLite identity used to
+/// classify a caller-scope mismatch. This grants no recovery authority: the
+/// ordinary opener still requires `read` with the complete expected binding.
+pub(super) fn read_for_native_format_preflight(
+    directory: &Path,
+    root: [u8; 32],
+    persistence: SessionPersistenceMode,
+    limits: Limits,
+) -> io::Result<Option<Anchor>> {
+    let anchor = read_selector(directory)?;
+    if let Some(anchor) = &anchor {
+        anchor.validate_root(root, true, persistence, limits)?;
+    }
+    Ok(anchor)
+}
+
+fn read_selector(directory: &Path) -> io::Result<Option<Anchor>> {
     let mut file = match file_read(&directory.join("CURRENT")) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -434,7 +473,6 @@ pub(super) fn read(
     if anchor.encode()? != bytes {
         return Err(invalid_data("private WAL basis selector is not canonical"));
     }
-    anchor.validate(binding, limits)?;
     Ok(Some(anchor))
 }
 
@@ -805,7 +843,17 @@ impl Namespace {
         self.basis_files += 1;
         self.next_basis_files += usize::from(number == epoch + 1);
         self.previous_basis_files += usize::from(number < epoch);
-        if self.basis_files > 3 || self.next_basis_files > 1 || self.previous_basis_files > 1 {
+        // A replacement install can retire a selected rollover file while its
+        // predecessor is still linked. Recovery removes both previous files.
+        let previous_limit = if anchor.is_some_and(|anchor| anchor.native_generation.is_some()) {
+            2
+        } else {
+            1
+        };
+        if self.basis_files > previous_limit + 2
+            || self.next_basis_files > 1
+            || self.previous_basis_files > previous_limit
+        {
             return Err(invalid_data(
                 "private WAL basis namespace exceeds file bounds",
             ));
@@ -835,3 +883,7 @@ pub(super) fn reclaim(
     (control.hook)(Point::AfterBasisReclaimSync)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "checkpoint_compat_tests.rs"]
+mod compat_tests;

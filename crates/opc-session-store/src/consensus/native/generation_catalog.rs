@@ -36,6 +36,10 @@ mod batch;
 #[path = "generation_catalog_order.rs"]
 mod source_order;
 
+#[path = "generation_preflight.rs"]
+mod preflight;
+pub(crate) use preflight::preflight_format;
+
 #[derive(Clone, Copy)]
 struct Range {
     offset: u64,
@@ -71,6 +75,7 @@ impl Summary {
 }
 
 struct Rows {
+    base_format: Format,
     context: Context,
     keys: HashMap<facts::KeyId, Indexed<facts::Key>>,
     receipts: HashMap<FencedTransitionV2RequestId, Indexed<facts::Receipt>>,
@@ -113,6 +118,15 @@ pub(crate) struct CatalogScope<'a> {
 }
 
 impl Catalog {
+    /// New native roots cannot select a vocabulary with logical-only purge.
+    /// The format-order check during reconstruction covers every later delta.
+    pub(crate) fn require_reclamation_format(&self) -> io::Result<()> {
+        if self.rows.base_format < Format::V6 {
+            return Err(invalid("native generation discriminator differs"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn open(
         path: &Path,
         expected: PrefixIdentity,
@@ -199,6 +213,7 @@ impl Catalog {
             origin.verify()?;
         }
         let Rows {
+            base_format: _,
             context,
             keys,
             receipts,
@@ -698,6 +713,7 @@ impl Rows {
         // The retained context has its own reservation before this clone. All
         // temporary before/after headers keep their Loaded guard until dropped.
         let mut rows = Self {
+            base_format: format,
             context: base.context.clone(),
             keys: HashMap::new(),
             receipts: HashMap::new(),
@@ -802,6 +818,24 @@ impl Rows {
                 true,
             )?;
             validate_log_transition(&delta.before, &delta.after)?;
+            if delta.after.log.purged != delta.before.log.purged {
+                let purged = delta
+                    .after
+                    .log
+                    .purged
+                    .ok_or_else(|| invalid("native generation purged frontier cleared"))?;
+                if rows.logs.get(&purged.index).map(|row| row.row.facts.id) != Some(purged) {
+                    return Err(invalid("native log pointer lacks exact retained lineage"));
+                }
+                // The selected predecessor still contains the exact boundary
+                // row. Check it before removing the entire covered prefix.
+                let retained = rows.logs.split_off(&(purged.index + 1));
+                let removed = std::mem::replace(&mut rows.logs, retained);
+                for row in removed.values() {
+                    check()?;
+                    rows.summary[4].replace(Some(row.row.content), None)?;
+                }
+            }
             roster_index::transition(&delta.before, &delta.after)?;
             ordinals.validate_retirement_with_recovery(
                 delta.before.business.frontiers.history,
@@ -1073,6 +1107,9 @@ impl Rows {
             let index = u64::from_le_bytes(reader.scalar()?);
             if index > COUNTER_MAX {
                 return Err(invalid("native generation log index exceeds model bound"));
+            }
+            if !base && after.log.purged.is_some_and(|purged| index <= purged.index) {
+                return Err(invalid("native generation changes protected log history"));
             }
             let before = reader.before()?;
             predecessor(self.logs.get(&index), before, checkpoint, base)?;

@@ -10,6 +10,8 @@ mod basis;
 mod lifecycle;
 mod ordinary;
 mod public_reads;
+mod purge_crash;
+mod purge_model;
 mod roster;
 mod scope_scans;
 mod v1;

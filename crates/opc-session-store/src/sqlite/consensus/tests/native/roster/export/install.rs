@@ -686,8 +686,7 @@ fn native_snapshot_origin_empty_source_repeated_install_cold_reopen_and_first_me
 }
 
 #[test]
-fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_export_and_cold_catalog(
-) {
+fn native_snapshot_origin_purge_removes_covered_prefix_through_export_and_cold_catalog() {
     let (directory, producer, signed, wal) = fresh(Phase::Established);
     parity(
         &wal,
@@ -742,18 +741,23 @@ fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_expo
     storage.replay_committed().unwrap();
     // Purge admission must be backed by a genuinely selected applied basis,
     // not merely by a later live applied value supplied to the projector.
-    let prepared = PreparedDelta::prepare(
-        owner.current(),
-        &version,
-        2,
-        2,
-        CUT,
-        storage.take_changes().unwrap(),
-        &|| Ok(()),
-    )
-    .unwrap();
+    let mut snapshot = storage.business.current_snapshot().unwrap();
+    snapshot.0.last_log_id = Some(log_id(7));
+    snapshot.0.snapshot_id = format!(
+        "{}{}",
+        crate::consensus::native::snapshot_prefix(wal.binding().digest().unwrap()),
+        uuid::Uuid::new_v4()
+    );
+    snapshot.1 = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
+    let (capture, selected) = storage.take_checkpoint_changes(Some(snapshot)).unwrap();
+    let prepared =
+        PreparedDelta::prepare(owner.current(), &version, 2, 2, CUT, capture, &|| Ok(())).unwrap();
     prepared.append(&mut owner, &|| Ok(())).unwrap();
     let version = prepared.target_version();
+    storage
+        .business
+        .publish_checkpoint_snapshot(selected.unwrap())
+        .unwrap();
     let applied_basis = owner.current().identity();
     drop(prepared);
     assert_eq!(
@@ -772,18 +776,15 @@ fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_expo
         )
         .unwrap();
     assert_eq!(storage.log.purged, Some(log_id(6)));
-    assert_eq!(
-        storage.log.entries.keys().copied().collect::<Vec<_>>(),
-        [5, 6, 7]
-    );
-    storage.validate_image().expect(
-        "a logical purge preserves the physical suffix of the authenticated install origin",
-    );
+    assert_eq!(storage.log.entries.keys().copied().collect::<Vec<_>>(), [7]);
+    storage
+        .validate_image()
+        .expect("the selected snapshot covers the removed prefix after an install");
     let mut hole = storage.clone();
-    hole.log.entries.remove(&5);
+    hole.log.entries.remove(&7);
     assert!(
         hole.validate_image().is_err(),
-        "an origin cannot authorize a missing first physical suffix row"
+        "the installed origin cannot authorize a missing retained applied row"
     );
     let target = empty(&signed);
     storage
@@ -813,10 +814,7 @@ fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_expo
     let storage = admitted(&path, selected, Arc::clone(&origin), &signed);
     assert_eq!(storage.log.purged, Some(log_id(6)));
     assert_eq!(storage.business.applied(), Some(log_id(7)));
-    assert_eq!(
-        storage.log.entries.keys().copied().collect::<Vec<_>>(),
-        [5, 6, 7]
-    );
+    assert_eq!(storage.log.entries.keys().copied().collect::<Vec<_>>(), [7]);
     let cold = empty(&signed);
     storage
         .export_cold_install_base_checked(&cold.conn.blocking_lock(), &|| Ok(()))

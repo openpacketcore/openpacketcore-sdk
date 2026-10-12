@@ -755,6 +755,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection checks charge their bounded path lookups. Document the separate
   startup binding limits required before full-snapshot loading. (#1272)
 
+- `opc-session-store`: physically reclaim native Raft log rows through the
+  selected purge frontier in Durable and Async mode. Retained rows now survive
+  snapshot export, install, and restart without accumulating the full log history.
+  Native persistence uses new root and generation formats; existing native roots
+  require a fresh installation and are refused with `FreshInstallationRequired`.
+  Generation-file ceilings remain until file rollover is implemented. Refs #1249.
+
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at
   `Complete` or `Acquired` can be recovered or committed without a spurious

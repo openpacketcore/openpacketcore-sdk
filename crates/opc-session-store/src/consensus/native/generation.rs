@@ -1,4 +1,4 @@
-//! Complete after-image transactions for a V4 native generation owner.
+//! Complete after-image transactions with frontier-implied log removal.
 //!
 //! This layer encodes one detached, certified change capture and verifies its
 //! complete readback through the append-prefix owner. It grants byte admission
@@ -38,11 +38,14 @@ pub(in crate::consensus::native) use relocation::{PositionedReader, RelocationBu
 #[path = "generation_facts.rs"]
 pub(super) mod facts;
 pub(crate) use base::{BaseParameters, PreparedBase};
+pub(crate) use catalog::preflight_format;
 pub(crate) use catalog::{Catalog, CatalogScope};
 pub(crate) use sqlite::SqlitePreparedBase;
 
-const MAGIC: &[u8; 8] = b"OPCNJD04";
-const SLOT_MAGIC: &[u8; 8] = b"OPCNJD05";
+const MAGIC: &[u8; 8] = b"OPCNJD06";
+const SLOT_MAGIC: &[u8; 8] = b"OPCNJD07";
+const V4_MAGIC: &[u8; 8] = b"OPCNJD04";
+const V5_MAGIC: &[u8; 8] = b"OPCNJD05";
 const V3_MAGIC: &[u8; 8] = b"OPCNJD03";
 const LEGACY_MAGIC: &[u8; 8] = b"OPCNJD02";
 
@@ -52,6 +55,8 @@ pub(super) enum Format {
     V3,
     V4,
     V5,
+    V6,
+    V7,
 }
 
 impl Format {
@@ -59,8 +64,12 @@ impl Format {
         let mut magic = [0; 8];
         reader.read_exact(&mut magic)?;
         if &magic == if base { base::SLOT_MAGIC } else { SLOT_MAGIC } {
-            Ok(Self::V5)
+            Ok(Self::V7)
         } else if &magic == if base { base::MAGIC } else { MAGIC } {
+            Ok(Self::V6)
+        } else if &magic == if base { base::V5_MAGIC } else { V5_MAGIC } {
+            Ok(Self::V5)
+        } else if &magic == if base { base::V4_MAGIC } else { V4_MAGIC } {
             Ok(Self::V4)
         } else if &magic == if base { base::V3_MAGIC } else { V3_MAGIC } {
             Ok(Self::V3)
@@ -77,9 +86,13 @@ impl Format {
         }
     }
 
+    fn has_voter_slots(self) -> bool {
+        matches!(self, Self::V5 | Self::V7)
+    }
+
     fn validate_context(self, context: &Context) -> io::Result<()> {
-        if (self == Self::V5) != context.business.frontiers.voter_slots.is_some()
-            || (self < Self::V5 && context.log.slot_intent.is_some())
+        if self.has_voter_slots() != context.business.frontiers.voter_slots.is_some()
+            || (!self.has_voter_slots() && context.log.slot_intent.is_some())
         {
             return Err(invalid("native generation voter-slot format differs"));
         }

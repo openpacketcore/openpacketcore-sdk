@@ -2,7 +2,10 @@ use super::*;
 use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
 };
-use opc_consensus::engine::{CommittedLeaderId, Membership};
+use opc_consensus::engine::{CommittedLeaderId, Membership, SnapshotMeta};
+
+#[path = "purge_tests.rs"]
+mod purge_tests;
 
 fn identity() -> SessionConsensusIdentity {
     SessionConsensusIdentity::new(
@@ -57,6 +60,26 @@ fn fixture() -> NativeStorage {
     storage.business.apply(&[formation]).unwrap();
     storage.validate_image().unwrap();
     storage
+}
+
+fn select_snapshot(storage: &mut NativeStorage, through: LogId<SessionConsensusNodeId>) {
+    storage
+        .business
+        .publish_snapshot_metadata((
+            SnapshotMeta {
+                last_log_id: Some(through),
+                last_membership: storage.business.membership(),
+                snapshot_id: format!(
+                    "{}{}",
+                    crate::consensus::native::snapshot_prefix([0xAD; 32]),
+                    uuid::Uuid::new_v4()
+                ),
+            },
+            format!("snapshot-{}.opc", uuid::Uuid::new_v4()),
+            [0xAE; 32],
+            1234,
+        ))
+        .unwrap();
 }
 
 fn values(log: &NativeLog) -> Vec<u8> {
@@ -176,6 +199,9 @@ fn reconstruct(
         log: base.log.clone(),
     };
     decoded.log.proof = None;
+    if let Some(purged) = changes.target.frontiers.purged {
+        decoded.log.entries = decoded.log.entries.split(&purged.index).1;
+    }
     for (index, change) in &changes.rows {
         match &change.after {
             Some(row) => {
@@ -232,7 +258,7 @@ fn native_log_changes_retry_truncate_replacement_and_commit_have_complete_cold_p
     let decoded = reconstruct(&base, &storage, &changes);
     cold(&decoded);
     let empty = storage.log.capture_changes(&storage.business).unwrap();
-    assert!(empty.rows.is_empty() && Arc::ptr_eq(&empty.base, &changes.target));
+    assert!(empty.rows.is_empty() && empty.base.same(&changes.target));
 }
 
 #[test]
@@ -339,7 +365,11 @@ fn native_log_changes_invalid_operations_leave_values_proof_and_capture_unchange
         let mut storage = fixture();
         storage.log.begin_changes(&storage.business).unwrap();
         let expected = values(&storage.log);
-        let proof = Arc::clone(storage.log.require_proof(&storage.business).unwrap());
+        let proof = storage
+            .log
+            .require_proof(&storage.business)
+            .unwrap()
+            .clone();
         assert!(
             storage
                 .log
@@ -348,12 +378,9 @@ fn native_log_changes_invalid_operations_leave_values_proof_and_capture_unchange
             "invalid operation {offset}"
         );
         assert_eq!(values(&storage.log), expected);
-        assert!(Arc::ptr_eq(
-            &proof,
-            storage.log.require_proof(&storage.business).unwrap()
-        ));
+        assert!(proof.same(storage.log.require_proof(&storage.business).unwrap()));
         let changes = storage.log.capture_changes(&storage.business).unwrap();
-        assert!(changes.rows.is_empty() && Arc::ptr_eq(&changes.base, &changes.target));
+        assert!(changes.rows.is_empty() && changes.base.same(&changes.target));
     }
 }
 
@@ -403,7 +430,7 @@ fn native_log_changes_metadata_revisions_purge_and_durable_authority_remain_dist
     storage.log.begin_changes(&storage.business).unwrap();
     project(&mut storage, &Operation::Barrier);
     let barrier = storage.log.capture_changes(&storage.business).unwrap();
-    assert!(barrier.rows.is_empty() && !Arc::ptr_eq(&barrier.base, &barrier.target));
+    assert!(barrier.rows.is_empty() && !barrier.base.same(&barrier.target));
     project(&mut storage, &Operation::Committed(Some(id(1, 2))));
     let entries = storage.log.read(1, Some(3), None).unwrap();
     assert!(
@@ -418,6 +445,7 @@ fn native_log_changes_metadata_revisions_purge_and_durable_authority_remain_dist
         .require_committed_entries(&storage.business, Some(id(1, 2)), &entries)
         .unwrap();
     storage.business.apply(&entries).unwrap();
+    select_snapshot(&mut storage, id(1, 2));
     storage
         .log
         .project(
@@ -428,27 +456,35 @@ fn native_log_changes_metadata_revisions_purge_and_durable_authority_remain_dist
         .unwrap();
     let changes = storage.log.capture_changes(&storage.business).unwrap();
     assert!(changes.rows.is_empty());
-    assert_eq!(
-        storage.log.entries.len(),
-        3,
-        "logical purge cannot invent physical reclamation"
-    );
+    assert_eq!(storage.log.entries.len(), 1);
+    assert_eq!(storage.log.entries.get_min().unwrap().0, 2);
+    assert_eq!(changes.target.frontiers.purged, Some(id(1, 1)));
+    assert_eq!(changes.base.summary.count - changes.target.summary.count, 2);
+    assert_eq!(changes.target.first, Some(id(1, 2)));
     assert_eq!(storage.log.read(0, None, None).unwrap().len(), 1);
     reconstruct(&base, &storage, &changes);
     cold(&storage);
     let expected = values(&storage.log);
-    assert!(storage
-        .log
-        .project(&Operation::Purge(id(2, 1)), &storage.business, None)
-        .is_err());
-    assert!(storage
-        .log
-        .project(
-            &Operation::Committed(Some(id(1, 0))),
-            &storage.business,
-            None
-        )
-        .is_err());
+    assert_eq!(
+        storage
+            .log
+            .project(&Operation::Purge(id(2, 1)), &storage.business, None)
+            .unwrap_err()
+            .to_string(),
+        "native delayed purge lineage differs"
+    );
+    assert_eq!(
+        storage
+            .log
+            .project(
+                &Operation::Committed(Some(id(1, 0))),
+                &storage.business,
+                None
+            )
+            .unwrap_err()
+            .to_string(),
+        "native log pointer lacks exact retained lineage"
+    );
     assert_eq!(values(&storage.log), expected);
 }
 
@@ -500,10 +536,10 @@ fn native_log_changes_unproved_copies_require_full_admission_and_clones_drop_jou
     project(&mut storage, &append(&[blank(1, 3)]));
     let fork = storage.log.clone();
     assert!(fork.changes.is_none());
-    assert!(Arc::ptr_eq(
-        fork.require_proof(&storage.business).unwrap(),
-        storage.log.require_proof(&storage.business).unwrap()
-    ));
+    assert!(fork
+        .require_proof(&storage.business)
+        .unwrap()
+        .same(storage.log.require_proof(&storage.business).unwrap()));
     let mut unproved = NativeLog {
         entries: fork.entries.clone(),
         vote: fork.vote,
@@ -542,6 +578,9 @@ impl CapturedLog {
     pub(in crate::consensus::native) fn reconstruct_for_test(&self, base: &NativeLog) -> NativeLog {
         let mut log = base.clone();
         log.proof = None;
+        if let Some(purged) = self.changes.target.frontiers.purged {
+            log.entries = log.entries.split(&purged.index).1;
+        }
         for (index, change) in &self.changes.rows {
             if let Some(row) = &change.after {
                 let encoded: Bytes = row.resident().unwrap().encoded.to_vec().into();
@@ -723,3 +762,6 @@ fn native_capture_log_equal_byte_retry_omission_still_rejects_after_transfer() {
     changes.rows.remove(&1);
     assert!(captured.validate(&|| Ok(())).is_err());
 }
+
+#[path = "purge_journal_tests.rs"]
+mod purge_journal_tests;

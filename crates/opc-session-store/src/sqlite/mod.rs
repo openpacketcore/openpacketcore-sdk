@@ -634,6 +634,8 @@ pub struct SqliteSessionBackend {
     pub(crate) voter_seed: Option<Arc<consensus::voter_slots::Seed>>,
     #[cfg(target_os = "linux")]
     pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
+    #[cfg(target_os = "linux")]
+    native_reopen_pending: Arc<AtomicBool>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) private_wal_test: Option<Arc<consensus::wal::integration::PrivateWalTest>>,
     // A recovered terminal snapshot stays pinned from the connection-aware
@@ -1127,6 +1129,13 @@ impl SqliteSessionBackend {
         // worker, so keeping that owner would miss the intended fault seam.
         #[cfg(target_os = "linux")]
         {
+            if backend
+                .native_owner
+                .as_ref()
+                .is_some_and(|owner| owner.selected())
+            {
+                return Err(native::unavailable());
+            }
             backend.native_owner = None;
         }
         backend.checkpoint_vfs_name = Some(Arc::from(vfs_name));
@@ -1143,15 +1152,6 @@ impl SqliteSessionBackend {
         conn: Connection,
         profile: crate::FencedTransitionV2Profile,
     ) -> Result<Self, StoreError> {
-        if consensus_identity_exists(&conn)?
-            && consensus::fenced_transition_profile_in_sync(&conn, false).map_err(|_| {
-                StoreError::BackendUnavailable("fenced_transition_store_profile_mismatch".into())
-            })? != profile
-        {
-            return Err(StoreError::BackendUnavailable(
-                "fenced_transition_store_profile_mismatch".into(),
-            ));
-        }
         let database_path = std::fs::canonicalize(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
         let database_bytes = std::fs::metadata(&database_path)
@@ -1162,17 +1162,34 @@ impl SqliteSessionBackend {
                 "SQLite database exceeds the fixed snapshot extent".into(),
             ));
         }
+        Self::new_with_conn_and_profile(conn, false, Some(database_path), profile)
+    }
+
+    fn prepare_file_connection(
+        database_path: &Path,
+        conn: &Connection,
+        profile: crate::FencedTransitionV2Profile,
+    ) -> Result<Option<consensus::OperatorRecoveryTerminalHandoff>, StoreError> {
+        if consensus_identity_exists(conn)?
+            && consensus::fenced_transition_profile_in_sync(conn, false).map_err(|_| {
+                StoreError::BackendUnavailable("fenced_transition_store_profile_mismatch".into())
+            })? != profile
+        {
+            return Err(StoreError::BackendUnavailable(
+                "fenced_transition_store_profile_mismatch".into(),
+            ));
+        }
         // Install before the auxiliary latch reader opens the file. An
         // existing image that cannot accept the common writer guard is never
         // examined as a normal SDK database.
-        install_consensus_snapshot_extent_guard(&conn)?;
+        install_consensus_snapshot_extent_guard(conn)?;
         let classification =
-            consensus::classify_operator_recovery_latch_with_connection_sync(&database_path, &conn)
+            consensus::classify_operator_recovery_latch_with_connection_sync(database_path, conn)
                 .map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "session operator recovery latch is unavailable".into(),
-                    )
-                })?;
+                StoreError::BackendUnavailable(
+                    "session operator recovery latch is unavailable".into(),
+                )
+            })?;
         if let Some(latch) = classification.latch() {
             opc_redaction::metrics::METRICS
                 .session_operator_recovery_required
@@ -1187,19 +1204,7 @@ impl SqliteSessionBackend {
                     std::sync::atomic::Ordering::Relaxed,
                 );
         }
-        let backend = Self::new_with_conn_and_profile(conn, false, Some(database_path), profile)?;
-        if let Some(handoff) = classification.into_terminal_handoff() {
-            backend
-                .terminal_recovery_handoff
-                .lock()
-                .map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "session operator recovery handoff is unavailable".into(),
-                    )
-                })?
-                .replace(handoff);
-        }
-        Ok(backend)
+        Ok(classification.into_terminal_handoff())
     }
 
     /// Read the primary writer's fixed automatic-checkpoint fallback in a test.
@@ -1279,13 +1284,8 @@ impl SqliteSessionBackend {
         )
     }
 
-    fn new_with_conn_and_profile(
-        conn: Connection,
-        in_memory: bool,
-        database_path: Option<PathBuf>,
-        fenced_transition_profile: crate::FencedTransitionV2Profile,
-    ) -> Result<Self, StoreError> {
-        apply_pragma_profile(&conn, in_memory, true)?;
+    fn initialize_backend_schema(conn: &Connection, in_memory: bool) -> Result<(), StoreError> {
+        apply_pragma_profile(conn, in_memory, true)?;
 
         // Create table for storing session records
         conn.execute(
@@ -1316,7 +1316,7 @@ impl SqliteSessionBackend {
         // from starving healthy rows and never retain an oversized key as a
         // continuation. The malformed index's implicit rowid is the exact
         // locator within a retained read transaction.
-        scope_scan::schema::install(&conn).map_err(|_| {
+        scope_scan::schema::install(conn).map_err(|_| {
             StoreError::BackendUnavailable("scope scan indexes are unavailable".into())
         })?;
 
@@ -1336,7 +1336,7 @@ impl SqliteSessionBackend {
             [],
         )
         .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
-        ops::initialize_restore_scan_metadata_sync(&conn)?;
+        ops::initialize_restore_scan_metadata_sync(conn)?;
 
         // Create table for storing lease entries
         conn.execute(
@@ -1361,7 +1361,7 @@ impl SqliteSessionBackend {
             [],
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        migrate_lease_acquired_at_schema(&conn)?;
+        migrate_lease_acquired_at_schema(conn)?;
 
         // Create table for key fences
         conn.execute(
@@ -1422,11 +1422,15 @@ impl SqliteSessionBackend {
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-        let consensus_acceptance_reader_pool = database_path
-            .as_ref()
-            .map(|path| ConsensusAcceptanceReaderPool::new(Arc::new(path.clone())))
-            .transpose()?;
+        Ok(())
+    }
 
+    fn new_with_conn_and_profile(
+        conn: Connection,
+        in_memory: bool,
+        database_path: Option<PathBuf>,
+        fenced_transition_profile: crate::FencedTransitionV2Profile,
+    ) -> Result<Self, StoreError> {
         #[cfg(target_os = "linux")]
         let native_owner = database_path
             .as_ref()
@@ -1434,15 +1438,43 @@ impl SqliteSessionBackend {
             .transpose()
             .map_err(|_| native::unavailable())?;
 
+        #[cfg(target_os = "linux")]
+        let native_selected = native_owner.as_ref().is_some_and(|owner| owner.selected());
+        #[cfg(not(target_os = "linux"))]
+        let native_selected = false;
+        // A selected native backend has no SQL authority. Defer every SQL
+        // query, pragma and schema write until its persisted vocabulary has
+        // passed the storage constructor's read-only preflight.
+        let terminal_recovery_handoff = if native_selected {
+            None
+        } else {
+            let handoff = database_path
+                .as_ref()
+                .map(|path| Self::prepare_file_connection(path, &conn, fenced_transition_profile))
+                .transpose()?
+                .flatten();
+            Self::initialize_backend_schema(&conn, in_memory)?;
+            handoff
+        };
+
+        // Native acceptance reads enter the WAL owner, never these SQL lanes.
+        let consensus_acceptance_reader_pool = database_path
+            .as_ref()
+            .filter(|_| !native_selected)
+            .map(|path| ConsensusAcceptanceReaderPool::new(Arc::new(path.clone())))
+            .transpose()?;
+
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             fenced_transition_profile,
             voter_seed: None,
             #[cfg(target_os = "linux")]
             native_owner,
+            #[cfg(target_os = "linux")]
+            native_reopen_pending: Arc::new(AtomicBool::new(native_selected)),
             #[cfg(all(test, target_os = "linux"))]
             private_wal_test: None,
-            terminal_recovery_handoff: Arc::new(StdMutex::new(None)),
+            terminal_recovery_handoff: Arc::new(StdMutex::new(terminal_recovery_handoff)),
             scope_scan_generation: Arc::new(tokio::sync::Mutex::new(None)),
             scope_scan_limits: Arc::new(StdMutex::new(
                 crate::scope_scan::ScopeScanLimits::default(),
@@ -1518,6 +1550,30 @@ impl SqliteSessionBackend {
             })
     }
 
+    /// Complete the original SQL import-template checks only after the root,
+    /// generation vocabulary and requested persistence mode have been admitted.
+    /// Clones serialize this one-time setup through the primary connection.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn finish_native_reopen_after_preflight(&self) -> Result<(), StoreError> {
+        let conn = self.conn.lock().await;
+        if !self.native_reopen_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let path = self
+            .database_path
+            .as_deref()
+            .ok_or_else(native::unavailable)?;
+        let handoff = Self::prepare_file_connection(path, &conn, self.fenced_transition_profile)?;
+        Self::initialize_backend_schema(&conn, false)?;
+        *self.terminal_recovery_handoff.lock().map_err(|_| {
+            StoreError::BackendUnavailable(
+                "session operator recovery handoff is unavailable".into(),
+            )
+        })? = handoff;
+        self.native_reopen_pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) async fn voter_profile_preflight(
         &self,
     ) -> Result<bool, crate::consensus::storage::SessionConsensusStorageError> {
@@ -1542,8 +1598,28 @@ impl SqliteSessionBackend {
             return Ok(None);
         };
         match owner.persistence_mode(expected) {
-            Ok(mode) => Ok(mode),
+            Ok(mode) => {
+                if mode.is_some() {
+                    owner
+                        .preflight_formats(expected)
+                        .map_err(SessionConsensusStorageError::from_validation_error)?;
+                }
+                Ok(mode)
+            }
+            Err(error)
+                if error.get_ref().is_some_and(|source| {
+                    matches!(
+                        source.downcast_ref::<SessionConsensusStorageError>(),
+                        Some(SessionConsensusStorageError::PersistenceFormatMismatch)
+                    )
+                }) =>
+            {
+                Err(SessionConsensusStorageError::PersistenceFormatMismatch)
+            }
             Err(_) => {
+                owner
+                    .preflight_formats_before_scope_lookup()
+                    .map_err(SessionConsensusStorageError::from_validation_error)?;
                 let conn = self.conn.lock().await;
                 let persisted = consensus::read_storage_identity_sync(&conn)
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;

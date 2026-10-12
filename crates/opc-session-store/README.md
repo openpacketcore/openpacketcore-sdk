@@ -642,7 +642,7 @@ process. Three and five fixed voters are supported; membership, storage roots,
 configuration epoch, persistence mode and application Recovery authority stay
 unchanged.
 
-New Async roots use format `OPCNA003`. Before the first volatile operation,
+New Async roots use format `OPCNA004`. Before the first volatile operation,
 the owner syncs a separate, exact-root-bound authority reservation. Its finite
 range bounds votes, log positions, lease fences, credentials and business
 frontiers independently of the session-generation writer. Ordinary operations
@@ -721,11 +721,18 @@ all-voter restart without adding a disk wait to ordinary acknowledgements.
 The proof permits consensus participation; it grants no lease or traffic
 authority. Initialization and each operation still require fresh quorum checks.
 
-Legacy `OPCNA001` roots retain their original quarantine contract; `OPCNA002`
-roots retain their completed-shutdown proof contract. Neither is implicitly
-migrated to an authority reservation. Older SDK versions reject the new
-format, so they cannot leave a stale close proof beside new volatile work.
-This change does not recover already-fenced legacy installations.
+Native roots use `OPCNR002` (Durable) and `OPCNA004` (Async). Earlier native
+roots are refused with `ConsensusSessionStoreOpenError::FreshInstallationRequired`;
+there is no implicit migration. Older SDK versions refuse the new roots before
+reading their selected generation. The format refusal grants no authority to
+retire external effects or choose a replacement history.
+
+Both modes physically remove log rows through the selected purge frontier,
+covered by the selected snapshot and applied cut. Snapshots, installs and
+restarts preserve only the retained suffix. Reclamation removes the accumulated
+log-row lifetime limit; generation files still grow toward their existing
+32 GiB Durable and 8 GiB Async ceilings until file rollover is implemented.
+See [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md).
 
 Automatic unanimous recovery requires retained reservations and an applied
 exact fixed membership on every participant. It cannot replace a missing or

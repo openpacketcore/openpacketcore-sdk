@@ -138,7 +138,7 @@ impl Binding {
                 return Err(invalid_data("asynchronous storage requires a native root"));
             }
             hash.update(if self.async_recovery_format && self.async_closed_format {
-                &b"opc-session-native-async-v3"[..]
+                &b"opc-session-native-async-v4"[..]
             } else if self.async_recovery_format {
                 return Err(invalid_data("asynchronous recovery root format differs"));
             } else if self.async_closed_format {
@@ -152,7 +152,7 @@ impl Binding {
                     "durable root cannot carry asynchronous close proof",
                 ));
             }
-            hash.update(b"opc-session-native-wal-v1");
+            hash.update(b"opc-session-native-wal-v2");
         } else {
             hash.update(b"opc-session-wal-private-v3");
         }

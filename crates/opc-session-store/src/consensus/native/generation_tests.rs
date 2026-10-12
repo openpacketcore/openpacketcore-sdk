@@ -776,7 +776,7 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
     let selected = owner.current().identity();
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..original.len()], original.as_slice());
-    assert_eq!(&bytes[original.len()..original.len() + 8], b"OPCNJD04");
+    assert_eq!(&bytes[original.len()..original.len() + 8], b"OPCNJD06");
     let (_, catalog) = Catalog::open(
         &path,
         selected,

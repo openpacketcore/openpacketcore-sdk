@@ -289,6 +289,28 @@
         "publication_authority_review_tls_alpn_and_io_alternates_are_retryable",
         "publication_authority_review_attestation_root_mismatch_is_rejected"
       ]
+    },
+    {
+      "module": "consensus::store::sequential_wal_sdk_tests::native_log_bound",
+      "shard": "heavy-1",
+      "tests": [
+        "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens"
+      ]
+    },
+    {
+      "module": "consensus::native::log::changes::tests::purge_journal_tests",
+      "shard": "heavy-1",
+      "tests": [
+        "native_purge_large_prefix_bounds_owner_allocations_at_window_and_cap"
+      ]
+    },
+    {
+      "module": "consensus::storage::tests::native_log_retained_bound",
+      "shard": "heavy-1",
+      "tests": [
+        "native_log_retained_bound_survives_snapshot_purge_and_restart",
+        "native_log_retained_bound_survives_snapshot_purge_and_restart_async"
+      ]
     }
   ],
   "_balance_comment": [

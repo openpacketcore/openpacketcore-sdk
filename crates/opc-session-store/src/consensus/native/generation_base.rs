@@ -1,12 +1,14 @@
-//! Streaming complete V4 bases. This borrows an immutable full capture;
+//! Streaming complete bases. This borrows an immutable full capture;
 //! the caller must prepare/encode it outside State and own its output file.
 //! It writes no selector, grants no writer authority, and reclaims nothing.
 //! Admission requires Catalog::open to read and validate the entire result.
 
 use super::*;
 
-pub(super) const MAGIC: &[u8; 8] = b"OPCNJ004";
-pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJ005";
+pub(super) const MAGIC: &[u8; 8] = b"OPCNJ006";
+pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJ007";
+pub(super) const V4_MAGIC: &[u8; 8] = b"OPCNJ004";
+pub(super) const V5_MAGIC: &[u8; 8] = b"OPCNJ005";
 pub(super) const V3_MAGIC: &[u8; 8] = b"OPCNJ003";
 pub(super) const LEGACY_MAGIC: &[u8; 8] = b"OPCNJ002";
 
@@ -95,9 +97,9 @@ impl<'a> PreparedBase<'a> {
             context,
         };
         let format = if header.context.business.frontiers.voter_slots.is_some() {
-            Format::V5
+            Format::V7
         } else {
-            Format::V4
+            Format::V6
         };
         let mut value = Self {
             storage,
@@ -143,8 +145,10 @@ impl<'a> PreparedBase<'a> {
         writer.write_all(match self.format {
             Format::V2 => LEGACY_MAGIC,
             Format::V3 => V3_MAGIC,
-            Format::V4 => MAGIC,
-            Format::V5 => SLOT_MAGIC,
+            Format::V4 => V4_MAGIC,
+            Format::V5 => V5_MAGIC,
+            Format::V6 => MAGIC,
+            Format::V7 => SLOT_MAGIC,
         })?;
         let header = encode_header(&self.header)?;
         write_bytes(writer, &header, MAX_HEADER)?;

@@ -298,25 +298,31 @@ fn native_voter_slot_churn_releases_projection_memory_on_snapshot_purge_and_reop
         let captured = storage.clone();
         let version = Version::capture(&storage).unwrap();
         commit(&mut storage, &prepare);
+        let candidate = (
+            SnapshotMeta {
+                last_log_id: Some(prepare.log_id),
+                last_membership: storage.business.frontiers.membership.clone(),
+                snapshot_id: format!("{}slot-churn", snapshot_prefix([6; 32])),
+            },
+            format!("snapshot-{}.opc", uuid::Uuid::new_v4()),
+            [5; 32],
+            4096,
+        );
         if snapshot {
             storage
                 .business
-                .set_current_snapshot((
-                    SnapshotMeta {
-                        last_log_id: Some(prepare.log_id),
-                        last_membership: storage.business.frontiers.membership.clone(),
-                        snapshot_id: format!("{}slot-churn", snapshot_prefix([6; 32])),
-                    },
-                    format!("snapshot-{}.opc", uuid::Uuid::new_v4()),
-                    [5; 32],
-                    4096,
-                ))
+                .set_current_snapshot(candidate.clone())
                 .unwrap();
         }
         epoch += 1;
         delta(&mut storage, &mut owner, &version, epoch);
         if !snapshot {
-            // A purge may use only an already selected applied predecessor.
+            // Preserve the separate applied checkpoint, then select the
+            // covering snapshot that now witnesses physical prefix removal.
+            let version = Version::capture(&storage).unwrap();
+            storage.business.set_current_snapshot(candidate).unwrap();
+            epoch += 1;
+            delta(&mut storage, &mut owner, &version, epoch);
             let version = Version::capture(&storage).unwrap();
             storage
                 .log
@@ -326,6 +332,8 @@ fn native_voter_slot_churn_releases_projection_memory_on_snapshot_purge_and_reop
                     Some(prepare.log_id),
                 )
                 .unwrap();
+            assert!(storage.log.entries.is_empty());
+            assert_eq!(storage.log.purged, Some(prepare.log_id));
             epoch += 1;
             delta(&mut storage, &mut owner, &version, epoch);
         }

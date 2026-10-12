@@ -7,7 +7,7 @@ use super::*;
 use crate::consensus::native::{
     ApplicationCapture, NativeState, NativeStorage, ReceiptCopies, ReceiptReads, ResolvedReceipts,
 };
-use crate::consensus::verified_snapshot::{PortableSnapshot, VerifiedFile};
+use crate::consensus::verified_snapshot::PortableSnapshot;
 
 #[path = "scope_scan.rs"]
 mod scope_scan;
@@ -351,6 +351,7 @@ impl Opening {
                 if catalog.identity() != prefix || catalog.cut_binding() != cut_binding {
                     return Err(invalid_data("native selected catalog binding differs"));
                 }
+                catalog.require_reclamation_format()?;
                 (control.hook)(Point::AfterNativeBasisAdmission)?;
                 native = catalog.into_storage(&|| Ok(()))?;
                 selected = Some(native_basis::Selected::admitted(append, &native)?);
@@ -358,27 +359,7 @@ impl Opening {
                 // selected process version, before projecting or replaying it.
                 native.begin_changes()?;
             } else {
-                if roster_root.is_some() {
-                    return Err(invalid_data(
-                        "native legacy full image cannot carry a configured roster root",
-                    ));
-                }
-                let source = VerifiedFile::capture(
-                    crate::sqlite::open_regular_read_nofollow(&path)?,
-                    MAX_BASIS,
-                )?;
-                if source.length() != anchor.basis_bytes || source.digest() != anchor.basis {
-                    return Err(invalid_data(
-                        "native selected basis extent or digest differs",
-                    ));
-                }
-                (control.hook)(Point::AfterNativeBasisAdmission)?;
-                native = NativeStorage::read_image(
-                    &mut io::BufReader::with_capacity(64 * 1024, source.reader()),
-                    binding.digest()?,
-                    anchor.position.sequence,
-                    binding.identity,
-                )?;
+                return Err(invalid_data("native generation discriminator differs"));
             }
             if native.business.members() != &authority.members
                 || native.business.applied() != anchor.native_applied()
@@ -487,6 +468,7 @@ impl Opening {
         if catalog.identity() != prefix || catalog.cut_binding() != cut_binding {
             return Err(invalid_data("native installed catalog binding differs"));
         }
+        catalog.require_reclamation_format()?;
         (self.control.hook)(Point::AfterNativeBasisAdmission)?;
         self.native = catalog.into_storage(&|| Ok(()))?;
         if self.native.business.members() != &authority.members
@@ -797,6 +779,24 @@ fn quorum_authority_observation_bounds_lock_and_refuses_async() {
 }
 
 impl Wal {
+    /// Read the selected physical log inventory without changing its owner.
+    #[cfg(test)]
+    pub(crate) fn native_log_inventory_for_test(
+        &self,
+    ) -> io::Result<(usize, Option<u64>, Option<u64>, u64)> {
+        let state = lock_state(&self.shared)?;
+        let native = state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("native log inventory owner missing"))?;
+        Ok((
+            native.log.entries.len(),
+            native.log.entries.get_min().map(|(index, _)| *index),
+            native.log.purged.map(|id| id.index),
+            state.checkpoint_epoch,
+        ))
+    }
+
     /// Change only the live test owner's placement field, leaving its persisted
     /// import image and all engine/application facts intact.
     #[cfg(test)]
@@ -1236,6 +1236,45 @@ impl Wal {
 
     pub(crate) fn is_native(&self) -> bool {
         self.binding.native
+    }
+
+    /// Forge a selected generation only after its fixture owner is closed.
+    /// Rebinding the selector lets format tests reach vocabulary admission
+    /// without being rejected first for an unrelated checksum mismatch.
+    #[cfg(test)]
+    pub(crate) fn rewrite_closed_native_generation_for_test(
+        &self,
+        rewrite: impl FnOnce(&mut Vec<u8>),
+    ) -> io::Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| invalid_data("native format fixture join owner poisoned"))?;
+        if !self.binding.native
+            || writer.is_some()
+            || lock_state(&self.shared)?.status != Status::Closed
+        {
+            return Err(invalid_data(
+                "native format fixture requires a joined closed writer",
+            ));
+        }
+        let mut anchor = checkpoint::read(&self.directory, self.binding, self.limits)?
+            .ok_or_else(|| invalid_data("native format fixture selector absent"))?;
+        let path = anchor.basis_path(&self.directory);
+        let mut bytes = fs::read(&path)?;
+        if (bytes.len() as u64) < anchor.basis_bytes {
+            return Err(invalid_data(
+                "native format fixture selected prefix truncated",
+            ));
+        }
+        bytes.truncate(anchor.basis_bytes as usize);
+        rewrite(&mut bytes);
+        anchor.basis = Sha256::digest(&bytes).into();
+        anchor.basis_bytes = bytes.len() as u64;
+        anchor.validate(self.binding, self.limits)?;
+        fs::write(&path, bytes)?;
+        File::open(&path)?.sync_all()?;
+        checkpoint::select(&self.directory, &anchor, &IoControl::default())
     }
 
     /// Consume only the closed native owner after all durable witness reads.
