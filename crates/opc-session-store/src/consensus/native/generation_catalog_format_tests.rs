@@ -1,6 +1,116 @@
 use super::*;
 
 #[test]
+fn native_preflight_rejects_wrong_base_identity() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    preflight(&files.bytes(), catalog.identity(), CUT).unwrap();
+    let mut expected = catalog.identity();
+    expected.binding[0] ^= 1;
+    assert_eq!(
+        preflight(&files.bytes(), expected, CUT)
+            .unwrap_err()
+            .to_string(),
+        "native generation base differs from selected identity"
+    );
+}
+
+#[test]
+fn native_preflight_rejects_wrong_final_cut() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    preflight(&files.bytes(), catalog.identity(), CUT).unwrap();
+    let mut cut = CUT;
+    cut[0] ^= 1;
+    assert_eq!(
+        preflight(&files.bytes(), catalog.identity(), cut)
+            .unwrap_err()
+            .to_string(),
+        "native generation selected final extent or cut differs"
+    );
+}
+
+#[test]
+fn native_preflight_rejects_wrong_delta_predecessor() {
+    let (mut storage, _, _) = fixture();
+    let (files, _) = Files::new(&storage);
+    storage.begin_changes().unwrap();
+    let prepared = files.prepare(&mut storage, 19);
+    let mut delta = Vec::new();
+    prepared.write_payload(&mut delta, &|| Ok(())).unwrap();
+    let mut wire = Wire::<Header>::read(&delta);
+    let identity = PrefixIdentity {
+        checkpoint_epoch: wire.header.checkpoint_epoch,
+        operation_sequence: wire.header.operation_sequence,
+        ..files.owner.current().identity()
+    };
+    let positive = wire.encode(MAGIC, files.bytes());
+    preflight(
+        &positive,
+        rebound(&positive, identity, &wire.header.after),
+        wire.header.cut_binding,
+    )
+    .unwrap();
+    wire.header.previous.operation_sequence ^= 1;
+    let forged = wire.encode(MAGIC, files.bytes());
+    assert_eq!(
+        preflight(
+            &forged,
+            rebound(&forged, identity, &wire.header.after),
+            wire.header.cut_binding
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation checkpoint predecessor differs"
+    );
+}
+
+#[test]
+fn native_preflight_rejects_oversize_count() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    preflight(&files.bytes(), catalog.identity(), CUT).unwrap();
+    let mut wire = Wire::<BaseHeader>::read(&files.bytes());
+    wire.header.context.log.count = validation::MAX_ITEMS + 1;
+    let forged = wire.encode(base::MAGIC, Vec::new());
+    assert_eq!(
+        preflight(
+            &forged,
+            rebound(&forged, catalog.identity(), &wire.header.context),
+            CUT
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation changed count exceeds original bound"
+    );
+}
+
+#[test]
+fn native_preflight_rejects_oversize_row_extent() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    preflight(&files.bytes(), catalog.identity(), CUT).unwrap();
+    let mut wire = Wire::<BaseHeader>::read(&files.bytes());
+    assert_eq!(
+        &wire.body[..2],
+        &[0, 0],
+        "base begins with a key frame and no predecessor"
+    );
+    wire.body[2..6].copy_from_slice(&u32::try_from(MAX_ITEM + 1).unwrap().to_le_bytes());
+    let forged = wire.encode(base::MAGIC, Vec::new());
+    assert_eq!(
+        preflight(
+            &forged,
+            rebound(&forged, catalog.identity(), &wire.header.context),
+            CUT
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation input extent exceeds bound"
+    );
+}
+
+#[test]
 fn native_generation_magic_separates_vocabulary_from_voter_profile() {
     for (base_frame, fixed, slots) in [
         (true, base::MAGIC, base::SLOT_MAGIC),

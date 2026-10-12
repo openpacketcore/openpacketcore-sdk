@@ -7,6 +7,49 @@ use crate::consensus::native::{async_recovery::Boundary, voter_slot_tests as slo
 use opc_consensus::voter_slots::*;
 use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, CONSENSUS_NODE_ID_MAX};
 
+#[test]
+fn native_compact_frontier_bounds_are_independent() {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    let context = full_context(false);
+    let value = serde_json::to_value(&context).unwrap();
+    let _ = serde_json::from_value::<Context>(value.clone()).unwrap();
+    let binary_oversize = BASE64.encode(vec![0; frontier_encoding::MAX_RECOVERY_BYTES + 1]);
+    assert_eq!(
+        binary_oversize.len(),
+        4 * frontier_encoding::MAX_RECOVERY_BYTES.div_ceil(3)
+    );
+    for encoded in [
+        "!".repeat(4 * frontier_encoding::MAX_RECOVERY_BYTES.div_ceil(3) + 4),
+        binary_oversize,
+    ] {
+        let mut refused = value.clone();
+        refused["business"]["frontiers"]["async_recovery"] = serde_json::json!(encoded);
+        assert_eq!(
+            serde_json::from_value::<Context>(refused)
+                .err()
+                .unwrap()
+                .to_string(),
+            "native recovery frontier exceeds encoding bound"
+        );
+    }
+}
+
+#[test]
+fn native_slot_text_bound_is_exercised() {
+    let context = full_context(true);
+    let mut value = serde_json::to_value(&context).unwrap();
+    let _ = serde_json::from_value::<Context>(value.clone()).unwrap();
+    value["business"]["frontiers"]["voter_slots"]["current"] = serde_json::json!(
+        "!".repeat(4 * opc_consensus::voter_slots::MAX_VOTER_SLOT_TABLE_BYTES.div_ceil(3) + 4)
+    );
+    assert_eq!(
+        serde_json::from_value::<Context>(value)
+            .err()
+            .unwrap()
+            .to_string(),
+        "native slot table exceeds encoding bound"
+    );
+}
 fn largest_slots() -> voter_slots::Table {
     let mut genesis = slots_fixture::genesis(9);
     genesis.cluster_instance = ConsensusClusterId::from_bytes([255; 32]);

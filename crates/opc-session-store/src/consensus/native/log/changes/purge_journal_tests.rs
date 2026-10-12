@@ -1,6 +1,34 @@
 use super::*;
 use crate::test_process::CommandExt as _;
 
+#[test]
+fn native_purge_rejects_changed_dirty_predecessor() {
+    let mut storage = applied_prefix(6);
+    storage.log.begin_changes(&storage.business).unwrap();
+    project(&mut storage, &append(&[blank(1, 1)]));
+    storage
+        .log
+        .changes
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&1)
+        .unwrap()
+        .after_stamp = None;
+    assert_eq!(
+        storage
+            .log
+            .project(
+                &Operation::Purge(id(1, 2)),
+                &storage.business,
+                storage.business.applied()
+            )
+            .unwrap_err()
+            .to_string(),
+        "native log dirty predecessor changed"
+    );
+}
+
 fn applied_prefix(count: u64) -> NativeStorage {
     assert!(count >= 3);
     let mut storage = fixture();

@@ -1,5 +1,21 @@
 use super::*;
 
+#[test]
+fn native_purge_rejects_noop_tombstone_below_frontier() {
+    let mut fixture = PurgeFixture::new();
+    fixture.admitted_ids().unwrap();
+    let mut frame = vec![4];
+    frame.extend_from_slice(&1_u64.to_le_bytes());
+    write_before(&mut frame, None).unwrap();
+    frame.push(0);
+    fixture.wire.body.splice(0..0, frame);
+    fixture.wire.header.changed[4] = 1;
+    assert_eq!(
+        fixture.admitted_ids().unwrap_err().to_string(),
+        "native generation changes protected log history"
+    );
+}
+
 struct PurgeFixture {
     storage: NativeStorage,
     files: Files,
