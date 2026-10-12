@@ -58,6 +58,17 @@ fn revision_mismatches_are_exported_with_bounded_labels_even_when_logs_are_limit
         opc_redaction::metrics::METRICS
             .record_scope_transport_revision_mismatch(role, purpose, direction);
     }
+    let mut expected_counts = [0; 50];
+    expected_counts[1] = 2; // worker / handshake / outbound
+    expected_counts[10] = 1; // observer / handshake / inbound
+    assert_eq!(
+        opc_redaction::metrics::METRICS
+            .scope_transport_revision_mismatches
+            .each_ref()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed)),
+        expected_counts,
+        "revision mismatches must count only the exact valid buckets"
+    );
     let exposition = opc_redaction::metrics::export_prometheus_text();
     assert!(exposition
         .lines()
