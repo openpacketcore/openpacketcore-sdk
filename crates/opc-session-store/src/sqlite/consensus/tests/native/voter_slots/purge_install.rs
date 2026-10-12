@@ -178,10 +178,10 @@ fn select_reclaim_and_reopen(receiver: &mut Receiver, through: u64) -> IncomingS
 
 #[test]
 fn native_voter_replacement_survives_reclaim_before_during_and_after_joint_consensus() {
-    // The middle schedule removes the prepare, marker and fencing witnesses
-    // before joint membership is appended. Their selected slot state, rather
-    // than historical log rows, must retain the exact replacement authority.
-    for purge_after in [3, 9, 12] {
+    // Purge before replacement, after fencing, at joint membership, at the
+    // uniform successor membership, and after finalization. Selected slot
+    // state must retain the exact replacement authority across every cut.
+    for purge_after in [3, 9, 10, 11, 12] {
         let mut receiver = Receiver::new(true, SessionPersistenceMode::Durable);
         let initial = fixture::genesis(3);
         let old = initial
