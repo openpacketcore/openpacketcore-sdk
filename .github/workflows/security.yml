@@ -6,7 +6,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "17 8 * * 1"
+    - cron: "17 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,6 +20,8 @@ jobs:
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
     env:
       GITLEAKS_VERSION: "8.30.1"
     steps:
@@ -27,6 +29,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Use the PR head's ignore fingerprints, not the synthetic merge tree.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install gitleaks
         shell: bash
@@ -44,7 +49,108 @@ jobs:
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Run gitleaks
-        run: gitleaks detect --source . --redact --no-banner
+        id: scan
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              for revision in "${PR_BASE_SHA:?}" "${PR_HEAD_SHA:?}"; do
+                git rev-parse --verify --quiet "${revision}^{commit}" >/dev/null || {
+                  echo "::error::Secret scan cannot find pull request commit ${revision}"
+                  exit 1
+                }
+              done
+              log_opts="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+              if ! git diff --quiet "${PR_BASE_SHA}...${PR_HEAD_SHA}" -- .gitleaksignore .gitleaks.toml; then
+                echo "::warning title=Secret scan exceptions changed::This pull request changes .gitleaksignore or .gitleaks.toml. Check that each added line pins one false positive by commit, file, rule and line."
+              fi
+              ;;
+            push)
+              # A single revision includes its entire reachable history.
+              log_opts="--full-history ${GITHUB_SHA:?}"
+              ;;
+            schedule|workflow_dispatch)
+              git fetch --force --prune origin \
+                '+refs/heads/*:refs/secret-scan/heads/*' '+refs/tags/*:refs/secret-scan/tags/*'
+              log_opts="--full-history --all"
+              ;;
+            *)
+              echo "::error::Unsupported secret-scan event: $GITHUB_EVENT_NAME"
+              exit 1
+              ;;
+          esac
+          report="${RUNNER_TEMP}/gitleaks-report.json"
+          log="${RUNNER_TEMP}/gitleaks.log"
+          status=0
+          # Exit 2 means findings. Any other non-zero status means the scan did not complete.
+          # gitleaks colours its log lines unless NO_COLOR is set, also when stderr is a file.
+          NO_COLOR=1 gitleaks detect --source . --redact --no-banner --exit-code 2 \
+            --report-format json --report-path "$report" --log-opts "$log_opts" 2> "$log" || status=$?
+          cat "$log" >&2
+          # gitleaks 8.30.1 exits 0 when its git log fails; it only logs the failure.
+          # A clean result has the scanner's "no leaks found" line and no error line.
+          if [[ "$status" -eq 0 ]]; then
+            if grep -q -E '^[^ ]+ (ERR|FTL) ' "$log"; then
+              echo "::error::The scanner logged an error; this is not a clean result."
+              status=1
+            elif ! grep -q -E '^[^ ]+ INF no leaks found$' "$log"; then
+              echo "::error::The scanner did not log \"no leaks found\"; this is not a clean result."
+              status=1
+            fi
+          fi
+          if [[ "$status" -eq 2 ]]; then
+            count="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$report")"
+            echo "findings=${count}" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+  report-scheduled-secret-scan:
+    name: Report scheduled secret scan failure
+    needs: secret-scan
+    if: always() && github.event_name == 'schedule' && needs.secret-scan.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: scheduled-secret-scan-report
+      cancel-in-progress: false
+    steps:
+      - name: Open or update the secret scan issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCAN_RESULT: ${{ needs.secret-scan.result }}
+          SCAN_FINDINGS: ${{ needs.secret-scan.outputs.findings }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          label=secret-scan
+          gh label create "$label" --repo "$GITHUB_REPOSITORY" --force \
+            --color B60205 --description 'Scheduled all-ref secret scan findings or failures'
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
+          body_file="${RUNNER_TEMP}/secret-scan-issue.md"
+          if [[ "$SCAN_FINDINGS" =~ ^[0-9]+$ ]]; then
+            detail="Findings: ${SCAN_FINDINGS}."
+          else
+            detail='No finding count was passed on: the scan found something or did not complete. This is not a clean result.'
+          fi
+          printf '%s\n' \
+            "Scheduled all-ref secret scan: **${SCAN_RESULT}**. ${detail}" \
+            "[Workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})." \
+            '' \
+            'The run log shows only the total and redacts values. To list the findings, fetch all refs as the workflow does and run the same gitleaks command with --verbose. This issue does not block unrelated pull requests.' \
+            > "$body_file"
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label "$label" \
+              --title 'Scheduled secret scan needs review' --body-file "$body_file"
+          fi
 
   rust-advisories:
     name: Rust advisory scan
