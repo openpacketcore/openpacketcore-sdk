@@ -1964,3 +1964,70 @@ async fn subtree_content_masked_join_preserves_predicate_admissions() {
     }
     assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked join identity changed conjunctive predicate admissions: {summaries:?}");
 }
+
+async fn masked_provider_get_config_boundary_is_independent(grouped: bool) {
+    let tree = if grouped {
+        "<state-hidden-peer><label>selected-row</label></state-hidden-peer><hostname/>"
+    } else {
+        "<hidden-peer><up>true</up><label/></hidden-peer><hostname/>"
+    };
+    let body = request("get-config", tree, "");
+    let mut fixtures = Vec::new();
+    let mut controls = Vec::new();
+    for size in [1, 4096] {
+        let mut model = config();
+        model.hidden_peer.clear();
+        let mut row = HiddenPeer::default();
+        row.secret = SecretLeaf::new(LeafPresence::Explicit("b".into()));
+        row.label = LeafPresence::Explicit("configuration-row".into());
+        model.hidden_peer.insert(SensitiveKey::new("b".into()), row);
+        let fixture = Fixture::new(model, &[]).await;
+        let key = "b".repeat(size);
+        *fixture.access.values.lock().unwrap() = if grouped {
+            vec![
+                state("/ex:system/ex:state-hidden-peer[ex:secret='b']/ex:label", "\"selected-row\""),
+                state(&format!("/ex:system/ex:state-hidden-peer[ex:secret='{key}']/ex:secret"), &serde_json::to_string(&key).unwrap()),
+            ]
+        } else {
+            vec![state(&format!("/ex:system/ex:hidden-peer[ex:secret='{key}']/ex:up"), "false")]
+        };
+        let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+        assert!(!reply.contains("<rpc-error>"), "{reply}");
+        assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+        assert!(tags(&reply, "label").is_empty());
+        assert!(tags(&reply, "up").is_empty());
+        assert!(tags(&reply, "secret").is_empty());
+        assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+        let work = MgmtLimits::default().max_subtree_filter_work_units
+            - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+        controls.push((reply, work, fixture.observation()));
+        fixtures.push(fixture);
+    }
+    assert_eq!(controls[0], controls[1], "configuration reads must not observe provider identity changes");
+    let boundary = controls[0].1;
+    let mut exact = Vec::new();
+    let mut below = Vec::new();
+    for fixture in &fixtures {
+        let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: boundary, ..MgmtLimits::default() }).await;
+        assert_eq!(reply, controls[0].0);
+        assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining(), 0);
+        exact.push((reply, fixture.observation()));
+        let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: boundary.checked_sub(1).unwrap(), ..MgmtLimits::default() }).await;
+        error(&reply, "too-big");
+        assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+        below.push((reply, fixture.observation()));
+    }
+    assert_eq!(exact[0], exact[1], "exact-boundary replies and full observations");
+    assert_eq!(below[0], below[1], "one-below errors and full observations");
+}
+
+#[tokio::test]
+async fn subtree_content_masked_state_join_get_config_has_fixed_work() {
+    masked_provider_get_config_boundary_is_independent(false).await;
+}
+
+#[tokio::test]
+async fn subtree_content_masked_provider_grouping_get_config_has_fixed_work() {
+    masked_provider_get_config_boundary_is_independent(true).await;
+}
