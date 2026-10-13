@@ -210,6 +210,9 @@ impl NetconfConfigBinding<System> for Binding {
     fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<System>> {
         Some(&netconf_xml::GeneratedNetconfXmlRenderer)
     }
+    fn generated_xml_edit_applicator(&self) -> Option<&dyn opc_mgmt_schema::NetconfXmlEditApplicator<System>> {
+        Some(&subtree_content_service::netconf_xml_edit::GeneratedNetconfXmlEditApplicator)
+    }
     fn supports_subtree_content(&self) -> bool { self.access.unsupported_projection.load(Ordering::SeqCst) == 0 }
     fn subtree_default_report(&self) -> opc_mgmt_schema::DefaultReport {
         if self.access.basic_report_all.load(Ordering::SeqCst) == 0 { opc_mgmt_schema::DefaultReport::Trim }
@@ -316,6 +319,10 @@ impl Fixture {
     }
 
     async fn rpc(&self, body: &str, limits: MgmtLimits) -> String {
+        self.rpc_after_setup(body, limits, "").await
+    }
+
+    async fn rpc_after_setup(&self, body: &str, limits: MgmtLimits, setup: &str) -> String {
         let principal = TrustedPrincipal::new(
             WorkloadIdentity::User("subtree-reader".into()), TenantId::new("fixture").unwrap(),
         ).with_auth_strength(AuthStrength::MutualTls);
@@ -330,6 +337,12 @@ impl Fixture {
         let exchange = async {
             assert!(read_frame(&mut client).await.contains("<hello"));
             write_frame(&mut client, &format!("<hello xmlns=\"{NC}\"><capabilities><capability>urn:ietf:params:netconf:base:1.0</capability></capabilities></hello>")).await;
+            if !setup.is_empty() {
+                write_frame(&mut client, &format!("<rpc xmlns=\"{NC}\" message-id=\"setup\">{setup}</rpc>")).await;
+                let reply = read_frame(&mut client).await;
+                assert!(reply.contains("<ok/>"), "candidate setup failed: {reply}");
+            }
+            SECRET_CLONES.store(0, Ordering::SeqCst);
             self.access.model.store(0, Ordering::SeqCst);
             self.access.provider.store(0, Ordering::SeqCst);
             self.policy_calls.store(0, Ordering::SeqCst);
@@ -391,6 +404,8 @@ fn policy(denied: &[&str]) -> NacmPolicy {
     for path in ["/ex:system", "/ex:system/**", "/ex:top-match", "/ex:yang-library", "/ex:yang-library/**", "/yanglib:yang-library", "/yanglib:yang-library/**", "/ncm:netconf-state", "/ncm:netconf-state/**"] {
         rules = rules.add_rule(NacmRule::allow(NacmAction::Read, YangPathPattern::parse(path, &modules).unwrap()));
     }
+    rules = rules.add_rule(NacmRule::allow(NacmAction::Update, YangPathPattern::parse("/ex:system/ex:hostname", &modules).unwrap()));
+    rules = rules.add_rule(NacmRule::allow(NacmAction::Exec, YangPathPattern::parse("/nc:edit-config", &modules).unwrap()));
     rules.add_rule(NacmRule::allow(NacmAction::Exec, YangPathPattern::parse("/nc:close-session", &modules).unwrap())).build()
 }
 
@@ -1243,5 +1258,158 @@ async fn subtree_content_read_preservation() {
         error(&fixture.read(op, "<hostname>router-marker</hostname><count/>", "").await, "operation-not-supported");
         fixture.no_access();
         assert_eq!(tags(&fixture.read(op, "<hostname/>", "").await, "hostname"), ["router-marker"]);
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_masked_payload_has_fixed_work() {
+    for op in ["get-config", "get", "get-data"] {
+      for mode in ["", "explicit", "trim", "report-all", "report-all-tagged"] {
+        let children = "<hostname>router-marker</hostname><secret/><intercept/><password/><unclassified/>";
+        let body = if op == "get-data" { nmda("running", None, children, mode) } else { request(op, children, mode) };
+        let mut expected = None;
+        let mut fixed_work = None;
+        for size in [1, 4096] {
+            let mut model = config();
+            model.secret = SecretLeaf::new(LeafPresence::Explicit("s".repeat(size)));
+            model.intercept = SecretLeaf::new(LeafPresence::Explicit("i".repeat(size)));
+            model.password = SecretLeaf::new(LeafPresence::Explicit("p".repeat(size)));
+            model.unclassified = SecretLeaf::new(LeafPresence::Explicit("u".repeat(size)));
+            let fixture = Fixture::new(model, &[]).await;
+            if fixed_work.is_none() {
+                let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+                for leaf in ["secret", "intercept", "password", "unclassified"] {
+                    assert_eq!(tags(&reply, leaf), ["&lt;redacted&gt;"]);
+                }
+                fixed_work = Some(MgmtLimits::default().max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining());
+            }
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap(), ..MgmtLimits::default() }).await;
+            assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+            assert_eq!(fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining(), 0);
+            let observed = (reply, fixture.observation());
+            if let Some(expected) = &expected { assert_eq!(&observed, expected, "masked bytes must not change observable work"); }
+            expected = Some(observed);
+        }
+      }
+    }
+}
+
+async fn candidate_access_is_shared(stored: bool) {
+    for op in ["get-config", "get-data"] {
+        let mut expected = None;
+        let mut fixed_work = None;
+        for populated in [false, true] {
+            let mut model = config();
+            if !populated { model.peer.clear(); }
+            let fixture = Fixture::with_datastores(model, &["/ex:system/ex:peer/ex:label"], None, true).await;
+            *fixture.access.trap.lock().unwrap() = Some("/ex:system/ex:peer");
+            let children = "<peer><label>hidden</label><id/></peer><hostname/>";
+            let body = if op == "get-config" { request(op, children, "").replace("<running/>", "<candidate/>") }
+                else { nmda("candidate", None, children, "") };
+            let setup = if stored {
+                format!("<edit-config><target><candidate/></target><config><system xmlns=\"{EX}\"><hostname>candidate-marker</hostname></system></config></edit-config>")
+            } else { String::new() };
+            let limits = MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap_or(MgmtLimits::default().max_subtree_filter_work_units), ..MgmtLimits::default() };
+            let reply = fixture.rpc_after_setup(&body, limits, &setup).await;
+            assert_eq!(tags(&reply, "hostname"), [if stored { "candidate-marker" } else { "router-marker" }]);
+            assert_eq!(SECRET_CLONES.load(Ordering::SeqCst), 0, "candidate read copied model data before projection");
+            assert!(tags(&reply, "id").is_empty());
+            assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.policy_calls.load(Ordering::SeqCst), 1);
+            let budget = fixture.access.budget.lock().unwrap().as_ref().unwrap().clone();
+            let work = limits.max_subtree_filter_work_units - budget.remaining();
+            assert_eq!(budget.predicate_trials(), 0);
+            if let Some(expected) = &expected { assert_eq!(&(reply.clone(), work, fixture.access.reads.lock().unwrap().clone()), expected); }
+            expected = Some((reply, work, fixture.access.reads.lock().unwrap().clone()));
+            fixed_work = Some(work);
+        }
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_candidate_fallback_never_clones_denied_rows() {
+    candidate_access_is_shared(false).await;
+}
+
+#[tokio::test]
+async fn subtree_content_stored_candidate_never_clones_denied_rows() {
+    candidate_access_is_shared(true).await;
+}
+
+#[tokio::test]
+async fn subtree_content_state_order_is_canonical() {
+    let fixture = Fixture::new(config(), &[]).await;
+    for op in ["get", "get-data"] {
+        let values = vec![
+            state("/ex:system/ex:state-peer[ex:site='north'][ex:id='7']/ex:label", "\"north-label\""),
+            state("/ex:system/ex:state-peer[ex:site='south'][ex:id='7']/ex:label", "\"south-label\""),
+        ];
+        let mut expected = None;
+        for reverse in [false, true] {
+            *fixture.access.values.lock().unwrap() = values.clone();
+            if reverse { fixture.access.values.lock().unwrap().reverse(); }
+            let reply = fixture.read(op, "<state-peer><id>7</id><label/></state-peer>", "").await;
+            assert_eq!(tags(&reply, "site"), ["north", "south"]);
+            assert_eq!(tags(&reply, "label"), ["north-label", "south-label"]);
+            if let Some(expected) = &expected { assert_eq!(&reply, expected); }
+            expected = Some(reply);
+        }
+        // State ordering must not reorder configuration's ordered-by-user rows.
+        let values: Vec<_> = ["a", "m", "z"].into_iter().map(|name|
+            state(&format!("/ex:system/ex:user-peer[ex:name='{name}']/ex:up"), "true")).collect();
+        for reverse in [false, true] {
+            *fixture.access.values.lock().unwrap() = values.clone();
+            if reverse { fixture.access.values.lock().unwrap().reverse(); }
+            let reply = fixture.read(op, "<hostname>router-marker</hostname><user-peer><name/><label/><up/></user-peer>", "").await;
+            assert_eq!(tags(&reply, "name"), ["z", "a", "m"]);
+            assert_eq!(tags(&reply, "up"), ["true"; 3]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_signed_references_are_malformed_before_access() {
+    let mut model = config();
+    model.hostname = LeafPresence::Explicit("A".into());
+    let fixture = Fixture::new(model, &[]).await;
+    let mut expected = None;
+    for op in ["get-config", "get", "get-data"] {
+        for reference in ["&#+65;", "&#x+41;", "&#;", "&#x;", "&#-65;", "&#x-41;", "&#0;", "&#xD800;", "&#xFFFF;", "&#x110000;"] {
+            let reply = fixture.read(op, &format!("<hostname>{reference}</hostname><count/>"), "").await;
+            error(&reply, "malformed-message");
+            fixture.no_access();
+            assert!(reply.contains("<error-message>malformed message</error-message>"));
+            if let Some(expected) = &expected { assert_eq!(&reply, expected); }
+            expected = Some(reply);
+        }
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_reference_limit_counts_decoded_bytes() {
+    let limits = MgmtLimits { max_value_bytes: 64, ..MgmtLimits::default() };
+    for op in ["get-config", "get", "get-data"] {
+      for literal in ["A".to_string(), "A".repeat(64), "é".repeat(32)] {
+        let mut model = config();
+        model.hostname = LeafPresence::Explicit(literal.clone());
+        let fixture = Fixture::new(model, &[]).await;
+        let mut expected = None;
+        let decimal: String = literal.chars().map(|ch| format!("&#{}{};", "0".repeat(80), u32::from(ch))).collect();
+        let hex: String = literal.chars().map(|ch| format!("&#x{}{:x};", "0".repeat(80), u32::from(ch))).collect();
+        for text in [literal.clone(), format!("<![CDATA[{literal}]]>"), decimal, hex] {
+            let body = request(op, &format!("<hostname>{text}</hostname><count/>"), "");
+            let reply = fixture.rpc(&body, limits).await;
+            assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
+            if let Some(expected) = &expected { assert_eq!(&reply, expected); }
+            expected = Some(reply);
+        }
+        if literal.len() == limits.max_value_bytes {
+            for overflow in [format!("{literal}A"), format!("{literal}&#65;"), format!("<![CDATA[{literal}]]>&#65;")] {
+                let reply = fixture.rpc(&request(op, &format!("<hostname>{overflow}</hostname>"), ""), limits).await;
+                error(&reply, "too-big");
+                fixture.no_access();
+            }
+        }
+      }
     }
 }

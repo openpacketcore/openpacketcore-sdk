@@ -32,6 +32,31 @@ fn generated_subtree_content_service() {
     let src = project.path().join("src");
     fs::create_dir(&src).unwrap();
     for (name, contents) in generate_rust(&canonical).unwrap() {
+        // Count real model clones outside the projector without changing what
+        // Clone copies. The nested tests run serially and reset after setup.
+        let contents = if name == "types.rs" {
+            let declaration = "# [derive (Clone , PartialEq , Default)] pub struct SecretLeaf";
+            assert_eq!(contents.matches(declaration).count(), 1);
+            let mut contents = contents.replacen(
+                declaration,
+                "# [derive (PartialEq , Default)] pub struct SecretLeaf",
+                1,
+            );
+            contents.push_str(
+                r#"
+pub static SECRET_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+impl<T: Clone> Clone for SecretLeaf<T> {
+    fn clone(&self) -> Self {
+        SECRET_CLONES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { inner: self.inner.clone() }
+    }
+}
+"#,
+            );
+            contents
+        } else {
+            contents
+        };
         fs::write(
             src.join(if name == "mod.rs" { "lib.rs" } else { &name }),
             contents,

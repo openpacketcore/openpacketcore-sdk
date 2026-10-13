@@ -72,6 +72,7 @@ module subtree-content {
       ordered-by user;
       leaf name { type string; opc:data-class "public"; }
       leaf label { type string; opc:data-class "public"; }
+      leaf up { config false; type boolean; opc:data-class "public"; }
     }
     list hidden-peer {
       key "secret";
