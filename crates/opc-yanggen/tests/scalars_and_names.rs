@@ -102,7 +102,7 @@ fn generated_integer_and_nested_name_contract() {
         "integer-scalars",
         include_str!("fixtures/integers.yang"),
         include_str!("fixtures/integers_test.rs"),
-        7,
+        9,
     );
 }
 
@@ -112,7 +112,7 @@ fn generated_string_constraints_contract() {
         "string-scalars",
         include_str!("fixtures/strings.yang"),
         include_str!("fixtures/strings_test.rs"),
-        9,
+        10,
     );
 }
 

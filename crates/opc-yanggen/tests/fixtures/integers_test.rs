@@ -8,6 +8,53 @@ use opc_mgmt_schema::{
 };
 use serde_json::{json, Value};
 
+#[test]
+fn integer_default_values_decode_octal_for_every_width() {
+    let wire = serde_json::to_value(DefaultCases::default()).unwrap();
+    for name in ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64"] {
+        let expected = if name.ends_with("64") { json!("8") } else { json!(8) };
+        assert_eq!(wire[name], expected, "{name}");
+    }
+    for name in ["negative-i8", "negative-i16", "negative-i32", "negative-i64"] {
+        let expected = if name.ends_with("64") { json!("-83") } else { json!(-83) };
+        assert_eq!(wire[name], expected, "{name}");
+    }
+}
+
+#[test]
+fn valueless_integer_list_patches_validate_and_assign_path_keys() {
+    let baseline = System::default();
+    for operation in [patch::ConfigOp::Update, patch::ConfigOp::Merge, patch::ConfigOp::Replace] {
+        for (path, leaf) in [
+            ("/n:restricted[secret-id='0']", "/n:system/n:restricted/n:secret-id"),
+            ("/n:restricted-pair[secret-id='0'][slot='1']", "/n:system/n:restricted-pair/n:secret-id"),
+            ("/n:restricted-pair[secret-id='1'][slot='0']", "/n:system/n:restricted-pair/n:slot"),
+        ] {
+            let mut candidate = baseline.clone();
+            let segments = patch::parse_path(path).unwrap();
+            let error = candidate.apply_patch_segments(&operation, &segments, None).unwrap_err();
+            assert_eq!(error.kind(), "invalid-value");
+            assert_eq!(error.message(), format!("numeric value at {leaf} is outside YANG range"));
+            assert_eq!(candidate, baseline);
+        }
+        for path in ["/n:restricted[secret-id='1']", "/n:restricted-pair[secret-id='1'][slot='10']"] {
+            let mut candidate = baseline.clone();
+            let segments = patch::parse_path(path).unwrap();
+            candidate.apply_patch_segments(&operation, &segments, None).unwrap();
+            let wire = serde_json::to_value(&candidate).unwrap();
+            let list = if path.contains("pair") { "n:restricted-pair" } else { "n:restricted" };
+            assert_eq!(wire[list][0]["secret-id"], "1");
+            if list == "n:restricted-pair" {
+                assert_eq!(wire[list][0]["slot"], 10);
+            }
+            assert_eq!(serde_json::from_value::<System>(wire).unwrap(), candidate);
+            let before = candidate.clone();
+            candidate.apply_patch_segments(&operation, &segments, None).unwrap();
+            assert_eq!(candidate, before);
+        }
+    }
+}
+
 fn set(config: &System, name: &str, value: Value) -> Result<System, opc_gnmi_server::GnmiError> {
     gnmi_set::patcher().apply_set(
         config,

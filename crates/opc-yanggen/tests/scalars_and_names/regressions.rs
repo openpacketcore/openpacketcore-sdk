@@ -6,6 +6,117 @@ use opc_yanggen::{
 };
 
 #[test]
+fn pattern_arguments_preserve_yang_quoting_and_concatenation() {
+    for (argument, expected) in [
+        (r"'\d+'", r"\d+"),
+        (r#""\\d+""#, r"\d+"),
+        (r"\d+", r"\d+"),
+        ("[0-9]+", "[0-9]+"),
+        ("a+", "a+"),
+        ("'a' + /* between */ \"b\"+'c'", "abc"),
+        (r#""\n\t\"\\d""#, "\n\t\"\\d"),
+        ("'a  \n  b'", "a  \n  b"),
+        ("a\u{a0}b", "a\u{a0}b"),
+    ] {
+        assert_pattern_argument(argument, expected);
+    }
+}
+
+fn assert_pattern_argument(argument: &str, expected: &str) {
+    let parsed = input(&format!(
+        "module example {{ namespace 'urn:example'; prefix ex;\ncontainer root {{ leaf value {{ type string {{\npattern {argument};\n}} }} }} }}"
+    ));
+    let leaf = parsed
+        .nodes
+        .iter()
+        .find(|node| node.path == "/ex:root/ex:value")
+        .unwrap();
+    let Some(TypeRef::RestrictedString { patterns, .. }) = &leaf.type_ref else {
+        panic!("expected a restricted string");
+    };
+    assert_eq!(patterns[0].expression, expected, "{argument:?}");
+}
+
+#[test]
+fn double_quoted_arguments_trim_before_escape_substitution_and_concatenation() {
+    // The opening quote is in column 9; tabs examined for indentation each
+    // expand to eight spaces, including the unstripped remainder of a tab.
+    for (argument, expected) in [
+        ("\"a  \n           b\"", "a\n  b"),
+        ("\"a\t\r\n\t\tb\"", "a\r\n       b"),
+        ("\"a\\t  \n         b\"", "a\t\nb"),
+        ("\"a  \\n  b\"", "a  \n  b"),
+        ("\"a  \n   b\" + '  c'", "a\nb  c"),
+    ] {
+        assert_pattern_argument(argument, expected);
+    }
+}
+
+#[test]
+fn malformed_quoted_arguments_are_refused_without_rewriting() {
+    use opc_yanggen::{generation_input_from_yang_sources, DiagnosticCode, YangSource};
+    for argument in [r#""\d+""#, r#""a\.b""#, r#""\r""#, r#""\q""#] {
+        let source = format!("module example {{ namespace 'urn:example'; prefix ex; container root {{ leaf value {{ type string {{ pattern {argument}; }} }} }} }}");
+        let error = generation_input_from_yang_sources(
+            "example",
+            &[YangSource::new("example.yang", source)],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, DiagnosticCode::YangSourceSyntaxError);
+        assert_eq!(error.message, "invalid escape in double-quoted YANG string");
+        assert!(error.source.is_some());
+    }
+    for argument in [
+        "'a' 'b'",
+        "a b",
+        "a + 'b'",
+        "'a' + b",
+        "'a' +",
+        "'a' ++ 'b'",
+    ] {
+        let source = format!("module example {{ namespace 'urn:example'; prefix ex; container root {{ leaf value {{ type string {{ pattern {argument}; }} }} }} }}");
+        let error = generation_input_from_yang_sources(
+            "example",
+            &[YangSource::new("example.yang", source)],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, DiagnosticCode::YangSourceSyntaxError);
+        assert_eq!(
+            error.message,
+            "YANG arguments require one string or quoted strings joined by '+'"
+        );
+    }
+}
+
+#[test]
+fn integer_defaults_use_the_yang_radix_before_range_checks() {
+    for ty in [
+        "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64",
+    ] {
+        for (value, valid) in [
+            ("010", true),
+            ("+010", true),
+            ("0x8", true),
+            ("+0x8", true),
+            ("012", false),
+            ("08", false),
+            ("0X8", false),
+            ("0x", false),
+            ("0x+8", false),
+            ("++8", false),
+        ] {
+            let source = format!("module example {{ namespace 'urn:example'; prefix ex; container root {{ leaf value {{ type {ty} {{ range '8'; }} default '{value}'; }} }} }}");
+            let result = generate_rust(&input(&source).to_canonical());
+            if valid {
+                result.unwrap_or_else(|error| panic!("{ty} {value}: {error}"));
+            } else {
+                assert_eq!(result.unwrap_err().message(), "integer default at /ex:root/ex:value is invalid or outside its type or declared range");
+            }
+        }
+    }
+}
+
+#[test]
 fn integer_refusals_are_value_free_without_string_restrictions() {
     compile_fixture(
         "integer-errors",

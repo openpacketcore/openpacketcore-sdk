@@ -14,6 +14,11 @@ module example {
     leaf whitespace { type string { pattern '\s'; } }
     leaf nonspace { type string { pattern '\w+'; } }
     leaf choice { type string { pattern '(ab|cd){1,2}x?'; } }
+    leaf single-digits { type string { pattern '\d+'; } }
+    leaf double-digits { type string { pattern "\\d+"; } }
+    leaf bare-digits { type string { pattern [0-9]+; } }
+    leaf bare-inverted { type string { pattern a+ { modifier invert-match; } } }
+    leaf concatenated { type string { pattern '[0-' + "9]" + '+'; } }
     leaf defaulted { type string { length '3'; pattern '[0-9]+'; } default '123'; }
     leaf reference { type leafref { path '/ex:root/ex:code'; } }
     leaf-list labels { type string { length '2..3'; } }
@@ -25,6 +30,11 @@ module example {
       key 'secret-id';
       leaf secret-id { type string { length '3'; pattern '[0-9]+'; } }
       leaf value { type string { length '1'; } }
+    }
+    list pair {
+      key 'secret-id slot';
+      leaf secret-id { type string { length '3'; pattern '[0-9]+'; } }
+      leaf slot { type string { length '2'; pattern '[a-z]+'; } }
     }
     container state { config false; leaf label { type string { length '2'; } } }
   }

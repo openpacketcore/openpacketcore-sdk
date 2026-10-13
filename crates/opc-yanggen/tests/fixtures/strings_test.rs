@@ -33,6 +33,11 @@ fn boundaries_and_xsd_semantics_roundtrip_every_path() {
         ("whitespace", vec![" ", "\t", "\n", "\r"], vec!["\u{a0}", "a"]),
         ("nonspace", vec!["abc123", "é+"], vec!["_", "-", " "]),
         ("choice", vec!["ab", "cdabx", "abcd"], vec!["ababc", "abcdab", "x"]),
+        ("single-digits", vec!["12", "123"], vec!["ab", "ddd"]),
+        ("double-digits", vec!["12", "123"], vec!["ab", "ddd"]),
+        ("bare-digits", vec!["12", "123"], vec!["ab", ""]),
+        ("bare-inverted", vec!["b", "ab"], vec!["a", "aa"]),
+        ("concatenated", vec!["12", "123"], vec!["ab", ""]),
         ("reference", vec!["123"], vec!["12", "1234"]),
         ("secret", vec!["123"], vec!["private-value", "1234", "abc"]),
     ] {
@@ -252,6 +257,42 @@ fn public_subtree_patch_methods_cannot_bypass_validation_or_atomicity() {
             assert_eq!(error.kind(), "invalid-value");
             assert_eq!(error.message(), "string violates YANG constraints");
             assert_eq!(candidate, baseline);
+        }
+        for path in [
+            "/ex:account[secret-id='12']",
+            "/ex:account[secret-id='abc']",
+            "/ex:pair[secret-id='12'][slot='ab']",
+            "/ex:pair[secret-id='abc'][slot='ab']",
+            "/ex:pair[secret-id='123'][slot='a']",
+            "/ex:pair[secret-id='123'][slot='12']",
+        ] {
+            let mut candidate = baseline.clone();
+            let segments = patch::parse_path(path).unwrap();
+            let error = candidate.apply_patch_segments(&operation, &segments, None).unwrap_err();
+            assert_eq!(error.kind(), "invalid-value");
+            assert_eq!(error.message(), "string violates YANG constraints");
+            assert_eq!(candidate, baseline);
+        }
+    }
+}
+
+#[test]
+fn valueless_list_patches_assign_all_path_keys_and_roundtrip() {
+    for operation in [patch::ConfigOp::Update, patch::ConfigOp::Merge, patch::ConfigOp::Replace] {
+        for path in ["/ex:account[secret-id='123']", "/ex:pair[secret-id='123'][slot='ab']"] {
+            let mut candidate = Root::default();
+            let segments = patch::parse_path(path).unwrap();
+            candidate.apply_patch_segments(&operation, &segments, None).unwrap();
+            let wire = serde_json::to_value(&candidate).unwrap();
+            let list = if path.contains("pair") { "example:pair" } else { "example:account" };
+            assert_eq!(wire[list][0]["secret-id"], "123");
+            if list == "example:pair" {
+                assert_eq!(wire[list][0]["slot"], "ab");
+            }
+            assert_eq!(serde_json::from_value::<Root>(wire).unwrap(), candidate);
+            let before = candidate.clone();
+            candidate.apply_patch_segments(&operation, &segments, None).unwrap();
+            assert_eq!(candidate, before);
         }
     }
 }
