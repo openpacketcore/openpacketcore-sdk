@@ -213,7 +213,11 @@ fn render_list_fn(
     let fn_ident = format_ident!("render_{}", nodes_by_path.helper_name(&node.path));
     let entry_fn_ident = format_ident!("render_{}_entry", nodes_by_path.helper_name(&node.path));
     let entry_type_ident = format_ident!("{}", nodes_by_path.type_name(node));
-    let field_type = sequence_field_type(node, nodes_by_path);
+    let field_type = if node.key_leaves.is_empty() && !super::types::is_sensitive_node(node) {
+        quote! { [super::types::#entry_type_ident] }
+    } else {
+        sequence_field_type(node, nodes_by_path)
+    };
 
     if super::types::is_sensitive_node(node) {
         return Ok(quote! {

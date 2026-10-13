@@ -315,6 +315,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     use std::fmt::Write as _;
 
     // Captured from the generator before user ordering support (1d880a21c).
+    // The patch.rs pin includes the safe-diagnostic correction for #1268.
     // Changing unaffected generated output requires an explicit baseline update.
     let expected = [
         (
@@ -343,7 +344,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "patch.rs",
-            "5f5d286da75e8b7648bb2d1ade4de6f69b295a8c6d0e796ac3defa1862621a48",
+            "0d7d5d4b3004e2e5cbd3de7822f89854da4395e4bcbb4cdf2ade50fd40fbd658",
         ),
         (
             "paths.rs",

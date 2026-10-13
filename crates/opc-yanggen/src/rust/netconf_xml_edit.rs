@@ -153,7 +153,7 @@ fn apply_children_fn(
     let fn_ident = format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
     let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
-    let mut leaf_list_group_arms = TokenStream::new();
+    let mut leaf_list_paths = Vec::new();
     let mut leaf_list_apply_stmts = TokenStream::new();
     let mut list_key_sets = TokenStream::new();
     let mut singleton_paths = Vec::new();
@@ -354,14 +354,7 @@ fn apply_children_fn(
                 } else {
                     quote! { &mut value.#field_ident }
                 };
-                leaf_list_group_arms.extend(quote! {
-                    #child_path_lit => {
-                        leaf_list_children
-                            .entry(child.schema_path)
-                            .or_default()
-                            .push(child);
-                    }
-                });
+                leaf_list_paths.push(child_path_lit);
                 leaf_list_apply_stmts.extend(quote! {
                     if let Some(#nodes_ident) = leaf_list_children.get(#child_path_lit) {
                         #leaf_list_fn_ident(#nodes_ident, #values)?;
@@ -376,7 +369,7 @@ fn apply_children_fn(
         arms.extend(arm);
     }
 
-    let leaf_list_grouping = if leaf_list_group_arms.is_empty() {
+    let leaf_list_grouping = if leaf_list_paths.is_empty() {
         TokenStream::new()
     } else {
         quote! {
@@ -385,9 +378,11 @@ fn apply_children_fn(
                 Vec<&EditConfigNode>,
             > = std::collections::BTreeMap::new();
             for child in children {
-                match child.schema_path {
-                    #leaf_list_group_arms
-                    _ => {}
+                if matches!(child.schema_path, #(#leaf_list_paths)|*) {
+                    leaf_list_children
+                        .entry(child.schema_path)
+                        .or_default()
+                        .push(child);
                 }
             }
             #leaf_list_apply_stmts

@@ -786,6 +786,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                     field_arms.extend(arm);
 
+                    // State data never belongs to a configuration diff, even
+                    // when a collection or an optional container disappears.
+                    if !child.config {
+                        continue;
+                    }
+
                     // Diff logic
                     let child_segment_str = last_segment(&child.path);
                     let diff_arm = match child.kind {
@@ -952,11 +958,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
-            // State-only rows and expanded-profile no-op diffs need no inputs.
-            let empty_state_diff = has_state_lists && diff_fields.is_empty();
+            // No-op configuration diffs need no inputs in any schema profile.
+            let empty_state_diff = diff_fields.is_empty();
             let previous_param = format_ident!(
                 "{}",
-                if (nodes_by_path.expanded_profile && diff_fields.is_empty()) || empty_state_diff {
+                if empty_state_diff {
                     "_previous"
                 } else {
                     "previous"
@@ -964,7 +970,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             );
             let deltas_param = format_ident!(
                 "{}",
-                if (nodes_by_path.expanded_profile && diff_fields.is_empty()) || empty_state_diff {
+                if empty_state_diff {
                     "_deltas"
                 } else {
                     "deltas"
@@ -1079,19 +1085,18 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
     }
 
-    let escape_key_value_fn = if input
-        .nodes
-        .iter()
-        .any(|node| node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty())
-    {
-        quote! {
-            fn escape_key_value(value: &str) -> String {
-                value.replace('\\', "\\\\").replace('\'', "\\'")
+    let escape_key_value_fn =
+        if input.nodes.iter().any(|node| {
+            node.config && node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()
+        }) {
+            quote! {
+                fn escape_key_value(value: &str) -> String {
+                    value.replace('\\', "\\\\").replace('\'', "\\'")
+                }
             }
-        }
-    } else {
-        quote! {}
-    };
+        } else {
+            quote! {}
+        };
 
     let scalar_validation = if has_scalar_constraints {
         quote! { super::validate::validate_syntax(&temp).map_err(|error| config_error("invalid-value", error.message))?; }
@@ -1294,10 +1299,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     #ordered_path_arm
                 };
                 if !super::paths::is_valid_path(path.as_str()) {
-                    return Err(config_error("invalid-path", format!("invalid path: {}", path)));
+                    return Err(config_error("invalid-path", "invalid path"));
                 }
                 if !super::paths::is_config_path(path.as_str()) {
-                    return Err(config_error("read-only", format!("cannot modify read-only path: {}", path)));
+                    return Err(config_error("read-only", "cannot modify read-only path"));
                 }
             }
 

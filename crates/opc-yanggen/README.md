@@ -64,9 +64,14 @@ extraction and edit helpers use that optional representation, including
 sensitive key wrappers. Read-only rows and nested containers with no
 configuration differences emit warning-free no-op diff helpers. Normal patch
 and NETCONF XML admission continue to reject writes to state paths.
+Invalid-path and read-only patch admission errors use stable messages without
+instance paths or key values, including their `Display` and `Debug` output.
+Configuration diffs exclude every read-only node kind, including removed rows, containers,
+keyless lists and leaf-lists; writable siblings still emit their own deltas.
 Generated modules for these schemas are checked with Clippy warnings denied.
-Their block boundaries preserve literal contents and punctuation; existing
-supported schemas retain their generated output bytes.
+Their block boundaries preserve literal contents and punctuation. The legacy
+output fixtures change only in `patch.rs` for safe diagnostics and state-diff
+exclusion; all other pinned generated files retain their bytes.
 
 Key leaves with a non-public `opc:data-class` remain available to serde,
 ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`
