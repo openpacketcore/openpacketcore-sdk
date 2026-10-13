@@ -285,6 +285,56 @@ fn invalid_patch_paths_do_not_disclose_sensitive_keys() {
 }
 
 #[test]
+fn patch_json_errors_do_not_disclose_values_or_unknown_fields() {
+    use mixed::patch::ConfigDelta;
+    let previous: mixed::types::Root = serde_json::from_value(json!({"hostname": "old"})).unwrap();
+    for (path, value, replace, kind, message) in [
+        ("/mx:root", json!({"synthetic-secret": "value"}), false, "unsupported-path", "unsupported field"),
+        ("/mx:root", json!({"count": "synthetic-secret"}), false, "invalid-value", "invalid numeric value"),
+        ("/mx:root", json!({"count": "synthetic-secret"}), true, "invalid-value", "invalid JSON value"),
+        ("/mx:root/mx:counters", json!(["synthetic-secret"]), false, "invalid-value", "invalid JSON value"),
+        ("/mx:root/mx:counters", json!(["synthetic-secret"]), true, "invalid-value", "invalid JSON value"),
+        ("/mx:root/mx:account[token='synthetic-secret']", json!({"count": "synthetic-secret"}), false, "invalid-value", "invalid JSON value"),
+        ("/mx:root/mx:account[token='synthetic-secret']", json!({"count": "synthetic-secret"}), true, "invalid-value", "invalid JSON value"),
+    ] {
+        let mut candidate = previous.clone();
+        let path = YangPath::new(path).unwrap();
+        let delta = if replace { ConfigDelta::Replace(path, value.to_string()) } else { ConfigDelta::Merge(path, value.to_string()) };
+        let error = mixed::patch::apply_patch(&mut candidate, &[delta]).unwrap_err();
+        assert_safe_patch_error(&error, kind, message);
+        assert_eq!(candidate, previous);
+    }
+}
+
+#[test]
+fn leafref_leaf_list_errors_never_disclose_referenced_values() {
+    use opc_config_model::{CommitMode, ConfigOperation, RequestId, RequestSource, TransportType, TrustedPrincipal, ValidationContext, ValidationError, WorkloadIdentity};
+    let context = ValidationContext {
+        request_id: RequestId::new(),
+        principal: TrustedPrincipal::new(WorkloadIdentity::Internal("test".into()), opc_types::TenantId::new("example").unwrap()),
+        transport: TransportType::Internal,
+        source: RequestSource::Northbound,
+        operation: ConfigOperation::Replace,
+        mode: CommitMode::Commit,
+        base_version: opc_types::ConfigVersion::INITIAL,
+        previous: None,
+    };
+    for name in ["references", "api-token"] {
+        let mut candidate: mixed::types::Root = serde_json::from_value(json!({"hostname": "present"})).unwrap();
+        let path = YangPath::new(format!("/mx:root/mx:{name}")).unwrap();
+        mixed::patch::apply_patch(&mut candidate, &[mixed::patch::ConfigDelta::Update(path.clone(), json!(["present"]).to_string())]).unwrap();
+        candidate.validate_semantics(&context).unwrap();
+        mixed::patch::apply_patch(&mut candidate, &[mixed::patch::ConfigDelta::Update(path, json!(["present", "synthetic-secret"]).to_string())]).unwrap();
+        let error = candidate.validate_semantics(&context).unwrap_err();
+        assert_eq!(error, ValidationError::semantics("Leaf-list value at index 1 not found in target path /mx:root/mx:hostname"));
+        for text in [error.message.clone(), error.to_string(), format!("{error:?}")] {
+            assert!(!text.contains("synthetic-secret"));
+            assert!(!text.contains("present"));
+        }
+    }
+}
+
+#[test]
 fn state_list_patch_is_refused_without_mutation() {
     let mut state = sample();
     let previous = state.clone();

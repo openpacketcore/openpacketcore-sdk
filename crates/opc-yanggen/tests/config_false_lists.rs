@@ -30,6 +30,15 @@ module mixed-state {
   revision 2026-10-12;
   container root {
     leaf hostname { type string; }
+    leaf count { type uint32; }
+    leaf-list counters { type uint32; }
+    leaf-list references { type leafref { path '/mx:root/mx:hostname'; } }
+    leaf-list api-token { type leafref { path '/mx:root/mx:hostname'; } }
+    list account {
+      key 'token';
+      leaf token { type string; }
+      leaf count { type uint32; }
+    }
     container state {
       config false;
       list error {
