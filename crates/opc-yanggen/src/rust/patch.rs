@@ -489,6 +489,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 } else {
                                     quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
                                 };
+                                let valueless_key_assign = if has_scalar_constraints {
+                                    quote! { else { #entry_key_assign } }
+                                } else {
+                                    quote! {}
+                                };
                                 let map_key = if key_is_sensitive {
                                     quote! { SensitiveKey::from(parsed_key.clone()) }
                                 } else {
@@ -513,6 +518,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                         #key_assign
                                                         *entry = parsed_item;
                                                     }
+                                                    #valueless_key_assign
                                                 }
                                             }
                                         } else {
@@ -609,6 +615,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         entry_key_assigns.push(quote! { entry.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
                                     }
                                 }
+                                let valueless_key_assign = if has_scalar_constraints {
+                                    quote! { else { #(#entry_key_assigns)* } }
+                                } else {
+                                    quote! {}
+                                };
 
                                 quote! {
                                     #child_name_str => {
@@ -630,6 +641,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                         #(#key_assigns)*
                                                         *entry = parsed_item;
                                                     }
+                                                    #valueless_key_assign
                                                 }
                                             }
                                         } else {

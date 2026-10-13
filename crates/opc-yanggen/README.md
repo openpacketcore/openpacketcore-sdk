@@ -76,20 +76,25 @@ Generated `YangInt64` and `YangUint64` wrappers encode RFC 7951 JSON values as
 strings; smaller integers encode as numbers. XML uses decimal text. Declared
 ranges are checked during JSON load, syntax validation, patches, gNMI Set, and
 NETCONF edits, including list keys, leaf-lists, and resolved leafrefs.
+Integer defaults use the YANG decimal, leading-zero octal, and `0x` hexadecimal
+notations for every width, including optional signs; their decoded values must
+satisfy the type and declared range. Protocol integer values remain decimal.
 In models using the new scalar constructs, malformed integer values and JSON
 structures receive fixed reasons that never include a supplied value. Subtree
 merges validate their typed JSON before applying fields. Models that use any of
 the added integer widths compare integer operands in an `i128` domain, including
 public constraint IR constants outside a leaf's storage range and chained
 references.
+List-entry Merge, Update, and Replace calls without a value still assign every
+path key to its key leaf and enforce its declared constraints before committing.
 
 Containers and lists with a shared local name receive deterministic names
 qualified by their parents, with stable suffixes for remaining collisions.
 Composite-key names and generated helper functions use the same name index.
 Case-distinct paths have separate pattern caches; references reuse the cache of
 their resolved scalar declaration.
-Previously valid models using none of the new constructs retain every generated
-file byte for byte.
+The legacy output fixtures retain every generated file byte for byte. Source
+quoting and integer-default decoding corrections apply to every model.
 
 String `length` uses Unicode scalar counts and supports disjoint intervals,
 `min`, and `max`. Multiple `pattern` statements are combined with AND; each
@@ -98,6 +103,13 @@ negating that one pattern. Defaults must satisfy the restrictions. Generated
 JSON load, direct syntax validation, patches, gNMI Set, and NETCONF edits enforce
 them on leaves, leaf-lists, keys, and leafrefs. Failed writes are atomic and
 return the existing typed error with a fixed reason that includes no value.
+
+Source arguments follow [RFC 7950 section 6.1.3](https://www.rfc-editor.org/rfc/rfc7950.html#section-6.1.3):
+single-quoted and unquoted strings preserve their characters, including `+` in
+unquoted patterns. Concatenation joins only quoted strings. Double quotes permit
+only `\n`, `\t`, `\"`, and `\\` escapes; other escapes are rejected. Physical
+line indentation and trailing whitespace are trimmed before escape substitution
+and concatenation. Write a digit pattern as `'\d+'` or `"\\d+"`.
 
 The supported XSD grammar includes grouping, alternation, bounded and unbounded
 repetition, character ranges and subtraction, negated classes, Unicode general

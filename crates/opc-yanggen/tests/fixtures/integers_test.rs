@@ -23,7 +23,8 @@ fn integer_default_values_decode_octal_for_every_width() {
 
 #[test]
 fn valueless_integer_list_patches_validate_and_assign_path_keys() {
-    let baseline = System::default();
+    // Start with absent leaves so JSON round-tripping preserves presence.
+    let baseline: System = serde_json::from_value(json!({})).unwrap();
     for operation in [patch::ConfigOp::Update, patch::ConfigOp::Merge, patch::ConfigOp::Replace] {
         for (path, leaf) in [
             ("/n:restricted[secret-id='0']", "/n:system/n:restricted/n:secret-id"),

@@ -9,6 +9,9 @@
 //! syntax validation, patches, gNMI Set, and NETCONF edits. Integer range metadata
 //! has an additive `i128` table; existing generated `i64` tables remain valid.
 //! The generator IR's [`NumericRangeInterval`] bounds are now `i128`.
+//! Schema integer defaults decode decimal, octal, and hexadecimal notation
+//! before range validation. Value-less list-entry patches assign and validate
+//! their path keys in models using the extended scalar constructs.
 //!
 //! Colliding container/list type names are deterministically parent-qualified,
 //! including their composite-key companions. Unique names remain unchanged.
@@ -17,6 +20,8 @@
 //! restrictions apply to the whole value, including `invert-match`. Generated
 //! code compiles each bounded pattern once through `opc-mgmt-schema` and checks
 //! deserialization, syntax validation, patches, gNMI Set, and NETCONF edits.
+//! Source quoting preserves literal strings, restricts double-quoted escapes,
+//! trims physical double-quoted lines, and concatenates only quoted strings.
 
 pub mod diagnostic;
 pub mod emit;

@@ -706,7 +706,7 @@ fn validate_integer_default(
     let Some((min, max)) = scalar.type_ref.as_ref().and_then(TypeRef::integer_bounds) else {
         return Ok(());
     };
-    if default.parse::<i128>().ok().is_some_and(|value| {
+    if parse_integer_default(default).is_some_and(|value| {
         (min..=max).contains(&value)
             && (scalar.numeric_range.is_empty()
                 || scalar
@@ -721,6 +721,28 @@ fn validate_integer_default(
             node.path,
         )))
     }
+}
+
+// RFC 7950 section 9.2.1 permits decimal, octal, and hexadecimal defaults.
+// This is schema syntax only; protocol values retain their decimal codecs.
+fn parse_integer_default(text: &str) -> Option<i128> {
+    let (negative, digits) = if let Some(digits) = text.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let (digits, radix) = if let Some(digits) = digits.strip_prefix("0x") {
+        (digits, 16)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (&digits[1..], 8)
+    } else {
+        (digits, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
+        return None;
+    }
+    let value = i128::from_str_radix(digits, radix).ok()?;
+    Some(if negative { -value } else { value })
 }
 
 fn validate_rust_identifier_collisions(input: &CanonicalInput) -> Result<(), RustGenerationError> {

@@ -280,7 +280,8 @@ fn public_subtree_patch_methods_cannot_bypass_validation_or_atomicity() {
 fn valueless_list_patches_assign_all_path_keys_and_roundtrip() {
     for operation in [patch::ConfigOp::Update, patch::ConfigOp::Merge, patch::ConfigOp::Replace] {
         for path in ["/ex:account[secret-id='123']", "/ex:pair[secret-id='123'][slot='ab']"] {
-            let mut candidate = Root::default();
+            // JSON omission keeps unrelated defaulted leaves absent.
+            let mut candidate: Root = serde_json::from_value(json!({})).unwrap();
             let segments = patch::parse_path(path).unwrap();
             candidate.apply_patch_segments(&operation, &segments, None).unwrap();
             let wire = serde_json::to_value(&candidate).unwrap();

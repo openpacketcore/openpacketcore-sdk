@@ -16,6 +16,7 @@ fn pattern_arguments_preserve_yang_quoting_and_concatenation() {
         ("'a' + /* between */ \"b\"+'c'", "abc"),
         (r#""\n\t\"\\d""#, "\n\t\"\\d"),
         ("'a  \n  b'", "a  \n  b"),
+        ("\"a \"", "a "),
         ("a\u{a0}b", "a\u{a0}b"),
     ] {
         assert_pattern_argument(argument, expected);
@@ -23,8 +24,12 @@ fn pattern_arguments_preserve_yang_quoting_and_concatenation() {
 }
 
 fn assert_pattern_argument(argument: &str, expected: &str) {
+    assert_pattern_statement(&format!("pattern {argument};"), expected);
+}
+
+fn assert_pattern_statement(statement: &str, expected: &str) {
     let parsed = input(&format!(
-        "module example {{ namespace 'urn:example'; prefix ex;\ncontainer root {{ leaf value {{ type string {{\npattern {argument};\n}} }} }} }}"
+        "module example {{ namespace 'urn:example'; prefix ex;\ncontainer root {{ leaf value {{ type string {{\n{statement}\n}} }} }} }}"
     ));
     let leaf = parsed
         .nodes
@@ -34,7 +39,7 @@ fn assert_pattern_argument(argument: &str, expected: &str) {
     let Some(TypeRef::RestrictedString { patterns, .. }) = &leaf.type_ref else {
         panic!("expected a restricted string");
     };
-    assert_eq!(patterns[0].expression, expected, "{argument:?}");
+    assert_eq!(patterns[0].expression, expected, "{statement:?}");
 }
 
 #[test]
@@ -47,9 +52,11 @@ fn double_quoted_arguments_trim_before_escape_substitution_and_concatenation() {
         ("\"a\\t  \n         b\"", "a\t\nb"),
         ("\"a  \\n  b\"", "a  \n  b"),
         ("\"a  \n   b\" + '  c'", "a\nb  c"),
+        ("\"a\n         \tb\"", "a\n\tb"),
     ] {
         assert_pattern_argument(argument, expected);
     }
+    assert_pattern_statement("\tpattern \"a\n                 b\";", "a\nb");
 }
 
 #[test]

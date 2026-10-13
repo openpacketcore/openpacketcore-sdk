@@ -1072,35 +1072,51 @@ fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> 
                 quote! { #b }
             }
             Some(TypeRef::Uint8) => {
-                let val = def_str.parse::<u8>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { #val }
             }
             Some(TypeRef::Int8) => {
-                let val = def_str.parse::<i8>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| i8::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { #val }
             }
             Some(TypeRef::Int16) => {
-                let val = def_str.parse::<i16>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| i16::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { #val }
             }
             Some(TypeRef::Int32) => {
-                let val = def_str.parse::<i32>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { #val }
             }
             Some(TypeRef::Uint16) => {
-                let val = def_str.parse::<u16>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { #val }
             }
             Some(TypeRef::Uint32) => {
-                let val = def_str.parse::<u32>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { #val }
             }
             Some(TypeRef::Uint64) => {
-                let val = def_str.parse::<u64>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { YangUint64(#val) }
             }
             Some(TypeRef::Int64) => {
-                let val = def_str.parse::<i64>().unwrap_or(0);
+                let val = super::parse_integer_default(def_str)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .unwrap_or(0);
                 quote! { YangInt64(#val) }
             }
             Some(TypeRef::Decimal64) => {

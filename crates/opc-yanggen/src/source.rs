@@ -1249,53 +1249,69 @@ impl<'a> Parser<'a> {
             ));
         };
 
-        let mut argument_parts = Vec::new();
-        loop {
-            let Some(peek) = self.peek() else {
-                return Err(Diagnostic::new(
-                    DiagnosticCode::YangSourceSyntaxError,
-                    format!("statement `{keyword}` is missing `;` or `{{`"),
-                    Some(token.source),
-                    Some("terminate the statement or add a child block"),
-                ));
-            };
-            match &peek.kind {
-                TokenKind::Semicolon => {
-                    self.index += 1;
-                    return Ok(Statement {
-                        keyword,
-                        argument: joined_argument(argument_parts),
-                        source: token.source,
-                        children: Vec::new(),
-                    });
+        let mut argument = None;
+        if let Some(peek) = self.peek() {
+            if let TokenKind::Ident(value) | TokenKind::String(value) = &peek.kind {
+                let quoted = matches!(peek.kind, TokenKind::String(_));
+                let mut value = value.clone();
+                self.index += 1;
+                if quoted {
+                    while self
+                        .peek()
+                        .is_some_and(|token| token.kind == TokenKind::Plus)
+                    {
+                        self.index += 1;
+                        let Some(Token {
+                            kind: TokenKind::String(part),
+                            ..
+                        }) = self.next()
+                        else {
+                            return Err(self.invalid_argument());
+                        };
+                        value.push_str(&part);
+                    }
                 }
-                TokenKind::LBrace => {
-                    self.index += 1;
-                    let children = self.parse_block()?;
-                    return Ok(Statement {
-                        keyword,
-                        argument: joined_argument(argument_parts),
-                        source: token.source,
-                        children,
-                    });
-                }
-                TokenKind::RBrace => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::YangSourceSyntaxError,
-                        format!("statement `{keyword}` ended before `;` or `{{`"),
-                        Some(peek.source.clone()),
-                        Some("terminate the statement before closing the parent block"),
-                    ));
-                }
-                TokenKind::Plus => {
-                    self.index += 1;
-                }
-                TokenKind::Ident(value) | TokenKind::String(value) => {
-                    argument_parts.push(value.clone());
-                    self.index += 1;
-                }
+                argument = Some(value);
             }
         }
+        let Some(terminator) = self.next() else {
+            return Err(Diagnostic::new(
+                DiagnosticCode::YangSourceSyntaxError,
+                format!("statement `{keyword}` is missing `;` or `{{`"),
+                Some(token.source),
+                Some("terminate the statement or add a child block"),
+            ));
+        };
+        let children = match terminator.kind {
+            TokenKind::Semicolon => Vec::new(),
+            TokenKind::LBrace => self.parse_block()?,
+            TokenKind::RBrace => {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::YangSourceSyntaxError,
+                    format!("statement `{keyword}` ended before `;` or `{{`"),
+                    Some(terminator.source),
+                    Some("terminate the statement before closing the parent block"),
+                ));
+            }
+            _ => return Err(self.invalid_argument()),
+        };
+        Ok(Statement {
+            keyword,
+            argument,
+            source: token.source,
+            children,
+        })
+    }
+
+    fn invalid_argument(&self) -> Diagnostic {
+        Diagnostic::new(
+            DiagnosticCode::YangSourceSyntaxError,
+            "YANG arguments require one string or quoted strings joined by '+'",
+            self.tokens
+                .get(self.index.saturating_sub(1))
+                .map(|token| token.source.clone()),
+            Some("join quoted strings with '+' or use a single argument"),
+        )
     }
 
     fn parse_block(&mut self) -> Result<Vec<Statement>, Diagnostic> {
@@ -1332,14 +1348,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn joined_argument(parts: Vec<String>) -> Option<String> {
-    match parts.len() {
-        0 => None,
-        1 => parts.into_iter().next(),
-        _ => Some(parts.join("")),
-    }
-}
-
 fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
     let mut tokens = Vec::new();
     let chars = source.text.chars().collect::<Vec<_>>();
@@ -1350,7 +1358,7 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
     while index < chars.len() {
         let ch = chars[index];
         match ch {
-            c if c.is_whitespace() => {
+            c if is_yang_whitespace(c) => {
                 advance_char(c, &mut line, &mut column);
                 index += 1;
             }
@@ -1390,6 +1398,14 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                     ));
                 }
             }
+            '*' if chars.get(index + 1) == Some(&'/') => {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::YangSourceSyntaxError,
+                    "unexpected block comment terminator",
+                    Some(YangSourceLocation::new(&source.file_name, line, column)),
+                    Some("remove the unmatched comment terminator or quote the string"),
+                ));
+            }
             '{' => {
                 tokens.push(symbol_token(
                     TokenKind::LBrace,
@@ -1420,7 +1436,10 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                 index += 1;
                 column += 1;
             }
-            '+' => {
+            '+' if tokens
+                .last()
+                .is_some_and(|token| matches!(token.kind, TokenKind::String(_))) =>
+            {
                 tokens.push(symbol_token(
                     TokenKind::Plus,
                     &source.file_name,
@@ -1452,13 +1471,18 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                         };
                         index += 1;
                         advance_char(escaped, &mut line, &mut column);
-                        value.push(match escaped {
-                            'n' => '\n',
-                            't' => '\t',
-                            '"' => '"',
-                            '\\' => '\\',
-                            other => other,
-                        });
+                        if !matches!(escaped, 'n' | 't' | '"' | '\\') {
+                            return Err(Diagnostic::new(
+                                DiagnosticCode::YangSourceSyntaxError,
+                                "invalid escape in double-quoted YANG string",
+                                Some(start),
+                                Some("double-quoted YANG strings allow only n, t, double quote, or backslash after a backslash"),
+                            ));
+                        }
+                        // Preserve escapes until indentation and trailing
+                        // whitespace have been stripped (RFC 7950 section 6.1.3).
+                        value.push(current);
+                        value.push(escaped);
                     } else {
                         value.push(current);
                     }
@@ -1471,6 +1495,9 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                         Some("close the string before the end of the file"),
                     ));
                 }
+                if quote == '"' {
+                    value = decode_double_quoted(&value, start.column);
+                }
                 tokens.push(Token {
                     kind: TokenKind::String(value),
                     source: start,
@@ -1481,13 +1508,15 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                 let start_column = column;
                 let mut value = String::new();
                 while let Some(&current) = chars.get(index) {
-                    if current.is_whitespace() || matches!(current, '{' | '}' | ';' | '"' | '\'') {
+                    if is_yang_whitespace(current)
+                        || matches!(current, '{' | '}' | ';' | '"' | '\'')
+                    {
                         break;
                     }
                     if current == '/' && matches!(chars.get(index + 1), Some('/') | Some('*')) {
                         break;
                     }
-                    if current == '+' {
+                    if current == '*' && chars.get(index + 1) == Some(&'/') {
                         break;
                     }
                     value.push(current);
@@ -1513,6 +1542,64 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
     Ok(tokens)
 }
 
+fn is_yang_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\r' | '\n')
+}
+
+// Trim physical lines before interpreting escapes, and preserve CRLF/LF.
+fn decode_double_quoted(raw: &str, quote_column: usize) -> String {
+    let mut trimmed = String::new();
+    for (index, line) in raw.split_inclusive('\n').enumerate() {
+        let (line, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        let mut chars = line.chars().peekable();
+        let mut body = String::new();
+        if index > 0 {
+            let mut remaining = quote_column;
+            while remaining > 0 {
+                let width = match chars.peek() {
+                    Some(' ') => 1,
+                    Some('\t') => 8,
+                    _ => break,
+                };
+                chars.next();
+                if width > remaining {
+                    body.extend(std::iter::repeat_n(' ', width - remaining));
+                }
+                remaining = remaining.saturating_sub(width);
+            }
+        }
+        body.extend(chars);
+        trimmed.push_str(if ending.is_empty() {
+            &body
+        } else {
+            body.trim_end_matches([' ', '\t'])
+        });
+        trimmed.push_str(ending);
+    }
+    let mut decoded = String::new();
+    let mut chars = trimmed.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            decoded.push(match chars.next() {
+                Some('n') => '\n',
+                Some('t') => '\t',
+                Some('"') => '"',
+                Some('\\') => '\\',
+                _ => unreachable!("the lexer validated every double-quoted escape"),
+            });
+        } else {
+            decoded.push(ch);
+        }
+    }
+    decoded
+}
+
 fn symbol_token(kind: TokenKind, file_name: &str, line: usize, column: usize) -> Token {
     Token {
         kind,
@@ -1524,6 +1611,8 @@ fn advance_char(ch: char, line: &mut usize, column: &mut usize) {
     if ch == '\n' {
         *line += 1;
         *column = 1;
+    } else if ch == '\t' {
+        *column += 8;
     } else {
         *column += 1;
     }

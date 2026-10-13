@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `opc-mgmt-schema` using `regex` (MIT OR Apache-2.0); XML-name and
   Unicode-block escapes fail closed as unsupported. Models using none of these
   new constructs retain byte-identical generated files. (#1006, #1263)
+  Source quoting preserves pattern characters and enforces RFC 7950 escapes,
+  whitespace trimming, and quoted concatenation. Value-less list-entry patches
+  assign and validate path keys, and integer defaults decode octal and
+  hexadecimal notation for every width.
 
 - `opc-proto-nas`: frame optional elements with complete per-message tables
   from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),
