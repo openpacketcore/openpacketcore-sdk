@@ -401,7 +401,7 @@ fn nested_keyless_state_content_round_trips_without_configuration_deltas() {
     let restored: keyless::types::State = serde_json::from_value(encoded).unwrap();
     assert_eq!(restored, state);
     let absent = keyless::types::State::default();
-    assert!(state.changed_paths(&absent).is_empty());
+    assert!(state.changed_paths(&absent, &[]).unwrap().is_empty());
     assert!(keyless::patch::diff_root(&state, &absent).unwrap().is_empty());
 }
 
