@@ -37,7 +37,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     for node in &sorted_nodes {
         match node.kind {
             SchemaNodeKind::Container | SchemaNodeKind::List => {
-                apply_fns.push(apply_children_fn(node, &nodes_by_path, input)?);
+                // Keyless lists are rejected by their list applicator before
+                // reaching children, so no child helper can be called.
+                if node.kind == SchemaNodeKind::Container || !node.key_leaves.is_empty() {
+                    apply_fns.push(apply_children_fn(node, &nodes_by_path, input)?);
+                }
             }
             SchemaNodeKind::Leaf => {}
             SchemaNodeKind::LeafList => {
