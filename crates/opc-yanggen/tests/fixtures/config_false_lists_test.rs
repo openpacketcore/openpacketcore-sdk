@@ -92,6 +92,25 @@ fn state_sensitive_numeric_key_retains_copy_and_redaction() {
 }
 
 #[test]
+fn state_defaults_keep_optional_presence_without_inventing_observations() {
+    let default = keys::types::Grant::default();
+    let count: &Option<u32> = &default.count;
+    assert_eq!(*count, None);
+    assert_eq!(*default.secret_counter.get(), None);
+    let absent: keys::types::Grant = serde_json::from_value(json!({"token-id": 17})).unwrap();
+    assert_eq!(absent.count, None);
+    assert_eq!(*absent.secret_counter.get(), None);
+    let present: keys::types::Grant = serde_json::from_value(json!({
+        "token-id": 17, "count": 0, "secret-counter": 0
+    })).unwrap();
+    assert_eq!(present.count, Some(0));
+    assert_eq!(*present.secret_counter.get(), Some(0));
+    let encoded = serde_json::to_value(&present).unwrap();
+    assert_eq!(encoded["count"], 0);
+    assert_eq!(encoded["secret-counter"], 0);
+}
+
+#[test]
 fn state_list_missing_and_duplicate_keys_are_rejected() {
     let missing = serde_json::from_value::<minimal::types::State>(json!({
         "error": [{"count": 7}]

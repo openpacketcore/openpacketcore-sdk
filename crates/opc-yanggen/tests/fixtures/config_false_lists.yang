@@ -19,7 +19,8 @@ module state-keys {
     list grant {
       key "token-id";
       leaf token-id { type uint32; }
-      leaf count { type uint32; }
+      leaf count { type uint32; default 0; }
+      leaf secret-counter { type uint32; default 0; }
     }
     list session {
       key "token region";
