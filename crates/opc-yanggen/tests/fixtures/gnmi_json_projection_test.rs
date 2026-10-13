@@ -97,7 +97,7 @@ fn sensitive_key_permitted_read() {
         entry("/ex:system/ex:subscriber/ex:tier", "/ex:system/ex:subscriber/ex:tier"),
         entry("/ex:system/ex:secret", "/ex:system/ex:secret"),
     ]);
-    let canonical = "/ex:system/ex:subscriber[ex:imsi='subscriber/\\'\\\\]sensitive-key']";
+    let canonical = r#"/ex:system/ex:subscriber[ex:imsi="subscriber/'\]sensitive-key"]"#;
     assert_eq!(updates.len(), 3);
     assert!(updates.contains(&(format!("{canonical}/ex:imsi"), serde_json::to_string(marker).unwrap())));
     assert!(updates.contains(&(format!("{canonical}/ex:tier"), "\"selected-tier\"".to_string())));

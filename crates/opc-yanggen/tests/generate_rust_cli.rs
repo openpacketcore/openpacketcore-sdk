@@ -322,6 +322,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     let expected = [
         (
             "gnmi_json.rs",
+            // #1269 permits authorized sensitive keys; #1270 M3 builds XPath literals.
             "537d5deb527ae2d47434f6538ddf0c9768694ce9fc0e3d24388d97fbfa7b6b87",
         ),
         (
@@ -338,6 +339,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "netconf_xml.rs",
+            // #1269 carries authorized identifying keys and instance selections into XML.
             "b3636444f2b3bb7904cf9a1dfc6380e6e2c3c65ff62dcc85adc30abd91904615",
         ),
         (
