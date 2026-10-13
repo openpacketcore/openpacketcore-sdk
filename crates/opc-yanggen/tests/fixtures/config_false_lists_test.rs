@@ -155,7 +155,7 @@ fn state_list_patch_is_refused_without_mutation() {
 #[test]
 fn state_list_netconf_edit_is_refused() {
     let error = parse_edit_config_xml_with_limits(
-        r#"<state xmlns="urn:example:minimal-state"><error><reason>temporary</reason><count>8</count></error></state>"#,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><state xmlns="urn:example:minimal-state"><error><reason>temporary</reason><count>8</count></error></state></config>"#,
         minimal::schema_registry::registry(),
         EditDefaultOperation::Merge,
         &MgmtLimits::default(),
