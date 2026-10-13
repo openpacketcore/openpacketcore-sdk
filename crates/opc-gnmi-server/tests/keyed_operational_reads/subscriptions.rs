@@ -383,6 +383,57 @@ async fn keyed_on_change_bounds_paths_before_instance_parsing() {
 }
 
 #[tokio::test]
+async fn authorized_event_value_limit_precedes_masking_at_the_byte_boundary() {
+    for length in [126, 127] {
+        let (service, _, sender) = subscription_fixture(
+            vec![],
+            policy(&["/ex:system/**"]),
+            MgmtLimits {
+                max_value_bytes: 128,
+                ..MgmtLimits::default()
+            },
+        )
+        .await;
+        let mut stream = service
+            .subscribe(open_requests(
+                subscription(selection(&[], "payload")),
+                false,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        sync(stream.next().await.unwrap().unwrap());
+        sender
+            .send(OperationalEvent::Update(peer(
+                "a",
+                "payload",
+                &serde_json::to_string(&"x".repeat(length)).unwrap(),
+            )))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if length == 126 {
+            let output = notification(result.unwrap());
+            assert_eq!(output.update.len(), 1);
+            assert_eq!(
+                output.update[0].val.as_ref().unwrap().value,
+                Some(gnmi::typed_value::Value::JsonIetfVal(
+                    b"\"<redacted>\"".to_vec()
+                ))
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert_eq!(error.message(), "invalid gNMI request");
+            assert!(!format!("{error:?}").contains("xxx"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn keyed_subscription_snapshots_preserve_partial_and_wildcard_selection() {
     for mode in [
         gnmi::subscription_list::Mode::Once,

@@ -496,6 +496,45 @@ async fn operational_key_payload_must_equal_the_complete_identity() {
 }
 
 #[tokio::test]
+async fn operational_denied_leaf_is_pruned_with_allowed_keys_and_sibling() {
+    let (service, binding, _) = fixture(
+        vec![
+            peer("hidden-marker", "up", "true"),
+            value("/ex:system/ex:visible", "17"),
+        ],
+        vec![policy(&[
+            "/ex:system/ex:peer/ex:site",
+            "/ex:system/ex:peer/ex:name",
+            "/ex:system/ex:visible",
+        ])],
+        MgmtLimits::default(),
+    )
+    .await;
+    let root = gnmi::Path {
+        elem: vec![gnmi::PathElem {
+            name: "system".into(),
+            key: HashMap::new(),
+        }],
+        ..Default::default()
+    };
+    let response = service
+        .get(get(vec![root], None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!format!("{response:?}").contains("hidden-marker"));
+    let output = decoded(response);
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].0[1].name, "ex:visible");
+    assert_eq!(output[0].1, b"17");
+    assert_eq!(binding.policy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        binding.provider.requests.lock().unwrap()[0].paths,
+        vec![YangPath::new("/ex:system/ex:visible").unwrap()]
+    );
+}
+
+#[tokio::test]
 async fn operational_opaque_keyed_aggregate_requires_a_child_filtering_binding() {
     let registry = masked_registry(Some(DataClass::Public), false);
     let values = vec![value(

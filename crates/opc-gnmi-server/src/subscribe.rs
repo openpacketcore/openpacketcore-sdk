@@ -1357,3 +1357,48 @@ fn nanos(value: u64) -> Result<Duration, GnmiError> {
     }
     Ok(Duration::from_nanos(value))
 }
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn equal_key_maps_have_equal_fingerprints_despite_distinct_wire_order() {
+        let mut responses = Vec::new();
+        for _ in 0..32 {
+            let keys = (0..8)
+                .map(|index| (format!("key{index}"), format!("value{index}")))
+                .collect();
+            responses.push(gnmi::SubscribeResponse {
+                response: Some(gnmi::subscribe_response::Response::Update(
+                    gnmi::Notification {
+                        update: vec![gnmi::Update {
+                            path: Some(gnmi::Path {
+                                elem: vec![gnmi::PathElem {
+                                    name: "list".into(),
+                                    key: keys,
+                                }],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            });
+        }
+        let first_wire = responses[0].encode_to_vec();
+        assert!(
+            responses
+                .iter()
+                .skip(1)
+                .any(|response| response.encode_to_vec() != first_wire),
+            "fixture must exercise distinct protobuf map orders"
+        );
+        let first = fingerprint_responses(&responses[..1]);
+        for response in responses {
+            assert_eq!(fingerprint_responses(&[response]), first);
+        }
+    }
+}
