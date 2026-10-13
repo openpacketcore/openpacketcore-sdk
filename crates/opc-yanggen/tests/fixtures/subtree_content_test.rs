@@ -1964,4 +1964,3 @@ async fn subtree_content_masked_join_preserves_predicate_admissions() {
     }
     assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked join identity changed conjunctive predicate admissions: {summaries:?}");
 }
-

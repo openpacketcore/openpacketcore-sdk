@@ -184,3 +184,161 @@ fn reservation_arithmetic_rejects_overflow() {
         );
     }
 }
+
+struct TypedRegistry;
+
+impl SchemaRegistry for TypedRegistry {
+    fn schema_digest(&self) -> &'static str {
+        "evaluation-reservation"
+    }
+
+    fn served_models(&self) -> &'static [ModelData] {
+        Registry.served_models()
+    }
+
+    fn origins(&self) -> &'static [OriginEntry] {
+        Registry.origins()
+    }
+
+    fn nodes(&self) -> &'static [NodeMeta] {
+        static NODES: std::sync::OnceLock<Vec<NodeMeta>> = std::sync::OnceLock::new();
+        NODES.get_or_init(|| {
+            Registry
+                .nodes()
+                .iter()
+                .map(|node| NodeMeta {
+                    leaf_type: (node.kind == NodeKind::Leaf).then_some(LeafType::String),
+                    ..*node
+                })
+                .collect()
+        })
+    }
+}
+
+fn evaluation_plan(budget: SubtreeBudget) -> AuthorizedSubtreePlan {
+    let compile = SubtreeBudget::new(1_000_000, 0).unwrap();
+    let leaf = "/m:root/m:peer/m:label";
+    let row = SubtreeScope {
+        predicates: vec![SubtreePredicate {
+            alternatives: vec![SubtreeMatch {
+                path: leaf,
+                predicate: ScalarPredicate::compile(&TypedRegistry, leaf, "first", false, &compile)
+                    .unwrap(),
+                in_scope: true,
+                keys: vec!["/m:root/m:peer/m:key"],
+            }],
+        }],
+        implicit_outputs: vec![SubtreeOutput {
+            path: leaf,
+            keys: vec!["/m:root/m:peer/m:key"],
+        }],
+        ..SubtreeScope::default()
+    };
+    let branch = |path, children| SubtreeScope {
+        branches: vec![SubtreeBranch {
+            path,
+            keys: Vec::new(),
+            children: Some(Box::new(children)),
+            outputs: Vec::new(),
+        }],
+        ..SubtreeScope::default()
+    };
+    let scope = branch("/m:root", branch("/m:root/m:peer", row));
+    let mut plan = SubtreePlan::new(vec![scope], compile, 64)
+        .unwrap()
+        .authorize(|_| true, 64)
+        .unwrap();
+    // Isolate admission of captured data from the separately tested compiler.
+    plan.budget = budget;
+    plan
+}
+
+#[test]
+fn evaluation_reservation_precedes_all_data_phases_and_predicate_admissions() {
+    let input = forest(&[("a", "first"), ("b", "second")]);
+    let original = input.clone();
+    let expected = forest(&[("a", "first")]);
+    let metadata = SubtreeBudget::new(1_000_000, 0).unwrap();
+    let plan = evaluation_plan(metadata.clone());
+    let work = evaluation::EvaluationWork::measure(&plan.scopes, &input, &TypedRegistry, &metadata)
+        .unwrap();
+    let metadata_used = 1_000_000 - metadata.remaining();
+    assert_eq!(metadata.predicate_trials(), 0);
+    let control = SubtreeBudget::new(1_000_000, 0).unwrap();
+    assert_eq!(
+        evaluation_plan(control.clone())
+            .evaluate(&TypedRegistry, &input)
+            .unwrap(),
+        expected
+    );
+    let total = 1_000_000 - control.remaining();
+    assert!(total > metadata_used);
+    assert_eq!(total - metadata_used, work.units);
+    assert_eq!(control.predicate_trials(), 2);
+    assert_eq!(work.predicate_trials, 2);
+    for limit in [metadata_used, total - 1] {
+        let budget = SubtreeBudget::new(limit, 0).unwrap();
+        assert_eq!(
+            evaluation_plan(budget.clone()).evaluate(&TypedRegistry, &input),
+            Err(SubtreeError::TooBig)
+        );
+        assert_eq!(input, original);
+        assert_eq!(budget.remaining(), limit);
+        assert_eq!(budget.predicate_trials(), 0);
+    }
+    let exact = SubtreeBudget::new(total, 0).unwrap();
+    assert_eq!(
+        evaluation_plan(exact.clone())
+            .evaluate(&TypedRegistry, &input)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(input, original);
+    assert_eq!(exact.remaining(), 0);
+    assert_eq!(exact.predicate_trials(), 2);
+}
+
+#[test]
+fn evaluation_reservation_is_independent_of_capture_order() {
+    let first = forest(&[("a", "first")]).remove(0);
+    let mut key_only = forest(&[("b", "unused")]).remove(0);
+    key_only.children[0].children = vec![NetconfXmlNode::scalar(
+        "/m:root/m:peer/m:key",
+        "b".repeat(64),
+        false,
+    )];
+    let second = forest(&[("c", "second")]).remove(0);
+    let captures = [first, key_only, second];
+    let expected = forest(&[("a", "first")]);
+    let control = SubtreeBudget::new(1_000_000, 0).unwrap();
+    assert_eq!(
+        evaluation_plan(control.clone())
+            .evaluate(&TypedRegistry, &captures)
+            .unwrap(),
+        expected
+    );
+    let used = 1_000_000 - control.remaining();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let input: Vec<_> = order.iter().map(|index| captures[*index].clone()).collect();
+        for limit in [1, 8, 128, 512, used / 2, used - 1, used, 1_000_000] {
+            let budget = SubtreeBudget::new(limit, 0).unwrap();
+            let result = evaluation_plan(budget.clone()).evaluate(&TypedRegistry, &input);
+            if limit < used {
+                assert_eq!(result, Err(SubtreeError::TooBig));
+                assert_eq!(budget.remaining(), limit);
+                assert_eq!(budget.predicate_trials(), 0);
+            } else {
+                assert_eq!(result.unwrap(), expected);
+                assert_eq!(budget.remaining(), limit - used);
+                assert_eq!(budget.predicate_trials(), control.predicate_trials());
+            }
+        }
+    }
+}

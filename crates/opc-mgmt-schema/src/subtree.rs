@@ -66,7 +66,7 @@ impl SubtreeBudget {
         self.0.remaining.load(Ordering::Relaxed)
     }
 
-    /// Completed predicate admissions for deterministic server-side checks.
+    /// Predicate admissions, including prepaid trials skipped during evaluation.
     /// Never include this in a client error, audit event or metric label.
     pub fn predicate_trials(&self) -> usize {
         self.0.predicate_trials.load(Ordering::Relaxed)
@@ -74,10 +74,15 @@ impl SubtreeBudget {
 
     fn begin_predicate_trial(&self) -> Result<(), SubtreeError> {
         self.charge(1)?;
-        // Each trial consumes a unit from the finite, non-resettable budget,
-        // so the shared counter cannot overflow.
-        self.0.predicate_trials.fetch_add(1, Ordering::Relaxed);
+        self.record_predicate_trials(1);
         Ok(())
+    }
+
+    fn record_predicate_trials(&self, count: usize) {
+        // Each trial consumes a unit from the finite, non-resettable budget,
+        // individually or in a checked complete evaluation reservation. Unused
+        // trial slots are not refunded, so this counter cannot expose a join.
+        self.0.predicate_trials.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Creates a positive budget and deducts work already performed by parsing.
@@ -279,20 +284,32 @@ impl ScalarPredicate {
     /// Compares one authorized, reported scalar without decoding unrelated data.
     pub fn matches(&self, reported: &str, budget: &SubtreeBudget) -> Result<bool, SubtreeError> {
         budget.begin_predicate_trial()?;
+        budget.charge(self.comparison_work(reported.len())?)?;
+        Ok(self.matches_value(reported))
+    }
+
+    fn comparison_work(&self, reported_bytes: usize) -> Result<usize, SubtreeError> {
         match &self.value {
-            ScalarValue::Never => Ok(false),
-            ScalarValue::Text(expected) => budget.compare(expected, reported),
-            ScalarValue::Boolean(expected) => {
-                budget.charge(reported.len())?;
-                Ok(match reported {
-                    "true" => *expected,
-                    "false" => !*expected,
-                    _ => false,
-                })
-            }
+            ScalarValue::Never => Ok(0),
+            ScalarValue::Text(expected) => expected
+                .len()
+                .checked_add(reported_bytes)
+                .ok_or(SubtreeError::TooBig),
+            ScalarValue::Boolean(_) | ScalarValue::Integer(_) => Ok(reported_bytes),
+        }
+    }
+
+    fn matches_value(&self, reported: &str) -> bool {
+        match &self.value {
+            ScalarValue::Never => false,
+            ScalarValue::Text(expected) => expected == reported,
+            ScalarValue::Boolean(expected) => match reported {
+                "true" => *expected,
+                "false" => !*expected,
+                _ => false,
+            },
             ScalarValue::Integer(expected) => {
-                budget.charge(reported.len())?;
-                Ok(parse_integer(self.kind, reported).is_some_and(|value| value == *expected))
+                parse_integer(self.kind, reported).is_some_and(|value| value == *expected)
             }
         }
     }

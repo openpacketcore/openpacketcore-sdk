@@ -408,8 +408,10 @@ where
         let mut configuration = binding
             .project_subtree_content(&config, ReadSelection::with_subtree_plan(&plan), report)
             .map_err(rpc_error)?;
-        opc_mgmt_schema::subtree::merge_bounded(registry, &mut configuration, input, plan.budget())
-            .map_err(rpc_error)?;
+        // Preserve both original forests until the evaluator has admitted the
+        // complete envelope. No intermediate identity join may determine fees.
+        plan.budget().charge(input.len()).map_err(rpc_error)?;
+        configuration.append(&mut input);
         input = configuration;
     }
     let selected = plan.evaluate(registry, &input).map_err(rpc_error)?;

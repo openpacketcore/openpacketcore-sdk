@@ -3,6 +3,8 @@
 use super::{ScalarPredicate, SubtreeBudget, SubtreeError};
 use crate::{DefaultReport, NetconfInstanceSelector, NetconfXmlNode, NodeKind, SchemaRegistry};
 
+mod evaluation;
+
 /// One scalar match after resolving its namespace and type.
 #[derive(Debug, Clone)]
 pub struct SubtreeMatch {
@@ -195,23 +197,40 @@ impl AuthorizedSubtreePlan {
         }
     }
 
-    /// Evaluates authorized, bounded and already validated captured inputs.
-    /// Results are deduplicated and retain the input instance order.
+    /// Joins and evaluates the complete, authorized and validated captures.
+    ///
+    /// Supply configuration and provider captures before identity coalescing.
+    /// Their original metadata sizes the complete join/evaluation/order envelope;
+    /// no later charge depends on a merged tree's shape. Results are deduplicated
+    /// and retain the input instance order.
     pub fn evaluate(
         &self,
         registry: &dyn SchemaRegistry,
         input: &[NetconfXmlNode],
     ) -> Result<Vec<NetconfXmlNode>, SubtreeError> {
+        // Sizing has its own bounded allowance. Its partial progress is not a
+        // shared observation: a raw provider sort can reorder metadata visits.
+        // Admit metadata plus all dependent data work atomically once sized.
+        let available = self.budget.remaining();
+        let sizing = SubtreeBudget::new(available, 0)?;
+        let work = evaluation::EvaluationWork::measure(&self.scopes, input, registry, &sizing)?;
+        let mut units = available - sizing.remaining();
+        add_work(&mut units, work.units)?;
+        let reservation = IdentityReservation::admit(&self.budget, units)?;
+        self.budget.record_predicate_trials(work.predicate_trials);
+        let mut joined = Vec::new();
+        merge_reserved(&mut joined, input.to_vec(), &work.leaf_lists, &reservation)?;
         let mut candidates = Vec::new();
         for scope in &self.scopes {
-            if let Some(nodes) = evaluate_scope(scope, input, &[], registry, &self.budget)? {
-                self.budget.charge(nodes.len())?;
+            if let Some(nodes) =
+                evaluate_scope(scope, &joined, &[], &work.leaf_lists, &reservation)?
+            {
                 candidates.extend(nodes);
             }
         }
         let mut selected = Vec::new();
-        merge_bounded(registry, &mut selected, candidates, &self.budget)?;
-        order_like(&mut selected, input, &[], &self.budget)?;
+        merge_reserved(&mut selected, candidates, &work.leaf_lists, &reservation)?;
+        order_reserved(&mut selected, &joined, &[], &reservation)?;
         Ok(selected)
     }
 }
@@ -791,7 +810,7 @@ impl<'a> SubtreeProjection<'a> {
 
 /// Sizes only the already-authorized capture, without testing identity values.
 /// Masked keys are fixed-width digests before reaching any of these operations.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CapturedWork {
     nodes: usize,
     keys: usize,
@@ -878,6 +897,7 @@ impl CapturedWork {
         Ok(units)
     }
 
+    #[cfg(test)]
     fn ordering_units(&self) -> Result<usize, SubtreeError> {
         // All input/selected candidate pairs and every possible vector shift
         // are reserved, including candidates skipped after an early match.
@@ -918,6 +938,10 @@ impl IdentityReservation {
 
     fn same_value(&self, left: &Option<String>, right: &Option<String>) -> bool {
         left == right
+    }
+
+    fn matches(&self, predicate: &ScalarPredicate, reported: &str) -> bool {
+        predicate.matches_value(reported)
     }
 }
 
@@ -978,59 +1002,47 @@ fn merge_reserved(
     Ok(())
 }
 
-fn copy_shell(
-    node: &NetconfXmlNode,
-    budget: &SubtreeBudget,
-) -> Result<NetconfXmlNode, SubtreeError> {
-    budget.charge(1)?;
+fn copy_shell(node: &NetconfXmlNode, _reservation: &IdentityReservation) -> NetconfXmlNode {
     let mut result = NetconfXmlNode::branch(node.schema_path);
-    for (path, value) in &node.keys {
-        budget.charge(1)?;
-        result.keys.push((*path, budget.copy(value)?));
-    }
-    if let Some(value) = &node.value {
-        result.value = Some(budget.copy(value)?);
-    }
+    result.keys.clone_from(&node.keys);
+    result.value.clone_from(&node.value);
     result.is_defaulted = node.is_defaulted;
     result.masked_ordinal = node.masked_ordinal;
-    Ok(result)
+    result
 }
 
 fn selected_copy(
     node: &NetconfXmlNode,
     outputs: &[SubtreeOutput],
-    budget: &SubtreeBudget,
-) -> Result<Option<NetconfXmlNode>, SubtreeError> {
-    budget.charge(1)?;
+    reservation: &IdentityReservation,
+) -> Option<NetconfXmlNode> {
     let mut selected = false;
     for output in outputs {
-        budget.charge(1)?;
-        selected |= budget.compare(output.path, node.schema_path)?;
+        selected |= output.path == node.schema_path;
     }
     let mut children = Vec::new();
     for child in &node.children {
-        if let Some(child) = selected_copy(child, outputs, budget)? {
-            budget.charge(1)?;
+        if let Some(child) = selected_copy(child, outputs, reservation) {
             children.push(child);
         }
     }
     if !selected && children.is_empty() {
-        return Ok(None);
+        return None;
     }
     if node.value.is_some() && !selected {
-        return Ok(None);
+        return None;
     }
-    let mut result = copy_shell(node, budget)?;
+    let mut result = copy_shell(node, reservation);
     result.children = children;
-    Ok(Some(result))
+    Some(result)
 }
 
 fn evaluate_scope(
     scope: &SubtreeScope,
     input: &[NetconfXmlNode],
     keys: &[(&'static str, String)],
-    registry: &dyn SchemaRegistry,
-    budget: &SubtreeBudget,
+    leaf_lists: &[&str],
+    reservation: &IdentityReservation,
 ) -> Result<Option<Vec<NetconfXmlNode>>, SubtreeError> {
     let mut matched = Vec::new();
     let mut matched_keys = Vec::new();
@@ -1038,22 +1050,16 @@ fn evaluate_scope(
         let mut satisfied = false;
         for alternative in &predicate.alternatives {
             for (path, value) in keys {
-                budget.charge(1)?;
-                if budget.compare(path, alternative.path)?
-                    && alternative.predicate.matches(value, budget)?
-                {
+                if *path == alternative.path && reservation.matches(&alternative.predicate, value) {
                     satisfied = true;
-                    budget.charge(1)?;
-                    matched_keys.push(NetconfXmlNode::scalar(path, budget.copy(value)?, false));
+                    matched_keys.push(NetconfXmlNode::scalar(path, value.clone(), false));
                 }
             }
             for (index, node) in input.iter().enumerate() {
-                budget.charge(1)?;
-                if budget.compare(node.schema_path, alternative.path)? {
+                if node.schema_path == alternative.path {
                     if let Some(value) = &node.value {
-                        if alternative.predicate.matches(value, budget)? {
+                        if reservation.matches(&alternative.predicate, value) {
                             satisfied = true;
-                            budget.charge(1)?;
                             matched.push(index);
                         }
                     }
@@ -1064,49 +1070,43 @@ fn evaluate_scope(
             return Ok(None);
         }
     }
-    // Collect the complete sibling batch before deduplication. A successful
-    // hidden-key search must not shrink or grow a later reservation's input.
+    // All dependent phases spend the envelope measured before the input join.
+    // These intermediate forests never determine a new work charge.
     let mut candidates = matched_keys;
     for index in matched {
-        budget.charge(1)?;
-        candidates.push(copy_shell(&input[index], budget)?);
+        candidates.push(copy_shell(&input[index], reservation));
     }
     if !scope.implicit_outputs.is_empty() {
         for node in input {
-            if let Some(copy) = selected_copy(node, &scope.implicit_outputs, budget)? {
-                budget.charge(1)?;
+            if let Some(copy) = selected_copy(node, &scope.implicit_outputs, reservation) {
                 candidates.push(copy);
             }
         }
     }
     for branch in &scope.branches {
         for (path, value) in keys {
-            budget.charge(1)?;
-            if budget.compare(path, branch.path)? && branch.children.is_none() {
+            if *path == branch.path && branch.children.is_none() {
                 let mut selected = false;
                 for output in &branch.outputs {
-                    budget.charge(1)?;
-                    selected |= budget.compare(output.path, path)?;
+                    selected |= output.path == *path;
                 }
                 if selected {
-                    budget.charge(1)?;
-                    candidates.push(NetconfXmlNode::scalar(path, budget.copy(value)?, false));
+                    candidates.push(NetconfXmlNode::scalar(path, value.clone(), false));
                 }
             }
         }
         for node in input {
-            budget.charge(1)?;
-            if !budget.compare(node.schema_path, branch.path)? {
+            if node.schema_path != branch.path {
                 continue;
             }
             let selected = if let Some(scope) = &branch.children {
                 if let Some(children) =
-                    evaluate_scope(scope, &node.children, &node.keys, registry, budget)?
+                    evaluate_scope(scope, &node.children, &node.keys, leaf_lists, reservation)?
                 {
                     if children.is_empty() {
                         None
                     } else {
-                        let mut copy = copy_shell(node, budget)?;
+                        let mut copy = copy_shell(node, reservation);
                         copy.children = children;
                         Some(copy)
                     }
@@ -1114,19 +1114,19 @@ fn evaluate_scope(
                     None
                 }
             } else {
-                selected_copy(node, &branch.outputs, budget)?
+                selected_copy(node, &branch.outputs, reservation)
             };
             if let Some(selected) = selected {
-                budget.charge(1)?;
                 candidates.push(selected);
             }
         }
     }
     let mut result = Vec::new();
-    merge_bounded(registry, &mut result, candidates, budget)?;
+    merge_reserved(&mut result, candidates, leaf_lists, reservation)?;
     Ok(Some(result))
 }
 
+#[cfg(test)]
 fn order_like(
     selected: &mut Vec<NetconfXmlNode>,
     input: &[NetconfXmlNode],

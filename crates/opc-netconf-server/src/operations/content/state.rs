@@ -4,9 +4,7 @@ use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{OperationalRequest, OperationalValueShape};
 use opc_mgmt_path::{append_key_predicate, parse_canonical_path};
-use opc_mgmt_schema::subtree::{
-    canonical_key, merge_bounded, AuthorizedSubtreePlan, SubtreeBudget, SubtreeError,
-};
+use opc_mgmt_schema::subtree::{canonical_key, AuthorizedSubtreePlan, SubtreeBudget, SubtreeError};
 use opc_mgmt_schema::{
     NetconfInstanceSelector, NetconfXmlNode, NodeKind, NodeMeta, SchemaRegistry,
 };
@@ -206,13 +204,11 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             current -= 1;
         }
     }
-    let mut output = Vec::new();
-    // One complete batch keeps reservation sizes independent of which earlier
-    // hidden identities merged, or where their raw sort order placed them.
+    // Keep every original capture until the evaluator reserves the whole join
+    // and evaluation. Coalescing here would make its input shape depend on
+    // masked identity equality across provider entries.
     budget.charge(accepted.len())?;
-    let trees = accepted.into_iter().map(|(_, _, tree)| tree).collect();
-    merge_bounded(registry, &mut output, trees, budget)?;
-    Ok(output)
+    Ok(accepted.into_iter().map(|(_, _, tree)| tree).collect())
 }
 
 fn add_work(total: &mut usize, units: usize) -> Result<(), SubtreeError> {

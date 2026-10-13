@@ -91,13 +91,25 @@ their capture position to preserve distinct members and deduplicate overlaps.
 Masked list keys enter the captured tree as fixed-width SHA-256 identities,
 computed identically by configuration and state capture and retained only for
 this request. Joins, copies, deduplication and ordering checks charge those
-identities, never the hidden key lengths. Identity phases first measure the
-complete captured input structure and reserve a checked worst-case bound for
-all tuple components, candidate pairs, descendant searches and vector moves.
-An equal prefix or an early matching row cannot reduce that reservation, and
-unused work is not refunded. Sibling alternatives and provider instances are
-merged as complete batches so an earlier match cannot change the size of a
-later reservation. Hashing itself has a fixed admission charge; it makes no
+identities, never the hidden key lengths. Configuration and provider captures
+remain uncoalesced until one checked envelope covers the initial join, every
+dependent predicate and copy, scope unions and final ordering. Sizing retains
+only schema paths, node/key counts and captured lengths. It pools all possible
+instances of each schema parent, including children that separate capture
+fragments could contribute to the same row. Sibling comparison products use
+these original groups; no intermediate joined or selected tree sizes a charge.
+
+Sizing normalizes its metadata order without changing data order. Its bounded
+local allowance prevents partial sizing progress from becoming a shared-budget
+observation when masked keys change provider sort order. Metadata work and the
+complete dependent envelope are admitted together before the first identity
+join. Overflow or insufficient admission leaves the input and shared allowance
+unchanged. All tuple components, candidate pairs, scalar comparisons, descendant
+searches, copies and vector moves are covered. Equal prefixes, earlier matches,
+coalesced rows and predicate short-circuits cannot reduce the reservation.
+Predicate instrumentation records all admitted trial slots, including unused
+slots; it does not expose which joined rows reached a later conjunct. No unused
+work is refunded. Hashing itself has a fixed admission charge; it makes no
 timing claim. Raw provider keys remain available only for
 mandatory canonical-path and key/payload consistency validation, under the
 independent provider byte caps. That validation charges public path bytes and
