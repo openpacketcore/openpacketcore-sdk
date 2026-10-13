@@ -42,6 +42,25 @@ module mixed-state {
 }
 "#;
 
+const NESTED_STATE: &str = r#"
+module nested-state {
+  yang-version 1.1;
+  namespace "urn:example:nested-state";
+  prefix ns;
+  revision 2026-10-12;
+  container state {
+    config false;
+    list sample {
+      key "name";
+      leaf name { type string; }
+      container detail {
+        leaf count { type uint32; }
+      }
+    }
+  }
+}
+"#;
+
 #[test]
 fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,6 +75,7 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
     for (name, source) in [
         ("minimal", MINIMAL_STATE),
         ("mixed", MIXED_STATE),
+        ("nested", NESTED_STATE),
         ("keys", include_str!("fixtures/config_false_lists.yang")),
     ] {
         // Use an already supported counter type so this regression isolates

@@ -1,4 +1,4 @@
-use generated_config_false_test::{keys, minimal, mixed};
+use generated_config_false_test::{keys, minimal, mixed, nested};
 use opc_config_model::{OpcConfig, YangPath};
 use opc_gnmi_server::{GnmiJsonRenderer, ReadSelection, ReadSelectionEntry};
 use opc_mgmt_limits::MgmtLimits;
@@ -131,6 +131,21 @@ fn state_counter_changes_do_not_create_configuration_deltas() {
     let previous = sample();
     let mut current = previous.clone();
     current.error.get_mut("temporary").unwrap().count = Some(8);
+    assert!(current.diff(&previous).unwrap().is_empty());
+}
+
+#[test]
+fn nested_state_counter_changes_do_not_create_configuration_deltas() {
+    let previous: nested::types::State = serde_json::from_value(json!({
+        "sample": [{"name": "edge", "detail": {"count": 7}}]
+    }))
+    .unwrap();
+    let mut current = previous.clone();
+    let entry = current.sample.get_mut("edge").unwrap();
+    assert_eq!(entry.name.as_deref(), Some("edge"));
+    let detail = entry.detail.as_mut().unwrap();
+    assert_eq!(detail.count, Some(7));
+    detail.count = Some(8);
     assert!(current.diff(&previous).unwrap().is_empty());
 }
 
