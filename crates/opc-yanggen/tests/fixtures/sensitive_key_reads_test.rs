@@ -435,14 +435,46 @@ async fn denied_key_omits_entry() {
                     _ => unreachable!(),
                 }
             }
+            // Keep a permitted sibling populated so a parent read must invoke
+            // projection even when every selected node in this entry is denied.
+            let visible_list = if list == "public-rows" {
+                root.sensitive_rows = config(
+                    "sensitive-rows",
+                    json!([{ "id": "visible-sibling-key", "value": "visible-sibling-value" }]),
+                )
+                .sensitive_rows;
+                "sensitive-rows"
+            } else {
+                root.public_rows = config(
+                    "public-rows",
+                    json!([{ "id": "visible-sibling-key", "value": "visible-sibling-value" }]),
+                )
+                .public_rows;
+                "public-rows"
+            };
             let denied = format!("/keys:root/keys:{list}/keys:{denied}");
             let fixture = Fixture::new(root, full_policy(&[&denied])).await;
             let response = fixture.get(child_path(list, &keys, "value")).await.unwrap();
             assert_eq!(updates(&response), vec![]);
             assert_eq!(data(&fixture.xml(&child_filter(list, "value")).await), "");
+            let parent_read = fixture.get(root_path()).await.unwrap();
+            assert_eq!(
+                updates(&parent_read),
+                vec![
+                    (
+                        child_path(visible_list, &[("id", "visible-sibling-key")], "id"),
+                        json!("visible-sibling-key")
+                    ),
+                    (
+                        child_path(visible_list, &[("id", "visible-sibling-key")], "value"),
+                        json!("visible-sibling-value")
+                    ),
+                ]
+            );
+            assert_eq!(data(&fixture.xml("").await), format!("<keys:root xmlns:keys=\"urn:keys\"><keys:{visible_list}><keys:id>visible-sibling-key</keys:id><keys:value>visible-sibling-value</keys:value></keys:{visible_list}></keys:root>"));
             assert_safe(
                 &fixture,
-                &response,
+                &parent_read,
                 &[
                     "hidden-public-key",
                     "hidden-sensitive-key",

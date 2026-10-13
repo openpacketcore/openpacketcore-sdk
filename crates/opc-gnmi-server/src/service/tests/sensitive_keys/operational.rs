@@ -41,121 +41,132 @@ impl OperationalStateProvider for AggregateProvider {
 
 #[tokio::test]
 async fn operational_subtree_with_denied_key_is_omitted() {
-    for denied in [
-        "/sys:system/sys:user/sys:name",
-        "/sys:system/sys:user/sys:role",
-    ] {
-        let policy = Arc::new(FixedPolicy(opaque_policy(denied)));
-        let provider = Arc::new(AggregateProvider::default());
-        let (sender, receiver) = operational_event_channel(4);
-        let events = Arc::new(ControlledEvents {
-            receiver: Mutex::new(Some(receiver)),
-            requests: Default::default(),
-        });
-        let audit = Arc::new(CapturingAudit::default());
-        let service =
-            state_key_service(policy, provider.clone(), events.clone(), audit.clone()).await;
-        let mut get = selected_get("/sys:system");
-        get.r#type = gnmi::get_request::DataType::State as i32;
-        let response = service
-            .get(authenticated_get_request(get))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(response.notification.is_empty());
-        for request in provider.0.lock().unwrap().iter() {
-            assert!(request.paths().iter().all(|path| !matches!(
-                path.as_str(),
-                "/sys:system" | "/sys:system/sys:user" | "/sys:system/sys:user/sys:role"
-            )));
-        }
-        let mut list = subscribe_list(
-            gnmi::subscription_list::Mode::Stream,
-            uptime_path(),
-            gnmi::SubscriptionMode::OnChange,
-        );
-        list.subscription[0].sample_interval = 0;
-        list.subscription.push(gnmi::Subscription {
-            path: Some(
-                crate::get::yang_path_to_proto(&YangPath::new("/sys:system").unwrap()).unwrap(),
-            ),
-            mode: gnmi::SubscriptionMode::OnChange as i32,
-            ..Default::default()
-        });
-        let mut stream = service
-            .subscribe(open_subscribe_request(list))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            stream.next().await.unwrap().unwrap().response,
-            Some(gnmi::subscribe_response::Response::SyncResponse(true))
-        );
-        let before = audit.events.lock().unwrap().len();
-        // This aggregate is also outside the pruned provider subscription. Its
-        // denial must happen before path validation, size checks or audit work.
-        sender
-            .send(OperationalEvent::Update(
-                OperationalValue::new(
-                    YangPath::new("/sys:system").unwrap(),
-                    serde_json::to_string(&"opaque-hidden-key".repeat(100000)).unwrap(),
-                )
-                .unwrap(),
-            ))
-            .await
-            .unwrap();
-        sender
-            .send(OperationalEvent::Delete {
-                path: user_role_yang_path("opaque-hidden-key"),
-            })
-            .await
-            .unwrap();
-        sender
-            .send(OperationalEvent::Update(
-                OperationalValue::new(YangPath::new("/sys:system/sys:uptime").unwrap(), "17")
+    for request_aggregate in [true, false] {
+        for denied in [
+            "/sys:system/sys:user/sys:name",
+            "/sys:system/sys:user/sys:role",
+        ] {
+            let policy = Arc::new(FixedPolicy(opaque_policy(denied)));
+            let provider = Arc::new(AggregateProvider::default());
+            let (sender, receiver) = operational_event_channel(4);
+            let events = Arc::new(ControlledEvents {
+                receiver: Mutex::new(Some(receiver)),
+                requests: Default::default(),
+            });
+            let audit = Arc::new(CapturingAudit::default());
+            let service =
+                state_key_service(policy, provider.clone(), events.clone(), audit.clone()).await;
+            let mut get = selected_get("/sys:system");
+            get.r#type = gnmi::get_request::DataType::State as i32;
+            let response = service
+                .get(authenticated_get_request(get))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.notification.is_empty());
+            for request in provider.0.lock().unwrap().iter() {
+                assert!(request.paths().iter().all(|path| !matches!(
+                    path.as_str(),
+                    "/sys:system" | "/sys:system/sys:user" | "/sys:system/sys:user/sys:role"
+                )));
+            }
+            let mut list = subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            );
+            list.subscription[0].sample_interval = 0;
+            if request_aggregate {
+                list.subscription.push(gnmi::Subscription {
+                    path: Some(
+                        crate::get::yang_path_to_proto(&YangPath::new("/sys:system").unwrap())
+                            .unwrap(),
+                    ),
+                    mode: gnmi::SubscriptionMode::OnChange as i32,
+                    ..Default::default()
+                });
+            }
+            let mut stream = service
+                .subscribe(open_subscribe_request(list))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().response,
+                Some(gnmi::subscribe_response::Response::SyncResponse(true))
+            );
+            let before = audit.events.lock().unwrap().len();
+            // This aggregate is also outside the pruned provider subscription. Its
+            // denial must happen before path validation, size checks or audit work.
+            sender
+                .send(OperationalEvent::Update(
+                    OperationalValue::new(
+                        YangPath::new("/sys:system").unwrap(),
+                        serde_json::to_string(&"opaque-hidden-key".repeat(100000)).unwrap(),
+                    )
                     .unwrap(),
-            ))
-            .await
-            .unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let Some(gnmi::subscribe_response::Response::Update(notification)) = response.response
-        else {
-            panic!("visible barrier event")
-        };
-        assert_eq!(notification.delete, Vec::new());
-        assert_eq!(notification.update.len(), 1);
-        assert_eq!(
-            notification.update[0].path,
-            Some(
-                crate::get::yang_path_to_proto(&YangPath::new("/sys:system/sys:uptime").unwrap())
+                ))
+                .await
+                .unwrap();
+            sender
+                .send(OperationalEvent::Delete {
+                    path: user_role_yang_path("opaque-hidden-key"),
+                })
+                .await
+                .unwrap();
+            sender
+                .send(OperationalEvent::Update(
+                    OperationalValue::new(YangPath::new("/sys:system/sys:uptime").unwrap(), "17")
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Some(gnmi::subscribe_response::Response::Update(notification)) = response.response
+            else {
+                panic!("visible barrier event")
+            };
+            assert_eq!(notification.delete, Vec::new());
+            assert_eq!(notification.update.len(), 1);
+            assert_eq!(
+                notification.update[0].path,
+                Some(
+                    crate::get::yang_path_to_proto(
+                        &YangPath::new("/sys:system/sys:uptime").unwrap()
+                    )
                     .unwrap()
-            )
-        );
-        assert_eq!(
-            notification.update[0].val.as_ref().unwrap().value,
-            Some(gnmi::typed_value::Value::JsonIetfVal(b"17".to_vec()))
-        );
-        assert_eq!(
-            audit.events.lock().unwrap().len(),
-            before,
-            "hidden data never adds audit work"
-        );
-        let requests = events.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let mut expected = vec![
-            YangPath::new("/sys:system/sys:contact").unwrap(),
-            YangPath::new("/sys:system/sys:hostname").unwrap(),
-            YangPath::new("/sys:system/sys:uptime").unwrap(),
-        ];
-        if denied.ends_with("sys:role") {
-            expected.push(YangPath::new("/sys:system/sys:user/sys:name").unwrap());
+                )
+            );
+            assert_eq!(
+                notification.update[0].val.as_ref().unwrap().value,
+                Some(gnmi::typed_value::Value::JsonIetfVal(b"17".to_vec()))
+            );
+            assert_eq!(
+                audit.events.lock().unwrap().len(),
+                before,
+                "hidden data never adds audit work"
+            );
+            let requests = events.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let mut expected = if request_aggregate {
+                vec![
+                    YangPath::new("/sys:system/sys:contact").unwrap(),
+                    YangPath::new("/sys:system/sys:hostname").unwrap(),
+                    YangPath::new("/sys:system/sys:uptime").unwrap(),
+                ]
+            } else {
+                vec![YangPath::new("/sys:system/sys:uptime").unwrap()]
+            };
+            if request_aggregate && denied.ends_with("sys:role") {
+                expected.push(YangPath::new("/sys:system/sys:user/sys:name").unwrap());
+            }
+            assert_eq!(requests[0].paths(), expected);
+            assert!(!format!("{:?}", audit.events.lock().unwrap()).contains("opaque-hidden"));
         }
-        assert_eq!(requests[0].paths(), expected);
-        assert!(!format!("{:?}", audit.events.lock().unwrap()).contains("opaque-hidden"));
     }
 }
 
@@ -355,7 +366,15 @@ async fn revoked_key_delete_is_dropped_before_visible_event_reestablishes_stream
         })
         .await
         .unwrap();
-    policy.wait_calls(2).await;
+    let evaluated_without_output = tokio::select! {
+        biased;
+        _ = stream.next() => false,
+        _ = policy.wait_calls(2) => true,
+    };
+    assert!(
+        evaluated_without_output,
+        "a denied delete must be authorized without emitting or closing the stream"
+    );
     assert!(
         std::future::poll_fn(|cx| std::task::Poll::Ready(
             stream.as_mut().poll_next(cx).is_pending()
