@@ -3,7 +3,8 @@ use super::*;
 #[test]
 fn application_open_audit_covers_connection_token_writes() {
     let fixture = fixture();
-    let source = SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
+    let source =
+        SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
     let conn = source.conn.blocking_lock();
     application_seed_applied_one(&fixture, &conn, &source.caps);
     fixture.wal.shutdown().unwrap();
@@ -12,48 +13,87 @@ fn application_open_audit_covers_connection_token_writes() {
          AFTER INSERT ON consensus_wal_application_connection BEGIN \
          UPDATE consensus_log SET entry_json = CAST('invalid' AS BLOB) \
          WHERE log_index = (SELECT MAX(log_index) FROM consensus_log); END;",
-    ).unwrap();
+    )
+    .unwrap();
     let before = super::super::super::wal::application::full_image_digest(&conn).unwrap();
     let result = open_snapshot_cache(&fixture, &source, &conn, IoControl::default());
     let error = match result {
-        Ok(wal) => { wal.shutdown().unwrap(); panic!("opening must audit its final connection-token effects") }
+        Ok(wal) => {
+            wal.shutdown().unwrap();
+            panic!("opening must audit its final connection-token effects")
+        }
         Err(error) => error,
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert_eq!(error.to_string(), "session consensus decoding failed");
-    assert_eq!(super::super::super::wal::application::full_image_digest(&conn).unwrap(), before);
-    assert_eq!(super::super::super::last_log_sync(&conn, identity()).unwrap(), Some(log_id(1)));
+    assert_eq!(
+        super::super::super::wal::application::full_image_digest(&conn).unwrap(),
+        before
+    );
+    assert_eq!(
+        super::super::super::last_log_sync(&conn, identity()).unwrap(),
+        Some(log_id(1))
+    );
 }
 
 #[test]
 fn application_open_discards_an_audit_after_a_later_transaction_write() {
     let fixture = fixture();
-    let source = SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
+    let source =
+        SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
     let conn = source.conn.blocking_lock();
     application_seed_applied_one(&fixture, &conn, &source.caps);
     fixture.wal.shutdown().unwrap();
     let before = super::super::super::wal::application::full_image_digest(&conn).unwrap();
     let opening = super::super::super::wal::snapshot::Opening::new(
-        &fixture.path(), fixture.wal.binding(), Limits::default(), IoControl::default(),
-    ).unwrap();
+        &fixture.path(),
+        fixture.wal.binding(),
+        Limits::default(),
+        IoControl::default(),
+    )
+    .unwrap();
     let result = opening.finish(&conn, &source.caps, || {
         assert!(!conn.is_autocommit());
-        assert_eq!(conn.execute("UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1", params![encode_json(&blank(1)).unwrap()]).unwrap(), 1);
+        assert_eq!(
+            conn.execute(
+                "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+                params![encode_json(&blank(1)).unwrap()]
+            )
+            .unwrap(),
+            1
+        );
         Ok(())
     });
     let error = match result {
-        Ok(wal) => { wal.shutdown().unwrap(); panic!("a write after audit must prevent publication") }
+        Ok(wal) => {
+            wal.shutdown().unwrap();
+            panic!("a write after audit must prevent publication")
+        }
         Err(error) => error,
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(error.to_string(), "private WAL application cache changed outside its owner");
-    assert_eq!(super::super::super::wal::application::full_image_digest(&conn).unwrap(), before,
-        "a write after the audit must be rejected before committing the opening transaction");
-    assert_eq!(super::super::super::last_log_sync(&conn, identity()).unwrap(), Some(log_id(1)));
+    assert_eq!(
+        error.to_string(),
+        "private WAL application cache changed outside its owner"
+    );
+    assert_eq!(
+        super::super::super::wal::application::full_image_digest(&conn).unwrap(),
+        before,
+        "a write after the audit must be rejected before committing the opening transaction"
+    );
+    assert_eq!(
+        super::super::super::last_log_sync(&conn, identity()).unwrap(),
+        Some(log_id(1))
+    );
 }
 
 fn application_seed_applied_one(fixture: &Fixture, conn: &Connection, caps: &BackendCapabilities) {
-    fixture.wal.submit(append(&[batch(1)])).unwrap().wait().unwrap();
+    fixture
+        .wal
+        .submit(append(&[batch(1)]))
+        .unwrap()
+        .wait()
+        .unwrap();
     fixture
         .wal
         .submit(Operation::Committed(Some(log_id(1))))
@@ -109,7 +149,10 @@ fn application_restore_audit_covers_connection_token_writes() {
     assert_eq!(stored, b"invalid");
     let original_error = super::super::super::last_log_sync(&conn, identity()).unwrap_err();
     assert_eq!(original_error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(original_error.to_string(), "session consensus decoding failed");
+    assert_eq!(
+        original_error.to_string(),
+        "session consensus decoding failed"
+    );
     let called = std::cell::Cell::new(false);
     let observed = reopened.with_application_read(&conn, || {
         called.set(true);
@@ -140,7 +183,11 @@ fn application_marker_change_is_rejected(statement: &str, expected_reason: &str)
     reopened.restore_application(&conn, &source.caps).unwrap();
     assert_eq!(reopened.with_application_read(&conn, || 7).unwrap(), 7);
     let before = super::super::super::wal::application::full_image_digest(&conn).unwrap();
-    reopened.submit(append(&[batch(2)])).unwrap().wait().unwrap();
+    reopened
+        .submit(append(&[batch(2)]))
+        .unwrap()
+        .wait()
+        .unwrap();
     reopened
         .submit(Operation::Committed(Some(log_id(2))))
         .unwrap()
@@ -211,7 +258,11 @@ fn application_frontier_cache_detects_deletion_and_same_connection_rollback() {
             let other = separate_connection.then(|| Connection::open(&path).unwrap());
             let writer = other.as_ref().unwrap_or(&conn);
             let tx = writer.unchecked_transaction().unwrap();
-            assert_eq!(tx.execute("DELETE FROM consensus_log WHERE log_index = 1", []).unwrap(), 1);
+            assert_eq!(
+                tx.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+                    .unwrap(),
+                1
+            );
             if rollback {
                 tx.rollback().unwrap();
             } else {
@@ -225,13 +276,20 @@ fn application_frontier_cache_detects_deletion_and_same_connection_rollback() {
             });
             assert!(!observation.finish().contains(&Event::FullDecode));
             if separate_connection && rollback {
-                assert_eq!(read.unwrap(), 7, "a rolled-back foreign write changes no visible bytes");
+                assert_eq!(
+                    read.unwrap(),
+                    7,
+                    "a rolled-back foreign write changes no visible bytes"
+                );
                 assert!(called.get());
                 fixture.wal.shutdown().unwrap();
             } else {
                 let error = read.expect_err("the existing connection counters must reject reuse");
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                assert_eq!(error.to_string(), "private WAL application cache changed outside its owner");
+                assert_eq!(
+                    error.to_string(),
+                    "private WAL application cache changed outside its owner"
+                );
                 assert!(!called.get());
                 assert!(fixture.wal.shutdown().is_err());
             }
@@ -260,7 +318,10 @@ fn application_frontier_cache_rejects_another_read_connection() {
         .with_application_read(&other, || called.set(true))
         .expect_err("a different connection cannot inherit the attached cache proof");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(error.to_string(), "private WAL application cache changed outside its owner");
+    assert_eq!(
+        error.to_string(),
+        "private WAL application cache changed outside its owner"
+    );
     assert!(!called.get());
     assert!(fixture.wal.shutdown().is_err());
 }

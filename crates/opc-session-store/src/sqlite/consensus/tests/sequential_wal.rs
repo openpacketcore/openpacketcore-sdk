@@ -9,8 +9,10 @@ use super::super::wal::application::ApplyControl;
 use super::super::wal::{Binding, IoControl, Limits, Operation, Point, Wal};
 use super::*;
 
-#[path = "sequential_wal/cancelled_reads.rs"]
+#[path = "sequential_wal/audit_publication.rs"]
 mod audit_publication;
+
+#[path = "sequential_wal/cancelled_reads.rs"]
 mod cancelled_reads;
 
 #[path = "sequential_wal/terminal_failure.rs"]
