@@ -43,9 +43,9 @@ struct Observation {
     counts: Mutex<Counts>,
 }
 
-pub(crate) struct Scope(Arc<Observation>);
+pub(crate) struct PayloadDecodeObservation(Arc<Observation>);
 
-impl Scope {
+impl PayloadDecodeObservation {
     pub(crate) fn new(scope: ScopeId, minimum_bytes: usize) -> Self {
         let observation = Arc::new(Observation {
             scope,
@@ -62,7 +62,7 @@ impl Scope {
     }
 }
 
-impl Drop for Scope {
+impl Drop for PayloadDecodeObservation {
     fn drop(&mut self) {
         let own = Arc::downgrade(&self.0);
         OBSERVERS

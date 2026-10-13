@@ -59,7 +59,7 @@ async fn scope_large_child_write_decodes_one_payload_per_voter_independent_of_hi
             let overhead = encoded.len() - envelope.ciphertext_and_tag.len();
             envelope.ciphertext_and_tag.resize(MAX_SCOPE_CHILD_VALUE_BYTES - 4096 - overhead, 1);
             let large = ScopeSealedValue::new(envelope.encode().unwrap()).unwrap();
-            let observer = scope_payload_decode_observer::Scope::new(scope, 0);
+            let observer = scope_payload_decode_observer::PayloadDecodeObservation::new(scope, 0);
             for ordinal in 1..=5_u8 {
                 let sequence = history + ordinal;
                 let before = observer.counts();

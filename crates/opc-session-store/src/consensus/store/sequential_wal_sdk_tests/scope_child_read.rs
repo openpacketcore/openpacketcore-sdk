@@ -70,8 +70,10 @@ async fn scope_child_read_three_large_children_refuse_the_whole_observation() {
                 .ciphertext_and_tag
                 .resize(MAX_SCOPE_CHILD_VALUE_BYTES - 4096 - overhead, 1);
             let large = ScopeSealedValue::new(envelope.encode().unwrap()).unwrap();
-            let observer =
-                scope_payload_decode_observer::Scope::new(granted.stamp().scope().clone(), 100_000);
+            let observer = scope_payload_decode_observer::PayloadDecodeObservation::new(
+                granted.stamp().scope().clone(),
+                100_000,
+            );
             for tag in 1..=3 {
                 let before = observer.counts();
                 let started = Instant::now();
