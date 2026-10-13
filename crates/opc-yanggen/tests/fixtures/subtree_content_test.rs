@@ -1456,3 +1456,38 @@ async fn subtree_content_masked_leaf_list_preserves_members_with_fixed_work() {
         }
     }
 }
+
+#[tokio::test]
+async fn subtree_content_masked_state_payload_has_fixed_work() {
+    for op in ["get", "get-data"] {
+        let mut expected = None;
+        let mut fixed_work = None;
+        for size in [1, 2048] {
+            let fixture = Fixture::new(config(), &[]).await;
+            *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:state-secret", &serde_json::to_string(&"s".repeat(size)).unwrap())];
+            let body = request(op, "<hostname>router-marker</hostname><state-secret/>", "");
+            let limits = MgmtLimits { max_value_bytes: 4096, ..MgmtLimits::default() };
+            if fixed_work.is_none() {
+                assert_eq!(tags(&fixture.rpc(&body, limits).await, "state-secret"), ["&lt;redacted&gt;"]);
+                fixed_work = Some(limits.max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining());
+            }
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap(), ..limits }).await;
+            assert_eq!(tags(&reply, "state-secret"), ["&lt;redacted&gt;"]);
+            let observed = (reply, fixture.observation());
+            if let Some(expected) = &expected { assert_eq!(&observed, expected); }
+            expected = Some(observed);
+        }
+        let fixture = Fixture::new(config(), &[]).await;
+        let body = request(op, "<hostname>router-marker</hostname><state-secret/>", "");
+        for json in ["\"escaped-\\u0041\"", "true", "false", "7", "1.25"] {
+            *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:state-secret", json)];
+            assert_eq!(tags(&fixture.rpc(&body, MgmtLimits::default()).await, "state-secret"), ["&lt;redacted&gt;"]);
+        }
+        *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:state-secret", "null")];
+        assert!(tags(&fixture.rpc(&body, MgmtLimits::default()).await, "state-secret").is_empty());
+        for json in ["{}", "[false]"] {
+            *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:state-secret", json)];
+            error(&fixture.rpc(&body, MgmtLimits::default()).await, "operation-failed");
+        }
+    }
+}
