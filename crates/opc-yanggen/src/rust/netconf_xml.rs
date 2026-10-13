@@ -180,6 +180,13 @@ fn render_container_fn(
     let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
     let child_stmts = child_render_stmts(node, nodes_by_path, false, &format_ident!("children"))?;
+    // Stored presence is data even when optional or default-trimmed children are empty.
+    // A descendant instance selection must still match before exposing its ancestors.
+    let empty_descendant_selection = if node.presence.is_some() {
+        quote! { ctx.has_descendant_instance_selection(path) }
+    } else {
+        quote! { ctx.is_descendant_selected(path) }
+    };
 
     Ok(quote! {
         fn #fn_ident(
@@ -195,7 +202,7 @@ fn render_container_fn(
             let mut children = String::new();
             #(#child_stmts)*
             if children.is_empty()
-                && (!ctx.is_selected(path) || ctx.is_descendant_selected(path))
+                && (!ctx.is_selected(path) || #empty_descendant_selection)
             {
                 return Ok(None);
             }
