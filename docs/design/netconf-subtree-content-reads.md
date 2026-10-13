@@ -194,15 +194,39 @@ reserved and admitted before the corresponding work. Never measure a joined,
 merged, selected or rendered result to decide a charge. Coalescing may leave
 reserved work unused; it cannot reduce the charge or change authorized output.
 
-Identity merging and final ordering use complete-phase reservations. Sizing
-visits are charged before reading capture metadata; the reservation depends on
-node/key counts, schema paths and retained byte lengths only. Captured masked
-identities have a fixed width. The merge bound covers all candidate identity
-and scalar comparisons, schema-kind lookups and insertions; the ordering bound
-also covers every possible removal shift and descendant pass. Both bounds use
-checked addition and multiplication and are admitted before the first identity
-comparison. Budget refusal therefore precedes mutation of a merge or ordering
-destination, and matching can stop early without changing the shared charge.
+Identity merging and final ordering share one complete evaluation reservation.
+Sizing visits are charged before reading capture metadata. Bounds use original
+node/key totals, the largest captured tuples and values, and schema cardinality
+within each parent row. A scalar or container path can occur at most once per
+joined parent; list and leaf-list bounds retain every original occurrence.
+These bounds are established from schema and capture metadata before any join.
+Custom captures must have the declared key structure for these bounds to apply.
+Captured masked identities have a fixed width.
+
+The initial join stable-sorts an index of each sibling batch by schema path,
+captured keys, masked ordinal and leaf-list value. Equal runs coalesce in one
+recursive batch, preserving scalar/default conflict checks and restoring the
+first occurrence's position. This also normalizes singleton capture subtrees.
+Selection then carries the original parent-local key or child position through
+copies and unions. Subsequent merges and output ordering sort these integer
+positions, so they do not repeatedly search or compare captured key tuples.
+Keys keep their schema slots, and lists and leaf-lists retain source order.
+
+A sort of a row of width N has at most N comparisons and N position moves per
+merge-sort level. Reservations multiply original node totals by the logarithmic
+row-width bound and the largest compared tuple/value lengths, then add linear
+visit, predicate, copy and conflict-check terms. They do not square pooled list
+sizes or charge vector-removal shifts. Metadata normalization, provider duplicate
+checks and provider ordering also use bounded index sorts. Provider ordering
+still uses validated canonical paths; its prepaid byte bound uses captured path
+identities, including fixed-width masked components.
+
+All additions and products are checked. Metadata sizing and the full executor
+bound are admitted together before the initial configuration/state join. Refusal leaves
+the input, shared allowance and predicate admissions unchanged; early exits do
+not refund work. Test-only counters record executor byte comparisons, copies
+and moves at their operation sites and assert against the executor portion of
+the reservation, without using unused metadata allowance as a cushion.
 
 Existing request, XML depth, namespace, attribute and content-node limits
 remain in force. Each accumulated decoded value is bounded by

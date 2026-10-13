@@ -78,6 +78,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys are refused before authorization or data access. Providers receive the
   response count and byte budgets; overflows fail without truncation. (#1270)
 
+- `opc-netconf-server`, `opc-mgmt-schema`, `opc-mgmt-limits`, `opc-yanggen`:
+  subtree content matching on scalar key and non-key leaves for `<get-config>`,
+  `<get>` and `<get-data>` (RFC 6241 section 6.2.5). Output, match leaves and
+  identifying keys are authorized together in one policy context before data
+  access; matches on leaves whose data class does not allow cleartext are
+  refused from the schema; matching follows with-defaults handling and preserves
+  instance correlation, masking and list order. New limits
+  `MgmtLimits::max_subtree_filter_nodes` (default 1024) and
+  `MgmtLimits::max_subtree_filter_work_units` (default 16777216) bound the filter
+  and plan size and the checked work of parsing, compilation and evaluation.
+  Masked list keys are captured as fixed-width request-local identities, and
+  evaluation work is reserved from the original captures before any identity
+  comparison. Startup content reads load the stored snapshot through
+  `StartupDatastore`, whose implementations must bound loading and decoding.
+  (#1272)
+
 - `opc-proto-nas`: frame optional elements with complete per-message tables
   from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),
   Security Mode Command (7), Security Mode Complete (3), Configuration Update
