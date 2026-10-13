@@ -13,6 +13,7 @@ pub(crate) fn prepare_read_filter(
     registry: &'static dyn SchemaRegistry,
     filter: Option<&Filter>,
     limits: &MgmtLimits,
+    supported: bool,
 ) -> Result<(Option<Filter>, Vec<NetconfKeyPredicate>), FilterError> {
     let Some(Filter::XPath(xpath)) = filter else {
         return Ok((filter.cloned(), Vec::new()));
@@ -20,6 +21,9 @@ pub(crate) fn prepare_read_filter(
     limits.check_xpath_filter_bytes(xpath.select().len())?;
     if !xpath.select().contains('[') {
         return Ok((filter.cloned(), Vec::new()));
+    }
+    if !supported {
+        return Err(FilterError::UnsupportedXPath);
     }
     let mut rest = xpath.select().trim();
     let mut schema = String::new();
@@ -72,15 +76,16 @@ pub(crate) fn prepare_read_filter(
             let [key_path] = keys.as_slice() else {
                 return Err(FilterError::UnsupportedXPath);
             };
-            let local = key_path
-                .rsplit('/')
-                .next()
-                .and_then(|part| part.split_once(':'))
-                .map(|(_, local)| local);
-            if !list
-                .key_leaves
-                .iter()
-                .any(|key| Some(key.rsplit(':').next().unwrap_or(key)) == local)
+            let key_node = registry.node(key_path).ok_or(FilterError::UnknownNode)?;
+            let name = key_path.rsplit('/').next().unwrap_or_default();
+            if key_node.kind != NodeKind::Leaf
+                || !list.key_leaves.iter().any(|key| {
+                    if key.contains(':') {
+                        *key == name
+                    } else {
+                        key_node.module == list.module && name.rsplit(':').next() == Some(*key)
+                    }
+                })
             {
                 return Err(FilterError::UnsupportedXPath);
             }

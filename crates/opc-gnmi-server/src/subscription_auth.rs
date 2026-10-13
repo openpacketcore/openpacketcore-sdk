@@ -117,10 +117,19 @@ impl StreamAuthorization {
             .clone();
         let mut requested = self.requested.clone();
         requested.push(ReadNode::operational(node));
-        let resolved = self
+        let resolved = match self
             .source
             .active_policy_context_for_principal(&self.principal)
-            .map_err(|_| authorization_failure())?;
+        {
+            Ok(resolved) => resolved,
+            Err(_) if self.gate.reevaluation_pending().unwrap_or(false) => {
+                // Output is already gated by the activated revision. Its
+                // independent control notification owns refresh failure and
+                // termination; an unprovably authorized event is only dropped.
+                return Ok(false);
+            }
+            Err(_) => return Err(authorization_failure()),
+        };
         let authz = ReadAuthorizer::new(self.registry, self.source.as_ref())
             .map_err(|_| authorization_failure())?;
         let selection = authz.authorize_selection_resolved(

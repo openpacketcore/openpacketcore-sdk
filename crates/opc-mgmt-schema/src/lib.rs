@@ -1153,6 +1153,17 @@ impl<'a> NetconfXmlRenderContext<'a> {
             .any(|predicate| predicate.key_path == path)
     }
 
+    /// Whether an instance filter selects a list strictly below this node.
+    /// Ancestor identifying keys alone cannot satisfy that descendant read.
+    pub fn has_descendant_instance_selection(&self, path: &str) -> bool {
+        self.predicates.iter().any(|predicate| {
+            predicate
+                .list_path
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
     /// Match one already-authorized key against every equality for that key.
     pub fn key_matches(&self, path: &str, value: &str) -> bool {
         self.predicates
@@ -1178,10 +1189,17 @@ impl<'a> NetconfXmlRenderContext<'a> {
     /// ancestor does **not** cover all descendants here: `ReadSelection` is
     /// post-NACM, and structural containers must not authorize sibling leaves.
     pub fn is_subtree_selected(&self, path: &str) -> bool {
-        self.selection.iter().any(|p| {
-            *p == path
-                || p.strip_prefix(path)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+        self.is_selected(path) || self.is_descendant_selected(path)
+    }
+
+    /// Returns whether an authorized node strictly below `path` is selected.
+    /// This distinguishes an explicitly selected empty structural container
+    /// from an ancestor whose requested descendants produced no data.
+    pub fn is_descendant_selected(&self, path: &str) -> bool {
+        self.selection.iter().any(|selected| {
+            selected
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
         })
     }
 

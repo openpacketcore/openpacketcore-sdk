@@ -400,6 +400,14 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Whether configuration projection honors every key predicate in
+    /// [`ReadSelection::predicates`]. The generated renderer implements this.
+    /// A custom renderer must explicitly opt in after implementing instance
+    /// matching; otherwise keyed XPath filters fail before projection.
+    fn key_predicates_supported(&self) -> bool {
+        self.generated_xml_renderer().is_some()
+    }
+
     /// Renders the currently published running config for the authorized paths.
     ///
     /// The default delegates to [`Self::generated_xml_renderer`] if present. A

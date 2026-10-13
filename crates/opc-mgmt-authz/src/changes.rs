@@ -1,5 +1,6 @@
 //! Ordered authorization changes, with a barrier at the protocol output boundary.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
@@ -61,6 +62,17 @@ impl AuthorizationGate {
             Err(AuthzError::PolicyUnavailable)
         } else {
             Ok(state.revision)
+        }
+    }
+
+    /// Whether an activated revision still owns a pending reevaluation. Data
+    /// work must not turn hidden traffic into an earlier termination trigger.
+    pub fn reevaluation_pending(&self) -> Result<bool, AuthzError> {
+        let state = self.0.lock().map_err(|_| AuthzError::PolicyUnavailable)?;
+        if state.failed {
+            Err(AuthzError::PolicyUnavailable)
+        } else {
+            Ok(state.pending)
         }
     }
 
@@ -215,6 +227,18 @@ struct HubState {
     listeners: Vec<Listener>,
 }
 
+impl HubState {
+    fn fail(&mut self) {
+        self.failed = true;
+        for listener in &self.listeners {
+            if let Some(gate) = listener.gate.upgrade() {
+                AuthorizationGate(gate).terminate();
+            }
+            let _ = listener.sender.send(Err(AuthzError::PolicyUnavailable));
+        }
+    }
+}
+
 impl Drop for HubState {
     fn drop(&mut self) {
         for listener in &self.listeners {
@@ -250,7 +274,13 @@ impl AuthorizationChangeHub {
         if state.failed {
             return Err(AuthzError::PolicyUnavailable);
         }
-        let initial = resolve()?;
+        let initial = match catch_unwind(AssertUnwindSafe(resolve)) {
+            Ok(result) => result?,
+            Err(_) => {
+                state.fail();
+                return Err(AuthzError::PolicyUnavailable);
+            }
+        };
         let (sender, receiver) = mpsc::unbounded_channel();
         gate.begin(state.revision)?;
         state
@@ -302,7 +332,10 @@ impl AuthorizationChangeHub {
                 }
             }
         }
-        apply();
+        if catch_unwind(AssertUnwindSafe(apply)).is_err() {
+            state.fail();
+            return Err(AuthzError::PolicyUnavailable);
+        }
         state.revision = revision;
         Ok(PendingAuthorizationChange {
             hub: self.clone(),
@@ -322,13 +355,7 @@ impl AuthorizationChangeHub {
     /// and its affected scope cannot be established. This source remains failed.
     pub fn fail(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.failed = true;
-            for listener in &state.listeners {
-                if let Some(gate) = listener.gate.upgrade() {
-                    AuthorizationGate(gate).terminate();
-                }
-                let _ = listener.sender.send(Err(AuthzError::PolicyUnavailable));
-            }
+            state.fail();
         }
     }
 }
@@ -380,3 +407,6 @@ impl Drop for PendingAuthorizationChange {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

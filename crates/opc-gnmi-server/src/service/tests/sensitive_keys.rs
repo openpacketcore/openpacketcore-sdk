@@ -1,4 +1,9 @@
 use super::*;
+use std::time::Duration;
+
+mod delivery;
+mod modes;
+mod operational;
 
 fn selected_policy(paths: &[&str], action: NacmAction) -> NacmPolicy {
     let modules = module_registry();
@@ -49,7 +54,7 @@ struct AlternatingPolicy {
 
 impl PolicySource for AlternatingPolicy {
     fn active_policy(&self, _: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
-        let path = if self.calls.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+        let path = if self.calls.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
             "/sys:system/sys:user/sys:role"
         } else {
             "/sys:system/sys:user/sys:name"
@@ -156,6 +161,7 @@ fn protocol_diagnostics_do_not_expose_keys_or_values() {
 struct XmlKeyBinding {
     bus: Arc<ConfigBus<DemoConfig>>,
     traversals: Arc<AtomicUsize>,
+    registry: &'static dyn SchemaRegistry,
 }
 
 impl opc_netconf_server::NetconfConfigBinding<DemoConfig> for XmlKeyBinding {
@@ -163,7 +169,7 @@ impl opc_netconf_server::NetconfConfigBinding<DemoConfig> for XmlKeyBinding {
         self.bus.clone()
     }
     fn schema_registry(&self) -> &'static dyn SchemaRegistry {
-        &TestRegistry
+        self.registry
     }
     fn nmda_get_data_supported(&self) -> bool {
         true
@@ -213,6 +219,15 @@ async fn xml_key_read(
     populated: bool,
     operation: &str,
 ) -> (String, usize) {
+    xml_key_read_with_registry(policy, populated, operation, &TestRegistry).await
+}
+
+async fn xml_key_read_with_registry(
+    policy: Arc<dyn PolicySource>,
+    populated: bool,
+    operation: &str,
+    registry: &'static dyn SchemaRegistry,
+) -> (String, usize) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut config = initial_config();
     if !populated {
@@ -227,6 +242,7 @@ async fn xml_key_read(
                     .unwrap(),
             ),
             traversals: traversals.clone(),
+            registry,
         },
         policy,
         CapturingAudit::default(),
@@ -468,13 +484,13 @@ impl SchemaRegistry for StateKeyRegistry {
     }
 }
 
-struct StateKeyBinding(TestBinding);
+struct StateKeyBinding(TestBinding, &'static dyn SchemaRegistry);
 impl GnmiConfigBinding<DemoConfig> for StateKeyBinding {
     fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
         self.0.bus.clone()
     }
     fn schema(&self) -> &'static dyn SchemaRegistry {
-        &StateKeyRegistry
+        self.1
     }
     fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<DemoConfig>> {
         self.0.patcher.clone()
@@ -524,17 +540,20 @@ async fn state_key_service(
     audit: Arc<dyn AuditSink>,
 ) -> GnmiService<DemoConfig, StateKeyBinding> {
     let server = GnmiServer::new(
-        StateKeyBinding(TestBinding {
-            bus: Arc::new(
-                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
-                    .await
-                    .unwrap(),
-            ),
-            policy,
-            operational,
-            events: Some(events),
-            patcher: unit_patcher(),
-        }),
+        StateKeyBinding(
+            TestBinding {
+                bus: Arc::new(
+                    ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                        .await
+                        .unwrap(),
+                ),
+                policy,
+                operational,
+                events: Some(events),
+                patcher: unit_patcher(),
+            },
+            &StateKeyRegistry,
+        ),
         MgmtLimits::default(),
         CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).unwrap()),
         ExtensionRegistry::default(),
@@ -632,12 +651,20 @@ impl PolicySource for ChangingContext {
 fn open_subscribe_request(
     list: gnmi::SubscriptionList,
 ) -> Request<tonic::Streaming<gnmi::SubscribeRequest>> {
+    open_subscribe_requests(vec![subscribe_request(list)])
+}
+
+fn open_subscribe_requests(
+    requests: Vec<gnmi::SubscribeRequest>,
+) -> Request<tonic::Streaming<gnmi::SubscribeRequest>> {
     use http_body_util::BodyExt;
-    let request = subscribe_request(list);
-    let payload = request.encode_to_vec();
-    let mut frame = vec![0];
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
+    let mut frame = Vec::new();
+    for request in requests {
+        let payload = request.encode_to_vec();
+        frame.push(0);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+    }
     let body =
         http_body_util::Full::new(bytes::Bytes::from(frame)).with_trailers(std::future::pending::<
             Option<Result<tonic::codegen::http::HeaderMap, std::convert::Infallible>>,
@@ -735,7 +762,13 @@ async fn idle_on_change_revocation_terminates_on_context_change() {
                 pending_without_trigger,
                 "hidden events cannot terminate while the control notification is held"
             );
-            assert_eq!(pending.complete().await.unwrap(), 1);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), pending.complete())
+                    .await
+                    .expect("independent control trigger")
+                    .unwrap(),
+                1
+            );
             assert_eq!(
                 policy.calls.load(Ordering::SeqCst),
                 2 + hidden_events,
@@ -774,4 +807,68 @@ async fn netconf_denied_leaf_with_allowed_keys_is_omitted() {
         assert!(!reply.contains("<sys:user"), "{reply}");
         assert_eq!(traversals, 0);
     }
+}
+
+struct XmlStateChildRegistry;
+impl SchemaRegistry for XmlStateChildRegistry {
+    fn schema_digest(&self) -> &'static str {
+        "fnv1a64:xml-state-child"
+    }
+    fn served_models(&self) -> &'static [ModelData] {
+        MODELS
+    }
+    fn origins(&self) -> &'static [OriginEntry] {
+        ORIGINS
+    }
+    fn nodes(&self) -> &'static [NodeMeta] {
+        static STATE: std::sync::OnceLock<Vec<NodeMeta>> = std::sync::OnceLock::new();
+        STATE.get_or_init(|| {
+            NODES
+                .iter()
+                .map(|node| {
+                    let mut node = *node;
+                    if node.path == "/sys:system/sys:user/sys:role" {
+                        node.config = false;
+                    }
+                    node
+                })
+                .collect()
+        })
+    }
+}
+
+#[tokio::test]
+async fn netconf_absent_operational_child_does_not_emit_unrequested_keys() {
+    for operation in xml_key_operations() {
+        let (reply, traversals) = xml_key_read_with_registry(
+            Arc::new(FixedPolicy(allow_all_read_policy())),
+            true,
+            &operation,
+            &XmlStateChildRegistry,
+        )
+        .await;
+        assert!(!reply.contains("<rpc-error>"), "{reply}");
+        assert!(!reply.contains("<sys:user"), "{reply}");
+        assert!(!reply.contains("admin"), "{reply}");
+        assert!(!reply.contains("guest"), "{reply}");
+        assert_eq!(traversals, 0, "no config rows for absent requested state");
+    }
+}
+
+#[tokio::test]
+async fn netconf_legacy_projection_refuses_instance_predicates() {
+    let (reply, traversals) = xml_key_read(
+        Arc::new(FixedPolicy(allow_all_read_policy())), true,
+        "<get-config><source><running/></source><filter type=\"xpath\" xmlns:sys=\"urn:demo\" select=\"/sys:system/sys:user[sys:name='absent-key-marker']/sys:role\"/></get-config>",
+    ).await;
+    assert!(
+        reply.contains("<error-tag>operation-not-supported</error-tag>"),
+        "{reply}"
+    );
+    assert!(!reply.contains("admin"));
+    assert!(!reply.contains("absent-key-marker"));
+    assert_eq!(
+        traversals, 0,
+        "legacy renderers must opt into instance matching"
+    );
 }

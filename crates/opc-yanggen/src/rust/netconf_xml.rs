@@ -194,7 +194,9 @@ fn render_container_fn(
             let qname = ctx.qualified_name(path)?;
             let mut children = String::new();
             #(#child_stmts)*
-            if children.is_empty() && !ctx.is_selected(path) {
+            if children.is_empty()
+                && (!ctx.is_selected(path) || ctx.is_descendant_selected(path))
+            {
                 return Ok(None);
             }
             let ns_decls = if include_namespaces {
@@ -344,6 +346,9 @@ fn render_list_entry_fn(
             #[allow(unused_mut)]
             let mut non_key_children = String::new();
             #(#non_key_stmts)*
+            if non_key_children.is_empty() && ctx.has_descendant_instance_selection(path) {
+                return Ok(None);
+            }
             if (!key_children.is_empty() || !non_key_children.is_empty())
                 && rendered_key_count != #required_key_count
             {

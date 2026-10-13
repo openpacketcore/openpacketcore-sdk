@@ -48,6 +48,32 @@ schema-source lookup, and edit-config candidate construction. Default render and
 edit hooks fail closed unless a generated or CNF-specific binding implements
 them.
 
+## Keyed read selection
+
+`<get>`, `<get-config>` and `<get-data>` authorize each selected descendant and
+all composite and ancestor-list keys against one resolved policy context. A
+denied or unknown dependency omits its entire entry before stored-row traversal.
+The server adds permitted identifying keys to XML selections; a selected
+structural parent alone contributes no key-only entry. An allowed key whose
+stored value is missing still produces the existing fixed projection failure.
+Sensitive keys keep their data-class formatting, including masked XML elements
+for security-secret and lawful-intercept keys.
+
+Generated configuration projection supports bounded XPath key equalities such
+as `/k:root/k:rows[k:id='chosen-instance']/k:value`. Predicates must identify
+actual list keys using bound namespace prefixes and XPath 1.0 string literals.
+Composite and ancestor predicates restrict instances after authorization.
+Expressions, non-key predicates, unions with predicates, wildcard predicates
+and opaque operational instance filtering remain unsupported. Existing schema
+selection and structural subtree filters retain their behavior.
+
+Custom bindings must honor both `ReadSelection::schema_paths()` and
+`ReadSelection::predicates()`. They must explicitly implement
+`key_predicates_supported` when they implement instance matching. Generated
+renderers supply this support through `render_selected_config`; other renderers
+refuse predicates by default, before traversing data. Predicate values are
+excluded from `Debug` diagnostics.
+
 ## Async audit and registry atomicity
 
 Production async session paths use `AuditSink::record_async` for reads, writes,

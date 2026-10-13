@@ -168,6 +168,7 @@ edition = "2021"
 [dependencies]
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
+tracing = "0.1"
 time = "={}"
 tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "io-util"] }}
 tonic = {{ version = "0.14.6", default-features = false, features = ["codegen"] }}

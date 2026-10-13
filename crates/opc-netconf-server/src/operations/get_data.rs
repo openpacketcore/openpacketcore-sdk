@@ -10,7 +10,6 @@ use opc_mgmt_authz::{
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{OperationalRequest, OperationalResponse};
-use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
 use crate::binding::{NetconfConfigBinding, ReadSelection};
 use crate::capabilities::NETCONF_NMDA_NS;
@@ -267,24 +266,28 @@ where
     }
 
     let registry = binding.schema_registry();
-    let (config_paths, predicates) =
-        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
-            .and_then(|(filter, predicates)| {
-                get_config_paths_with_limits(registry, filter.as_ref(), ctx.limits)
-                    .map(|paths| (paths, predicates))
-            }) {
-            Ok(paths) => paths,
-            Err(err) => {
-                return fail(
-                    audit_mode,
-                    &ctx,
-                    err.rpc_error(),
-                    err.audit_reason(),
-                    Vec::new(),
-                )
-                .await
-            }
-        };
+    let (config_paths, predicates) = match crate::filter::prepare_read_filter(
+        registry,
+        request.filter.as_ref(),
+        ctx.limits,
+        binding.key_predicates_supported(),
+    )
+    .and_then(|(filter, predicates)| {
+        get_config_paths_with_limits(registry, filter.as_ref(), ctx.limits)
+            .map(|paths| (paths, predicates))
+    }) {
+        Ok(paths) => paths,
+        Err(err) => {
+            return fail(
+                audit_mode,
+                &ctx,
+                err.rpc_error(),
+                err.audit_reason(),
+                Vec::new(),
+            )
+            .await
+        }
+    };
     if ctx.limits.check_paths(config_paths.len()).is_err() {
         return fail(audit_mode, &ctx, RpcError::too_big(), "too-big", Vec::new()).await;
     }
@@ -384,30 +387,34 @@ where
     }
 
     let registry = binding.schema_registry();
-    let (selected_paths, predicates) =
-        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
-            .and_then(|(filter, predicates)| {
-                get_paths_with_discovery(
-                    registry,
-                    filter.as_ref(),
-                    binding.yang_library_capability().is_some(),
-                    binding.netconf_monitoring_capability().is_some(),
-                    ctx.limits,
-                )
-                .map(|paths| (paths, predicates))
-            }) {
-            Ok(paths) => paths,
-            Err(err) => {
-                return fail(
-                    audit_mode,
-                    &ctx,
-                    err.rpc_error(),
-                    err.audit_reason(),
-                    Vec::new(),
-                )
-                .await
-            }
-        };
+    let (selected_paths, predicates) = match crate::filter::prepare_read_filter(
+        registry,
+        request.filter.as_ref(),
+        ctx.limits,
+        binding.key_predicates_supported(),
+    )
+    .and_then(|(filter, predicates)| {
+        get_paths_with_discovery(
+            registry,
+            filter.as_ref(),
+            binding.yang_library_capability().is_some(),
+            binding.netconf_monitoring_capability().is_some(),
+            ctx.limits,
+        )
+        .map(|paths| (paths, predicates))
+    }) {
+        Ok(paths) => paths,
+        Err(err) => {
+            return fail(
+                audit_mode,
+                &ctx,
+                err.rpc_error(),
+                err.audit_reason(),
+                Vec::new(),
+            )
+            .await
+        }
+    };
     let resolved = match ctx
         .authz
         .policy_source()
@@ -547,8 +554,28 @@ where
             .await
         }
     };
-    let render_state_paths = state_paths_with_values(&state_paths, &operational);
-    let render_config_paths = config_paths_for_render(registry, &config_paths, &render_state_paths);
+    let available_state_paths = state_paths_with_values(&state_paths, &operational);
+    let render_paths = authorization.xml_paths_where(&selected_paths.data_paths, |path| {
+        config_paths.contains(&path) || available_state_paths.contains(&path)
+    });
+    let render_config_paths = render_paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            registry.node(path).is_some_and(|node| {
+                node.config
+                    // A state-only response needs its identifying key leaves,
+                    // but no selected configuration structural parents.
+                    && (request.config_filter != Some(false)
+                        || node.kind == opc_mgmt_schema::NodeKind::Leaf)
+            })
+        })
+        .collect::<Vec<_>>();
+    let render_state_paths = render_paths
+        .iter()
+        .copied()
+        .filter(|path| available_state_paths.contains(path))
+        .collect::<Vec<_>>();
 
     let rendered_data = if render_config_paths.is_empty() && render_state_paths.is_empty() {
         Ok(String::new())
@@ -678,30 +705,6 @@ fn state_paths_with_values(
                 .is_some_and(|path| operational.value_for(&path).is_some())
         })
         .collect()
-}
-
-fn config_paths_for_render(
-    registry: &'static dyn SchemaRegistry,
-    config_paths: &[&'static str],
-    render_state_paths: &[&'static str],
-) -> Vec<&'static str> {
-    if !render_state_paths.is_empty() || has_data_bearing_config_path(registry, config_paths) {
-        config_paths.to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-fn has_data_bearing_config_path(
-    registry: &'static dyn SchemaRegistry,
-    config_paths: &[&'static str],
-) -> bool {
-    config_paths.iter().any(|path| {
-        registry.node(path).is_some_and(|node| {
-            node.config
-                && (node.presence || matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList))
-        })
-    })
 }
 
 async fn success<C, P, A>(

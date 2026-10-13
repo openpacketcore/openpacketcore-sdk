@@ -21,19 +21,63 @@ Public API:
 Example:
 
 ```rust
-use opc_mgmt_authz::{PolicySource, ReadAuthorizer};
+use opc_mgmt_authz::{AuthzError, PolicySource, ReadAuthorizer};
 use opc_mgmt_schema::SchemaRegistry;
 
-fn make_read_authorizer(
-    source: std::sync::Arc<dyn PolicySource>,
-    registry: std::sync::Arc<dyn SchemaRegistry>,
-) -> ReadAuthorizer {
-    ReadAuthorizer::new(source, registry)
+fn make_read_authorizer<P: PolicySource>(
+    source: P,
+    registry: &dyn SchemaRegistry,
+) -> Result<ReadAuthorizer<'_, P>, AuthzError> {
+    ReadAuthorizer::new(registry, source)
 }
 ```
 
 If the policy source is unavailable, callers must fail closed. An empty active
 policy default-denies. Path resolution failures also deny access.
+
+## List identity and subscription contexts
+
+`ReadAuthorizer::authorize_selection` loads one resolved policy context for the
+requested nodes and every identifying key, including composite components and
+ancestor-list keys. A denied or unknown key omits its entire dependent entry.
+This applies to public keys as well as sensitive keys. `ReadAction::Read` and
+`ReadAction::Subscribe` are separate permissions. Canonical predicates select
+instances after authorization and never grant permission.
+
+Use `ReadNode::operational` for opaque provider values and events. Its dependency
+set includes every descendant schema node, and all identifying keys must permit
+cleartext. The protocol omits an unauthorized aggregate before reading its JSON;
+it does not rewrite provider JSON. Use `ReadNode::projected` for generated
+schema-aware projection. `AuthorizedReadSelection::xml_paths` adds permitted keys
+to material XML selections without turning a structural parent into permission
+to read children. Multi-registry reads share one `ResolvedPolicy` through
+`authorize_selection_resolved`.
+
+A live `PolicySource` must implement `watch_authorization` using one
+`AuthorizationChangeHub` for its authorization context. Register the watch and
+resolve its initial context together with `hub.register(gate, || resolve())`.
+Install every new policy, resolved group/role set, or principal validity state
+inside `hub.activate(|| install_context())`, and await its result. Prepare any
+external reads before activation; the context returned by read authorization
+must be the context installed under the hub's barrier. Updating a database and
+having readers load it directly before activating the hub would violate that
+boundary.
+
+Activation gates all attached output before installing the context. It delivers
+ordered control notifications and waits until every affected stream has
+reevaluated or closed. A later activation waits for that acknowledgement, so a
+revoke-then-restore sequence cannot skip the revoked revision. The hub wakes all
+attached streams conservatively; applications can use separate hubs when they
+have independently scoped contexts. `prepare_change` and `complete` expose the
+same barrier in two steps. Dropping an incomplete change fails the source.
+Call `hub.fail()` when context refresh or change delivery fails with unknown
+scope. Rebuilding a failed source requires fresh subscriptions.
+
+The default watch method refuses subscriptions. `AuthorizationWatch::immutable`
+is an explicit option only for a policy **and resolved principal context** that
+cannot change during any attached subscription. It is unsuitable for a live
+datastore, revocable principal, or dynamic group resolver. These APIs require no
+stored-data migration or manual key-management action.
 
 ## Relationships
 

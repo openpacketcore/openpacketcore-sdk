@@ -305,25 +305,22 @@ where
     C: OpcConfig + 'static,
     B: GnmiConfigBinding<C> + 'static,
 {
-    let mut dedupe = SnapshotDedupe::default();
-    if !plan.updates_only
-        && !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true).await?
-    {
-        return Ok(());
-    }
-    if plan.updates_only {
-        let responses = render_snapshot_async(&server, &principal, &plan).await?;
-        dedupe.last = Some(fingerprint_responses(&responses));
-    }
-    send_sync(&outbound).await?;
-
     let queue_capacity = subscribe_queue_capacity(server.limits())?;
     let mut operational_rx = match plan
         .stream
         .as_ref()
         .and_then(|stream| stream.operational_request.as_ref())
     {
-        Some(request) => subscribe_operational_events(server.as_ref(), &plan, request)?,
+        Some(request) => {
+            let server = server.clone();
+            let plan = plan.clone();
+            let request = request.clone();
+            tokio::task::spawn_blocking(move || {
+                subscribe_operational_events(server.as_ref(), &plan, &request)
+            })
+            .await
+            .map_err(|_| GnmiError::unavailable("gNMI event subscription failed"))??
+        }
         None => None,
     };
     let config_rx = plan
@@ -336,6 +333,18 @@ where
                 .config_bus()
                 .subscribe(SubscriberLagPolicy::ForceResync, queue_capacity)
         });
+    let mut dedupe = SnapshotDedupe::default();
+    if !plan.updates_only
+        && !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true).await?
+    {
+        return Ok(());
+    }
+    if plan.updates_only {
+        let responses = render_snapshot_async(&server, &principal, &plan).await?;
+        dedupe.last = Some(fingerprint_responses(&responses));
+    }
+    send_sync(&outbound).await?;
+
     let mut sample = plan
         .stream
         .as_ref()

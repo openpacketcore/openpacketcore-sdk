@@ -59,13 +59,37 @@ impl AuthorizedReadSelection {
     /// must not turn into an entry containing only an unrequested key.
     /// Call only with the schema paths used to create this result.
     pub fn xml_paths(&self, requested: &[&'static str]) -> Vec<&'static str> {
+        self.xml_paths_where(requested, |_| true)
+    }
+
+    /// Expands permitted XML data that is available for this response.
+    ///
+    /// `include` filters requested data before introducing identifying keys.
+    /// This avoids key-only entries when a requested operational value is absent.
+    /// Selected structural ancestors are retained only for included data and
+    /// never grant permission to an unselected child.
+    pub fn xml_paths_where(
+        &self,
+        requested: &[&'static str],
+        include: impl Fn(&str) -> bool,
+    ) -> Vec<&'static str> {
         let mut paths = BTreeSet::new();
         for (index, (decision, path)) in self.decisions.iter().zip(requested).enumerate() {
-            if decision.allowed && self.material.get(index) == Some(&true) {
+            if decision.allowed && self.material.get(index) == Some(&true) && include(path) {
                 paths.insert(*path);
                 paths.extend(self.identifying_keys(index).iter().copied());
             }
         }
+        let structural = self
+            .decisions
+            .iter()
+            .zip(requested)
+            .filter(|(decision, path)| {
+                decision.allowed && paths.iter().any(|data| below(path, data))
+            })
+            .map(|(_, path)| *path)
+            .collect::<Vec<_>>();
+        paths.extend(structural);
         paths.into_iter().collect()
     }
 }
@@ -201,7 +225,7 @@ impl Requirements {
                         if key.contains(':') {
                             name == *key
                         } else {
-                            name.rsplit(':').next() == Some(*key)
+                            child.module == list.module && name.rsplit(':').next() == Some(*key)
                         }
                     });
                 let Some(key_node) = key_node.filter(|node| node.kind == NodeKind::Leaf) else {
@@ -223,3 +247,6 @@ fn below(parent: &str, child: &str) -> bool {
         .strip_prefix(parent)
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
+
+#[cfg(test)]
+mod tests;

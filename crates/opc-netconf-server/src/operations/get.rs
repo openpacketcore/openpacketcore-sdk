@@ -10,7 +10,6 @@ use opc_mgmt_authz::{
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{OperationalRequest, OperationalResponse};
-use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
 use crate::binding::{NetconfConfigBinding, ReadSelection};
 use crate::error::{
@@ -140,50 +139,54 @@ where
         }
         None => None,
     };
-    let (selected_paths, predicates) =
-        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
-            .and_then(|(filter, predicates)| {
-                get_paths_with_discovery(
-                    registry,
-                    filter.as_ref(),
-                    yang_library_capability.is_some(),
-                    monitoring_capability.is_some(),
-                    ctx.limits,
-                )
-                .map(|paths| (paths, predicates))
-            }) {
-            Ok(paths) => paths,
-            Err(err) => {
-                let rpc_error = err.rpc_error();
-                let error_tag = rpc_error.classification.tag;
-                if audit_failure(
-                    audit_mode,
-                    ctx.audit,
-                    ctx.request_id,
-                    ctx.principal,
-                    ctx.transport,
-                    err.audit_reason(),
-                    Vec::new(),
-                )
-                .await
-                .is_err()
-                {
-                    record_rpc_error(
-                        NetconfOperation::Get,
-                        NetconfErrorTag::OperationFailed,
-                        ctx.started.elapsed(),
-                    );
-                    return error_reply(&ctx, RpcError::operation_failed());
-                }
-                record_rpc_error(NetconfOperation::Get, error_tag, ctx.started.elapsed());
-                tracing::debug!(
-                    operation = "get",
-                    error_tag = error_tag.as_str(),
-                    "NETCONF get rejected unsupported or invalid filter"
+    let (selected_paths, predicates) = match crate::filter::prepare_read_filter(
+        registry,
+        request.filter.as_ref(),
+        ctx.limits,
+        binding.key_predicates_supported(),
+    )
+    .and_then(|(filter, predicates)| {
+        get_paths_with_discovery(
+            registry,
+            filter.as_ref(),
+            yang_library_capability.is_some(),
+            monitoring_capability.is_some(),
+            ctx.limits,
+        )
+        .map(|paths| (paths, predicates))
+    }) {
+        Ok(paths) => paths,
+        Err(err) => {
+            let rpc_error = err.rpc_error();
+            let error_tag = rpc_error.classification.tag;
+            if audit_failure(
+                audit_mode,
+                ctx.audit,
+                ctx.request_id,
+                ctx.principal,
+                ctx.transport,
+                err.audit_reason(),
+                Vec::new(),
+            )
+            .await
+            .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::Get,
+                    NetconfErrorTag::OperationFailed,
+                    ctx.started.elapsed(),
                 );
-                return error_reply(&ctx, rpc_error);
+                return error_reply(&ctx, RpcError::operation_failed());
             }
-        };
+            record_rpc_error(NetconfOperation::Get, error_tag, ctx.started.elapsed());
+            tracing::debug!(
+                operation = "get",
+                error_tag = error_tag.as_str(),
+                "NETCONF get rejected unsupported or invalid filter"
+            );
+            return error_reply(&ctx, rpc_error);
+        }
+    };
     let selected_path_count = selected_paths
         .data_paths
         .len()
@@ -464,8 +467,20 @@ where
         }
     };
 
-    let render_state_paths = state_paths_with_values(&state_paths, &operational);
-    let render_config_paths = config_paths_for_render(registry, &config_paths, &render_state_paths);
+    let available_state_paths = state_paths_with_values(&state_paths, &operational);
+    let render_paths = authorization.xml_paths_where(&selected_paths.data_paths, |path| {
+        config_paths.contains(&path) || available_state_paths.contains(&path)
+    });
+    let render_config_paths = render_paths
+        .iter()
+        .copied()
+        .filter(|path| registry.node(path).is_some_and(|node| node.config))
+        .collect::<Vec<_>>();
+    let render_state_paths = render_paths
+        .iter()
+        .copied()
+        .filter(|path| available_state_paths.contains(path))
+        .collect::<Vec<_>>();
 
     let rendered_data = if render_config_paths.is_empty() && render_state_paths.is_empty() {
         Ok(String::new())
@@ -701,30 +716,6 @@ fn state_paths_with_values(
                 .is_some_and(|path| operational.value_for(&path).is_some())
         })
         .collect()
-}
-
-fn config_paths_for_render(
-    registry: &'static dyn SchemaRegistry,
-    config_paths: &[&'static str],
-    render_state_paths: &[&'static str],
-) -> Vec<&'static str> {
-    if !render_state_paths.is_empty() || has_data_bearing_config_path(registry, config_paths) {
-        config_paths.to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-fn has_data_bearing_config_path(
-    registry: &'static dyn SchemaRegistry,
-    config_paths: &[&'static str],
-) -> bool {
-    config_paths.iter().any(|path| {
-        registry.node(path).is_some_and(|node| {
-            node.config
-                && (node.presence || matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList))
-        })
-    })
 }
 
 async fn audit_success<A: AuditSink>(
