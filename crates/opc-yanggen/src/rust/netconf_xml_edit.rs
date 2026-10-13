@@ -758,14 +758,12 @@ fn apply_list_fn(
             quote! { parsed },
             has_state_lists,
         );
-        if !is_sensitive {
-            cloned_map_key = super::types::cloned_key_value(
-                key_leaf_node,
-                nodes_by_path,
-                quote! { parsed_key },
-                has_state_lists,
-            );
-        }
+        cloned_map_key = super::types::cloned_key_value(
+            key_leaf_node,
+            nodes_by_path,
+            quote! { parsed_key },
+            has_state_lists,
+        );
         let raw_key = if is_sensitive {
             cloned_parsed.clone()
         } else {
