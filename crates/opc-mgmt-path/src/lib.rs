@@ -36,8 +36,8 @@
 mod canonical;
 
 pub use canonical::{
-    append_key_predicate, canonical_path_matches, CanonicalPath, CanonicalPathError,
-    CanonicalSegment,
+    append_key_predicate, canonical_path_matches, instance_schema_matches, CanonicalPath,
+    CanonicalPathError, CanonicalSegment,
 };
 
 use std::{collections::BTreeMap, fmt};

@@ -178,12 +178,7 @@ where
         .map_err(|_| GnmiError::schema("gNMI read authorizer setup failed"))?;
     let decision_input = selected_entries
         .iter()
-        .map(
-            |entry| match server.binding().schema().node(entry.schema_path()) {
-                Some(node) if !node.config => ReadNode::operational(entry.schema_path()),
-                _ => ReadNode::projected(entry.schema_path()),
-            },
-        )
+        .map(|entry| read_node(server.binding().schema(), entry.schema_path()))
         .collect::<Vec<_>>();
     let authorization = match stream_authorization {
         Some(stream) => stream
@@ -688,13 +683,47 @@ where
     Ok(response)
 }
 
+pub(crate) fn read_node<'a>(registry: &dyn SchemaRegistry, path: &'a str) -> ReadNode<'a> {
+    match registry.node(path) {
+        Some(node) if !node.config && matches!(node.kind, NodeKind::Container | NodeKind::List) => {
+            ReadNode::operational(path)
+        }
+        _ => ReadNode::projected(path),
+    }
+}
+
+pub(crate) fn validate_operational_identity<'a>(
+    registry: &dyn SchemaRegistry,
+    path: &'a YangPath,
+) -> Result<opc_mgmt_path::CanonicalPath<'a>, GnmiError> {
+    let parsed = opc_mgmt_path::CanonicalPath::parse(path.as_str())
+        .map_err(|_| GnmiError::schema("invalid operational instance"))?;
+    let mut schema = String::new();
+    for segment in parsed.segments() {
+        schema.push('/');
+        schema.push_str(segment.name);
+        let ancestor = registry
+            .node(&schema)
+            .ok_or_else(|| GnmiError::schema("invalid operational instance"))?;
+        for (name, _) in &segment.keys {
+            let key = opc_mgmt_path::declared_key(registry, ancestor, name)
+                .ok_or_else(|| GnmiError::schema("invalid operational identity"))?;
+            if !opc_mgmt_path::key_allows_cleartext(registry, key.path) {
+                return Err(GnmiError::schema(
+                    "operational identity cannot be represented",
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
 pub(crate) fn project_operational_value(
     registry: &dyn SchemaRegistry,
     value: &opc_mgmt_opstate::OperationalValue,
     node: &'static opc_mgmt_schema::NodeMeta,
 ) -> Result<opc_mgmt_opstate::OperationalValue, GnmiError> {
-    let parsed = opc_mgmt_path::CanonicalPath::parse(value.path().as_str())
-        .map_err(|_| GnmiError::schema("invalid operational instance"))?;
+    let parsed = validate_operational_identity(registry, value.path())?;
     let mut schema = String::new();
     for segment in parsed.segments() {
         schema.push('/');
@@ -705,11 +734,6 @@ pub(crate) fn project_operational_value(
         for (name, identity) in &segment.keys {
             let key = opc_mgmt_path::declared_key(registry, ancestor, name)
                 .ok_or_else(|| GnmiError::schema("invalid operational identity"))?;
-            if !opc_mgmt_path::key_allows_cleartext(registry, key.path) {
-                return Err(GnmiError::schema(
-                    "operational identity cannot be represented",
-                ));
-            }
             if key.path == node.path {
                 let json: serde_json::Value = serde_json::from_str(value.value_json())
                     .map_err(|_| GnmiError::schema("invalid operational value"))?;

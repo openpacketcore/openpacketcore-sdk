@@ -27,6 +27,9 @@ use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, 
 use opc_types::TenantId;
 use tonic::{Code, Request};
 
+#[path = "keyed_operational_reads/subscriptions.rs"]
+mod subscriptions;
+
 struct Registry;
 const fn leaf(path: &'static str, config: bool, class: DataClass) -> NodeMeta {
     NodeMeta {
@@ -165,6 +168,7 @@ impl AuditSink for Audit {
 }
 #[derive(Clone)]
 struct Binding {
+    registry: &'static dyn SchemaRegistry,
     bus: Arc<ConfigBus<()>>,
     provider: Arc<Provider>,
     policy: Arc<Policy>,
@@ -182,7 +186,7 @@ impl GnmiConfigBinding<()> for Binding {
         Arc::clone(&self.bus)
     }
     fn schema(&self) -> &'static dyn SchemaRegistry {
-        &Registry
+        self.registry
     }
     fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<()>> {
         Arc::new(self.clone())
@@ -236,7 +240,17 @@ async fn fixture(
     policies: Vec<NacmPolicy>,
     limits: MgmtLimits,
 ) -> (GnmiService<(), Binding>, Binding, Arc<Audit>) {
+    fixture_with_registry(values, policies, limits, &Registry).await
+}
+
+async fn fixture_with_registry(
+    values: Vec<OperationalValue>,
+    policies: Vec<NacmPolicy>,
+    limits: MgmtLimits,
+    registry: &'static dyn SchemaRegistry,
+) -> (GnmiService<(), Binding>, Binding, Arc<Audit>) {
     let binding = Binding {
+        registry,
         bus: Arc::new(
             ConfigBus::new_dev_only((), MockManagedDatastore::new())
                 .await
@@ -273,6 +287,235 @@ fn peer(name: &str, leaf: &str, json: &str) -> OperationalValue {
         &format!("/ex:system/ex:peer[ex:site='east'][ex:name='{name}']/ex:{leaf}"),
         json,
     )
+}
+
+struct MaskedRegistry {
+    nodes: &'static [NodeMeta],
+    key: &'static str,
+    class: Option<DataClass>,
+}
+
+impl SchemaRegistry for MaskedRegistry {
+    fn schema_digest(&self) -> &'static str {
+        "masked-key-fixture"
+    }
+    fn served_models(&self) -> &'static [ModelData] {
+        Registry.served_models()
+    }
+    fn nodes(&self) -> &'static [NodeMeta] {
+        self.nodes
+    }
+    fn origins(&self) -> &'static [OriginEntry] {
+        Registry.origins()
+    }
+    fn data_class(&self, path: &str) -> Option<DataClass> {
+        if path == self.key {
+            self.class
+        } else {
+            self.node(path).map(|node| node.data_class)
+        }
+    }
+}
+
+fn masked_registry(class: Option<DataClass>, secret_name: bool) -> &'static MaskedRegistry {
+    fn owned(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    let replace = |path: &str| {
+        owned(if secret_name {
+            path.replace("/ex:name", "/ex:password")
+        } else {
+            path.to_string()
+        })
+    };
+    let mut nodes = NODES.to_vec();
+    for node in &mut nodes {
+        node.path = replace(node.path);
+        node.child_paths = Box::leak(
+            node.child_paths
+                .iter()
+                .map(|path| replace(path))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        if node.path == "/ex:system/ex:peer" {
+            node.key_leaves = if secret_name {
+                &["site", "password"]
+            } else {
+                &["site", "name"]
+            };
+            let mut children = node.child_paths.to_vec();
+            children.push("/ex:system/ex:peer/ex:child");
+            children.sort_unstable();
+            node.child_paths = Box::leak(children.into_boxed_slice());
+        }
+    }
+    let key = replace("/ex:system/ex:peer/ex:name");
+    nodes
+        .iter_mut()
+        .find(|node| node.path == key)
+        .unwrap()
+        .data_class = class.unwrap_or(DataClass::Public);
+    nodes.extend([
+        NodeMeta {
+            kind: NodeKind::List,
+            leaf_type: None,
+            key_leaves: &["slot"],
+            child_paths: &[
+                "/ex:system/ex:peer/ex:child/ex:slot",
+                "/ex:system/ex:peer/ex:child/ex:up",
+            ],
+            ..leaf("/ex:system/ex:peer/ex:child", false, DataClass::Public)
+        },
+        leaf(
+            "/ex:system/ex:peer/ex:child/ex:slot",
+            false,
+            DataClass::Public,
+        ),
+        leaf(
+            "/ex:system/ex:peer/ex:child/ex:up",
+            false,
+            DataClass::Operational,
+        ),
+    ]);
+    nodes.sort_unstable_by_key(|node| node.path);
+    let registry = Box::leak(Box::new(MaskedRegistry {
+        nodes: Box::leak(nodes.into_boxed_slice()),
+        key,
+        class,
+    }));
+    registry.self_check().unwrap();
+    registry
+}
+
+fn masked_selection(secret_name: bool, nested: bool, guess: &str) -> gnmi::Path {
+    let mut path = selection(
+        &[(if secret_name { "password" } else { "name" }, guess)],
+        "up",
+    );
+    if nested {
+        path.elem.insert(
+            2,
+            gnmi::PathElem {
+                name: "child".into(),
+                key: HashMap::new(),
+            },
+        );
+    }
+    path
+}
+
+fn masked_instance(secret_name: bool, nested: bool) -> OperationalValue {
+    let key = if secret_name { "password" } else { "name" };
+    let child = if nested { "/ex:child[ex:slot='1']" } else { "" };
+    value(
+        &format!("/ex:system/ex:peer[ex:site='east'][ex:{key}='correct-marker']{child}/ex:up"),
+        "true",
+    )
+}
+
+#[tokio::test]
+async fn masked_composite_and_ancestor_matches_refuse_all_classes_and_get_locations() {
+    for (class, secret_name) in [
+        (Some(DataClass::SecuritySecret), false),
+        (Some(DataClass::LawfulIntercept), false),
+        (None, false),
+        (Some(DataClass::Public), true),
+    ] {
+        let registry = masked_registry(class, secret_name);
+        for nested in [false, true] {
+            for populated in [false, true] {
+                for allowed in [false, true] {
+                    for guess in ["correct-marker", "wrong-marker"] {
+                        for prefix in [false, true] {
+                            let values = if populated {
+                                vec![masked_instance(secret_name, nested)]
+                            } else {
+                                vec![]
+                            };
+                            let (service, binding, audit) = fixture_with_registry(
+                                values,
+                                vec![policy(if allowed { &["/ex:system/**"] } else { &[] })],
+                                MgmtLimits::default(),
+                                registry,
+                            )
+                            .await;
+                            let path = masked_selection(secret_name, nested, guess);
+                            let request = if prefix {
+                                get(vec![gnmi::Path::default()], Some(path))
+                            } else {
+                                get(vec![path], None)
+                            };
+                            let error = service.get(request).await.unwrap_err();
+                            assert_eq!(error.code(), Code::InvalidArgument);
+                            assert_eq!(error.message(), "invalid gNMI request");
+                            assert_eq!(binding.policy.calls.load(Ordering::SeqCst), 0);
+                            assert_eq!(binding.config_reads.load(Ordering::SeqCst), 0);
+                            assert!(binding.provider.requests.lock().unwrap().is_empty());
+                            assert_eq!(binding.renders.load(Ordering::SeqCst), 0);
+                            assert!(!format!("{error:?} {:?}", audit.0.lock().unwrap())
+                                .contains("marker"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn operational_key_payload_must_equal_the_complete_identity() {
+    let registry = masked_registry(Some(DataClass::Public), false);
+    for payload in ["1", "mismatch-marker"] {
+        let values = vec![value(
+            "/ex:system/ex:peer[ex:site='east'][ex:name='a']/ex:child[ex:slot='1']/ex:slot",
+            &serde_json::to_string(payload).unwrap(),
+        )];
+        let (service, _, _) = fixture_with_registry(
+            values,
+            vec![policy(&["/ex:system/**"])],
+            MgmtLimits::default(),
+            registry,
+        )
+        .await;
+        let mut path = masked_selection(false, true, "a");
+        path.elem.last_mut().unwrap().name = "slot".into();
+        let result = service.get(get(vec![path], None)).await;
+        if payload == "1" {
+            let output = decoded(result.unwrap().into_inner());
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].0[2].key["ex:slot"], "1");
+            assert_eq!(output[0].1, b"\"1\"");
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), Code::Internal);
+            assert_eq!(error.message(), "gNMI internal error");
+            assert!(!format!("{error:?}").contains("marker"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn operational_opaque_keyed_aggregate_requires_a_child_filtering_binding() {
+    let registry = masked_registry(Some(DataClass::Public), false);
+    let values = vec![value(
+        "/ex:system/ex:peer[ex:site='east'][ex:name='a']/ex:child[ex:slot='1']",
+        r#"{"slot":"1","up":"opaque-marker"}"#,
+    )];
+    let (service, _, _) = fixture_with_registry(
+        values,
+        vec![policy(&["/ex:system/**"])],
+        MgmtLimits::default(),
+        registry,
+    )
+    .await;
+    let error = service
+        .get(get(vec![selection(&[], "child")], None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Internal);
+    assert_eq!(error.message(), "gNMI internal error");
+    assert!(!format!("{error:?}").contains("marker"));
 }
 fn selection(keys: &[(&str, &str)], leaf: &str) -> gnmi::Path {
     gnmi::Path {

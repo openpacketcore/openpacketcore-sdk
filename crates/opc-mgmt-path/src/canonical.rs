@@ -57,22 +57,13 @@ impl<'a> CanonicalPath<'a> {
             let mut keys = Vec::new();
             let mut seen = BTreeSet::new();
             while let Some(predicate) = rest.strip_prefix('[') {
-                let (key, literal) = predicate.split_once('=').ok_or(CanonicalPathError)?;
+                let (key, value, remainder) = literal_predicate(predicate)?;
                 parse_qualified_name(key).ok_or(CanonicalPathError)?;
                 if !seen.insert(key) {
                     return Err(CanonicalPathError);
                 }
-                let quote = match literal.as_bytes().first() {
-                    Some(b'\'') => '\'',
-                    Some(b'"') => '"',
-                    _ => return Err(CanonicalPathError),
-                };
-                let literal = &literal[1..];
-                let end = literal.find(quote).ok_or(CanonicalPathError)?;
-                keys.push((key, &literal[..end]));
-                rest = literal[end + 1..]
-                    .strip_prefix(']')
-                    .ok_or(CanonicalPathError)?;
+                keys.push((key, value));
+                rest = remainder;
             }
             segments.push(CanonicalSegment { name, keys });
             if rest.is_empty() {
@@ -121,6 +112,59 @@ impl<'a> CanonicalPath<'a> {
                 .map(|segment| PathSegment::with_keys(segment.name, segment.keys.iter().copied())),
         )
     }
+}
+
+fn literal_predicate(predicate: &str) -> Result<(&str, &str, &str), CanonicalPathError> {
+    let (key, literal) = predicate.split_once('=').ok_or(CanonicalPathError)?;
+    let quote = match literal.as_bytes().first() {
+        Some(b'\'') => '\'',
+        Some(b'"') => '"',
+        _ => return Err(CanonicalPathError),
+    };
+    let literal = &literal[1..];
+    let end = literal.find(quote).ok_or(CanonicalPathError)?;
+    let remaining = literal[end + 1..]
+        .strip_prefix(']')
+        .ok_or(CanonicalPathError)?;
+    Ok((key, &literal[..end], remaining))
+}
+
+/// Matches only qualified node names and depth, without collecting key values.
+///
+/// This allocation-free structural check identifies an event's authorization
+/// dependencies before byte limits or instance validation. It uses the same
+/// literal boundaries as [`CanonicalPath::parse`], including ordinary
+/// backslashes, but does not validate key names, uniqueness, types or tuples.
+/// A matching authorized event still requires strict instance resolution.
+pub fn instance_schema_matches(schema_path: &str, instance_path: &str) -> bool {
+    let Some(mut rest) = instance_path.strip_prefix('/') else {
+        return false;
+    };
+    let Some(schema) = schema_path.strip_prefix('/') else {
+        return false;
+    };
+    let mut names = schema.split('/').peekable();
+    while let Some(name) = names.next() {
+        let end = rest.find(['/', '[']).unwrap_or(rest.len());
+        if name.is_empty() || name != &rest[..end] {
+            return false;
+        }
+        rest = &rest[end..];
+        while let Some(predicate) = rest.strip_prefix('[') {
+            let Ok((_, _, remainder)) = literal_predicate(predicate) else {
+                return false;
+            };
+            rest = remainder;
+        }
+        if names.peek().is_none() {
+            return rest.is_empty();
+        }
+        let Some(remainder) = rest.strip_prefix('/') else {
+            return false;
+        };
+        rest = remainder;
+    }
+    false
 }
 
 /// Tests the syntax and instance relation of two canonical paths.

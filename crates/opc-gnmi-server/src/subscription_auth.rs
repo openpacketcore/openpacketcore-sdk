@@ -56,16 +56,7 @@ impl StreamAuthorization {
     ) -> Result<Self, GnmiError> {
         let requested = selected
             .iter()
-            .map(|entry| {
-                if registry
-                    .node(entry.schema_path())
-                    .is_some_and(|node| !node.config)
-                {
-                    ReadNode::operational(entry.schema_path())
-                } else {
-                    ReadNode::projected(entry.schema_path())
-                }
-            })
+            .map(|entry| crate::get::read_node(registry, entry.schema_path()))
             .collect::<Vec<_>>();
         let authz =
             ReadAuthorizer::new(registry, source.as_ref()).map_err(|_| authorization_failure())?;
@@ -136,7 +127,7 @@ impl StreamAuthorization {
     /// a denied event does not examine revocation state or perform audit work.
     pub(crate) fn event(&self, node: &'static str) -> Result<bool, GnmiError> {
         let mut requested = self.requested.clone();
-        requested.push(ReadNode::operational(node));
+        requested.push(crate::get::read_node(self.registry, node));
         loop {
             let revision = self.gate.revision().map_err(|_| authorization_failure())?;
             let previous = self

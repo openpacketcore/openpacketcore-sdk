@@ -10,7 +10,7 @@ use crate::subscription_auth::{authorization_failure, StreamAuthorization};
 use opc_config_bus::{ConfigEvent, SubscriberLagPolicy};
 use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal, YangPath};
 use opc_mgmt_audit::{AuditOperation, AuditOutcome, SchemaNodePath};
-use opc_mgmt_authz::{AuthorizationGate, ReadAction, ReadAuthorizer, ReadNode};
+use opc_mgmt_authz::{AuthorizationGate, ReadAction, ReadAuthorizer};
 use opc_mgmt_opstate::{
     OperationalEvent, OperationalEventReceiver, OperationalSubscriptionRequest,
 };
@@ -21,12 +21,11 @@ use tonic::{Status, Streaming};
 use crate::audit::{outcome_for_error, record_audit, schema_paths_for_schema};
 use crate::get::{
     encoding_from_proto, handle_read_request, handle_subscribed_read, now_nanos, operational_error,
-    select_paths, select_read_request, update_to_proto, yang_path_to_proto, GetDataType,
-    ModelFilter,
+    project_operational_value, read_node, select_paths, select_read_request, update_to_proto,
+    validate_operational_identity, yang_path_to_proto, GetDataType, ModelFilter,
 };
 use crate::metrics::{
-    active_stream, record_nacm_denials, record_rpc_error, GnmiNacmAction, GnmiOperation,
-    SubscribeModeMetric,
+    active_stream, record_rpc_error, GnmiNacmAction, GnmiOperation, SubscribeModeMetric,
 };
 use crate::proto::gnmi;
 use crate::proto_adapter::path_from_proto;
@@ -586,15 +585,11 @@ where
         .paths()
         .iter()
         .filter(|path| {
-            server
-                .binding()
-                .schema()
-                .node(path.as_str())
-                .is_some_and(|node| {
-                    plan.authorization
-                        .as_ref()
-                        .is_some_and(|auth| auth.permits_request(node.path))
-                })
+            event_schema_node(server.binding().schema(), path.as_str()).is_some_and(|node| {
+                plan.authorization
+                    .as_ref()
+                    .is_some_and(|auth| auth.permits_request(node.path))
+            })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -676,7 +671,8 @@ where
         .operational_request
         .as_ref()
         .ok_or_else(|| GnmiError::schema("operational event sent without subscription request"))?;
-    let Some(node) = server.binding().schema().node(event.path().as_str()) else {
+    let registry = server.binding().schema();
+    let Some(node) = event_schema_node(registry, event.path().as_str()) else {
         return Ok(None);
     };
     let allowed = match &plan.authorization {
@@ -689,7 +685,7 @@ where
                 .authorize_selection(
                     principal,
                     ReadAction::Subscribe,
-                    &[ReadNode::operational(node.path)],
+                    &[read_node(registry, node.path)],
                     &Default::default(),
                 )
                 .map_err(|_| authorization_failure())?
@@ -699,9 +695,20 @@ where
         }
     };
     if !allowed {
-        record_nacm_denials(GnmiNacmAction::Subscribe, 1);
         return Ok(None);
     }
+    server
+        .limits()
+        .check_value_bytes(event.path().as_str().len())
+        .map_err(GnmiError::from_limits)?;
+    if let OperationalEvent::Update(value) = &event {
+        server
+            .limits()
+            .check_value_bytes(value.value_json().len())
+            .map_err(GnmiError::from_limits)?;
+    }
+    opc_mgmt_path::resolve_instance(registry, event.path())
+        .map_err(|_| GnmiError::schema("invalid operational instance"))?;
     if node.config {
         return Err(GnmiError::schema(
             "operational event path resolved to config data",
@@ -718,6 +725,7 @@ where
 
     let notification = match event {
         OperationalEvent::Update(value) => {
+            let value = project_operational_value(registry, &value, node)?;
             let update = GnmiJsonUpdate::new(value.path().clone(), value.value_json().to_string())
                 .map_err(|err| GnmiError::schema(err.detail().to_string()))?;
             gnmi::Notification {
@@ -728,13 +736,16 @@ where
                 atomic: true,
             }
         }
-        OperationalEvent::Delete { path } => gnmi::Notification {
-            timestamp: now_nanos(),
-            prefix: None,
-            update: Vec::new(),
-            delete: vec![yang_path_to_proto(&path)?],
-            atomic: true,
-        },
+        OperationalEvent::Delete { path } => {
+            validate_operational_identity(registry, &path)?;
+            gnmi::Notification {
+                timestamp: now_nanos(),
+                prefix: None,
+                update: Vec::new(),
+                delete: vec![yang_path_to_proto(&path)?],
+                atomic: true,
+            }
+        }
     };
 
     let response = gnmi::SubscribeResponse {
@@ -742,6 +753,16 @@ where
         extension: Vec::new(),
     };
     Ok(Some(response))
+}
+
+fn event_schema_node(
+    registry: &dyn opc_mgmt_schema::SchemaRegistry,
+    path: &str,
+) -> Option<&'static opc_mgmt_schema::NodeMeta> {
+    registry
+        .nodes()
+        .iter()
+        .find(|node| opc_mgmt_path::instance_schema_matches(node.path, path))
 }
 
 async fn audit_subscribe_result<C, B>(
@@ -785,16 +806,48 @@ fn fingerprint_responses(responses: &[gnmi::SubscribeResponse]) -> Vec<u8> {
     let mut out = Vec::new();
     for response in responses {
         let mut content = response.clone();
+        let mut keys = Vec::new();
         if let Some(gnmi::subscribe_response::Response::Update(notification)) =
             &mut content.response
         {
             notification.timestamp = 0;
+            if let Some(prefix) = &mut notification.prefix {
+                fingerprint_path_keys(prefix, &mut keys);
+            }
+            for update in &mut notification.update {
+                if let Some(path) = &mut update.path {
+                    fingerprint_path_keys(path, &mut keys);
+                }
+            }
+            for path in &mut notification.delete {
+                fingerprint_path_keys(path, &mut keys);
+            }
         }
         content
             .encode_length_delimited(&mut out)
             .expect("encoding SubscribeResponse to Vec cannot fail");
+        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+        out.extend_from_slice(&keys);
     }
     out
+}
+
+// Protobuf map encoding follows HashMap iteration order. Extract the keys in a
+// stable order before encoding the remaining message, preserving every literal
+// value and boundary in the fingerprint.
+fn fingerprint_path_keys(path: &mut gnmi::Path, out: &mut Vec<u8>) {
+    for element in &mut path.elem {
+        let mut keys: Vec<_> = element.key.iter().collect();
+        keys.sort_unstable_by_key(|(name, _)| *name);
+        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+        for (name, value) in keys {
+            for text in [name, value] {
+                out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+            }
+        }
+        element.key.clear();
+    }
 }
 
 #[derive(Default)]
