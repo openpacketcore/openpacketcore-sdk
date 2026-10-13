@@ -2625,6 +2625,7 @@ fn audit_recovery(
     )
 }
 
+#[cfg(test)]
 fn audit_recovery_projected(
     directory: &Path,
     binding: Binding,

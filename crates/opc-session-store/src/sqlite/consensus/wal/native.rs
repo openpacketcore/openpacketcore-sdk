@@ -296,7 +296,7 @@ fn audit_native_recovery(
 }
 
 impl Opening {
-    #[cfg(any(test, feature = "test-control"))]
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn new(
         directory: &Path,
         binding: Binding,
@@ -538,7 +538,7 @@ impl Opening {
         self.finish_with_install_source(None, verify)
     }
 
-    #[cfg(any(test, feature = "test-control"))]
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn finish_with_install_source(
         self,
         source: Option<&snapshot::InstallSource>,
