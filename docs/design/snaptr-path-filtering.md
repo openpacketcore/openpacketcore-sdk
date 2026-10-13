@@ -1,14 +1,12 @@
 # S-NAPTR path filtering
 
-STATE: needs-review
-
-Proposed addition to [bounded S-NAPTR discovery](../rfc/031-bounded-snaptr-discovery.md)
+An addition to [bounded S-NAPTR discovery](../rfc/031-bounded-snaptr-discovery.md)
 for [issue #1276](https://github.com/openpacketcore/openpacketcore-sdk/issues/1276).
 
-## Tests first
+## Regression contract
 
-These regressions precede implementation after design acceptance. Use synthetic
-DNS fixtures, fixed seeds and controlled response ordering.
+The regression fixtures use synthetic DNS, fixed seeds and controlled response
+ordering.
 
 | Case | Required observation |
 | --- | --- |
@@ -18,14 +16,15 @@ DNS fixtures, fixed seeds and controlled response ordering.
 | Response order | Reverse wire RRset order and independently force replies to complete in reverse traversal order. The same seed and exclusions produce the same endpoints and ranking paths. |
 | Provenance and references | Remove primary and alternate paths separately. Keep endpoints unique; promote the best surviving path; rebuild every host, candidate and path index. No reference or primary record chain may name excluded data. |
 | Freshness | Remove a uniquely short-lived path and check expiry against the remaining original deadlines; retain shared RRset minima and both resolver freshness bounds. Cover staggered observations, zero/high-bit TTLs and already expired records. Filtering reads no clock and restarts no TTL. |
-| Partial results and failures | Filter capped, omitted-alternate, refused and failed results. Preserve coverage, incomplete-host flags, failure bounds and response diagnostics; do not recover omitted paths or claim exhaustive coverage. |
+| Partial results and failures | Filter capped, omitted-alternate, refused and failed results. Preserve coverage, incomplete-host flags, failure bounds and response diagnostics; do not recover omitted paths or claim exhaustive coverage. Include the controlled full-prefix regression below. |
 | Empty and invalid inputs | Excluding every path returns `Ok(None)`. Address, SRV, legacy and mixed answers lacking complete S-NAPTR metadata return `InvalidQuery` without invoking the predicate. Neither case creates a DNS negative or fallback authority. |
 | Identity and composition | Keeping every path returns an equal answer with identical order, weights, provenance, references, expiry and coverage. Repeated pure filtering equals conjunction of the predicates. Filtering a cached answer leaves the cache and its scheduling state unchanged. |
+| Authority changes on a cached answer | Publish the original three-host answer and test both fresh and stale lookups. Initially accept U, B and A; then remove U and require B/Y followed by A/X, with the correct first path and primary record chain for each endpoint. Remove B too and require A/X. Exclude all hosts and require `Ok(None)` while the original answer, coverage and cache status remain unchanged. Re-allow U by filtering the original answer again and recover U/X in its original position. None of these filtering calls issues a DNS query. |
 | Bounds | The predicate runs exactly once per retained path; no DNS I/O occurs. Include the retained ranks in the existing maximum-payload size regression. |
 
 ## API
 
-Add one borrowed operation to `DnsAnswer`:
+`DnsAnswer` provides one borrowed operation:
 
 ```rust,ignore
 pub fn filter_snaptr_paths<F>(&self, keep: F) -> Result<Option<Self>, DnsError>
@@ -79,10 +78,20 @@ Coverage describes the original bounded discovery. Copy every `SnaptrCoverage`
 field unchanged; consumer exclusions do not increment application/protocol
 `filtered_records` or erase omissions, refusals and failures. Filtering cannot
 backfill an endpoint/path cap or evaluate a predicate against an unvisited or
-failed path. Existing failure bounds remain conservative: do not reinterpret
-which failures affect freshness using the reduced endpoint set. Response sources,
-question outcomes, branch failures and root diagnostics remain on the original
-`DnsClientResponse`; this answer-only operation does not rewrite them.
+failed path.
+
+Copy both existing freshness bounds unchanged. Their scope remains the original
+discovery prefix: a failed branch below a previously full prefix may have no
+retained freshness bound, even if consumer exclusions leave a surviving alternate
+ranked after it. Filtering does not recompute failed-branch relevance or certify
+an exhaustive authorized prefix. Response sources, question outcomes, branch
+failures and root diagnostics remain on the original `DnsClientResponse`; this
+answer-only operation does not rewrite them. Add a controlled-order regression
+with order-10 U supplying 16 endpoints, order-20 F failing after that prefix fills,
+and an already admitted order-30 A retaining an alternate to X. Exclude U and
+require A/X with A's ranking path, unchanged original failure-bound behavior,
+preserved incomplete coverage and failure observations, and unchanged cache
+scheduling.
 
 Apply the operation as a consumer selection view, including after cache lookup.
 Publish the original DNS result to the shared cache: its key contains no consumer
@@ -93,6 +102,4 @@ selection, never authoritative absence or permission for protocol downgrade.
 The operation uses only the retained bounded payload: at most 16 endpoints,
 four paths per endpoint and 16 rank components per path. Account for rank storage
 inside the existing 2 MiB metadata bound. No additional DNS work, dependencies,
-background task or durable format is introduced. After acceptance, implement in
-`opc-peer-discovery`, retain the behavioral failure evidence, and qualify the
-crate and applicable repository gates on the final candidate.
+background task or durable format is introduced.

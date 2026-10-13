@@ -12,25 +12,6 @@ fn filter_query() -> DnsQuery {
     query_for(ROOT_FILTER, "x-example", "x-test")
 }
 
-// Tests-first compatibility bridge: baseline discovery has no path-filter API.
-// It represents the current unfiltered selection and is removed when the
-// inherent operation is implemented. Runtime assertions, not a missing method,
-// demonstrate the changed contract on real resolver output.
-trait PendingPathFilter {
-    fn filter_snaptr_paths(
-        &self,
-        keep: impl FnMut(&SnaptrPath) -> bool,
-    ) -> Result<Option<DnsAnswer>, DnsError>;
-}
-impl PendingPathFilter for DnsAnswer {
-    fn filter_snaptr_paths(
-        &self,
-        _keep: impl FnMut(&SnaptrPath) -> bool,
-    ) -> Result<Option<DnsAnswer>, DnsError> {
-        Ok(Some(self.clone()))
-    }
-}
-
 async fn three_hosts(ttls: [u32; 3]) -> (FakeDns, DnsClientResponse) {
     let dns = FakeDns::new(move |q| {
         let (owner, kind, _) = question(q);
@@ -352,6 +333,12 @@ async fn path_filter_rejects_non_snaptr_and_incomplete_metadata_before_callbacks
         invalid.push(DnsAnswer::new(vec![source.clone(), candidate]).unwrap());
     }
     invalid.push(DnsAnswer::new(vec![DnsCandidate::without_ttl(source.peer().clone())]).unwrap());
+    let mut missing_rank = source.clone();
+    missing_rank.snaptr.as_mut().unwrap().paths[0].rank = Box::default();
+    let mut mixed = DnsAnswer::new(vec![source.clone(), missing_rank]).unwrap();
+    mixed.snaptr_hosts = original.snaptr_hosts.clone();
+    mixed.snaptr_coverage = original.snaptr_coverage;
+    invalid.push(mixed);
     for answer in invalid {
         let mut calls = 0;
         assert_eq!(
@@ -734,12 +721,11 @@ async fn path_filter_after_full_prefix_preserves_original_failure_scope_and_cach
 #[tokio::test(start_paused = true)]
 async fn path_filter_keeps_omissions_refusals_failures_and_incomplete_host_flags() {
     const C: &str = "c.example.invalid.";
-    const D: &str = "d.example.invalid.";
     let dns = FakeDns::new(|q| {
         let (owner, kind, _) = question(q);
         let answers = match (owner.as_str(), kind) {
             (ROOT_FILTER, 35) => {
-                let mut records: Vec<_> = [U, B, A, C, D, F]
+                let mut records: Vec<_> = [U, B, A, C, B, F]
                     .into_iter()
                     .enumerate()
                     .map(|(i, host)| {
@@ -758,7 +744,7 @@ async fn path_filter_keeps_omissions_refusals_failures_and_incomplete_host_flags
                 ));
                 records
             }
-            (U | B | A | C | D, 1) => vec![address(&owner, "192.0.2.1", 900)],
+            (U | B | A | C, 1) => vec![address(&owner, "192.0.2.1", 900)],
             (F, 1) => return Some(reply(q, 5, &[], &[], &[])),
             _ => panic!("unexpected question {owner} {kind}"),
         };
@@ -777,6 +763,13 @@ async fn path_filter_keeps_omissions_refusals_failures_and_incomplete_host_flags
     assert_eq!(coverage.refused_branches, 1);
     assert_eq!(coverage.failed_branches, 1);
     assert!(coverage.incomplete);
+    assert!(!original
+        .snaptr_hosts()
+        .unwrap()
+        .iter()
+        .find(|h| h.name().as_str() == B)
+        .unwrap()
+        .complete());
     assert_eq!(
         original.filter_snaptr_paths(|_| true).unwrap(),
         Some(original.clone())

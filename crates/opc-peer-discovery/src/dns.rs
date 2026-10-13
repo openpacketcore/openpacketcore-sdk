@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use crate::{DiscoveryTarget, PeerCandidate, PeerDiscoveryTime, ServiceDiscoveryInput};
 
+#[path = "dns_snaptr_filter.rs"]
+mod path_filter;
+
 /// Canonical absolute ASCII DNS name, redacted in diagnostics.
 ///
 /// Names are lowercased and have exactly one terminal dot. IDNA conversion is

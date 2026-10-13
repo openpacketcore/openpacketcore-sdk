@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-peer-discovery`: add `DnsAnswer::filter_snaptr_paths` to apply consumer
+  path policy while preserving the original seeded S-NAPTR traversal order.
+  Surviving paths determine endpoint order and primary provenance; original
+  discovery coverage, record times and failure bounds are retained. (#1276)
+
 - `opc-yanggen`: support all eight integer widths, exact declared ranges,
   RFC 7951 strings for 64-bit values, and deterministic distinct Rust types for
   nested nodes sharing a local name. Support Unicode string lengths, multiple
