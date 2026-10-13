@@ -1413,3 +1413,46 @@ async fn subtree_content_reference_limit_counts_decoded_bytes() {
       }
     }
 }
+
+#[tokio::test]
+async fn subtree_content_masked_defaults_preserve_presence() {
+    for presence in [LeafPresence::Defaulted("hidden-default".into()), LeafPresence::Defaulted("other".into()), LeafPresence::Explicit("hidden-default".into())] {
+        let mut model = config();
+        model.secret_default = SecretLeaf::new(presence);
+        let fixture = Fixture::new(model, &[]).await;
+        for op in ["get-config", "get", "get-data"] {
+          for mode in ["", "explicit", "trim", "report-all", "report-all-tagged"] {
+            let body = |children| if op == "get-data" { nmda("running", None, children, mode) } else { request(op, children, mode) };
+            let ordinary = fixture.rpc(&body("<secret-default/>"), MgmtLimits::default()).await;
+            let content = fixture.rpc(&body("<hostname>router-marker</hostname><secret-default/>"), MgmtLimits::default()).await;
+            assert_eq!(data(&content).contains("<ex:secret-default"), data(&ordinary).contains("<ex:secret-default"), "{op} {mode}: {ordinary} / {content}");
+            assert_eq!(data(&content).contains("wd:default=\"true\""), data(&ordinary).contains("wd:default=\"true\""));
+            assert_eq!(data(&content).matches("&lt;redacted&gt;").count(), data(&ordinary).matches("&lt;redacted&gt;").count());
+            assert!(!content.contains("hidden-default"));
+        }
+      }
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_masked_leaf_list_preserves_members_with_fixed_work() {
+    for op in ["get-config", "get", "get-data"] {
+        let mut expected = None;
+        let mut fixed_work = None;
+        for size in [1, 4096] {
+            let mut model = config();
+            model.credentials = SecretLeaf::new(vec![format!("a{}", "s".repeat(size)), format!("b{}", "s".repeat(size))]);
+            let fixture = Fixture::new(model, &[]).await;
+            let body = request(op, "<hostname>router-marker</hostname><credentials/><credentials/>", "");
+            if fixed_work.is_none() {
+                assert_eq!(tags(&fixture.rpc(&body, MgmtLimits::default()).await, "credentials"), ["&lt;redacted&gt;"; 2]);
+                fixed_work = Some(MgmtLimits::default().max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining());
+            }
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap(), ..MgmtLimits::default() }).await;
+            assert_eq!(tags(&reply, "credentials"), ["&lt;redacted&gt;"; 2]);
+            let observed = (reply, fixture.observation());
+            if let Some(expected) = &expected { assert_eq!(&observed, expected); }
+            expected = Some(observed);
+        }
+    }
+}

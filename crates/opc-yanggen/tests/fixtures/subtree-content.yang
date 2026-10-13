@@ -23,6 +23,8 @@ module subtree-content {
     leaf identity-ref { type string; opc:data-class "public"; }
     leaf opaque-ref { type string; opc:data-class "public"; }
     leaf secret { type string; opc:data-class "security-secret"; }
+    leaf secret-default { type string; default "hidden-default"; opc:data-class "security-secret"; }
+    leaf-list credentials { type string; opc:data-class "security-secret"; }
     leaf intercept { type string; opc:data-class "lawful-intercept"; }
     leaf password { type string; }
     leaf unclassified { type string; opc:data-class "security-secret"; }
