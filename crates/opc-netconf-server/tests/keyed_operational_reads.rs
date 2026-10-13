@@ -283,7 +283,11 @@ async fn fixture_with_registry(
     (server, binding, policy, audit)
 }
 
-fn rpc(server: &Server, operation: &str, limits: &MgmtLimits) -> String {
+fn rpc<B: NetconfConfigBinding<()>>(
+    server: &ReadOnlyNetconfServer<(), B, Arc<Policy>, Arc<Audit>>,
+    operation: &str,
+    limits: &MgmtLimits,
+) -> String {
     let principal = TrustedPrincipal::new(
         WorkloadIdentity::User("reader".into()),
         TenantId::from_static("example"),
@@ -295,6 +299,92 @@ fn rpc(server: &Server, operation: &str, limits: &MgmtLimits) -> String {
         &format!(r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="1">{operation}</rpc>"#),
         limits,
     )
+}
+
+struct ProjectionProbe(Binding);
+
+impl NetconfConfigBinding<()> for ProjectionProbe {
+    fn config_bus(&self) -> Arc<ConfigBus<()>> {
+        self.0.config_bus()
+    }
+
+    fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+        self.0.schema_registry()
+    }
+
+    fn nmda_get_data_supported(&self) -> bool {
+        true
+    }
+
+    fn get_operational_state(
+        &self,
+        request: &OperationalRequest,
+    ) -> Result<OperationalResponse, OperationalError> {
+        self.0.get_operational_state(request)
+    }
+
+    fn render_get_data(
+        &self,
+        _: &(),
+        _: opc_netconf_server::ReadSelection<'_>,
+        _: &OperationalResponse,
+        _: opc_netconf_server::ReadSelection<'_>,
+    ) -> Result<String, opc_netconf_server::BindingError> {
+        self.0.renders.fetch_add(1, Ordering::SeqCst);
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn netconf_complete_instance_validation_precedes_custom_projection() {
+    for (path, valid) in [
+        (
+            "/ex:system/ex:peer[ex:site='east'][ex:name='a']/ex:up",
+            true,
+        ),
+        ("/ex:system/ex:peer[ex:name='a']/ex:up", false),
+        (
+            "/ex:system/ex:peer[ex:name='a'][ex:site='east']/ex:up",
+            false,
+        ),
+        (
+            "/ex:system/ex:peer[ex:site=\"east\"][ex:name='a']/ex:up",
+            false,
+        ),
+    ] {
+        for operation in [get, get_data] {
+            let (_, binding, source, audit) = fixture(
+                vec![value(path, "true")],
+                vec![policy(&["/ex:system", "/ex:system/**"])],
+            )
+            .await;
+            let server = ReadOnlyNetconfServer::new(
+                ProjectionProbe(binding.clone()),
+                source.clone(),
+                audit,
+                TransportType::NetconfTls,
+            )
+            .unwrap();
+            let reply = rpc(
+                &server,
+                &operation(r#"<system xmlns="urn:example"><peer><up/></peer></system>"#),
+                &MgmtLimits::default(),
+            );
+            assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(binding.provider.requests.lock().unwrap().len(), 1);
+            if valid {
+                assert!(!reply.contains("<rpc-error"), "{reply}");
+                assert_eq!(binding.renders.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(
+                    reply.contains("<error-tag>operation-failed</error-tag>"),
+                    "{reply}"
+                );
+                assert!(!reply.contains("<data"));
+                assert_eq!(binding.renders.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
 }
 
 fn value(path: &str, json: &str) -> OperationalValue {
