@@ -43,6 +43,10 @@ pub(super) struct CacheGuard {
     changes: u64,
     data_version: i64,
     schema_version: i64,
+    // None requires the original payload audit. Some binds its exact logical
+    // last log (including an empty log) to these same connection counters.
+    // Only a complete restore, original apply, or snapshot audit establishes it.
+    audited_last_log: Option<Option<LogId<SessionConsensusNodeId>>>,
 }
 
 /// A full audit (or an audited extension) proved this exact applied prefix.
@@ -434,6 +438,14 @@ impl Wal {
                     if control == ApplyControl::BeforeSqliteCommit {
                         return Err(io::Error::other("private WAL injected pre-commit failure"));
                     }
+                    // Marker triggers may change the log after the original
+                    // apply validators. Audit the stored final row before its
+                    // connection counters can establish a reusable proof.
+                    let final_entry = entries
+                        .last()
+                        .ok_or_else(|| invalid_data("private WAL application batch is empty"))?;
+                    let audited_last_log =
+                        audit_final_application_log(tx, self.binding, final_entry)?;
                     let token = state
                         .application_guard
                         .as_ref()
@@ -441,7 +453,11 @@ impl Wal {
                             invalid_data("private WAL cache connection is not attached")
                         })?
                         .token;
-                    *next_guard.borrow_mut() = Some(read_cache_guard(tx, token)?);
+                    let mut guard = read_cache_guard(tx, token)?;
+                    // Publication still waits for projection and response
+                    // verification below.
+                    guard.audited_last_log = Some(audited_last_log);
+                    *next_guard.borrow_mut() = Some(guard);
                     commit_started.set(Some(Instant::now()));
                     Ok(())
                 },
@@ -597,9 +613,23 @@ fn validate_cache_frontier(conn: &Connection, state: &State, binding: Binding) -
     }
     state.authority.validate(conn, binding.identity)?;
     let applied = read_applied_sync(conn, binding.identity)?;
+    let last_log = match state
+        .application_guard
+        .as_ref()
+        .and_then(|guard| guard.audited_last_log)
+    {
+        Some(last_log) => {
+            // Reuse only under the exact owner-committed SQL image. Re-decoding
+            // a large last command on every guarded metadata read otherwise
+            // makes that read's cost depend on an unrelated payload's size.
+            validate_cache_guard(conn, state)?;
+            last_log
+        }
+        None => consensus::last_log_sync(conn, binding.identity)?,
+    };
     if applied != read_applied_sync(&state.conn, binding.identity)?
         || read_committed_sync(conn, binding.identity)? != applied
-        || consensus::last_log_sync(conn, binding.identity)? != applied
+        || last_log != applied
     {
         return Err(invalid_data(
             "private WAL application cache frontier differs",
@@ -607,6 +637,32 @@ fn validate_cache_frontier(conn: &Connection, state: &State, binding: Binding) -
     }
     validate_marker(conn, state, binding, applied)?;
     Ok(())
+}
+
+fn audit_final_application_log(
+    conn: &Connection,
+    binding: Binding,
+    expected: &Entry<SessionRaftTypeConfig>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    let encoded = encode_json(expected)?;
+    let stored = conn
+        .query_row(
+            "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
+            [consensus::checked_i64(expected.log_id.index)?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if stored.as_ref() != Some(&encoded) {
+        return Err(invalid_data("private WAL application final log differs"));
+    }
+    // Retain the original highest-row, purge-floor, row/ID and command checks.
+    // Payload equality above also refuses a different valid entry at the same ID.
+    let audited = consensus::last_log_sync(conn, binding.identity)?;
+    if audited != Some(expected.log_id) {
+        return Err(invalid_data("private WAL application final log differs"));
+    }
+    Ok(audited)
 }
 
 fn require_exact_entries(
@@ -772,7 +828,10 @@ pub(super) fn restore_transaction(
     let token = *uuid::Uuid::new_v4().as_bytes();
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS consensus_wal_application_connection (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), token BLOB NOT NULL)").map_err(db_error)?;
     conn.execute("INSERT OR REPLACE INTO temp.consensus_wal_application_connection (singleton, token) VALUES (1, ?1)", params![token.as_slice()]).map_err(db_error)?;
-    let guard = read_cache_guard(conn, token)?;
+    let mut guard = read_cache_guard(conn, token)?;
+    // The complete prefix/content audit above proved last_log == applied.
+    // Installing the connection token above changes no application or log row.
+    guard.audited_last_log = Some(applied);
     Ok(RestoredCache {
         guard,
         applied,
@@ -823,6 +882,7 @@ fn read_cache_guard(conn: &Connection, token: [u8; 16]) -> io::Result<CacheGuard
         schema_version: conn
             .pragma_query_value(Some("main"), "schema_version", |row| row.get(0))
             .map_err(db_error)?,
+        audited_last_log: None,
     })
 }
 
@@ -913,10 +973,17 @@ pub(super) fn complete_snapshot_cache(
     state.application_guard = Some(guard);
     validate_cache_guard(conn, state)?;
     audit_snapshot_cache(conn, &state.conn, binding, &state.application_marker)?;
-    state.applied_prefix = read_applied_sync(&state.conn, binding.identity)?
+    let applied = read_applied_sync(&state.conn, binding.identity)?;
+    state.applied_prefix = applied
         .map(|applied| AppliedPrefix::after_audit(state, binding, applied))
         .transpose()?;
-    validate_cache_guard(conn, state)
+    validate_cache_guard(conn, state)?;
+    if let Some(guard) = &mut state.application_guard {
+        // Snapshot compaction may change the physical last row. Its complete
+        // audit above proves the logical frontier before enabling reuse again.
+        guard.audited_last_log = Some(applied);
+    }
+    Ok(())
 }
 
 fn marker(conn: &Connection) -> io::Result<Option<Marker>> {

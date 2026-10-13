@@ -4,12 +4,16 @@ use super::{
     policy::{RoutedCall, ScopeRole},
     pool::{ProofPools, ProofShare},
     proof::{PossessionClaims, PossessionProof},
+    revision::{self, QUORUM_REQUEST},
     rpc::*,
     wire::*,
 };
 use opc_session_store::{
     scope_authority::*,
-    scope_batch::{ScopeBatchAttempt, ScopeBatchError, ScopeBatchRequest, ScopeBatchStore},
+    scope_batch::{
+        ScopeBatchAttempt, ScopeBatchError, ScopeBatchRequest, ScopeBatchStore,
+        ScopeChildReadRequest,
+    },
     scope_scheduler::ScopeWorkClass,
     SessionConsumerIdentity,
 };
@@ -32,6 +36,7 @@ const CLASSES: [Class; 5] = [
 ];
 #[cfg(test)]
 mod batch_tests;
+mod child_reads;
 mod listener;
 #[cfg(test)]
 mod scan_tests;
@@ -114,6 +119,13 @@ impl ScopeServer {
     #[cfg(test)]
     pub(crate) fn unproven_proof_waiters_for_test(&self, class: Class) -> usize {
         self.proofs.waiting(class, ProofShare::WorkerUnproven)
+    }
+    #[cfg(test)]
+    pub(crate) fn child_read_proof_usage_for_test(&self, class: Class) -> (usize, usize) {
+        (
+            self.proofs.used(class, ProofShare::WorkerUnproven),
+            self.proofs.used(class, ProofShare::WorkerCurrent),
+        )
     }
     #[cfg(test)]
     pub(crate) fn lose_next_scan_reply_for_test(&self) {
@@ -215,16 +227,30 @@ impl ScopeServer {
             .begin_handshake()
             .map_err(|_| ScopeRpcError::Retry)?;
         let (connection, first, scope) = timeout(Duration::from_secs(5), async {
-            let mut connection = handshake
-                .accept_scope_unbound(io)
-                .await
-                .map_err(|_| ScopeRpcError::Unauthorized)?;
+            let mut connection = handshake.accept_scope_unbound(io).await.map_err(|error| {
+                revision::rpc_handshake_error(QUORUM_REQUEST, error, ScopeRpcError::Unauthorized)
+            })?;
+            if let Ok(interval) = self.config.clock.interval() {
+                if let Ok(authentication) = connection.authentication_state(interval) {
+                    revision::authenticated_handshake(QUORUM_REQUEST, &authentication);
+                }
+            }
             let mut fixed = [0; HEADER_BYTES];
             connection
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let header =
+                revision::rpc_header(&fixed, QUORUM_REQUEST, ScopeRpcError::Invalid, || {
+                    connection
+                        .authentication_state(
+                            self.config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if header.kind != FrameKind::Call || header.class != class {
                 return Err(ScopeRpcError::Invalid);
             }
@@ -274,7 +300,16 @@ impl ScopeServer {
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?
                 .map_err(|_| ScopeRpcError::Retry)?;
-            header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            header = revision::rpc_header(&fixed, QUORUM_REQUEST, ScopeRpcError::Invalid, || {
+                connection
+                    .authentication_state(
+                        self.config
+                            .clock
+                            .interval()
+                            .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                    )
+                    .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+            })?;
         }
     }
     async fn call(
@@ -310,7 +345,10 @@ impl ScopeServer {
                         .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
                 )
                 .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
-            if let Some(stamp) = promoted.clone() {
+            if let Some(stamp) = promoted
+                .clone()
+                .filter(|_| header.method != Method::ChildRead)
+            {
                 let context = Context {
                     route: route.clone(),
                     scope: scope.clone(),
@@ -415,9 +453,9 @@ impl ScopeServer {
                 return Err(error);
             }
         };
-        let _running = if header.method.is_scan() {
-            // Scan execution is owned by the store's actual workers. In
-            // particular, retention queueing must not hold a second permit.
+        let _running = if header.method.is_scan() || header.method == Method::ChildRead {
+            // Scans own their execution credits in the store. Child reads
+            // obtain their dispatch credit only after validating the sole cut.
             None
         } else {
             Some(
@@ -436,7 +474,20 @@ impl ScopeServer {
                     .map_err(|_| ScopeRpcError::Retry)?,
             )
         };
+        let mut child_reply_deadline = None;
         let outcome = match call {
+            Ok(NativeCall::ChildRead(request)) => {
+                // The cached hint selected only a proof share. The sole read
+                // cut must independently establish current authority and class.
+                *promoted = None;
+                self.dispatch_child_read(
+                    connection,
+                    &request,
+                    admission.clone(),
+                    &mut child_reply_deadline,
+                )
+                .await
+            }
             Ok(call) if header.method.is_scan() => {
                 // Requests are sequential on this channel. EOF cancels a
                 // waiting admission promptly; pipelining is not a valid next
@@ -456,11 +507,39 @@ impl ScopeServer {
             .and_then(|v| v),
             Err(refusal) => Err(refusal),
         };
-        let (status, own, body, current) = match outcome {
+        let (mut status, mut own, mut body, mut current) = match outcome {
             Ok(value) => value,
-            Err(error) => (error_status(error).0, [0; 32], error_status(error).1, None),
+            Err(error) => {
+                let (status, body) = error_status(error)?;
+                (status, [0; 32], body, None)
+            }
         };
-        admission.check().map_err(authority_error)?;
+        if let Err(error) = admission.check() {
+            if header.method != Method::ChildRead || error != ScopeAuthorityError::Unauthorized {
+                return Err(authority_error(error));
+            }
+            // The read has drained its cut and class credit. A revoked caller
+            // can receive a correlated refusal only while TLS remains live.
+            connection
+                .authentication_state(
+                    self.config
+                        .clock
+                        .interval()
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                )
+                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?;
+            (status, body) = error_status(ScopeRpcError::Unauthorized)?;
+            own = [0; 32];
+            current = None;
+            *promoted = None;
+            child_reply_deadline = None;
+        }
+        if child_reply_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            (status, body) = error_status(ScopeRpcError::Retry)?;
+            own = [0; 32];
+            current = None;
+            child_reply_deadline = None;
+        }
         #[cfg(test)]
         if status == ResultStatus::ScanObservation
             && self
@@ -526,7 +605,9 @@ impl ScopeServer {
         let reply = header
             .response(FrameKind::Result, bytes.len())
             .map_err(|_| ScopeRpcError::Invalid)?;
-        timeout(Duration::from_secs(5), async {
+        let write_deadline = Instant::now() + Duration::from_secs(5);
+        let write_deadline = child_reply_deadline.map_or(write_deadline, |d| d.min(write_deadline));
+        tokio::time::timeout_at(write_deadline, async {
             connection
                 .write_all(&reply.encode().map_err(|_| ScopeRpcError::Invalid)?)
                 .await
@@ -599,7 +680,17 @@ impl ScopeServer {
                 .read_exact(&mut fixed)
                 .await
                 .map_err(|_| ScopeRpcError::Retry)?;
-            let proof_header = Header::decode(&fixed).map_err(|_| ScopeRpcError::Invalid)?;
+            let proof_header =
+                revision::rpc_header(&fixed, QUORUM_REQUEST, ScopeRpcError::Invalid, || {
+                    connection
+                        .authentication_state(
+                            self.config
+                                .clock
+                                .interval()
+                                .map_err(|_| ScopeRpcError::AuthTimeUnavailable)?,
+                        )
+                        .map_err(|_| ScopeRpcError::AuthTimeUnavailable)
+                })?;
             if proof_header.kind != FrameKind::Proof || !proof_header.matches_attempt(header) {
                 return Err(ScopeRpcError::Invalid);
             }
@@ -643,6 +734,7 @@ impl ScopeServer {
                 if value.identity().as_str() != context.route.principal.as_str()
                     || value.boot_key() != &hash(&claims.public_key)
                 {
+                    *promoted = None;
                     return Err(ScopeRpcError::Unauthorized);
                 }
             }
@@ -664,7 +756,7 @@ impl ScopeServer {
                         *promoted = None;
                     }
                 }
-            } else {
+            } else if header.method != Method::ChildRead {
                 let routing = Arc::new(Routing(context.clone()));
                 let store = ScopeAuthorityStore::new(
                     self.config.store.clone(),
@@ -767,6 +859,7 @@ impl ScopeServer {
             Arc::new(VerifiedScopeCall {
                 context,
                 execution,
+                public_key,
                 ticket,
                 boots: self.config.boots.clone(),
                 closures: self.config.closures.clone(),
@@ -850,6 +943,7 @@ impl ScopeServer {
                 }
             },
             NativeCall::Scan(request) => self.dispatch_scan(request, admission, views).await,
+            NativeCall::ChildRead(_) => Err(ScopeRpcError::Invalid),
             NativeCall::Batch(_)
             | NativeCall::BatchCancel(_)
             | NativeCall::BatchReopen(_)
@@ -1048,6 +1142,7 @@ impl ScopeAuthorityAdmission for Routing {
 struct VerifiedScopeCall {
     context: Context,
     execution: Option<ScopeExecution>,
+    public_key: Option<[u8; 33]>,
     ticket: Option<BootAuthorityRecord>,
     boots: Arc<dyn ScopeBootAuthority>,
     closures: Arc<dyn ScopeClosureSource>,
@@ -1087,6 +1182,13 @@ impl ScopeAuthorityAdmission for VerifiedScopeCall {
             return Err(ScopeAuthorityError::Unauthorized);
         }
         if action == ScopeAuthorityAction::Read {
+            if self.context.route.method == Method::ChildRead
+                && (self.context.route.role != ScopeRole::Worker
+                    || execution.is_none()
+                    || execution != self.execution.as_ref())
+            {
+                return Err(ScopeAuthorityError::Unauthorized);
+            }
             if self.context.route.method.is_scan()
                 && (!self.current
                     || self.context.route.role != ScopeRole::Worker
@@ -1174,6 +1276,7 @@ pub(super) enum NativeCall {
     BatchReopen(Box<ScopeAuthorityStamp>),
     BatchLookup(Box<ScopeBatchAttempt>),
     Scan(Box<opc_session_store::scope_scan::ScopeScanRequest>),
+    ChildRead(Box<ScopeChildReadRequest>),
 }
 impl NativeCall {
     pub(super) fn execution(&self) -> Option<&ScopeExecution> {
@@ -1182,6 +1285,7 @@ impl NativeCall {
             Self::Batch(request) => Some(request.stamp().execution()),
             Self::BatchCancel(attempt) => Some(attempt.stamp().execution()),
             Self::Scan(request) => Some(request.stamp().execution()),
+            Self::ChildRead(request) => Some(request.stamp().execution()),
             _ => None,
         }
     }
@@ -1191,6 +1295,18 @@ impl NativeCall {
         scope: &ScopeId,
     ) -> Result<Self, ScopeRpcError> {
         match header.method {
+            Method::ChildRead => {
+                let request = ScopeChildReadRequest::decode_canonical(bytes)
+                    .map_err(|_| ScopeRpcError::Invalid)?;
+                if request.stamp().scope() != scope
+                    || transport_request_digest(header.method, &header.request_id, bytes)
+                        .map_err(|_| ScopeRpcError::Invalid)?
+                        != header.digest
+                {
+                    return Err(ScopeRpcError::Invalid);
+                }
+                Ok(Self::ChildRead(Box::new(request)))
+            }
             method if method.is_scan() => {
                 let request =
                     opc_session_store::scope_scan::ScopeScanRequest::decode_canonical(bytes)
@@ -1344,7 +1460,7 @@ async fn refuse_before_dispatch(
     reply: RefusalReply,
     error: ScopeRpcError,
 ) -> Result<(), ScopeRpcError> {
-    let (status, body) = error_status(error);
+    let (status, body) = error_status(error)?;
     if matches!(reply, RefusalReply::Silent) || status != ResultStatus::ProvenNoEffect {
         return Ok(());
     }
@@ -1387,8 +1503,9 @@ async fn refuse_before_dispatch(
     .map_err(|_| ScopeRpcError::Retry)?
 }
 
-fn error_status(error: ScopeRpcError) -> (ResultStatus, Vec<u8>) {
-    match error {
+fn error_status(error: ScopeRpcError) -> Result<(ResultStatus, Vec<u8>), ScopeRpcError> {
+    Ok(match error {
+        ScopeRpcError::TransportRevisionMismatch => return Err(error),
         ScopeRpcError::OutcomeUnknown => (ResultStatus::OutcomeUnknown, Vec::new()),
         ScopeRpcError::Superseded => (ResultStatus::Obsolete, vec![1]),
         ScopeRpcError::Closed => (ResultStatus::Obsolete, vec![2]),
@@ -1407,7 +1524,7 @@ fn error_status(error: ScopeRpcError) -> (ResultStatus, Vec<u8>) {
                 },
             ],
         ),
-    }
+    })
 }
 /// Supervised class listeners; drop requests shutdown, explicit shutdown joins.
 pub struct ScopeServerHandle {

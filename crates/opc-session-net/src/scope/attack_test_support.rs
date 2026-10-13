@@ -10,6 +10,72 @@ use tokio::{
     net::TcpStream,
 };
 
+pub(crate) async fn send_revision_one_scope_frame(
+    tls: &AuthenticatedClientConfig,
+    address: SocketAddr,
+    scope: &ScopeId,
+    proof: bool,
+) {
+    let binding = ScopeBinding::from_scope(scope).unwrap();
+    let canonical = scope.encode_canonical().unwrap();
+    let request_id = [61; 16];
+    let body = CallPayload {
+        nonce: [62; 32],
+        canonical: canonical.clone(),
+    }
+    .encode(Method::Current)
+    .unwrap();
+    let call = Header {
+        kind: FrameKind::Call,
+        class: Class::SafetyControl,
+        method: Method::Current,
+        installation: *binding.installation(),
+        scope: binding.commitment(),
+        request_id,
+        digest: transport_request_digest(Method::Current, &request_id, &canonical).unwrap(),
+        payload_len: body.len(),
+    };
+    let mut stream = tls
+        .begin_handshake()
+        .unwrap()
+        .connect_scope(
+            TcpStream::connect(address).await.unwrap(),
+            binding.tls_domain().unwrap(),
+        )
+        .await
+        .unwrap();
+    if proof {
+        stream.write_all(&call.encode().unwrap()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut fixed = [0; HEADER_BYTES];
+        stream.read_exact(&mut fixed).await.unwrap();
+        let challenge = Header::decode(&fixed).unwrap();
+        assert!(challenge.matches_attempt(&call));
+        assert_eq!(
+            (challenge.kind, challenge.payload_len),
+            (FrameKind::Challenge, 32)
+        );
+        let mut nonce = [0; 32];
+        stream.read_exact(&mut nonce).await.unwrap();
+    }
+    let old = if proof {
+        call.response(FrameKind::Proof, 128).unwrap()
+    } else {
+        call
+    };
+    let mut fixed = old.encode().unwrap();
+    fixed[4..6].copy_from_slice(&1u16.to_be_bytes());
+    stream.write_all(&fixed).await.unwrap();
+    stream.flush().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.read_u8())
+            .await
+            .expect("an authenticated old fixed header is refused before its withheld body")
+            .is_err()
+    );
+}
+
 async fn begin(
     tls: &AuthenticatedClientConfig,
     address: SocketAddr,

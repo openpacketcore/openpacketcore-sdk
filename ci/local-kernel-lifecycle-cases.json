@@ -7,6 +7,10 @@
     "ebpf::aya_runtime::local_scope::fresh_tests::native_fresh_gtpu_dscp_graphs_open_only_together_under_real_activation",
     "ebpf::aya_runtime::local_scope::fresh_tests::native_scoped_sessions_keep_undo_publication_and_backpressure_owned",
     "ebpf::aya_runtime::local_scope::fresh_tests::native_shutdown_owns_reset_after_caller_cancellation_while_draining",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_transport_arp_and_packets_cross_only_the_intended_lifecycle_boundaries",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_transport_fresh_gtpu_dscp_graphs_open_only_together_under_real_activation",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_transport_scoped_sessions_keep_undo_publication_and_backpressure_owned",
+    "ebpf::aya_runtime::local_scope::fresh_tests::native_transport_shutdown_owns_reset_after_caller_cancellation_while_draining",
     "ebpf::aya_runtime::local_scope::tests::native_all_three_legacy_resets_refuse_a_bound_local_scope",
     "ebpf::aya_runtime::local_scope::tests::native_changed_occupant_invalidates_prior_artifact_inventory",
     "ebpf::aya_runtime::local_scope::tests::native_current_graph_retires_locally_with_external_program_fd",
@@ -27,15 +31,21 @@
     "local_scope::tests::native_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply",
     "local_scope::tests::native_scoped_actor_refuses_legacy_reset_and_dscp_activation",
     "local_scope::tests::native_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss",
+    "local_scope::tests::native_transport_expiration_and_spi_zero_acquire_do_not_block_exact_live_undo",
+    "local_scope::tests::native_transport_rebuilt_authority_cannot_reinstall_a_removed_effect",
+    "local_scope::tests::native_transport_scoped_actor_owns_partial_panic_cancellation_and_lost_publication_reply",
+    "local_scope::tests::native_transport_scoped_effect_uses_real_quorum_and_preserves_publication_during_store_loss",
+    "local_scope::tests::native_transport_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install",
     "local_scope::tests::native_unknown_committed_reply_never_mints_effect_and_stale_child_cannot_install",
     "local_scope::tests::native_unknown_root_contents_refuse_empty_observation_and_reset_before_effects"
   ],
   "opc-local-kernel-lifecycle": [
-    "scope::activation_tests::native_opening_owns_interrupted_filter_removal_and_publication"
+    "scope::activation_tests::native_opening_owns_interrupted_filter_removal_and_publication",
+    "scope::activation_tests::native_transport_opening_owns_interrupted_filter_removal_and_publication"
   ],
   "opc-linux-gtpu-sys": [
-    "tc::tests::private_netns_gact_round_trip_preserves_foreign_filter",
+    "tc::scope_tests::private_namespace_scope_retains_lock_across_bpffs_replacement",
     "tc::scope_tests::private_netns_topology_checks_native_qdisc_tcx_and_xdp",
-    "tc::scope_tests::private_namespace_scope_retains_lock_across_bpffs_replacement"
+    "tc::tests::private_netns_gact_round_trip_preserves_foreign_filter"
   ]
 }
