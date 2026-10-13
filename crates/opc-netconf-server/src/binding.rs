@@ -394,6 +394,12 @@ impl StartupDatastoreError {
 /// responsible for durable, atomic writes appropriate for their CNF.
 pub trait StartupDatastore<C: OpcConfig>: Send + Sync {
     /// Loads the complete startup config, if one exists.
+    ///
+    /// Implementations must enforce their datastore's stored-byte, collection
+    /// and allocation limits before loading or decoding the configuration.
+    /// This interface supplies a complete snapshot, including rows a subsequent
+    /// read may deny. NETCONF subtree authorization gates projection of that
+    /// snapshot; its work budget does not bound this storage or decoding step.
     fn load_startup_config(&self) -> Result<Option<C>, StartupDatastoreError>;
 
     /// Replaces the complete startup config.

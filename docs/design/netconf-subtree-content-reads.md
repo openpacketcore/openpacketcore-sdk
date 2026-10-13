@@ -102,6 +102,17 @@ The evaluator uses those same captured inputs for predicates and output.
 Candidate reads share an immutable model snapshot, including fallback to
 running; capturing a candidate never clones the complete configuration.
 
+A startup read loads the binding's stored startup configuration in full through
+`StartupDatastore`, as ordinary startup reads do. That interface returns a
+complete configuration and has no selective decoding operation, so loading
+may decode denied rows. The pre-access guarantee begins at projection, as it
+does for provider internals. The binding must bound stored bytes, decoded
+collections and allocations before loading or decoding its snapshot; these
+datastore limits are separate from the NETCONF subtree work budget. The server
+loads it once, only after an authorized configuration branch survives pruning,
+then applies the shared projection budget. It does not claim that the matching
+budget bounds storage I/O or decoding inside a startup implementation.
+
 Authorized operational match leaves become provider dependencies. A complete
 provider response is validated before any predicate evaluation: duplicate,
 unsolicited, malformed, noncanonical, out-of-request or inconsistent values
