@@ -74,6 +74,12 @@
       "kind": "disabled",
       "reason": "Add native-scope authority to the existing opening, interrupted containment removal and publication scenario, including native work-class checks. The required local-kernel-lifecycle manifest runs this privileged private-namespace case. The original local-store case and its shared assertions remain.",
       "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-gnmi-server::lib=lib::service::tests::subscribe_operational_event_omits_nacm_denied_update",
+      "kind": "assertions-decreased",
+      "reason": "Denied operational events now omit per-event audit work. The former audit-record assertions are replaced by an empty audit sink assertion; authenticated hidden-event and blocked-audit regressions cover omission and independent authorization termination.",
+      "issue": 1269
     }
   ]
 }
