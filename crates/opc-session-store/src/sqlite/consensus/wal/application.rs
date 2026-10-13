@@ -722,6 +722,10 @@ fn audit_final_application_log(
     consensus::log_row_reuse_test_observer::note(
         consensus::log_row_reuse_test_observer::Event::ApplicationFinalAuditEnd,
     );
+    #[cfg(test)]
+    if let Some(entry) = expected.entries.last() {
+        consensus::scope_payload_decode_observer::final_audit(entry, encoded.len());
+    }
     Ok(audited)
 }
 

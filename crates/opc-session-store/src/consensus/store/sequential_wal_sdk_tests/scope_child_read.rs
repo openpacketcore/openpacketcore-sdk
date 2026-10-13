@@ -4,6 +4,7 @@ use crate::scope_authority::tests::{execution, identity};
 use crate::scope_authority::*;
 use crate::scope_batch::tests::{claim, create, key, value};
 use crate::scope_batch::*;
+use crate::sqlite::consensus::scope_payload_decode_observer;
 use std::sync::atomic::AtomicU64;
 
 async fn child_read_authority_fixture(fleet: &Fleet) -> (usize, CommittedScopeAuthority) {
@@ -69,8 +70,12 @@ async fn scope_child_read_three_large_children_refuse_the_whole_observation() {
                 .ciphertext_and_tag
                 .resize(MAX_SCOPE_CHILD_VALUE_BYTES - 4096 - overhead, 1);
             let large = ScopeSealedValue::new(envelope.encode().unwrap()).unwrap();
+            let observer =
+                scope_payload_decode_observer::Scope::new(granted.stamp().scope().clone(), 100_000);
             for tag in 1..=3 {
-                reader
+                let before = observer.counts();
+                let started = Instant::now();
+                let result = reader
                     .execute(
                         &identity("worker-1"),
                         &ScopeBatchRequest::in_lane(
@@ -87,10 +92,16 @@ async fn scope_child_read_three_large_children_refuse_the_whole_observation() {
                         )
                         .unwrap(),
                     )
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("large child {tag} setup (native={native}): {error}")
-                    });
+                    .await;
+                let elapsed = started.elapsed();
+                scope_payload_decode_observer::report(serde_json::json!({
+                    "case": "large-observation-setup", "tag": tag, "native": native,
+                    "success": result.is_ok(), "elapsed_us": elapsed.as_micros(),
+                    "counts": observer.counts().since(&before),
+                }));
+                result.unwrap_or_else(|error| {
+                    panic!("large child {tag} setup (native={native}): {error}")
+                });
             }
             let pair = reader
                 .read_current(&identity("worker-1"), granted.stamp(), &[key(1), key(2)])

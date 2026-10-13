@@ -18,6 +18,8 @@ pub(crate) mod roster_snapshot;
 pub(crate) mod scope_authority;
 pub(crate) mod scope_batch;
 mod scope_continuity;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod scope_payload_decode_observer;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -21655,6 +21657,8 @@ pub(crate) fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<Sessi
     if typed_v2 || raw_v2 {
         validate_exact_fenced_transition_v2_log_json(bytes, &entry)?;
     }
+    #[cfg(all(test, target_os = "linux"))]
+    scope_payload_decode_observer::decoded(&entry, bytes.len());
     Ok(entry)
 }
 
