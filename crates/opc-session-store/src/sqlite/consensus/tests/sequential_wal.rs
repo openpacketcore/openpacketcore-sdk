@@ -10,6 +10,7 @@ use super::super::wal::{Binding, IoControl, Limits, Operation, Point, Wal};
 use super::*;
 
 #[path = "sequential_wal/cancelled_reads.rs"]
+mod audit_publication;
 mod cancelled_reads;
 
 #[path = "sequential_wal/terminal_failure.rs"]
