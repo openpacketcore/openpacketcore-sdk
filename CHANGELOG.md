@@ -691,6 +691,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Leafref leaf-list validation errors identify the index and target schema
   without including the referenced value. Omit unreachable NETCONF edit helpers
   throughout keyless-list subtrees while preserving their rejection stubs.
+  Reject state writes through direct patch helpers, gNMI Set, and NETCONF edit
+  application, including state in ancestor bodies and implicit state removal.
+  Keep defaulted state leaves optional and sensitive numeric key copies lint-free.
   Compile generated fixtures and check them with Clippy warnings denied (#1268).
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install

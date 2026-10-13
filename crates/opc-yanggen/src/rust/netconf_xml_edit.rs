@@ -68,6 +68,33 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     }
 
     let root_apply = apply_root_fn(root, &nodes_by_path)?;
+    let has_state = input.nodes.iter().any(|node| !node.config);
+    let (validate_edit, validate_state, write_validation) = if has_state {
+        let path = &root.path;
+        (
+            quote! { validate_edit_write(edit)?; },
+            quote! {
+                if !candidate.state_matches(running) {
+                    return Err(NetconfEditError::ReadOnly { path: #path });
+                }
+            },
+            quote! {
+                fn validate_edit_write(edit: &EditConfigNode) -> Result<(), NetconfEditError> {
+                    if let Some(node) = super::schema_registry::registry().node(edit.schema_path) {
+                        if !node.config {
+                            return Err(NetconfEditError::ReadOnly { path: node.path });
+                        }
+                    }
+                    for child in &edit.children {
+                        validate_edit_write(child)?;
+                    }
+                    Ok(())
+                }
+            },
+        )
+    } else {
+        (quote! {}, quote! {}, quote! {})
+    };
 
     let tokens = quote! {
         #[allow(unused_imports)]
@@ -85,8 +112,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 running: &super::types::#root_type_ident,
                 edit: &EditConfigNode,
             ) -> Result<super::types::#root_type_ident, NetconfEditError> {
+                #validate_edit
                 let mut candidate = running.clone();
                 apply_root(edit, &mut candidate)?;
+                #validate_state
                 Ok(candidate)
             }
         }
@@ -97,6 +126,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #root_apply
+
+        #write_validation
 
         #(#apply_fns)*
     };

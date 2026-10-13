@@ -62,8 +62,16 @@ Keyed lists under `config false` retain `Option<T>` key leaves and the same
 scalar or composite map-key types as configuration lists. Generated key
 extraction and edit helpers use that optional representation, including
 sensitive key wrappers. Read-only rows and nested containers with no
-configuration differences emit warning-free no-op diff helpers. Normal patch
-and NETCONF XML admission continue to reject writes to state paths.
+configuration differences emit warning-free no-op diff helpers. State leaf
+fields, including leaves with a schema default, start as `None`; an observed
+value equal to that default remains `Some(value)`.
+Generated patch application, including direct `apply_patch_segments` calls,
+gNMI Set, and the NETCONF XML edit applicator reject writes to state paths.
+They also reject state members in JSON or XML bodies addressed to configuration
+ancestors, including empty or null state members and hand-built NETCONF edit
+nodes. Ancestor replacement or removal that would erase existing state is
+refused. Rejections use fixed diagnostics with no input values and leave the
+original model unchanged; configuration edits that retain state still succeed.
 Patch errors use stable messages without instance paths, input field names, or
 values, including their `Display` and `Debug` output. This covers invalid and
 read-only paths, numeric parsing, JSON decoding, and unsupported fields.
@@ -71,11 +79,11 @@ Configuration diffs exclude every read-only node kind, including removed rows, c
 keyless lists and leaf-lists; writable siblings still emit their own deltas.
 NETCONF edit generation omits helpers beneath keyless lists, including nested
 container, leaf-list and list helpers, while retaining the reachable list's
-unsupported-shape rejection.
+unsupported-shape rejection. Read-only admission takes precedence for state lists.
 Generated modules for these schemas are checked with Clippy warnings denied.
-Their block boundaries preserve literal contents and punctuation. The legacy
-output fixtures change only in `patch.rs` for safe diagnostics and state-diff
-exclusion; all other pinned generated files retain their bytes.
+Their block boundaries preserve literal contents and punctuation. Pinned output
+changes are confined to patch and NETCONF edit generation; unrelated generated
+artifacts retain their bytes.
 
 Key leaves with a non-public `opc:data-class` remain available to serde,
 ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`

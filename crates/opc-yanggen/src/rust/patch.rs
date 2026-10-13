@@ -15,6 +15,7 @@ fn is_sensitive_node(node: &SchemaNode) -> bool {
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let has_state_lists = super::has_state_keyed_lists(input);
+    let has_state = input.nodes.iter().any(|node| !node.config);
     let root = input
         .nodes
         .iter()
@@ -83,6 +84,20 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     } else {
         quote! { pub }
     };
+    let inner_apply = if has_state && has_scalar_constraints && !has_ordered_lists {
+        // The scalar wrapper already uses `apply_patch_segments_inner` for its
+        // checked entry point. State recursion needs a distinct private method.
+        format_ident!("apply_patch_segments_state_inner")
+    } else if has_state {
+        format_ident!("apply_patch_segments_inner")
+    } else {
+        apply_segments.clone()
+    };
+    let inner_visibility = if has_state {
+        quote! {}
+    } else {
+        apply_visibility.clone()
+    };
     let ordered_parameter = if has_ordered_lists {
         quote! { , ordered_list: Option<&OrderedListReplacement> }
     } else {
@@ -149,6 +164,22 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             let struct_name = format_ident!("{}", nodes_by_path.type_name(node));
             let mut field_arms = TokenStream::new();
             let mut diff_fields = TokenStream::new();
+            let all_fields_read_only = has_state
+                && node
+                    .child_paths
+                    .iter()
+                    .filter_map(|path| nodes_by_path.get(path))
+                    .all(|child| !child.config);
+            let dispatch_return = if all_fields_read_only {
+                quote! {}
+            } else {
+                quote! { return }
+            };
+            let dispatch_semicolon = if all_fields_read_only {
+                quote! {}
+            } else {
+                quote! { ; }
+            };
 
             for child_path in &node.child_paths {
                 if let Some(child) = nodes_by_path.get(child_path) {
@@ -281,11 +312,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     } else {
                                         if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                             if let Some(ref mut container) = self.#field_ident {
-                                                container.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                container.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         } else {
                                             let container = #get_mut_container;
-                                            container.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                            container.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                         }
                                     }
                                 }
@@ -395,7 +426,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                         .map_err(|_| config_error("invalid-value", #list_error))?;
                                                     for ((key, _), raw_row) in rows.into_iter().zip(raw_rows) {
                                                         let value = raw_row.to_string();
-                                                        list.entry(key).or_default().#apply_segments(op, &[], Some(&value) #ordered_argument)?;
+                                                        list.entry(key).or_default().#inner_apply(op, &[], Some(&value) #ordered_argument)?;
                                                     }
                                                 }
                                             }
@@ -529,12 +560,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         } else {
                                             if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                                 if let Some(entry) = self.#field_ident.get_mut(&parsed_key) {
-                                                    entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                    entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(#map_key).or_default();
                                                 #entry_key_assign
-                                                entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         }
                                     }
@@ -659,12 +690,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         } else {
                                             if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                                 if let Some(entry) = self.#field_ident.get_mut(&parsed_key) {
-                                                    entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                    entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
                                                 #(#entry_key_assigns)*
-                                                entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         }
                                     }
@@ -784,7 +815,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         _ => quote! {},
                     };
 
-                    field_arms.extend(arm);
+                    if child.config {
+                        field_arms.extend(arm);
+                    } else {
+                        field_arms.extend(quote! {
+                            #child_name_str => {
+                                #dispatch_return Err(config_error("read-only", "cannot modify read-only path")) #dispatch_semicolon
+                            }
+                        });
+                    }
 
                     // State data never belongs to a configuration diff, even
                     // when a collection or an optional container disappears.
@@ -1011,15 +1050,56 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             } else {
                 quote! {}
             };
-            impls.extend(quote! {
-                impl #struct_name {
-                    #public_apply_wrapper
+            let state_matcher = if has_state {
+                state_matcher(node, &nodes_by_path)
+            } else {
+                quote! {}
+            };
+            let checked_apply = if has_state {
+                let path = &node.path;
+                quote! {
                     #apply_visibility fn #apply_segments(
                         &mut self,
                         op: &ConfigOp,
                         segments: &[PathSegment],
                         value: Option<&str> #ordered_parameter,
                     ) -> Result<(), ConfigError> {
+                        validate_patch_input(#path, segments, value)?;
+                        let mut candidate = self.clone();
+                        candidate.#inner_apply(op, segments, value #ordered_argument)?;
+                        if !candidate.state_matches(self) {
+                            return Err(config_error("read-only", "cannot modify read-only path"));
+                        }
+                        *self = candidate;
+                        Ok(())
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let validate_inner = if has_state {
+                let path = &node.path;
+                quote! { validate_patch_input(#path, segments, value)?; }
+            } else {
+                quote! {}
+            };
+            let dispatch_success = if all_fields_read_only {
+                quote! {}
+            } else {
+                quote! { Ok(()) }
+            };
+            impls.extend(quote! {
+                impl #struct_name {
+                    #public_apply_wrapper
+                    #state_matcher
+                    #checked_apply
+                    #inner_visibility fn #inner_apply(
+                        &mut self,
+                        op: &ConfigOp,
+                        segments: &[PathSegment],
+                        value: Option<&str> #ordered_parameter,
+                    ) -> Result<(), ConfigError> {
+                        #validate_inner
                         if segments.is_empty() {
                             #reject_ordered_target
                             match op {
@@ -1046,7 +1126,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                     val.to_string()
                                                 };
                                                 let segs = parse_path(&k).map_err(|_| config_error("invalid-path", "invalid path"))?;
-                                                self.#apply_segments(op, &segs, Some(&val_str) #ordered_argument)?;
+                                                self.#inner_apply(op, &segs, Some(&val_str) #ordered_argument)?;
                                             }
                                             return Ok(());
                                         } else {
@@ -1065,10 +1145,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         match cleaned_name {
                             #field_arms
                             _ => {
-                                return Err(config_error("unsupported-path", "unsupported field"));
+                                #dispatch_return Err(config_error("unsupported-path", "unsupported field")) #dispatch_semicolon
                             }
                         }
-                        Ok(())
+                        #dispatch_success
                     }
 
                     pub fn diff_segments(
@@ -1103,6 +1183,78 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     } else {
         quote! {}
     };
+    let write_validation = if has_state {
+        quote! {
+            // Resolve relative helper paths and JSON member paths using the same
+            // bare names as dispatch. Reject state before parsing its payload.
+            fn write_target(
+                mut node: &'static opc_mgmt_schema::NodeMeta,
+                segments: &[PathSegment],
+            ) -> Result<Option<&'static opc_mgmt_schema::NodeMeta>, ConfigError> {
+                let registry = super::schema_registry::registry();
+                for segment in segments {
+                    if !node.config {
+                        return Err(config_error("read-only", "cannot modify read-only path"));
+                    }
+                    let Some(child) = node.child_paths.iter().filter_map(|path| registry.node(path))
+                        .find(|child| clean_segment(child.path.rsplit('/').next().unwrap_or("")) == clean_segment(&segment.name)) else {
+                            // Existing dispatch/deserialization owns unknown fields.
+                            return Ok(None);
+                        };
+                    node = child;
+                }
+                if !node.config {
+                    return Err(config_error("read-only", "cannot modify read-only path"));
+                }
+                Ok(Some(node))
+            }
+
+            fn validate_state_members(
+                node: &'static opc_mgmt_schema::NodeMeta,
+                value: &serde_json::Value,
+            ) -> Result<(), ConfigError> {
+                use opc_mgmt_schema::NodeKind;
+                if !matches!(node.kind, NodeKind::Container | NodeKind::List) {
+                    return Ok(());
+                }
+                match value {
+                    serde_json::Value::Object(members) => {
+                        for (name, value) in members {
+                            let segments = parse_path(name).map_err(|_| config_error("invalid-path", "invalid path"))?;
+                            if let Some(child) = write_target(node, &segments)? {
+                                validate_state_members(child, value)?;
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(rows) if node.kind == NodeKind::List => {
+                        for row in rows {
+                            validate_state_members(node, row)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+
+            fn validate_patch_input(
+                path: &'static str,
+                segments: &[PathSegment],
+                value: Option<&str>,
+            ) -> Result<(), ConfigError> {
+                let node = super::schema_registry::registry().node(path)
+                    .ok_or_else(|| config_error("invalid-path", "invalid path"))?;
+                if let Some(target) = write_target(node, segments)? {
+                    if let Some(value) = value.and_then(|text| serde_json::from_str(text).ok()) {
+                        validate_state_members(target, &value)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let tokens = quote! {
         use opc_config_model::{ConfigError, YangPath};
         use super::types::*;
@@ -1127,6 +1279,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #ordered_definitions
+
+        #write_validation
 
         fn config_error(kind: &'static str, message: impl Into<String>) -> ConfigError {
             ConfigError::new(kind, message)
@@ -1378,6 +1532,113 @@ fn subtree_constraint_checks(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenS
         });
     }
     checks
+}
+
+// Compare only operational fields so replacing/removing a configuration ancestor
+// cannot erase retained observations. Configuration list order is independent of
+// the state associated with each key.
+fn state_matcher(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
+    if !node.config {
+        return quote! {
+            pub(crate) fn state_matches(&self, previous: &Self) -> bool {
+                self == previous
+            }
+        };
+    }
+    let mut checks = Vec::new();
+    for child in node.child_paths.iter().filter_map(|path| nodes.get(path)) {
+        let field = format_ident!(
+            "{}",
+            to_snake_case(clean_segment(last_segment(&child.path)))
+        );
+        if !child.config {
+            checks.push(quote! { self.#field == previous.#field });
+            continue;
+        }
+        if !nodes.nodes.values().any(|descendant| {
+            !descendant.config
+                && descendant
+                    .path
+                    .strip_prefix(&child.path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            continue;
+        }
+        let current = if is_sensitive_node(child) {
+            quote! { self.#field.get() }
+        } else {
+            quote! { self.#field }
+        };
+        let previous = if is_sensitive_node(child) {
+            quote! { previous.#field.get() }
+        } else {
+            quote! { previous.#field }
+        };
+        let (current_iter, previous_iter) = if super::is_user_ordered(child) {
+            if is_sensitive_node(child) {
+                (
+                    quote! { (#current).into_iter() },
+                    quote! { (#previous).into_iter() },
+                )
+            } else {
+                (
+                    quote! { (&self.#field).into_iter() },
+                    quote! { (&previous.#field).into_iter() },
+                )
+            }
+        } else {
+            (quote! { (#current).iter() }, quote! { (#previous).iter() })
+        };
+        let check = match child.kind {
+            SchemaNodeKind::Container => quote! {
+                match ((#current).as_ref(), (#previous).as_ref()) {
+                    (Some(current), Some(previous)) => current.state_matches(previous),
+                    (Some(current), None) => current.state_matches(&Default::default()),
+                    (None, Some(previous)) => previous.state_matches(&Default::default()),
+                    (None, None) => true,
+                }
+            },
+            SchemaNodeKind::List if child.key_leaves.is_empty() => quote! {
+                (#current).iter().enumerate().all(|(index, row)| {
+                    (#previous).get(index).map_or_else(
+                        || row.state_matches(&Default::default()),
+                        |old| row.state_matches(old),
+                    )
+                }) && (#previous).iter().skip((#current).len())
+                    .all(|row| row.state_matches(&Default::default()))
+            },
+            SchemaNodeKind::List => quote! {
+                #current_iter.all(|(key, row)| {
+                    (#previous).get(key).map_or_else(
+                        || row.state_matches(&Default::default()),
+                        |old| row.state_matches(old),
+                    )
+                }) && #previous_iter.all(|(key, row)| {
+                    (#current).contains_key(key) || row.state_matches(&Default::default())
+                })
+            },
+            _ => continue,
+        };
+        checks.push(check);
+    }
+    if checks.is_empty() {
+        quote! {
+            pub(crate) fn state_matches(&self, _previous: &Self) -> bool { true }
+        }
+    } else if checks.len() == 1 {
+        let check = &checks[0];
+        quote! {
+            pub(crate) fn state_matches(&self, previous: &Self) -> bool {
+                #check
+            }
+        }
+    } else {
+        quote! {
+            pub(crate) fn state_matches(&self, previous: &Self) -> bool {
+                #((#checks))&&*
+            }
+        }
+    }
 }
 
 #[cfg(test)]
