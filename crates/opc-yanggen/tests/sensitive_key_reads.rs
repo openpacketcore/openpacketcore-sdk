@@ -42,7 +42,11 @@ fn input() -> CanonicalInput {
             .iter()
             .map(|(key, _)| format!("{path}/keys:{key}"))
             .collect::<Vec<_>>();
-        children.extend([format!("{path}/keys:value"), format!("{path}/keys:payload")]);
+        children.extend([
+            format!("{path}/keys:value"),
+            format!("{path}/keys:payload"),
+            format!("{path}/keys:observed"),
+        ]);
         if list == "parents" {
             children.push(format!("{path}/keys:children"));
         }
@@ -72,6 +76,16 @@ fn input() -> CanonicalInput {
                 ..Default::default()
             });
         }
+        nodes.push(SchemaNode {
+            path: format!("{path}/keys:observed"),
+            module: "keys".into(),
+            kind: SchemaNodeKind::Leaf,
+            config: false,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("public".into()),
+            source: source.clone(),
+            ..Default::default()
+        });
         if list == "parents" {
             let child = format!("{path}/keys:children");
             nodes.push(SchemaNode {
@@ -80,16 +94,20 @@ fn input() -> CanonicalInput {
                 kind: SchemaNodeKind::List,
                 config: true,
                 key_leaves: vec!["id".into()],
-                child_paths: vec![format!("{child}/keys:id"), format!("{child}/keys:value")],
+                child_paths: vec![
+                    format!("{child}/keys:id"),
+                    format!("{child}/keys:value"),
+                    format!("{child}/keys:observed"),
+                ],
                 source: source.clone(),
                 ..Default::default()
             });
-            for name in ["id", "value"] {
+            for name in ["id", "value", "observed"] {
                 nodes.push(SchemaNode {
                     path: format!("{child}/keys:{name}"),
                     module: "keys".into(),
                     kind: SchemaNodeKind::Leaf,
-                    config: true,
+                    config: name != "observed",
                     type_ref: Some(TypeRef::String),
                     data_class: Some(
                         if name == "id" {
@@ -265,6 +283,7 @@ tonic = {{ version = "0.14.6", default-features = false, features = ["codegen"] 
         "opc-mgmt-authz",
         "opc-mgmt-audit",
         "opc-mgmt-opstate",
+        "opc-mgmt-path",
         "opc-mgmt-limits",
         "opc-nacm",
         "opc-gnmi-server",

@@ -1,6 +1,6 @@
 //! RFC 8526 `<get-data>` operation handling.
 
-use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal, YangPath};
+use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
@@ -9,8 +9,8 @@ use opc_mgmt_authz::{
 };
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
-use opc_mgmt_opstate::{OperationalRequest, OperationalResponse};
 
+use super::operational_reads::{read_node, read_operational};
 use crate::binding::{NetconfConfigBinding, ReadSelection};
 use crate::capabilities::NETCONF_NMDA_NS;
 use crate::error::{
@@ -387,13 +387,12 @@ where
     }
 
     let registry = binding.schema_registry();
-    let (selected_paths, predicates) = match crate::filter::prepare_read_filter(
+    let (selected_paths, branches) = match crate::filter::prepare_instance_read_filter(
         registry,
         request.filter.as_ref(),
         ctx.limits,
-        binding.key_predicates_supported(),
     )
-    .and_then(|(filter, predicates)| {
+    .and_then(|(filter, branches)| {
         get_paths_with_discovery(
             registry,
             filter.as_ref(),
@@ -401,7 +400,7 @@ where
             binding.netconf_monitoring_capability().is_some(),
             ctx.limits,
         )
-        .map(|paths| (paths, predicates))
+        .map(|paths| (paths, branches))
     }) {
         Ok(paths) => paths,
         Err(err) => {
@@ -438,13 +437,7 @@ where
         &selected_paths
             .data_paths
             .iter()
-            .map(|path| {
-                if registry.node(path).is_some_and(|node| !node.config) {
-                    ReadNode::operational(path)
-                } else {
-                    ReadNode::projected(path)
-                }
-            })
+            .map(|path| read_node(registry, path))
             .collect::<Vec<_>>(),
         &Default::default(),
     );
@@ -541,41 +534,37 @@ where
         return fail(audit_mode, &ctx, RpcError::too_big(), "too-big", Vec::new()).await;
     }
 
-    let operational = match read_operational(binding, &state_paths) {
-        Ok(response) => response,
-        Err(()) => {
-            return fail(
-                audit_mode,
-                &ctx,
-                RpcError::operation_failed(),
-                "operation-failed",
-                schema_paths(&allowed_paths),
-            )
-            .await
-        }
+    let (operational, available_state_paths) =
+        match read_operational(binding, &state_paths, &branches, ctx.limits) {
+            Ok(response) => response,
+            Err(rpc_error) => {
+                let reason = if rpc_error.classification.tag == NetconfErrorTag::TooBig {
+                    "too-big"
+                } else {
+                    "operation-failed"
+                };
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    rpc_error,
+                    reason,
+                    schema_paths(&allowed_paths),
+                )
+                .await;
+            }
+        };
+    let render_config_paths = if request.config_filter == Some(false) {
+        Vec::new()
+    } else {
+        super::operational_reads::config_render_paths(
+            registry,
+            &authorization,
+            &selected_paths.data_paths,
+            &config_paths,
+            &available_state_paths,
+        )
     };
-    let available_state_paths = state_paths_with_values(&state_paths, &operational);
-    let render_paths = authorization.xml_paths_where(&selected_paths.data_paths, |path| {
-        config_paths.contains(&path) || available_state_paths.contains(&path)
-    });
-    let render_config_paths = render_paths
-        .iter()
-        .copied()
-        .filter(|path| {
-            registry.node(path).is_some_and(|node| {
-                node.config
-                    // A state-only response needs its identifying key leaves,
-                    // but no selected configuration structural parents.
-                    && (request.config_filter != Some(false)
-                        || node.kind == opc_mgmt_schema::NodeKind::Leaf)
-            })
-        })
-        .collect::<Vec<_>>();
-    let render_state_paths = render_paths
-        .iter()
-        .copied()
-        .filter(|path| available_state_paths.contains(path))
-        .collect::<Vec<_>>();
+    let render_state_paths = available_state_paths;
 
     let rendered_data = if render_config_paths.is_empty() && render_state_paths.is_empty() {
         Ok(String::new())
@@ -583,9 +572,9 @@ where
         let snapshot = binding.config_bus().current_snapshot();
         binding.render_get_data(
             snapshot.config.as_ref(),
-            ReadSelection::new(&render_config_paths).with_predicates(&predicates),
+            ReadSelection::new(&render_config_paths).with_instances(&branches),
             &operational,
-            ReadSelection::new(&render_state_paths),
+            ReadSelection::new(&render_state_paths).with_instances(&branches),
         )
     };
 
@@ -669,42 +658,6 @@ fn authorize_builtin_registry<P: PolicySource>(
             .collect::<Vec<_>>(),
         &Default::default(),
     ))
-}
-
-fn read_operational<C, B>(
-    binding: &B,
-    state_paths: &[&'static str],
-) -> Result<OperationalResponse, ()>
-where
-    C: OpcConfig,
-    B: NetconfConfigBinding<C>,
-{
-    if state_paths.is_empty() {
-        return Ok(OperationalResponse::default());
-    }
-    let requested = state_paths
-        .iter()
-        .map(|path| YangPath::new(*path).map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let request = OperationalRequest::new(requested);
-    let response = binding.get_operational_state(&request).map_err(|_| ())?;
-    response.validate_for_request(&request).map_err(|_| ())?;
-    Ok(response)
-}
-
-fn state_paths_with_values(
-    state_paths: &[&'static str],
-    operational: &OperationalResponse,
-) -> Vec<&'static str> {
-    state_paths
-        .iter()
-        .copied()
-        .filter(|path| {
-            YangPath::new(*path)
-                .ok()
-                .is_some_and(|path| operational.value_for(&path).is_some())
-        })
-        .collect()
 }
 
 async fn success<C, P, A>(

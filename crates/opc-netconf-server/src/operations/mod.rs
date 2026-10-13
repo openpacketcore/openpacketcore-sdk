@@ -8,6 +8,7 @@ use opc_mgmt_audit::{AuditError, AuditEvent, AuditSink};
 pub mod get;
 pub mod get_config;
 pub mod get_data;
+mod operational_reads;
 
 #[derive(Clone, Copy)]
 pub(crate) enum AuditMode {

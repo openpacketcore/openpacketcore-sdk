@@ -772,6 +772,25 @@ where
         self.config_authority.is_some()
     }
 
+    fn read_filter_preflight(
+        &self,
+        operation: &RpcOperation,
+        limits: &MgmtLimits,
+    ) -> Option<(NetconfOperation, crate::filter::FilterError)> {
+        let (metric, filter) = match operation {
+            RpcOperation::Get(request) => (NetconfOperation::Get, request.filter.as_ref()),
+            RpcOperation::GetData(request)
+                if request.datastore == crate::xml::NmdaDatastore::Operational =>
+            {
+                (NetconfOperation::GetData, request.filter.as_ref())
+            }
+            _ => return None,
+        };
+        crate::filter::prepare_instance_read_filter(self.binding.schema_registry(), filter, limits)
+            .err()
+            .map(|error| (metric, error))
+    }
+
     async fn ensure_config_authority(
         &self,
         operation: ConfigAuthorityOperation,
@@ -1096,6 +1115,27 @@ where
             }
         };
 
+        if let Some((metric, error)) = self.read_filter_preflight(&parsed.operation, limits) {
+            let event = AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Read,
+                audit_failed(error.audit_reason()),
+            );
+            let error = if self.audit.record(&event).is_err() {
+                RpcError::operation_failed()
+            } else {
+                error.rpc_error()
+            };
+            record_rpc_error(metric, error.classification.tag, started.elapsed());
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(&parsed.message_id),
+                &parsed.reply_attrs,
+                error,
+            ));
+        }
+
         if let Some(gate) = config_authority_gate(&parsed.operation) {
             if self.config_authority.is_some()
                 || self
@@ -1398,6 +1438,28 @@ where
                 .into();
             }
         };
+
+        if let Some((metric, error)) = self.read_filter_preflight(&parsed.operation, limits) {
+            let event = AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Read,
+                audit_failed(error.audit_reason()),
+            );
+            let error = if self.audit.record_async(&event).await.is_err() {
+                RpcError::operation_failed()
+            } else {
+                error.rpc_error()
+            };
+            record_rpc_error(metric, error.classification.tag, started.elapsed());
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(&parsed.message_id),
+                &parsed.reply_attrs,
+                error,
+            ))
+            .into();
+        }
 
         if self.required_config_audit.is_some() && !self.required_audit_profile_supported() {
             // A mutable application binding must not enable a local effect
@@ -8392,6 +8454,44 @@ mod tests {
     struct DemoRenderer;
 
     impl NetconfXmlRenderer<DemoConfig> for DemoRenderer {
+        fn render_selected_nodes(
+            &self,
+            config: &DemoConfig,
+            selection: &[&str],
+            predicates: &[opc_mgmt_schema::NetconfKeyPredicate],
+            branches: &[opc_mgmt_schema::NetconfInstanceBranch],
+            report: DefaultReport,
+        ) -> Result<Vec<opc_mgmt_schema::NetconfDataNode>, NetconfProjectionError> {
+            if !matches!(report, DefaultReport::Trim | DefaultReport::ReportAll) {
+                return Err(NetconfProjectionError::UnsupportedDefaultReport { report });
+            }
+            let branches = branches.iter().collect::<Vec<_>>();
+            let ctx = NetconfXmlRenderContext::new(&REGISTRY, selection, report)
+                .with_predicates(predicates)
+                .with_instances(&branches);
+            let mut children = Vec::new();
+            for (path, value) in [
+                ("/sys:system/sys:hostname", &config.hostname),
+                ("/sys:system/sys:secret", &config.secret),
+            ] {
+                if ctx.is_selected(path) {
+                    children.push(opc_mgmt_schema::NetconfDataNode::leaf(
+                        path,
+                        value.clone(),
+                        false,
+                    ));
+                }
+            }
+            Ok(if children.is_empty() {
+                Vec::new()
+            } else {
+                vec![opc_mgmt_schema::NetconfDataNode::branch(
+                    "/sys:system",
+                    children,
+                )]
+            })
+        }
+
         fn render_running_config(
             &self,
             config: &DemoConfig,

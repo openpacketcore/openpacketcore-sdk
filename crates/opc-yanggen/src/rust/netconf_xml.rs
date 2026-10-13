@@ -60,7 +60,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         #[allow(unused_imports)]
         use super::types::*;
         use opc_mgmt_schema::{
-            DefaultReport, NetconfKeyPredicate, NetconfProjectionError, NetconfXmlRenderContext, NetconfXmlRenderer,
+            DefaultReport, NetconfDataNode, NetconfInstanceBranch, NetconfKeyPredicate, NetconfProjectionError, NetconfXmlRenderContext, NetconfXmlRenderer,
         };
 
         /// Generated NETCONF XML renderer for this schema.
@@ -83,19 +83,32 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 predicates: &[NetconfKeyPredicate],
                 report: DefaultReport,
             ) -> Result<String, NetconfProjectionError> {
+                let nodes = self.render_selected_nodes(config, selection, predicates, &[], report)?;
+                opc_mgmt_schema::render_netconf_data(super::schema_registry::registry(), &nodes, report)
+            }
+
+            fn render_selected_nodes(
+                &self,
+                config: &super::types::#root_type_ident,
+                selection: &[&str],
+                predicates: &[NetconfKeyPredicate],
+                branches: &[NetconfInstanceBranch],
+                report: DefaultReport,
+            ) -> Result<Vec<NetconfDataNode>, NetconfProjectionError> {
                 match report {
                     DefaultReport::Trim
                     | DefaultReport::ReportAll
                     | DefaultReport::Explicit
                     | DefaultReport::ReportAllTagged => {}
                 }
+                let instances = branches.iter().collect::<Vec<_>>();
                 let ctx = NetconfXmlRenderContext::new(
                     super::schema_registry::registry(),
                     selection,
                     report,
-                ).with_predicates(predicates);
+                ).with_predicates(predicates).with_instances(&instances);
                 #root_function(config, &ctx, #root_path, true)
-                    .map(|opt| opt.unwrap_or_default())
+                    .map(|opt| opt.into_iter().collect())
             }
 
             fn supported_default_reports(&self) -> &'static [DefaultReport] {
@@ -193,34 +206,19 @@ fn render_container_fn(
             value: &super::types::#type_ident,
             ctx: &NetconfXmlRenderContext<'_>,
             path: &'static str,
-            include_namespaces: bool,
-        ) -> Result<Option<String>, NetconfProjectionError> {
+            _include_namespaces: bool,
+        ) -> Result<Option<NetconfDataNode>, NetconfProjectionError> {
             if !ctx.is_subtree_selected(path) {
                 return Ok(None);
             }
-            let qname = ctx.qualified_name(path)?;
-            let mut children = String::new();
+                        let mut children = Vec::new();
             #(#child_stmts)*
             if children.is_empty()
                 && (!ctx.is_selected(path) || #empty_descendant_selection)
             {
                 return Ok(None);
             }
-            let ns_decls = if include_namespaces {
-                ctx.module_namespaces()
-                    .into_iter()
-                    .map(|(prefix, ns)| {
-                        format!(
-                            " xmlns:{}=\"{}\"",
-                            opc_mgmt_schema::xml_escape_attr(&prefix),
-                            opc_mgmt_schema::xml_escape_attr(ns)
-                        )
-                    })
-                    .collect::<String>()
-            } else {
-                String::new()
-            };
-            Ok(Some(format!("<{qname}{ns_decls}>{children}</{qname}>")))
+            Ok(Some(NetconfDataNode::branch(path, children)))
         }
     })
 }
@@ -244,7 +242,7 @@ fn render_list_fn(
                 _value: &#field_type,
                 ctx: &NetconfXmlRenderContext<'_>,
                 path: &'static str,
-            ) -> Result<Option<String>, NetconfProjectionError> {
+            ) -> Result<Option<Vec<NetconfDataNode>>, NetconfProjectionError> {
                 if !ctx.is_subtree_selected(path) {
                     return Ok(None);
                 }
@@ -271,14 +269,14 @@ fn render_list_fn(
             value: &#field_type,
             ctx: &NetconfXmlRenderContext<'_>,
             path: &'static str,
-        ) -> Result<Option<String>, NetconfProjectionError> {
+        ) -> Result<Option<Vec<NetconfDataNode>>, NetconfProjectionError> {
             if !ctx.is_subtree_selected(path) {
                 return Ok(None);
             }
-            let mut fragments = String::new();
+            let mut fragments = Vec::new();
             for entry in #iter_expr {
                 if let Some(fragment) = #entry_fn_ident(entry, ctx, path, false)? {
-                    fragments.push_str(&fragment);
+                    fragments.push(fragment);
                 }
             }
             if fragments.is_empty() {
@@ -319,7 +317,7 @@ fn render_list_entry_fn(
             inner
         };
         predicate_stmts.push(quote! {
-            if ctx.has_key_predicate(#child_path) {
+            if ctx.has_key_predicate(#child_path) || ctx.has_instance_selection() {
                 let value = &value.#field;
                 let Some((raw, _)) = #inner else {
                     return Err(NetconfProjectionError::UnsupportedShape {
@@ -329,6 +327,7 @@ fn render_list_entry_fn(
                 if !ctx.key_matches(#child_path, &raw) {
                     return Ok(None);
                 }
+                instance_keys.push((#child_path, raw));
             }
         });
     }
@@ -345,20 +344,28 @@ fn render_list_entry_fn(
             value: &super::types::#type_ident,
             ctx: &NetconfXmlRenderContext<'_>,
             path: &'static str,
-            include_namespaces: bool,
-        ) -> Result<Option<String>, NetconfProjectionError> {
+            _include_namespaces: bool,
+        ) -> Result<Option<NetconfDataNode>, NetconfProjectionError> {
             if !ctx.is_subtree_selected(path) {
                 return Ok(None);
             }
-            #(#predicate_stmts)*
-            let qname = ctx.qualified_name(path)?;
             #[allow(unused_mut)]
-            let mut key_children = String::new();
+            let mut instance_keys: Vec<(&str, String)> = Vec::new();
+            #(#predicate_stmts)*
+            let instance_keys = instance_keys.iter().map(|(path, value)| (*path, value.as_str())).collect::<Vec<_>>();
+            let instances = ctx.matching_instances(path, &instance_keys);
+            if ctx.has_instance_selection() && instances.is_empty() {
+                return Ok(None);
+            }
+            let selected_ctx = ctx.with_instances(&instances);
+            let ctx = &selected_ctx;
+                        #[allow(unused_mut)]
+            let mut key_children = Vec::new();
             #[allow(unused_mut)]
             let mut rendered_key_count = 0usize;
             #(#key_stmts)*
             #[allow(unused_mut)]
-            let mut non_key_children = String::new();
+            let mut non_key_children = Vec::new();
             #(#non_key_stmts)*
             if non_key_children.is_empty() && ctx.has_descendant_instance_selection(path) {
                 return Ok(None);
@@ -372,25 +379,11 @@ fn render_list_entry_fn(
                 });
             }
             let mut children = key_children;
-            children.push_str(&non_key_children);
+            children.extend(non_key_children);
             if children.is_empty() {
                 return Ok(None);
             }
-            let ns_decls = if include_namespaces {
-                ctx.module_namespaces()
-                    .into_iter()
-                    .map(|(prefix, ns)| {
-                        format!(
-                            " xmlns:{}=\"{}\"",
-                            opc_mgmt_schema::xml_escape_attr(&prefix),
-                            opc_mgmt_schema::xml_escape_attr(ns)
-                        )
-                    })
-                    .collect::<String>()
-            } else {
-                String::new()
-            };
-            Ok(Some(format!("<{qname}{ns_decls}>{children}</{qname}>")))
+            Ok(Some(NetconfDataNode::branch(path, children)))
         }
     })
 }
@@ -416,7 +409,7 @@ fn render_leaf_list_fn(
                 _value: &#field_type,
                 ctx: &NetconfXmlRenderContext<'_>,
                 path: &'static str,
-            ) -> Result<Option<String>, NetconfProjectionError> {
+            ) -> Result<Option<Vec<NetconfDataNode>>, NetconfProjectionError> {
                 if !ctx.is_selected(path) {
                     return Ok(None);
                 }
@@ -435,7 +428,7 @@ fn render_leaf_list_fn(
             value: &#field_type,
             ctx: &NetconfXmlRenderContext<'_>,
             path: &'static str,
-        ) -> Result<Option<String>, NetconfProjectionError> {
+        ) -> Result<Option<Vec<NetconfDataNode>>, NetconfProjectionError> {
             if !ctx.is_selected(path) {
                 return Ok(None);
             }
@@ -443,10 +436,10 @@ fn render_leaf_list_fn(
             if values.is_empty() {
                 return Ok(None);
             }
-            let mut fragments = String::new();
+            let mut fragments = Vec::new();
             for v in values {
                 let raw = #scalar;
-                fragments.push_str(&ctx.format_leaf(path, &raw)?);
+                fragments.push(NetconfDataNode::leaf(path, raw, false));
             }
             Ok(Some(fragments))
         }
@@ -469,7 +462,7 @@ fn render_leaf_fn(
                 _value: &#field_type,
                 ctx: &NetconfXmlRenderContext<'_>,
                 path: &'static str,
-            ) -> Result<Option<String>, NetconfProjectionError> {
+            ) -> Result<Option<NetconfDataNode>, NetconfProjectionError> {
                 if !ctx.is_selected(path) {
                     return Ok(None);
                 }
@@ -488,7 +481,7 @@ fn render_leaf_fn(
             value: &#field_type,
             ctx: &NetconfXmlRenderContext<'_>,
             path: &'static str,
-        ) -> Result<Option<String>, NetconfProjectionError> {
+        ) -> Result<Option<NetconfDataNode>, NetconfProjectionError> {
             if !ctx.is_selected(path) {
                 return Ok(None);
             }
@@ -506,7 +499,7 @@ fn render_leaf_fn(
                     }
                 }
             }
-            ctx.format_leaf_with_default(path, &raw, is_defaulted).map(Some)
+            Ok(Some(NetconfDataNode::leaf(path, raw, is_defaulted)))
         }
     })
 }
@@ -540,15 +533,22 @@ fn child_render_stmts(
                 quote! {
                     if let Some(v) = value.#field_ident.as_ref() {
                         if let Some(fragment) = #child_fn(v, ctx, #child_path, false)? {
-                            #target.push_str(&fragment);
+                            #target.push(fragment);
                         }
                     }
                 }
             }
-            SchemaNodeKind::Leaf | SchemaNodeKind::List | SchemaNodeKind::LeafList => {
+            SchemaNodeKind::Leaf => {
                 quote! {
                     if let Some(fragment) = #child_fn(&value.#field_ident, ctx, #child_path)? {
-                        #target.push_str(&fragment);
+                        #target.push(fragment);
+                    }
+                }
+            }
+            SchemaNodeKind::List | SchemaNodeKind::LeafList => {
+                quote! {
+                    if let Some(fragments) = #child_fn(&value.#field_ident, ctx, #child_path)? {
+                        #target.extend(fragments);
                     }
                 }
             }
@@ -583,7 +583,7 @@ fn list_key_render_stmts(
         let field_ident = format_ident!("{}", to_snake_case(child_local));
         stmts.push(quote! {
             if let Some(fragment) = #child_fn(&value.#field_ident, ctx, #child_path)? {
-                key_children.push_str(&fragment);
+                key_children.push(fragment);
                 rendered_key_count += 1;
             }
         });

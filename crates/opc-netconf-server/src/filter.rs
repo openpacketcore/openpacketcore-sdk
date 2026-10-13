@@ -13,6 +13,8 @@ use crate::xml::{Filter, SubtreeFilter, SubtreeSelection, XPathFilter};
 
 mod key_predicates;
 pub(crate) use key_predicates::prepare_read_filter;
+mod instances;
+pub(crate) use instances::prepare_instance_read_filter;
 
 /// RFC 8525 `ietf-yang-library` XML namespace.
 pub const YANG_LIBRARY_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-yang-library";
@@ -765,6 +767,12 @@ pub enum FilterError {
     /// supported bounded schema-selection subset.
     #[error("NETCONF XPath filter is not supported")]
     UnsupportedXPath,
+    /// A subtree content match did not name a declared list key.
+    #[error("NETCONF subtree content match is not supported")]
+    UnsupportedSubtree,
+    /// Matching this key would disclose a value that the reply masks.
+    #[error("NETCONF key match is not permitted")]
+    MaskedKeyMatch,
     /// The XPath filter expression was malformed for the supported subset.
     #[error("NETCONF XPath filter is malformed")]
     InvalidXPath,
@@ -784,7 +792,10 @@ impl FilterError {
     /// Client-facing NETCONF error classification.
     pub const fn rpc_error(&self) -> RpcError {
         match self {
-            Self::UnsupportedXPath => RpcError::operation_not_supported(),
+            Self::UnsupportedXPath | Self::UnsupportedSubtree => {
+                RpcError::operation_not_supported()
+            }
+            Self::MaskedKeyMatch => RpcError::invalid_value(),
             Self::InvalidXPath => RpcError::new(
                 NetconfError::new(NetconfErrorType::Protocol, NetconfErrorTag::BadElement),
                 "bad element",
@@ -807,7 +818,8 @@ impl FilterError {
     /// Stable audit reason.
     pub const fn audit_reason(&self) -> &'static str {
         match self {
-            Self::UnsupportedXPath => "operation-not-supported",
+            Self::UnsupportedXPath | Self::UnsupportedSubtree => "operation-not-supported",
+            Self::MaskedKeyMatch => "invalid-value",
             Self::InvalidXPath => "bad-element",
             Self::Limit(_) => "too-big",
             Self::UnknownNamespace => "unknown-namespace",
@@ -835,6 +847,9 @@ pub fn get_config_paths_with_limits(
     filter: Option<&Filter>,
     limits: &MgmtLimits,
 ) -> Result<Vec<&'static str>, FilterError> {
+    if matches!(filter, Some(Filter::Subtree(tree)) if tree.has_content_matches()) {
+        return Err(FilterError::UnsupportedSubtree);
+    }
     data_paths(registry, filter, DataPathScope::ConfigOnly, limits)
 }
 
@@ -955,7 +970,11 @@ struct SelectionOutcome {
 impl SelectionOutcome {
     fn observe_error(&mut self, error: FilterError) {
         match error {
-            FilterError::UnsupportedXPath | FilterError::InvalidXPath | FilterError::Limit(_) => {}
+            FilterError::UnsupportedXPath
+            | FilterError::UnsupportedSubtree
+            | FilterError::MaskedKeyMatch
+            | FilterError::InvalidXPath
+            | FilterError::Limit(_) => {}
             FilterError::UnknownNamespace => self.unknown_namespace = true,
             FilterError::UnknownNode => self.unknown_node = true,
         }

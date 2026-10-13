@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds integer-width and restricted-string variants. Existing runtime `i64`
   range metadata remains compatible. (#1006, #1263)
 
+- `opc-mgmt-schema`: NETCONF renderers used by the default `<get>` and
+  operational `<get-data>` binding hooks must implement `render_selected_nodes`.
+  Regenerate model bindings or project authorized configuration into
+  `NetconfDataNode` values so configuration and state merge by complete list
+  identity before masking. Renderers without this contract fail closed. (#1270)
+
 - `opc-proto-nas`: `MmMessageBody::ConfigurationUpdateCommand` and
   `MmMessageBody::ConfigurationUpdateComplete` now carry the typed
   `ConfigurationUpdateCommand` and `ConfigurationUpdateComplete` structs
@@ -52,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whitespace trimming, and quoted concatenation. Value-less list-entry patches
   assign and validate path keys, and integer defaults decode octal and
   hexadecimal notation for every width.
+
+- Management reads expand unkeyed and partially keyed operational selections
+  into bounded, canonical instances. gNMI Get and Subscribe preserve literal
+  keys, mask operational payloads, and reject incomplete identities; NETCONF
+  `<get>` and operational `<get-data>` preserve subtree key matches, branch
+  selections, list ancestry, and configuration order. Matches against masked
+  keys are refused before authorization or data access. Providers receive the
+  response count and byte budgets; overflows fail without truncation. (#1270)
 
 - `opc-proto-nas`: frame optional elements with complete per-message tables
   from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),

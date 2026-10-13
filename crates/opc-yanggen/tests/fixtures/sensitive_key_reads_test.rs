@@ -92,6 +92,7 @@ impl GnmiPatchApplicator<Root> for NoPatch {
 struct Binding {
     bus: Arc<ConfigBus<Root>>,
     policy: Arc<Policy>,
+    operational: Vec<opc_mgmt_opstate::OperationalValue>,
 }
 impl GnmiConfigBinding<Root> for Binding {
     fn config_bus(&self) -> Arc<ConfigBus<Root>> {
@@ -136,6 +137,21 @@ impl NetconfConfigBinding<Root> for Binding {
                 .unwrap(),
         )
     }
+    fn get_operational_state(
+        &self,
+        request: &OperationalRequest,
+    ) -> Result<OperationalResponse, OperationalError> {
+        Ok(OperationalResponse::new(
+            self.operational
+                .iter()
+                .filter(|value| {
+                    request.paths.iter().any(|path| {
+                        opc_mgmt_path::canonical_path_matches(path.as_str(), value.path().as_str())
+                    })
+                })
+                .cloned(),
+        ))
+    }
 }
 fn principal() -> TrustedPrincipal {
     TrustedPrincipal::new(
@@ -159,6 +175,13 @@ enum NetconfRead {
 
 impl Fixture {
     async fn new(root: Root, policy: Policy) -> Self {
+        Self::with_operational(root, policy, vec![]).await
+    }
+    async fn with_operational(
+        root: Root,
+        policy: Policy,
+        operational: Vec<opc_mgmt_opstate::OperationalValue>,
+    ) -> Self {
         let policy = Arc::new(policy);
         let binding = Binding {
             bus: Arc::new(
@@ -167,6 +190,7 @@ impl Fixture {
                     .unwrap(),
             ),
             policy: policy.clone(),
+            operational,
         };
         let audit = Audit::default();
         let server = GnmiServer::new(
@@ -355,6 +379,96 @@ fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn observed(list: &str, keys: &[(&str, &str)], text: &str) -> opc_mgmt_opstate::OperationalValue {
+    let mut path = format!("/keys:root/keys:{list}");
+    for (key, value) in keys {
+        opc_mgmt_path::append_key_predicate(&mut path, &format!("keys:{key}"), value).unwrap();
+    }
+    path.push_str("/keys:observed");
+    opc_mgmt_opstate::OperationalValue::new(
+        opc_config_model::YangPath::new(path).unwrap(),
+        serde_json::to_string(text).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn generated_netconf_get_merges_concrete_state_and_preserves_configuration_order() {
+    let fixture = Fixture::with_operational(
+        config(
+            "ordered-rows",
+            json!([{ "id": "z", "value": "first" }, { "id": "a", "value": "second" }]),
+        ),
+        full_policy(&[]),
+        vec![
+            observed("ordered-rows", &[("id", "c")], "new-c"),
+            observed("ordered-rows", &[("id", "a")], "state-a"),
+            observed("ordered-rows", &[("id", "b")], "new-b"),
+        ],
+    )
+    .await;
+    let reply = fixture
+        .xml_operation(
+            "<get><filter><root xmlns=\"urn:keys\"><ordered-rows/></root></filter></get>",
+        )
+        .await;
+    assert_eq!(data(&reply), "<keys:root xmlns:keys=\"urn:keys\"><keys:ordered-rows><keys:id>z</keys:id><keys:value>first</keys:value></keys:ordered-rows><keys:ordered-rows><keys:id>a</keys:id><keys:value>second</keys:value><keys:observed>state-a</keys:observed></keys:ordered-rows><keys:ordered-rows><keys:id>b</keys:id><keys:observed>new-b</keys:observed></keys:ordered-rows><keys:ordered-rows><keys:id>c</keys:id><keys:observed>new-c</keys:observed></keys:ordered-rows></keys:root>");
+}
+
+#[tokio::test]
+async fn generated_netconf_get_applies_each_branch_to_configuration_and_state() {
+    let fixture = Fixture::with_operational(
+        config(
+            "composite-rows",
+            json!([
+                { "tenant": "east", "id": "a", "value": "selected-east", "payload": SECRET },
+                { "tenant": "west", "id": "a", "value": "hidden-west", "payload": SECRET }
+            ]),
+        ),
+        full_policy(&[]),
+        vec![
+            observed(
+                "composite-rows",
+                &[("tenant", "east"), ("id", "a")],
+                "hidden-state",
+            ),
+            observed(
+                "composite-rows",
+                &[("tenant", "west"), ("id", "a")],
+                "selected-west",
+            ),
+        ],
+    )
+    .await;
+    let reply = fixture.xml_operation("<get><filter><root xmlns=\"urn:keys\"><composite-rows><tenant>east</tenant><value/></composite-rows><composite-rows><tenant>west</tenant><observed/></composite-rows></root></filter></get>").await;
+    assert_eq!(data(&reply), "<keys:root xmlns:keys=\"urn:keys\"><keys:composite-rows><keys:tenant>east</keys:tenant><keys:id>a</keys:id><keys:value>selected-east</keys:value></keys:composite-rows><keys:composite-rows><keys:tenant>west</keys:tenant><keys:id>a</keys:id><keys:observed>selected-west</keys:observed></keys:composite-rows></keys:root>");
+    assert!(!reply.contains("hidden"));
+    assert!(!reply.contains(SECRET));
+}
+
+#[tokio::test]
+async fn generated_netconf_operational_state_masks_forbidden_keys_without_merging_them() {
+    for (list, key) in [
+        ("blocked-rows", "id"),
+        ("lawful-rows", "id"),
+        ("named-rows", "password"),
+    ] {
+        let fixture = Fixture::with_operational(
+            Root::default(),
+            full_policy(&[]),
+            vec![
+                observed(list, &[(key, "b-marker")], "second"),
+                observed(list, &[(key, "a-marker")], "first"),
+            ],
+        )
+        .await;
+        let reply = fixture.xml_operation(&format!("<get><filter><root xmlns=\"urn:keys\"><{list}><observed/></{list}></root></filter></get>")).await;
+        assert_eq!(data(&reply), format!("<keys:root xmlns:keys=\"urn:keys\"><keys:{list}><keys:{key}>&lt;redacted&gt;</keys:{key}><keys:observed>first</keys:observed></keys:{list}><keys:{list}><keys:{key}>&lt;redacted&gt;</keys:{key}><keys:observed>second</keys:observed></keys:{list}></keys:root>"));
+        assert!(!reply.contains("marker"));
+        assert!(!format!("{:?}", fixture.audit.0.lock().unwrap()).contains("marker"));
+    }
 }
 fn assert_safe(fixture: &Fixture, response: &gnmi::GetResponse, markers: &[&str]) {
     let diagnostic = format!("{response:?} {:?}", fixture.audit.0.lock().unwrap());

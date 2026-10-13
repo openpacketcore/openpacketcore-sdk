@@ -32,6 +32,97 @@ fn interface_eth1() -> Interfaces {
     iface
 }
 
+fn instance_branch(name: &str, payload: &'static str) -> opc_mgmt_schema::NetconfInstanceBranch {
+    opc_mgmt_schema::NetconfInstanceBranch {
+        schema_paths: vec!["/ex:system/ex:interfaces/ex:name", payload],
+        predicates: vec![opc_mgmt_schema::NetconfKeyPredicate {
+            list_path: "/ex:system/ex:interfaces",
+            key_path: "/ex:system/ex:interfaces/ex:name",
+            value: name.into(),
+        }],
+    }
+}
+
+#[test]
+fn concrete_branches_preserve_distinct_descendant_selections() {
+    let mut system = sample_config();
+    system.interfaces.insert("eth0".into(), interface_eth0());
+    system.interfaces.insert("eth1".into(), interface_eth1());
+    let branches = vec![
+        instance_branch("eth0", "/ex:system/ex:interfaces/ex:mtu"),
+        instance_branch("eth1", "/ex:system/ex:interfaces/ex:admin"),
+    ];
+    let nodes = renderer()
+        .render_selected_nodes(
+            &system,
+            &[
+                "/ex:system/ex:interfaces/ex:name",
+                "/ex:system/ex:interfaces/ex:mtu",
+                "/ex:system/ex:interfaces/ex:admin",
+            ],
+            &[],
+            &branches,
+            DefaultReport::Trim,
+        )
+        .unwrap();
+    let xml = opc_mgmt_schema::render_netconf_data(
+        generated_test::schema_registry::registry(),
+        &nodes,
+        DefaultReport::Trim,
+    )
+    .unwrap();
+    assert_eq!(xml, "<ex:system xmlns:ex=\"urn:example\"><ex:interfaces><ex:name>eth0</ex:name><ex:mtu>1500</ex:mtu></ex:interfaces><ex:interfaces><ex:name>eth1</ex:name><ex:admin>false</ex:admin></ex:interfaces></ex:system>");
+    assert!(!format!("{nodes:?}").contains("eth0"));
+    assert!(!format!("{branches:?}").contains("eth1"));
+}
+
+#[test]
+fn concrete_nested_branches_retain_their_ancestor_constraints() {
+    let mut system = sample_config();
+    for (name, mut iface) in [("eth0", interface_eth0()), ("eth1", interface_eth1())] {
+        for id in [100, 200] {
+            let mut sub = SubInterfaces::default();
+            sub.id = LeafPresence::Explicit(id);
+            sub.description = LeafPresence::Explicit(format!("{name}-{id}"));
+            iface.sub_interfaces.insert(id, sub);
+        }
+        system.interfaces.insert(name.into(), iface);
+    }
+    let mut branches = Vec::new();
+    for (name, id) in [("eth0", "100"), ("eth1", "200")] {
+        let mut branch = instance_branch(
+            name,
+            "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description",
+        );
+        branch
+            .schema_paths
+            .push("/ex:system/ex:interfaces/ex:sub-interfaces/ex:id");
+        branch
+            .predicates
+            .push(opc_mgmt_schema::NetconfKeyPredicate {
+                list_path: "/ex:system/ex:interfaces/ex:sub-interfaces",
+                key_path: "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id",
+                value: id.into(),
+            });
+        branches.push(branch);
+    }
+    let paths = [
+        "/ex:system/ex:interfaces/ex:name",
+        "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id",
+        "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description",
+    ];
+    let nodes = renderer()
+        .render_selected_nodes(&system, &paths, &[], &branches, DefaultReport::Trim)
+        .unwrap();
+    let xml = opc_mgmt_schema::render_netconf_data(
+        generated_test::schema_registry::registry(),
+        &nodes,
+        DefaultReport::Trim,
+    )
+    .unwrap();
+    assert_eq!(xml, "<ex:system xmlns:ex=\"urn:example\"><ex:interfaces><ex:name>eth0</ex:name><ex:sub-interfaces><ex:id>100</ex:id><ex:description>eth0-100</ex:description></ex:sub-interfaces></ex:interfaces><ex:interfaces><ex:name>eth1</ex:name><ex:sub-interfaces><ex:id>200</ex:id><ex:description>eth1-200</ex:description></ex:sub-interfaces></ex:interfaces></ex:system>");
+}
+
 #[test]
 fn selected_leaf_only() {
     let system = sample_config();
@@ -243,8 +334,12 @@ fn keyed_list_renders_selected_children() {
         )
         .unwrap();
 
-    assert!(xml.contains("<ex:interfaces><ex:name>eth0</ex:name><ex:mtu>1500</ex:mtu></ex:interfaces>"));
-    assert!(xml.contains("<ex:interfaces><ex:name>eth1</ex:name><ex:mtu>9000</ex:mtu></ex:interfaces>"));
+    assert!(
+        xml.contains("<ex:interfaces><ex:name>eth0</ex:name><ex:mtu>1500</ex:mtu></ex:interfaces>")
+    );
+    assert!(
+        xml.contains("<ex:interfaces><ex:name>eth1</ex:name><ex:mtu>9000</ex:mtu></ex:interfaces>")
+    );
     assert!(!xml.contains("<ex:admin>"));
     assert!(!xml.contains("auth-secret"));
 }
@@ -448,7 +543,11 @@ fn sensitive_leaf_list_is_redacted() {
     system.secret_codes = SecretLeaf::new(vec!["alpha".to_string(), "beta".to_string()]);
 
     let xml = renderer()
-        .render_running_config(&system, &["/ex:system/ex:secret-codes"], DefaultReport::Trim)
+        .render_running_config(
+            &system,
+            &["/ex:system/ex:secret-codes"],
+            DefaultReport::Trim,
+        )
         .unwrap();
 
     assert!(xml.contains("<ex:secret-codes>"));
@@ -526,7 +625,11 @@ fn report_all_tagged_explicit_same_value_leaf_emits_without_tag() {
     system.enabled = LeafPresence::Explicit(true);
 
     let xml = renderer()
-        .render_running_config(&system, &["/ex:system/ex:enabled"], DefaultReport::ReportAllTagged)
+        .render_running_config(
+            &system,
+            &["/ex:system/ex:enabled"],
+            DefaultReport::ReportAllTagged,
+        )
         .unwrap();
 
     assert!(xml.contains("<ex:enabled>true</ex:enabled>"));
@@ -570,7 +673,11 @@ fn report_all_tagged_secret_defaulted_leaf_redacts_value_and_still_tags() {
     system.secret = SecretLeaf::new(LeafPresence::Defaulted("hunter2".to_string()));
 
     let xml = renderer()
-        .render_running_config(&system, &["/ex:system/ex:secret"], DefaultReport::ReportAllTagged)
+        .render_running_config(
+            &system,
+            &["/ex:system/ex:secret"],
+            DefaultReport::ReportAllTagged,
+        )
         .unwrap();
 
     assert!(xml.contains("<ex:secret wd:default=\"true\">"));
@@ -599,16 +706,15 @@ fn report_all_tagged_no_duplicate_wd_declaration() {
     let xml = renderer()
         .render_running_config(
             &system,
-            &[
-                "/ex:system/ex:hostname",
-                "/ex:system/ex:enabled",
-            ],
+            &["/ex:system/ex:hostname", "/ex:system/ex:enabled"],
             DefaultReport::ReportAllTagged,
         )
         .unwrap();
 
     let mut found = 0usize;
-    for m in xml.match_indices("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\"") {
+    for m in
+        xml.match_indices("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\"")
+    {
         let _ = m;
         found += 1;
     }
@@ -629,13 +735,9 @@ fn report_all_tagged_avoids_served_module_prefix_collision() {
         .unwrap();
 
     assert!(xml.contains("xmlns:wd=\"urn:wd-prefix-module\""));
-    assert!(xml.contains(
-        "xmlns:wd1=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""
-    ));
-    assert!(xml.contains(
-        "<wd:colliding-default wd1:default=\"true\">collision</wd:colliding-default>"
-    ));
-    assert!(!xml.contains(
-        "xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""
-    ));
+    assert!(xml.contains("xmlns:wd1=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""));
+    assert!(
+        xml.contains("<wd:colliding-default wd1:default=\"true\">collision</wd:colliding-default>")
+    );
+    assert!(!xml.contains("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""));
 }
