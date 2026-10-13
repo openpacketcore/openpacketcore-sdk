@@ -180,6 +180,17 @@ refusal; when a key is denied, the list is omitted like any other. NETCONF keeps
 rendering such a key masked, because an XML key element can carry a masked value and a
 gNMI path cannot. Non-key payload values keep their data-class masking.
 
+Refuse a requested key-value match when the key's reply value is masked: its class
+forbids cleartext, its name assigns the security-secret class, or no data class is
+recorded. Otherwise a reply only for the correct guess reveals the masked key.
+Decide this from the schema before authorization, provider access or stored-row
+access, and return the same fixed, value-free refusal for every such request,
+independent of the supplied value, permissions and whether any instance exists.
+Apply this to every composite and ancestor-list key in gNMI Get and Subscribe
+prefixes and paths and NETCONF get and operational get-data subtree content
+matches. An omitted key, including a gNMI wildcard treated as omission, is not a
+key-value match. Unconstrained reads retain the identity and masking rules above.
+
 The baseline gNMI operational path passes provider JSON through unmasked. In Get, every
 snapshot and every event, mask each accepted operational payload, key leaves included,
 whose schema data class does not allow cleartext, with the redaction the generated gNMI
@@ -301,6 +312,14 @@ Give the regressions explicit names and exact outcomes. Required test contracts:
 - `operational_non_cleartext_key_class_is_refused`: security-secret, lawful-intercept
   and secret-like-name keys under a full grant give a fixed gNMI refusal and masked
   NETCONF keys; denied keys omit the entry.
+- `operational_masked_key_match_is_refused_before_access`: masked-class,
+  secret-like-name and unclassified key matches give the same fixed refusal for
+  correct and incorrect guesses, absent and populated instances, and allowed and
+  denied readers. Cover composite and ancestor keys, gNMI Get and Subscribe
+  prefixes and paths, and NETCONF get and operational get-data. Assert zero policy,
+  provider and stored-row accesses and no supplied value in diagnostics; omitting
+  the match retains the existing read behavior. Removing this schema-only refusal
+  must fail the test independently of later authorization and identity guards.
 - `operational_opaque_aggregate_cannot_bypass_selection` and
   `operational_expansion_preserves_sensitive_encoding_and_debug`: child access inside
   aggregates, permitted sensitive identities, operational payloads of non-cleartext
@@ -316,7 +335,8 @@ checking event limits before authorization, removing the independent policy/cont
 notification trigger or making it depend on data events, removing the opaque-aggregate
 guard, timestamp- or order-sensitive change detection,
 per-event denial records, unmasked gNMI operational payloads, bypassing response or
-filter-text limits and removing diagnostic redaction. Existing exact-read, denied-leaf,
+filter-text limits, permitting masked-key matches and removing diagnostic redaction.
+Existing exact-read, denied-leaf,
 duplicate/origin, unsupported-filter and Debug tests are preservation controls: they may
 already pass at baseline and must fail when their own guard is removed, not necessarily
 when expansion alone is absent. Inspect complete decoded paths/payloads, error
