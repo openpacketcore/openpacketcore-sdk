@@ -531,6 +531,67 @@ fn config() -> System {
     config
 }
 
+#[tokio::test]
+async fn subtree_content_default_limits_key_lookup_over_100_entries() {
+    let mut model = System::default();
+    let mut values = Vec::new();
+    for id in 0..100u16 {
+        let mut peer = Peer::default();
+        peer.site = LeafPresence::Explicit("s".into());
+        peer.id = LeafPresence::Explicit(id);
+        peer.label = LeafPresence::Explicit(format!("p{id}"));
+        peer.cost = LeafPresence::Explicit(id);
+        peer.enabled = LeafPresence::Explicit(true);
+        peer.credential = SecretLeaf::new(LeafPresence::Explicit("secret".into()));
+        model.peer.insert(PeerKey { site: "s".into(), id }, peer);
+        values.push(state(&format!("/ex:system/ex:peer[ex:site='s'][ex:id='{id}']/ex:up"), "true"));
+    }
+    let fixture = Fixture::new(model, &[]).await;
+    *fixture.access.values.lock().unwrap() = values;
+    fixture.access.filter_response.store(1, Ordering::SeqCst);
+    let mut replies = Vec::new();
+    for op in ["get-config", "get", "get-data"] {
+        let reply = fixture.rpc(&request(op, "<peer><site>s</site><id>49</id></peer>", ""), MgmtLimits::default()).await;
+        replies.push((op, reply, fixture.access.provider.load(Ordering::SeqCst), fixture.policy_calls.load(Ordering::SeqCst)));
+    }
+    assert!(replies.iter().all(|(_, reply, _, _)| !reply.contains("<rpc-error>")), "default-limit key lookups: {replies:?}");
+    for (op, reply, provider_calls, policy_calls) in replies {
+        assert_eq!(data(&reply).matches("<ex:peer>").count(), 1, "{op}: {reply}");
+        assert_eq!(tags(&reply, "site"), ["s"]);
+        assert_eq!(tags(&reply, "id"), ["49"]);
+        assert_eq!(tags(&reply, "label"), ["p49"]);
+        assert_eq!(tags(&reply, "cost"), ["49"]);
+        assert_eq!(tags(&reply, "enabled"), ["true"]);
+        assert_eq!(tags(&reply, "credential"), ["&lt;redacted&gt;"]);
+        assert_eq!(tags(&reply, "up"), if op == "get-config" { vec![] } else { vec!["true"] });
+        assert_eq!(provider_calls, usize::from(op != "get-config"));
+        assert_eq!(policy_calls, 1);
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_default_limits_state_read_with_1024_provider_values() {
+    let fixture = Fixture::new(System::default(), &[]).await;
+    *fixture.access.values.lock().unwrap() = (0..1024u16).map(|id|
+        state(&format!("/ex:system/ex:peer[ex:site='s'][ex:id='{id}']/ex:up"), "true")
+    ).collect();
+    let mut replies = Vec::new();
+    for op in ["get", "get-data"] {
+        let reply = fixture.rpc(&request(op, "<peer><up>true</up><up/></peer>", ""), MgmtLimits::default()).await;
+        replies.push((op, reply, fixture.access.provider.load(Ordering::SeqCst), fixture.policy_calls.load(Ordering::SeqCst)));
+    }
+    assert!(replies.iter().all(|(_, reply, _, _)| !reply.contains("<rpc-error>")), "default-limit state reads: {replies:?}");
+    for (op, reply, provider_calls, policy_calls) in replies {
+        assert_eq!(data(&reply).matches("<ex:peer>").count(), 1024, "{op}");
+        assert_eq!(tags(&reply, "site"), vec!["s"; 1024]);
+        assert_eq!(tags(&reply, "up"), vec!["true"; 1024]);
+        assert_eq!(tags(&reply, "id").iter().map(|id| id.parse::<u16>().unwrap()).collect::<std::collections::BTreeSet<_>>(), (0..1024u16).collect());
+        assert!(tags(&reply, "label").is_empty());
+        assert_eq!(provider_calls, 1);
+        assert_eq!(policy_calls, 1);
+    }
+}
+
 fn data(reply: &str) -> &str {
     assert!(!reply.contains("<rpc-error>"), "{reply}");
     let data = reply.split_once("<data").expect(reply).1;
