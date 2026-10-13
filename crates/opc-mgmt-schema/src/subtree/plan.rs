@@ -4,6 +4,12 @@ use super::{ScalarPredicate, SubtreeBudget, SubtreeError};
 use crate::{DefaultReport, NetconfInstanceSelector, NetconfXmlNode, NodeKind, SchemaRegistry};
 
 mod evaluation;
+mod identity;
+#[cfg(test)]
+use identity::order_reserved;
+use identity::{
+    copy_nodes, merge_reserved, merge_selected, ordered_nodes, IdentityReservation, SelectedNode,
+};
 
 /// One scalar match after resolving its namespace and type.
 #[derive(Debug, Clone)]
@@ -217,21 +223,25 @@ impl AuthorizedSubtreePlan {
         let mut units = available - sizing.remaining();
         add_work(&mut units, work.units)?;
         let reservation = IdentityReservation::admit(&self.budget, units)?;
+        #[cfg(test)]
+        reservation.executor_allowance(work.units);
         self.budget.record_predicate_trials(work.predicate_trials);
         let mut joined = Vec::new();
-        merge_reserved(&mut joined, input.to_vec(), &work.leaf_lists, &reservation)?;
+        merge_reserved(
+            &mut joined,
+            copy_nodes(input, &reservation),
+            &work.leaf_lists,
+            &reservation,
+        )?;
         let mut candidates = Vec::new();
         for scope in &self.scopes {
-            if let Some(nodes) =
-                evaluate_scope(scope, &joined, &[], &work.leaf_lists, &reservation)?
-            {
+            if let Some(nodes) = evaluate_scope(scope, &joined, &[], &reservation)? {
+                reservation.moved(nodes.len());
                 candidates.extend(nodes);
             }
         }
-        let mut selected = Vec::new();
-        merge_reserved(&mut selected, candidates, &work.leaf_lists, &reservation)?;
-        order_reserved(&mut selected, &joined, &[], &reservation)?;
-        Ok(selected)
+        let selected = merge_selected(candidates, &reservation)?;
+        Ok(ordered_nodes(selected, &reservation))
     }
 }
 
@@ -813,10 +823,17 @@ impl<'a> SubtreeProjection<'a> {
 #[derive(Clone, Default)]
 struct CapturedWork {
     nodes: usize,
+    // Maximum sibling batch in one row; nodes remains the original total.
+    row_nodes: usize,
     keys: usize,
     schema_bytes: usize,
     key_bytes: usize,
     value_bytes: usize,
+    largest_identity: usize,
+    largest_value: usize,
+    largest_keys: usize,
+    largest_key_path: usize,
+    largest_key_value: usize,
     leaf_lists: Vec<&'static str>,
 }
 
@@ -827,6 +844,61 @@ fn add_work(total: &mut usize, units: usize) -> Result<(), SubtreeError> {
 
 fn multiply_work(left: usize, right: usize) -> Result<usize, SubtreeError> {
     left.checked_mul(right).ok_or(SubtreeError::TooBig)
+}
+
+// ceil(log2(nodes + 1)), without overflowing at usize::MAX.
+fn index_levels(nodes: usize) -> usize {
+    (usize::BITS - nodes.leading_zeros()) as usize
+}
+
+fn sort_levels(nodes: usize) -> usize {
+    index_levels(nodes.saturating_sub(1))
+}
+
+fn normalize_leaf_lists(
+    paths: &mut Vec<&'static str>,
+    budget: &SubtreeBudget,
+) -> Result<usize, SubtreeError> {
+    budget.charge(paths.len())?;
+    let largest = paths.iter().map(|path| path.len()).max().unwrap_or(0);
+    let comparison = multiply_work(largest, 2)?
+        .checked_add(1)
+        .ok_or(SubtreeError::TooBig)?;
+    let mut per_path = multiply_work(
+        sort_levels(paths.len()),
+        comparison.checked_add(1).ok_or(SubtreeError::TooBig)?,
+    )?;
+    add_work(&mut per_path, comparison)?;
+    add_work(&mut per_path, 4)?;
+    budget.charge(multiply_work(paths.len(), per_path)?)?;
+    let order = identity::sorted_indices(
+        paths.len(),
+        |left, right| paths[left].cmp(paths[right]),
+        |_| {},
+    );
+    let mut normalized = Vec::new();
+    for index in order {
+        if normalized.last() != Some(&paths[index]) {
+            normalized.push(paths[index]);
+        }
+    }
+    *paths = normalized;
+    Ok(largest)
+}
+
+fn leaf_probe_units(
+    work: &CapturedWork,
+    visits: usize,
+    paths: usize,
+    largest_path: usize,
+) -> Result<usize, SubtreeError> {
+    let mut comparison = largest_path;
+    add_work(&mut comparison, work.largest_identity)?;
+    add_work(&mut comparison, 2)?;
+    if paths == 0 {
+        return Ok(0);
+    }
+    multiply_work(multiply_work(visits, index_levels(paths) + 1)?, comparison)
 }
 
 impl CapturedWork {
@@ -841,6 +913,8 @@ impl CapturedWork {
         for (path, value) in keys {
             add_work(&mut self.key_bytes, path.len())?;
             add_work(&mut self.key_bytes, value.len())?;
+            self.largest_key_path = self.largest_key_path.max(path.len());
+            self.largest_key_value = self.largest_key_value.max(value.len());
         }
         Ok(())
     }
@@ -854,12 +928,23 @@ impl CapturedWork {
         for node in nodes {
             budget.charge(1)?;
             add_work(&mut self.nodes, 1)?;
+            add_work(&mut self.row_nodes, 1)?;
             add_work(&mut self.schema_bytes, node.schema_path.len())?;
             add_work(
                 &mut self.value_bytes,
                 node.value.as_ref().map_or(0, String::len),
             )?;
             self.include_keys(&node.keys, budget)?;
+            let mut identity = node.schema_path.len();
+            for (path, value) in &node.keys {
+                add_work(&mut identity, path.len())?;
+                add_work(&mut identity, value.len())?;
+            }
+            self.largest_identity = self.largest_identity.max(identity);
+            self.largest_value = self
+                .largest_value
+                .max(node.value.as_ref().map_or(0, String::len));
+            self.largest_keys = self.largest_keys.max(node.keys.len());
             if let Some(registry) = registry {
                 // Resolve every input node before a merge can skip descendants
                 // or stop at a matching row. These searches use schema only.
@@ -879,69 +964,56 @@ impl CapturedWork {
             .ok_or(SubtreeError::TooBig)
     }
 
-    fn merge_units(&self) -> Result<usize, SubtreeError> {
-        // Each original node is processed at most once and can inspect at most
-        // N candidates and N leaf-list paths. Complete tuple bytes cover every
-        // component even when an unequal prefix would stop the actual compare.
-        // Scalar equality can run during both candidate search and acceptance.
-        // Four N² units cover probes/control work; the remaining terms cover
-        // all compared bytes, component visits, recursion and insertions.
-        let mut units = multiply_work(multiply_work(self.nodes, self.nodes)?, 4)?;
-        let mut per_node = self.identity_bytes()?;
-        add_work(&mut per_node, self.schema_bytes)?;
-        per_node = multiply_work(per_node, 2)?;
-        add_work(&mut per_node, multiply_work(self.value_bytes, 4)?)?;
-        add_work(&mut per_node, multiply_work(self.keys, 2)?)?;
-        add_work(&mut per_node, 8)?;
-        add_work(&mut units, multiply_work(self.nodes, per_node)?)?;
+    fn comparison_units(&self) -> Result<usize, SubtreeError> {
+        let mut units = multiply_work(self.largest_identity, 2)?;
+        add_work(&mut units, multiply_work(self.largest_value, 2)?)?;
+        add_work(&mut units, multiply_work(self.largest_keys, 2)?)?;
+        add_work(&mut units, 8)?;
         Ok(units)
+    }
+
+    fn merge_units(&self) -> Result<usize, SubtreeError> {
+        let comparison = self.comparison_units()?;
+        // One indexed sort per sibling batch, one adjacent-run comparison per
+        // node, and one scalar/default conflict check per coalescing node.
+        let passes = sort_levels(self.row_nodes.min(self.nodes));
+        let mut per_node = multiply_work(
+            passes,
+            comparison.checked_add(1).ok_or(SubtreeError::TooBig)?,
+        )?;
+        add_work(&mut per_node, comparison)?;
+        add_work(&mut per_node, multiply_work(self.largest_value, 2)?)?;
+        add_work(&mut per_node, 16)?;
+        let mut units = multiply_work(self.nodes, per_node)?;
+        // Linear tuple visits also make every captured total participate in
+        // checked arithmetic, even for empty or synthetic metadata.
+        add_work(&mut units, multiply_work(self.identity_bytes()?, 2)?)?;
+        add_work(&mut units, multiply_work(self.value_bytes, 2)?)?;
+        add_work(&mut units, multiply_work(self.keys, 2)?)?;
+        Ok(units)
+    }
+
+    fn selection_merge_units(&self) -> Result<usize, SubtreeError> {
+        // Source positions replace repeated identity-tuple comparisons. Keep
+        // the scalar/default conflict checks when equal positions coalesce.
+        let mut per_node = multiply_work(sort_levels(self.row_nodes.min(self.nodes)), 2)?;
+        add_work(&mut per_node, multiply_work(self.largest_value, 2)?)?;
+        add_work(&mut per_node, 16)?;
+        multiply_work(self.nodes, per_node)
     }
 
     #[cfg(test)]
     fn ordering_units(&self) -> Result<usize, SubtreeError> {
-        // All input/selected candidate pairs and every possible vector shift
-        // are reserved, including candidates skipped after an early match.
-        // The K×N term also covers identity-key searches in child selections.
-        // Descendant order passes spend this one reservation, not a new charge
-        // whose size could depend on which hidden identity matched first.
-        let mut units = multiply_work(multiply_work(self.nodes, self.nodes)?, 4)?;
-        add_work(
-            &mut units,
-            multiply_work(multiply_work(self.nodes, self.keys)?, 2)?,
-        )?;
-        let mut compared_bytes = self.identity_bytes()?;
-        add_work(&mut compared_bytes, self.value_bytes)?;
-        let mut repetitions = multiply_work(self.nodes, 3)?;
-        add_work(&mut repetitions, self.keys)?;
-        add_work(&mut units, multiply_work(repetitions, compared_bytes)?)?;
-        add_work(&mut units, multiply_work(self.nodes, 8)?)?;
-        add_work(&mut units, multiply_work(self.keys, 2)?)?;
+        let mut work = self.clone();
+        // The standalone test wrapper pools selected nodes, source nodes and
+        // owner keys. Each key can produce one additional scalar probe.
+        add_work(&mut work.nodes, self.keys)?;
+        add_work(&mut work.row_nodes, self.keys)?;
+        work.largest_identity = work.largest_identity.max(self.largest_key_path);
+        work.largest_value = work.largest_value.max(self.largest_key_value);
+        let mut units = multiply_work(work.merge_units()?, 2)?;
+        add_work(&mut units, multiply_work(work.nodes, 16)?)?;
         Ok(units)
-    }
-}
-
-/// Proof that a complete identity phase was admitted before its first compare.
-/// Early exits may save CPU work but never change or refund the shared charge.
-struct IdentityReservation;
-
-impl IdentityReservation {
-    fn admit(budget: &SubtreeBudget, units: usize) -> Result<Self, SubtreeError> {
-        budget.charge(units)?;
-        Ok(Self)
-    }
-
-    fn same_identity(&self, left: &NetconfXmlNode, right: &NetconfXmlNode) -> bool {
-        left.schema_path == right.schema_path
-            && left.keys == right.keys
-            && left.masked_ordinal == right.masked_ordinal
-    }
-
-    fn same_value(&self, left: &Option<String>, right: &Option<String>) -> bool {
-        left == right
-    }
-
-    fn matches(&self, predicate: &ScalarPredicate, reported: &str) -> bool {
-        predicate.matches_value(reported)
     }
 }
 
@@ -960,106 +1032,71 @@ pub fn merge_bounded(
     let mut work = CapturedWork::default();
     work.include_nodes(existing, Some(registry), budget)?;
     work.include_nodes(&incoming, Some(registry), budget)?;
-    let reservation = IdentityReservation::admit(budget, work.merge_units()?)?;
+    let leaf_bytes = normalize_leaf_lists(&mut work.leaf_lists, budget)?;
+    let mut units = work.merge_units()?;
+    add_work(
+        &mut units,
+        leaf_probe_units(&work, work.nodes, work.leaf_lists.len(), leaf_bytes)?,
+    )?;
+    let reservation = IdentityReservation::admit(budget, units)?;
     merge_reserved(existing, incoming, &work.leaf_lists, &reservation)
-}
-
-fn merge_reserved(
-    existing: &mut Vec<NetconfXmlNode>,
-    incoming: Vec<NetconfXmlNode>,
-    leaf_lists: &[&str],
-    reservation: &IdentityReservation,
-) -> Result<(), SubtreeError> {
-    for mut node in incoming {
-        let leaf_list = leaf_lists.contains(&node.schema_path);
-        let mut found = None;
-        for (index, previous) in existing.iter().enumerate() {
-            if reservation.same_identity(previous, &node) {
-                if leaf_list && !reservation.same_value(&previous.value, &node.value) {
-                    continue;
-                }
-                found = Some(index);
-                break;
-            }
-        }
-        if let Some(index) = found {
-            let previous = &mut existing[index];
-            if !reservation.same_value(&previous.value, &node.value)
-                || previous.is_defaulted != node.is_defaulted
-            {
-                return Err(SubtreeError::Projection);
-            }
-            merge_reserved(
-                &mut previous.children,
-                std::mem::take(&mut node.children),
-                leaf_lists,
-                reservation,
-            )?;
-        } else {
-            existing.push(node);
-        }
-    }
-    Ok(())
-}
-
-fn copy_shell(node: &NetconfXmlNode, _reservation: &IdentityReservation) -> NetconfXmlNode {
-    let mut result = NetconfXmlNode::branch(node.schema_path);
-    result.keys.clone_from(&node.keys);
-    result.value.clone_from(&node.value);
-    result.is_defaulted = node.is_defaulted;
-    result.masked_ordinal = node.masked_ordinal;
-    result
 }
 
 fn selected_copy(
     node: &NetconfXmlNode,
+    index: usize,
+    keys: &[(&'static str, String)],
     outputs: &[SubtreeOutput],
     reservation: &IdentityReservation,
-) -> Option<NetconfXmlNode> {
+) -> Result<Option<SelectedNode>, SubtreeError> {
+    reservation.compared(1);
     let mut selected = false;
     for output in outputs {
-        selected |= output.path == node.schema_path;
+        selected |= reservation.path_eq(output.path, node.schema_path);
     }
     let mut children = Vec::new();
-    for child in &node.children {
-        if let Some(child) = selected_copy(child, outputs, reservation) {
+    for (index, child) in node.children.iter().enumerate() {
+        if let Some(child) = selected_copy(child, index, &node.keys, outputs, reservation)? {
+            reservation.moved(1);
             children.push(child);
         }
     }
     if !selected && children.is_empty() {
-        return None;
+        return Ok(None);
     }
     if node.value.is_some() && !selected {
-        return None;
+        return Ok(None);
     }
-    let mut result = copy_shell(node, reservation);
+    let mut result = SelectedNode::capture(node, index, keys, reservation)?;
     result.children = children;
-    Some(result)
+    Ok(Some(result))
 }
 
 fn evaluate_scope(
     scope: &SubtreeScope,
     input: &[NetconfXmlNode],
     keys: &[(&'static str, String)],
-    leaf_lists: &[&str],
     reservation: &IdentityReservation,
-) -> Result<Option<Vec<NetconfXmlNode>>, SubtreeError> {
+) -> Result<Option<Vec<SelectedNode>>, SubtreeError> {
     let mut matched = Vec::new();
     let mut matched_keys = Vec::new();
     for predicate in &scope.predicates {
         let mut satisfied = false;
         for alternative in &predicate.alternatives {
-            for (path, value) in keys {
-                if *path == alternative.path && reservation.matches(&alternative.predicate, value) {
+            for (index, (path, value)) in keys.iter().enumerate() {
+                if reservation.path_eq(path, alternative.path)
+                    && reservation.matches(&alternative.predicate, value)
+                {
                     satisfied = true;
-                    matched_keys.push(NetconfXmlNode::scalar(path, value.clone(), false));
+                    matched_keys.push(SelectedNode::key(path, value, index, reservation));
                 }
             }
             for (index, node) in input.iter().enumerate() {
-                if node.schema_path == alternative.path {
+                if reservation.path_eq(node.schema_path, alternative.path) {
                     if let Some(value) = &node.value {
                         if reservation.matches(&alternative.predicate, value) {
                             satisfied = true;
+                            reservation.moved(1);
                             matched.push(index);
                         }
                     }
@@ -1074,39 +1111,48 @@ fn evaluate_scope(
     // These intermediate forests never determine a new work charge.
     let mut candidates = matched_keys;
     for index in matched {
-        candidates.push(copy_shell(&input[index], reservation));
+        reservation.moved(1);
+        candidates.push(SelectedNode::capture(
+            &input[index],
+            index,
+            keys,
+            reservation,
+        )?);
     }
     if !scope.implicit_outputs.is_empty() {
-        for node in input {
-            if let Some(copy) = selected_copy(node, &scope.implicit_outputs, reservation) {
+        for (index, node) in input.iter().enumerate() {
+            if let Some(copy) =
+                selected_copy(node, index, keys, &scope.implicit_outputs, reservation)?
+            {
+                reservation.moved(1);
                 candidates.push(copy);
             }
         }
     }
     for branch in &scope.branches {
-        for (path, value) in keys {
-            if *path == branch.path && branch.children.is_none() {
+        for (index, (path, value)) in keys.iter().enumerate() {
+            if reservation.path_eq(path, branch.path) && branch.children.is_none() {
                 let mut selected = false;
                 for output in &branch.outputs {
-                    selected |= output.path == *path;
+                    selected |= reservation.path_eq(output.path, path);
                 }
                 if selected {
-                    candidates.push(NetconfXmlNode::scalar(path, value.clone(), false));
+                    candidates.push(SelectedNode::key(path, value, index, reservation));
                 }
             }
         }
-        for node in input {
-            if node.schema_path != branch.path {
+        for (index, node) in input.iter().enumerate() {
+            if !reservation.path_eq(node.schema_path, branch.path) {
                 continue;
             }
             let selected = if let Some(scope) = &branch.children {
                 if let Some(children) =
-                    evaluate_scope(scope, &node.children, &node.keys, leaf_lists, reservation)?
+                    evaluate_scope(scope, &node.children, &node.keys, reservation)?
                 {
                     if children.is_empty() {
                         None
                     } else {
-                        let mut copy = copy_shell(node, reservation);
+                        let mut copy = SelectedNode::capture(node, index, keys, reservation)?;
                         copy.children = children;
                         Some(copy)
                     }
@@ -1114,16 +1160,15 @@ fn evaluate_scope(
                     None
                 }
             } else {
-                selected_copy(node, &branch.outputs, reservation)
+                selected_copy(node, index, keys, &branch.outputs, reservation)?
             };
             if let Some(selected) = selected {
+                reservation.moved(1);
                 candidates.push(selected);
             }
         }
     }
-    let mut result = Vec::new();
-    merge_reserved(&mut result, candidates, leaf_lists, reservation)?;
-    Ok(Some(result))
+    Ok(Some(merge_selected(candidates, reservation)?))
 }
 
 #[cfg(test)]
@@ -1139,59 +1184,6 @@ fn order_like(
     work.include_keys(keys, budget)?;
     let reservation = IdentityReservation::admit(budget, work.ordering_units()?)?;
     order_reserved(selected, input, keys, &reservation)
-}
-
-fn order_reserved(
-    selected: &mut Vec<NetconfXmlNode>,
-    input: &[NetconfXmlNode],
-    keys: &[(&'static str, String)],
-    reservation: &IdentityReservation,
-) -> Result<(), SubtreeError> {
-    let mut ordered = Vec::new();
-    // Identity keys are retained separately from projected child values. A key
-    // selected or matched by the filter still occupies its schema-order slot.
-    for (path, value) in keys {
-        let mut index = 0;
-        while index < selected.len() {
-            let node = &selected[index];
-            if *path == node.schema_path {
-                if !node.keys.is_empty()
-                    || !node.children.is_empty()
-                    || !node.value.as_ref().is_some_and(|actual| value == actual)
-                {
-                    return Err(SubtreeError::Projection);
-                }
-                let node = selected.remove(index);
-                ordered.push(node);
-                break;
-            }
-            index += 1;
-        }
-    }
-    for original in input {
-        let mut index = 0;
-        while index < selected.len() {
-            if reservation.same_identity(original, &selected[index])
-                && reservation.same_value(&original.value, &selected[index].value)
-            {
-                let mut node = selected.remove(index);
-                order_reserved(
-                    &mut node.children,
-                    &original.children,
-                    &original.keys,
-                    reservation,
-                )?;
-                ordered.push(node);
-                break;
-            }
-            index += 1;
-        }
-    }
-    if !selected.is_empty() {
-        return Err(SubtreeError::Projection);
-    }
-    *selected = ordered;
-    Ok(())
 }
 
 #[cfg(test)]

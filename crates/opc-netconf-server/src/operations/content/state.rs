@@ -80,9 +80,6 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         let path = value.path().as_str();
         let (node, ancestors, identity, path_identity) =
             instance(registry, path, budget, limits.max_value_bytes)?;
-        if contains_path_identity(&seen, &path_identity, budget)? {
-            return Err(SubtreeError::Projection);
-        }
         let path_work = path_identity.len();
         if node.config || !matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList) {
             return Err(SubtreeError::Projection);
@@ -182,33 +179,38 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         budget.charge(1)?;
         accepted.push((path, path_work, tree));
     }
-    // Canonical order still uses the raw validated path. Precharge insertion
-    // sort's complete worst case so comparison/move count cannot reveal hidden
-    // key order, and use only fixed-width identities to measure path work.
-    let count = accepted.len();
-    budget.charge(count.checked_mul(2).ok_or(SubtreeError::TooBig)?)?;
-    let max_path_work = accepted.iter().map(|(_, work, _)| *work).max().unwrap_or(0);
-    let pairs = count
-        .checked_mul(count.saturating_sub(1))
-        .ok_or(SubtreeError::TooBig)?
-        / 2;
-    let per_pair = max_path_work
-        .checked_mul(2)
-        .and_then(|work| work.checked_add(2))
-        .ok_or(SubtreeError::TooBig)?;
-    budget.charge(pairs.checked_mul(per_pair).ok_or(SubtreeError::TooBig)?)?;
-    for index in 1..count {
-        let mut current = index;
-        while current > 0 && accepted[current - 1].0 > accepted[current].0 {
-            accepted.swap(current - 1, current);
-            current -= 1;
-        }
+    // Detect duplicate complete identities in one indexed batch. A failed
+    // equality test or an early duplicate never changes the prepaid work.
+    budget.charge(seen.len())?;
+    let max_identity = seen.iter().map(String::len).max().unwrap_or(0);
+    let identities = sorted_positions(seen.len(), max_identity, budget, |left, right| {
+        seen[left].cmp(&seen[right])
+    })?;
+    if identities
+        .windows(2)
+        .any(|pair| seen[pair[0]] == seen[pair[1]])
+    {
+        return Err(SubtreeError::Projection);
     }
-    // Keep every original capture until the evaluator reserves the whole join
-    // and evaluation. Coalescing here would make its input shape depend on
-    // masked identity equality across provider entries.
+    // Canonical output order still uses raw validated paths, with work sized
+    // exclusively from captured path identities (fixed width for masked keys).
+    // Sorting positions and moving each tree once avoids quadratic shifts.
     budget.charge(accepted.len())?;
-    Ok(accepted.into_iter().map(|(_, _, tree)| tree).collect())
+    let max_path_work = accepted.iter().map(|(_, work, _)| *work).max().unwrap_or(0);
+    let order = sorted_positions(accepted.len(), max_path_work, budget, |left, right| {
+        accepted[left].0.cmp(accepted[right].0)
+    })?;
+    budget.charge(accepted.len().checked_mul(2).ok_or(SubtreeError::TooBig)?)?;
+    let mut slots: Vec<_> = accepted
+        .into_iter()
+        .map(|(_, _, tree)| Some(tree))
+        .collect();
+    // Retain every original chain; only the evaluator may coalesce identities
+    // after admitting its complete capture-derived envelope.
+    order
+        .into_iter()
+        .map(|index| slots[index].take().ok_or(SubtreeError::Projection))
+        .collect()
 }
 
 fn add_work(total: &mut usize, units: usize) -> Result<(), SubtreeError> {
@@ -216,20 +218,49 @@ fn add_work(total: &mut usize, units: usize) -> Result<(), SubtreeError> {
     Ok(())
 }
 
-fn contains_path_identity(
-    previous: &[String],
-    path: &str,
+/// A stable merge sort has at most N comparisons and N position moves per
+/// level. Include a complete adjacent equality pass for duplicate detection.
+fn sorted_positions(
+    count: usize,
+    captured_bytes: usize,
     budget: &SubtreeBudget,
-) -> Result<bool, SubtreeError> {
-    budget.charge(previous.len())?;
-    let mut work = previous.len();
-    for candidate in previous {
-        add_work(&mut work, candidate.len())?;
-        add_work(&mut work, path.len())?;
+    mut compare: impl FnMut(usize, usize) -> std::cmp::Ordering,
+) -> Result<Vec<usize>, SubtreeError> {
+    let levels = (usize::BITS - count.saturating_sub(1).leading_zeros()) as usize;
+    let per_compare = captured_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or(SubtreeError::TooBig)?;
+    let per_node = levels
+        .checked_add(1)
+        .and_then(|levels| levels.checked_mul(per_compare))
+        .and_then(|work| work.checked_add(2))
+        .ok_or(SubtreeError::TooBig)?;
+    budget.charge(count.checked_mul(per_node).ok_or(SubtreeError::TooBig)?)?;
+    let mut order: Vec<_> = (0..count).collect();
+    let mut scratch = vec![0; count];
+    let mut width = 1usize;
+    while width < count {
+        let mut start = 0;
+        while start < count {
+            let middle = start.saturating_add(width).min(count);
+            let end = middle.saturating_add(width).min(count);
+            let (mut left, mut right) = (start, middle);
+            for slot in &mut scratch[start..end] {
+                if left < middle && (right == end || !compare(order[left], order[right]).is_gt()) {
+                    *slot = order[left];
+                    left += 1;
+                } else {
+                    *slot = order[right];
+                    right += 1;
+                }
+            }
+            start = end;
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        width = width.saturating_mul(2);
     }
-    // Every candidate is prepaid even if a duplicate is found at the front.
-    budget.charge(work)?;
-    Ok(previous.iter().any(|candidate| candidate == path))
+    Ok(order)
 }
 
 fn requested_instance(
@@ -524,4 +555,63 @@ fn instance(
         identity,
         path_identity,
     ))
+}
+
+#[cfg(test)]
+mod index_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn provider_index_sort_admits_before_comparing_and_is_order_independent() {
+        let count = 1024;
+        let mut expected_used = None;
+        for reverse in [false, true] {
+            let mut paths: Vec<_> = (0..count).map(|index| format!("{index:04}")).collect();
+            if reverse {
+                paths.reverse();
+            }
+            let budget =
+                SubtreeBudget::new(MgmtLimits::default().max_subtree_filter_work_units, 0).unwrap();
+            let mut comparisons = 0;
+            let order = sorted_positions(count, 64, &budget, |left, right| {
+                comparisons += 1;
+                paths[left].cmp(&paths[right])
+            })
+            .unwrap();
+            assert_eq!(
+                order.iter().map(|index| &paths[*index]).collect::<Vec<_>>(),
+                {
+                    let mut expected: Vec<_> = paths.iter().collect();
+                    expected.sort();
+                    expected
+                }
+            );
+            assert!(
+                comparisons <= count * 10,
+                "1024 positions need at most ten merge-sort levels"
+            );
+            let used = MgmtLimits::default().max_subtree_filter_work_units - budget.remaining();
+            if let Some(expected) = expected_used {
+                assert_eq!(used, expected);
+            }
+            expected_used = Some(used);
+            let refused = SubtreeBudget::new(used - 1, 0).unwrap();
+            assert_eq!(
+                sorted_positions(count, 64, &refused, |_, _| panic!(
+                    "comparison before admission"
+                )),
+                Err(SubtreeError::TooBig)
+            );
+            assert_eq!(refused.remaining(), used - 1);
+        }
+        let budget = SubtreeBudget::new(1, 0).unwrap();
+        assert_eq!(
+            sorted_positions(usize::MAX, usize::MAX, &budget, |_, _| panic!(
+                "overflow before admission"
+            )),
+            Err(SubtreeError::TooBig)
+        );
+        assert_eq!(budget.remaining(), 1);
+    }
 }

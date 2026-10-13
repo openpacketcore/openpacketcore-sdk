@@ -2,8 +2,8 @@
 //!
 //! Sizing uses only the original capture's schema paths, counts and lengths.
 //! `Shape` deliberately cannot hold a key identity or a scalar value. Scope
-//! estimates pool all possible parent instances before bounding comparisons;
-//! they never assume that two capture fragments will, or will not, coalesce.
+//! estimates retain original row totals and maxima. Indexed sibling operations
+//! use logarithmic bounds without assuming which fragments will coalesce.
 
 use super::*;
 
@@ -15,11 +15,26 @@ struct KeySize {
 
 struct Shape {
     path: &'static str,
+    kind: NodeKind,
+    metadata_work: usize,
     value_bytes: Option<usize>,
     keys: Vec<KeySize>,
     children: Vec<Shape>,
     shell: Footprint,
     tree: Footprint,
+}
+
+fn metadata_units(path: &str, keys: &[KeySize], children: &[Shape]) -> Result<usize, SubtreeError> {
+    let mut units = path.len();
+    add_work(&mut units, 6)?;
+    for key in keys {
+        add_work(&mut units, key.path.len())?;
+        add_work(&mut units, 2)?;
+    }
+    for child in children {
+        add_work(&mut units, child.metadata_work)?;
+    }
+    Ok(units)
 }
 
 impl Shape {
@@ -43,27 +58,30 @@ fn normalize_shapes(shapes: &mut [Shape], budget: &SubtreeBudget) -> Result<(), 
     budget.charge(shapes.len())?;
     let mut comparison = 0;
     for shape in shapes.iter() {
-        let mut units = multiply_work(shape.tree.total.nodes, 4)?;
-        add_work(&mut units, multiply_work(shape.tree.total.keys, 2)?)?;
-        add_work(&mut units, shape.tree.total.identity_bytes()?)?;
-        comparison = comparison.max(units);
+        comparison = comparison.max(shape.metadata_work);
     }
-    let pairs = multiply_work(shapes.len(), shapes.len().saturating_sub(1))? / 2;
-    let per_pair = multiply_work(comparison, 2)?
+    let per_compare = multiply_work(comparison, 2)?
         .checked_add(2)
         .ok_or(SubtreeError::TooBig)?;
-    budget.charge(multiply_work(pairs, per_pair)?)?;
-    // Only metadata is sorted. The real captured data keeps its input order.
-    // Prepay the entire insertion sort, including early equal-prefix exits.
-    for index in 1..shapes.len() {
-        let mut current = index;
-        while current > 0
-            && shapes[current - 1]
-                .compare_metadata(&shapes[current])
-                .is_gt()
-        {
-            shapes.swap(current - 1, current);
-            current -= 1;
+    let mut per_node = multiply_work(sort_levels(shapes.len()), per_compare)?;
+    add_work(&mut per_node, 8)?;
+    budget.charge(multiply_work(shapes.len(), per_node)?)?;
+    // Metadata alone is sorted; all comparison/move work is prepaid. The
+    // capture order and every identity/payload remain outside this operation.
+    let order = identity::sorted_indices(
+        shapes.len(),
+        |left, right| shapes[left].compare_metadata(&shapes[right]),
+        |_| {},
+    );
+    let mut destination = vec![0; shapes.len()];
+    for (to, from) in order.into_iter().enumerate() {
+        destination[from] = to;
+    }
+    for index in 0..shapes.len() {
+        while destination[index] != index {
+            let next = destination[index];
+            shapes.swap(index, next);
+            destination.swap(index, next);
         }
     }
     Ok(())
@@ -90,10 +108,17 @@ impl SelectionEstimate {
 impl CapturedWork {
     fn append(&mut self, other: &Self) -> Result<(), SubtreeError> {
         add_work(&mut self.nodes, other.nodes)?;
+        add_work(&mut self.row_nodes, other.row_nodes)?;
         add_work(&mut self.keys, other.keys)?;
         add_work(&mut self.schema_bytes, other.schema_bytes)?;
         add_work(&mut self.key_bytes, other.key_bytes)?;
-        add_work(&mut self.value_bytes, other.value_bytes)
+        add_work(&mut self.value_bytes, other.value_bytes)?;
+        self.largest_identity = self.largest_identity.max(other.largest_identity);
+        self.largest_value = self.largest_value.max(other.largest_value);
+        self.largest_keys = self.largest_keys.max(other.largest_keys);
+        self.largest_key_path = self.largest_key_path.max(other.largest_key_path);
+        self.largest_key_value = self.largest_key_value.max(other.largest_key_value);
+        Ok(())
     }
 
     fn copy_units(&self) -> Result<usize, SubtreeError> {
@@ -109,16 +134,24 @@ impl CapturedWork {
         for key in keys {
             add_work(&mut self.key_bytes, key.path.len())?;
             add_work(&mut self.key_bytes, key.bytes)?;
+            self.largest_key_path = self.largest_key_path.max(key.path.len());
+            self.largest_key_value = self.largest_key_value.max(key.bytes);
         }
         Ok(())
     }
 
     fn clamp(&mut self, cap: &Self) {
         self.nodes = self.nodes.min(cap.nodes);
+        self.row_nodes = self.row_nodes.min(cap.row_nodes);
         self.keys = self.keys.min(cap.keys);
         self.schema_bytes = self.schema_bytes.min(cap.schema_bytes);
         self.key_bytes = self.key_bytes.min(cap.key_bytes);
         self.value_bytes = self.value_bytes.min(cap.value_bytes);
+        self.largest_identity = self.largest_identity.min(cap.largest_identity);
+        self.largest_value = self.largest_value.min(cap.largest_value);
+        self.largest_keys = self.largest_keys.min(cap.largest_keys);
+        self.largest_key_path = self.largest_key_path.min(cap.largest_key_path);
+        self.largest_key_value = self.largest_key_value.min(cap.largest_key_value);
     }
 }
 
@@ -128,9 +161,9 @@ struct SiblingGroup {
     work: CapturedWork,
 }
 
-// Comparisons and vector shifts stay within a sibling vector. Group by its
-// schema parent, pooling ALL original instances of that parent. Thus grouping
-// never assumes anything about equality of captured row identities.
+// Indexed operations stay within a sibling vector. Sum original row counts
+// and retain the largest per-row tuple, instead of multiplying pooled bytes
+// by pooled nodes. A pooled logarithm bounds every possible fragment join.
 #[derive(Clone, Default)]
 struct Footprint {
     total: CapturedWork,
@@ -215,6 +248,9 @@ impl Footprint {
                 work: CapturedWork {
                     keys: total.keys,
                     key_bytes: total.key_bytes,
+                    largest_keys: total.keys,
+                    largest_key_path: total.largest_key_path,
+                    largest_key_value: total.largest_key_value,
                     ..CapturedWork::default()
                 },
             });
@@ -251,58 +287,105 @@ impl Footprint {
         let mut units = 0;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
-            let work = &group.work;
-            let mut per_node = multiply_work(work.identity_bytes()?, 2)?;
-            add_work(&mut per_node, multiply_work(work.value_bytes, 4)?)?;
-            add_work(&mut per_node, multiply_work(work.keys, 2)?)?;
-            add_work(&mut per_node, 8)?;
-            add_work(&mut units, multiply_work(work.nodes, per_node)?)?;
-            add_work(
-                &mut units,
-                multiply_work(multiply_work(work.nodes, work.nodes)?, 4)?,
-            )?;
+            add_work(&mut units, group.work.merge_units()?)?;
         }
         Ok(units)
     }
 
+    fn selection_merge_units(&self, budget: &SubtreeBudget) -> Result<usize, SubtreeError> {
+        let mut units = 0;
+        budget.charge(self.siblings.len())?;
+        for group in &self.siblings {
+            add_work(&mut units, group.work.selection_merge_units()?)?;
+        }
+        Ok(units)
+    }
+
+    fn position_ordering_units(&self, budget: &SubtreeBudget) -> Result<usize, SubtreeError> {
+        let mut units = 0;
+        budget.charge(self.siblings.len())?;
+        for group in &self.siblings {
+            let work = &group.work;
+            let mut per_node = multiply_work(sort_levels(work.row_nodes.min(work.nodes)), 2)?;
+            add_work(&mut per_node, 6)?;
+            add_work(&mut units, multiply_work(work.nodes, per_node)?)?;
+        }
+        Ok(units)
+    }
+
+    fn position_lookup_units(
+        &self,
+        owner_keys: &[SiblingGroup],
+        budget: &SubtreeBudget,
+    ) -> Result<usize, SubtreeError> {
+        let mut units = 0;
+        budget.charge(self.siblings.len())?;
+        for group in &self.siblings {
+            let keys = group_work(owner_keys, group.parent, budget)?;
+            if keys.largest_keys == 0 {
+                continue;
+            }
+            let mut probe = group.work.largest_identity;
+            add_work(&mut probe, keys.largest_key_path)?;
+            add_work(&mut probe, 1)?;
+            let mut per_node = multiply_work(probe, keys.largest_keys)?;
+            add_work(&mut per_node, keys.largest_key_value)?;
+            add_work(&mut per_node, group.work.largest_value)?;
+            add_work(&mut per_node, 4)?;
+            add_work(&mut units, multiply_work(group.work.nodes, per_node)?)?;
+        }
+        Ok(units)
+    }
+
+    fn limit_rows(
+        &mut self,
+        bounds: &[SiblingGroup],
+        copies: usize,
+        budget: &SubtreeBudget,
+    ) -> Result<(), SubtreeError> {
+        for group in &mut self.siblings {
+            budget.charge(1)?;
+            let width = group_work(bounds, group.parent, budget)?.nodes;
+            group.work.row_nodes = group.work.row_nodes.min(multiply_work(width, copies)?);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn ordering_units(&self, input: &Self, budget: &SubtreeBudget) -> Result<usize, SubtreeError> {
-        // Input and selection have distinct roles: only input nodes probe,
-        // only selected nodes move, and only input keys order child scalars.
-        // Pooling instances by schema still bounds every possible correlation.
         let mut units = multiply_work(input.total.nodes, 4)?;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
             let selected = &group.work;
             let source = group_work(&input.siblings, group.parent, budget)?;
             let keys = group_work(&input.child_keys, group.parent, budget)?;
-            add_work(&mut units, multiply_work(selected.nodes, 4)?)?;
-            add_work(&mut units, multiply_work(keys.keys, 4)?)?;
-            let source_probes = source
+            // The selected index is built once for each parent row. Probes
+            // come only from original source nodes or original captured keys.
+            let mut probe = source.clone();
+            probe.largest_identity = probe.largest_identity.max(keys.largest_key_path);
+            probe.largest_value = probe.largest_value.max(keys.largest_key_value);
+            let probes = source
                 .nodes
                 .checked_add(keys.keys)
                 .ok_or(SubtreeError::TooBig)?;
-            add_work(
-                &mut units,
-                multiply_work(multiply_work(selected.nodes, source_probes)?, 4)?,
+            let mut comparison = selected.largest_identity;
+            add_work(&mut comparison, probe.largest_identity)?;
+            add_work(&mut comparison, selected.largest_value)?;
+            add_work(&mut comparison, probe.largest_value)?;
+            add_work(&mut comparison, selected.largest_keys)?;
+            add_work(&mut comparison, probe.largest_keys)?;
+            add_work(&mut comparison, 8)?;
+            let per_probe = multiply_work(
+                index_levels(selected.row_nodes.min(selected.nodes)) + 1,
+                comparison,
             )?;
-            add_work(
-                &mut units,
-                multiply_work(multiply_work(selected.nodes, selected.nodes)?, 2)?,
-            )?;
-            let mut source_bytes = source.identity_bytes()?;
-            add_work(&mut source_bytes, source.value_bytes)?;
-            add_work(&mut source_bytes, multiply_work(source.keys, 2)?)?;
-            add_work(&mut source_bytes, keys.key_bytes)?;
-            add_work(&mut units, multiply_work(selected.nodes, source_bytes)?)?;
-            let mut selected_bytes = selected.identity_bytes()?;
-            add_work(&mut selected_bytes, selected.value_bytes)?;
-            add_work(&mut selected_bytes, multiply_work(selected.keys, 2)?)?;
-            add_work(&mut units, multiply_work(source.nodes, selected_bytes)?)?;
-            let key_scalar_bytes = selected
-                .schema_bytes
-                .checked_add(selected.value_bytes)
-                .ok_or(SubtreeError::TooBig)?;
-            add_work(&mut units, multiply_work(keys.keys, key_scalar_bytes)?)?;
+            add_work(&mut units, multiply_work(probes, per_probe)?)?;
+            add_work(&mut units, selected.merge_units()?)?;
+            add_work(&mut units, multiply_work(selected.nodes, 12)?)?;
+            add_work(&mut units, multiply_work(probes, 4)?)?;
+            add_work(&mut units, source.identity_bytes()?)?;
+            add_work(&mut units, source.value_bytes)?;
+            add_work(&mut units, keys.key_bytes)?;
         }
         Ok(units)
     }
@@ -315,8 +398,11 @@ impl Footprint {
         for group in &self.child_keys {
             let scalars = CapturedWork {
                 nodes: group.work.keys,
+                row_nodes: group.work.keys,
                 schema_bytes: group.work.key_bytes,
                 value_bytes: group.work.key_bytes,
+                largest_identity: group.work.largest_key_path,
+                largest_value: group.work.largest_key_value,
                 ..CapturedWork::default()
             };
             cap.total.append(&scalars)?;
@@ -337,10 +423,18 @@ fn capture_shape(
     registry: &dyn SchemaRegistry,
     budget: &SubtreeBudget,
     leaf_lists: &mut Vec<&'static str>,
+    parent: &str,
 ) -> Result<Vec<Shape>, SubtreeError> {
     budget.charge(nodes.len())?;
     let mut shapes = Vec::new();
     for node in nodes {
+        let mut path_work = node.schema_path.len();
+        add_work(&mut path_work, parent.len())?;
+        add_work(&mut path_work, 1)?;
+        budget.charge(path_work)?;
+        if node.schema_path.rsplit_once('/').map(|(parent, _)| parent) != Some(parent) {
+            return Err(SubtreeError::Projection);
+        }
         budget.charge(node.keys.len())?;
         let keys: Vec<_> = node
             .keys
@@ -352,23 +446,68 @@ fn capture_shape(
             .collect();
         let mut shell = CapturedWork {
             nodes: 1,
+            row_nodes: 1,
             schema_bytes: node.schema_path.len(),
             value_bytes: node.value.as_ref().map_or(0, String::len),
             ..CapturedWork::default()
         };
         shell.add_keys(&keys)?;
+        shell.largest_identity = shell.identity_bytes()?;
+        shell.largest_value = shell.value_bytes;
+        shell.largest_keys = shell.keys;
         let shell = Footprint::shell(node.schema_path, shell, budget)?;
-        if budget.node(registry, node.schema_path)?.kind == NodeKind::LeafList {
+        let metadata = budget.node(registry, node.schema_path)?;
+        let kind = metadata.kind;
+        // Cardinality bounds must also hold for a custom projector's capture.
+        if (kind != NodeKind::List && !node.keys.is_empty())
+            || (kind != NodeKind::LeafList && node.masked_ordinal.is_some())
+        {
+            return Err(SubtreeError::Projection);
+        }
+        if kind == NodeKind::List {
+            if node.keys.len() != metadata.key_leaves.len() {
+                return Err(SubtreeError::Projection);
+            }
+            for ((path, _), declared) in node.keys.iter().zip(metadata.key_leaves) {
+                let mut units = path.len();
+                add_work(&mut units, node.schema_path.len())?;
+                add_work(&mut units, multiply_work(declared.len(), 2)?)?;
+                add_work(&mut units, 2)?;
+                budget.charge(units)?;
+                let Some((parent, name)) = path.rsplit_once('/') else {
+                    return Err(SubtreeError::Projection);
+                };
+                let local = name.split_once(':').map_or(name, |(_, local)| local);
+                if parent != node.schema_path || (name != *declared && local != *declared) {
+                    return Err(SubtreeError::Projection);
+                }
+            }
+        }
+        if kind == NodeKind::LeafList {
             budget.charge(1)?;
             leaf_lists.push(node.schema_path);
         }
-        let children = capture_shape(&node.children, registry, budget, leaf_lists)?;
+        let children = capture_shape(
+            &node.children,
+            registry,
+            budget,
+            leaf_lists,
+            node.schema_path,
+        )?;
         let mut tree = shell.copy_metadata(budget)?;
         for child in &children {
             tree.append(&child.tree, budget)?;
         }
+        budget.charge(
+            keys.len()
+                .checked_add(children.len())
+                .ok_or(SubtreeError::TooBig)?,
+        )?;
+        let metadata_work = metadata_units(node.schema_path, &keys, &children)?;
         shapes.push(Shape {
             path: node.schema_path,
+            kind,
+            metadata_work,
             value_bytes: node.value.as_ref().map(String::len),
             keys,
             children,
@@ -394,12 +533,78 @@ fn scalar_work(key: &KeySize, budget: &SubtreeBudget) -> Result<Footprint, Subtr
         key.path,
         CapturedWork {
             nodes: 1,
+            row_nodes: 1,
             schema_bytes: key.path.len(),
             value_bytes: key.bytes,
+            largest_identity: key.path.len(),
+            largest_value: key.bytes,
             ..CapturedWork::default()
         },
         budget,
     )
+}
+
+// After the initial join, a scalar/container schema path occurs at most once
+// under any one parent. Lists and leaf-lists may retain every original node.
+// These are schema bounds, not observations of a joined or selected forest.
+fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGroup>, SubtreeError> {
+    fn add_path(
+        paths: &mut Vec<(&'static str, usize)>,
+        path: &'static str,
+        repeating: bool,
+        budget: &SubtreeBudget,
+    ) -> Result<(), SubtreeError> {
+        for (previous, count) in paths.iter_mut() {
+            budget.charge(1)?;
+            if budget.compare(previous, path)? {
+                if repeating {
+                    add_work(count, 1)?;
+                }
+                return Ok(());
+            }
+        }
+        budget.charge(1)?;
+        paths.push((path, 1));
+        Ok(())
+    }
+    fn visit(
+        shapes: &[Shape],
+        paths: &mut Vec<(&'static str, usize)>,
+        budget: &SubtreeBudget,
+    ) -> Result<(), SubtreeError> {
+        for shape in shapes {
+            budget.charge(1)?;
+            add_path(
+                paths,
+                shape.path,
+                matches!(shape.kind, NodeKind::List | NodeKind::LeafList),
+                budget,
+            )?;
+            for key in &shape.keys {
+                budget.charge(1)?;
+                add_path(paths, key.path, false, budget)?;
+            }
+            visit(&shape.children, paths, budget)?;
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    visit(shapes, &mut paths, budget)?;
+    let mut groups = Vec::new();
+    for (path, nodes) in paths {
+        budget.charge(path.len())?;
+        let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        add_group(
+            &mut groups,
+            parent,
+            &CapturedWork {
+                nodes,
+                ..CapturedWork::default()
+            },
+            budget,
+        )?;
+    }
+    Ok(groups)
 }
 
 pub(super) struct EvaluationWork {
@@ -407,6 +612,8 @@ pub(super) struct EvaluationWork {
     pub(super) predicate_trials: usize,
     pub(super) leaf_lists: Vec<&'static str>,
     leaf_list_bytes: usize,
+    row_bounds: Vec<SiblingGroup>,
+    owner_keys: Vec<SiblingGroup>,
 }
 
 impl EvaluationWork {
@@ -421,61 +628,78 @@ impl EvaluationWork {
             predicate_trials: 0,
             leaf_lists: Vec::new(),
             leaf_list_bytes: 0,
+            row_bounds: Vec::new(),
+            owner_keys: Vec::new(),
         };
-        let shapes = capture_shape(input, registry, budget, &mut work.leaf_lists)?;
+        let shapes = capture_shape(input, registry, budget, &mut work.leaf_lists, "")?;
+        work.row_bounds = row_bounds(&shapes, budget)?;
         budget.charge(shapes.len())?;
         let input: Vec<_> = shapes.iter().collect();
         let raw = forest_work(&input, budget)?;
-        budget.charge(work.leaf_lists.len())?;
-        for path in &work.leaf_lists {
-            add_work(&mut work.leaf_list_bytes, path.len())?;
-        }
+        budget.charge(raw.child_keys.len())?;
+        work.owner_keys = raw.child_keys.clone();
+        work.leaf_list_bytes = normalize_leaf_lists(&mut work.leaf_lists, budget)?;
         add_work(&mut work.units, raw.copy_units()?)?;
         work.merge(&raw, input.len(), budget)?;
         let mut candidates = SelectionEstimate::default();
         for scope in scopes {
             budget.charge(1)?;
-            let selected = work.scope(scope, &input, &[], budget)?;
+            let selected = work.scope(scope, &input, &[], "", budget)?;
             add_work(&mut work.units, selected.roots)?;
             candidates.append(&selected.work, selected.roots, budget)?;
         }
-        work.merge(&candidates.work, candidates.roots, budget)?;
+        work.merge_selection(&candidates.work, candidates.roots, "", budget)?;
         candidates.work.clamp(&raw.selection_cap(budget)?, budget)?;
+        candidates.work.limit_rows(&work.row_bounds, 1, budget)?;
         add_work(
             &mut work.units,
-            candidates.work.ordering_units(&raw, budget)?,
+            candidates.work.position_ordering_units(budget)?,
         )?;
         Ok(work)
     }
 
     fn merge(
         &mut self,
+        captured: &Footprint,
+        _roots: usize,
+        budget: &SubtreeBudget,
+    ) -> Result<(), SubtreeError> {
+        add_work(&mut self.units, captured.merge_units(budget)?)?;
+        add_work(
+            &mut self.units,
+            leaf_probe_units(
+                &captured.total,
+                captured.total.nodes,
+                self.leaf_lists.len(),
+                self.leaf_list_bytes,
+            )?,
+        )
+    }
+
+    fn merge_selection(
+        &mut self,
         candidates: &Footprint,
         roots: usize,
+        parent: &str,
         budget: &SubtreeBudget,
     ) -> Result<(), SubtreeError> {
         // Each scope merge starts empty. With at most one possible incoming
         // root across all instances, insertion cannot compare identities or
         // recurse into children. This bound uses original-fragment counts,
         // never the number of roots left by an actual identity merge.
-        let visits = if roots <= 1 {
-            add_work(&mut self.units, roots)?;
-            roots
+        let width = group_work(&candidates.siblings, parent, budget)?.row_nodes;
+        if roots <= 1 || width <= 1 {
+            add_work(&mut self.units, roots)
         } else {
-            add_work(&mut self.units, candidates.merge_units(budget)?)?;
-            candidates.total.nodes
-        };
-        // Every merge uses the same complete capture's leaf-list schema table.
-        // A small selection can therefore scan more entries than it has nodes.
-        let count = self.leaf_lists.len();
-        add_work(&mut self.units, multiply_work(visits, count)?)?;
+            add_work(&mut self.units, candidates.selection_merge_units(budget)?)
+        }
+    }
+
+    fn copy(&mut self, input: &Footprint, budget: &SubtreeBudget) -> Result<(), SubtreeError> {
+        add_work(&mut self.units, input.copy_units()?)?;
         add_work(
             &mut self.units,
-            multiply_work(visits, self.leaf_list_bytes)?,
-        )?;
-        add_work(
-            &mut self.units,
-            multiply_work(count, candidates.total.schema_bytes)?,
+            input.position_lookup_units(&self.owner_keys, budget)?,
         )
     }
 
@@ -518,7 +742,7 @@ impl EvaluationWork {
             add_work(&mut self.units, multiply_work(input.total.nodes, per_node)?)?;
             add_work(&mut self.units, input.total.schema_bytes)?;
         }
-        add_work(&mut self.units, input.copy_units()?)
+        self.copy(input, budget)
     }
 
     fn scope(
@@ -526,9 +750,11 @@ impl EvaluationWork {
         scope: &SubtreeScope,
         input: &[&Shape],
         keys: &[KeySize],
+        parent: &'static str,
         budget: &SubtreeBudget,
     ) -> Result<SelectionEstimate, SubtreeError> {
-        let available = forest_work(input, budget)?;
+        let mut available = forest_work(input, budget)?;
+        available.limit_rows(&self.row_bounds, 1, budget)?;
         let mut candidates = SelectionEstimate::default();
         budget.charge(scope.predicates.len())?;
         for predicate in &scope.predicates {
@@ -538,7 +764,7 @@ impl EvaluationWork {
                     if self.path_probe(key.path, alternative.path, budget)? {
                         self.predicate(&alternative.predicate, key.bytes)?;
                         let scalar = scalar_work(key, budget)?;
-                        add_work(&mut self.units, scalar.copy_units()?)?;
+                        self.copy(&scalar, budget)?;
                         candidates.append(&scalar, 1, budget)?;
                     }
                 }
@@ -547,7 +773,7 @@ impl EvaluationWork {
                         if let Some(bytes) = node.value_bytes {
                             self.predicate(&alternative.predicate, bytes)?;
                             add_work(&mut self.units, 1)?;
-                            add_work(&mut self.units, node.shell.copy_units()?)?;
+                            self.copy(&node.shell, budget)?;
                             candidates.append(&node.shell, 1, budget)?;
                         }
                     }
@@ -566,7 +792,7 @@ impl EvaluationWork {
                         self.path_probe(output.path, key.path, budget)?;
                     }
                     let scalar = scalar_work(key, budget)?;
-                    add_work(&mut self.units, scalar.copy_units()?)?;
+                    self.copy(&scalar, budget)?;
                     candidates.append(&scalar, 1, budget)?;
                 }
             }
@@ -585,27 +811,43 @@ impl EvaluationWork {
                     budget.charge(node.keys.len())?;
                     children.extend(node.children.iter());
                     child_keys.extend_from_slice(&node.keys);
-                    add_work(&mut self.units, node.shell.copy_units()?)?;
+                    self.copy(&node.shell, budget)?;
                     candidates.append(&node.shell, 1, budget)?;
                 }
-                // Pool all original fragments for this schema scope. Bounding
-                // each fragment separately would miss comparisons and children
-                // that become siblings after a masked-identity join.
-                let selected = self.scope(child_scope, &children, &child_keys, budget)?;
+                // Original row totals cover all possible coalescing fragments.
+                // Merge/order costs use each row's tuple maxima and an index
+                // depth, never a product of pooled node and byte totals.
+                let selected =
+                    self.scope(child_scope, &children, &child_keys, branch.path, budget)?;
                 candidates.work.append(&selected.work, budget)?;
             } else {
-                let selected = forest_work(&matching, budget)?;
+                let mut selected = forest_work(&matching, budget)?;
+                selected.limit_rows(&self.row_bounds, 1, budget)?;
                 self.select(&selected, &branch.outputs, budget)?;
                 candidates.append(&selected, matching.len(), budget)?;
             }
         }
-        self.merge(&candidates.work, candidates.roots, budget)?;
+        // Each predicate/selection can contribute a copy of a joined input.
+        // Keys can also be materialized as scalars. The multiplicity comes
+        // only from the request; schema cardinality bounds each row's width.
+        let mut copies = usize::from(!scope.implicit_outputs.is_empty());
+        for predicate in &scope.predicates {
+            add_work(&mut copies, multiply_work(predicate.alternatives.len(), 2)?)?;
+        }
+        for branch in &scope.branches {
+            add_work(&mut copies, if branch.children.is_some() { 1 } else { 2 })?;
+        }
+        candidates
+            .work
+            .limit_rows(&self.row_bounds, copies, budget)?;
+        self.merge_selection(&candidates.work, candidates.roots, parent, budget)?;
         let mut cap = available.selection_cap(budget)?;
         budget.charge(keys.len())?;
         for key in keys {
             cap.append(&scalar_work(key, budget)?, budget)?;
         }
         candidates.work.clamp(&cap, budget)?;
+        candidates.work.limit_rows(&self.row_bounds, 1, budget)?;
         candidates.roots = candidates.roots.min(
             input
                 .len()
@@ -641,6 +883,12 @@ mod tests {
             }
             Shape {
                 path,
+                kind: if children.is_empty() {
+                    NodeKind::Leaf
+                } else {
+                    NodeKind::Container
+                },
+                metadata_work: metadata_units(path, &[], &children).unwrap(),
                 value_bytes,
                 keys: Vec::new(),
                 children,
@@ -714,6 +962,8 @@ mod tests {
             predicate_trials: 0,
             leaf_lists: Vec::new(),
             leaf_list_bytes: 0,
+            row_bounds: Vec::new(),
+            owner_keys: Vec::new(),
         };
         let budget = SubtreeBudget::new(1_000_000, 0).unwrap();
         let mut work = make();
