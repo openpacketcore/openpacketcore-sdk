@@ -174,8 +174,8 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     // Pins retain #1268 state-write and safe-diagnostic changes, #1269 authorized
     // read projection, and #1270 canonical gNMI key literals. Every generated
     // file stays pinned across the four source models.
-    // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 M3 XPath literals.
-    // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 M3 XPath literals.
+    // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
+    // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // base/netconf_xml.rs: #1269 authorized identifying keys and instance selections.
     // comments/netconf_xml.rs: #1269 authorized identifying keys and instance selections.
     // enum/netconf_xml.rs: #1269 generated instance-selection contract.
