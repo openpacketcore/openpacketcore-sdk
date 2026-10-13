@@ -589,6 +589,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: bound repeated scope-payload decoding in the retained
+  SQL WAL owner by reusing the exact bytes of two recent decoded entries.
+  Previous children no longer add payload decodes to sequential large-child
+  writes. Row, authority, projection and final stored-byte audits remain intact,
+  with the original operation deadline.
+
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at
   `Complete` or `Acquired` can be recovered or committed without a spurious

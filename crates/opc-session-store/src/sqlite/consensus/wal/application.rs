@@ -201,6 +201,10 @@ pub(super) fn project_operation_guarded(
             voter_fence,
         );
     }
+    let _payloads = state.scope_payloads.enter();
+    if matches!(operation, Operation::Truncate(_) | Operation::Purge(_)) {
+        state.scope_payloads.clear();
+    }
     if let Err(error) = validate_applied_prefix(state, binding) {
         fence(state);
         return Err(error);
@@ -407,6 +411,7 @@ impl Wal {
             self.shared.ready.notify_all();
             return Err(error);
         }
+        let _payloads = state.scope_payloads.enter();
         if entries.is_empty() {
             let result = apply_original(conn, caps, &state, self.binding, entries);
             if result.is_err() {

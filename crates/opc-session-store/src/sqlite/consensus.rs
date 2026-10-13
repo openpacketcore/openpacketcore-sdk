@@ -18,6 +18,8 @@ pub(crate) mod roster_snapshot;
 pub(crate) mod scope_authority;
 pub(crate) mod scope_batch;
 mod scope_continuity;
+#[cfg(target_os = "linux")]
+mod scope_payload_cache;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod scope_payload_decode_observer;
 
@@ -21642,6 +21644,10 @@ fn validate_exact_fenced_transition_v2_log_json(
 /// exact structural schema, including when a V2 discriminant appears only in
 /// data an ordinary derived decoder would ignore.
 pub(crate) fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeConfig>> {
+    #[cfg(target_os = "linux")]
+    if let Some(entry) = scope_payload_cache::decoded(bytes) {
+        return Ok(entry);
+    }
     #[cfg(test)]
     log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::FullDecode);
     if bytes.is_empty() || bytes.len() > SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES {
@@ -21659,6 +21665,8 @@ pub(crate) fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<Sessi
     }
     #[cfg(all(test, target_os = "linux"))]
     scope_payload_decode_observer::decoded(&entry, bytes.len());
+    #[cfg(target_os = "linux")]
+    scope_payload_cache::remember(bytes, &entry);
     Ok(entry)
 }
 
