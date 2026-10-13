@@ -328,3 +328,35 @@ fn projection_structural_lookup_probes_share_the_work_budget() {
         "one admission unit cannot pay for plan-path probes"
     );
 }
+
+#[test]
+fn projection_empty_authorized_plan_charges_enter_admission() {
+    struct Observer(std::sync::atomic::AtomicUsize);
+    impl SubtreeAccessObserver for Observer {
+        fn before_read(&self, _: &'static str, _: SubtreeAccessKind) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    for structural in [false, true] {
+        let budget = budget();
+        let plan = SubtreePlan::new(Vec::new(), budget.clone(), 32)
+            .unwrap()
+            .authorize(|_| true, 32)
+            .unwrap();
+        let observer = Observer(std::sync::atomic::AtomicUsize::new(0));
+        let projection = plan
+            .projection(&Registry, crate::DefaultReport::Trim)
+            .with_observer(&observer);
+        let before = budget.remaining();
+        assert!(!projection.enter("/m:secret", structural).unwrap());
+        assert_eq!(budget.remaining(), before - 1);
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        budget.charge(budget.remaining()).unwrap();
+        assert_eq!(
+            projection.enter("/m:secret", structural),
+            Err(SubtreeError::TooBig)
+        );
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}

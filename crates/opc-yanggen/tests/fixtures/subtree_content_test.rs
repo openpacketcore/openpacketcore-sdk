@@ -1702,3 +1702,109 @@ async fn subtree_content_public_candidate_handler_never_clones_denied_rows() {
 async fn subtree_content_public_startup_handler_never_clones_denied_rows() {
     direct_context_never_clones_denied_rows("startup").await;
 }
+
+#[tokio::test]
+async fn subtree_content_masked_composite_key_prefix_equality_has_fixed_work() {
+    let mut summaries = Vec::new();
+    for op in ["get-config", "get", "get-data"] {
+        let body = request(op, "<hostname>router-marker</hostname><class-peer><label/></class-peer><class-peer><label/></class-peer>", "");
+        let mut fixtures = Vec::new();
+        let mut controls = Vec::new();
+        for size in [1, 4096] {
+            let mut model = config();
+            model.class_peer.clear();
+            for (secret, suffix) in [("b".to_owned(), "a"), ("b".repeat(size), "z")] {
+                let intercept = "fixed-intercept".to_owned();
+                let password = "fixed-password".to_owned();
+                let unclassified = suffix.to_owned();
+                let mut row = ClassPeer::default();
+                row.secret = SecretLeaf::new(LeafPresence::Explicit(secret.clone()));
+                row.intercept = SecretLeaf::new(LeafPresence::Explicit(intercept.clone()));
+                row.password = SecretLeaf::new(LeafPresence::Explicit(password.clone()));
+                row.unclassified = SecretLeaf::new(LeafPresence::Explicit(unclassified.clone()));
+                row.label = LeafPresence::Explicit("same-row-label".into());
+                model.class_peer.insert(ClassPeerKey { secret, intercept, password, unclassified }, row);
+            }
+            let fixture = Fixture::new(model, &[]).await;
+            let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+            assert_eq!(tags(&reply, "label"), ["same-row-label"; 2]);
+            assert_eq!(tags(&reply, "secret"), ["&lt;redacted&gt;"; 2]);
+            let used = MgmtLimits::default().max_subtree_filter_work_units
+                - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+            controls.push((reply, used, fixture.observation()));
+            fixtures.push(fixture);
+        }
+        assert_eq!(controls[0].0, controls[1].0, "generous-budget authorized replies must be identical");
+        let limit = controls.iter().map(|(_, used)| *used).min().unwrap();
+        let mut bounded = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit, ..MgmtLimits::default() }).await;
+            if reply.contains("<rpc-error>") { error(&reply, "too-big"); }
+            bounded.push((reply, fixture.observation(), fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining()));
+        }
+        let mut overflow = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit.checked_sub(1).unwrap(), ..MgmtLimits::default() }).await;
+            error(&reply, "too-big");
+            overflow.push((reply, fixture.observation()));
+        }
+        let invariant = controls[0].1 == controls[1].1
+            && controls[0].2 == controls[1].2
+            && bounded[0] == bounded[1]
+            && bounded[0].0 == controls[0].0
+            && bounded[0].2 == 0
+            && overflow[0] == overflow[1];
+        summaries.push((op, controls[0].1, controls[1].1, invariant));
+    }
+    assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked identities changed exact-boundary replies, work or complete observations: {summaries:?}");
+}
+
+#[tokio::test]
+async fn subtree_content_masked_key_reorders_rejected_rows_without_changing_work() {
+    let mut summaries = Vec::new();
+    for op in ["get-config", "get", "get-data"] {
+        let body = request(op, "<hostname>router-marker</hostname><hidden-peer><label>selected-row</label></hidden-peer>", "");
+        let mut fixtures = Vec::new();
+        let mut controls = Vec::new();
+        for key in ["a".to_owned(), "z".repeat(4096)] {
+            let mut model = config();
+            model.hidden_peer.clear();
+            for (secret, label) in [(key, "selected-row"), ("m".to_owned(), "rejected-row")] {
+                let mut row = HiddenPeer::default();
+                row.secret = SecretLeaf::new(LeafPresence::Explicit(secret.clone()));
+                row.label = LeafPresence::Explicit(label.into());
+                model.hidden_peer.insert(SensitiveKey::new(secret), row);
+            }
+            let fixture = Fixture::new(model, &[]).await;
+            let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+            assert_eq!(tags(&reply, "label"), ["selected-row"]);
+            assert_eq!(tags(&reply, "secret"), ["&lt;redacted&gt;"]);
+            let used = MgmtLimits::default().max_subtree_filter_work_units
+                - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+            controls.push((reply, used, fixture.observation()));
+            fixtures.push(fixture);
+        }
+        assert_eq!(controls[0].0, controls[1].0, "generous-budget authorized replies must be identical");
+        let limit = controls.iter().map(|(_, used)| *used).min().unwrap();
+        let mut bounded = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit, ..MgmtLimits::default() }).await;
+            if reply.contains("<rpc-error>") { error(&reply, "too-big"); }
+            bounded.push((reply, fixture.observation(), fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining()));
+        }
+        let mut overflow = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit.checked_sub(1).unwrap(), ..MgmtLimits::default() }).await;
+            error(&reply, "too-big");
+            overflow.push((reply, fixture.observation()));
+        }
+        let invariant = controls[0].1 == controls[1].1
+            && controls[0].2 == controls[1].2
+            && bounded[0] == bounded[1]
+            && bounded[0].0 == controls[0].0
+            && bounded[0].2 == 0
+            && overflow[0] == overflow[1];
+        summaries.push((op, controls[0].1, controls[1].1, invariant));
+    }
+    assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked identities changed exact-boundary replies, work or complete observations: {summaries:?}");
+}
