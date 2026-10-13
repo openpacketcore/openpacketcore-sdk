@@ -569,31 +569,37 @@ impl XPathFilter {
     }
 }
 
-/// Parsed subtree filter. Read operations retain content matches for the
-/// schema-aware list-key evaluator; configuration-only reads still reject them.
+/// Bounded subtree filter retaining sibling scopes and content predicates.
+///
+/// Structural selections remain available for unconstrained reads. A caller
+/// must evaluate the tree when [`Self::has_content_matches`] is true.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubtreeFilter {
     selections: Vec<SubtreeSelection>,
     roots: Vec<SubtreeNode>,
+    content_matches: bool,
+    parse_work: usize,
 }
 
 impl SubtreeFilter {
-    /// Parsed selection nodes in document order.
-    pub fn selections(&self) -> &[SubtreeSelection] {
-        &self.selections
-    }
-
-    /// Original branches, preserving content literals and sibling correlation.
+    /// Root nodes in document order, including repeated alternatives.
     pub fn roots(&self) -> &[SubtreeNode] {
         &self.roots
     }
 
-    /// Whether any retained branch contains a literal content match.
-    pub fn has_content_matches(&self) -> bool {
-        fn has_text(node: &SubtreeNode) -> bool {
-            node.text.is_some() || node.children.iter().any(has_text)
-        }
-        self.roots.iter().any(has_text)
+    /// Whether any node has a non-whitespace content predicate.
+    pub const fn has_content_matches(&self) -> bool {
+        self.content_matches
+    }
+
+    /// Work already charged while retaining decoded filter content.
+    pub const fn parse_work(&self) -> usize {
+        self.parse_work
+    }
+
+    /// Parsed selection nodes in document order.
+    pub fn selections(&self) -> &[SubtreeSelection] {
+        &self.selections
     }
 
     pub(crate) fn push(&mut self, selection: SubtreeSelection) {
@@ -601,37 +607,35 @@ impl SubtreeFilter {
     }
 }
 
-/// One namespace-qualified subtree branch. Content is literal decoded text,
-/// excluded from diagnostics, and does not itself grant any schema permission.
-#[derive(Clone, PartialEq, Eq)]
+/// A subtree containment, selection or content-match node.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtreeNode {
     element: FilterElement,
-    text: Option<String>,
+    text: FilterText,
     children: Vec<SubtreeNode>,
 }
 
-impl std::fmt::Debug for SubtreeNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SubtreeNode")
-            .field("element", &self.element)
-            .finish_non_exhaustive()
+impl SubtreeNode {
+    /// Namespace-qualified element name; an empty namespace is a wildcard.
+    pub const fn element(&self) -> &FilterElement {
+        &self.element
+    }
+    /// Decoded predicate with only outer XML whitespace removed.
+    pub fn text(&self) -> Option<&str> {
+        (!self.text.0.is_empty()).then_some(self.text.0.as_str())
+    }
+    /// Child scopes, without flattening repeated containment branches.
+    pub fn children(&self) -> &[SubtreeNode] {
+        &self.children
     }
 }
 
-impl SubtreeNode {
-    /// Namespace-qualified element name.
-    pub fn element(&self) -> &FilterElement {
-        &self.element
-    }
+#[derive(Clone, Default, PartialEq, Eq)]
+struct FilterText(String);
 
-    /// Literal content-match value, if this is a text-bearing leaf.
-    pub fn text(&self) -> Option<&str> {
-        self.text.as_deref()
-    }
-
-    /// Child branches in document order.
-    pub fn children(&self) -> &[SubtreeNode] {
-        &self.children
+impl std::fmt::Debug for FilterText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
     }
 }
 
@@ -678,6 +682,9 @@ pub enum XmlError {
     /// Shared management-plane limit error.
     #[error(transparent)]
     Limit(#[from] LimitsError),
+    /// A retained subtree tree, value or work budget exceeded its bound.
+    #[error("NETCONF subtree filter exceeds a limit")]
+    SubtreeFilterLimit,
     /// XML parser rejected the document.
     #[error("malformed NETCONF XML")]
     Malformed,
@@ -731,7 +738,9 @@ impl XmlError {
         use NetconfErrorTag as Tag;
         use NetconfErrorType as Ty;
         match self {
-            Self::Limit(_) => NetconfError::new(Ty::Protocol, Tag::TooBig),
+            Self::Limit(_) | Self::SubtreeFilterLimit => {
+                NetconfError::new(Ty::Protocol, Tag::TooBig)
+            }
             Self::Malformed
             | Self::DtdForbidden
             | Self::EntityForbidden
@@ -757,7 +766,7 @@ impl XmlError {
     /// Static, payload-free client message.
     pub const fn client_message(&self) -> &'static str {
         match self {
-            Self::Limit(_) => "request is too large",
+            Self::Limit(_) | Self::SubtreeFilterLimit => "request is too large",
             Self::UnknownNamespace => "unknown namespace",
             Self::MissingAttribute => "missing attribute",
             Self::MissingElement => "missing element",
@@ -793,17 +802,42 @@ struct Element {
     namespace: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+fn is_xml_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
+fn is_xml_character(character: char) -> bool {
+    matches!(character, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
+fn filter_reference(reference: &str) -> Option<char> {
+    let character = match reference {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "apos" => '\'',
+        "quot" => '"',
+        _ => {
+            let value = if let Some(digits) = reference.strip_prefix("#x") {
+                u32::from_str_radix(digits, 16).ok()?
+            } else {
+                reference.strip_prefix('#')?.parse::<u32>().ok()?
+            };
+            char::from_u32(value)?
+        }
+    };
+    is_xml_character(character).then_some(character)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FilterFrame {
     path: Vec<FilterElement>,
     child_count: usize,
-    /// True when this node is a content-match or attribute-match expression that
-    /// this server does not implement. Children are parsed (for bounds checking)
-    /// but do not become selections.
-    suppress_subtree: bool,
-    text: String,
-    has_text: bool,
+    text: FilterText,
     children: Vec<SubtreeNode>,
+    content_counted: bool,
+    /// Attribute matches are bounded and refused after parsing.
+    suppress_subtree: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -985,9 +1019,10 @@ struct ParserState {
     pre_decl_misc_seen: bool,
     limits: MgmtLimits,
     filter_content_match_count: usize,
-    filter_attribute_match_count: usize,
     filter_node_count: usize,
-    filter_text_bytes: usize,
+    filter_decoded_bytes: usize,
+    filter_parse_work: usize,
+    filter_attribute_match_count: usize,
     filter_unsupported_subtree_error: Option<XmlError>,
 }
 
@@ -1086,25 +1121,63 @@ impl ParserState {
         Ok(())
     }
 
-    fn reject_filter_text(&mut self) -> Result<(), XmlError> {
+    fn charge_filter_work(&mut self, units: usize) -> Result<(), XmlError> {
+        let next = self
+            .filter_parse_work
+            .checked_add(units)
+            .ok_or(XmlError::SubtreeFilterLimit)?;
+        self.limits
+            .check_subtree_filter_work(next)
+            .map_err(|_| XmlError::SubtreeFilterLimit)?;
+        self.filter_parse_work = next;
+        if let Some(Filter::Subtree(filter)) = self.active_filter_mut() {
+            filter.parse_work = next;
+        }
+        Ok(())
+    }
+
+    fn append_filter_text(&mut self, text: &str) -> Result<(), XmlError> {
         if !matches!(self.active_filter(), Some(Filter::Subtree(_))) {
             return Err(XmlError::UnsupportedFilterContent);
         }
-        if let Some(frame) = self.filter_stack.last() {
-            if frame.suppress_subtree {
-                // Text inside an already-suppressed attribute-match/content-match
-                // subtree is ignored; the unsupported form was already counted.
-                return Ok(());
-            }
+        self.charge_filter_work(text.len())?;
+        if !text.chars().all(is_xml_character) {
+            return Err(XmlError::Malformed);
         }
-        self.filter_content_match_count += 1;
+        let Some(frame) = self.filter_stack.last() else {
+            return if text.chars().all(is_xml_whitespace) {
+                Ok(())
+            } else {
+                Err(XmlError::UnsupportedFilterContent)
+            };
+        };
+        let length = frame
+            .text
+            .0
+            .len()
+            .checked_add(text.len())
+            .ok_or(XmlError::SubtreeFilterLimit)?;
         self.limits
-            .check_subtree_filter_content_match_nodes(self.filter_content_match_count)?;
-        if let Some(frame) = self.filter_stack.last_mut() {
-            frame.suppress_subtree = true;
+            .check_value_bytes(length)
+            .map_err(|_| XmlError::SubtreeFilterLimit)?;
+        let aggregate = self
+            .filter_decoded_bytes
+            .checked_add(text.len())
+            .ok_or(XmlError::SubtreeFilterLimit)?;
+        self.limits
+            .check_request_bytes(aggregate)
+            .map_err(|_| XmlError::SubtreeFilterLimit)?;
+        let is_content = !text.chars().all(is_xml_whitespace);
+        if is_content && !frame.content_counted {
+            self.filter_content_match_count += 1;
+            self.limits
+                .check_subtree_filter_content_match_nodes(self.filter_content_match_count)?;
         }
-        self.filter_unsupported_subtree_error =
-            Some(XmlError::SubtreeFilterContentMatchNotSupported);
+        self.charge_filter_work(text.len())?;
+        let frame = self.filter_stack.last_mut().ok_or(XmlError::Malformed)?;
+        frame.content_counted |= is_content;
+        frame.text.0.push_str(text);
+        self.filter_decoded_bytes = aggregate;
         Ok(())
     }
 
@@ -1129,19 +1202,7 @@ impl ParserState {
         }
 
         if self.filter_depth > 0 {
-            if self.accepts_filter_content_matches() && !self.filter_stack.is_empty() {
-                self.filter_text_bytes = self.filter_text_bytes.saturating_add(text.len());
-                self.limits.check_value_bytes(self.filter_text_bytes)?;
-                if let Some(frame) = self.filter_stack.last_mut() {
-                    frame.text.push_str(text);
-                    frame.has_text = true;
-                }
-                return Ok(());
-            }
-            if text.trim().is_empty() {
-                return Ok(());
-            }
-            return self.reject_filter_text();
+            return self.append_filter_text(text);
         }
         if self.notification_filter_depth > 0 {
             return Ok(());
@@ -2602,59 +2663,29 @@ impl ParserState {
         if !matches!(self.active_filter(), Some(Filter::Subtree(_))) {
             return Err(XmlError::UnsupportedFilterContent);
         }
-
-        self.filter_node_count = self.filter_node_count.saturating_add(1);
-        self.limits.check_paths(self.filter_node_count)?;
-
-        if let Some(mut path) = self
+        self.filter_node_count += 1;
+        self.limits
+            .check_subtree_filter_nodes(self.filter_node_count)
+            .map_err(|_| XmlError::SubtreeFilterLimit)?;
+        let path_bytes = self.filter_stack.last().map_or(0, |frame| {
+            frame
+                .path
+                .iter()
+                .map(|name| name.namespace.len() + name.local.len())
+                .sum()
+        });
+        self.charge_filter_work(1 + path_bytes + element.namespace.len() + element.local.len())?;
+        let mut suppress_subtree = self
             .filter_stack
             .last()
-            .and_then(|parent| parent.suppress_subtree.then(|| parent.path.clone()))
-        {
-            if !attrs.is_empty() {
-                self.record_filter_attribute_match()?;
-            }
-            path.push(FilterElement {
-                namespace: element.namespace.clone(),
-                local: element.local.clone(),
-            });
-            self.filter_stack.push(FilterFrame {
-                path,
-                child_count: 0,
-                suppress_subtree: true,
-                text: String::new(),
-                has_text: false,
-                children: Vec::new(),
-            });
-            return Ok(());
+            .is_some_and(|frame| frame.suppress_subtree);
+        if !attrs.is_empty() {
+            self.record_filter_attribute_match()?;
+            suppress_subtree = true;
         }
-
         if let Some(parent) = self.filter_stack.last_mut() {
             parent.child_count += 1;
         }
-
-        if !attrs.is_empty() {
-            self.record_filter_attribute_match()?;
-            let mut path = self
-                .filter_stack
-                .last()
-                .map(|frame| frame.path.clone())
-                .unwrap_or_default();
-            path.push(FilterElement {
-                namespace: element.namespace.clone(),
-                local: element.local.clone(),
-            });
-            self.filter_stack.push(FilterFrame {
-                path,
-                child_count: 0,
-                suppress_subtree: true,
-                text: String::new(),
-                has_text: false,
-                children: Vec::new(),
-            });
-            return Ok(());
-        }
-
         let mut path = self
             .filter_stack
             .last()
@@ -2664,56 +2695,52 @@ impl ParserState {
             namespace: element.namespace.clone(),
             local: element.local.clone(),
         });
-
         self.filter_stack.push(FilterFrame {
             path,
             child_count: 0,
-            suppress_subtree: false,
-            text: String::new(),
-            has_text: false,
+            text: FilterText::default(),
             children: Vec::new(),
+            content_counted: false,
+            suppress_subtree,
         });
-
         Ok(())
     }
 
     fn finish_filter_content_element(&mut self) -> Result<(), XmlError> {
-        let frame = self.filter_stack.pop().ok_or(XmlError::Malformed)?;
+        let mut frame = self.filter_stack.pop().ok_or(XmlError::Malformed)?;
         if frame.suppress_subtree {
             return Ok(());
         }
-        if frame.child_count > 0 && !frame.text.trim().is_empty() {
-            return Err(XmlError::SubtreeFilterContentMatchNotSupported);
+        self.charge_filter_work(frame.text.0.len())?;
+        let trimmed = frame.text.0.trim_matches(is_xml_whitespace);
+        let start = frame.text.0.len() - frame.text.0.trim_start_matches(is_xml_whitespace).len();
+        let end = start + trimmed.len();
+        frame.text.0.truncate(end);
+        frame.text.0.drain(..start);
+        if !frame.text.0.is_empty() && frame.child_count != 0 {
+            return Err(XmlError::UnsupportedFilterContent);
         }
-        let text = (frame.has_text && frame.child_count == 0 && !frame.text.trim().is_empty())
-            .then_some(frame.text);
-        if text.is_some() {
-            self.filter_content_match_count = self.filter_content_match_count.saturating_add(1);
-            self.limits
-                .check_subtree_filter_content_match_nodes(self.filter_content_match_count)?;
-        }
+        let element = frame.path.last().ok_or(XmlError::Malformed)?;
+        self.charge_filter_work(element.namespace.len() + element.local.len())?;
         let node = SubtreeNode {
-            element: frame.path.last().ok_or(XmlError::Malformed)?.clone(),
-            text,
+            element: element.clone(),
+            text: frame.text,
             children: frame.children,
         };
-        let selection =
-            SubtreeSelection::new(frame.path, frame.child_count == 0 && node.text.is_none());
+        let content = node.text().is_some();
+        let parse_work = self.filter_parse_work;
+        let Some(Filter::Subtree(filter)) = self.active_filter_mut() else {
+            return Err(XmlError::UnsupportedFilterContent);
+        };
+        filter.content_matches |= content;
+        filter.parse_work = parse_work;
+        filter.push(SubtreeSelection::new(frame.path, frame.child_count == 0));
         if let Some(parent) = self.filter_stack.last_mut() {
             parent.children.push(node);
         } else if let Some(Filter::Subtree(filter)) = self.active_filter_mut() {
             filter.roots.push(node);
         }
-        let Some(Filter::Subtree(filter)) = self.active_filter_mut() else {
-            return Err(XmlError::UnsupportedFilterContent);
-        };
-        filter.push(selection);
         Ok(())
-    }
-
-    fn accepts_filter_content_matches(&self) -> bool {
-        (self.get.is_some() || self.get_data.is_some())
-            && matches!(self.active_filter(), Some(Filter::Subtree(_)))
     }
 
     fn active_filter(&self) -> Option<&Filter> {
@@ -3092,7 +3119,7 @@ fn parse_message_with_context(
                 if state.notification_filter_is_active() {
                     continue;
                 }
-                if state.filter_depth > 1 && state.accepts_filter_content_matches() {
+                if state.filter_depth > 0 {
                     state
                         .text(cdata.as_ref())
                         .map_err(|err| parse_error(&state, err))?;
@@ -3110,12 +3137,12 @@ fn parse_message_with_context(
                 limits
                     .check_value_bytes(reference.len())
                     .map_err(|err| parse_error(&state, err.into()))?;
-                if state.filter_depth > 1 && state.accepts_filter_content_matches() {
-                    let encoded = format!("&{};", reference.as_ref());
-                    let decoded = quick_xml::escape::unescape(&encoded)
-                        .map_err(|_| parse_error(&state, XmlError::EntityForbidden))?;
+                if state.filter_depth > 0 {
+                    let character = filter_reference(reference.as_ref())
+                        .ok_or_else(|| parse_error(&state, XmlError::EntityForbidden))?;
+                    let mut bytes = [0; 4];
                     state
-                        .text(&decoded)
+                        .text(character.encode_utf8(&mut bytes))
                         .map_err(|err| parse_error(&state, err))?;
                     continue;
                 }
@@ -4851,31 +4878,177 @@ mod tests {
     }
 
     #[test]
-    fn rejects_subtree_filter_content_match_until_supported() {
-        let err = parse_rpc(
-            &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-1</sys:hostname></sys:system></filter></get-config>"#),
+    fn parses_subtree_filter_content_match_without_flattening() {
+        let parsed = parse_rpc(
+            &rpc(r#"<get><filter><system xmlns="urn:opc:test"><peer><id>7</id><name/></peer><peer><id>8</id><state/></peer></system></filter></get>"#),
             &MgmtLimits::default(),
-        )
-        .expect_err("content match not supported yet");
-        assert_eq!(err, XmlError::SubtreeFilterContentMatchNotSupported);
+        ).expect("parse content tree");
+        let RpcOperation::Get(request) = parsed.operation else {
+            panic!("get");
+        };
+        let Some(Filter::Subtree(filter)) = request.filter else {
+            panic!("subtree");
+        };
+        assert!(filter.has_content_matches());
+        let branches = filter.roots()[0].children();
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].children()[0].text(), Some("7"));
+        assert_eq!(branches[1].children()[0].text(), Some("8"));
+        assert_eq!(branches[0].children()[1].element().local, "name");
+        assert_eq!(branches[1].children()[1].element().local, "state");
     }
 
     #[test]
     fn parse_context_preserves_message_id_after_rpc_envelope() {
-        let err = parse_rpc_with_context(
-            &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-1</sys:hostname></sys:system></filter></get-config>"#),
-            &MgmtLimits::default(),
-        )
-        .expect_err("content match not supported yet");
+        let xml =
+            rpc(r#"<get><filter><system xmlns="urn:opc:test" name="marker"/></filter></get>"#);
+        let err =
+            parse_rpc_with_context(&xml, &MgmtLimits::default()).expect_err("attribute match");
         assert_eq!(err.message_id.as_deref(), Some("101"));
-        assert_eq!(err.error, XmlError::SubtreeFilterContentMatchNotSupported);
+        assert_eq!(err.error, XmlError::SubtreeFilterAttributeMatchNotSupported);
+        assert_eq!(
+            parse_rpc(&xml, &MgmtLimits::default()).expect_err("legacy error"),
+            err.error
+        );
+    }
 
-        let legacy = parse_rpc(
-            &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-1</sys:hostname></sys:system></filter></get-config>"#),
-            &MgmtLimits::default(),
+    #[test]
+    fn subtree_text_decoding_trims_once_and_redacts_debug() {
+        let literals = [
+            "a &amp; b  c",
+            "a &#38; b  c",
+            "a &#x26; b  c",
+            "<![CDATA[a & b  c]]>",
+            " a <![CDATA[& b ]]><![CDATA[ c]]> ",
+        ];
+        for literal in literals {
+            let xml = rpc(&format!(
+                "<get><filter><name xmlns=\"urn:opc:test\">{literal}</name></filter></get>"
+            ));
+            let parsed = parse_rpc(&xml, &MgmtLimits::default()).expect("decoded predicate");
+            assert!(!format!("{parsed:?}").contains("a & b"));
+            let RpcOperation::Get(request) = parsed.operation else {
+                panic!("get");
+            };
+            let Some(Filter::Subtree(filter)) = request.filter else {
+                panic!("subtree");
+            };
+            assert_eq!(filter.roots()[0].text(), Some("a & b  c"));
+        }
+        for (literal, expected) in [(" \t\r\n ", None), ("\u{a0}", Some("\u{a0}"))] {
+            let parsed = parse_rpc(
+                &rpc(&format!(
+                    "<get><filter><name xmlns=\"urn:opc:test\">{literal}</name></filter></get>"
+                )),
+                &MgmtLimits::default(),
+            )
+            .unwrap();
+            let RpcOperation::Get(request) = parsed.operation else {
+                panic!("get");
+            };
+            let Some(Filter::Subtree(filter)) = request.filter else {
+                panic!("subtree");
+            };
+            assert_eq!(filter.roots()[0].text(), expected);
+            assert_eq!(filter.has_content_matches(), expected.is_some());
+        }
+    }
+
+    #[test]
+    fn subtree_text_invalid_references_and_mixed_content_are_fixed_errors() {
+        for reference in ["&missing;", "&#0;", "&#xD800;", "&#xFFFE;", "&#x110000;"] {
+            let xml = rpc(&format!(
+                "<get><filter><name xmlns=\"urn:opc:test\">{reference}</name></filter></get>"
+            ));
+            let error = parse_rpc(&xml, &MgmtLimits::default()).expect_err("illegal reference");
+            assert_eq!(
+                error.classification().tag,
+                NetconfErrorTag::MalformedMessage
+            );
+            assert!(!format!("{error:?}").contains(reference));
+        }
+        for content in ["text<child/>", "<child/>text"] {
+            let xml = rpc(&format!(
+                "<get><filter><name xmlns=\"urn:opc:test\">{content}</name></filter></get>"
+            ));
+            assert_eq!(
+                parse_rpc(&xml, &MgmtLimits::default()).expect_err("mixed content"),
+                XmlError::UnsupportedFilterContent
+            );
+        }
+    }
+
+    #[test]
+    fn subtree_text_and_tree_limits_check_exact_boundaries() {
+        let xml = rpc(&format!(
+            "<get><filter><name xmlns=\"urn:opc:test\">{}<![CDATA[ef]]>&amp;</name></filter></get>",
+            "a".repeat(61)
+        ));
+        let limits = MgmtLimits {
+            max_value_bytes: 64,
+            max_subtree_filter_nodes: 1,
+            max_subtree_filter_content_match_nodes: 1,
+            ..MgmtLimits::default()
+        };
+        let parsed = parse_rpc(&xml, &limits).expect("64 decoded bytes across three events");
+        let RpcOperation::Get(request) = parsed.operation else {
+            panic!("get");
+        };
+        let Some(Filter::Subtree(filter)) = request.filter else {
+            panic!("subtree");
+        };
+        let work = filter.parse_work();
+        assert!(parse_rpc(
+            &xml,
+            &MgmtLimits {
+                max_subtree_filter_work_units: work,
+                ..limits
+            }
         )
-        .expect_err("legacy parse error");
-        assert_eq!(legacy, XmlError::SubtreeFilterContentMatchNotSupported);
+        .is_ok());
+        assert_eq!(
+            parse_rpc(
+                &xml,
+                &MgmtLimits {
+                    max_subtree_filter_work_units: work - 1,
+                    ..limits
+                }
+            )
+            .expect_err("first work overflow"),
+            XmlError::SubtreeFilterLimit
+        );
+        assert_eq!(
+            parse_rpc(
+                &xml,
+                &MgmtLimits {
+                    max_value_bytes: 63,
+                    ..limits
+                }
+            )
+            .expect_err("first byte overflow"),
+            XmlError::SubtreeFilterLimit
+        );
+        let two =
+            rpc("<get><filter><parent xmlns=\"urn:opc:test\"><child/></parent></filter></get>");
+        assert!(parse_rpc(
+            &two,
+            &MgmtLimits {
+                max_subtree_filter_nodes: 2,
+                ..MgmtLimits::default()
+            }
+        )
+        .is_ok());
+        assert_eq!(
+            parse_rpc(
+                &two,
+                &MgmtLimits {
+                    max_subtree_filter_nodes: 1,
+                    ..MgmtLimits::default()
+                }
+            )
+            .expect_err("first node overflow"),
+            XmlError::SubtreeFilterLimit
+        );
     }
 
     #[test]

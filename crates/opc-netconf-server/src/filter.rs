@@ -763,6 +763,9 @@ pub struct GetPathSelection {
 /// Filter projection failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FilterError {
+    /// A constrained subtree requires the content-plan evaluator.
+    #[error("NETCONF subtree content plan is not supported")]
+    UnsupportedContent,
     /// The XPath filter used a valid XPath construct outside the currently
     /// supported bounded schema-selection subset.
     #[error("NETCONF XPath filter is not supported")]
@@ -792,7 +795,7 @@ impl FilterError {
     /// Client-facing NETCONF error classification.
     pub const fn rpc_error(&self) -> RpcError {
         match self {
-            Self::UnsupportedXPath | Self::UnsupportedSubtree => {
+            Self::UnsupportedXPath | Self::UnsupportedSubtree | Self::UnsupportedContent => {
                 RpcError::operation_not_supported()
             }
             Self::MaskedKeyMatch => RpcError::invalid_value(),
@@ -818,7 +821,9 @@ impl FilterError {
     /// Stable audit reason.
     pub const fn audit_reason(&self) -> &'static str {
         match self {
-            Self::UnsupportedXPath | Self::UnsupportedSubtree => "operation-not-supported",
+            Self::UnsupportedXPath | Self::UnsupportedSubtree | Self::UnsupportedContent => {
+                "operation-not-supported"
+            }
             Self::MaskedKeyMatch => "invalid-value",
             Self::InvalidXPath => "bad-element",
             Self::Limit(_) => "too-big",
@@ -911,6 +916,9 @@ pub fn get_paths_with_discovery(
             limits,
         ),
         Some(Filter::Subtree(filter)) => {
+            if filter.has_content_matches() {
+                return Err(FilterError::UnsupportedContent);
+            }
             let mut data_paths = Vec::new();
             let mut yang_library_paths = Vec::new();
             let mut netconf_monitoring_paths = Vec::new();
@@ -973,6 +981,7 @@ impl SelectionOutcome {
             FilterError::UnsupportedXPath
             | FilterError::UnsupportedSubtree
             | FilterError::MaskedKeyMatch
+            | FilterError::UnsupportedContent
             | FilterError::InvalidXPath
             | FilterError::Limit(_) => {}
             FilterError::UnknownNamespace => self.unknown_namespace = true,
@@ -1035,6 +1044,9 @@ fn subtree_paths(
     filter: &SubtreeFilter,
     scope: DataPathScope,
 ) -> Result<Vec<&'static str>, FilterError> {
+    if filter.has_content_matches() {
+        return Err(FilterError::UnsupportedContent);
+    }
     let mut selected = Vec::new();
     for selection in filter.selections() {
         for path in resolve_selection_paths(registry, selection)? {
