@@ -569,7 +569,16 @@ impl NativeStorage {
         Ok(Self { business, log })
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_committed(&mut self) -> io::Result<()> {
+        self.replay_committed_with_check(&|| Ok(()))
+    }
+
+    pub(crate) fn replay_committed_with_check(
+        &mut self,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        check()?;
         // Recovery owns its decoder/application cohort. Transport packaging
         // cannot enlarge preparation, and every durable entry is still
         // audited before any recovery publication or file repair.
@@ -589,12 +598,13 @@ impl NativeStorage {
             .applied()
             .map_or(0, |applied| applied.index + 1);
         while next <= committed.index {
+            check()?;
             let end = (next + REPLAY_ENTRIES as u64).min(committed.index + 1);
             // Recovery holds exclusive NativeStorage ownership before a WAL
             // writer exists. The same detached codec still supplies complete
             // independently owned log and receipt results for cold rows.
             let capture = self.capture_log_read()?;
-            let rows = capture.resolve(next, Some(end), Some(REPLAY_ENTRIES), &|| Ok(()))?;
+            let rows = capture.resolve(next, Some(end), Some(REPLAY_ENTRIES), check)?;
             capture.require_current_authority(self)?;
             let entries = rows.entries();
             if entries.len() != (end - next) as usize {
@@ -602,10 +612,7 @@ impl NativeStorage {
             }
             self.log
                 .require_committed_entries(&self.business, self.log.committed, entries)?;
-            let reads = self
-                .business
-                .capture_apply_reads(entries)?
-                .resolve(&|| Ok(()))?;
+            let reads = self.business.capture_apply_reads(entries)?.resolve(check)?;
             let copies = reads.copy_current(&self.business)?;
             self.business.apply_with_receipts(entries, &copies)?;
             next = end;

@@ -1582,14 +1582,9 @@ impl SqliteSessionBackend {
     }
 
     #[cfg(target_os = "linux")]
-    async fn run_native_format_preflight(
-        scan: impl FnOnce(&AtomicBool) -> std::io::Result<Vec<consensus::CurrentSnapshot>>
-            + Send
-            + 'static,
-    ) -> Result<
-        Vec<consensus::CurrentSnapshot>,
-        crate::consensus::storage::SessionConsensusStorageError,
-    > {
+    async fn run_native_open_blocking<T: Send + 'static>(
+        scan: impl FnOnce(&AtomicBool) -> std::io::Result<T> + Send + 'static,
+    ) -> Result<T, crate::consensus::storage::SessionConsensusStorageError> {
         use crate::consensus::storage::SessionConsensusStorageError;
 
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -1655,7 +1650,7 @@ impl SqliteSessionBackend {
             Ok(mode) => {
                 if mode.is_some() {
                     let scan_owner = Arc::clone(owner);
-                    let snapshots = Self::run_native_format_preflight(move |cancellation| {
+                    let snapshots = Self::run_native_open_blocking(move |cancellation| {
                         scan_owner.preflight_formats(expected, cancellation)
                     })
                     .await?;
@@ -1675,7 +1670,7 @@ impl SqliteSessionBackend {
             }
             Err(_) => {
                 let scan_owner = Arc::clone(owner);
-                let snapshots = Self::run_native_format_preflight(move |cancellation| {
+                let snapshots = Self::run_native_open_blocking(move |cancellation| {
                     scan_owner.preflight_formats_before_scope_lookup(cancellation)
                 })
                 .await?;

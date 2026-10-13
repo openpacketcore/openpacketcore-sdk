@@ -246,7 +246,9 @@ fn audit_native_recovery(
     limits: Limits,
     anchor: Option<checkpoint::Anchor>,
     native: &mut NativeStorage,
+    check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<RecoveryAudit> {
+    check()?;
     if binding.persistence == SessionPersistenceMode::Async {
         let selected = anchor
             .as_ref()
@@ -256,10 +258,16 @@ fn audit_native_recovery(
         }
         // Audit the immutable initial WAL header independently. No WAL entry,
         // pending intent or tail can be replayed into an asynchronous cut.
-        let audit =
-            audit_recovery_projected(directory, binding, limits, anchor, false, None, |_| {
-                Err(invalid_data("asynchronous root contains a WAL operation"))
-            })?;
+        let audit = audit_recovery_projected_with_check(
+            directory,
+            binding,
+            limits,
+            anchor,
+            false,
+            None,
+            check,
+            |_| Err(invalid_data("asynchronous root contains a WAL operation")),
+        )?;
         if audit.end != CutPosition::initial()
             || audit.cut != 0
             || audit.stage.is_some()
@@ -275,18 +283,20 @@ fn audit_native_recovery(
         return Ok(audit);
     }
     let frozen = anchor.as_ref().and_then(checkpoint::Anchor::native_applied);
-    audit_recovery_projected(
+    audit_recovery_projected_with_check(
         directory,
         binding,
         limits,
         anchor,
         false,
         native.log.committed,
+        check,
         |operation| native.log.project(operation, &native.business, frozen),
     )
 }
 
 impl Opening {
+    #[cfg(any(test, feature = "test-control"))]
     pub(in crate::sqlite::consensus) fn new(
         directory: &Path,
         binding: Binding,
@@ -294,6 +304,18 @@ impl Opening {
         limits: Limits,
         control: IoControl,
     ) -> io::Result<Self> {
+        Self::new_with_check(directory, binding, roster_root, limits, control, &|| Ok(()))
+    }
+
+    pub(in crate::sqlite::consensus) fn new_with_check(
+        directory: &Path,
+        binding: Binding,
+        roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+        limits: Limits,
+        control: IoControl,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
         let limits = limits.validate()?;
         if !binding.native || !fs::symlink_metadata(directory)?.is_dir() {
             return Err(invalid_data("native WAL directory or format differs"));
@@ -304,6 +326,7 @@ impl Opening {
         let lock = file_read(&directory.join("LOCK"))?;
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
         let conn = cold_basis(directory, binding)?;
+        check()?;
         let authority = Authority::load(&conn, binding.identity)?;
         let mut native = from_pristine_basis(&conn, binding, &authority, roster_root.clone())?;
         let mut selected = None;
@@ -346,14 +369,16 @@ impl Opening {
                         roster_root: roster_root.clone(),
                     },
                     cut_binding,
-                    &|| Ok(()),
+                    check,
                 )?;
                 if catalog.identity() != prefix || catalog.cut_binding() != cut_binding {
                     return Err(invalid_data("native selected catalog binding differs"));
                 }
                 catalog.require_reclamation_format()?;
+                check()?;
                 (control.hook)(Point::AfterNativeBasisAdmission)?;
-                native = catalog.into_storage(&|| Ok(()))?;
+                check()?;
+                native = catalog.into_storage(check)?;
                 selected = Some(native_basis::Selected::admitted(append, &native)?);
                 // Track the complete unpublished WAL suffix from this exact
                 // selected process version, before projecting or replaying it.
@@ -370,11 +395,12 @@ impl Opening {
                 ));
             }
         }
-        let audit = audit_native_recovery(directory, binding, limits, anchor, &mut native)?;
+        let audit = audit_native_recovery(directory, binding, limits, anchor, &mut native, check)?;
         // The audit sees only complete published cuts. Replay the exact committed
         // prefix before file repair, selection stabilization or owner exposure.
-        native.replay_committed()?;
+        native.replay_committed_with_check(check)?;
         native.validate_image()?;
+        check()?;
         Ok(Self {
             directory: directory.to_path_buf(),
             directory_pin,
@@ -416,7 +442,12 @@ impl Opening {
             .map(|snapshots| snapshots.origin.clone())
     }
 
-    fn admit_origin(mut self, source: Option<&snapshot::InstallSource>) -> io::Result<Self> {
+    fn admit_origin(
+        mut self,
+        source: Option<&snapshot::InstallSource>,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
         let Some(anchor) = self.pending_origin.take() else {
             return Ok(self);
         };
@@ -441,7 +472,7 @@ impl Opening {
             MAX_BASIS,
             self.binding.identity,
             &authority.members,
-            &|| Ok(()),
+            check,
         )?;
         let predecessor = cold_basis(&self.directory, self.binding)?;
         let origin = source.apply_native_original(
@@ -449,7 +480,7 @@ impl Opening {
             self.binding,
             self.roster_root.as_deref(),
             &incarnation,
-            &|| Ok(()),
+            check,
         )?;
         drop(predecessor);
         let (append, catalog) = crate::consensus::native::generation::Catalog::open_with_origin(
@@ -463,14 +494,16 @@ impl Opening {
             },
             Some(origin),
             cut_binding,
-            &|| Ok(()),
+            check,
         )?;
         if catalog.identity() != prefix || catalog.cut_binding() != cut_binding {
             return Err(invalid_data("native installed catalog binding differs"));
         }
         catalog.require_reclamation_format()?;
+        check()?;
         (self.control.hook)(Point::AfterNativeBasisAdmission)?;
-        self.native = catalog.into_storage(&|| Ok(()))?;
+        check()?;
+        self.native = catalog.into_storage(check)?;
         if self.native.business.members() != &authority.members
             || self.native.business.applied() != anchor.native_applied()
             || self.native.log.committed != anchor.native_committed()
@@ -488,10 +521,12 @@ impl Opening {
             self.limits,
             Some(anchor),
             &mut self.native,
+            check,
         )?);
-        self.native.replay_committed()?;
+        self.native.replay_committed_with_check(check)?;
         self.native.validate_image()?;
         source.verify()?;
+        check()?;
         Ok(self)
     }
 
@@ -503,10 +538,20 @@ impl Opening {
         self.finish_with_install_source(None, verify)
     }
 
+    #[cfg(any(test, feature = "test-control"))]
     pub(in crate::sqlite::consensus) fn finish_with_install_source(
         self,
         source: Option<&snapshot::InstallSource>,
         verify: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Wal> {
+        self.finish_with_install_source_checked(source, verify, &|| Ok(()))
+    }
+
+    pub(in crate::sqlite::consensus) fn finish_with_install_source_checked(
+        self,
+        source: Option<&snapshot::InstallSource>,
+        verify: impl FnOnce() -> io::Result<()>,
+        check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Wal> {
         let Self {
             directory,
@@ -520,18 +565,20 @@ impl Opening {
             mut selected,
             audit,
             ..
-        } = self.admit_origin(source)?;
+        } = self.admit_origin(source, check)?;
         let audit = audit.ok_or_else(|| invalid_data("native recovery audit missing"))?;
         // All referenced strict descriptors are admitted and rechecked before
         // the audit is allowed to repair files or stabilize a selector.
         verify()?;
+        check()?;
         if let Some(selected) = &mut selected {
             let anchor = audit
                 .anchor
                 .as_ref()
                 .ok_or_else(|| invalid_data("native admitted generation lacks its selector"))?;
-            selected.repair(&anchor.basis_path(&directory), &|| Ok(()))?;
+            selected.repair(&anchor.basis_path(&directory), check)?;
         }
+        check()?;
         let (mut disk, history_bytes) = audit.finish(&directory, lock, &control)?;
         let (native, selected, history_bytes) = match selected {
             Some(selected) => (native, selected, history_bytes),
@@ -545,9 +592,9 @@ impl Opening {
         // validation has completed. Consume before starting the writer, so a
         // second cold incarnation can never reuse this permission.
         if binding.async_recovery_format {
-            native
-                .check_async_reservation(async_authority::read(&directory, binding)?, &|| Ok(()))?;
+            native.check_async_reservation(async_authority::read(&directory, binding)?, check)?;
         }
+        check()?;
         let recovered_closed = if binding.async_closed_format {
             async_closed::consume(
                 &directory,
@@ -1340,7 +1387,7 @@ impl Wal {
             IoControl::default(),
         )?;
         let admitted = admit_snapshots(opening.snapshots(), opening.install_candidate())?;
-        let opening = opening.admit_origin(install_source(&admitted))?;
+        let opening = opening.admit_origin(install_source(&admitted), &|| Ok(()))?;
         verify(&admitted)?;
         let authority = Authority::load(&opening.conn, self.binding.identity)?;
         let mut owner_facts = native_fixture_facts(

@@ -195,6 +195,16 @@ state, scope, membership and snapshot admission still run afterward. Later
 log-file rollover and sibling-table retirement need no second fresh-install
 boundary under this contract.
 
+Both compatibility preflight paths and full generation admission run on
+blocking workers. Full admission includes selected-state reconstruction,
+installed-origin reconstruction, recovery replay and finalization. Snapshot
+descriptors are admitted and rechecked before recovery can repair files or
+stabilize a selector. Cancelling an opener releases queued captures immediately
+and stops running scans at their next cancellation check; a running admission
+keeps its connection guard and descriptor owner until it stops. Ordinary-open
+tests over large selected and installed generations verify runtime progress in
+both persistence modes.
+
 The public reopen regressions
 `native_unknown_frontier_public_reopen_refuses_before_backend_or_snapshot_writes`,
 `native_unknown_command_public_reopen_refuses_before_backend_or_snapshot_writes`

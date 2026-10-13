@@ -157,12 +157,323 @@ async fn native_format_preflight_keeps_runtime_responsive_before_scope_lookup() 
     responsive_preflight(identity(2)).await;
 }
 
+async fn open_ordinary(
+    backend: &SqliteSessionBackend,
+    directory: &FixedRawReadStoreFixture,
+    mode: SessionPersistenceMode,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    let members = fixed_raw_read_members();
+    let local = SessionConsensusNodeId::new(8).unwrap();
+    let peers = members
+        .iter()
+        .copied()
+        .filter(|node| *node != local)
+        .map(|node| {
+            (
+                node,
+                Arc::new(MembershipObservationProbePeer { node_id: node })
+                    as Arc<dyn SessionConsensusPeer>,
+            )
+        })
+        .collect();
+    let network =
+        SessionRaftNetworkFactory::try_new(identity(1), local, members.clone(), peers).unwrap();
+    open_fixed_with_persistence_and_roster_attestation_root(
+        backend,
+        SnapshotDirectory::from_path(directory.snapshot_path().join("retained-bound-snapshots")),
+        identity(1),
+        members.clone(),
+        fixed_raw_read_bindings(&members),
+        network.peer_directory(),
+        PlacementResiliencePolicy::AllowReducedResilience,
+        None,
+        SnapshotIntegrityPolicy::FsVerity,
+        mode,
+    )
+    .await
+}
+
+fn close_ordinary(log: SqliteConsensusLogStore, machine: SqliteConsensusStateMachine) {
+    machine
+        .core
+        .private_wal
+        .as_ref()
+        .unwrap()
+        .shutdown_after_consensus()
+        .unwrap();
+    drop(log);
+    drop(machine);
+}
+
+async fn installed_generation(directory: &FixedRawReadStoreFixture, mode: SessionPersistenceMode) {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let source = FixedRawReadStoreFixture::new();
+    large_generation(&source, mode).await;
+    let producer = SqliteSessionBackend::open(source.path().join(DATABASE)).unwrap();
+    let (producer_log, mut producer_machine, _) =
+        open_ordinary(&producer, &source, mode).await.unwrap();
+    let mut snapshot = producer_machine
+        .get_current_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.meta.last_log_id, Some(log_id(16_383)));
+    let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+    let (log, mut machine, _) = open_ordinary(&backend, directory, mode).await.unwrap();
+    let mut receiving = machine.begin_receiving_snapshot().await.unwrap();
+    snapshot.snapshot.rewind().await.unwrap();
+    tokio::io::copy(&mut snapshot.snapshot, &mut receiving)
+        .await
+        .unwrap();
+    receiving.flush().await.unwrap();
+    Box::pin(machine.install_snapshot(&snapshot.meta, receiving))
+        .await
+        .unwrap();
+    assert_eq!(
+        machine.applied_state().await.unwrap().0,
+        Some(log_id(16_383))
+    );
+    close_ordinary(log, machine);
+    close_ordinary(producer_log, producer_machine);
+}
+
+async fn responsive_full_open(installed: bool) {
+    use crate::sqlite::consensus::wal::Point;
+
+    for mode in [
+        SessionPersistenceMode::Durable,
+        SessionPersistenceMode::Async,
+    ] {
+        let directory = FixedRawReadStoreFixture::new();
+        if installed {
+            installed_generation(&directory, mode).await;
+        } else {
+            large_generation(&directory, mode).await;
+        }
+        let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+        let runtime_thread = std::thread::current().id();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let admitted = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&admitted);
+        backend
+            .native_owner
+            .as_ref()
+            .unwrap()
+            .set_io_hook_for_test(Arc::new(move |point| {
+                if point == Point::AfterNativeBasisAdmission {
+                    // The ordinary selected path reaches this in Opening::new;
+                    // an installed origin reaches it in finish_with_install_source.
+                    // Fail inline execution directly, without using a timeout
+                    // as evidence that the runtime failed to make progress.
+                    assert_ne!(
+                        std::thread::current().id(),
+                        runtime_thread,
+                        "full native admission must leave the runtime thread"
+                    );
+                    assert!(!seen.swap(true, Ordering::SeqCst));
+                    entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30))
+                        .map_err(|_| std::io::Error::other("full admission release timed out"))?;
+                }
+                Ok(())
+            }));
+        let progressed = Arc::new(AtomicBool::new(false));
+        let progress = Arc::clone(&progressed);
+        let timer = tokio::spawn(async move {
+            started.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            progress.store(true, Ordering::SeqCst);
+            release.send(()).unwrap();
+        });
+        let (log, mut machine, opened_identity) =
+            open_ordinary(&backend, &directory, mode).await.unwrap();
+        timer.await.unwrap();
+        assert!(admitted.load(Ordering::SeqCst));
+        assert!(progressed.load(Ordering::SeqCst));
+        assert_eq!(opened_identity, identity(1));
+        assert_eq!(
+            machine.applied_state().await.unwrap().0,
+            Some(log_id(16_383))
+        );
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .meta
+                .last_log_id,
+            Some(log_id(16_383))
+        );
+        close_ordinary(log, machine);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_full_open_keeps_runtime_responsive_for_selected_generation() {
+    responsive_full_open(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_full_open_keeps_runtime_responsive_for_installed_generation() {
+    responsive_full_open(true).await;
+}
+
 fn cancellation_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
         .build()
         .unwrap()
+}
+
+#[test]
+fn native_full_open_cancels_running_admission_and_releases_owners() {
+    use crate::sqlite::consensus::wal::Point;
+
+    cancellation_runtime().block_on(async {
+        for installed in [false, true] {
+            for mode in [
+                SessionPersistenceMode::Durable,
+                SessionPersistenceMode::Async,
+            ] {
+                let directory = FixedRawReadStoreFixture::new();
+                if installed {
+                    installed_generation(&directory, mode).await;
+                } else {
+                    large_generation(&directory, mode).await;
+                }
+                let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+                let owner = backend.native_owner.as_ref().unwrap();
+                let before = root_selection(&directory);
+                let snapshots_before: Vec<_> =
+                    namespace(directory.snapshot_path()).into_keys().collect();
+                let runtime_thread = std::thread::current().id();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let entered = Mutex::new(Some(entered));
+                let (release, wait) = mpsc::channel();
+                let wait = Mutex::new(wait);
+                let publication_attempted = Arc::new(AtomicBool::new(false));
+                let published = Arc::clone(&publication_attempted);
+                owner.set_io_hook_for_test(Arc::new(move |point| {
+                    if point == Point::BeforeRecoveryPublicationSync {
+                        published.store(true, Ordering::SeqCst);
+                    }
+                    if point == Point::AfterNativeBasisAdmission {
+                        assert_ne!(std::thread::current().id(), runtime_thread);
+                        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                        wait.lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30))
+                            .unwrap();
+                    }
+                    Ok(())
+                }));
+                let mut opening = Box::pin(open_ordinary(&backend, &directory, mode));
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::select! {
+                        _ = &mut opening => panic!("opener finished before admission was released"),
+                        entered = started => entered.unwrap(),
+                    }
+                })
+                .await
+                .unwrap();
+                drop(opening);
+                // Cancellation cannot expose the connection while the worker
+                // still owns its scan, native lock and borrowed descriptors.
+                let mut connection = Box::pin(backend.lock_connection_for_test());
+                assert!(std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(connection.as_mut().poll(cx))
+                })
+                .await
+                .is_pending());
+                drop(connection);
+                release.send(()).unwrap();
+                tokio::task::spawn_blocking(|| ()).await.unwrap();
+                assert!(
+                    !publication_attempted.load(Ordering::SeqCst),
+                    "cancelled admission must stop before recovery publication"
+                );
+                assert_eq!(Arc::strong_count(owner), 1);
+                assert!(owner.current().is_err());
+                assert_eq!(root_selection(&directory), before);
+                assert_eq!(
+                    namespace(directory.snapshot_path())
+                        .into_keys()
+                        .collect::<Vec<_>>(),
+                    snapshots_before,
+                    "cancellation must release private snapshot derivatives"
+                );
+                owner.set_io_hook_for_test(Arc::new(|_| Ok(())));
+                let (log, mut machine, _) = open_ordinary(&backend, &directory, mode)
+                    .await
+                    .expect("cancelled admission must release the native lock for a full reopen");
+                assert_eq!(
+                    machine.applied_state().await.unwrap().0,
+                    Some(log_id(16_383))
+                );
+                close_ordinary(log, machine);
+            }
+        }
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_full_open_worker_failures_keep_typed_refusals() {
+    use crate::sqlite::consensus::wal::Point;
+
+    for installed in [false, true] {
+        for mode in [
+            SessionPersistenceMode::Durable,
+            SessionPersistenceMode::Async,
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            if installed {
+                installed_generation(&directory, mode).await;
+            } else {
+                large_generation(&directory, mode).await;
+            }
+            let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+            let owner = backend.native_owner.as_ref().unwrap();
+            let before = root_selection(&directory);
+            for panic in [false, true] {
+                owner.set_io_hook_for_test(Arc::new(move |point| {
+                    if point == Point::AfterNativeBasisAdmission {
+                        assert!(!panic, "injected full admission worker panic");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "injected full admission refusal",
+                        ));
+                    }
+                    Ok(())
+                }));
+                assert_eq!(
+                    open_ordinary(&backend, &directory, mode).await.err(),
+                    Some(if panic {
+                        SessionConsensusStorageError::BackendUnavailable
+                    } else {
+                        SessionConsensusStorageError::CorruptState
+                    })
+                );
+                assert!(owner.current().is_err());
+                assert_eq!(Arc::strong_count(owner), 1);
+                assert_eq!(root_selection(&directory), before);
+            }
+        }
+    }
 }
 
 #[test]

@@ -65,6 +65,17 @@ fn identity(metadata: &fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
+fn check_open_cancelled(cancellation: &AtomicBool) -> io::Result<()> {
+    if cancellation.load(Ordering::Acquire) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "native generation admission cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn open_directory(path: &Path) -> io::Result<Arc<File>> {
     let file = OpenOptions::new()
         .read(true)
@@ -421,15 +432,16 @@ impl NativeOwner {
     }
 
     pub(crate) async fn attach_with_descriptors<V, F>(
-        &self,
+        self: &Arc<Self>,
         core: &mut SqliteConsensusCore,
         persistence: SessionPersistenceMode,
         validate: impl FnOnce(Vec<consensus::CurrentSnapshot>, Option<consensus::CurrentSnapshot>) -> F,
-        verify: impl FnOnce(&V) -> io::Result<()>,
-        install_source: impl FnOnce(&V) -> Option<&super::snapshot::InstallSource>,
+        verify: impl FnOnce(&V) -> io::Result<()> + Send + 'static,
+        install_source: impl FnOnce(&V) -> Option<&super::snapshot::InstallSource> + Send + 'static,
     ) -> io::Result<()>
     where
         F: std::future::Future<Output = io::Result<V>>,
+        V: Send + 'static,
     {
         if !self.selected()
             || core.private_wal.is_some()
@@ -438,29 +450,50 @@ impl NativeOwner {
             return Err(invalid_data("native fixed owner admission differs"));
         }
         self.verify_database(core)?;
-        let conn = core.conn.lock().await;
+        let conn = Arc::clone(&core.conn).lock_owned().await;
         let path = directory_path(&self.parent).join(&self.native_name);
         let existing = match fs::symlink_metadata(&path) {
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
-        let wal = if existing {
+        let (wal, _conn) = if existing {
             let pin = pin_directory(&path)?;
             let binding = self.read_root(&pin, core.storage_identity)?;
             if binding.persistence != persistence {
                 return Err(invalid_data("native persistence mode differs"));
             }
-            let opening = super::native::Opening::new(
-                &directory_path(&pin),
-                binding,
-                core.configured_roster_root.clone(),
-                Limits::default(),
-                self.io_control(),
-            )?;
+            let owner = Arc::clone(self);
+            let roster_root = core.configured_roster_root.clone();
+            // The worker owns the connection guard as well as the descriptor
+            // owner. Cancelling an open must not release either underneath a
+            // running scan; queued captures are retired by the shared guard.
+            let (opening, conn, owner) =
+                crate::sqlite::SqliteSessionBackend::run_native_open_blocking(move |cancel| {
+                    let opening = super::native::Opening::new_with_check(
+                        &directory_path(&pin),
+                        binding,
+                        roster_root,
+                        Limits::default(),
+                        owner.io_control(),
+                        &|| check_open_cancelled(cancel),
+                    )?;
+                    Ok((opening, conn, owner))
+                })
+                .await
+                .map_err(io::Error::other)?;
             let descriptors = validate(opening.snapshots(), opening.install_candidate()).await?;
-            opening
-                .finish_with_install_source(install_source(&descriptors), || verify(&descriptors))?
+            crate::sqlite::SqliteSessionBackend::run_native_open_blocking(move |cancel| {
+                let _owner = owner;
+                let wal = opening.finish_with_install_source_checked(
+                    install_source(&descriptors),
+                    || verify(&descriptors),
+                    &|| check_open_cancelled(cancel),
+                )?;
+                Ok((wal, conn))
+            })
+            .await
+            .map_err(io::Error::other)?
         } else {
             if !core.fresh_native_basis || read_selection(&self.database)?.is_some() {
                 return Err(invalid_data(
@@ -483,7 +516,7 @@ impl NativeOwner {
                 persistence,
             )?;
             self.write_root(&wal)?;
-            wal
+            (wal, conn)
         };
         self.verify_database(core)?;
         let placement = core

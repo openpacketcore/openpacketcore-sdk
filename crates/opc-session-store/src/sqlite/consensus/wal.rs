@@ -2632,8 +2632,32 @@ fn audit_recovery_projected(
     anchor: Option<checkpoint::Anchor>,
     allow_snapshot_proof: bool,
     basis_committed: Option<LogId<SessionConsensusNodeId>>,
+    project: impl FnMut(&Operation) -> io::Result<Option<LogId<SessionConsensusNodeId>>>,
+) -> io::Result<RecoveryAudit> {
+    audit_recovery_projected_with_check(
+        directory,
+        binding,
+        limits,
+        anchor,
+        allow_snapshot_proof,
+        basis_committed,
+        &|| Ok(()),
+        project,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_recovery_projected_with_check(
+    directory: &Path,
+    binding: Binding,
+    limits: Limits,
+    anchor: Option<checkpoint::Anchor>,
+    allow_snapshot_proof: bool,
+    basis_committed: Option<LogId<SessionConsensusNodeId>>,
+    check: &impl Fn() -> io::Result<()>,
     mut project: impl FnMut(&Operation) -> io::Result<Option<LogId<SessionConsensusNodeId>>>,
 ) -> io::Result<RecoveryAudit> {
+    check()?;
     let base = anchor
         .as_ref()
         .map_or_else(CutPosition::initial, |anchor| anchor.position);
@@ -2647,6 +2671,7 @@ fn audit_recovery_projected(
     let mut retired_cuts = 0;
     let mut file_count = 0;
     for entry in fs::read_dir(directory)? {
+        check()?;
         let entry = entry?;
         file_count += 1;
         if file_count
@@ -2741,6 +2766,7 @@ fn audit_recovery_projected(
     let mut cut_chain = anchor.as_ref().map_or([0; 32], |anchor| anchor.cut_chain);
     let mut publications = Vec::new();
     for (expected, (&ordinal, path)) in cuts.iter().enumerate() {
+        check()?;
         if ordinal != base_cut + expected as u64 + 1 {
             return Err(invalid_data("private WAL publication gap"));
         }
@@ -2820,6 +2846,7 @@ fn audit_recovery_projected(
     let mut decoder: Option<Decoder> = None;
     let mut position = base;
     for (&segment, (path, physical_len)) in segments.range(..=end.segment) {
+        check()?;
         let len = if segment == end.segment {
             end.offset
         } else {
@@ -2845,6 +2872,7 @@ fn audit_recovery_projected(
         };
         file.seek(SeekFrom::Start(offset))?;
         while offset < len {
+            check()?;
             if sequence >= end.sequence || len - offset < FRAME_HEADER as u64 {
                 return Err(invalid_data(
                     "private WAL incomplete or excess acknowledged frame",

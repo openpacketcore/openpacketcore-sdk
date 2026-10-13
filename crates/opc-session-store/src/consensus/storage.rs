@@ -2387,6 +2387,7 @@ impl SessionConsensusStorageError {
         {
             Some(Self::FreshInstallationRequired) => Self::FreshInstallationRequired,
             Some(Self::PersistenceFormatMismatch) => Self::PersistenceFormatMismatch,
+            Some(Self::BackendUnavailable) => Self::BackendUnavailable,
             _ => Self::CorruptState,
         }
     }
@@ -2661,7 +2662,7 @@ async fn attach_private_wal_before_snapshot_cleanup(
 #[cfg(target_os = "linux")]
 async fn attach_native_wal_before_snapshot_cleanup(
     core: &mut SqliteConsensusCore,
-    owner: &consensus::wal::owner::NativeOwner,
+    owner: &Arc<consensus::wal::owner::NativeOwner>,
     lease: Arc<SnapshotDirectoryLease>,
     persistence: SessionPersistenceMode,
 ) -> io::Result<()> {
