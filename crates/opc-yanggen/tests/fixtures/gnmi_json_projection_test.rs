@@ -86,6 +86,39 @@ fn sensitive_key_preserves_conditional_scalar_traits() {
 }
 
 #[test]
+fn sensitive_key_permitted_read() {
+    let marker = "subscriber/'\\]sensitive-key";
+    let system: System = serde_json::from_value(json!({
+        "subscriber": [{ "imsi": marker, "tier": "selected-tier" }],
+        "secret": "non-key-secret-marker"
+    })).expect("synthetic configuration");
+    let updates = render(&system, vec![
+        entry("/ex:system/ex:subscriber/ex:imsi", "/ex:system/ex:subscriber/ex:imsi"),
+        entry("/ex:system/ex:subscriber/ex:tier", "/ex:system/ex:subscriber/ex:tier"),
+        entry("/ex:system/ex:secret", "/ex:system/ex:secret"),
+    ]);
+    let canonical = "/ex:system/ex:subscriber[ex:imsi='subscriber/\\'\\\\]sensitive-key']";
+    assert_eq!(updates.len(), 3);
+    assert!(updates.contains(&(format!("{canonical}/ex:imsi"), serde_json::to_string(marker).unwrap())));
+    assert!(updates.contains(&(format!("{canonical}/ex:tier"), "\"selected-tier\"".to_string())));
+    let secret = updates.iter().find(|(path, _)| path == "/ex:system/ex:secret").unwrap();
+    assert!(!secret.1.contains("non-key-secret-marker"));
+    assert_eq!(serde_json::from_str::<String>(&secret.1).unwrap(), "<redacted>");
+}
+
+#[test]
+fn sensitive_key_direct_child_read() {
+    let system = sample_config();
+    assert_eq!(render(&system, vec![entry(
+        "/ex:system/ex:subscriber/ex:tier",
+        "/ex:system/ex:subscriber[ex:imsi='001010000000001']/ex:tier",
+    )]), vec![(
+        "/ex:system/ex:subscriber[ex:imsi='001010000000001']/ex:tier".to_string(),
+        "\"gold\"".to_string(),
+    )]);
+}
+
+#[test]
 fn selected_leaf_only_does_not_leak_siblings() {
     let system = sample_config();
     let updates = render(

@@ -598,6 +598,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[cfg(test)]
 #[allow(deprecated, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    mod sensitive_keys;
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
