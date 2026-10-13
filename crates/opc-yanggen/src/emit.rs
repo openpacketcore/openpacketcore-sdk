@@ -647,6 +647,9 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
             None => "none".to_string(),
             Some(TypeRef::Boolean) => "boolean".to_string(),
             Some(TypeRef::String) => "string".to_string(),
+            Some(TypeRef::RestrictedString { length, patterns }) => {
+                format!("string length={length:?} patterns={patterns:?}")
+            }
             Some(TypeRef::Enumeration { values }) => {
                 let names = values
                     .iter()
@@ -655,6 +658,11 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
                     .join(",");
                 format!("enumeration(values={names})")
             }
+            Some(TypeRef::Uint8) => numeric_type_str("uint8", &node.numeric_range),
+            Some(TypeRef::Uint64) => numeric_type_str("uint64", &node.numeric_range),
+            Some(TypeRef::Int8) => numeric_type_str("int8", &node.numeric_range),
+            Some(TypeRef::Int16) => numeric_type_str("int16", &node.numeric_range),
+            Some(TypeRef::Int32) => numeric_type_str("int32", &node.numeric_range),
             Some(TypeRef::Uint16) => numeric_type_str("uint16", &node.numeric_range),
             Some(TypeRef::Uint32) => numeric_type_str("uint32", &node.numeric_range),
             Some(TypeRef::Int64) => numeric_type_str("int64", &node.numeric_range),

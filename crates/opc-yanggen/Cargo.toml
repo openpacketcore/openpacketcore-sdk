@@ -14,6 +14,7 @@ documentation = "https://docs.rs/opc-yanggen"
 keywords = ["5g", "cnf", "yang", "telecom", "packet-core"]
 categories = ["network-programming", "encoding"]
 [dependencies]
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 serde = { workspace = true }

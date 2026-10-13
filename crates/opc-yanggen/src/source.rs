@@ -717,14 +717,39 @@ fn parse_type_ref(statement: &Statement) -> Result<ParsedTypeRef, Diagnostic> {
     let type_name = required_argument(statement, "type")?;
     match type_name {
         "boolean" => parse_plain_type(statement, TypeRef::Boolean),
-        "string" => parse_plain_type(statement, TypeRef::String),
+        "string" => parse_string_type(statement),
         "enumeration" => parse_enumeration_type(statement).map(|type_ref| ParsedTypeRef {
             type_ref,
             numeric_range: Vec::new(),
         }),
-        "uint16" => parse_integer_type(statement, TypeRef::Uint16, 0, i64::from(u16::MAX)),
-        "uint32" => parse_integer_type(statement, TypeRef::Uint32, 0, i64::from(u32::MAX)),
-        "int64" => parse_integer_type(statement, TypeRef::Int64, i64::MIN, i64::MAX),
+        "uint8" => parse_integer_type(statement, TypeRef::Uint8, 0, i128::from(u8::MAX)),
+        "uint64" => parse_integer_type(statement, TypeRef::Uint64, 0, i128::from(u64::MAX)),
+        "int8" => parse_integer_type(
+            statement,
+            TypeRef::Int8,
+            i128::from(i8::MIN),
+            i128::from(i8::MAX),
+        ),
+        "int16" => parse_integer_type(
+            statement,
+            TypeRef::Int16,
+            i128::from(i16::MIN),
+            i128::from(i16::MAX),
+        ),
+        "int32" => parse_integer_type(
+            statement,
+            TypeRef::Int32,
+            i128::from(i32::MIN),
+            i128::from(i32::MAX),
+        ),
+        "uint16" => parse_integer_type(statement, TypeRef::Uint16, 0, i128::from(u16::MAX)),
+        "uint32" => parse_integer_type(statement, TypeRef::Uint32, 0, i128::from(u32::MAX)),
+        "int64" => parse_integer_type(
+            statement,
+            TypeRef::Int64,
+            i128::from(i64::MIN),
+            i128::from(i64::MAX),
+        ),
         "decimal64" => {
             ensure_type_children_supported(statement, &["fraction-digits"])?;
             Ok(ParsedTypeRef {
@@ -764,11 +789,117 @@ fn parse_plain_type(statement: &Statement, type_ref: TypeRef) -> Result<ParsedTy
     })
 }
 
+fn parse_string_type(statement: &Statement) -> Result<ParsedTypeRef, Diagnostic> {
+    use crate::ir::{StringLengthInterval, StringPattern};
+    use opc_mgmt_schema::string_constraints::{CompiledYangPattern, PatternError};
+    ensure_type_children_supported(statement, &["length", "pattern"])?;
+    let mut length = Vec::new();
+    let mut patterns = Vec::new();
+    let mut seen_length = false;
+    for child in &statement.children {
+        match child.keyword.as_str() {
+            "length" => {
+                if seen_length {
+                    return Err(invalid_string_constraint(
+                        child,
+                        "duplicate string length statement",
+                    ));
+                }
+                seen_length = true;
+                // Length uses the same interval grammar, with an unsigned
+                // character-count domain. Keep declaration order for validation.
+                let mut range_statement = child.clone();
+                range_statement.keyword = "range".into();
+                for interval in parse_numeric_range(&range_statement, 0, i128::from(u64::MAX))? {
+                    let interval = StringLengthInterval {
+                        min: interval.min as u64,
+                        max: interval.max as u64,
+                    };
+                    if length
+                        .last()
+                        .is_some_and(|prior: &StringLengthInterval| prior.max >= interval.min)
+                    {
+                        return Err(invalid_string_constraint(
+                            child,
+                            "string length intervals must be ascending and disjoint",
+                        ));
+                    }
+                    length.push(interval);
+                }
+            }
+            "pattern" => {
+                if patterns.len() == 64 {
+                    return Err(invalid_string_constraint(
+                        child,
+                        "string type exceeds the 64-pattern limit",
+                    ));
+                }
+                let expression = required_argument(child, "pattern")?.to_string();
+                CompiledYangPattern::compile(&expression).map_err(|error| {
+                    Diagnostic::new(
+                        if error == PatternError::UnsupportedEscape {
+                            DiagnosticCode::UnsupportedYangFeature
+                        } else {
+                            DiagnosticCode::YangSourceSyntaxError
+                        },
+                        error.to_string(),
+                        Some(child.source.clone()),
+                        Some("use the documented bounded XSD pattern profile"),
+                    )
+                })?;
+                let mut invert_match = false;
+                let mut seen_modifier = false;
+                for sub in &child.children {
+                    match sub.keyword.as_str() {
+                        "description" | "reference" | "error-message" | "error-app-tag" => {}
+                        "modifier" => {
+                            if seen_modifier
+                                || required_argument(sub, "modifier")? != "invert-match"
+                                || !sub.children.is_empty()
+                            {
+                                return Err(invalid_string_constraint(
+                                    sub,
+                                    "pattern modifier must be one invert-match statement",
+                                ));
+                            }
+                            seen_modifier = true;
+                            invert_match = true;
+                        }
+                        other => return Err(unsupported(sub, other)),
+                    }
+                }
+                patterns.push(StringPattern {
+                    expression,
+                    invert_match,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(ParsedTypeRef {
+        type_ref: if seen_length || !patterns.is_empty() {
+            TypeRef::RestrictedString { length, patterns }
+        } else {
+            TypeRef::String
+        },
+        numeric_range: Vec::new(),
+    })
+}
+
+fn invalid_string_constraint(statement: &Statement, message: &'static str) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticCode::YangSourceSyntaxError,
+        message,
+        Some(statement.source.clone()),
+        Some("use a valid YANG string length or pattern restriction"),
+    )
+}
+
 fn parse_integer_type(
     statement: &Statement,
     type_ref: TypeRef,
-    base_min: i64,
-    base_max: i64,
+    base_min: i128,
+    base_max: i128,
 ) -> Result<ParsedTypeRef, Diagnostic> {
     ensure_type_children_supported(statement, &["range"])?;
     Ok(ParsedTypeRef {
@@ -779,8 +910,8 @@ fn parse_integer_type(
 
 fn parse_optional_numeric_range(
     statement: &Statement,
-    base_min: i64,
-    base_max: i64,
+    base_min: i128,
+    base_max: i128,
 ) -> Result<Vec<NumericRangeInterval>, Diagnostic> {
     let mut parsed_range = None;
     for child in &statement.children {
@@ -802,8 +933,8 @@ fn parse_optional_numeric_range(
 
 fn parse_numeric_range(
     statement: &Statement,
-    base_min: i64,
-    base_max: i64,
+    base_min: i128,
+    base_max: i128,
 ) -> Result<Vec<NumericRangeInterval>, Diagnostic> {
     for child in &statement.children {
         match child.keyword.as_str() {
@@ -850,14 +981,14 @@ fn parse_numeric_range(
 fn parse_numeric_range_bound(
     statement: &Statement,
     raw: &str,
-    base_min: i64,
-    base_max: i64,
-) -> Result<i64, Diagnostic> {
+    base_min: i128,
+    base_max: i128,
+) -> Result<i128, Diagnostic> {
     match raw {
         "min" => Ok(base_min),
         "max" => Ok(base_max),
         "" => Err(invalid_range(statement, "range bound must not be empty")),
-        value => value.parse::<i64>().map_err(|_| {
+        value => value.parse::<i128>().map_err(|_| {
             invalid_range(statement, "range bound must be an integer, 'min', or 'max'")
         }),
     }
@@ -1118,53 +1249,69 @@ impl<'a> Parser<'a> {
             ));
         };
 
-        let mut argument_parts = Vec::new();
-        loop {
-            let Some(peek) = self.peek() else {
-                return Err(Diagnostic::new(
-                    DiagnosticCode::YangSourceSyntaxError,
-                    format!("statement `{keyword}` is missing `;` or `{{`"),
-                    Some(token.source),
-                    Some("terminate the statement or add a child block"),
-                ));
-            };
-            match &peek.kind {
-                TokenKind::Semicolon => {
-                    self.index += 1;
-                    return Ok(Statement {
-                        keyword,
-                        argument: joined_argument(argument_parts),
-                        source: token.source,
-                        children: Vec::new(),
-                    });
+        let mut argument = None;
+        if let Some(peek) = self.peek() {
+            if let TokenKind::Ident(value) | TokenKind::String(value) = &peek.kind {
+                let quoted = matches!(peek.kind, TokenKind::String(_));
+                let mut value = value.clone();
+                self.index += 1;
+                if quoted {
+                    while self
+                        .peek()
+                        .is_some_and(|token| token.kind == TokenKind::Plus)
+                    {
+                        self.index += 1;
+                        let Some(Token {
+                            kind: TokenKind::String(part),
+                            ..
+                        }) = self.next()
+                        else {
+                            return Err(self.invalid_argument());
+                        };
+                        value.push_str(&part);
+                    }
                 }
-                TokenKind::LBrace => {
-                    self.index += 1;
-                    let children = self.parse_block()?;
-                    return Ok(Statement {
-                        keyword,
-                        argument: joined_argument(argument_parts),
-                        source: token.source,
-                        children,
-                    });
-                }
-                TokenKind::RBrace => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::YangSourceSyntaxError,
-                        format!("statement `{keyword}` ended before `;` or `{{`"),
-                        Some(peek.source.clone()),
-                        Some("terminate the statement before closing the parent block"),
-                    ));
-                }
-                TokenKind::Plus => {
-                    self.index += 1;
-                }
-                TokenKind::Ident(value) | TokenKind::String(value) => {
-                    argument_parts.push(value.clone());
-                    self.index += 1;
-                }
+                argument = Some(value);
             }
         }
+        let Some(terminator) = self.next() else {
+            return Err(Diagnostic::new(
+                DiagnosticCode::YangSourceSyntaxError,
+                format!("statement `{keyword}` is missing `;` or `{{`"),
+                Some(token.source),
+                Some("terminate the statement or add a child block"),
+            ));
+        };
+        let children = match terminator.kind {
+            TokenKind::Semicolon => Vec::new(),
+            TokenKind::LBrace => self.parse_block()?,
+            TokenKind::RBrace => {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::YangSourceSyntaxError,
+                    format!("statement `{keyword}` ended before `;` or `{{`"),
+                    Some(terminator.source),
+                    Some("terminate the statement before closing the parent block"),
+                ));
+            }
+            _ => return Err(self.invalid_argument()),
+        };
+        Ok(Statement {
+            keyword,
+            argument,
+            source: token.source,
+            children,
+        })
+    }
+
+    fn invalid_argument(&self) -> Diagnostic {
+        Diagnostic::new(
+            DiagnosticCode::YangSourceSyntaxError,
+            "YANG arguments require one string or quoted strings joined by '+'",
+            self.tokens
+                .get(self.index.saturating_sub(1))
+                .map(|token| token.source.clone()),
+            Some("join quoted strings with '+' or use a single argument"),
+        )
     }
 
     fn parse_block(&mut self) -> Result<Vec<Statement>, Diagnostic> {
@@ -1201,14 +1348,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn joined_argument(parts: Vec<String>) -> Option<String> {
-    match parts.len() {
-        0 => None,
-        1 => parts.into_iter().next(),
-        _ => Some(parts.join("")),
-    }
-}
-
 fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
     let mut tokens = Vec::new();
     let chars = source.text.chars().collect::<Vec<_>>();
@@ -1219,7 +1358,7 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
     while index < chars.len() {
         let ch = chars[index];
         match ch {
-            c if c.is_whitespace() => {
+            c if is_yang_whitespace(c) => {
                 advance_char(c, &mut line, &mut column);
                 index += 1;
             }
@@ -1259,6 +1398,14 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                     ));
                 }
             }
+            '*' if chars.get(index + 1) == Some(&'/') => {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::YangSourceSyntaxError,
+                    "unexpected block comment terminator",
+                    Some(YangSourceLocation::new(&source.file_name, line, column)),
+                    Some("remove the unmatched comment terminator or quote the string"),
+                ));
+            }
             '{' => {
                 tokens.push(symbol_token(
                     TokenKind::LBrace,
@@ -1289,7 +1436,10 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                 index += 1;
                 column += 1;
             }
-            '+' => {
+            '+' if tokens
+                .last()
+                .is_some_and(|token| matches!(token.kind, TokenKind::String(_))) =>
+            {
                 tokens.push(symbol_token(
                     TokenKind::Plus,
                     &source.file_name,
@@ -1321,13 +1471,18 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                         };
                         index += 1;
                         advance_char(escaped, &mut line, &mut column);
-                        value.push(match escaped {
-                            'n' => '\n',
-                            't' => '\t',
-                            '"' => '"',
-                            '\\' => '\\',
-                            other => other,
-                        });
+                        if !matches!(escaped, 'n' | 't' | '"' | '\\') {
+                            return Err(Diagnostic::new(
+                                DiagnosticCode::YangSourceSyntaxError,
+                                "invalid escape in double-quoted YANG string",
+                                Some(start),
+                                Some("double-quoted YANG strings allow only n, t, double quote, or backslash after a backslash"),
+                            ));
+                        }
+                        // Preserve escapes until indentation and trailing
+                        // whitespace have been stripped (RFC 7950 section 6.1.3).
+                        value.push(current);
+                        value.push(escaped);
                     } else {
                         value.push(current);
                     }
@@ -1340,6 +1495,9 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                         Some("close the string before the end of the file"),
                     ));
                 }
+                if quote == '"' {
+                    value = decode_double_quoted(&value, start.column);
+                }
                 tokens.push(Token {
                     kind: TokenKind::String(value),
                     source: start,
@@ -1350,13 +1508,15 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
                 let start_column = column;
                 let mut value = String::new();
                 while let Some(&current) = chars.get(index) {
-                    if current.is_whitespace() || matches!(current, '{' | '}' | ';' | '"' | '\'') {
+                    if is_yang_whitespace(current)
+                        || matches!(current, '{' | '}' | ';' | '"' | '\'')
+                    {
                         break;
                     }
                     if current == '/' && matches!(chars.get(index + 1), Some('/') | Some('*')) {
                         break;
                     }
-                    if current == '+' {
+                    if current == '*' && chars.get(index + 1) == Some(&'/') {
                         break;
                     }
                     value.push(current);
@@ -1382,6 +1542,64 @@ fn lex(source: &YangSource) -> Result<Vec<Token>, Diagnostic> {
     Ok(tokens)
 }
 
+fn is_yang_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\r' | '\n')
+}
+
+// Trim physical lines before interpreting escapes, and preserve CRLF/LF.
+fn decode_double_quoted(raw: &str, quote_column: usize) -> String {
+    let mut trimmed = String::new();
+    for (index, line) in raw.split_inclusive('\n').enumerate() {
+        let (line, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        let mut chars = line.chars().peekable();
+        let mut body = String::new();
+        if index > 0 {
+            let mut remaining = quote_column;
+            while remaining > 0 {
+                let width = match chars.peek() {
+                    Some(' ') => 1,
+                    Some('\t') => 8,
+                    _ => break,
+                };
+                chars.next();
+                if width > remaining {
+                    body.extend(std::iter::repeat_n(' ', width - remaining));
+                }
+                remaining = remaining.saturating_sub(width);
+            }
+        }
+        body.extend(chars);
+        trimmed.push_str(if ending.is_empty() {
+            &body
+        } else {
+            body.trim_end_matches([' ', '\t'])
+        });
+        trimmed.push_str(ending);
+    }
+    let mut decoded = String::new();
+    let mut chars = trimmed.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            decoded.push(match chars.next() {
+                Some('n') => '\n',
+                Some('t') => '\t',
+                Some('"') => '"',
+                Some('\\') => '\\',
+                _ => unreachable!("the lexer validated every double-quoted escape"),
+            });
+        } else {
+            decoded.push(ch);
+        }
+    }
+    decoded
+}
+
 fn symbol_token(kind: TokenKind, file_name: &str, line: usize, column: usize) -> Token {
     Token {
         kind,
@@ -1393,6 +1611,8 @@ fn advance_char(ch: char, line: &mut usize, column: &mut usize) {
     if ch == '\n' {
         *line += 1;
         *column = 1;
+    } else if ch == '\t' {
+        *column += 8;
     } else {
         *column += 1;
     }

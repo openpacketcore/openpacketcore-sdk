@@ -20,8 +20,14 @@
 //! pulls crypto): it mirrors the five datastore [`NacmAction`] variants locally so
 //! generated code stays minimal, and the server maps to `opc_nacm::NacmAction`
 //! (identical variant names) at its own boundary.
+//!
+//! [`LeafType`] covers all eight YANG integer widths. [`IntegerRangeIntervalMeta`]
+//! preserves the complete signed and unsigned domains. Existing
+//! [`NumericRangeIntervalMeta`] tables retain their original signed bounds.
 
 #![forbid(unsafe_code)]
+
+pub mod string_constraints;
 
 pub use opc_data_governance::DataClass;
 
@@ -29,7 +35,7 @@ pub use opc_data_governance::DataClass;
 /// codegen-rejected `Choice`/`Case` kinds.
 ///
 /// Fail-closed by construction: YANG types the generator cannot represent
-/// (`uint64`, `binary`, `union`) have no variant here and never reach the IR, so
+/// (`binary`, `union`) have no variant here and never reach the IR, so
 /// the registry can never label a leaf with a type the codec does not support.
 /// `Custom` records a YANG typedef name verbatim but carries no wire codec — a
 /// server must treat it as opaque (and may reject typed-value validation for it)
@@ -46,10 +52,20 @@ pub enum LeafType {
         /// Allowed enumeration values.
         values: &'static [EnumValueMeta],
     },
+    /// `uint8`
+    Uint8,
     /// `uint16`
     Uint16,
     /// `uint32`
     Uint32,
+    /// `uint64` (RFC 7951 JSON string)
+    Uint64,
+    /// `int8`
+    Int8,
+    /// `int16`
+    Int16,
+    /// `int32`
+    Int32,
     /// `int64`
     Int64,
     /// `decimal64` (generator-backed by `f64`; see opc-yanggen)
@@ -83,12 +99,32 @@ pub struct EnumValueMeta {
 }
 
 /// One inclusive YANG integer range interval for a leaf.
+///
+/// Retained for source compatibility with previously generated range tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NumericRangeIntervalMeta {
     /// Inclusive lower bound after resolving YANG `min`.
     pub min: i64,
     /// Inclusive upper bound after resolving YANG `max`.
     pub max: i64,
+}
+
+/// One inclusive integer interval covering both `i64::MIN` and `u64::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegerRangeIntervalMeta {
+    /// Inclusive lower bound after resolving YANG `min`.
+    pub min: i128,
+    /// Inclusive upper bound after resolving YANG `max`.
+    pub max: i128,
+}
+
+/// Exact integer range metadata associated with a schema node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeIntegerRangeMeta {
+    /// Canonical absolute schema path for the ranged leaf.
+    pub path: &'static str,
+    /// Allowed inclusive intervals.
+    pub intervals: &'static [IntegerRangeIntervalMeta],
 }
 
 /// Range metadata associated with one schema node.
@@ -597,6 +633,24 @@ pub trait SchemaRegistry: Send + Sync {
     /// before range metadata was introduced.
     fn numeric_ranges(&self) -> &'static [NodeNumericRangeMeta] {
         &[]
+    }
+
+    /// Exact integer ranges emitted for models using the extended integer types.
+    /// This includes all integer widths in those models; the legacy table also
+    /// retains intervals representable by its signed bounds.
+    fn integer_ranges(&self) -> &'static [NodeIntegerRangeMeta] {
+        &[]
+    }
+
+    /// Exact integer intervals at a schema path, without narrowing `uint64`.
+    fn integer_range(&self, schema_path: &str) -> &'static [IntegerRangeIntervalMeta] {
+        let Some(node) = self.node(schema_path) else {
+            return &[];
+        };
+        self.integer_ranges()
+            .iter()
+            .find(|range| range.path == node.path)
+            .map_or(&[], |range| range.intervals)
     }
 
     /// Retrieves raw YANG source text for a module identified by name and optional
