@@ -31,6 +31,8 @@ module mixed-state {
   container root {
     leaf hostname { type string; }
     leaf count { type uint32; }
+    leaf health { config false; type boolean; }
+    leaf-list state-label { config false; type string; }
     leaf-list counters { type uint32; }
     leaf-list references { type leafref { path '/mx:root/mx:hostname'; } }
     leaf-list api-token { type leafref { path '/mx:root/mx:hostname'; } }
@@ -38,6 +40,27 @@ module mixed-state {
       key 'token';
       leaf token { type string; }
       leaf count { type uint32; }
+      container telemetry {
+        config false;
+        leaf packets { type uint32; }
+      }
+    }
+    list channel {
+      key "name";
+      ordered-by user;
+      leaf name { type string; }
+      leaf setting { type string; }
+      container status {
+        config false;
+        leaf count { type uint32; }
+      }
+    }
+    container branch {
+      leaf setting { type string; }
+      container branch-state {
+        config false;
+        leaf count { type uint32; }
+      }
     }
     container state {
       config false;
