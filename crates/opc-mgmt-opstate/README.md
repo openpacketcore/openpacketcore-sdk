@@ -44,10 +44,25 @@ Operational values are RFC 7951 JSON strings checked at construction. Providers
 must omit unknown paths instead of fabricating values. Origin may be included
 only when requested and genuinely known.
 
+Omitted request keys select every matching list instance, including partial
+composite and ancestor-list selections. Providers report each concrete instance
+once, even when selectors overlap. Paths must have the requested depth and
+qualified node names; this is not a descendant-prefix match. `value_for` keeps
+its exact-lookup behavior.
+
+`OperationalRequest` carries `max_values` and `max_value_bytes`. Providers stop
+after `max_values + 1` values so the adapter can refuse overflow. Response
+validation rejects the whole result on excess count, an oversized path or JSON
+value, malformed or unrequested paths, duplicate paths, or unsolicited origin
+metadata. Count and byte checks precede path parsing. Protocol adapters must
+also validate complete canonical identities against their schema and apply
+authorization and data-class masking.
+
 ## Relationships
 
 - Consumed by `opc-gnmi-server` and `opc-netconf-server`.
 - Uses `opc-config-model` paths and config workflow metadata.
+- Uses the literal canonical path matcher in `opc-mgmt-path`.
 - Uses `opc-mgmt-errors` to map commit failures in apply-plan state.
 
 ## Status And Limits

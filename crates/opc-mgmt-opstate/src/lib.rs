@@ -22,6 +22,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
+use std::fmt;
+
+use opc_mgmt_path::canonical_path_matches;
 
 use opc_config_model::YangPath;
 use thiserror::Error;
@@ -91,7 +94,7 @@ impl Origin {
 }
 
 /// A request for operational state at one or more schema paths.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OperationalRequest {
     /// SDK-canonical paths the server is reading; list instances include their
     /// canonical key predicates when the northbound request addressed one.
@@ -99,6 +102,19 @@ pub struct OperationalRequest {
     /// Whether the caller wants NMDA origin metadata (NMDA `get-data` with
     /// `with-origin`); providers attach [`Origin`] only when this is set.
     pub include_origin: bool,
+    /// Maximum accepted number of reported values, including expanded list
+    /// instances. Providers stop after this many values plus one; the extra
+    /// value lets the adapter refuse overflow instead of truncating.
+    pub max_values: usize,
+    /// Maximum encoded bytes of each path and each JSON payload. The adapter
+    /// checks all byte lengths before parsing or indexing any reported entry.
+    pub max_value_bytes: usize,
+}
+
+impl Default for OperationalRequest {
+    fn default() -> Self {
+        Self::new([])
+    }
 }
 
 impl OperationalRequest {
@@ -107,6 +123,8 @@ impl OperationalRequest {
         Self {
             paths: paths.into_iter().collect(),
             include_origin: false,
+            max_values: 1024,
+            max_value_bytes: 1024 * 1024,
         }
     }
 
@@ -118,6 +136,18 @@ impl OperationalRequest {
     /// Requests NMDA origin metadata for the reported values.
     pub fn with_origin(mut self) -> Self {
         self.include_origin = true;
+        self
+    }
+
+    /// Sets the caller's per-read expansion limit.
+    pub fn with_max_values(mut self, max_values: usize) -> Self {
+        self.max_values = max_values;
+        self
+    }
+
+    /// Sets the caller's byte limit for each reported path and JSON value.
+    pub fn with_max_value_bytes(mut self, max_value_bytes: usize) -> Self {
+        self.max_value_bytes = max_value_bytes;
         self
     }
 }
@@ -268,136 +298,6 @@ impl OperationalEvent {
     }
 }
 
-fn canonical_path_matches(selection: &str, candidate: &str) -> bool {
-    let Ok(selection) = parse_canonical_path(selection) else {
-        return false;
-    };
-    let Ok(candidate) = parse_canonical_path(candidate) else {
-        return false;
-    };
-    if selection.len() != candidate.len() {
-        return false;
-    }
-    selection
-        .iter()
-        .zip(candidate.iter())
-        .all(|(selected, actual)| {
-            selected.name == actual.name
-                && selected.keys.iter().all(|(key, value)| {
-                    actual.keys.iter().any(|(actual_key, actual_value)| {
-                        actual_key == key && actual_value == value
-                    })
-                })
-        })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CanonicalSegment<'a> {
-    name: &'a str,
-    keys: Vec<(&'a str, String)>,
-}
-
-fn parse_canonical_path(path: &str) -> Result<Vec<CanonicalSegment<'_>>, ()> {
-    let mut segments = Vec::new();
-    for segment in split_canonical_segments(path)? {
-        let (name, predicates) = segment
-            .split_once('[')
-            .map(|(name, rest)| (name, Some(rest)))
-            .unwrap_or((segment, None));
-        if name.is_empty() {
-            return Err(());
-        }
-        let mut keys = Vec::new();
-        if let Some(mut rest) = predicates {
-            loop {
-                let end = find_predicate_end(rest)?;
-                let predicate = &rest[..end];
-                let (key, value) = parse_predicate(predicate)?;
-                keys.push((key, value));
-                rest = &rest[end + 1..];
-                if rest.is_empty() {
-                    break;
-                }
-                rest = rest.strip_prefix('[').ok_or(())?;
-            }
-        }
-        segments.push(CanonicalSegment { name, keys });
-    }
-    Ok(segments)
-}
-
-fn split_canonical_segments(path: &str) -> Result<Vec<&str>, ()> {
-    if !path.starts_with('/') {
-        return Err(());
-    }
-    let mut out = Vec::new();
-    let mut start = 1;
-    let mut quote = false;
-    let mut escape = false;
-    for (idx, ch) in path.char_indices().skip(1) {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' if quote => escape = true,
-            '\'' => quote = !quote,
-            '/' if !quote => {
-                out.push(&path[start..idx]);
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    if quote || escape {
-        return Err(());
-    }
-    if start < path.len() {
-        out.push(&path[start..]);
-    }
-    Ok(out)
-}
-
-fn find_predicate_end(rest: &str) -> Result<usize, ()> {
-    let mut quote = false;
-    let mut escape = false;
-    for (idx, ch) in rest.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' if quote => escape = true,
-            '\'' => quote = !quote,
-            ']' if !quote => return Ok(idx),
-            _ => {}
-        }
-    }
-    Err(())
-}
-
-fn parse_predicate(predicate: &str) -> Result<(&str, String), ()> {
-    let (key, raw_value) = predicate.split_once('=').ok_or(())?;
-    let quoted = raw_value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .ok_or(())?;
-    Ok((key, unescape_predicate_value(quoted)?))
-}
-
-fn unescape_predicate_value(value: &str) -> Result<String, ()> {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            out.push(chars.next().ok_or(())?);
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
-}
-
 /// A malformed operational-state event supplied by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum OperationalEventError {
@@ -506,17 +406,31 @@ impl OperationalResponse {
 
     /// Validates a provider response against the request that produced it.
     ///
-    /// A valid response reports each path at most once, reports only requested
-    /// paths, and includes origin metadata only when the request asked for it.
+    /// A valid response reports each concrete path at most once, reports only
+    /// instances of requested paths, and includes origin metadata only when
+    /// requested. Omitted keys select all instances; this is not a descendant
+    /// match. The exact-lookup semantics of [`Self::value_for`] are unchanged.
     pub fn validate_for_request(
         &self,
         request: &OperationalRequest,
     ) -> Result<(), OperationalResponseError> {
-        let requested = request.paths.iter().collect::<HashSet<_>>();
+        if self.values.len() > request.max_values {
+            return Err(OperationalResponseError::LimitExceeded);
+        }
+        if self.values.iter().any(|value| {
+            value.path().as_str().len() > request.max_value_bytes
+                || value.value_json().len() > request.max_value_bytes
+        }) {
+            return Err(OperationalResponseError::LimitExceeded);
+        }
         let mut seen = HashSet::new();
 
         for value in &self.values {
-            if !requested.contains(value.path()) {
+            if !request
+                .paths
+                .iter()
+                .any(|selected| canonical_path_matches(selected.as_str(), value.path().as_str()))
+            {
                 return Err(OperationalResponseError::UnexpectedPath);
             }
             if !seen.insert(value.path()) {
@@ -534,6 +448,9 @@ impl OperationalResponse {
 /// A malformed operational-state response supplied by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum OperationalResponseError {
+    /// The response exceeds the caller's expansion or per-value byte limit.
+    #[error("operational response limit exceeded")]
+    LimitExceeded,
     /// A value was reported for a path that was not requested.
     #[error("operational response included an unrequested path")]
     UnexpectedPath,
@@ -611,6 +528,11 @@ pub trait OperationalStateProvider: Send + Sync {
     /// Implementations MUST omit any requested path they cannot supply rather
     /// than fabricating a value, and MUST attach [`Origin`] only when
     /// `request.include_origin` is set and the origin is genuinely known.
+    /// An omitted list key requests every matching instance. Report each
+    /// concrete instance once, even when request selectors overlap, and stop
+    /// after `request.max_values + 1` values so adapters can reject overflow.
+    /// Adapters still refuse a response that ignores the budget; allocation
+    /// before returning remains the provider's responsibility.
     fn get(&self, request: &OperationalRequest) -> Result<OperationalResponse, OperationalError>;
 }
 
@@ -633,41 +555,39 @@ pub trait OperationalEventSource: Send + Sync {
     ) -> Result<OperationalEventReceiver, OperationalError>;
 }
 
-impl std::fmt::Debug for OperationalRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationalRequest").finish_non_exhaustive()
+impl fmt::Debug for OperationalRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperationalRequest { .. }")
     }
 }
 
-impl std::fmt::Debug for OperationalValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationalValue").finish_non_exhaustive()
+impl fmt::Debug for OperationalValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperationalValue { .. }")
     }
 }
 
-impl std::fmt::Debug for OperationalResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationalResponse")
-            .finish_non_exhaustive()
+impl fmt::Debug for OperationalResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperationalResponse { .. }")
     }
 }
 
-impl std::fmt::Debug for OperationalSubscriptionRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationalSubscriptionRequest")
-            .finish_non_exhaustive()
+impl fmt::Debug for OperationalSubscriptionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperationalSubscriptionRequest { .. }")
     }
 }
 
-impl std::fmt::Debug for OperationalEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationalEvent").finish_non_exhaustive()
+impl fmt::Debug for OperationalEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperationalEvent { .. }")
     }
 }
 
-impl std::fmt::Debug for OperationalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationalError").finish_non_exhaustive()
+impl fmt::Debug for OperationalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperationalError { .. }")
     }
 }
 

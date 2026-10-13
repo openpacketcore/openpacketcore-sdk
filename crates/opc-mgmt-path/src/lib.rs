@@ -33,10 +33,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+mod canonical;
+
+pub use canonical::{
+    append_key_predicate, canonical_path_matches, CanonicalPath, CanonicalPathError,
+    CanonicalSegment,
+};
+
+use std::{collections::BTreeMap, fmt};
 
 use opc_config_model::YangPath;
-use opc_mgmt_schema::{NodeKind, NodeMeta, SchemaRegistry};
+use opc_mgmt_schema::{LeafType, NodeKind, NodeMeta, SchemaRegistry};
 use thiserror::Error;
 
 /// One element of a northbound path: a node name (bare or `prefix:name`) and any
@@ -119,6 +126,9 @@ pub struct ResolvedPath {
 /// never key values.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PathError {
+    /// A supplied key match would reveal a masked reply identity.
+    #[error("masked key match is not supported")]
+    MaskedKeyMatch,
     /// The request path had no segments.
     #[error("empty path")]
     Empty,
@@ -169,6 +179,22 @@ pub fn resolve(
     registry: &dyn SchemaRegistry,
     request: &RequestPath,
 ) -> Result<ResolvedPath, PathError> {
+    resolve_mode(registry, request, ResolutionMode::Write)?
+        .ok_or_else(|| PathError::Malformed("invalid key value".to_string()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolutionMode {
+    Write,
+    Read,
+    Instance,
+}
+
+fn resolve_mode(
+    registry: &dyn SchemaRegistry,
+    request: &RequestPath,
+    mode: ResolutionMode,
+) -> Result<Option<ResolvedPath>, PathError> {
     let origin_modules = match &request.origin {
         Some(origin) => Some(
             registry
@@ -224,6 +250,26 @@ pub fn resolve(
         }
     }
 
+    // Check every supplied identity match before considering any key value.
+    // Invalid typed selectors must not bypass a later masked-key refusal.
+    if mode == ResolutionMode::Read {
+        let mut ancestor = String::new();
+        for (seg_name, input) in target_segs.iter().zip(&segments) {
+            ancestor.push('/');
+            ancestor.push_str(seg_name);
+            let list = registry
+                .node(&ancestor)
+                .ok_or_else(|| PathError::UnknownPath(ancestor.clone()))?;
+            for (name, _) in &input.keys {
+                if let Some(key) = declared_key(registry, list, name) {
+                    if !key_allows_cleartext(registry, key.path) {
+                        return Err(PathError::MaskedKeyMatch);
+                    }
+                }
+            }
+        }
+    }
+
     let mut canonical = String::new();
     let mut ancestor = String::new();
     for (i, seg_name) in target_segs.iter().enumerate() {
@@ -238,7 +284,16 @@ pub fn resolve(
         let input_seg = segments[i];
 
         if matches!(ancestor_node.kind, NodeKind::List) {
-            render_keys(registry, seg_name, ancestor_node, input_seg, &mut canonical)?;
+            if !render_keys(
+                registry,
+                seg_name,
+                ancestor_node,
+                input_seg,
+                &mut canonical,
+                mode,
+            )? {
+                return Ok(None);
+            }
         } else if !input_seg.keys.is_empty() {
             return Err(PathError::NotAList {
                 path: ancestor.clone(),
@@ -249,11 +304,39 @@ pub fn resolve(
     let canonical =
         YangPath::new(canonical).map_err(|err| PathError::Malformed(err.message().to_string()))?;
 
-    Ok(ResolvedPath {
+    Ok(Some(ResolvedPath {
         schema_path: node.path.to_string(),
         canonical,
         node,
-    })
+    }))
+}
+
+/// Resolves a read selector with omitted list keys and typed canonical values.
+/// An invalid typed value selects no instance. Masked key matches are refused
+/// from schema metadata before a caller may consult policy or stored data.
+pub fn resolve_read(
+    registry: &dyn SchemaRegistry,
+    request: &RequestPath,
+) -> Result<Option<ResolvedPath>, PathError> {
+    resolve_mode(registry, request, ResolutionMode::Read)
+}
+
+/// Resolves a reported concrete instance with complete declared keys and
+/// requires canonical encoding. This is never partial-key read selection.
+pub fn resolve_instance(
+    registry: &dyn SchemaRegistry,
+    path: &YangPath,
+) -> Result<ResolvedPath, PathError> {
+    let parsed = CanonicalPath::parse(path.as_str())
+        .map_err(|_| PathError::Malformed("invalid canonical path".to_string()))?;
+    let resolved = resolve_mode(registry, &parsed.to_request(), ResolutionMode::Instance)?
+        .ok_or_else(|| PathError::Malformed("invalid canonical key".to_string()))?;
+    if resolved.canonical != *path {
+        return Err(PathError::Malformed(
+            "non-canonical instance path".to_string(),
+        ));
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,14 +417,17 @@ fn render_keys(
     list: &NodeMeta,
     input: &PathSegment,
     out: &mut String,
-) -> Result<(), PathError> {
+    mode: ResolutionMode,
+) -> Result<bool, PathError> {
     // Map supplied keys by bare name; reject duplicates and wrong prefixes.
     let mut provided: BTreeMap<&str, &str> = BTreeMap::new();
     for (k, v) in &input.keys {
         let (prefix, bare) = parse_qualified_name(k).ok_or_else(|| {
             PathError::Malformed(format!("invalid key name for list '{}'", list.path))
         })?;
-        validate_key_value(list.path, v)?;
+        if mode == ResolutionMode::Write {
+            validate_key_value(list.path, v)?;
+        }
         if !key_prefix_matches(registry, list, prefix, bare) {
             return Err(PathError::UnexpectedKeys {
                 list: list.path.to_string(),
@@ -362,7 +448,7 @@ fn render_keys(
         .filter(|kl| !provided.contains_key(bare_segment(kl)))
         .map(|kl| (*kl).to_string())
         .collect();
-    if !missing.is_empty() {
+    if mode != ResolutionMode::Read && !missing.is_empty() {
         return Err(PathError::MissingKeys {
             list: list.path.to_string(),
             missing,
@@ -389,14 +475,87 @@ fn render_keys(
     let key_prefix = prefix_of(seg_name);
     for kl in list.key_leaves {
         let bare = bare_segment(kl);
-        let value = provided.get(bare).expect("validated present above");
-        match prefix_of(kl).or(key_prefix) {
-            Some(prefix) => out.push_str(&format!("[{prefix}:{bare}='{value}']")),
-            None => out.push_str(&format!("[{bare}='{value}']")),
-        }
+        let Some(value) = provided.get(bare) else {
+            continue;
+        };
+        let key_name = match prefix_of(kl).or(key_prefix) {
+            Some(prefix) => format!("{prefix}:{bare}"),
+            None => bare.to_string(),
+        };
+        let typed = if mode == ResolutionMode::Write {
+            (*value).to_string()
+        } else {
+            let key = declared_key(registry, list, kl)
+                .ok_or_else(|| PathError::Malformed("unknown declared key".to_string()))?;
+            let Some(value) = canonical_key_value(registry, key.path, value) else {
+                return Ok(false);
+            };
+            value
+        };
+        append_key_predicate(out, &key_name, &typed)
+            .map_err(|_| PathError::Malformed("invalid canonical key literal".to_string()))?;
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// Returns a declared key's schema node, never a node inferred from its value.
+pub fn declared_key(
+    registry: &dyn SchemaRegistry,
+    list: &NodeMeta,
+    supplied: &str,
+) -> Option<&'static NodeMeta> {
+    let (prefix, bare) = parse_qualified_name(supplied)?;
+    if list.kind != NodeKind::List || !key_prefix_matches(registry, list, prefix, bare) {
+        return None;
+    }
+    let declared = list
+        .key_leaves
+        .iter()
+        .find(|name| bare_segment(name) == bare)?;
+    let key_prefix =
+        prefix_of(declared).or_else(|| list.path.rsplit('/').next().and_then(prefix_of));
+    let name = key_prefix.map_or_else(|| bare.to_string(), |prefix| format!("{prefix}:{bare}"));
+    registry
+        .node(&format!("{}/{name}", list.path))
+        .filter(|node| node.kind == NodeKind::Leaf)
+}
+
+/// Whether an identifying key may be exposed in a protocol path or matched
+/// against a request value. Missing classification fails closed.
+pub fn key_allows_cleartext(registry: &dyn SchemaRegistry, path: &str) -> bool {
+    let name = bare_segment(path.rsplit('/').next().unwrap_or_default()).to_ascii_lowercase();
+    !["secret", "password", "token", "credential", "private-key"]
+        .iter()
+        .any(|part| name.contains(part))
+        && registry
+            .data_class(path)
+            .is_some_and(|class| class.allows_cleartext())
+}
+
+/// Canonicalizes integer and boolean key values, following leafrefs to their
+/// target type. Other key types compare literally. Cyclic or missing leafref
+/// targets and invalid typed values fail closed, with no diagnostic payload.
+pub fn canonical_key_value(
+    registry: &dyn SchemaRegistry,
+    path: &str,
+    value: &str,
+) -> Option<String> {
+    let mut current = path;
+    // A leafref chain cannot validly visit more schema nodes than exist.
+    for _ in 0..=registry.nodes().len() {
+        match registry.leaf_type(current)? {
+            LeafType::Uint16 => return value.parse::<u16>().ok().map(|value| value.to_string()),
+            LeafType::Uint32 => return value.parse::<u32>().ok().map(|value| value.to_string()),
+            LeafType::Int64 => return value.parse::<i64>().ok().map(|value| value.to_string()),
+            LeafType::Boolean => {
+                return matches!(value, "true" | "false").then(|| value.to_string())
+            }
+            LeafType::LeafRef { target_path } => current = target_path,
+            _ => return Some(value.to_string()),
+        }
+    }
+    None
 }
 
 fn validate_key_value(list_path: &str, value: &str) -> Result<(), PathError> {
@@ -501,23 +660,26 @@ fn prefix_of(seg: &str) -> Option<&str> {
     seg.split_once(':').map(|(prefix, _)| prefix)
 }
 
-impl std::fmt::Debug for PathSegment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PathSegment").finish_non_exhaustive()
+impl fmt::Debug for PathSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PathSegment { .. }")
     }
 }
 
-impl std::fmt::Debug for RequestPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RequestPath").finish_non_exhaustive()
+impl fmt::Debug for RequestPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RequestPath { .. }")
     }
 }
 
-impl std::fmt::Debug for ResolvedPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedPath").finish_non_exhaustive()
+impl fmt::Debug for ResolvedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResolvedPath { .. }")
     }
 }
+
+#[cfg(test)]
+mod read_tests;
 
 #[cfg(test)]
 mod tests {
