@@ -632,6 +632,7 @@ impl State {
     fn fence(&mut self) {
         self.status = Status::Failed;
         self.applied_prefix = None;
+        self.application_guard = None;
         self.queue.clear();
         self.terminal_failure.send_if_modified(|failed| {
             if *failed {
