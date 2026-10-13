@@ -1,4 +1,4 @@
-use generated_config_false_test::{keys, minimal, mixed, nested};
+use generated_config_false_test::{keyless, keys, minimal, mixed, nested};
 use opc_config_model::{OpcConfig, YangPath};
 use opc_gnmi_server::{GnmiJsonRenderer, ReadSelection, ReadSelectionEntry};
 use opc_mgmt_limits::MgmtLimits;
@@ -383,4 +383,59 @@ fn configuration_sibling_keeps_its_writable_leaf_type() {
         mixed::types::LeafPresence::Explicit("new".to_owned())
     );
     assert_eq!(root.state, previous_state);
+}
+
+#[test]
+fn nested_keyless_state_content_round_trips_without_configuration_deltas() {
+    let state: keyless::types::State = serde_json::from_value(json!({
+        "keyed": [{
+            "name": "first",
+            "observation": [{"detail": {"count": 7}, "label": ["a", "b"]}]
+        }]
+    })).unwrap();
+    let row = state.keyed.get("first").unwrap();
+    assert_eq!(row.observation.len(), 1);
+    assert_eq!(row.observation[0].detail.as_ref().unwrap().count, Some(7));
+    assert_eq!(row.observation[0].label, ["a", "b"]);
+    let encoded = serde_json::to_value(&state).unwrap();
+    let restored: keyless::types::State = serde_json::from_value(encoded).unwrap();
+    assert_eq!(restored, state);
+    let absent = keyless::types::State::default();
+    assert!(state.changed_paths(&absent).is_empty());
+    assert!(keyless::patch::diff_root(&state, &absent).unwrap().is_empty());
+}
+
+#[test]
+fn nested_keyless_state_edit_keeps_its_rejection_stub() {
+    use opc_mgmt_schema::{EditConfigNode, EditOperation, NetconfXmlEditApplicator, NodeKind};
+
+    let state: keyless::types::State = serde_json::from_value(json!({
+        "keyed": [{"name": "first", "observation": [{"label": ["retained"]}]}]
+    })).unwrap();
+    let original = state.clone();
+    let edit = EditConfigNode {
+        schema_path: "/nk:state",
+        operation: EditOperation::Merge,
+        value: None,
+        list_keys: Default::default(),
+        children: vec![EditConfigNode {
+            schema_path: "/nk:state/nk:keyed",
+            operation: EditOperation::Merge,
+            value: None,
+            list_keys: [("name".into(), "first".into())].into(),
+            children: vec![EditConfigNode {
+                schema_path: "/nk:state/nk:keyed/nk:observation",
+                operation: EditOperation::Merge,
+                value: None,
+                list_keys: Default::default(),
+                children: Vec::new(),
+            }],
+        }],
+    };
+    let error = keyless::netconf_xml_edit::applicator().apply_edit_config(&state, &edit).unwrap_err();
+    assert_eq!(error, NetconfEditError::UnsupportedShape {
+        path: "/nk:state/nk:keyed/nk:observation",
+        kind: NodeKind::List,
+    });
+    assert_eq!(state, original);
 }

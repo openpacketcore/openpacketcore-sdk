@@ -90,6 +90,14 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
         ("mixed", MIXED_STATE),
         ("nested", NESTED_STATE),
         ("keys", include_str!("fixtures/config_false_lists.yang")),
+        (
+            "keyless",
+            include_str!("fixtures/nested_keyless_state.yang"),
+        ),
+        (
+            "deep_keyless",
+            include_str!("fixtures/deep_keyless_state.yang"),
+        ),
     ] {
         // Use an already supported counter type so this regression isolates
         // state-list emission from support for additional integer widths.
