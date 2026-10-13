@@ -357,7 +357,7 @@ async fn ordered_fixture(
     seed: u64,
     reverse_wire: bool,
     reverse_completion: bool,
-    shared: bool,
+    octets: [usize; 3],
     srv_mode: bool,
 ) -> (DnsAnswer, Vec<String>) {
     let completed = Arc::new(Mutex::new(Vec::new()));
@@ -420,12 +420,8 @@ async fn ordered_fixture(
                     }))
                     .await;
                     trace.lock().unwrap().push(owner.clone());
-                    // Collapsing every host onto X exposes all original path positions.
-                    vec![address(
-                        &owner,
-                        &format!("192.0.2.{}", if shared { 1 } else { i + 1 }),
-                        900,
-                    )]
+                    // Shared octets collapse hosts onto one endpoint and expose original path positions.
+                    vec![address(&owner, &format!("192.0.2.{}", octets[i]), 900)]
                 }
                 _ => panic!("unexpected question {owner} {kind}"),
             };
@@ -456,12 +452,13 @@ async fn path_filter_preserves_seeded_naptr_and_srv_draws_across_wire_and_comple
         for srv_mode in [false, true] {
             for seed in [0, 1, 7, 31] {
                 let (control, forward) =
-                    ordered_fixture(ordering, seed, false, false, false, srv_mode).await;
+                    ordered_fixture(ordering, seed, false, false, [1, 2, 3], srv_mode).await;
                 let host_order: Vec<_> = selections(&control).into_iter().map(|(h, _)| h).collect();
                 assert_eq!(forward, vec![U, B, A]);
                 for reverse_wire in [false, true] {
                     let (shared, reverse) =
-                        ordered_fixture(ordering, seed, reverse_wire, true, true, srv_mode).await;
+                        ordered_fixture(ordering, seed, reverse_wire, true, [1, 1, 1], srv_mode)
+                            .await;
                     assert_eq!(reverse, vec![A, B, U]);
                     let mut visited = Vec::new();
                     let retained = shared
@@ -494,6 +491,26 @@ async fn path_filter_preserves_seeded_naptr_and_srv_draws_across_wire_and_comple
                         }
                     }
                     check_references(&retained);
+                    // The first and last drawn hosts share X. Excluding the first must
+                    // move the middle host's Y ahead of X; only retained draw positions show it.
+                    let octets = [U, B, A].map(|h| if h == host_order[1] { 2 } else { 1 });
+                    let (pair, _) =
+                        ordered_fixture(ordering, seed, reverse_wire, true, octets, srv_mode).await;
+                    let port = if srv_mode { 4040 } else { 2123 };
+                    let (x, y) = (format!("192.0.2.1:{port}"), format!("192.0.2.2:{port}"));
+                    assert_eq!(selections(&pair)[0].1, x);
+                    let moved = pair
+                        .filter_snaptr_paths(|p| p.terminal_host().as_str() != host_order[0])
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        selections(&moved),
+                        expected(&[
+                            (host_order[1].as_str(), y.as_str()),
+                            (host_order[2].as_str(), x.as_str()),
+                        ])
+                    );
+                    check_references(&moved);
                 }
             }
         }
