@@ -36,6 +36,8 @@ Following RFC 6243 section 4.5.1, matching sees only values that the same read
 would report after default processing. An unset default can match under
 report-all or report-all-tagged. A value omitted by trim or explicit cannot
 match. Defaults never create list instances, keys or operational values.
+Generated configuration defaults use `LeafPresence::Defaulted`; an explicitly
+absent field stays absent in both ordinary and content-filtered reads.
 
 ## Scalar comparison
 

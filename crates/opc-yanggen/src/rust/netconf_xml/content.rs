@@ -180,10 +180,7 @@ fn leaf_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
         let leaf = match #value {
             super::types::LeafPresence::Explicit(item) => ctx.scalar(#path, #scalar, false)?,
             super::types::LeafPresence::Defaulted(item) => ctx.scalar(#path, #scalar, true)?,
-            super::types::LeafPresence::Absent => match ctx.default(#path)? {
-                Some(default) => ctx.scalar(#path, opc_mgmt_schema::subtree::SubtreeScalar::Text(default), true)?,
-                None => None,
-            },
+            super::types::LeafPresence::Absent => None,
         };
         Ok(leaf.into_iter().collect())
     }
