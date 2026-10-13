@@ -1491,3 +1491,24 @@ async fn subtree_content_masked_state_payload_has_fixed_work() {
         }
     }
 }
+
+#[tokio::test]
+async fn subtree_content_absent_defaults_match_ordinary_presence() {
+    let mut model = config();
+    model.secret_default = SecretLeaf::new(LeafPresence::Absent);
+    model.port = LeafPresence::Absent;
+    let fixture = Fixture::new(model, &[]).await;
+    for op in ["get-config", "get", "get-data"] {
+      for mode in ["", "explicit", "trim", "report-all", "report-all-tagged"] {
+        let body = |children| if op == "get-data" { nmda("running", None, children, mode) } else { request(op, children, mode) };
+        let ordinary = fixture.rpc(&body("<port/><secret-default/>"), MgmtLimits::default()).await;
+        let content = fixture.rpc(&body("<hostname>router-marker</hostname><port/><secret-default/>"), MgmtLimits::default()).await;
+        for leaf in ["port", "secret-default"] {
+            let tag = format!("<ex:{leaf}");
+            assert!(!data(&ordinary).contains(&tag));
+            assert_eq!(data(&content).contains(&tag), data(&ordinary).contains(&tag), "{op} {mode}: {ordinary} / {content}");
+        }
+        assert_eq!(data(&fixture.rpc(&body("<port>7</port><hostname/>"), MgmtLimits::default()).await), "");
+      }
+    }
+}
