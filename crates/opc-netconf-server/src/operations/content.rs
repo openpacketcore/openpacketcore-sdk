@@ -26,6 +26,7 @@ use crate::xml::{
 use super::get::GetContext;
 use super::{record_audit, AuditMode};
 
+mod fragment;
 mod state;
 
 #[derive(Clone, Copy)]
@@ -429,13 +430,13 @@ where
             binding.project_netconf_monitoring_content(selection)
         }
         .map_err(rpc_error)?;
+        fragment::reserve_append(discovery_registry, &input, plan.budget()).map_err(rpc_error)?;
         let selected = plan
             .evaluate(discovery_registry, &input)
             .map_err(rpc_error)?;
         let fragment = NetconfXmlRenderContext::new(discovery_registry, plan.paths(), report)
             .render_nodes(&selected)
             .map_err(|_| RpcError::operation_failed())?;
-        plan.budget().charge(fragment.len()).map_err(rpc_error)?;
         xml.push_str(&fragment);
     }
     Ok(ReadResult::Data(xml))

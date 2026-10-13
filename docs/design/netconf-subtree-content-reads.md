@@ -98,6 +98,11 @@ only schema paths, node/key counts and captured lengths. It pools all possible
 instances of each schema parent, including children that separate capture
 fragments could contribute to the same row. Sibling comparison products use
 these original groups; no intermediate joined or selected tree sizes a charge.
+Discovery fragment appending follows the same rule: before evaluation, a checked
+bound counts every original node and stored key, captured scalar lengths, XML
+escaping, qualified names, namespace declarations and default attributes. Its
+metadata work and complete byte-copy allowance are admitted together; neither
+selected nodes nor rendered fragment lengths determine a later charge.
 
 Sizing normalizes its metadata order without changing data order. Its bounded
 local allowance prevents partial sizing progress from becoming a shared-budget
@@ -181,6 +186,13 @@ enumerated and add no work charges. Every projector `enter` check, including one
 rejects a node, consumes work before checking selection. Authorization builds
 one bounded, sorted set of structural prefixes; subsequent exact and structural
 lookups charge every binary-search probe instead of scanning all plan paths.
+
+Every phase after capture derives its charges from the original uncoalesced
+node, key and child counts and retained lengths from each source, together with
+fixed schema and request metadata. Each bound uses checked arithmetic and is
+reserved and admitted before the corresponding work. Never measure a joined,
+merged, selected or rendered result to decide a charge. Coalescing may leave
+reserved work unused; it cannot reduce the charge or change authorized output.
 
 Identity merging and final ordering use complete-phase reservations. Sizing
 visits are charged before reading capture metadata; the reservation depends on
