@@ -82,8 +82,8 @@ container, leaf-list and list helpers, while retaining the reachable list's
 unsupported-shape rejection. Read-only admission takes precedence for state lists.
 Generated modules for these schemas are checked with Clippy warnings denied.
 Their block boundaries preserve literal contents and punctuation. Pinned output
-changes are confined to patch and NETCONF edit generation; unrelated generated
-artifacts retain their bytes.
+changes are confined to patch, NETCONF edit and leafref validation generation;
+unrelated generated artifacts retain their bytes.
 
 Key leaves with a non-public `opc:data-class` remain available to serde,
 ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`
