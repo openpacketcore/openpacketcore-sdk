@@ -16,6 +16,11 @@ module state-keys {
       leaf token { type string; }
       leaf count { type uint32; }
     }
+    list grant {
+      key "token-id";
+      leaf token-id { type uint32; }
+      leaf count { type uint32; }
+    }
     list session {
       key "token region";
       leaf token { type string; }

@@ -77,6 +77,21 @@ fn state_sensitive_single_and_composite_keys_extract_and_redact() {
 }
 
 #[test]
+fn state_sensitive_numeric_key_retains_copy_and_redaction() {
+    let state: keys::types::State = serde_json::from_value(json!({
+        "grant": [{"token-id": 918273, "count": 7}]
+    })).unwrap();
+    let row = state.grant.get(&918273).unwrap();
+    let key: keys::types::SensitiveKey<u32> = keys::serde::ExtractKey::extract_key(row).unwrap();
+    let copied = key;
+    assert_eq!(*key.get(), 918273);
+    assert_eq!(copied, key);
+    assert_eq!(*row.token_id.get(), Some(918273));
+    assert_eq!(format!("{key:?}"), "<REDACTED>");
+    assert!(!format!("{state:?}").contains("918273"));
+}
+
+#[test]
 fn state_list_missing_and_duplicate_keys_are_rejected() {
     let missing = serde_json::from_value::<minimal::types::State>(json!({
         "error": [{"count": 7}]
