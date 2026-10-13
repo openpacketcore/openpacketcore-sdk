@@ -41,6 +41,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with bit 8 set is one octet, and half-octet duplicates use the high nibble.
   Correct the Security Mode clause references to 8.2.25 and 8.2.26. (#1238)
 
+- `opc-session-store` and `opc-session-net`: add bounded current child reads for
+  1–32 ordered keys under one complete read barrier and backend snapshot. Carry
+  exact child metadata and sealed bytes over scope transport revision 2, reuse
+  granted batch-builder admission, and release captured reads on peer close or
+  the fixed server limit. Revision mismatch is a distinct, observable call
+  failure with no permanent latch or immediate retry. Revision 2 requires a
+  fresh installation; see the RFC 026 child-read addendum.
+
+- `opc-local-kernel-lifecycle`, GTP-U and XFRM: add the opt-in `native-scope`
+  authority adapter for stateless workers. Authenticate supervised completion
+  provenance and read back the original activation before coordinator ack;
+  preserve its trusted class, local reset fence and shared consumption state.
+  Local and native adapters use one current-child cut for readback and recheck
+  and retain the same concrete backend effect type. Readback also checks the
+  exact batch revision. Qualification runs the existing kernel lifecycle
+  scenarios through both adapters.
+
 - `opc-session-store` and `opc-session-net`: add coherent, paged restore of a
   positively handed-over scope across native and SQLite storage and authenticated
   worker TLS. Same-cut children, index children and claims carry final per-item
@@ -640,6 +657,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the YAML Organization's `yaml_serde` and `libyaml-rs`, resolving
   RUSTSEC-2024-0449. Preserve the scenario fixture's complete parsed values and
   serialization roundtrip in a compatibility regression.
+
+- `opc-session-store`: bound repeated scope-payload decoding in the retained
+  SQL WAL owner by reusing the exact bytes of two recent decoded entries.
+  Previous children no longer add payload decodes to sequential large-child
+  writes. Row, authority, projection and final stored-byte audits remain intact,
+  with the original operation deadline.
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at

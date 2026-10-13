@@ -4,11 +4,15 @@
 //! The store owns request canonicalization, durable authority and capabilities.
 
 mod boot;
+pub(crate) mod child_read_wire;
 mod clock;
 mod notice;
 mod policy;
 mod pool;
 mod proof;
+mod revision;
+#[cfg(test)]
+mod revision_tests;
 mod socket;
 mod wire;
 
@@ -19,10 +23,18 @@ pub use clock::{
 };
 pub use policy::{PolicyError, PrincipalGrant, ScopePolicy, ScopeRole};
 pub use pool::{ProofBudgets, ProofPoolError};
+pub use revision::{
+    scope_transport_revision_diagnostics, ScopeTransportDirection, ScopeTransportPurpose,
+    ScopeTransportRevisionDiagnostic, ScopeTransportRole,
+    SCOPE_TRANSPORT_REVISION_MISMATCH_COUNTER,
+};
 pub use wire::{Class, ScopeBinding, WireError};
 
 #[cfg(test)]
 mod wire_tests;
+
+#[cfg(test)]
+mod child_read_tests;
 
 #[cfg(test)]
 mod proof_tests;
@@ -85,7 +97,7 @@ pub use issuer_notice::{IssuedTicketNotice, TicketNoticeEntry, TicketNoticeSourc
 mod rpc;
 pub use rpc::{
     PendingScopeAuthority, ScopeAuthorityReply, ScopeClient, ScopeClientConfig, ScopeRpcError,
-    ScopeServer, ScopeServerConfig, ScopeServerHandle,
+    ScopeServer, ScopeServerConfig, ScopeServerHandle, VerifiedScopeBatchCompletion,
 };
 
 mod rpc_client;

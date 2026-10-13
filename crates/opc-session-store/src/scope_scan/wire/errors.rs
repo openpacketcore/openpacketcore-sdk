@@ -37,6 +37,7 @@ pub(super) fn write(
                 ScopeScanError::FreshInstallationRequired => 12,
                 ScopeScanError::DurableConsensusRequired => 13,
                 ScopeScanError::CapacityRefused => 14,
+                ScopeScanError::TransportRevisionMismatch => return Err(ScopeScanWireError),
             },
         ),
     };

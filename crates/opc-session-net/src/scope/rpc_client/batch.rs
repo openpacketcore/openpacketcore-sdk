@@ -1,6 +1,8 @@
 //! Authenticated access for the shared lane coordinator.
 use super::*;
 use opc_session_store::{scope_batch::*, scope_scheduler::ScopeWorkClass};
+mod provenance;
+pub use provenance::VerifiedScopeBatchCompletion;
 
 impl ScopeClient {
     /// Open this boot's shared batch coordinator under one read reservation.
@@ -26,6 +28,7 @@ impl ScopeClient {
             client: self.clone(),
             stamp: authority.stamp().clone(),
             attempt,
+            observed: std::sync::Mutex::new(std::array::from_fn(|_| None)),
         });
         ScopeBatchCoordinator::open_port(port, authority, self.0.config.scheduler.clone(), class)
             .await
@@ -102,10 +105,34 @@ struct BatchPort {
     client: ScopeClient,
     stamp: ScopeAuthorityStamp,
     attempt: Duration,
+    observed: std::sync::Mutex<[Option<provenance::AppliedFact>; SCOPE_BATCH_LANES]>,
 }
 
 #[async_trait::async_trait]
 impl ScopeBatchPort for BatchPort {
+    fn completion_context(
+        &self,
+        request: &ScopeBatchRequest,
+        class: ScopeWorkClass,
+        outcome: &ScopeBatchCompletionOutcome,
+        retention: ScopeBatchCompletionRetention,
+    ) -> Option<ScopeBatchCompletionContext> {
+        self.seal_completion(request, class, outcome, retention)
+    }
+    async fn read_current(
+        &self,
+        request: &ScopeChildReadRequest,
+        class: ScopeWorkClass,
+        deadline: Instant,
+    ) -> Result<Vec<Option<ScopeChildRecord>>, ScopeChildReadError> {
+        if request.stamp() != &self.stamp {
+            return Err(ScopeBatchError::Scope(ScopeAuthorityError::Unauthorized).into());
+        }
+        self.client
+            .read_children_admitted(request, class, deadline)
+            .await
+    }
+
     async fn reopen(&self, class: ScopeWorkClass) -> Result<ScopeBatchReopen, ScopeBatchError> {
         let payload = self
             .client
@@ -125,6 +152,7 @@ impl ScopeBatchPort for BatchPort {
         {
             return Err(ScopeBatchError::OutcomeUnknown);
         }
+        self.observe_cut(&cut);
         Ok(cut)
     }
 
@@ -172,6 +200,7 @@ impl ScopeBatchPort for BatchPort {
         if !outcome.matches_request(request) {
             return Err(ScopeBatchError::OutcomeUnknown);
         }
+        self.observe_applied(request.attempt()?, &outcome);
         Ok(outcome)
     }
 
@@ -219,6 +248,7 @@ impl ScopeBatchPort for BatchPort {
         if receipt.attempt() != target {
             return Err(ScopeBatchError::OutcomeUnknown);
         }
+        self.observe_receipt(&receipt);
         Ok(receipt)
     }
 }
@@ -244,6 +274,7 @@ pub(in crate::scope) fn batch_error(error: ScopeRpcError) -> ScopeBatchError {
         }
         ScopeRpcError::Retired => ScopeAuthorityError::Retired.into(),
         ScopeRpcError::ProfileUnavailable => ScopeAuthorityError::ProfileNotActivated.into(),
+        ScopeRpcError::TransportRevisionMismatch => ScopeBatchError::TransportRevisionMismatch,
         _ => ScopeBatchError::OutcomeUnknown,
     }
 }

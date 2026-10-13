@@ -2,10 +2,11 @@ use super::{proof::*, wire::*};
 use serde_json::Value;
 
 fn vectors() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap()
+    .unwrap()["authority_startup"]
+        .clone()
 }
 fn bytes(value: &Value) -> Vec<u8> {
     let (pairs, remainder) = value.as_str().unwrap().as_bytes().as_chunks::<2>();

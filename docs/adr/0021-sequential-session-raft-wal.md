@@ -70,6 +70,18 @@ command validation and membership/receipt projection. Checksums do not replace
 those validators. No SQL validation or operator-recovery authority is removed
 from the production adapter by the private slice.
 
+The retained SQL WAL owner reuses successful scope-payload decoding across its
+synchronous append, committed-prefix, application and Raft read paths. It keeps
+at most two recent entries within an 8 MiB per-owner allocation bound, including
+their raw bytes and typed payload capacities. Reuse compares every raw byte and
+returns an independent decoded value; it does not cache row, authority or
+projection decisions. Every database read and those checks still run, including
+the final stored-byte audit before application publication. Changed, malformed,
+ineligible or oversized inputs take the original decoder. Recovery starts cold,
+and truncation or purge clears retained payloads. Sequential near-limit child
+writes therefore decode the new payload once per voter without decoding earlier
+children again, under the unchanged operation deadline.
+
 Segment creation and rollover require file and parent-directory durability.
 A durable publication record binds the accepted log cut; acknowledgement must
 follow both data durability and publication. Before any data write, the private

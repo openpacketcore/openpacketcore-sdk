@@ -545,6 +545,7 @@ struct DurableCut {
 }
 
 struct State {
+    scope_payloads: Arc<super::scope_payload_cache::Cache>,
     // Immutable cold legacy-import template on the native route. Native
     // admission, business application and reads branch before touching it.
     conn: Connection,
@@ -631,7 +632,9 @@ pub(crate) struct Wal {
 impl State {
     fn fence(&mut self) {
         self.status = Status::Failed;
+        self.scope_payloads.clear();
         self.applied_prefix = None;
+        self.application_guard = None;
         self.queue.clear();
         self.terminal_failure.send_if_modified(|failed| {
             if *failed {
@@ -679,6 +682,7 @@ impl State {
             None => read_committed_sync(&conn, binding.identity)?,
         };
         Ok(Self {
+            scope_payloads: Arc::default(),
             conn,
             authority,
             consensus_closed: false,
@@ -1320,6 +1324,7 @@ impl Wal {
         state
             .authority
             .validate(&state.conn, self.binding.identity)?;
+        let _payloads = state.scope_payloads.enter();
         read_log_range_sync(
             &state.conn,
             self.binding.identity,

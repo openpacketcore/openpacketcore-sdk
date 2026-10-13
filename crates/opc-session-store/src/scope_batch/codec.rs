@@ -93,9 +93,13 @@ canonical_codec!(ScopeBatchReceipt, COMMAND_HEADROOM);
 canonical_codec!(ScopeBatchLookup, COMMAND_HEADROOM);
 canonical_codec!(ScopeBatchReopen, MAX_SCOPE_BATCH_REOPEN_BYTES);
 canonical_codec!(ScopeBatchError, MAX_SCOPE_BATCH_ERROR_BYTES);
+canonical_codec!(ScopeChildRecord, MAX_SCOPE_CHILD_RECORD_BYTES);
 
 impl ScopeBatchError {
     fn validate(&self) -> Result<(), Self> {
+        if matches!(self, Self::TransportRevisionMismatch) {
+            return Err(Self::InvalidRequest);
+        }
         let Self::Conflict(conflicts) = self else {
             return Ok(());
         };

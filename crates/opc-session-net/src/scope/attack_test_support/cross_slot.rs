@@ -1,4 +1,8 @@
 //! Raw test peers deliberately bypass the SDK's own-key and local-gate checks.
+#[path = "cross_slot_child_read.rs"]
+mod child_reads;
+pub(crate) use child_reads::{child_read_with_boot_on, reject_before_proof};
+
 use super::super::{
     proof::{PossessionClaims, PossessionProof},
     wire::*,
@@ -24,6 +28,7 @@ pub(crate) enum RawCall<'a> {
     Outcome(&'a ScopeAuthorityRequest),
     BatchReopen(&'a ScopeAuthorityStamp),
     BatchLookup(&'a ScopeBatchAttempt),
+    ChildRead(&'a ScopeChildReadRequest),
 }
 impl RawCall<'_> {
     fn method(self) -> Method {
@@ -39,6 +44,7 @@ impl RawCall<'_> {
             Self::Outcome(_) => Method::Outcome,
             Self::BatchReopen(_) => Method::BatchReopen,
             Self::BatchLookup(_) => Method::BatchLookup,
+            Self::ChildRead(_) => Method::ChildRead,
         }
     }
     pub(crate) fn label(self) -> String {
@@ -47,7 +53,7 @@ impl RawCall<'_> {
     pub(crate) fn carries_execution(self) -> bool {
         matches!(
             self,
-            Self::Authority(_) | Self::ApplyBatch(_) | Self::BatchCancel(_)
+            Self::Authority(_) | Self::ApplyBatch(_) | Self::BatchCancel(_) | Self::ChildRead(_)
         )
     }
     fn canonical(self, scope: &ScopeId) -> Vec<u8> {
@@ -58,6 +64,7 @@ impl RawCall<'_> {
                 attempt.encode_canonical().unwrap()
             }
             Self::BatchReopen(stamp) => stamp.encode_canonical().unwrap(),
+            Self::ChildRead(request) => request.encode_canonical().unwrap(),
             Self::Current => scope.encode_canonical().unwrap(),
             Self::Outcome(request) => {
                 let mut bytes = scope.encode_canonical().unwrap();
@@ -118,7 +125,8 @@ impl RawPeer {
                 Method::ApplyBatch
                 | Method::BatchCancel
                 | Method::BatchReopen
-                | Method::BatchLookup => Class::Normal,
+                | Method::BatchLookup
+                | Method::ChildRead => Class::Normal,
                 _ => Class::SafetyControl,
             };
             let binding = ScopeBinding::from_scope(scope).unwrap();
@@ -200,12 +208,15 @@ impl RawPeer {
             assert_eq!(payload.nonce, nonce);
             if matches!(
                 payload.status,
-                ResultStatus::Committed | ResultStatus::CurrentView
+                ResultStatus::Committed
+                    | ResultStatus::CurrentView
+                    | ResultStatus::ChildObservation
             ) {
                 let expected = match call {
                     RawCall::Current | RawCall::BatchReopen(_) | RawCall::BatchLookup(_) => {
                         ResultStatus::CurrentView
                     }
+                    RawCall::ChildRead(_) => ResultStatus::ChildObservation,
                     _ => ResultStatus::Committed,
                 };
                 assert_eq!(payload.status, expected);
