@@ -140,45 +140,50 @@ where
         }
         None => None,
     };
-    let selected_paths = match get_paths_with_discovery(
-        registry,
-        request.filter.as_ref(),
-        yang_library_capability.is_some(),
-        monitoring_capability.is_some(),
-        ctx.limits,
-    ) {
-        Ok(paths) => paths,
-        Err(err) => {
-            let rpc_error = err.rpc_error();
-            let error_tag = rpc_error.classification.tag;
-            if audit_failure(
-                audit_mode,
-                ctx.audit,
-                ctx.request_id,
-                ctx.principal,
-                ctx.transport,
-                err.audit_reason(),
-                Vec::new(),
-            )
-            .await
-            .is_err()
-            {
-                record_rpc_error(
-                    NetconfOperation::Get,
-                    NetconfErrorTag::OperationFailed,
-                    ctx.started.elapsed(),
+    let (selected_paths, predicates) =
+        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
+            .and_then(|(filter, predicates)| {
+                get_paths_with_discovery(
+                    registry,
+                    filter.as_ref(),
+                    yang_library_capability.is_some(),
+                    monitoring_capability.is_some(),
+                    ctx.limits,
+                )
+                .map(|paths| (paths, predicates))
+            }) {
+            Ok(paths) => paths,
+            Err(err) => {
+                let rpc_error = err.rpc_error();
+                let error_tag = rpc_error.classification.tag;
+                if audit_failure(
+                    audit_mode,
+                    ctx.audit,
+                    ctx.request_id,
+                    ctx.principal,
+                    ctx.transport,
+                    err.audit_reason(),
+                    Vec::new(),
+                )
+                .await
+                .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Get,
+                        NetconfErrorTag::OperationFailed,
+                        ctx.started.elapsed(),
+                    );
+                    return error_reply(&ctx, RpcError::operation_failed());
+                }
+                record_rpc_error(NetconfOperation::Get, error_tag, ctx.started.elapsed());
+                tracing::debug!(
+                    operation = "get",
+                    error_tag = error_tag.as_str(),
+                    "NETCONF get rejected unsupported or invalid filter"
                 );
-                return error_reply(&ctx, RpcError::operation_failed());
+                return error_reply(&ctx, rpc_error);
             }
-            record_rpc_error(NetconfOperation::Get, error_tag, ctx.started.elapsed());
-            tracing::debug!(
-                operation = "get",
-                error_tag = error_tag.as_str(),
-                "NETCONF get rejected unsupported or invalid filter"
-            );
-            return error_reply(&ctx, rpc_error);
-        }
-    };
+        };
     let selected_path_count = selected_paths
         .data_paths
         .len()
@@ -466,7 +471,8 @@ where
         Ok(String::new())
     } else {
         let snapshot = binding.config_bus().current_snapshot();
-        let config_selection = ReadSelection::new(&render_config_paths);
+        let config_selection =
+            ReadSelection::new(&render_config_paths).with_predicates(&predicates);
         let state_selection = ReadSelection::new(&render_state_paths);
         match with_defaults_mode {
             Some(mode) => binding.render_get_data_with_defaults(

@@ -60,7 +60,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         #[allow(unused_imports)]
         use super::types::*;
         use opc_mgmt_schema::{
-            DefaultReport, NetconfProjectionError, NetconfXmlRenderContext, NetconfXmlRenderer,
+            DefaultReport, NetconfKeyPredicate, NetconfProjectionError, NetconfXmlRenderContext, NetconfXmlRenderer,
         };
 
         /// Generated NETCONF XML renderer for this schema.
@@ -73,6 +73,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 selection: &[&str],
                 report: DefaultReport,
             ) -> Result<String, NetconfProjectionError> {
+                self.render_selected_config(config, selection, &[], report)
+            }
+
+            fn render_selected_config(
+                &self,
+                config: &super::types::#root_type_ident,
+                selection: &[&str],
+                predicates: &[NetconfKeyPredicate],
+                report: DefaultReport,
+            ) -> Result<String, NetconfProjectionError> {
                 match report {
                     DefaultReport::Trim
                     | DefaultReport::ReportAll
@@ -83,7 +93,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     super::schema_registry::registry(),
                     selection,
                     report,
-                );
+                ).with_predicates(predicates);
                 #root_function(config, &ctx, #root_path, true)
                     .map(|opt| opt.unwrap_or_default())
             }
@@ -277,6 +287,35 @@ fn render_list_entry_fn(
     type_ident: &proc_macro2::Ident,
 ) -> Result<TokenStream, RustGenerationError> {
     let key_stmts = list_key_render_stmts(node, nodes_by_path)?;
+    let mut predicate_stmts = Vec::new();
+    for child_path in ordered_child_paths(node) {
+        let Some(child) = nodes_by_path.get(child_path) else {
+            continue;
+        };
+        let local = clean_segment(last_segment(child_path));
+        if !node
+            .key_leaves
+            .iter()
+            .any(|key| clean_segment(key) == local)
+        {
+            continue;
+        }
+        let field = format_ident!("{}", to_snake_case(local));
+        let inner = leaf_inner_expr(child, nodes_by_path);
+        predicate_stmts.push(quote! {
+            if ctx.has_key_predicate(#child_path) {
+                let value = &value.#field;
+                let Some((raw, _)) = (#inner) else {
+                    return Err(NetconfProjectionError::UnsupportedShape {
+                        path, kind: opc_mgmt_schema::NodeKind::List,
+                    });
+                };
+                if !ctx.key_matches(#child_path, &raw) {
+                    return Ok(None);
+                }
+            }
+        });
+    }
     let non_key_stmts = child_render_stmts(
         node,
         nodes_by_path,
@@ -295,6 +334,7 @@ fn render_list_entry_fn(
             if !ctx.is_subtree_selected(path) {
                 return Ok(None);
             }
+            #(#predicate_stmts)*
             let qname = ctx.qualified_name(path)?;
             #[allow(unused_mut)]
             let mut key_children = String::new();

@@ -103,6 +103,58 @@ pub fn resolve_path(
     })
 }
 
+/// Resolve a read selector using the escaping used by generated JSON paths.
+///
+/// The shared write-path resolver accepts XPath literals, which cannot encode a
+/// single quote with a backslash. Read projections use escaped SDK instance
+/// paths instead. Validate the schema and key names through that resolver, then
+/// substitute only complete, generated placeholder literals in one pass.
+pub(crate) fn resolve_read_path(
+    registry: &dyn SchemaRegistry,
+    prefix: Option<&GnmiPath>,
+    path: &GnmiPath,
+) -> Result<ResolvedGnmiPath, GnmiError> {
+    let mut request = to_request_path(prefix, path)?;
+    let mut values = Vec::new();
+    for segment in request.prefix.iter_mut().chain(&mut request.elems) {
+        for (_, value) in &mut segment.keys {
+            let placeholder = values.len().to_string();
+            values.push(std::mem::replace(value, placeholder));
+        }
+    }
+    let resolved = opc_mgmt_path::resolve(registry, &request)
+        .map_err(|err| GnmiError::invalid(err.to_string()))?;
+    let mut canonical = String::new();
+    let mut remainder = resolved.canonical.as_str();
+    while let Some((head, tail)) = remainder.split_once("='") {
+        canonical.push_str(head);
+        canonical.push_str("='");
+        let (index, tail) = tail
+            .split_once("']")
+            .ok_or_else(|| GnmiError::schema("invalid normalized read path"))?;
+        let value = index
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| values.get(index))
+            .ok_or_else(|| GnmiError::schema("invalid normalized read key"))?;
+        for character in value.chars() {
+            if matches!(character, '\\' | '\'') {
+                canonical.push('\\');
+            }
+            canonical.push(character);
+        }
+        canonical.push_str("']");
+        remainder = tail;
+    }
+    canonical.push_str(remainder);
+    Ok(ResolvedGnmiPath {
+        schema_path: resolved.schema_path,
+        canonical: opc_config_model::YangPath::new(canonical)
+            .map_err(|_| GnmiError::invalid("invalid read path"))?,
+        node: resolved.node,
+    })
+}
+
 /// Resolves a batch of paths and enforces `max_paths_per_request`.
 pub fn resolve_paths(
     registry: &dyn SchemaRegistry,

@@ -267,8 +267,12 @@ where
     }
 
     let registry = binding.schema_registry();
-    let config_paths =
-        match get_config_paths_with_limits(registry, request.filter.as_ref(), ctx.limits) {
+    let (config_paths, predicates) =
+        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
+            .and_then(|(filter, predicates)| {
+                get_config_paths_with_limits(registry, filter.as_ref(), ctx.limits)
+                    .map(|paths| (paths, predicates))
+            }) {
             Ok(paths) => paths,
             Err(err) => {
                 return fail(
@@ -335,7 +339,7 @@ where
             .startup_config
             .expect("startup support checked before rendering"),
     };
-    let selection = ReadSelection::new(&allowed_paths);
+    let selection = ReadSelection::new(&allowed_paths).with_predicates(&predicates);
     let rendered = match request.with_defaults {
         Some(mode) => binding.render_running_config_with_defaults(config, selection, mode),
         None => binding.render_running_config(config, selection),
@@ -380,25 +384,30 @@ where
     }
 
     let registry = binding.schema_registry();
-    let selected_paths = match get_paths_with_discovery(
-        registry,
-        request.filter.as_ref(),
-        binding.yang_library_capability().is_some(),
-        binding.netconf_monitoring_capability().is_some(),
-        ctx.limits,
-    ) {
-        Ok(paths) => paths,
-        Err(err) => {
-            return fail(
-                audit_mode,
-                &ctx,
-                err.rpc_error(),
-                err.audit_reason(),
-                Vec::new(),
-            )
-            .await
-        }
-    };
+    let (selected_paths, predicates) =
+        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
+            .and_then(|(filter, predicates)| {
+                get_paths_with_discovery(
+                    registry,
+                    filter.as_ref(),
+                    binding.yang_library_capability().is_some(),
+                    binding.netconf_monitoring_capability().is_some(),
+                    ctx.limits,
+                )
+                .map(|paths| (paths, predicates))
+            }) {
+            Ok(paths) => paths,
+            Err(err) => {
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    err.rpc_error(),
+                    err.audit_reason(),
+                    Vec::new(),
+                )
+                .await
+            }
+        };
     let resolved = match ctx
         .authz
         .policy_source()
@@ -547,7 +556,7 @@ where
         let snapshot = binding.config_bus().current_snapshot();
         binding.render_get_data(
             snapshot.config.as_ref(),
-            ReadSelection::new(&render_config_paths),
+            ReadSelection::new(&render_config_paths).with_predicates(&predicates),
             &operational,
             ReadSelection::new(&render_state_paths),
         )

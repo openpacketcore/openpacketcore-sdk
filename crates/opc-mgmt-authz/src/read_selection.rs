@@ -44,6 +44,7 @@ pub struct AuthorizedReadSelection {
     /// identifier is retained in this set.
     pub permitted_paths: BTreeSet<String>,
     keys: Vec<Vec<&'static str>>,
+    material: Vec<bool>,
 }
 
 impl AuthorizedReadSelection {
@@ -54,11 +55,13 @@ impl AuthorizedReadSelection {
 
     /// Expands an allowed XML selection with its permitted identifying keys.
     /// XML list entries carry their key elements even in a direct child read.
+    /// Structural selections alone contribute no key output: a denied child
+    /// must not turn into an entry containing only an unrequested key.
     /// Call only with the schema paths used to create this result.
     pub fn xml_paths(&self, requested: &[&'static str]) -> Vec<&'static str> {
         let mut paths = BTreeSet::new();
         for (index, (decision, path)) in self.decisions.iter().zip(requested).enumerate() {
-            if decision.allowed {
+            if decision.allowed && self.material.get(index) == Some(&true) {
                 paths.insert(*path);
                 paths.extend(self.identifying_keys(index).iter().copied());
             }
@@ -158,6 +161,16 @@ impl<P: PolicySource> ReadAuthorizer<'_, P> {
         AuthorizedReadSelection {
             decisions: effective,
             permitted_paths,
+            material: requested
+                .iter()
+                .map(|request| {
+                    registry.node(request.path).is_some_and(|node| {
+                        request.opaque
+                            || node.presence
+                            || matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList)
+                    })
+                })
+                .collect(),
             keys: requirements
                 .into_iter()
                 .map(|r| r.keys.into_iter().collect())

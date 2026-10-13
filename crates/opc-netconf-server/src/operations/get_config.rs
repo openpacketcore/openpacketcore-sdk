@@ -244,8 +244,12 @@ where
     };
 
     let registry = binding.schema_registry();
-    let config_paths =
-        match get_config_paths_with_limits(registry, request.filter.as_ref(), ctx.limits) {
+    let (config_paths, predicates) =
+        match crate::filter::prepare_read_filter(registry, request.filter.as_ref(), ctx.limits)
+            .and_then(|(filter, predicates)| {
+                get_config_paths_with_limits(registry, filter.as_ref(), ctx.limits)
+                    .map(|paths| (paths, predicates))
+            }) {
             Ok(paths) => paths,
             Err(err) => {
                 let rpc_error = err.rpc_error();
@@ -437,7 +441,7 @@ where
             .startup_config
             .expect("startup support checked before rendering"),
     };
-    let selection = ReadSelection::new(&allowed_paths);
+    let selection = ReadSelection::new(&allowed_paths).with_predicates(&predicates);
     let rendered = match with_defaults_mode {
         Some(mode) => binding.render_running_config_with_defaults(config, selection, mode),
         None => binding.render_running_config(config, selection),

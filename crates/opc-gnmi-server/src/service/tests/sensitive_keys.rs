@@ -182,7 +182,9 @@ impl opc_netconf_server::NetconfConfigBinding<DemoConfig> for XmlKeyBinding {
         config: &DemoConfig,
         selection: opc_netconf_server::ReadSelection<'_>,
     ) -> Result<String, opc_netconf_server::binding::BindingError> {
-        if !selection.contains("/sys:system/sys:user/sys:role") {
+        if !selection.contains("/sys:system/sys:user/sys:role")
+            && !selection.contains("/sys:system/sys:user/sys:name")
+        {
             return Ok(String::new());
         }
         self.traversals.fetch_add(1, Ordering::SeqCst);
@@ -193,7 +195,14 @@ impl opc_netconf_server::NetconfConfigBinding<DemoConfig> for XmlKeyBinding {
         }
         let mut xml = String::new();
         for (name, user) in &config.users {
-            xml.push_str(&format!("<sys:user xmlns:sys=\"urn:demo\"><sys:name>{name}</sys:name><sys:role>{}</sys:role></sys:user>", user.role));
+            let role = if selection.contains("/sys:system/sys:user/sys:role") {
+                format!("<sys:role>{}</sys:role>", user.role)
+            } else {
+                String::new()
+            };
+            xml.push_str(&format!(
+                "<sys:user xmlns:sys=\"urn:demo\"><sys:name>{name}</sys:name>{role}</sys:user>"
+            ));
         }
         Ok(xml)
     }
@@ -742,5 +751,27 @@ async fn idle_on_change_revocation_terminates_on_context_change() {
             assert_eq!(error.message(), "gNMI service unavailable");
             assert!(stream.next().await.is_none());
         }
+    }
+}
+
+#[tokio::test]
+async fn netconf_denied_leaf_with_allowed_keys_is_omitted() {
+    for operation in xml_key_operations() {
+        let (reply, traversals) = xml_key_read(
+            Arc::new(FixedPolicy(selected_policy(
+                &[
+                    "/sys:system",
+                    "/sys:system/sys:user",
+                    "/sys:system/sys:user/sys:name",
+                ],
+                NacmAction::Read,
+            ))),
+            true,
+            &operation,
+        )
+        .await;
+        assert!(!reply.contains("<rpc-error>"), "{reply}");
+        assert!(!reply.contains("<sys:user"), "{reply}");
+        assert_eq!(traversals, 0);
     }
 }

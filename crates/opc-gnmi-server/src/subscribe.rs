@@ -618,10 +618,10 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    let Some(response) = prepare_operational_event(server, principal, plan, event)? else {
-        return Ok(true);
-    };
-    Ok(outbound.send(Ok(response)).await.is_ok())
+    match prepare_operational_event(server, principal, plan, event)? {
+        Some(response) => Ok(outbound.send(Ok(response)).await.is_ok()),
+        None => Ok(true),
+    }
 }
 
 async fn send_operational_event_owned<C, B>(
@@ -1109,7 +1109,7 @@ where
         if path.elems.is_empty() {
             let origin_modules = root_origin_modules(registry, prefix.as_ref(), Some(&path))?;
             if let Some(prefix) = prefix.as_ref().filter(|prefix| !prefix.elems.is_empty()) {
-                let resolved = crate::resolve_path(registry, None, prefix)?;
+                let resolved = crate::path::resolve_read_path(registry, None, prefix)?;
                 classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
             } else {
                 classify_all_matching(
@@ -1121,7 +1121,7 @@ where
             }
             continue;
         }
-        let resolved = crate::resolve_path(registry, prefix.as_ref(), &path)?;
+        let resolved = crate::path::resolve_read_path(registry, prefix.as_ref(), &path)?;
         classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
     }
     classes

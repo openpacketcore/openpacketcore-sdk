@@ -894,6 +894,25 @@ pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
         report: DefaultReport,
     ) -> Result<String, NetconfProjectionError>;
 
+    /// Render an authorized selection restricted to matching list instances.
+    /// A renderer that has not implemented predicates must refuse them instead
+    /// of silently returning other instances.
+    fn render_selected_config(
+        &self,
+        config: &C,
+        selection: &[&str],
+        predicates: &[NetconfKeyPredicate],
+        report: DefaultReport,
+    ) -> Result<String, NetconfProjectionError> {
+        if let Some(predicate) = predicates.first() {
+            return Err(NetconfProjectionError::UnsupportedShape {
+                path: predicate.list_path,
+                kind: NodeKind::List,
+            });
+        }
+        self.render_running_config(config, selection, report)
+    }
+
     /// Reports which with-defaults modes this renderer implements.
     fn supported_default_reports(&self) -> &'static [DefaultReport];
 }
@@ -1072,6 +1091,27 @@ impl std::fmt::Debug for EditConfigNode {
     }
 }
 
+/// One schema-validated list-key equality used only to select instances.
+/// It never grants access; the entire entry must already be authorized.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NetconfKeyPredicate {
+    /// List schema path.
+    pub list_path: &'static str,
+    /// Key leaf schema path, a direct child of the list.
+    pub key_path: &'static str,
+    /// Literal key value. Values are deliberately excluded from diagnostics.
+    pub value: String,
+}
+
+impl std::fmt::Debug for NetconfKeyPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetconfKeyPredicate")
+            .field("list_path", &self.list_path)
+            .field("key_path", &self.key_path)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Context shared by generated NETCONF XML renderers.
 ///
 /// The context is intentionally immutable: generated container renderers build
@@ -1082,6 +1122,7 @@ pub struct NetconfXmlRenderContext<'a> {
     registry: &'a dyn SchemaRegistry,
     selection: &'a [&'a str],
     report: DefaultReport,
+    predicates: &'a [NetconfKeyPredicate],
 }
 
 impl<'a> NetconfXmlRenderContext<'a> {
@@ -1095,7 +1136,29 @@ impl<'a> NetconfXmlRenderContext<'a> {
             registry,
             selection,
             report,
+            predicates: &[],
         }
+    }
+
+    /// Restrict authorized entries by their real key values before masking.
+    pub fn with_predicates(mut self, predicates: &'a [NetconfKeyPredicate]) -> Self {
+        self.predicates = predicates;
+        self
+    }
+
+    /// Whether this key participates in instance selection.
+    pub fn has_key_predicate(&self, path: &str) -> bool {
+        self.predicates
+            .iter()
+            .any(|predicate| predicate.key_path == path)
+    }
+
+    /// Match one already-authorized key against every equality for that key.
+    pub fn key_matches(&self, path: &str, value: &str) -> bool {
+        self.predicates
+            .iter()
+            .filter(|predicate| predicate.key_path == path)
+            .all(|predicate| predicate.value == value)
     }
 
     /// The report mode in effect for this render.

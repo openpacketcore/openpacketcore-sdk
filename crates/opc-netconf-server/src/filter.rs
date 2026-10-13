@@ -11,6 +11,9 @@ use crate::capabilities::NETCONF_MONITORING_NS;
 use crate::error::RpcError;
 use crate::xml::{Filter, SubtreeFilter, SubtreeSelection, XPathFilter};
 
+mod key_predicates;
+pub(crate) use key_predicates::prepare_read_filter;
+
 /// RFC 8525 `ietf-yang-library` XML namespace.
 pub const YANG_LIBRARY_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-yang-library";
 /// RFC 8525 `ietf-yang-library` module name.

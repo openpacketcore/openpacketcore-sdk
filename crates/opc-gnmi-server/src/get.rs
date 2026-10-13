@@ -448,7 +448,7 @@ pub(crate) fn select_paths(
 
     if request_paths.is_empty() {
         if let Some(prefix) = prefix.filter(|prefix| !prefix.elems.is_empty()) {
-            let resolved = crate::resolve_path(registry, None, prefix)?;
+            let resolved = crate::path::resolve_read_path(registry, None, prefix)?;
             expand_from_resolved(registry, &resolved, data_type, model_filter, &mut selected)?;
         } else {
             let origin_modules = root_origin_modules(registry, prefix, None)?;
@@ -477,7 +477,7 @@ pub(crate) fn select_paths(
                             &mut selected,
                         )?;
                     } else {
-                        let resolved = crate::resolve_path(registry, None, prefix)?;
+                        let resolved = crate::path::resolve_read_path(registry, None, prefix)?;
                         expand_from_resolved(
                             registry,
                             &resolved,
@@ -497,7 +497,7 @@ pub(crate) fn select_paths(
                 }
                 continue;
             }
-            let resolved = crate::resolve_path(registry, prefix, path)?;
+            let resolved = crate::path::resolve_read_path(registry, prefix, path)?;
             expand_from_resolved(registry, &resolved, data_type, model_filter, &mut selected)?;
         }
     }

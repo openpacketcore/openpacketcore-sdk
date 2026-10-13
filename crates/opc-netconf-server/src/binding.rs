@@ -243,12 +243,30 @@ impl EditConfigError {
 #[derive(Debug, Clone, Copy)]
 pub struct ReadSelection<'a> {
     schema_paths: &'a [&'static str],
+    predicates: &'a [opc_mgmt_schema::NetconfKeyPredicate],
 }
 
 impl<'a> ReadSelection<'a> {
     /// Creates a selection from predicate-free schema-node paths.
     pub const fn new(schema_paths: &'a [&'static str]) -> Self {
-        Self { schema_paths }
+        Self {
+            schema_paths,
+            predicates: &[],
+        }
+    }
+
+    /// Restricts already-authorized entries to schema-validated key equalities.
+    pub const fn with_predicates(
+        mut self,
+        predicates: &'a [opc_mgmt_schema::NetconfKeyPredicate],
+    ) -> Self {
+        self.predicates = predicates;
+        self
+    }
+
+    /// Instance selectors; these never grant permission to any schema node.
+    pub const fn predicates(&self) -> &'a [opc_mgmt_schema::NetconfKeyPredicate] {
+        self.predicates
     }
 
     /// Predicate-free schema-node paths the caller may read.
@@ -398,7 +416,12 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
             )
         })?;
         renderer
-            .render_running_config(config, selection.schema_paths(), DefaultReport::Trim)
+            .render_selected_config(
+                config,
+                selection.schema_paths(),
+                selection.predicates(),
+                DefaultReport::Trim,
+            )
             .map_err(projection_error)
     }
 
@@ -484,7 +507,12 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
             ));
         }
         renderer
-            .render_running_config(config, selection.schema_paths(), report)
+            .render_selected_config(
+                config,
+                selection.schema_paths(),
+                selection.predicates(),
+                report,
+            )
             .map_err(projection_error)
     }
 
@@ -519,9 +547,10 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         if let Some(renderer) = self.generated_xml_renderer() {
             out.push_str(
                 &renderer
-                    .render_running_config(
+                    .render_selected_config(
                         config,
                         config_selection.schema_paths(),
+                        config_selection.predicates(),
                         DefaultReport::Trim,
                     )
                     .map_err(projection_error)?,
@@ -565,7 +594,12 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
             ));
         }
         let mut out = renderer
-            .render_running_config(config, config_selection.schema_paths(), report)
+            .render_selected_config(
+                config,
+                config_selection.schema_paths(),
+                config_selection.predicates(),
+                report,
+            )
             .map_err(projection_error)?;
         out.push_str(&render_operational_xml(
             self.schema_registry(),

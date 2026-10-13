@@ -5508,15 +5508,9 @@ mod tests {
         assert!(sent);
         assert!(rx.try_recv().is_err());
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, AuditOperation::Subscribe);
-        assert_eq!(
-            events[0].outcome,
-            audit_denied(AuditReasonCode::ACCESS_DENIED)
-        );
-        assert_eq!(
-            events[0].schema_paths,
-            vec![schema_node_path("/sys:system/sys:uptime")]
+        assert!(
+            events.is_empty(),
+            "hidden events do not perform per-event audit work"
         );
     }
 
