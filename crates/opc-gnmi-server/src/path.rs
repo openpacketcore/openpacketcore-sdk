@@ -6,6 +6,9 @@ use opc_mgmt_schema::{NodeMeta, SchemaRegistry};
 
 use crate::GnmiError;
 
+/// Shared literal key builder for generated gNMI renderers.
+pub use opc_mgmt_path::append_key_predicate;
+
 /// One gNMI `PathElem` represented without protobuf.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GnmiPathElem {
@@ -103,56 +106,64 @@ pub fn resolve_path(
     })
 }
 
-/// Resolve a read selector using the escaping used by generated JSON paths.
-///
-/// The shared write-path resolver accepts XPath literals, which cannot encode a
-/// single quote with a backslash. Read projections use escaped SDK instance
-/// paths instead. Validate the schema and key names through that resolver, then
-/// substitute only complete, generated placeholder literals in one pass.
+/// Resolves a gNMI read selection. Exactly `*` in a key value means omission;
+/// other canonical-key values remain literal. Writes use [`resolve_path`].
 pub(crate) fn resolve_read_path(
     registry: &dyn SchemaRegistry,
     prefix: Option<&GnmiPath>,
     path: &GnmiPath,
-) -> Result<ResolvedGnmiPath, GnmiError> {
+) -> Result<Option<ResolvedGnmiPath>, GnmiError> {
     let mut request = to_request_path(prefix, path)?;
-    let mut values = Vec::new();
-    for segment in request.prefix.iter_mut().chain(&mut request.elems) {
-        for (_, value) in &mut segment.keys {
-            let placeholder = values.len().to_string();
-            values.push(std::mem::replace(value, placeholder));
+    if request
+        .prefix
+        .iter()
+        .chain(&request.elems)
+        .any(|segment| segment.keys.iter().any(|(_, value)| value == "*"))
+    {
+        // Wildcards omit a value constraint, not validation of its key name.
+        // Resolve the structural path before dropping wildcard predicates so
+        // unknown keys, keys on non-lists and duplicate aliases stay invalid.
+        let mut structural = request.clone();
+        for segment in structural.prefix.iter_mut().chain(&mut structural.elems) {
+            segment.keys.clear();
         }
-    }
-    let resolved = opc_mgmt_path::resolve(registry, &request)
-        .map_err(|err| GnmiError::invalid(err.to_string()))?;
-    let mut canonical = String::new();
-    let mut remainder = resolved.canonical.as_str();
-    while let Some((head, tail)) = remainder.split_once("='") {
-        canonical.push_str(head);
-        canonical.push_str("='");
-        let (index, tail) = tail
-            .split_once("']")
-            .ok_or_else(|| GnmiError::schema("invalid normalized read path"))?;
-        let value = index
-            .parse::<usize>()
-            .ok()
-            .and_then(|index| values.get(index))
-            .ok_or_else(|| GnmiError::schema("invalid normalized read key"))?;
-        for character in value.chars() {
-            if matches!(character, '\\' | '\'') {
-                canonical.push('\\');
+        let resolved = opc_mgmt_path::resolve_read(registry, &structural)
+            .map_err(|_| GnmiError::invalid("invalid gNMI read selection"))?
+            .ok_or_else(|| GnmiError::invalid("invalid gNMI read selection"))?;
+        let mut ancestor = String::new();
+        for (name, input) in resolved
+            .schema_path
+            .trim_start_matches('/')
+            .split('/')
+            .zip(request.prefix.iter().chain(&request.elems))
+        {
+            ancestor.push('/');
+            ancestor.push_str(name);
+            let node = registry
+                .node(&ancestor)
+                .ok_or_else(|| GnmiError::invalid("invalid gNMI read selection"))?;
+            let mut keys = std::collections::BTreeSet::new();
+            for (name, _) in &input.keys {
+                let key = opc_mgmt_path::declared_key(registry, node, name)
+                    .ok_or_else(|| GnmiError::invalid("invalid gNMI read selection"))?;
+                if !keys.insert(key.path) {
+                    return Err(GnmiError::invalid("invalid gNMI read selection"));
+                }
             }
-            canonical.push(character);
         }
-        canonical.push_str("']");
-        remainder = tail;
     }
-    canonical.push_str(remainder);
-    Ok(ResolvedGnmiPath {
-        schema_path: resolved.schema_path,
-        canonical: opc_config_model::YangPath::new(canonical)
-            .map_err(|_| GnmiError::invalid("invalid read path"))?,
-        node: resolved.node,
-    })
+    for segment in request.prefix.iter_mut().chain(&mut request.elems) {
+        segment.keys.retain(|(_, value)| value != "*");
+    }
+    opc_mgmt_path::resolve_read(registry, &request)
+        .map(|resolved| {
+            resolved.map(|resolved| ResolvedGnmiPath {
+                schema_path: resolved.schema_path,
+                canonical: resolved.canonical,
+                node: resolved.node,
+            })
+        })
+        .map_err(|_| GnmiError::invalid("invalid gNMI read selection"))
 }
 
 /// Resolves a batch of paths and enforces `max_paths_per_request`.

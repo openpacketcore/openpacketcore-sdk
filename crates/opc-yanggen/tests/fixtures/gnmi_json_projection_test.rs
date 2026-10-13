@@ -226,6 +226,76 @@ fn multi_key_list_paths_use_schema_key_order() {
 }
 
 #[test]
+fn generated_key_paths_preserve_literal_and_trailing_backslashes() {
+    let mut system = System::default();
+    let name = r"branch\tail\";
+    let mut interface = Interfaces::default();
+    interface.name = LeafPresence::Explicit(name.to_string());
+    interface.mtu = LeafPresence::Explicit(1500);
+    system.interfaces.insert(name.to_string(), interface);
+
+    let updates = render(
+        &system,
+        vec![entry(
+            "/ex:system/ex:interfaces/ex:mtu",
+            "/ex:system/ex:interfaces/ex:mtu",
+        )],
+    );
+    assert_eq!(
+        updates,
+        vec![(
+            r"/ex:system/ex:interfaces[ex:name='branch\tail\']/ex:mtu".to_string(),
+            "1500".to_string(),
+        )]
+    );
+}
+
+#[test]
+fn generated_key_paths_use_xpath_literals_for_apostrophes() {
+    let mut system = System::default();
+    let name = "branch'/[]=";
+    let mut interface = Interfaces::default();
+    interface.name = LeafPresence::Explicit(name.to_string());
+    interface.mtu = LeafPresence::Explicit(1500);
+    system.interfaces.insert(name.to_string(), interface);
+
+    let updates = render(
+        &system,
+        vec![entry(
+            "/ex:system/ex:interfaces/ex:mtu",
+            "/ex:system/ex:interfaces/ex:mtu",
+        )],
+    );
+    assert_eq!(
+        updates,
+        vec![(
+            r#"/ex:system/ex:interfaces[ex:name="branch'/[]="]/ex:mtu"#.to_string(),
+            "1500".to_string(),
+        )]
+    );
+}
+
+#[test]
+fn generated_key_paths_refuse_both_quote_characters_without_value_detail() {
+    let mut system = System::default();
+    let name = "private-key'\"";
+    let mut interface = Interfaces::default();
+    interface.name = LeafPresence::Explicit(name.to_string());
+    interface.mtu = LeafPresence::Explicit(1500);
+    system.interfaces.insert(name.to_string(), interface);
+    let entries = vec![entry(
+        "/ex:system/ex:interfaces/ex:mtu",
+        "/ex:system/ex:interfaces/ex:mtu",
+    )];
+    let schema_paths = ["/ex:system/ex:interfaces/ex:mtu"];
+    let err = renderer()
+        .render_running_json(&system, ReadSelection::with_entries(&schema_paths, &entries))
+        .expect_err("unrepresentable identity must fail closed");
+    assert!(!err.detail().contains("private-key"));
+    assert!(!format!("{err:?}").contains("private-key"));
+}
+
+#[test]
 fn leaf_list_renders_json_array() {
     let system = sample_config();
     let updates = render(

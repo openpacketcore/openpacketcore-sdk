@@ -171,8 +171,8 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     use std::fmt::Write as _;
 
     // All thirteen files originate from 1d880a21c before user ordering support.
-    // Pins retain #1268 state-write and safe-diagnostic changes and add #1269
-    // gNMI key-class guards and NETCONF selection/predicate output. Every generated
+    // Pins retain #1268 state-write and safe-diagnostic changes, #1269 authorized
+    // read projection, and #1270 canonical gNMI key literals. Every generated
     // file stays pinned across the four source models.
     let expected: BTreeMap<String, BTreeMap<String, String>> =
         serde_json::from_str(include_str!("fixtures/system_ordered_digests.json")).unwrap();

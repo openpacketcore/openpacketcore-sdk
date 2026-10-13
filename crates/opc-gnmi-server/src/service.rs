@@ -361,6 +361,23 @@ where
             record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
             return Err(status_from_error(final_err));
         }
+        // Refuse schema-forbidden key matches before consulting configuration
+        // authority, policy, a provider or stored rows.
+        if let Err(err) = crate::get::select_read_request(&self.server, request.get_ref()) {
+            let final_err = record_audit(
+                self.server.audit(),
+                RequestId::new(),
+                principal.principal(),
+                AuditOperation::Read,
+                outcome_for_error(&err),
+                Vec::new(),
+            )
+            .await
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
+            return Err(status_from_error(final_err));
+        }
         if let Err(err) = self
             .server
             .ensure_config_authority(ConfigAuthorityOperation::LinearizableRead)

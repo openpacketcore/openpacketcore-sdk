@@ -153,17 +153,13 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #[allow(dead_code)]
-        fn append_key_predicate(path: &mut String, key_name: &'static str, raw_value: &str) {
-            path.push('[');
-            path.push_str(key_name);
-            path.push_str("='");
-            for ch in raw_value.chars() {
-                if ch == '\\' || ch == '\'' {
-                    path.push('\\');
-                }
-                path.push(ch);
-            }
-            path.push_str("']");
+        fn append_key_predicate(
+            path: &mut String,
+            key_name: &'static str,
+            raw_value: &str,
+        ) -> Result<(), GnmiJsonProjectionError> {
+            opc_gnmi_server::path::append_key_predicate(path, key_name, raw_value)
+                .map_err(|_| GnmiJsonProjectionError::projection("invalid canonical key literal"))
         }
 
         /// Returns the generated gNMI JSON/RFC 7951 renderer for this schema.
@@ -700,7 +696,7 @@ fn list_key_predicate_stmts(
                 )));
             };
             let raw = #raw;
-            append_key_predicate(&mut entry_canonical_path, #key_schema_name, &raw);
+            append_key_predicate(&mut entry_canonical_path, #key_schema_name, &raw)?;
             let _ = &value.#field_ident;
         });
     }

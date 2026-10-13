@@ -315,14 +315,14 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     use std::fmt::Write as _;
 
     // Captured from the generator before user ordering support (1d880a21c).
-    // The patch.rs pin includes #1268 safe diagnostics. The gNMI JSON and NETCONF
-    // XML pins include #1269 authorized read projection. Every generated file
-    // remains covered by its complete-file assertion.
+    // The patch.rs pin retains #1268 safe diagnostics. Read renderer pins include
+    // #1269 authorized projection and #1270 canonical gNMI key literals. Every
+    // generated file remains covered by its complete-file assertion.
     // Changing unaffected generated output requires an explicit baseline update.
     let expected = [
         (
             "gnmi_json.rs",
-            "c01156ab06a1e4f4e260a99f25b64cffb7be54308c3d0a4df97216230fb00a52",
+            "537d5deb527ae2d47434f6538ddf0c9768694ce9fc0e3d24388d97fbfa7b6b87",
         ),
         (
             "gnmi_set.rs",

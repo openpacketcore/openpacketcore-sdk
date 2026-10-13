@@ -242,7 +242,7 @@ where
         .collect::<Vec<_>>();
 
     let state_audit_paths = audit_paths_for_entries(&state_entries)?;
-    let operational = read_operational(server.binding(), &state_entries)
+    let operational = read_operational(server.binding(), &state_entries, server.limits())
         .map_err(|error| ReadFailure::new(error, state_audit_paths))?;
     let state_entries_with_values = state_entries_with_values(&state_entries, &operational);
     let config_entries = config_entries_for_render(server.binding().schema(), &config_entries);
@@ -448,8 +448,9 @@ pub(crate) fn select_paths(
 
     if request_paths.is_empty() {
         if let Some(prefix) = prefix.filter(|prefix| !prefix.elems.is_empty()) {
-            let resolved = crate::path::resolve_read_path(registry, None, prefix)?;
-            expand_from_resolved(registry, &resolved, data_type, model_filter, &mut selected)?;
+            if let Some(resolved) = crate::path::resolve_read_path(registry, None, prefix)? {
+                expand_from_resolved(registry, &resolved, data_type, model_filter, &mut selected)?;
+            }
         } else {
             let origin_modules = root_origin_modules(registry, prefix, None)?;
             select_all_matching(
@@ -477,14 +478,17 @@ pub(crate) fn select_paths(
                             &mut selected,
                         )?;
                     } else {
-                        let resolved = crate::path::resolve_read_path(registry, None, prefix)?;
-                        expand_from_resolved(
-                            registry,
-                            &resolved,
-                            data_type,
-                            model_filter,
-                            &mut selected,
-                        )?;
+                        if let Some(resolved) =
+                            crate::path::resolve_read_path(registry, None, prefix)?
+                        {
+                            expand_from_resolved(
+                                registry,
+                                &resolved,
+                                data_type,
+                                model_filter,
+                                &mut selected,
+                            )?;
+                        }
                     }
                 } else {
                     select_all_matching(
@@ -497,8 +501,9 @@ pub(crate) fn select_paths(
                 }
                 continue;
             }
-            let resolved = crate::path::resolve_read_path(registry, prefix, path)?;
-            expand_from_resolved(registry, &resolved, data_type, model_filter, &mut selected)?;
+            if let Some(resolved) = crate::path::resolve_read_path(registry, prefix, path)? {
+                expand_from_resolved(registry, &resolved, data_type, model_filter, &mut selected)?;
+            }
         }
     }
 
@@ -640,6 +645,7 @@ fn schema_paths_for_entries(entries: &[ReadSelectionEntry]) -> Vec<&'static str>
 fn read_operational<C, B>(
     binding: &B,
     state_entries: &[ReadSelectionEntry],
+    limits: &opc_mgmt_limits::MgmtLimits,
 ) -> Result<OperationalResponse, GnmiError>
 where
     C: OpcConfig,
@@ -652,15 +658,95 @@ where
         .iter()
         .map(|entry| entry.canonical_path().clone())
         .collect::<Vec<_>>();
-    let request = OperationalRequest::new(requested);
-    let response = binding
+    let request = OperationalRequest::new(requested)
+        .with_max_values(limits.max_paths_per_request)
+        .with_max_value_bytes(limits.max_value_bytes);
+    let mut response = binding
         .operational_state()
         .get(&request)
         .map_err(operational_error)?;
     response
         .validate_for_request(&request)
-        .map_err(|_| GnmiError::schema("invalid operational response"))?;
+        .map_err(|error| match error {
+            opc_mgmt_opstate::OperationalResponseError::LimitExceeded => {
+                GnmiError::invalid("management-plane limit exceeded")
+            }
+            _ => GnmiError::schema("invalid operational response"),
+        })?;
+    let registry = binding.schema();
+    for value in &mut response.values {
+        let resolved = opc_mgmt_path::resolve_instance(registry, value.path())
+            .map_err(|_| GnmiError::schema("invalid operational instance"))?;
+        if resolved.node.config {
+            return Err(GnmiError::schema("invalid operational instance"));
+        }
+        *value = project_operational_value(registry, value, resolved.node)?;
+    }
+    response
+        .values
+        .sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
     Ok(response)
+}
+
+pub(crate) fn project_operational_value(
+    registry: &dyn SchemaRegistry,
+    value: &opc_mgmt_opstate::OperationalValue,
+    node: &'static opc_mgmt_schema::NodeMeta,
+) -> Result<opc_mgmt_opstate::OperationalValue, GnmiError> {
+    let parsed = opc_mgmt_path::CanonicalPath::parse(value.path().as_str())
+        .map_err(|_| GnmiError::schema("invalid operational instance"))?;
+    let mut schema = String::new();
+    for segment in parsed.segments() {
+        schema.push('/');
+        schema.push_str(segment.name);
+        let ancestor = registry
+            .node(&schema)
+            .ok_or_else(|| GnmiError::schema("invalid operational instance"))?;
+        for (name, identity) in &segment.keys {
+            let key = opc_mgmt_path::declared_key(registry, ancestor, name)
+                .ok_or_else(|| GnmiError::schema("invalid operational identity"))?;
+            if !opc_mgmt_path::key_allows_cleartext(registry, key.path) {
+                return Err(GnmiError::schema(
+                    "operational identity cannot be represented",
+                ));
+            }
+            if key.path == node.path {
+                let json: serde_json::Value = serde_json::from_str(value.value_json())
+                    .map_err(|_| GnmiError::schema("invalid operational value"))?;
+                let matches = match json {
+                    serde_json::Value::String(ref raw) => raw == identity,
+                    serde_json::Value::Bool(raw) => raw.to_string() == *identity,
+                    serde_json::Value::Number(ref raw) => raw.to_string() == *identity,
+                    _ => false,
+                };
+                if !matches {
+                    return Err(GnmiError::schema(
+                        "operational key value differs from identity",
+                    ));
+                }
+            }
+        }
+    }
+    if matches!(node.kind, NodeKind::Container | NodeKind::List)
+        && parsed.segments().iter().any(|s| !s.keys.is_empty())
+    {
+        return Err(GnmiError::schema(
+            "opaque expanded operational value is unsupported",
+        ));
+    }
+    let class = registry
+        .data_class(node.path)
+        .unwrap_or(opc_mgmt_schema::DataClass::SecuritySecret);
+    if class.allows_cleartext() {
+        return Ok(value.clone());
+    }
+    let masked = opc_redaction::redact("", class, opc_redaction::RedactionLevel::Mask, None, None)
+        .to_string();
+    let json = serde_json::to_string(&masked)
+        .map_err(|_| GnmiError::schema("operational masking failed"))?;
+    opc_mgmt_opstate::OperationalValue::new(value.path().clone(), json)
+        .map(|masked| masked.with_origin(value.origin()))
+        .map_err(|_| GnmiError::schema("operational masking failed"))
 }
 
 pub(crate) fn operational_error(err: OperationalError) -> GnmiError {
@@ -678,10 +764,20 @@ fn state_entries_with_values(
     state_entries: &[ReadSelectionEntry],
     operational: &OperationalResponse,
 ) -> Vec<ReadSelectionEntry> {
-    state_entries
+    operational
+        .values
         .iter()
-        .filter(|entry| operational.value_for(entry.canonical_path()).is_some())
-        .cloned()
+        .filter_map(|value| {
+            state_entries
+                .iter()
+                .find(|entry| {
+                    opc_mgmt_path::canonical_path_matches(
+                        entry.canonical_path().as_str(),
+                        value.path().as_str(),
+                    )
+                })
+                .map(|entry| ReadSelectionEntry::new(entry.schema_path(), value.path().clone()))
+        })
         .collect()
 }
 
@@ -724,128 +820,26 @@ pub(crate) fn update_to_proto(
 }
 
 pub(crate) fn yang_path_to_proto(path: &YangPath) -> Result<gnmi::Path, GnmiError> {
-    let elems = split_yang_path(path.as_str())?
-        .into_iter()
-        .map(segment_to_path_elem)
-        .collect::<Result<Vec<_>, _>>()?;
+    let parsed = opc_mgmt_path::CanonicalPath::parse(path.as_str())
+        .map_err(|_| GnmiError::schema("invalid canonical response path"))?;
+    let elems = parsed
+        .segments()
+        .iter()
+        .map(|segment| gnmi::PathElem {
+            name: segment.name.to_string(),
+            key: segment
+                .keys
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        })
+        .collect();
     Ok(gnmi::Path {
         element: Vec::new(),
         origin: String::new(),
         elem: elems,
         target: String::new(),
     })
-}
-
-fn split_yang_path(path: &str) -> Result<Vec<&str>, GnmiError> {
-    let mut out = Vec::new();
-    let mut start = 1;
-    let mut quote = false;
-    let mut escape = false;
-    for (idx, ch) in path.char_indices().skip(1) {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' if quote => escape = true,
-            '\'' => quote = !quote,
-            '/' if !quote => {
-                out.push(&path[start..idx]);
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    if quote || escape {
-        return Err(GnmiError::schema("invalid canonical YANG path"));
-    }
-    if start < path.len() {
-        out.push(&path[start..]);
-    }
-    Ok(out)
-}
-
-fn segment_to_path_elem(segment: &str) -> Result<gnmi::PathElem, GnmiError> {
-    let (name, predicates) = segment
-        .split_once('[')
-        .map(|(name, rest)| (name, Some(rest)))
-        .unwrap_or((segment, None));
-    if name.is_empty() {
-        return Err(GnmiError::schema("invalid canonical YANG path segment"));
-    }
-    let mut elem = gnmi::PathElem {
-        name: name.to_string(),
-        key: std::collections::HashMap::new(),
-    };
-    let Some(mut rest) = predicates else {
-        return Ok(elem);
-    };
-    loop {
-        let Some(end) = find_predicate_end(rest)? else {
-            return Err(GnmiError::schema("invalid canonical YANG key predicate"));
-        };
-        let predicate = &rest[..end];
-        let (key, value) = parse_predicate(predicate)?;
-        elem.key.insert(key, value);
-        rest = &rest[end + 1..];
-        if rest.is_empty() {
-            return Ok(elem);
-        }
-        let Some(next) = rest.strip_prefix('[') else {
-            return Err(GnmiError::schema("invalid canonical YANG key predicate"));
-        };
-        rest = next;
-    }
-}
-
-fn find_predicate_end(rest: &str) -> Result<Option<usize>, GnmiError> {
-    let mut quote = false;
-    let mut escape = false;
-    for (idx, ch) in rest.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' if quote => escape = true,
-            '\'' => quote = !quote,
-            ']' if !quote => return Ok(Some(idx)),
-            _ => {}
-        }
-    }
-    if quote || escape {
-        return Err(GnmiError::schema("invalid canonical YANG key predicate"));
-    }
-    Ok(None)
-}
-
-fn parse_predicate(predicate: &str) -> Result<(String, String), GnmiError> {
-    let (key, raw_value) = predicate
-        .split_once('=')
-        .ok_or_else(|| GnmiError::schema("invalid canonical YANG key predicate"))?;
-    let Some(quoted) = raw_value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-    else {
-        return Err(GnmiError::schema("invalid canonical YANG key predicate"));
-    };
-    Ok((key.to_string(), unescape_predicate_value(quoted)?))
-}
-
-fn unescape_predicate_value(value: &str) -> Result<String, GnmiError> {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            let Some(next) = chars.next() else {
-                return Err(GnmiError::schema("invalid canonical YANG key predicate"));
-            };
-            out.push(next);
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
 }
 
 pub(crate) fn now_nanos() -> i64 {
@@ -864,7 +858,7 @@ mod tests {
 
     #[test]
     fn canonical_yang_path_to_proto_path_preserves_keys() {
-        let path = YangPath::new("/sys:system/sys:user[sys:name='a\\'b']/sys:role").expect("path");
+        let path = YangPath::new(r#"/sys:system/sys:user[sys:name="a'b"]/sys:role"#).expect("path");
         let proto = yang_path_to_proto(&path).expect("proto path");
 
         assert_eq!(proto.elem[0].name, "sys:system");
