@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn native_prefix_subtraction_rejects_underflow() {
+    let mut summary = Summary {
+        count: 2,
+        ..Summary::default()
+    };
+    summary
+        .subtract(Summary {
+            count: 2,
+            ..Summary::default()
+        })
+        .unwrap();
+    assert_eq!(summary.count, 0);
+    assert_eq!(
+        summary
+            .subtract(Summary {
+                count: 1,
+                ..Summary::default()
+            })
+            .unwrap_err()
+            .to_string(),
+        "native log prefix removal count differs"
+    );
+    assert_eq!(summary.count, 0);
+}
+
 fn applied_at(snapshot: u64) -> NativeStorage {
     let mut storage = fixture();
     project(&mut storage, &Operation::Committed(Some(id(1, 2))));

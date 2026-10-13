@@ -12,6 +12,156 @@ const ROOT_SELECTION: &str = "user.opc.native-root-v1";
 
 mod responsiveness;
 
+#[tokio::test(flavor = "current_thread")]
+async fn native_snapshot_preflight_rejects_path_escape() {
+    let directory = FixedRawReadStoreFixture::new();
+    let (backend, raft, wal, _) =
+        native_log_retained_bound::open_engine(&directory, SessionPersistenceMode::Durable).await;
+    select_command_and_snapshot(&raft).await;
+    let selected = wal.native_retained_snapshots().unwrap();
+    assert_eq!(selected.len(), 1);
+    drop(close_engine(backend, raft, wal).await);
+    let root = directory.snapshot_path().join("retained-bound-snapshots");
+    let source = SnapshotDirectory::from_path(&root);
+    preflight_native_snapshot_schemas(&source, selected.clone(), SnapshotIntegrityPolicy::FsVerity)
+        .await
+        .unwrap();
+    let before = (
+        namespace(directory.path()),
+        namespace(directory.snapshot_path()),
+        root_selection(&directory),
+    );
+    for name in [
+        format!("../retained-bound-snapshots/{}", selected[0].1),
+        root.join(&selected[0].1).to_str().unwrap().to_owned(),
+    ] {
+        let mut invalid = selected.clone();
+        invalid[0].1 = name;
+        assert_eq!(
+            preflight_native_snapshot_schemas(&source, invalid, SnapshotIntegrityPolicy::FsVerity)
+                .await,
+            Err(SessionConsensusStorageError::CorruptState)
+        );
+    }
+    assert_eq!(
+        (
+            namespace(directory.path()),
+            namespace(directory.snapshot_path()),
+            root_selection(&directory)
+        ),
+        before
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_snapshot_preflight_rejects_wrong_length() {
+    let directory = FixedRawReadStoreFixture::new();
+    let (backend, raft, wal, _) =
+        native_log_retained_bound::open_engine(&directory, SessionPersistenceMode::Durable).await;
+    select_command_and_snapshot(&raft).await;
+    let mut selected = wal.native_retained_snapshots().unwrap();
+    assert_eq!(selected.len(), 1);
+    drop(close_engine(backend, raft, wal).await);
+    let source =
+        SnapshotDirectory::from_path(directory.snapshot_path().join("retained-bound-snapshots"));
+    preflight_native_snapshot_schemas(&source, selected.clone(), SnapshotIntegrityPolicy::FsVerity)
+        .await
+        .unwrap();
+    let before = (
+        namespace(directory.path()),
+        namespace(directory.snapshot_path()),
+        root_selection(&directory),
+    );
+    selected[0].3 += 1;
+    assert!(selected[0].3 < SNAPSHOT_ENVELOPE_MAX_BYTES);
+    assert_eq!(
+        preflight_native_snapshot_schemas(&source, selected, SnapshotIntegrityPolicy::FsVerity)
+            .await,
+        Err(SessionConsensusStorageError::CorruptState)
+    );
+    assert_eq!(
+        (
+            namespace(directory.path()),
+            namespace(directory.snapshot_path()),
+            root_selection(&directory)
+        ),
+        before
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_preflight_worker_failures_keep_typed_refusal_and_no_writes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for mode in [
+        SessionPersistenceMode::Durable,
+        SessionPersistenceMode::Async,
+    ] {
+        let directory = FixedRawReadStoreFixture::new();
+        let (backend, raft, wal, _) =
+            native_log_retained_bound::open_engine(&directory, mode).await;
+        select_command_and_snapshot(&raft).await;
+        drop(close_engine(backend, raft, wal).await);
+        for expected in [identity(1), identity(2)] {
+            let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+            let result = backend
+                .native_persistence_preflight(expected, |_| async { Ok(()) })
+                .await;
+            assert_eq!(
+                result,
+                if expected == identity(1) {
+                    Ok(Some(mode))
+                } else {
+                    Err(SessionConsensusStorageError::IdentityMismatch)
+                }
+            );
+            for panic in [false, true] {
+                backend
+                    .native_owner
+                    .as_ref()
+                    .unwrap()
+                    .set_preflight_hook_for_test(Arc::new(move || {
+                        if panic {
+                            panic!("injected preflight worker panic");
+                        }
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "injected preflight rejection",
+                        ))
+                    }));
+                let before = (
+                    namespace(directory.path()),
+                    namespace(directory.snapshot_path()),
+                    root_selection(&directory),
+                );
+                let inspected = AtomicBool::new(false);
+                let result = backend
+                    .native_persistence_preflight(expected, |_| async {
+                        inspected.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await;
+                assert_eq!(
+                    result,
+                    Err(if panic {
+                        SessionConsensusStorageError::BackendUnavailable
+                    } else {
+                        SessionConsensusStorageError::CorruptState
+                    })
+                );
+                assert!(!inspected.load(Ordering::SeqCst));
+                assert_eq!(
+                    (
+                        namespace(directory.path()),
+                        namespace(directory.snapshot_path()),
+                        root_selection(&directory)
+                    ),
+                    before
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct FileObservation {
     mode: u32,

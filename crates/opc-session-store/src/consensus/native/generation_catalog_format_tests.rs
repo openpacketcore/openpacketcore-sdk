@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn native_preflight_requires_roster_counts() {
+    let (mut storage, _, _) = fixture();
+    let (files, _) = Files::new(&storage);
+    storage.begin_changes().unwrap();
+    let prepared = files.prepare(&mut storage, 19);
+    let mut delta = Vec::new();
+    prepared.write_payload(&mut delta, &|| Ok(())).unwrap();
+    let mut wire = Wire::<Header>::read(&delta);
+    let identity = PrefixIdentity {
+        checkpoint_epoch: wire.header.checkpoint_epoch,
+        operation_sequence: wire.header.operation_sequence,
+        ..files.owner.current().identity()
+    };
+    let positive = wire.encode(MAGIC, files.bytes());
+    preflight(
+        &positive,
+        rebound(&positive, identity, &wire.header.after),
+        wire.header.cut_binding,
+    )
+    .unwrap();
+    assert_eq!(wire.header.roster_changed, Some([0; 2]));
+    wire.header.roster_changed = None;
+    let forged = wire.encode(MAGIC, files.bytes());
+    assert_eq!(
+        preflight(
+            &forged,
+            rebound(&forged, identity, &wire.header.after),
+            wire.header.cut_binding
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation roster frame counts differ from its format"
+    );
+}
+
+#[test]
 fn native_preflight_rejects_wrong_base_identity() {
     let (storage, _, _) = fixture();
     let (files, catalog) = Files::new(&storage);
@@ -111,6 +147,60 @@ fn native_preflight_rejects_oversize_row_extent() {
 }
 
 #[test]
+fn native_preflight_row_extent_is_bounded_by_selected_length() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    let original = files.bytes();
+    preflight(&original, catalog.identity(), CUT).unwrap();
+    let mut wire = Wire::<BaseHeader>::read(&original);
+    assert_eq!(&wire.body[..2], &[0, 0]);
+    let remaining = original.len() - (wire.body_offset + 6);
+    let length = remaining + 1;
+    assert!(length <= MAX_ITEM, "the item bound must allow this length");
+    wire.body[2..6].copy_from_slice(&u32::try_from(length).unwrap().to_le_bytes());
+    let forged = wire.encode(base::MAGIC, Vec::new());
+    assert_eq!(forged.len(), original.len());
+    assert_eq!(
+        preflight(
+            &forged,
+            rebound(&forged, catalog.identity(), &wire.header.context),
+            CUT
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation input extent exceeds bound"
+    );
+}
+
+#[test]
+fn native_preflight_row_extent_is_bounded_by_item_limit() {
+    let (storage, _, _) = fixture();
+    let (files, catalog) = Files::new(&storage);
+    preflight(&files.bytes(), catalog.identity(), CUT).unwrap();
+    let mut wire = Wire::<BaseHeader>::read(&files.bytes());
+    assert_eq!(&wire.body[..2], &[0, 0]);
+    let length = MAX_ITEM + 1;
+    wire.body[2..6].copy_from_slice(&u32::try_from(length).unwrap().to_le_bytes());
+    wire.body.resize(wire.body.len() + length, 0);
+    let forged = wire.encode(base::MAGIC, Vec::new());
+    assert!(
+        forged.len() - (wire.body_offset + 6) >= length,
+        "the selected extent must allow this length"
+    );
+    assert_eq!(
+        preflight_with_maximum(
+            &forged,
+            rebound(&forged, catalog.identity(), &wire.header.context),
+            CUT,
+            forged.len() as u64
+        )
+        .unwrap_err()
+        .to_string(),
+        "native generation input extent exceeds bound"
+    );
+}
+
+#[test]
 fn native_generation_magic_separates_vocabulary_from_voter_profile() {
     for (base_frame, fixed, slots) in [
         (true, base::MAGIC, base::SLOT_MAGIC),
@@ -174,10 +264,19 @@ fn native_generation_magic_separates_vocabulary_from_voter_profile() {
 }
 
 fn preflight(bytes: &[u8], identity: PrefixIdentity, cut: [u8; 32]) -> io::Result<()> {
+    preflight_with_maximum(bytes, identity, cut, MAXIMUM)
+}
+
+fn preflight_with_maximum(
+    bytes: &[u8],
+    identity: PrefixIdentity,
+    cut: [u8; 32],
+    maximum: u64,
+) -> io::Result<()> {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("selected.native");
     std::fs::write(&path, bytes).unwrap();
-    let result = preflight_format(&path, identity, MAXIMUM, cut, &|| Ok(()));
+    let result = preflight_format(&path, identity, maximum, cut, &|| Ok(()));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     result.map(|_| ())
 }

@@ -17,6 +17,48 @@ const MAXIMUM: u64 = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
 const BLOCK: usize = 64 * 1024;
 const CUT: [u8; 32] = [0xEA; 32];
 
+#[test]
+fn native_origin_cannot_override_nonadjacent_purge() {
+    let (directory, producer, signed, wal) = fresh(Phase::Established);
+    parity(
+        &wal,
+        &producer,
+        &signed,
+        &[admission(&signed), terminal(&signed, 4)],
+    );
+    let incoming = IncomingSnapshot::with_identity(&producer.conn.blocking_lock(), signed.identity);
+    let local = empty(&signed);
+    let mut installed = copy(&local.conn.blocking_lock());
+    let origin = install(&incoming, &installed, wal.binding(), &signed);
+    assert!(origin.matches_cut(log_id(4)));
+    let path = directory.path().join("installed-origin.native");
+    let prefix = written(
+        &mut installed,
+        &path,
+        wal.binding(),
+        Arc::clone(&origin),
+        &signed,
+    );
+    let mut storage = admitted(&path, prefix, Arc::clone(&origin), &signed);
+    let suffix =
+        [5, 6].map(|index| ordinary(&signed, index, SessionMutationIntent::AdvanceLogicalTime));
+    storage
+        .log
+        .project(&append(&suffix), &storage.business, Some(log_id(4)))
+        .unwrap();
+    storage.log.validate(&storage.business).unwrap();
+    assert_eq!(storage.log.entries.get_min().unwrap().0, 5);
+    storage.log.purged = Some(log_id(2));
+    assert_eq!(
+        storage
+            .log
+            .validate(&storage.business)
+            .unwrap_err()
+            .to_string(),
+        "native retained log lacks its prefix"
+    );
+}
+
 fn empty(signed: &RosterV2PersistenceFixture) -> SqliteSessionBackend {
     let backend = SqliteSessionBackend::in_memory().unwrap();
     initialize(&backend, signed);
