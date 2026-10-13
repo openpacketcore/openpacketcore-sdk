@@ -1735,7 +1735,7 @@ async fn subtree_content_masked_composite_key_prefix_equality_has_fixed_work() {
             fixtures.push(fixture);
         }
         assert_eq!(controls[0].0, controls[1].0, "generous-budget authorized replies must be identical");
-        let limit = controls.iter().map(|(_, used)| *used).min().unwrap();
+        let limit = controls.iter().map(|(_, used, _)| *used).min().unwrap();
         let mut bounded = Vec::new();
         for fixture in &fixtures {
             let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit, ..MgmtLimits::default() }).await;
@@ -1785,7 +1785,7 @@ async fn subtree_content_masked_key_reorders_rejected_rows_without_changing_work
             fixtures.push(fixture);
         }
         assert_eq!(controls[0].0, controls[1].0, "generous-budget authorized replies must be identical");
-        let limit = controls.iter().map(|(_, used)| *used).min().unwrap();
+        let limit = controls.iter().map(|(_, used, _)| *used).min().unwrap();
         let mut bounded = Vec::new();
         for fixture in &fixtures {
             let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit, ..MgmtLimits::default() }).await;
