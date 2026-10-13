@@ -69,6 +69,69 @@ Composite key diagnostics redact individual sensitive fields. Calling
 `redact_sensitive()` continues to hash the map key and corresponding row leaf
 together.
 
+### Integer widths, names, and string restrictions
+
+All eight YANG integer types are supported with exact ranges through `u64::MAX`.
+Generated `YangInt64` and `YangUint64` wrappers encode RFC 7951 JSON values as
+strings; smaller integers encode as numbers. XML uses decimal text. Declared
+ranges are checked during JSON load, syntax validation, patches, gNMI Set, and
+NETCONF edits, including list keys, leaf-lists, and resolved leafrefs.
+Integer defaults use the YANG decimal, leading-zero octal, and `0x` hexadecimal
+notations for every width, including optional signs; their decoded values must
+satisfy the type and declared range. Protocol integer values remain decimal.
+In models using the new scalar constructs, malformed integer values and JSON
+structures receive fixed reasons that never include a supplied value. Subtree
+merges validate their typed JSON before applying fields. Models that use any of
+the added integer widths compare integer operands in an `i128` domain, including
+public constraint IR constants outside a leaf's storage range and chained
+references.
+List-entry Merge, Update, and Replace calls without a value still assign every
+path key to its key leaf and enforce its declared constraints before committing.
+
+Containers and lists with a shared local name receive deterministic names
+qualified by their parents, with stable suffixes for remaining collisions.
+Composite-key names and generated helper functions use the same name index.
+Case-distinct paths have separate pattern caches; references reuse the cache of
+their resolved scalar declaration.
+The legacy output fixtures retain every generated file byte for byte. Source
+quoting and integer-default decoding corrections apply to every model.
+
+String `length` uses Unicode scalar counts and supports disjoint intervals,
+`min`, and `max`. Multiple `pattern` statements are combined with AND; each
+matches the whole value using XSD semantics, with `modifier invert-match`
+negating that one pattern. Defaults must satisfy the restrictions. Generated
+JSON load, direct syntax validation, patches, gNMI Set, and NETCONF edits enforce
+them on leaves, leaf-lists, keys, and leafrefs. Failed writes are atomic and
+return the existing typed error with a fixed reason that includes no value.
+
+Source arguments follow [RFC 7950 section 6.1.3](https://www.rfc-editor.org/rfc/rfc7950.html#section-6.1.3):
+single-quoted and unquoted strings preserve their characters, including `+` in
+unquoted patterns. Concatenation joins only quoted strings. Double quotes permit
+only `\n`, `\t`, `\"`, and `\\` escapes; other escapes are rejected. Physical
+line indentation and trailing whitespace are trimmed before escape substitution
+and concatenation. Write a digit pattern as `'\d+'` or `"\\d+"`.
+
+The supported XSD grammar includes grouping, alternation, bounded and unbounded
+repetition, character ranges and subtraction, negated classes, Unicode general
+categories, and XSD whitespace/digit/word escapes. `^` and `$` are literal
+characters. XML-name escapes (`\i`, `\c` and complements) and Unicode-block
+escapes (`\p{Is...}`) are explicitly rejected as unsupported; malformed patterns
+and constructs from other regex dialects are rejected at generation time.
+
+Pattern matching uses `regex` 1.13.1 (MIT OR Apache-2.0), already present in the
+workspace lockfile and now a direct dependency of `opc-mgmt-schema`. A bounded
+XSD translator prevents the engine's different syntax from changing semantics.
+Each pattern is limited to 4,096 source bytes, 64 nesting levels, and 1 MiB each
+for compiled automaton and DFA cache; a string type may declare at most 64
+patterns. Generated `OnceLock` storage compiles each declared pattern once and
+shares it with leafrefs. No regex dependency is added to generated manifests.
+
+`NumericRangeInterval` in the generator IR now uses `i128` bounds; callers with
+typed `i64` bounds must convert them with `.into()`. New `TypeRef` variants cover
+the additional integer widths and restricted strings, so exhaustive matches
+must handle them. Runtime registries add `integer_ranges()`/`integer_range()`
+with `i128` bounds while preserving the legacy `i64` numeric-range API.
+
 ## Relationships
 
 - Emits implementations consumed by `opc-config-model`,

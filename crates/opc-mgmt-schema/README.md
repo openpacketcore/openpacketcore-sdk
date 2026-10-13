@@ -38,6 +38,20 @@ fn accepts_path(registry: &dyn SchemaRegistry, schema_path: &str) -> bool {
 lookup indexes, discovery metadata, module/origin lookup, key-leaf metadata,
 numeric ranges, defaults, NACM actions, and self-check behavior.
 
+`IntegerRangeIntervalMeta` and `NodeIntegerRangeMeta` expose exact `i128`
+integer bounds through `integer_ranges()` and `integer_range()`, including
+`uint64` limits. The existing `NumericRangeIntervalMeta` and numeric-range
+methods keep their `i64` types; existing generated registries remain compatible.
+
+The `string_constraints` module provides bounded whole-value XSD pattern
+matching for generated string validators. It translates the supported XSD
+grammar to `regex` 1.13.1 (MIT OR Apache-2.0), an existing workspace dependency.
+Generated code caches each compiled pattern in `OnceLock`. Source patterns
+are limited to 4,096 bytes and 64 nesting levels; compilation and DFA caching
+each have a 1 MiB bound. XML-name escapes and Unicode-block escapes are rejected
+explicitly. Errors never contain the expression or candidate value. See the
+[generator's supported grammar](../opc-yanggen/README.md#integer-widths-names-and-string-restrictions).
+
 ## Relationships
 
 - `opc-yanggen` emits registry implementations for generated CNF models.

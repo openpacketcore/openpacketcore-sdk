@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-yanggen`: `NumericRangeInterval` IR bounds are now `i128` to represent
+  all YANG integer limits; convert typed `i64` inputs with `.into()`. `TypeRef`
+  adds integer-width and restricted-string variants. Existing runtime `i64`
+  range metadata remains compatible. (#1006, #1263)
+
 - `opc-proto-nas`: `MmMessageBody::ConfigurationUpdateCommand` and
   `MmMessageBody::ConfigurationUpdateComplete` now carry the typed
   `ConfigurationUpdateCommand` and `ConfigurationUpdateComplete` structs
@@ -32,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error for Configuration Update Command/Complete bodies.
 
 ### Added
+
+- `opc-yanggen`: support all eight integer widths, exact declared ranges,
+  RFC 7951 strings for 64-bit values, and deterministic distinct Rust types for
+  nested nodes sharing a local name. Support Unicode string lengths, multiple
+  whole-value XSD patterns, and `invert-match` across load and generated writes,
+  with fixed value-free errors. Pattern compilation is bounded and cached once
+  through `opc-mgmt-schema` using `regex` (MIT OR Apache-2.0); XML-name and
+  Unicode-block escapes fail closed as unsupported. Models using none of these
+  new constructs retain byte-identical generated files. (#1006, #1263)
+  Source quoting preserves pattern characters and enforces RFC 7950 escapes,
+  whitespace trimming, and quoted concatenation. Value-less list-entry patches
+  assign and validate path keys, and integer defaults decode octal and
+  hexadecimal notation for every width.
 
 - `opc-proto-nas`: frame optional elements with complete per-message tables
   from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),
