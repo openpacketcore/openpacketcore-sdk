@@ -561,8 +561,8 @@ fn generate_leafref_check(
 
     let insert_expr = if target_node.config {
         quote! {
-            if let Some(ref v) = #target_access.as_option() {
-                #set_ident.insert((*v).clone());
+            if let Some(v) = #target_access.as_option() {
+                #set_ident.insert(v.clone());
             }
         }
     } else {
@@ -646,23 +646,12 @@ fn generate_leafref_check(
     };
 
     let validate_expr = if leaf_node.kind == SchemaNodeKind::LeafList {
-        let missing_error = if is_leaf_sensitive {
-            quote! {
-                ValidationError::semantics(format!(
-                    "Leaf-list value at index {} not found in target path {}",
-                    index,
-                    #target_path,
-                ))
-            }
-        } else {
-            quote! {
-                ValidationError::semantics(format!(
-                    "Leaf-list value {:?} at index {} not found in target path {}",
-                    v,
-                    index,
-                    #target_path,
-                ))
-            }
+        let missing_error = quote! {
+            ValidationError::semantics(format!(
+                "Leaf-list value at index {} not found in target path {}",
+                index,
+                #target_path,
+            ))
         };
         quote! {
             for (index, v) in #leaf_access.iter().enumerate() {

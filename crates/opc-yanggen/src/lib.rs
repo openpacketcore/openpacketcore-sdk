@@ -22,6 +22,9 @@
 //! deserialization, syntax validation, patches, gNMI Set, and NETCONF edits.
 //! Source quoting preserves literal strings, restricts double-quoted escapes,
 //! trims physical double-quoted lines, and concatenates only quoted strings.
+//!
+//! Generated patch errors and leafref leaf-list validation errors omit input
+//! keys and values from their messages, `Display`, and `Debug` output.
 
 pub mod diagnostic;
 pub mod emit;

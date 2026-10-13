@@ -64,8 +64,9 @@ extraction and edit helpers use that optional representation, including
 sensitive key wrappers. Read-only rows and nested containers with no
 configuration differences emit warning-free no-op diff helpers. Normal patch
 and NETCONF XML admission continue to reject writes to state paths.
-Invalid-path and read-only patch admission errors use stable messages without
-instance paths or key values, including their `Display` and `Debug` output.
+Patch errors use stable messages without instance paths, input field names, or
+values, including their `Display` and `Debug` output. This covers invalid and
+read-only paths, numeric parsing, JSON decoding, and unsupported fields.
 Configuration diffs exclude every read-only node kind, including removed rows, containers,
 keyless lists and leaf-lists; writable siblings still emit their own deltas.
 Generated modules for these schemas are checked with Clippy warnings denied.
@@ -163,8 +164,8 @@ Current scope:
   the supported OpenPacketCore YANG subset.
 - Absolute `leafref` validation for both scalar leaves and leaf-lists. Generated
   leaf-list checks validate every element against the referenced target set and
-  identify the unresolved element and its index without changing scalar-leaf
-  behavior. Empty leaf-lists require no matching target value.
+  identify the unresolved element's index and target schema path without
+  including its value. Empty leaf-lists require no matching target value.
 - Fail-closed diagnostics for unsupported or unsafe constructs.
 
 Known constraints:

@@ -686,8 +686,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extracting or assigning keys of `config false` lists, including composite
   and sensitive keys. Emit warning-free state-list helpers and statement
   boundaries; omit state data from configuration diffs for every node kind,
-  including collection removals. Keep invalid-path and read-only patch
-  diagnostics free of instance paths and key values. Compile generated fixtures
+  including collection removals. Keep patch diagnostics free of input field
+  names, instance paths, and values, including JSON and numeric decoding.
+  Leafref leaf-list validation errors identify the index and target schema
+  without including the referenced value. Compile generated fixtures
   and check them with Clippy warnings denied (#1268).
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install

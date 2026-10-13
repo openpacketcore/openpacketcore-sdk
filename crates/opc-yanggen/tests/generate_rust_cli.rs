@@ -344,7 +344,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "patch.rs",
-            "0d7d5d4b3004e2e5cbd3de7822f89854da4395e4bcbb4cdf2ade50fd40fbd658",
+            "2d08d6ffe3b0b30eb090009a39afeafe96e0ae75976b7f86880050f123a448ee",
         ),
         (
             "paths.rs",

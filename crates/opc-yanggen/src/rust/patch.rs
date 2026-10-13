@@ -42,14 +42,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         )
     } else {
         (
-            quote! { |e| config_error("invalid-value", e.to_string()) },
+            quote! { |_| config_error("invalid-value", "invalid JSON value") },
             quote! {},
         )
     };
     let integer_error = if normalize_errors {
         quote! { |_| config_error("invalid-value", "invalid integer value") }
     } else {
-        quote! { |e| config_error("invalid-value", e.to_string()) }
+        quote! { |_| config_error("invalid-value", "invalid numeric value") }
     };
     let validate_merge = if normalize_errors {
         quote! { let _: Self = serde_json::from_str(v).map_err(#json_error)?; }
@@ -195,7 +195,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             let parsed = YangInt64(_v.parse::<i64>().map_err(#integer_error)?);
                         },
                         Some(TypeRef::Decimal64) => quote! {
-                            let parsed = YangDecimal64(_v.parse::<f64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                            let parsed = YangDecimal64(_v.parse::<f64>().map_err(|_| config_error("invalid-value", "invalid numeric value"))?);
                         },
                         Some(TypeRef::Empty) => quote! {
                             let parsed = YangEmpty;
@@ -245,7 +245,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 #child_name_str => {
                                     #reject_ordered_target
                                     if segments.len() > 1 {
-                                        return Err(config_error("invalid-path", format!("path goes deeper than leaf: {}", cleaned_name)));
+                                        return Err(config_error("invalid-path", "path goes deeper than leaf"));
                                     }
                                     match op {
                                         ConfigOp::Delete | ConfigOp::Remove => {
@@ -730,7 +730,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     let parsed_elem = YangInt64(v.parse::<i64>().map_err(#integer_error)?);
                                 },
                                 Some(TypeRef::Decimal64) => quote! {
-                                    let parsed_elem = YangDecimal64(v.parse::<f64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                    let parsed_elem = YangDecimal64(v.parse::<f64>().map_err(|_| config_error("invalid-value", "invalid numeric value"))?);
                                 },
                                 Some(TypeRef::Empty) => quote! {
                                     let parsed_elem = YangEmpty;
@@ -1045,7 +1045,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 } else {
                                                     val.to_string()
                                                 };
-                                                let segs = parse_path(&k).map_err(|e| config_error("invalid-path", e))?;
+                                                let segs = parse_path(&k).map_err(|_| config_error("invalid-path", "invalid path"))?;
                                                 self.#apply_segments(op, &segs, Some(&val_str) #ordered_argument)?;
                                             }
                                             return Ok(());
@@ -1065,7 +1065,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         match cleaned_name {
                             #field_arms
                             _ => {
-                                return Err(config_error("unsupported-path", format!("unsupported field: {}", cleaned_name)));
+                                return Err(config_error("unsupported-path", "unsupported field"));
                             }
                         }
                         Ok(())
@@ -1317,7 +1317,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     ConfigDelta::Remove(p) => (p, ConfigOp::Remove, None #ordered_none),
                     #ordered_apply_arm
                 };
-                let segments = parse_path(path.as_str()).map_err(|e| config_error("invalid-path", e))?;
+                let segments = parse_path(path.as_str()).map_err(|_| config_error("invalid-path", "invalid path"))?;
                 if segments.is_empty() {
                     return Err(config_error("invalid-path", "Path is empty"));
                 }

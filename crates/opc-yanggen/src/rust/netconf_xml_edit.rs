@@ -530,9 +530,16 @@ fn apply_leaf_list_fn(
 
     let parse_expr = parse_leaf_value_expr(node, nodes_by_path)?;
     let key_expr = leaf_list_value_key_expr(node, nodes_by_path)?;
+    let key_value_type = match resolved_type(node, nodes_by_path) {
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
+        | Some(TypeRef::IdentityRef { .. })
+        | Some(TypeRef::LeafRef { .. })
+        | Some(TypeRef::Enumeration { .. }) => quote! { str },
+        _ => element_type.clone(),
+    };
 
     Ok(quote! {
-        fn #key_fn_ident(value: &#element_type) -> String {
+        fn #key_fn_ident(value: &#key_value_type) -> String {
             #key_expr
         }
 
@@ -663,7 +670,7 @@ fn leaf_list_value_key_expr(
         Some(TypeRef::String | TypeRef::RestrictedString { .. })
         | Some(TypeRef::IdentityRef { .. })
         | Some(TypeRef::LeafRef { .. })
-        | Some(TypeRef::Enumeration { .. }) => Ok(quote! { value.clone() }),
+        | Some(TypeRef::Enumeration { .. }) => Ok(quote! { value.to_owned() }),
         Some(TypeRef::Custom { .. }) | None => Err(RustGenerationError::new(format!(
             "netconf_xml_edit: unsupported leaf-list type at {}",
             node.path
