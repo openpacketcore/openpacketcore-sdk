@@ -64,6 +64,9 @@ extraction and edit helpers use that optional representation, including
 sensitive key wrappers. Read-only rows with no configuration differences
 emit warning-free no-op diff helpers. Normal patch and NETCONF XML admission
 continue to reject writes to state paths.
+Generated modules for these schemas are checked with Clippy warnings denied.
+Their block boundaries preserve literal contents and punctuation; existing
+supported schemas retain their generated output bytes.
 
 Key leaves with a non-public `opc:data-class` remain available to serde,
 ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`

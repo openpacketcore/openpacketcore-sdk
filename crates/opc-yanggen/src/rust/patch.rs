@@ -14,6 +14,7 @@ fn is_sensitive_node(node: &SchemaNode) -> bool {
 }
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let root = input
         .nodes
         .iter()
@@ -479,9 +480,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                 let key_field_ident = format_ident!("{}", to_snake_case(key_leaf));
                                 let key_is_sensitive = is_sensitive_node(key_leaf_node);
+                                let cloned_key = super::types::cloned_key_value(
+                                    key_leaf_node,
+                                    &nodes_by_path,
+                                    quote! { parsed_key },
+                                    has_state_lists,
+                                );
                                 let key_value = super::types::explicit_leaf_value(
                                     key_leaf_node,
-                                    quote! { parsed_key.clone() },
+                                    cloned_key.clone(),
                                 );
                                 let key_assign =
                                     quote! { parsed_item.#key_field_ident = #key_value; };
@@ -493,9 +500,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     quote! {}
                                 };
                                 let map_key = if key_is_sensitive {
-                                    quote! { SensitiveKey::from(parsed_key.clone()) }
+                                    quote! { SensitiveKey::from(#cloned_key) }
                                 } else {
-                                    quote! { parsed_key.clone() }
+                                    cloned_key
                                 };
 
                                 quote! {
@@ -601,12 +608,18 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                     let key_field_ident =
                                         format_ident!("{}", to_snake_case(key_leaf));
+                                    let cloned_key = super::types::cloned_key_value(
+                                        key_leaf_node,
+                                        &nodes_by_path,
+                                        quote! { #key_ident },
+                                        has_state_lists,
+                                    );
                                     key_fields.extend(quote! {
-                                        #key_field_ident: #key_ident.clone(),
+                                        #key_field_ident: #cloned_key,
                                     });
                                     let key_value = super::types::explicit_leaf_value(
                                         key_leaf_node,
-                                        quote! { #key_ident.clone() },
+                                        cloned_key,
                                     );
                                     key_assigns.push(
                                         quote! { parsed_item.#key_field_ident = #key_value; },
@@ -869,6 +882,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 };
                                 let key_bracket_construction_prev =
                                     key_bracket_construction.clone();
+                                let previous_keys = if has_state_lists {
+                                    quote! { k in previous.#field_ident.keys() }
+                                } else {
+                                    quote! { (k, _) in &previous.#field_ident }
+                                };
 
                                 let keyed_diff = quote! {
                                     let list_path = format!("{}/{}", _path_prefix, #child_segment_str);
@@ -881,7 +899,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             cur_val.diff_segments(&Default::default(), &entry_path, deltas)?;
                                         }
                                     }
-                                    for (k, _) in &previous.#field_ident {
+                                    for #previous_keys {
                                         if !self.#field_ident.contains_key(k) {
                                             #key_bracket_construction_prev
                                             let entry_path = format!("{}{}", list_path, key_bracket_str);

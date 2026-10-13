@@ -30,6 +30,43 @@ pub(super) fn explicit_leaf_value(node: &SchemaNode, value: TokenStream) -> Toke
     }
 }
 
+/// Copies scalar keys in state-list models and clones keys that own data.
+/// Other models retain their established emitted bytes.
+pub(super) fn cloned_key_value(
+    node: &SchemaNode,
+    nodes_by_path: &NodeIndex<'_>,
+    value: TokenStream,
+    has_state_lists: bool,
+) -> TokenStream {
+    let raw_type = get_raw_type(node, nodes_by_path).to_string();
+    if has_state_lists
+        && matches!(
+            raw_type.as_str(),
+            "bool"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "YangUint64"
+                | "YangInt64"
+                | "YangDecimal64"
+                | "YangEmpty"
+        )
+    {
+        value
+    } else {
+        quote! { #value.clone() }
+    }
+}
+
 fn get_raw_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     get_raw_type_internal(node, nodes_by_path, &mut std::collections::HashSet::new())
 }
@@ -138,6 +175,7 @@ fn normalized_deserializer(struct_name: &proc_macro2::Ident, fields: &TokenStrea
 }
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let mut tokens = TokenStream::new();
     let nodes_by_path = NodeIndex::new(&input.nodes);
     let normalize_errors =
@@ -373,6 +411,26 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
     };
 
+    let (presence_default_derive, absent_default, presence_default_impl) = if has_state_lists {
+        (
+            quote! { #[derive(Default)] },
+            quote! { #[default] },
+            quote! {},
+        )
+    } else {
+        (
+            quote! {},
+            quote! {},
+            quote! {
+                impl<T: Default> Default for LeafPresence<T> {
+                    fn default() -> Self {
+                        Self::Absent
+                    }
+                }
+            },
+        )
+    };
+
     // Emit helper types
     tokens.extend(quote! {
         use serde::{Serialize, Deserialize};
@@ -435,7 +493,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #[derive(Clone, PartialEq)]
+        #presence_default_derive
         pub enum LeafPresence<T> {
+            #absent_default
             Absent,
             Defaulted(T),
             Explicit(T),
@@ -468,11 +528,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 matches!(self, Self::Absent)
             }
         }
-        impl<T: Default> Default for LeafPresence<T> {
-            fn default() -> Self {
-                Self::Absent
-            }
-        }
+        #presence_default_impl
         impl<T: Serialize> Serialize for LeafPresence<T> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where

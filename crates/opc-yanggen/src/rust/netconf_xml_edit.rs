@@ -19,6 +19,7 @@ use quote::{format_ident, quote};
 
 /// Emits the `netconf_xml_edit` module for the generated crate.
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let nodes_by_path = NodeIndex::new(&input.nodes);
 
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
@@ -55,7 +56,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // apply_children_<list> helper is in scope.
     for node in &sorted_nodes {
         if node.kind == SchemaNodeKind::List {
-            apply_fns.push(apply_list_fn(node, &nodes_by_path)?);
+            apply_fns.push(apply_list_fn(node, &nodes_by_path, has_state_lists)?);
         }
     }
 
@@ -144,6 +145,7 @@ fn apply_children_fn(
     nodes_by_path: &NodeIndex<'_>,
     input: &CanonicalInput,
 ) -> Result<TokenStream, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let fn_ident = format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
     let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
@@ -264,6 +266,11 @@ fn apply_children_fn(
                 } else {
                     quote! { #child_type_ident::default() }
                 };
+                let default_constructor = if has_state_lists && !is_boxed {
+                    quote! { #child_type_ident::default }
+                } else {
+                    quote! { || #new_expr }
+                };
                 let children_fn_ident =
                     format_ident!("apply_children_{}", nodes_by_path.helper_name(&child.path));
                 quote! {
@@ -295,7 +302,7 @@ fn apply_children_fn(
                                 value.#field_ident = Some(new_container);
                             }
                             EditOperation::Merge => {
-                                let container = value.#field_ident.get_or_insert_with(|| #new_expr);
+                                let container = value.#field_ident.get_or_insert_with(#default_constructor);
                                 #children_fn_ident(&child.children, container)?;
                             }
                             EditOperation::None => {
@@ -386,6 +393,21 @@ fn apply_children_fn(
     let check_singletons = if singleton_paths.is_empty() {
         TokenStream::new()
     } else {
+        let singleton_arm = if has_state_lists {
+            quote! {
+                #(#singleton_paths)|* if !singletons.insert(child.schema_path) => {
+                    return Err(NetconfEditError::InvalidValue { path: child.schema_path });
+                }
+            }
+        } else {
+            quote! {
+                #(#singleton_paths)|* => {
+                    if !singletons.insert(child.schema_path) {
+                        return Err(NetconfEditError::InvalidValue { path: child.schema_path });
+                    }
+                }
+            }
+        };
         quote! {
             // RFC 6241 section 7.2 leaves repeated operations on one
             // conceptual node undefined. Reject them before applying children;
@@ -393,11 +415,7 @@ fn apply_children_fn(
             let mut singletons = std::collections::BTreeSet::new();
             for child in children {
                 match child.schema_path {
-                    #(#singleton_paths)|* => {
-                        if !singletons.insert(child.schema_path) {
-                            return Err(NetconfEditError::InvalidValue { path: child.schema_path });
-                        }
-                    }
+                    #singleton_arm
                     _ => {}
                 }
             }
@@ -426,6 +444,29 @@ fn apply_children_fn(
             "_value"
         }
     );
+    let apply_child = quote! {
+        match child.schema_path {
+            #arms
+            _ => {
+                return Err(NetconfEditError::UnknownPath(
+                    child.schema_path.to_string(),
+                ));
+            }
+        }
+    };
+    let apply_children = if rejects_every_child {
+        quote! {
+            if let Some(child) = children.first() {
+                #apply_child
+            }
+        }
+    } else {
+        quote! {
+            for child in children {
+                #apply_child
+            }
+        }
+    };
 
     Ok(quote! {
         fn #fn_ident(
@@ -435,16 +476,7 @@ fn apply_children_fn(
             #check_singletons
             #list_key_sets
             #leaf_list_grouping
-            for child in children {
-                match child.schema_path {
-                    #arms
-                    _ => {
-                        return Err(NetconfEditError::UnknownPath(
-                            child.schema_path.to_string(),
-                        ));
-                    }
-                }
-            }
+            #apply_children
             Ok(())
         }
     })
@@ -645,6 +677,7 @@ fn leaf_list_value_key_expr(
 fn apply_list_fn(
     node: &SchemaNode,
     nodes_by_path: &NodeIndex<'_>,
+    has_state_lists: bool,
 ) -> Result<TokenStream, RustGenerationError> {
     let fn_ident = format_ident!("apply_{}", nodes_by_path.helper_name(&node.path));
     let children_fn_ident =
@@ -670,8 +703,11 @@ fn apply_list_fn(
 
     let mut parse_keys = Vec::new();
     let mut key_assigns = Vec::new();
+    let mut key_initializers = Vec::new();
     let mut key_struct_fields = Vec::new();
     let mut single_key_is_sensitive = false;
+    let mut cloned_parsed = quote! { parsed.clone() };
+    let mut cloned_map_key = quote! { parsed_key.clone() };
 
     if node.key_leaves.len() == 1 {
         let key_leaf = &node.key_leaves[0];
@@ -694,13 +730,28 @@ fn apply_list_fn(
         });
         let is_sensitive = is_sensitive_node(key_leaf_node);
         single_key_is_sensitive = is_sensitive;
+        cloned_parsed = super::types::cloned_key_value(
+            key_leaf_node,
+            nodes_by_path,
+            quote! { parsed },
+            has_state_lists,
+        );
+        if !is_sensitive {
+            cloned_map_key = super::types::cloned_key_value(
+                key_leaf_node,
+                nodes_by_path,
+                quote! { parsed_key },
+                has_state_lists,
+            );
+        }
         let raw_key = if is_sensitive {
-            quote! { parsed.clone() }
+            cloned_parsed.clone()
         } else {
-            quote! { parsed_key.clone() }
+            cloned_map_key.clone()
         };
         let key_value = super::types::explicit_leaf_value(key_leaf_node, raw_key);
         key_assigns.push(quote! { entry.#key_field_ident = #key_value; });
+        key_initializers.push(quote! { #key_field_ident: #key_value, });
     } else {
         for key_leaf in &node.key_leaves {
             let key_bare = clean_segment(key_leaf);
@@ -722,17 +773,25 @@ fn apply_list_fn(
                 #parse
                 let #key_field_ident = parsed;
             });
-            key_struct_fields.push(quote! { #key_field_ident: #key_field_ident.clone() });
-            let key_value = super::types::explicit_leaf_value(
+            let cloned_key = super::types::cloned_key_value(
                 key_leaf_node,
-                quote! { #key_field_ident.clone() },
+                nodes_by_path,
+                quote! { #key_field_ident },
+                has_state_lists,
             );
+            key_struct_fields.push(if cloned_key.to_string() == key_field_ident.to_string() {
+                quote! { #key_field_ident }
+            } else {
+                quote! { #key_field_ident: #cloned_key }
+            });
+            let key_value = super::types::explicit_leaf_value(key_leaf_node, cloned_key);
             key_assigns.push(quote! { entry.#key_field_ident = #key_value; });
+            key_initializers.push(quote! { #key_field_ident: #key_value, });
         }
     }
 
     let build_key = if node.key_leaves.len() == 1 && single_key_is_sensitive {
-        quote! { let parsed_key = SensitiveKey::from(parsed.clone()); }
+        quote! { let parsed_key = SensitiveKey::from(#cloned_parsed); }
     } else if node.key_leaves.len() == 1 {
         quote! { let parsed_key = parsed; }
     } else {
@@ -762,6 +821,24 @@ fn apply_list_fn(
     } else {
         quote! { map.insert(parsed_key, entry); }
     };
+    let new_entry = if has_state_lists {
+        let remaining_fields = if node.child_paths.len() == node.key_leaves.len() {
+            quote! {}
+        } else {
+            quote! { ..Default::default() }
+        };
+        quote! {
+            let mut entry = #entry_type_ident {
+                #(#key_initializers)*
+                #remaining_fields
+            };
+        }
+    } else {
+        quote! {
+            let mut entry = #entry_type_ident::default();
+            #(#key_assigns)*
+        }
+    };
 
     Ok(quote! {
         fn #fn_ident(
@@ -788,7 +865,7 @@ fn apply_list_fn(
             // spellings can address the same typed list entry. A separate
             // set for each sibling list prevents repeated parents from
             // hiding duplicate or conflicting leaf-list entry operations.
-            if !edit_keys.insert(parsed_key.clone()) {
+            if !edit_keys.insert(#cloned_map_key) {
                 return Err(NetconfEditError::InvalidValue { path: node.schema_path });
             }
             match node.operation {
@@ -812,19 +889,17 @@ fn apply_list_fn(
                             kind: NodeKind::List,
                         });
                     }
-                    let mut entry = #entry_type_ident::default();
-                    #(#key_assigns)*
+                    #new_entry
                     #children_fn_ident(&node.children, &mut entry)?;
                     #upsert
                 }
                 EditOperation::Replace => {
-                    let mut entry = #entry_type_ident::default();
-                    #(#key_assigns)*
+                    #new_entry
                     #children_fn_ident(&node.children, &mut entry)?;
                     #upsert
                 }
                 EditOperation::Merge => {
-                    let entry = map.entry(parsed_key.clone()).or_default();
+                    let entry = map.entry(#cloned_map_key).or_default();
                     #(#key_assigns)*
                     #children_fn_ident(&node.children, entry)?;
                 }
@@ -832,8 +907,7 @@ fn apply_list_fn(
                     if let Some(entry) = map.get_mut(&parsed_key) {
                         #children_fn_ident(&node.children, entry)?;
                     } else if node.children.iter().any(|child| child.operation != EditOperation::None) {
-                        let mut entry = #entry_type_ident::default();
-                        #(#key_assigns)*
+                        #new_entry
                         let baseline = entry.clone();
                         #children_fn_ident(&node.children, &mut entry)?;
                         if entry != baseline {
