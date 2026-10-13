@@ -53,6 +53,12 @@ to material XML selections without turning a structural parent into permission
 to read children. Multi-registry reads share one `ResolvedPolicy` through
 `authorize_selection_resolved`.
 
+Use `authorize_event_selection_resolved` for per-event subscription checks.
+It evaluates the same complete dependency batch against the supplied context
+without emitting decision traces that would reveal denied-event activity.
+Requests, snapshots, and independent authorization-control reevaluations keep
+using the ordinary traced selection API.
+
 A live `PolicySource` must implement `watch_authorization` using one
 `AuthorizationChangeHub` for its authorization context. Register the watch and
 resolve its initial context together with `hub.register(gate, || resolve())`.

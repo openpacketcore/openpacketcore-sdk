@@ -253,6 +253,12 @@ pub struct WritePathDecision {
     pub allowed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ReadTrace {
+    Emit,
+    Suppress,
+}
+
 /// Read-side NACM authorizer over a schema registry and a tenant policy source.
 pub struct ReadAuthorizer<'r, P: PolicySource> {
     registry: &'r dyn SchemaRegistry,
@@ -321,6 +327,16 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
         action: ReadAction,
         paths: &[&str],
     ) -> Vec<PathDecision> {
+        self.authorize_resolved_with_trace(resolved, action, paths, ReadTrace::Emit)
+    }
+
+    fn authorize_resolved_with_trace(
+        &self,
+        resolved: &ResolvedPolicy,
+        action: ReadAction,
+        paths: &[&str],
+        trace: ReadTrace,
+    ) -> Vec<PathDecision> {
         let policy = &resolved.policy;
         let authz_principal = &resolved.principal;
         let nacm_action = action.to_nacm();
@@ -359,13 +375,15 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
                 }
             })
             .collect();
-        trace_read_decisions(
-            authz_principal,
-            policy,
-            resolved.mode.as_deref(),
-            nacm_action,
-            &decisions,
-        );
+        if matches!(trace, ReadTrace::Emit) {
+            trace_read_decisions(
+                authz_principal,
+                policy,
+                resolved.mode.as_deref(),
+                nacm_action,
+                &decisions,
+            );
+        }
         decisions
     }
 

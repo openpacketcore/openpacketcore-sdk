@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use opc_config_model::TrustedPrincipal;
 use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
-use crate::{AuthzError, PathDecision, PolicySource, ReadAction, ReadAuthorizer, ResolvedPolicy};
+use crate::{
+    AuthzError, PathDecision, PolicySource, ReadAction, ReadAuthorizer, ReadTrace, ResolvedPolicy,
+};
 
 /// One requested schema node, before any stored values are inspected.
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +124,45 @@ impl<P: PolicySource> ReadAuthorizer<'_, P> {
         requested: &[ReadNode<'_>],
         previously_permitted: &BTreeSet<String>,
     ) -> AuthorizedReadSelection {
+        self.authorize_selection_resolved_with_trace(
+            resolved,
+            action,
+            requested,
+            previously_permitted,
+            ReadTrace::Emit,
+        )
+    }
+
+    /// Evaluates a subscription event without emitting authorization traces.
+    ///
+    /// Uses the same caller-owned policy context, evaluator, and complete schema
+    /// dependency batch as [`Self::authorize_selection_resolved`]. Suppressing
+    /// per-event traces prevents a denied event from revealing hidden activity.
+    /// Requests, snapshots, and independent authorization-control reevaluations
+    /// must use the ordinary traced entry point instead.
+    pub fn authorize_event_selection_resolved(
+        &self,
+        resolved: &ResolvedPolicy,
+        requested: &[ReadNode<'_>],
+        previously_permitted: &BTreeSet<String>,
+    ) -> AuthorizedReadSelection {
+        self.authorize_selection_resolved_with_trace(
+            resolved,
+            ReadAction::Subscribe,
+            requested,
+            previously_permitted,
+            ReadTrace::Suppress,
+        )
+    }
+
+    fn authorize_selection_resolved_with_trace(
+        &self,
+        resolved: &ResolvedPolicy,
+        action: ReadAction,
+        requested: &[ReadNode<'_>],
+        previously_permitted: &BTreeSet<String>,
+        trace: ReadTrace,
+    ) -> AuthorizedReadSelection {
         let registry = self.registry();
         let requirements = requested
             .iter()
@@ -156,7 +197,7 @@ impl<P: PolicySource> ReadAuthorizer<'_, P> {
             batch.extend(requirement.paths.iter().copied());
         }
         let batch = batch.into_iter().collect::<Vec<_>>();
-        let decisions = self.authorize_resolved(resolved, action, &batch);
+        let decisions = self.authorize_resolved_with_trace(resolved, action, &batch, trace);
         let allowed = batch
             .iter()
             .copied()

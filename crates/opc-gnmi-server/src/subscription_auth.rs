@@ -151,12 +151,8 @@ impl StreamAuthorization {
             };
             let authz = ReadAuthorizer::new(self.registry, self.source.as_ref())
                 .map_err(|_| authorization_failure())?;
-            let selection = authz.authorize_selection_resolved(
-                &resolved,
-                ReadAction::Subscribe,
-                &requested,
-                &previous,
-            );
+            let selection =
+                authz.authorize_event_selection_resolved(&resolved, &requested, &previous);
             if selection
                 .decisions
                 .last()
