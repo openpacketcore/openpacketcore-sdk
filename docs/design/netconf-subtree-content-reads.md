@@ -91,8 +91,14 @@ their capture position to preserve distinct members and deduplicate overlaps.
 Masked list keys enter the captured tree as fixed-width SHA-256 identities,
 computed identically by configuration and state capture and retained only for
 this request. Joins, copies, deduplication and ordering checks charge those
-identities, never the hidden key lengths. Hashing itself has a fixed admission
-charge; it makes no timing claim. Raw provider keys remain available only for
+identities, never the hidden key lengths. Identity phases first measure the
+complete captured input structure and reserve a checked worst-case bound for
+all tuple components, candidate pairs, descendant searches and vector moves.
+An equal prefix or an early matching row cannot reduce that reservation, and
+unused work is not refunded. Sibling alternatives and provider instances are
+merged as complete batches so an earlier match cannot change the size of a
+later reservation. Hashing itself has a fixed admission charge; it makes no
+timing claim. Raw provider keys remain available only for
 mandatory canonical-path and key/payload consistency validation, under the
 independent provider byte caps. That validation charges public path bytes and
 fixed units for masked keys, without retaining raw keys for matching. Predicate
@@ -136,7 +142,8 @@ After complete validation, state instances are ordered by raw canonical path.
 The shared budget precharges the sort's worst-case comparison and move count
 using the fixed-width captured identities, so hidden key lengths and raw sort
 order cannot affect the allowance. Merging retains configuration order for
-existing instances.
+existing instances. Provider duplicate-path, selector and key searches also
+reserve their complete candidate comparisons before an early match or refusal.
 `OperationalValue` validates JSON at construction and retains its shape with
 the immutable payload. Masked non-key state selections check this proof before
 capturing only the fixed placeholder. Complete provider byte and count limits
@@ -163,6 +170,16 @@ rejects a node, consumes work before checking selection. Authorization builds
 one bounded, sorted set of structural prefixes; subsequent exact and structural
 lookups charge every binary-search probe instead of scanning all plan paths.
 
+Identity merging and final ordering use complete-phase reservations. Sizing
+visits are charged before reading capture metadata; the reservation depends on
+node/key counts, schema paths and retained byte lengths only. Captured masked
+identities have a fixed width. The merge bound covers all candidate identity
+and scalar comparisons, schema-kind lookups and insertions; the ordering bound
+also covers every possible removal shift and descendant pass. Both bounds use
+checked addition and multiplication and are admitted before the first identity
+comparison. Budget refusal therefore precedes mutation of a merge or ordering
+destination, and matching can stop early without changing the shared charge.
+
 Existing request, XML depth, namespace, attribute and content-node limits
 remain in force. Each accumulated decoded value is bounded by
 `max_value_bytes`, and aggregate decoded text is bounded by
@@ -172,7 +189,8 @@ limits remain independent of the matching budget. An overrun returns fixed
 no-match. Custom projectors must use the shared budget before retaining or
 comparing values and before accessing rows. They must capture list identities
 through `SubtreeProjection::key`, and propagate budget failures from `selected`
-and `subtree_selected` as well as `enter`.
+and `subtree_selected` as well as `enter`. Callers of `merge_bounded` must submit
+the complete sibling batch, rather than repeatedly merge a growing prefix.
 
 The authenticated generated-service fixture covers the content contracts
 in `crates/opc-yanggen/tests/fixtures/subtree_content_test.rs`; parser, codec,

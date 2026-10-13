@@ -82,42 +82,14 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         let path = value.path().as_str();
         let (node, ancestors, identity, path_identity) =
             instance(registry, path, budget, limits.max_value_bytes)?;
-        for previous in &seen {
-            budget.charge(1)?;
-            if budget.compare(previous, &path_identity)? {
-                return Err(SubtreeError::Projection);
-            }
+        if contains_path_identity(&seen, &path_identity, budget)? {
+            return Err(SubtreeError::Projection);
         }
         let path_work = path_identity.len();
         if node.config || !matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList) {
             return Err(SubtreeError::Projection);
         }
-        let mut requested = false;
-        for selector in &selectors {
-            budget.charge(1)?;
-            if !budget.compare(selector.schema_path, node.path)? {
-                continue;
-            }
-            let mut matches = true;
-            for (key, expected) in &selector.keys {
-                let mut found = false;
-                for actual in &identity {
-                    budget.charge(1)?;
-                    if budget.compare(key, actual.path)?
-                        && budget.compare(expected, &actual.captured)?
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                matches &= found;
-            }
-            if matches {
-                requested = true;
-                break;
-            }
-        }
-        if !requested {
+        if !requested_instance(&selectors, node.path, &identity, budget)? {
             return Err(SubtreeError::Projection);
         }
         budget.charge(1)?;
@@ -130,14 +102,14 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             OperationalValueShape::Structured => return Err(SubtreeError::Projection),
             OperationalValueShape::Scalar => {}
         }
-        let mut identity_value = None;
+        budget.charge(identity.len())?;
+        let mut key_search_work = identity.len();
         for key in &identity {
-            budget.charge(1)?;
-            if budget.compare(key.path, node.path)? {
-                identity_value = Some(key);
-                break;
-            }
+            add_work(&mut key_search_work, key.path.len())?;
+            add_work(&mut key_search_work, node.path.len())?;
         }
+        budget.charge(key_search_work)?;
+        let identity_value = identity.iter().find(|key| key.path == node.path);
         budget.charge(1)?;
         let masked = !registry
             .data_class(node.path)
@@ -235,10 +207,71 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         }
     }
     let mut output = Vec::new();
-    for (_, _, tree) in accepted {
-        merge_bounded(registry, &mut output, vec![tree], budget)?;
-    }
+    // One complete batch keeps reservation sizes independent of which earlier
+    // hidden identities merged, or where their raw sort order placed them.
+    budget.charge(accepted.len())?;
+    let trees = accepted.into_iter().map(|(_, _, tree)| tree).collect();
+    merge_bounded(registry, &mut output, trees, budget)?;
     Ok(output)
+}
+
+fn add_work(total: &mut usize, units: usize) -> Result<(), SubtreeError> {
+    *total = total.checked_add(units).ok_or(SubtreeError::TooBig)?;
+    Ok(())
+}
+
+fn contains_path_identity(
+    previous: &[String],
+    path: &str,
+    budget: &SubtreeBudget,
+) -> Result<bool, SubtreeError> {
+    budget.charge(previous.len())?;
+    let mut work = previous.len();
+    for candidate in previous {
+        add_work(&mut work, candidate.len())?;
+        add_work(&mut work, path.len())?;
+    }
+    // Every candidate is prepaid even if a duplicate is found at the front.
+    budget.charge(work)?;
+    Ok(previous.iter().any(|candidate| candidate == path))
+}
+
+fn requested_instance(
+    selectors: &[NetconfInstanceSelector],
+    path: &str,
+    identity: &[InstanceKey],
+    budget: &SubtreeBudget,
+) -> Result<bool, SubtreeError> {
+    budget.charge(selectors.len())?;
+    let mut work = selectors.len();
+    for selector in selectors {
+        add_work(&mut work, selector.schema_path.len())?;
+        add_work(&mut work, path.len())?;
+        budget.charge(selector.keys.len())?;
+        add_work(&mut work, selector.keys.len())?;
+        for (key, expected) in &selector.keys {
+            budget.charge(identity.len())?;
+            add_work(&mut work, identity.len())?;
+            for actual in identity {
+                add_work(&mut work, key.len())?;
+                add_work(&mut work, actual.path.len())?;
+                add_work(&mut work, expected.len())?;
+                add_work(&mut work, actual.captured.len())?;
+            }
+        }
+    }
+    // Selector constraints themselves are schema-approved cleartext. Captured
+    // tuples can also contain masked components; reserve the whole product
+    // before any path, component or selector comparison can stop the search.
+    budget.charge(work)?;
+    Ok(selectors.iter().any(|selector| {
+        selector.schema_path == path
+            && selector.keys.iter().all(|(key, expected)| {
+                identity
+                    .iter()
+                    .any(|actual| *key == actual.path && *expected == actual.captured)
+            })
+    }))
 }
 
 fn append(

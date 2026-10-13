@@ -202,12 +202,15 @@ impl AuthorizedSubtreePlan {
         registry: &dyn SchemaRegistry,
         input: &[NetconfXmlNode],
     ) -> Result<Vec<NetconfXmlNode>, SubtreeError> {
-        let mut selected = Vec::new();
+        let mut candidates = Vec::new();
         for scope in &self.scopes {
             if let Some(nodes) = evaluate_scope(scope, input, &[], registry, &self.budget)? {
-                merge_bounded(registry, &mut selected, nodes, &self.budget)?;
+                self.budget.charge(nodes.len())?;
+                candidates.extend(nodes);
             }
         }
+        let mut selected = Vec::new();
+        merge_bounded(registry, &mut selected, candidates, &self.budget)?;
         order_like(&mut selected, input, &[], &self.budget)?;
         Ok(selected)
     }
@@ -786,42 +789,169 @@ impl<'a> SubtreeProjection<'a> {
     }
 }
 
-fn same_identity(
-    left: &NetconfXmlNode,
-    right: &NetconfXmlNode,
-    budget: &SubtreeBudget,
-) -> Result<bool, SubtreeError> {
-    budget.charge(1)?;
-    if !budget.compare(left.schema_path, right.schema_path)?
-        || left.keys.len() != right.keys.len()
-        || left.masked_ordinal != right.masked_ordinal
-    {
-        return Ok(false);
-    }
-    for ((left_path, left_value), (right_path, right_value)) in left.keys.iter().zip(&right.keys) {
-        if !budget.compare(left_path, right_path)? || !budget.compare(left_value, right_value)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// Sizes only the already-authorized capture, without testing identity values.
+/// Masked keys are fixed-width digests before reaching any of these operations.
+#[derive(Default)]
+struct CapturedWork {
+    nodes: usize,
+    keys: usize,
+    schema_bytes: usize,
+    key_bytes: usize,
+    value_bytes: usize,
+    leaf_lists: Vec<&'static str>,
 }
 
-/// Joins validated trees by complete identities, charging each candidate and byte.
+fn add_work(total: &mut usize, units: usize) -> Result<(), SubtreeError> {
+    *total = total.checked_add(units).ok_or(SubtreeError::TooBig)?;
+    Ok(())
+}
+
+fn multiply_work(left: usize, right: usize) -> Result<usize, SubtreeError> {
+    left.checked_mul(right).ok_or(SubtreeError::TooBig)
+}
+
+impl CapturedWork {
+    fn include_keys(
+        &mut self,
+        keys: &[(&'static str, String)],
+        budget: &SubtreeBudget,
+    ) -> Result<(), SubtreeError> {
+        // Admit the metadata visits before inspecting any tuple component.
+        budget.charge(keys.len())?;
+        add_work(&mut self.keys, keys.len())?;
+        for (path, value) in keys {
+            add_work(&mut self.key_bytes, path.len())?;
+            add_work(&mut self.key_bytes, value.len())?;
+        }
+        Ok(())
+    }
+
+    fn include_nodes(
+        &mut self,
+        nodes: &[NetconfXmlNode],
+        registry: Option<&dyn SchemaRegistry>,
+        budget: &SubtreeBudget,
+    ) -> Result<(), SubtreeError> {
+        for node in nodes {
+            budget.charge(1)?;
+            add_work(&mut self.nodes, 1)?;
+            add_work(&mut self.schema_bytes, node.schema_path.len())?;
+            add_work(
+                &mut self.value_bytes,
+                node.value.as_ref().map_or(0, String::len),
+            )?;
+            self.include_keys(&node.keys, budget)?;
+            if let Some(registry) = registry {
+                // Resolve every input node before a merge can skip descendants
+                // or stop at a matching row. These searches use schema only.
+                if budget.node(registry, node.schema_path)?.kind == NodeKind::LeafList {
+                    budget.charge(1)?;
+                    self.leaf_lists.push(node.schema_path);
+                }
+            }
+            self.include_nodes(&node.children, registry, budget)?;
+        }
+        Ok(())
+    }
+
+    fn identity_bytes(&self) -> Result<usize, SubtreeError> {
+        self.schema_bytes
+            .checked_add(self.key_bytes)
+            .ok_or(SubtreeError::TooBig)
+    }
+
+    fn merge_units(&self) -> Result<usize, SubtreeError> {
+        // Each original node is processed at most once and can inspect at most
+        // N candidates and N leaf-list paths. Complete tuple bytes cover every
+        // component even when an unequal prefix would stop the actual compare.
+        // Scalar equality can run during both candidate search and acceptance.
+        // Four N² units cover probes/control work; the remaining terms cover
+        // all compared bytes, component visits, recursion and insertions.
+        let mut units = multiply_work(multiply_work(self.nodes, self.nodes)?, 4)?;
+        let mut per_node = self.identity_bytes()?;
+        add_work(&mut per_node, self.schema_bytes)?;
+        per_node = multiply_work(per_node, 2)?;
+        add_work(&mut per_node, multiply_work(self.value_bytes, 4)?)?;
+        add_work(&mut per_node, multiply_work(self.keys, 2)?)?;
+        add_work(&mut per_node, 8)?;
+        add_work(&mut units, multiply_work(self.nodes, per_node)?)?;
+        Ok(units)
+    }
+
+    fn ordering_units(&self) -> Result<usize, SubtreeError> {
+        // All input/selected candidate pairs and every possible vector shift
+        // are reserved, including candidates skipped after an early match.
+        // The K×N term also covers identity-key searches in child selections.
+        // Descendant order passes spend this one reservation, not a new charge
+        // whose size could depend on which hidden identity matched first.
+        let mut units = multiply_work(multiply_work(self.nodes, self.nodes)?, 4)?;
+        add_work(
+            &mut units,
+            multiply_work(multiply_work(self.nodes, self.keys)?, 2)?,
+        )?;
+        let mut compared_bytes = self.identity_bytes()?;
+        add_work(&mut compared_bytes, self.value_bytes)?;
+        let mut repetitions = multiply_work(self.nodes, 3)?;
+        add_work(&mut repetitions, self.keys)?;
+        add_work(&mut units, multiply_work(repetitions, compared_bytes)?)?;
+        add_work(&mut units, multiply_work(self.nodes, 8)?)?;
+        add_work(&mut units, multiply_work(self.keys, 2)?)?;
+        Ok(units)
+    }
+}
+
+/// Proof that a complete identity phase was admitted before its first compare.
+/// Early exits may save CPU work but never change or refund the shared charge.
+struct IdentityReservation;
+
+impl IdentityReservation {
+    fn admit(budget: &SubtreeBudget, units: usize) -> Result<Self, SubtreeError> {
+        budget.charge(units)?;
+        Ok(Self)
+    }
+
+    fn same_identity(&self, left: &NetconfXmlNode, right: &NetconfXmlNode) -> bool {
+        left.schema_path == right.schema_path
+            && left.keys == right.keys
+            && left.masked_ordinal == right.masked_ordinal
+    }
+
+    fn same_value(&self, left: &Option<String>, right: &Option<String>) -> bool {
+        left == right
+    }
+}
+
+/// Joins complete captures under a value-independent, prepaid identity bound.
+/// Submit the complete batch: incrementally merging prefixes would let the
+/// previously matched identities affect the size of later reservations.
 pub fn merge_bounded(
     registry: &dyn SchemaRegistry,
     existing: &mut Vec<NetconfXmlNode>,
     incoming: Vec<NetconfXmlNode>,
     budget: &SubtreeBudget,
 ) -> Result<(), SubtreeError> {
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let mut work = CapturedWork::default();
+    work.include_nodes(existing, Some(registry), budget)?;
+    work.include_nodes(&incoming, Some(registry), budget)?;
+    let reservation = IdentityReservation::admit(budget, work.merge_units()?)?;
+    merge_reserved(existing, incoming, &work.leaf_lists, &reservation)
+}
+
+fn merge_reserved(
+    existing: &mut Vec<NetconfXmlNode>,
+    incoming: Vec<NetconfXmlNode>,
+    leaf_lists: &[&str],
+    reservation: &IdentityReservation,
+) -> Result<(), SubtreeError> {
     for mut node in incoming {
-        budget.charge(1)?;
-        let kind = budget.node(registry, node.schema_path)?.kind;
+        let leaf_list = leaf_lists.contains(&node.schema_path);
         let mut found = None;
         for (index, previous) in existing.iter().enumerate() {
-            if same_identity(previous, &node, budget)? {
-                if kind == NodeKind::LeafList
-                    && !optional_value_equal(&previous.value, &node.value, budget)?
-                {
+            if reservation.same_identity(previous, &node) {
+                if leaf_list && !reservation.same_value(&previous.value, &node.value) {
                     continue;
                 }
                 found = Some(index);
@@ -830,35 +960,22 @@ pub fn merge_bounded(
         }
         if let Some(index) = found {
             let previous = &mut existing[index];
-            if !optional_value_equal(&previous.value, &node.value, budget)?
+            if !reservation.same_value(&previous.value, &node.value)
                 || previous.is_defaulted != node.is_defaulted
             {
                 return Err(SubtreeError::Projection);
             }
-            merge_bounded(
-                registry,
+            merge_reserved(
                 &mut previous.children,
                 std::mem::take(&mut node.children),
-                budget,
+                leaf_lists,
+                reservation,
             )?;
         } else {
-            budget.charge(1)?;
             existing.push(node);
         }
     }
     Ok(())
-}
-
-fn optional_value_equal(
-    left: &Option<String>,
-    right: &Option<String>,
-    budget: &SubtreeBudget,
-) -> Result<bool, SubtreeError> {
-    match (left, right) {
-        (None, None) => Ok(true),
-        (Some(left), Some(right)) => budget.compare(left, right),
-        _ => Ok(false),
-    }
 }
 
 fn copy_shell(
@@ -947,20 +1064,18 @@ fn evaluate_scope(
             return Ok(None);
         }
     }
-    let mut result = Vec::new();
-    merge_bounded(registry, &mut result, matched_keys, budget)?;
+    // Collect the complete sibling batch before deduplication. A successful
+    // hidden-key search must not shrink or grow a later reservation's input.
+    let mut candidates = matched_keys;
     for index in matched {
-        merge_bounded(
-            registry,
-            &mut result,
-            vec![copy_shell(&input[index], budget)?],
-            budget,
-        )?;
+        budget.charge(1)?;
+        candidates.push(copy_shell(&input[index], budget)?);
     }
     if !scope.implicit_outputs.is_empty() {
         for node in input {
             if let Some(copy) = selected_copy(node, &scope.implicit_outputs, budget)? {
-                merge_bounded(registry, &mut result, vec![copy], budget)?;
+                budget.charge(1)?;
+                candidates.push(copy);
             }
         }
     }
@@ -975,12 +1090,7 @@ fn evaluate_scope(
                 }
                 if selected {
                     budget.charge(1)?;
-                    merge_bounded(
-                        registry,
-                        &mut result,
-                        vec![NetconfXmlNode::scalar(path, budget.copy(value)?, false)],
-                        budget,
-                    )?;
+                    candidates.push(NetconfXmlNode::scalar(path, budget.copy(value)?, false));
                 }
             }
         }
@@ -1007,10 +1117,13 @@ fn evaluate_scope(
                 selected_copy(node, &branch.outputs, budget)?
             };
             if let Some(selected) = selected {
-                merge_bounded(registry, &mut result, vec![selected], budget)?;
+                budget.charge(1)?;
+                candidates.push(selected);
             }
         }
     }
+    let mut result = Vec::new();
+    merge_bounded(registry, &mut result, candidates, budget)?;
     Ok(Some(result))
 }
 
@@ -1020,29 +1133,35 @@ fn order_like(
     keys: &[(&'static str, String)],
     budget: &SubtreeBudget,
 ) -> Result<(), SubtreeError> {
+    let mut work = CapturedWork::default();
+    work.include_nodes(selected, None, budget)?;
+    work.include_nodes(input, None, budget)?;
+    work.include_keys(keys, budget)?;
+    let reservation = IdentityReservation::admit(budget, work.ordering_units()?)?;
+    order_reserved(selected, input, keys, &reservation)
+}
+
+fn order_reserved(
+    selected: &mut Vec<NetconfXmlNode>,
+    input: &[NetconfXmlNode],
+    keys: &[(&'static str, String)],
+    reservation: &IdentityReservation,
+) -> Result<(), SubtreeError> {
     let mut ordered = Vec::new();
     // Identity keys are retained separately from projected child values. A key
     // selected or matched by the filter still occupies its schema-order slot.
     for (path, value) in keys {
         let mut index = 0;
         while index < selected.len() {
-            budget.charge(1)?;
             let node = &selected[index];
-            if budget.compare(path, node.schema_path)? {
+            if *path == node.schema_path {
                 if !node.keys.is_empty()
                     || !node.children.is_empty()
-                    || !node
-                        .value
-                        .as_ref()
-                        .map(|actual| budget.compare(value, actual))
-                        .transpose()?
-                        .unwrap_or(false)
+                    || !node.value.as_ref().is_some_and(|actual| value == actual)
                 {
                     return Err(SubtreeError::Projection);
                 }
-                budget.charge(selected.len() - index)?;
                 let node = selected.remove(index);
-                budget.charge(1)?;
                 ordered.push(node);
                 break;
             }
@@ -1052,19 +1171,16 @@ fn order_like(
     for original in input {
         let mut index = 0;
         while index < selected.len() {
-            budget.charge(1)?;
-            if same_identity(original, &selected[index], budget)?
-                && optional_value_equal(&original.value, &selected[index].value, budget)?
+            if reservation.same_identity(original, &selected[index])
+                && reservation.same_value(&original.value, &selected[index].value)
             {
-                budget.charge(selected.len() - index)?;
                 let mut node = selected.remove(index);
-                order_like(
+                order_reserved(
                     &mut node.children,
                     &original.children,
                     &original.keys,
-                    budget,
+                    reservation,
                 )?;
-                budget.charge(1)?;
                 ordered.push(node);
                 break;
             }

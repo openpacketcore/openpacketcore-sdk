@@ -727,6 +727,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-netconf-server` subtree content reads use fixed-width masked list-key
   identities so the matching allowance cannot expose hidden key lengths.
+  Identity joins, deduplication, searches and ordering reserve complete bounds
+  before comparison, independent of equal key prefixes or early matching rows.
   Public candidate/startup handlers borrow supplied snapshots, and projection
   selection checks charge their bounded path lookups. Document the separate
   startup binding limits required before full-snapshot loading. (#1272)
