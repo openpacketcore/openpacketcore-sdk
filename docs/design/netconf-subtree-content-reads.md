@@ -15,6 +15,9 @@ predefined entities and legal character references accumulate before outer XML
 whitespace is trimmed once. Interior characters and other Unicode spaces are
 preserved. Mixed text and child elements are invalid; DTDs, external and
 undeclared entities, and references to non-XML characters remain forbidden.
+Numeric references require decimal digits or `x` followed by hexadecimal
+digits; neither form accepts a sign. Value limits count accumulated decoded
+UTF-8 bytes, while encoded references remain subject to request and work limits.
 
 Element names match by namespace URI and local name. Prefix aliases do not
 change matching. An absent namespace, including `xmlns=""`, is a wildcard
@@ -78,7 +81,12 @@ Content matching on a security-secret, lawful-intercept, secret-like-name or
 unclassified leaf is refused from the schema for every reader, including key
 leaves. Comparing a masked value would disclose whether a guess was correct.
 Selecting these leaves still uses normal masking, including masked NETCONF
-key elements. Raw identity values can correlate authorized instances without
+key elements. Masked configuration payloads enter the captured tree as the
+fixed placeholder before encoding, copying or charging payload bytes. Default
+omission compares against the schema default without encoding hidden values;
+its work depends on that schema default. Masked leaf-list members retain only
+their capture position to preserve distinct members and deduplicate overlaps.
+Raw identity values can correlate authorized instances without
 becoming unmasked XML payloads. Predicate text is redacted from Debug output
 and never appears in error replies, logs, audits or metric labels.
 
@@ -89,6 +97,8 @@ and never appears in error replies, logs, audits or metric labels.
 `SubtreeProjection` before typed field access. They capture the authorized
 values once, after default handling, without serializing the complete model.
 The evaluator uses those same captured inputs for predicates and output.
+Candidate reads share an immutable model snapshot, including fallback to
+running; capturing a candidate never clones the complete configuration.
 
 Authorized operational match leaves become provider dependencies. A complete
 provider response is validated before any predicate evaluation: duplicate,
@@ -99,6 +109,8 @@ ancestor-key tuples; missing state does not create configuration rows.
 Provider paths require qualified keys in schema order. Single quotes are
 preferred, double quotes represent a key containing an apostrophe, and
 backslashes remain literal. A key requiring both quote delimiters is refused.
+After complete validation, state instances are ordered by canonical path under
+the shared budget. Merging retains configuration order for existing instances.
 
 A binding must opt into `supports_subtree_content` and honor
 `project_subtree_content`. Regenerated renderers supply both. A binding that
@@ -127,7 +139,7 @@ limits remain independent of the matching budget. An overrun returns fixed
 no-match. Custom projectors must use the shared budget before retaining or
 comparing values and before accessing rows.
 
-The authenticated generated-service fixture covers all 19 content contracts
+The authenticated generated-service fixture covers the content contracts
 in `crates/opc-yanggen/tests/fixtures/subtree_content_test.rs`; parser, codec,
 tree and path unit tests supplement it. Existing structural, XPath, masking,
 ordering and default-report controls remain in place.

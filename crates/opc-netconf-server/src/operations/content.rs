@@ -379,6 +379,7 @@ where
         return Ok(ReadResult::Reply(reply));
     }
     let config = if needs_config(&plan, registry, scope).map_err(rpc_error)? {
+        plan.budget().charge(1).map_err(rpc_error)?;
         Some(load(source)?)
     } else {
         None

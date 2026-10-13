@@ -206,9 +206,9 @@ fn leaf_list_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
     quote! {
         if !ctx.enter(#path, false)? { return Ok(Vec::new()); }
         let mut projected = Vec::new();
-        for item in #value.iter() {
+        for (ordinal, item) in #value.iter().enumerate() {
             ctx.budget().charge(1)?;
-            if let Some(node) = ctx.scalar(#path, #scalar, false)? { ctx.budget().charge(1)?; projected.push(node); }
+            if let Some(node) = ctx.leaf_list_scalar(#path, #scalar, ordinal)? { ctx.budget().charge(1)?; projected.push(node); }
         }
         Ok(projected)
     }

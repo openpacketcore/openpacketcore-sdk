@@ -364,7 +364,8 @@ impl ConfirmedCommitState {
 
 #[derive(Debug, Clone)]
 struct CandidateSnapshot<C> {
-    config: C,
+    // Reads share the immutable model; only write paths may materialize a copy.
+    config: Arc<C>,
     base_version: ConfigVersion,
     generation: Arc<()>,
 }
@@ -428,9 +429,13 @@ impl<C: Clone> CandidateDatastore<C> {
         self.snapshot.clone()
     }
 
-    fn snapshot_or(&mut self, running: &C, running_version: ConfigVersion) -> CandidateSnapshot<C> {
+    fn snapshot_or(
+        &mut self,
+        running: &Arc<C>,
+        running_version: ConfigVersion,
+    ) -> CandidateSnapshot<C> {
         self.snapshot().unwrap_or_else(|| CandidateSnapshot {
-            config: running.clone(),
+            config: Arc::clone(running),
             base_version: running_version,
             generation: Arc::new(()),
         })
@@ -439,7 +444,7 @@ impl<C: Clone> CandidateDatastore<C> {
     fn replace(&mut self, candidate: C, base_version: ConfigVersion) {
         self.prune_released();
         self.snapshot = Some(CandidateSnapshot {
-            config: candidate,
+            config: Arc::new(candidate),
             base_version,
             generation: Arc::new(()),
         });
@@ -2255,11 +2260,11 @@ where
             ContentSource::Candidate => {
                 let running = self.binding.config_bus().current_snapshot();
                 let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-                let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
+                let candidate = candidate.snapshot_or(&running.config, running.version);
                 if candidate.base_version != running.version {
                     return Err(RpcError::operation_failed());
                 }
-                Ok(Arc::new(candidate.config))
+                Ok(candidate.config)
             }
             ContentSource::Startup => self
                 .binding
@@ -2284,8 +2289,8 @@ where
         }
         let running = self.binding.config_bus().current_snapshot();
         let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-        let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
-        (candidate.base_version == running.version).then_some(candidate.config)
+        let candidate = candidate.snapshot_or(&running.config, running.version);
+        (candidate.base_version == running.version).then(|| candidate.config.as_ref().clone())
     }
 
     fn candidate_config_for_get_data(&self, request: &crate::xml::GetDataRequest) -> Option<C> {
@@ -2296,8 +2301,8 @@ where
         }
         let running = self.binding.config_bus().current_snapshot();
         let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-        let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
-        (candidate.base_version == running.version).then_some(candidate.config)
+        let candidate = candidate.snapshot_or(&running.config, running.version);
+        (candidate.base_version == running.version).then(|| candidate.config.as_ref().clone())
     }
 
     fn startup_config_for_get_config(
@@ -4703,7 +4708,7 @@ where
         let candidate_generation = candidate
             .as_ref()
             .map(|candidate| Arc::clone(&candidate.generation));
-        let candidate_config = candidate.map(|candidate| candidate.config);
+        let candidate_config = candidate.map(|candidate| Arc::unwrap_or_clone(candidate.config));
         let commit_request = CommitRequest::new(
             context.request_id,
             context.principal.clone(),
@@ -5453,11 +5458,11 @@ where
                     .candidate
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .snapshot_or(running.config.as_ref(), running.version);
+                    .snapshot_or(&running.config, running.version);
                 if candidate.base_version != running.version {
                     return Err(DatastoreFailure::Failed);
                 }
-                Ok(candidate.config)
+                Ok(Arc::unwrap_or_clone(candidate.config))
             }
             XmlDatastore::Startup => {
                 if !self.binding.startup_datastore_capability() {
@@ -6438,7 +6443,7 @@ where
         let running = self.binding.config_bus().current_snapshot();
         let base = {
             let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-            candidate.snapshot_or(running.config.as_ref(), running.version)
+            candidate.snapshot_or(&running.config, running.version)
         };
         if base.base_version != running.version {
             return self
@@ -7006,7 +7011,7 @@ where
                     .candidate
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .snapshot_or(snapshot.config.as_ref(), snapshot.version);
+                    .snapshot_or(&snapshot.config, snapshot.version);
                 if candidate.base_version != snapshot.version {
                     return self
                         .validate_failed_reply(
@@ -7017,7 +7022,7 @@ where
                         )
                         .await;
                 }
-                Arc::new(candidate.config)
+                candidate.config
             }
             XmlDatastore::Startup => {
                 let Some(startup) = self.binding.startup_datastore() else {

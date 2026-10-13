@@ -44,6 +44,9 @@ pub struct NetconfXmlNode {
     pub value: Option<String>,
     /// Whether the scalar originated from a schema default.
     pub is_defaulted: bool,
+    /// Capture position of a masked leaf-list member, never serialized.
+    /// Preserves distinct members without retaining their unnecessary raw text.
+    pub masked_ordinal: Option<usize>,
     /// Structural children in configuration order.
     pub children: Vec<NetconfXmlNode>,
 }
@@ -62,6 +65,7 @@ impl NetconfXmlNode {
             keys: Vec::new(),
             value: None,
             is_defaulted: false,
+            masked_ordinal: None,
             children: Vec::new(),
         }
     }
@@ -91,6 +95,7 @@ pub fn merge_netconf_nodes(
         if let Some(previous) = existing.iter_mut().find(|previous| {
             previous.schema_path == node.schema_path
                 && previous.keys == node.keys
+                && previous.masked_ordinal == node.masked_ordinal
                 && (metadata.kind != NodeKind::LeafList || previous.value == node.value)
         }) {
             if previous.value != node.value || previous.is_defaulted != node.is_defaulted {
@@ -142,6 +147,9 @@ impl NetconfXmlRenderContext<'_> {
         let metadata = self
             .node(node.schema_path)
             .ok_or(NetconfProjectionError::WriteError)?;
+        if node.masked_ordinal.is_some() && metadata.kind != NodeKind::LeafList {
+            return Err(NetconfProjectionError::WriteError);
+        }
         if let Some(value) = &node.value {
             if !matches!(metadata.kind, NodeKind::Leaf | NodeKind::LeafList)
                 || !node.keys.is_empty()

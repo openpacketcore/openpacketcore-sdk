@@ -819,9 +819,16 @@ fn filter_reference(reference: &str) -> Option<char> {
         "quot" => '"',
         _ => {
             let value = if let Some(digits) = reference.strip_prefix("#x") {
+                if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return None;
+                }
                 u32::from_str_radix(digits, 16).ok()?
             } else {
-                reference.strip_prefix('#')?.parse::<u32>().ok()?
+                let digits = reference.strip_prefix('#')?;
+                if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                digits.parse::<u32>().ok()?
             };
             char::from_u32(value)?
         }
@@ -3196,9 +3203,6 @@ fn parse_message_with_context(
                 return Err(parse_error(&state, XmlError::DtdForbidden));
             }
             Event::GeneralRef(reference) => {
-                limits
-                    .check_value_bytes(reference.len())
-                    .map_err(|err| parse_error(&state, err.into()))?;
                 if state.filter_depth > 0 {
                     state
                         .charge_filter_work(reference.len())
@@ -3211,6 +3215,9 @@ fn parse_message_with_context(
                         .map_err(|err| parse_error(&state, err))?;
                     continue;
                 }
+                limits
+                    .check_value_bytes(reference.len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
                 return Err(parse_error(&state, XmlError::EntityForbidden));
             }
             Event::Decl(decl) => {

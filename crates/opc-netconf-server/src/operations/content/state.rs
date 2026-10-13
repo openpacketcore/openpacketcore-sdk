@@ -160,10 +160,32 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             tree = parent;
         }
         budget.charge(1)?;
-        accepted.push(tree);
+        accepted.push((path, tree));
+    }
+    // Validate the complete response before ordering or merging any instances.
+    // Fallible insertion sort charges every comparison and move in advance.
+    for index in 1..accepted.len() {
+        budget.charge(1)?;
+        let mut current = index;
+        while current > 0 {
+            budget.charge(1)?;
+            let left = accepted[current - 1].0;
+            let right = accepted[current].0;
+            budget.charge(
+                left.len()
+                    .checked_add(right.len())
+                    .ok_or(SubtreeError::TooBig)?,
+            )?;
+            if left <= right {
+                break;
+            }
+            budget.charge(1)?;
+            accepted.swap(current - 1, current);
+            current -= 1;
+        }
     }
     let mut output = Vec::new();
-    for tree in accepted {
+    for (_, tree) in accepted {
         merge_bounded(registry, &mut output, vec![tree], budget)?;
     }
     Ok(output)

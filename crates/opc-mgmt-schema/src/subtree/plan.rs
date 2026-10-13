@@ -511,6 +511,38 @@ impl std::fmt::Debug for SubtreeScalar<'_> {
 }
 
 impl SubtreeScalar<'_> {
+    // Only the public schema default determines comparison work. Masked text
+    // is borrowed, never encoded or copied merely to decide default omission.
+    fn matches_default(self, default: &str, budget: &SubtreeBudget) -> Result<bool, SubtreeError> {
+        budget.charge(default.len().checked_mul(2).ok_or(SubtreeError::TooBig)?)?;
+        Ok(match self {
+            Self::Text(value) => value == default,
+            Self::Empty => default.is_empty(),
+            Self::Boolean(value) => default == if value { "true" } else { "false" },
+            Self::Integer(value) => {
+                budget.charge(20)?;
+                default
+                    .parse::<i64>()
+                    .is_ok_and(|expected| expected.to_string() == default && value == expected)
+            }
+            Self::Unsigned(value) => {
+                budget.charge(20)?;
+                default
+                    .parse::<u64>()
+                    .is_ok_and(|expected| expected.to_string() == default && value == expected)
+            }
+            Self::Decimal(value) => {
+                budget.charge(327)?;
+                default.parse::<f64>().is_ok_and(|expected| {
+                    expected.to_string() == default
+                        && ((value.is_nan() && expected.is_nan())
+                            || (value == expected
+                                && value.is_sign_negative() == expected.is_sign_negative()))
+                })
+            }
+        })
+    }
+
     /// Encodes the existing wire representation after charging its allocation.
     pub fn encode(self, budget: &SubtreeBudget) -> Result<String, SubtreeError> {
         match self {
@@ -641,19 +673,55 @@ impl<'a> SubtreeProjection<'a> {
         value: SubtreeScalar<'_>,
         is_defaulted: bool,
     ) -> Result<Option<NetconfXmlNode>, SubtreeError> {
+        self.scalar_at(path, value, is_defaulted, None)
+    }
+
+    /// Projects one leaf-list member, retaining its capture position if masked.
+    /// The position keeps distinct masked members separate without raw payloads.
+    pub fn leaf_list_scalar(
+        &self,
+        path: &'static str,
+        value: SubtreeScalar<'_>,
+        ordinal: usize,
+    ) -> Result<Option<NetconfXmlNode>, SubtreeError> {
+        self.scalar_at(path, value, false, Some(ordinal))
+    }
+
+    fn scalar_at(
+        &self,
+        path: &'static str,
+        value: SubtreeScalar<'_>,
+        is_defaulted: bool,
+        ordinal: Option<usize>,
+    ) -> Result<Option<NetconfXmlNode>, SubtreeError> {
         if is_defaulted && self.report == DefaultReport::Explicit {
             return Ok(None);
         }
-        let raw = value.encode(self.budget)?;
         if is_defaulted && self.report == DefaultReport::Trim {
             if let Some(default) = self.budget.node(self.registry, path)?.default {
-                if self.budget.compare(default, &raw)? {
+                if value.matches_default(default, self.budget)? {
                     return Ok(None);
                 }
             }
         }
         self.budget.charge(1)?;
-        Ok(Some(NetconfXmlNode::scalar(path, raw, is_defaulted)))
+        let masked = !self
+            .registry
+            .data_class(path)
+            .is_some_and(crate::DataClass::allows_cleartext);
+        let payload = if masked {
+            // The same fixed placeholder used by RedactedValue::Mask. Its
+            // bytes, never the hidden scalar's bytes, enter the captured tree.
+            self.budget.copy("<redacted>")?
+        } else {
+            value.encode(self.budget)?
+        };
+        self.budget.charge(1)?;
+        let mut node = NetconfXmlNode::scalar(path, payload, is_defaulted);
+        if masked {
+            node.masked_ordinal = ordinal;
+        }
+        Ok(Some(node))
     }
 }
 
@@ -663,7 +731,9 @@ fn same_identity(
     budget: &SubtreeBudget,
 ) -> Result<bool, SubtreeError> {
     budget.charge(1)?;
-    if !budget.compare(left.schema_path, right.schema_path)? || left.keys.len() != right.keys.len()
+    if !budget.compare(left.schema_path, right.schema_path)?
+        || left.keys.len() != right.keys.len()
+        || left.masked_ordinal != right.masked_ordinal
     {
         return Ok(false);
     }
@@ -744,6 +814,7 @@ fn copy_shell(
         result.value = Some(budget.copy(value)?);
     }
     result.is_defaulted = node.is_defaulted;
+    result.masked_ordinal = node.masked_ordinal;
     Ok(result)
 }
 
