@@ -725,6 +725,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Keep defaulted state leaves optional and sensitive numeric key copies lint-free.
   Compile generated fixtures and check them with Clippy warnings denied (#1268).
 
+- `opc-netconf-server` subtree content reads use fixed-width masked list-key
+  identities so the matching allowance cannot expose hidden key lengths.
+  Public candidate/startup handlers borrow supplied snapshots, and projection
+  selection checks charge their bounded path lookups. Document the separate
+  startup binding limits required before full-snapshot loading. (#1272)
+
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at
   `Complete` or `Acquired` can be recovered or committed without a spurious

@@ -1170,7 +1170,10 @@ where
                         limits,
                     },
                     request,
-                    |source| self.load_content_config(source),
+                    |source| {
+                        self.load_content_config(source)
+                            .map(crate::operations::content::ContentConfig::Shared)
+                    },
                     AuditMode::Synchronous,
                     || async {
                         let gate = config_authority_gate(&parsed.operation)?;
@@ -1569,7 +1572,10 @@ where
                         limits,
                     },
                     request,
-                    |source| self.load_content_config(source),
+                    |source| {
+                        self.load_content_config(source)
+                            .map(crate::operations::content::ContentConfig::Shared)
+                    },
                     AuditMode::Asynchronous,
                     || async {
                         let gate = config_authority_gate(&parsed.operation)?;

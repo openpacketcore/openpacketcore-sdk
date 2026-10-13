@@ -38,7 +38,10 @@ impl NetconfInstanceSelector {
 pub struct NetconfXmlNode {
     /// Predicate-free schema path.
     pub schema_path: &'static str,
-    /// Complete list keys in YANG key order, as `(key schema path, raw value)`.
+    /// Complete list keys in YANG key order, as `(key schema path, identity)`.
+    /// Ordinary reads retain canonical text. Subtree content capture replaces
+    /// non-cleartext keys with `SubtreeBudget::masked_identity` before matching;
+    /// the renderer still emits those elements through their schema's mask.
     pub keys: Vec<(&'static str, String)>,
     /// Scalar payload, when this is a leaf or one leaf-list member.
     pub value: Option<String>,

@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use crate::{LeafType, NodeKind, NodeMeta, NumericRangeIntervalMeta, SchemaRegistry};
 
 mod plan;
@@ -121,6 +123,24 @@ impl SubtreeBudget {
     pub fn copy(&self, text: &str) -> Result<String, SubtreeError> {
         self.charge(text.len())?;
         Ok(text.to_owned())
+    }
+
+    /// Captures a masked key as a fixed-width identity, never as wire text.
+    ///
+    /// Only this request's projection retains the digest. Both config and state
+    /// capture must use it for non-cleartext keys before any matching work.
+    /// Hashing charges one fixed visit and the 64 retained hexadecimal bytes,
+    /// independent of raw key length. This is not a constant-time guarantee.
+    pub fn masked_identity(&self, value: &str) -> Result<String, SubtreeError> {
+        self.charge(65)?;
+        let digest = Sha256::digest(value.as_bytes());
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut identity = String::with_capacity(64);
+        for byte in digest {
+            identity.push(char::from(HEX[usize::from(byte >> 4)]));
+            identity.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        Ok(identity)
     }
 
     /// Looks up an exact canonical schema path, charging every visited entry.
@@ -289,6 +309,24 @@ pub fn canonical_key(
     let node = budget.node(registry, path)?;
     let target = resolve_scalar_target(registry, node, budget)?;
     let kind = target.leaf_type.ok_or(SubtreeError::Unsupported)?;
+    budget.charge(1)?;
+    if !registry
+        .data_class(path)
+        .is_some_and(crate::DataClass::allows_cleartext)
+    {
+        // Mandatory provider identity validation retains raw text only here.
+        // Its independently bounded input cannot contribute hidden byte counts
+        // to the caller's matching allowance. Charge one validation unit;
+        // downstream matching retains only masked_identity's fixed-width form.
+        budget.charge(1)?;
+        return Ok(match kind {
+            LeafType::Boolean => matches!(value, "true" | "false").then(|| value.to_owned()),
+            LeafType::Uint16 | LeafType::Uint32 | LeafType::Int64 => {
+                parse_integer(kind, value).map(|integer| integer.to_string())
+            }
+            _ => Some(value.to_owned()),
+        });
+    }
     let value = parse_scalar(kind, &[], value, true, budget)?;
     ScalarPredicate {
         value,

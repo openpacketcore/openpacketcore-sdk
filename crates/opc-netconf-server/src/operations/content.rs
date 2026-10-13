@@ -42,6 +42,24 @@ pub(crate) enum ContentSource {
     Startup,
 }
 
+/// A request capture can share an owned snapshot or borrow one supplied by a
+/// public handler's caller. Neither variant clones the configuration model.
+pub(crate) enum ContentConfig<'a, C> {
+    Shared(Arc<C>),
+    Borrowed(&'a C),
+}
+
+impl<C> std::ops::Deref for ContentConfig<'_, C> {
+    type Target = C;
+
+    fn deref(&self) -> &C {
+        match self {
+            Self::Shared(config) => config,
+            Self::Borrowed(config) => config,
+        }
+    }
+}
+
 impl<'a> ContentRequest<'a> {
     pub(crate) fn from_operation(operation: &'a RpcOperation) -> Option<Self> {
         let request = match operation {
@@ -181,11 +199,11 @@ impl<'a> ContentRequest<'a> {
     }
 }
 
-pub(crate) async fn handle<C, B, P, A>(
+pub(crate) async fn handle<'a, C, B, P, A>(
     binding: &B,
     ctx: GetContext<'_, P, A>,
     request: ContentRequest<'_>,
-    load: impl FnOnce(ContentSource) -> Result<Arc<C>, RpcError>,
+    load: impl FnOnce(ContentSource) -> Result<ContentConfig<'a, C>, RpcError>,
     audit_mode: AuditMode,
 ) -> String
 where
@@ -202,11 +220,11 @@ where
 
 /// Runs the authority gate only after schema and read authorization permit data
 /// access. A gate rejection has already supplied its audit and complete reply.
-pub(crate) async fn handle_with_gate<C, B, P, A, F>(
+pub(crate) async fn handle_with_gate<'a, C, B, P, A, F>(
     binding: &B,
     ctx: GetContext<'_, P, A>,
     request: ContentRequest<'_>,
-    load: impl FnOnce(ContentSource) -> Result<Arc<C>, RpcError>,
+    load: impl FnOnce(ContentSource) -> Result<ContentConfig<'a, C>, RpcError>,
     audit_mode: AuditMode,
     gate: impl FnOnce() -> F,
 ) -> String
@@ -275,11 +293,11 @@ enum ReadResult {
     Reply(String),
 }
 
-async fn read<C, B, P, A, F>(
+async fn read<'a, C, B, P, A, F>(
     binding: &B,
     ctx: &GetContext<'_, P, A>,
     request: ContentRequest<'_>,
-    load: impl FnOnce(ContentSource) -> Result<Arc<C>, RpcError>,
+    load: impl FnOnce(ContentSource) -> Result<ContentConfig<'a, C>, RpcError>,
     audit_paths: &mut Vec<SchemaNodePath>,
     gate: impl FnOnce() -> F,
 ) -> Result<ReadResult, RpcError>

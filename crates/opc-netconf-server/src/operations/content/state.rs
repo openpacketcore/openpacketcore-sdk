@@ -80,13 +80,15 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             return Err(SubtreeError::Projection);
         }
         let path = value.path().as_str();
+        let (node, ancestors, identity, path_identity) =
+            instance(registry, path, budget, limits.max_value_bytes)?;
         for previous in &seen {
             budget.charge(1)?;
-            if budget.compare(previous, path)? {
+            if budget.compare(previous, &path_identity)? {
                 return Err(SubtreeError::Projection);
             }
         }
-        let (node, ancestors, identity) = instance(registry, path, budget, limits.max_value_bytes)?;
+        let path_work = path_identity.len();
         if node.config || !matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList) {
             return Err(SubtreeError::Projection);
         }
@@ -99,9 +101,11 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             let mut matches = true;
             for (key, expected) in &selector.keys {
                 let mut found = false;
-                for (path, actual) in &identity {
+                for actual in &identity {
                     budget.charge(1)?;
-                    if budget.compare(key, path)? && budget.compare(expected, actual)? {
+                    if budget.compare(key, actual.path)?
+                        && budget.compare(expected, &actual.captured)?
+                    {
                         found = true;
                         break;
                     }
@@ -117,7 +121,7 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             return Err(SubtreeError::Projection);
         }
         budget.charge(1)?;
-        seen.push(budget.copy(path)?);
+        seen.push(path_identity);
         // OperationalValue has already validated the immutable JSON. Its shape
         // proof lets masked non-key output avoid decoding or retaining raw text.
         budget.charge(1)?;
@@ -127,39 +131,49 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             OperationalValueShape::Scalar => {}
         }
         let mut identity_value = None;
-        for (path, key) in &identity {
+        for key in &identity {
             budget.charge(1)?;
-            if budget.compare(path, node.path)? {
+            if budget.compare(key.path, node.path)? {
                 identity_value = Some(key);
                 break;
             }
         }
         budget.charge(1)?;
-        let masked = identity_value.is_none()
-            && !registry
-                .data_class(node.path)
-                .is_some_and(opc_mgmt_schema::DataClass::allows_cleartext);
-        let raw = if masked {
+        let masked = !registry
+            .data_class(node.path)
+            .is_some_and(opc_mgmt_schema::DataClass::allows_cleartext);
+        let raw = if masked && identity_value.is_none() {
             budget.copy("<redacted>")?
         } else {
-            // JSON parsing/copies are bounded in advance by the encoded byte count.
-            budget.charge(
+            // A masked key still requires raw key/payload consistency validation.
+            // Its bytes are independently capped above; matching charges one
+            // fixed validation unit and retains only the captured surrogate.
+            budget.charge(if masked {
+                1
+            } else {
                 value
                     .value_json()
                     .len()
                     .checked_mul(3)
-                    .ok_or(SubtreeError::TooBig)?,
-            )?;
+                    .ok_or(SubtreeError::TooBig)?
+            })?;
             let json: serde_json::Value =
                 serde_json::from_str(value.value_json()).map_err(|_| SubtreeError::Projection)?;
             match json {
                 serde_json::Value::Null => continue,
                 serde_json::Value::String(raw) => raw,
                 serde_json::Value::Bool(value) => {
-                    budget.copy(if value { "true" } else { "false" })?
+                    let text = if value { "true" } else { "false" };
+                    if masked {
+                        text.to_owned()
+                    } else {
+                        budget.copy(text)?
+                    }
                 }
                 serde_json::Value::Number(value) => {
-                    budget.charge(327)?;
+                    if !masked {
+                        budget.charge(327)?;
+                    }
                     value.to_string()
                 }
                 serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
@@ -168,47 +182,60 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             }
         };
         // Even values which would fail a predicate must pass identity validation.
-        if let Some(key) = identity_value {
+        let captured = if let Some(key) = identity_value {
             let canonical = canonical_key(registry, node.path, &raw, budget)?
                 .ok_or(SubtreeError::Projection)?;
-            if !budget.compare(key, &canonical)? {
+            let consistent = if masked {
+                budget.charge(1)?;
+                key.raw == canonical
+            } else {
+                budget.compare(&key.raw, &canonical)?
+            };
+            if !consistent {
                 return Err(SubtreeError::Projection);
             }
-        }
+            if masked {
+                budget.copy(&key.captured)?
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
         budget.charge(1)?;
-        let mut tree = NetconfXmlNode::scalar(node.path, raw, false);
+        let mut tree = NetconfXmlNode::scalar(node.path, captured, false);
         for mut parent in ancestors.into_iter().rev() {
             budget.charge(1)?;
             parent.children.push(tree);
             tree = parent;
         }
         budget.charge(1)?;
-        accepted.push((path, tree));
+        accepted.push((path, path_work, tree));
     }
-    // Validate the complete response before ordering or merging any instances.
-    // Fallible insertion sort charges every comparison and move in advance.
-    for index in 1..accepted.len() {
-        budget.charge(1)?;
+    // Canonical order still uses the raw validated path. Precharge insertion
+    // sort's complete worst case so comparison/move count cannot reveal hidden
+    // key order, and use only fixed-width identities to measure path work.
+    let count = accepted.len();
+    budget.charge(count.checked_mul(2).ok_or(SubtreeError::TooBig)?)?;
+    let max_path_work = accepted.iter().map(|(_, work, _)| *work).max().unwrap_or(0);
+    let pairs = count
+        .checked_mul(count.saturating_sub(1))
+        .ok_or(SubtreeError::TooBig)?
+        / 2;
+    let per_pair = max_path_work
+        .checked_mul(2)
+        .and_then(|work| work.checked_add(2))
+        .ok_or(SubtreeError::TooBig)?;
+    budget.charge(pairs.checked_mul(per_pair).ok_or(SubtreeError::TooBig)?)?;
+    for index in 1..count {
         let mut current = index;
-        while current > 0 {
-            budget.charge(1)?;
-            let left = accepted[current - 1].0;
-            let right = accepted[current].0;
-            budget.charge(
-                left.len()
-                    .checked_add(right.len())
-                    .ok_or(SubtreeError::TooBig)?,
-            )?;
-            if left <= right {
-                break;
-            }
-            budget.charge(1)?;
+        while current > 0 && accepted[current - 1].0 > accepted[current].0 {
             accepted.swap(current - 1, current);
             current -= 1;
         }
     }
     let mut output = Vec::new();
-    for (_, tree) in accepted {
+    for (_, _, tree) in accepted {
         merge_bounded(registry, &mut output, vec![tree], budget)?;
     }
     Ok(output)
@@ -321,10 +348,19 @@ fn request_path(
     Ok(canonical)
 }
 
+struct InstanceKey {
+    path: &'static str,
+    // Raw text survives only until mandatory provider consistency validation.
+    raw: String,
+    // All selection, joins, copies and output identity use this representation.
+    captured: String,
+}
+
 type Instance = (
     &'static NodeMeta,
     Vec<NetconfXmlNode>,
-    Vec<(&'static str, String)>,
+    Vec<InstanceKey>,
+    String,
 );
 
 fn instance(
@@ -333,16 +369,27 @@ fn instance(
     budget: &SubtreeBudget,
     limit: usize,
 ) -> Result<Instance, SubtreeError> {
-    // Precharge a bound for syntax visits and retained path/key copies.
-    budget.charge(path.len().checked_mul(4).ok_or(SubtreeError::TooBig)?)?;
+    // The complete provider byte cap precedes this mandatory syntax pass. Raw
+    // key validation has a fixed admission charge; cleartext names and keys are
+    // metered below, before their canonical copies. Hidden lengths never enter
+    // the matching allowance, including this path's later equality/sort costs.
+    budget.charge(1)?;
     let segments = parse_canonical_path(path).map_err(|_| SubtreeError::Projection)?;
     let mut schema = String::new();
     let mut canonical = String::new();
+    let mut path_identity = String::new();
     let mut ancestors = Vec::new();
     let mut identity = Vec::new();
     let mut leaf = None;
     for (index, segment) in segments.iter().enumerate() {
         budget.charge(1)?;
+        budget.charge(
+            segment
+                .name
+                .len()
+                .checked_add(1)
+                .ok_or(SubtreeError::TooBig)?,
+        )?;
         append(&mut schema, "/", budget, limit)?;
         append(&mut schema, &segment.name, budget, limit)?;
         let node = budget.node(registry, &schema).map_err(|error| {
@@ -354,6 +401,8 @@ fn instance(
         })?;
         append(&mut canonical, "/", budget, limit)?;
         append(&mut canonical, &segment.name, budget, limit)?;
+        append(&mut path_identity, "/", budget, usize::MAX)?;
+        append(&mut path_identity, &segment.name, budget, usize::MAX)?;
         budget.charge(1)?;
         let mut branch = NetconfXmlNode::branch(node.path);
         match node.kind {
@@ -371,15 +420,51 @@ fn instance(
                     if !budget.compare(expected, name)? {
                         return Err(SubtreeError::Projection);
                     }
+                    budget.charge(1)?;
+                    let masked = !registry
+                        .data_class(key.path)
+                        .is_some_and(opc_mgmt_schema::DataClass::allows_cleartext);
                     let normalized = canonical_key(registry, key.path, value, budget)?
                         .ok_or(SubtreeError::Projection)?;
-                    if !budget.compare(&normalized, value)? {
-                        return Err(SubtreeError::Projection);
-                    }
-                    append_key(&mut canonical, name, &normalized, budget, limit)?;
+                    let captured = if masked {
+                        budget.charge(1)?;
+                        if normalized != *value {
+                            return Err(SubtreeError::Projection);
+                        }
+                        // This is provider validation, bounded by the input path
+                        // cap, not a retained raw matching identity.
+                        let raw_bytes = name
+                            .len()
+                            .checked_add(normalized.len())
+                            .and_then(|bytes| bytes.checked_add(5))
+                            .ok_or(SubtreeError::TooBig)?;
+                        if canonical
+                            .len()
+                            .checked_add(raw_bytes)
+                            .ok_or(SubtreeError::TooBig)?
+                            > limit
+                        {
+                            return Err(SubtreeError::TooBig);
+                        }
+                        budget.charge(name.len().checked_add(6).ok_or(SubtreeError::TooBig)?)?;
+                        append_key_predicate(&mut canonical, name, &normalized)
+                            .map_err(|_| SubtreeError::Projection)?;
+                        budget.masked_identity(&normalized)?
+                    } else {
+                        if !budget.compare(&normalized, value)? {
+                            return Err(SubtreeError::Projection);
+                        }
+                        append_key(&mut canonical, name, &normalized, budget, limit)?;
+                        budget.copy(&normalized)?
+                    };
+                    append_key(&mut path_identity, name, &captured, budget, usize::MAX)?;
                     budget.charge(2)?;
-                    identity.push((key.path, budget.copy(&normalized)?));
-                    branch.keys.push((key.path, normalized));
+                    identity.push(InstanceKey {
+                        path: key.path,
+                        raw: normalized,
+                        captured: budget.copy(&captured)?,
+                    });
+                    branch.keys.push((key.path, captured));
                 }
             }
             _ if !segment.keys.is_empty() => return Err(SubtreeError::Projection),
@@ -395,8 +480,19 @@ fn instance(
             ancestors.push(branch);
         }
     }
-    if !budget.compare(path, &canonical)? {
+    budget.charge(
+        path_identity
+            .len()
+            .checked_mul(2)
+            .ok_or(SubtreeError::TooBig)?,
+    )?;
+    if path != canonical {
         return Err(SubtreeError::Projection);
     }
-    Ok((leaf.ok_or(SubtreeError::Projection)?, ancestors, identity))
+    Ok((
+        leaf.ok_or(SubtreeError::Projection)?,
+        ancestors,
+        identity,
+        path_identity,
+    ))
 }

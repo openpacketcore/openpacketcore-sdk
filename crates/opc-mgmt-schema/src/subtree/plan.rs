@@ -112,9 +112,22 @@ impl SubtreePlan {
         for scope in &scopes {
             collect_paths(scope, &mut paths, &self.budget, node_limit)?;
         }
+        // Keep all exact structural prefixes once, after authorization, instead
+        // of rescanning every dependency for every projected row and child.
+        let mut structural_paths = Vec::new();
+        for path in &paths {
+            let mut prefix = *path;
+            while !prefix.is_empty() {
+                self.budget
+                    .charge(prefix.len().checked_add(1).ok_or(SubtreeError::TooBig)?)?;
+                insert_path(&mut structural_paths, prefix, &self.budget, node_limit)?;
+                prefix = prefix.rsplit_once('/').map_or("", |(parent, _)| parent);
+            }
+        }
         Ok(AuthorizedSubtreePlan {
             scopes,
             paths,
+            structural_paths,
             budget: self.budget,
         })
     }
@@ -125,6 +138,7 @@ impl SubtreePlan {
 pub struct AuthorizedSubtreePlan {
     scopes: Vec<SubtreeScope>,
     paths: Vec<&'static str>,
+    structural_paths: Vec<&'static str>,
     budget: SubtreeBudget,
 }
 
@@ -174,6 +188,7 @@ impl AuthorizedSubtreePlan {
         SubtreeProjection {
             registry,
             paths: &self.paths,
+            structural_paths: &self.structural_paths,
             budget: &self.budget,
             report,
             observer: None,
@@ -569,6 +584,7 @@ impl SubtreeScalar<'_> {
 pub struct SubtreeProjection<'a> {
     registry: &'a dyn SchemaRegistry,
     paths: &'a [&'static str],
+    structural_paths: &'a [&'static str],
     budget: &'a SubtreeBudget,
     report: DefaultReport,
     observer: Option<&'a dyn SubtreeAccessObserver>,
@@ -622,27 +638,44 @@ impl<'a> SubtreeProjection<'a> {
         Ok(())
     }
     /// Whether this exact schema node has a surviving authorized dependency.
-    pub fn selected(&self, path: &str) -> bool {
-        self.paths.binary_search(&path).is_ok()
+    /// Every binary-search probe consumes the shared work allowance.
+    pub fn selected(&self, path: &str) -> Result<bool, SubtreeError> {
+        self.contains_path(self.paths, path)
     }
     /// Whether an authorized path needs this structural ancestor.
-    pub fn subtree_selected(&self, path: &str) -> bool {
-        self.paths.iter().any(|candidate| {
-            *candidate == path
-                || candidate
-                    .strip_prefix(path)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
+    /// Prefixes are precomputed once during authorization, with bounded probes.
+    pub fn subtree_selected(&self, path: &str) -> Result<bool, SubtreeError> {
+        self.contains_path(self.structural_paths, path)
+    }
+
+    fn contains_path(&self, paths: &[&str], path: &str) -> Result<bool, SubtreeError> {
+        let mut lo = 0;
+        let mut hi = paths.len();
+        while lo < hi {
+            self.budget.charge(1)?;
+            let middle = lo + (hi - lo) / 2;
+            self.budget.charge(
+                path.len()
+                    .checked_add(paths[middle].len())
+                    .ok_or(SubtreeError::TooBig)?,
+            )?;
+            match paths[middle].cmp(path) {
+                std::cmp::Ordering::Equal => return Ok(true),
+                std::cmp::Ordering::Less => lo = middle + 1,
+                std::cmp::Ordering::Greater => hi = middle,
+            }
+        }
+        Ok(false)
     }
     /// Gates a candidate node before any field, value or row access.
     pub fn enter(&self, path: &'static str, structural: bool) -> Result<bool, SubtreeError> {
+        self.budget.charge(1)?;
         let permitted = if structural {
-            self.subtree_selected(path)
+            self.subtree_selected(path)?
         } else {
-            self.selected(path)
+            self.selected(path)?
         };
         if permitted {
-            self.budget.charge(1)?;
             if let Some(observer) = self.observer {
                 observer.before_read(
                     path,
@@ -666,6 +699,34 @@ impl<'a> SubtreeProjection<'a> {
         }
         Ok(self.budget.node(self.registry, path)?.default)
     }
+    /// Captures a complete key after authorization, before any byte-based work.
+    /// Masked keys use the same fixed-width identity as operational capture.
+    pub fn key(
+        &self,
+        path: &'static str,
+        value: SubtreeScalar<'_>,
+    ) -> Result<String, SubtreeError> {
+        self.budget.charge(1)?;
+        if self
+            .registry
+            .data_class(path)
+            .is_some_and(crate::DataClass::allows_cleartext)
+        {
+            return value.encode(self.budget);
+        }
+        self.budget.charge(1)?;
+        use std::borrow::Cow;
+        let raw = match value {
+            SubtreeScalar::Text(value) => Cow::Borrowed(value),
+            SubtreeScalar::Empty => Cow::Borrowed(""),
+            SubtreeScalar::Boolean(value) => Cow::Borrowed(if value { "true" } else { "false" }),
+            SubtreeScalar::Integer(value) => Cow::Owned(value.to_string()),
+            SubtreeScalar::Unsigned(value) => Cow::Owned(value.to_string()),
+            SubtreeScalar::Decimal(value) => Cow::Owned(value.to_string()),
+        };
+        self.budget.masked_identity(&raw)
+    }
+
     /// Projects a present scalar using the same default-report rules as XML.
     pub fn scalar(
         &self,

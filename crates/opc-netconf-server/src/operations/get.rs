@@ -100,7 +100,11 @@ where
             binding,
             ctx,
             content,
-            |_| Ok(binding.config_bus().current_snapshot().config.clone()),
+            |_| {
+                Ok(super::content::ContentConfig::Shared(
+                    binding.config_bus().current_snapshot().config.clone(),
+                ))
+            },
             audit_mode,
         )
         .await;

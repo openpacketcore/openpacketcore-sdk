@@ -23,7 +23,7 @@ pub(crate) fn project_yang_library(
         ctx,
     )?;
     if ctx.enter(YANG_LIBRARY_MODULE_SET, true)? {
-        if !ctx.selected(YANG_LIBRARY_MODULE_SET_NAME) {
+        if !ctx.selected(YANG_LIBRARY_MODULE_SET_NAME)? {
             return Err(SubtreeError::Projection);
         }
         ctx.row(YANG_LIBRARY_MODULE_SET)?;

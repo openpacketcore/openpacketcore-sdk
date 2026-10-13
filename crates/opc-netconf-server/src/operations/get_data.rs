@@ -125,20 +125,18 @@ where
             read_ctx,
             content,
             |source| {
-                use super::content::ContentSource;
+                use super::content::{ContentConfig, ContentSource};
                 match source {
-                    ContentSource::Running => {
-                        Ok(binding.config_bus().current_snapshot().config.clone())
-                    }
+                    ContentSource::Running => Ok(ContentConfig::Shared(
+                        binding.config_bus().current_snapshot().config.clone(),
+                    )),
                     ContentSource::Candidate => ctx
                         .candidate_config
-                        .cloned()
-                        .map(std::sync::Arc::new)
+                        .map(ContentConfig::Borrowed)
                         .ok_or_else(RpcError::operation_failed),
                     ContentSource::Startup => ctx
                         .startup_config
-                        .cloned()
-                        .map(std::sync::Arc::new)
+                        .map(ContentConfig::Borrowed)
                         .ok_or_else(RpcError::data_missing),
                 }
             },

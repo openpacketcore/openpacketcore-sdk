@@ -91,7 +91,7 @@ fn project_function(
                     #[allow(unused_mut)]
                     let mut children = Vec::new();
                     #(#children)*
-                    if children.is_empty() && !ctx.selected(#path) { return Ok(Vec::new()); }
+                    if children.is_empty() && !ctx.selected(#path)? { return Ok(Vec::new()); }
                     ctx.budget().charge(1)?;
                     let mut node = opc_mgmt_schema::NetconfXmlNode::branch(#path);
                     node.children = children;
@@ -244,7 +244,7 @@ fn list_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> Result<TokenStream, Ru
         let scalar = scalar_ref(child, nodes, quote! { item });
         keys.push(quote! {
             let raw = match #value {
-                super::types::LeafPresence::Explicit(item) | super::types::LeafPresence::Defaulted(item) => #scalar.encode(ctx.budget())?,
+                super::types::LeafPresence::Explicit(item) | super::types::LeafPresence::Defaulted(item) => ctx.key(#child_path, #scalar)?,
                 super::types::LeafPresence::Absent => return Err(opc_mgmt_schema::subtree::SubtreeError::Projection),
             };
             keys.push((#child_path, raw));
@@ -257,7 +257,7 @@ fn list_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> Result<TokenStream, Ru
     let children = child_statements(node, nodes)?;
     Ok(quote! {
         if !ctx.enter(#path, true)? { return Ok(Vec::new()); }
-        if !(true #(&& ctx.selected(#key_paths))*) { return Err(opc_mgmt_schema::subtree::SubtreeError::Projection); }
+        if !(true #(&& ctx.selected(#key_paths)?)*) { return Err(opc_mgmt_schema::subtree::SubtreeError::Projection); }
         let mut projected = Vec::new();
         for value in value.values() {
             ctx.row(#path)?;
