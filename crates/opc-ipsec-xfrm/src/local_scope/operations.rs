@@ -117,6 +117,22 @@ fn mismatch() -> XfrmError {
         operation: "local_scope_receipt",
     }
 }
+// A failed authority read never establishes the final state of a kernel
+// operation. Keep revision mismatch observable without authorizing any effect.
+fn authority_error(error: opc_local_kernel_lifecycle::LocalEffectError) -> XfrmError {
+    use opc_local_kernel_lifecycle::LocalEffectError;
+    match error {
+        LocalEffectError::TransportRevisionMismatch => XfrmError::StateIndeterminate {
+            operation: "scope_transport_revision_mismatch",
+        },
+        LocalEffectError::Closed
+        | LocalEffectError::Stale
+        | LocalEffectError::WrongRequest
+        | LocalEffectError::RetryableNoEffect
+        | LocalEffectError::OutcomeUnknown
+        | LocalEffectError::Unavailable => uncertain(),
+    }
+}
 fn uncertain() -> XfrmError {
     XfrmError::StateIndeterminate {
         operation: "local_scope_effect",
@@ -514,7 +530,7 @@ impl effect::Kernel for NativeKernel<'_> {
             return Err(mismatch());
         }
         self.backend.preflight_scoped_sa(self.request)?;
-        self.effect.recheck().await.map_err(|_| uncertain())
+        self.effect.recheck().await.map_err(authority_error)
     }
     async fn policy(&mut self) -> Result<effect::Readback, XfrmError> {
         self.local()?;
@@ -589,4 +605,31 @@ pub(crate) enum TestFault {
 pub(crate) struct TestPause {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[test]
+fn authority_revision_mismatch_has_a_distinct_local_refusal() {
+    use opc_local_kernel_lifecycle::LocalEffectError;
+    assert!(matches!(
+        authority_error(LocalEffectError::TransportRevisionMismatch),
+        XfrmError::StateIndeterminate {
+            operation: "scope_transport_revision_mismatch"
+        }
+    ));
+    for failure in [
+        LocalEffectError::Closed,
+        LocalEffectError::Stale,
+        LocalEffectError::WrongRequest,
+        LocalEffectError::RetryableNoEffect,
+        LocalEffectError::OutcomeUnknown,
+        LocalEffectError::Unavailable,
+    ] {
+        assert!(matches!(
+            authority_error(failure),
+            XfrmError::StateIndeterminate {
+                operation: "local_scope_effect"
+            }
+        ));
+    }
 }

@@ -87,15 +87,79 @@ pub enum SchemaNodeKind {
 pub enum TypeRef {
     Boolean,
     String,
-    Enumeration { values: Vec<EnumValue> },
+    /// A string with retained YANG `length` and conjunctive XSD patterns.
+    RestrictedString {
+        /// Ordered, disjoint allowed character-count intervals.
+        length: Vec<StringLengthInterval>,
+        /// Every pattern must accept the value after applying its modifier.
+        patterns: Vec<StringPattern>,
+    },
+    Enumeration {
+        values: Vec<EnumValue>,
+    },
+    Uint8,
     Uint16,
     Uint32,
+    Uint64,
+    Int8,
+    Int16,
+    Int32,
     Int64,
     Decimal64,
     Empty,
-    IdentityRef { base: String },
-    LeafRef { target_path: String },
-    Custom { name: String },
+    IdentityRef {
+        base: String,
+    },
+    LeafRef {
+        target_path: String,
+    },
+    Custom {
+        name: String,
+    },
+}
+
+impl TypeRef {
+    pub(crate) fn string_restrictions(
+        &self,
+    ) -> Option<(&[StringLengthInterval], &[StringPattern])> {
+        match self {
+            Self::RestrictedString { length, patterns } => Some((length, patterns)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn integer_bounds(&self) -> Option<(i128, i128)> {
+        Some(match self {
+            Self::Uint8 => (0, i128::from(u8::MAX)),
+            Self::Uint16 => (0, i128::from(u16::MAX)),
+            Self::Uint32 => (0, i128::from(u32::MAX)),
+            Self::Uint64 => (0, i128::from(u64::MAX)),
+            Self::Int8 => (i128::from(i8::MIN), i128::from(i8::MAX)),
+            Self::Int16 => (i128::from(i16::MIN), i128::from(i16::MAX)),
+            Self::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+            Self::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+            _ => return None,
+        })
+    }
+}
+
+/// One inclusive YANG string length interval, measured in Unicode characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StringLengthInterval {
+    /// Inclusive lower character count.
+    pub min: u64,
+    /// Inclusive upper character count, including YANG `max` = `u64::MAX`.
+    pub max: u64,
+}
+
+/// A YANG XSD pattern and its optional `invert-match` modifier.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StringPattern {
+    /// The original XSD regular expression, preserved in the schema digest.
+    pub expression: String,
+    /// Whether a match must instead reject the value.
+    #[serde(default)]
+    pub invert_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,8 +171,10 @@ pub struct EnumValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NumericRangeInterval {
-    pub min: i64,
-    pub max: i64,
+    /// Inclusive bound; `i128` represents every YANG signed and unsigned integer.
+    pub min: i128,
+    /// Inclusive bound; `i128` represents every YANG signed and unsigned integer.
+    pub max: i128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

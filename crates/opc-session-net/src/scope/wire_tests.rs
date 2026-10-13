@@ -2,10 +2,11 @@ use super::wire::*;
 use serde_json::Value;
 
 fn vectors() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap()
+    .unwrap()["authority_startup"]
+        .clone()
 }
 fn bytes(value: &Value) -> Vec<u8> {
     let (pairs, remainder) = value.as_str().unwrap().as_bytes().as_chunks::<2>();
@@ -42,13 +43,13 @@ fn malformed_or_oversized_headers_are_rejected_before_payload_read() {
         assert!(Header::decode(&good[..length]).is_err());
     }
     for (offset, value) in [
-        (5, 2),
+        (5, 1),
         (6, 0),
         (6, 6),
         (7, 4),
         (8, 1),
         (9, 0),
-        (9, 17),
+        (9, 18),
         (10, 1),
         (11, 1),
     ] {

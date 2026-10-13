@@ -210,31 +210,101 @@ impl ScopeBatchReservation {
         F: FnOnce(ScopeBatchBuildContext) -> Fut,
         Fut: Future<Output = Result<ScopeBatchRequest, ScopeBatchError>>,
     {
-        let permit = self
-            .resident
-            .start_in_lane(&self.guard)
+        let (admitted, permit) = self.start().await?;
+        let cut = admitted.inner.backend().reopen(permit.class()).await?;
+        let context = admitted.context(&cut)?;
+        let request = build(context.clone()).await?;
+        admitted.finish(permit, context, request, None)
+    }
+
+    /// Build with serialized current-child observations under the original
+    /// resident/running grant and replay lane. The context borrows this attempt;
+    /// neither it nor a read may escape the builder. Every attempted read is
+    /// debited, and the absolute budget includes start, reopen and construction.
+    /// Cancelling before registration submits no application batch or cancellation.
+    pub async fn submit_with_reads<F>(
+        self,
+        budget: ScopeBatchReadBudget,
+        build: F,
+    ) -> Result<ScopeBatchHandle, ScopeChildReadError>
+    where
+        F: for<'run> FnOnce(
+            ScopeBatchReadContext<'run>,
+        ) -> futures_util::future::BoxFuture<
+            'run,
+            Result<ScopeBatchRequest, ScopeChildReadError>,
+        >,
+    {
+        read_context::before(budget.deadline(), async {
+            let (admitted, permit) = self.start().await?;
+            let backend = admitted.inner.backend();
+            let cut = backend.reopen(permit.class()).await?;
+            let context = admitted.context(&cut)?;
+            let reading = ScopeBatchReadContext::new(
+                &context,
+                &context.stamp,
+                backend.as_ref(),
+                &permit,
+                budget,
+            );
+            let request = build(reading).await?;
+            admitted
+                .finish(permit, context, request, Some(budget.deadline()))
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    async fn start(self) -> Result<(AdmittedReservation, ScopeWorkPermit), ScopeBatchError> {
+        let Self {
+            inner,
+            lane,
+            guard,
+            resident,
+        } = self;
+        let permit = resident
+            .start_in_lane(&guard)
             .await
             // Nothing has been built or dispatched, so this affine reservation
             // may release its entitlement when pre-dispatch start fails.
             .map_err(|error| scheduler_error(error.error()))?;
-        let cut = self.inner.backend().reopen(permit.class()).await?;
+        Ok((AdmittedReservation { inner, lane, guard }, permit))
+    }
+}
+
+struct AdmittedReservation {
+    inner: Arc<Inner>,
+    lane: u8,
+    guard: Arc<ScopeLaneGuard>,
+}
+
+impl AdmittedReservation {
+    fn context(&self, cut: &ScopeBatchReopen) -> Result<ScopeBatchBuildContext, ScopeBatchError> {
         let view = cut.check_stamp(&self.inner.stamp)?;
         let sequence = view.lanes()[usize::from(self.lane)]
             .sequence()
             .checked_add(1)
             .filter(|sequence| *sequence <= COUNTER_MAX)
             .ok_or(ScopeBatchError::InvalidRequest)?;
-        let context = ScopeBatchBuildContext {
+        Ok(ScopeBatchBuildContext {
             stamp: self.inner.stamp.clone(),
             lane: self.lane,
             sequence,
             view: view.clone(),
-        };
-        let request = build(context).await?;
+        })
+    }
+
+    fn finish(
+        self,
+        permit: ScopeWorkPermit,
+        context: ScopeBatchBuildContext,
+        request: ScopeBatchRequest,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ScopeBatchHandle, ScopeBatchError> {
         request.validate()?;
         if request.stamp() != &self.inner.stamp
             || request.lane() != self.lane
-            || request.sequence() != sequence
+            || request.sequence() != context.sequence
         {
             return Err(ScopeBatchError::InvalidRequest);
         }
@@ -244,7 +314,7 @@ impl ScopeBatchReservation {
         let control = Control::new();
         {
             let mut state = lock(&self.inner.state);
-            if view.lanes().iter().any(|lane| {
+            if context.view.lanes().iter().any(|lane| {
                 lane.receipt()
                     .is_some_and(|receipt| receipt.attempt().request_id() == request.request_id())
             }) || state
@@ -263,6 +333,9 @@ impl ScopeBatchReservation {
             let slot = &mut state.slots[usize::from(self.lane)];
             if slot.is_some() {
                 return Err(ScopeBatchError::FormatMismatch);
+            }
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(ScopeBatchError::Unavailable);
             }
             *slot = Some(Slot {
                 attempt: attempt.clone(),

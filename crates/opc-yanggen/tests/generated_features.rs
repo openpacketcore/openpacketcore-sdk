@@ -72,7 +72,7 @@ fn create_test_input() -> CanonicalInput {
             type_ref: Some(TypeRef::Uint32),
             numeric_range: vec![NumericRangeInterval {
                 min: 1,
-                max: i64::from(u32::MAX),
+                max: i128::from(u32::MAX),
             }],
             key_leaves: vec![],
             child_paths: vec![],

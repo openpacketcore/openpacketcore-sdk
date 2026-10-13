@@ -38,6 +38,7 @@ impl WalLogStore {
         state
             .authority
             .validate(&state.conn, self.wal.binding.identity)?;
+        let _payloads = state.scope_payloads.enter();
         read(&state.conn)
     }
 

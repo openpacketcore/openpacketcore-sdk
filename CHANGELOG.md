@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-yanggen`: `NumericRangeInterval` IR bounds are now `i128` to represent
+  all YANG integer limits; convert typed `i64` inputs with `.into()`. `TypeRef`
+  adds integer-width and restricted-string variants. Existing runtime `i64`
+  range metadata remains compatible. (#1006, #1263)
+
 - `opc-proto-nas`: `MmMessageBody::ConfigurationUpdateCommand` and
   `MmMessageBody::ConfigurationUpdateComplete` now carry the typed
   `ConfigurationUpdateCommand` and `ConfigurationUpdateComplete` structs
@@ -33,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-yanggen`: support all eight integer widths, exact declared ranges,
+  RFC 7951 strings for 64-bit values, and deterministic distinct Rust types for
+  nested nodes sharing a local name. Support Unicode string lengths, multiple
+  whole-value XSD patterns, and `invert-match` across load and generated writes,
+  with fixed value-free errors. Pattern compilation is bounded and cached once
+  through `opc-mgmt-schema` using `regex` (MIT OR Apache-2.0); XML-name and
+  Unicode-block escapes fail closed as unsupported. Models using none of these
+  new constructs retain byte-identical generated files. (#1006, #1263)
+  Source quoting preserves pattern characters and enforces RFC 7950 escapes,
+  whitespace trimming, and quoted concatenation. Value-less list-entry patches
+  assign and validate path keys, and integer defaults decode octal and
+  hexadecimal notation for every width.
+
 - `opc-proto-nas`: frame optional elements with complete per-message tables
   from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),
   Security Mode Command (7), Security Mode Complete (3), Configuration Update
@@ -40,6 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enforce the selected table's identifiers and wire-length bounds. Every IEI
   with bit 8 set is one octet, and half-octet duplicates use the high nibble.
   Correct the Security Mode clause references to 8.2.25 and 8.2.26. (#1238)
+
+- `opc-session-store` and `opc-session-net`: add bounded current child reads for
+  1–32 ordered keys under one complete read barrier and backend snapshot. Carry
+  exact child metadata and sealed bytes over scope transport revision 2, reuse
+  granted batch-builder admission, and release captured reads on peer close or
+  the fixed server limit. Revision mismatch is a distinct, observable call
+  failure with no permanent latch or immediate retry. Revision 2 requires a
+  fresh installation; see the RFC 026 child-read addendum.
+
+- `opc-local-kernel-lifecycle`, GTP-U and XFRM: add the opt-in `native-scope`
+  authority adapter for stateless workers. Authenticate supervised completion
+  provenance and read back the original activation before coordinator ack;
+  preserve its trusted class, local reset fence and shared consumption state.
+  Local and native adapters use one current-child cut for readback and recheck
+  and retain the same concrete backend effect type. Readback also checks the
+  exact batch revision. Qualification runs the existing kernel lifecycle
+  scenarios through both adapters.
 
 - `opc-session-store` and `opc-session-net`: add coherent, paged restore of a
   positively handed-over scope across native and SQLite storage and authenticated
@@ -635,6 +670,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-testbed`: replace deprecated `serde_yaml` and unmaintained `unsafe-libyaml`
+  with the YAML Organization's `yaml_serde` and `libyaml-rs`, resolving
+  RUSTSEC-2024-0449. Preserve the scenario fixture's complete parsed values and
+  serialization roundtrip in a compatibility regression.
+
+- `opc-session-store`: bound repeated scope-payload decoding in the retained
+  SQL WAL owner by reusing the exact bytes of two recent decoded entries.
+  Previous children no longer add payload decodes to sequential large-child
+  writes. Row, authority, projection and final stored-byte audits remain intact,
+  with the original operation deadline.
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at

@@ -3,10 +3,11 @@ use opc_session_store::scope_authority::*;
 use serde_json::Value;
 use std::sync::Mutex;
 fn vectors() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap()
+    .unwrap()["authority_startup"]
+        .clone()
 }
 fn bytes(v: &Value) -> Vec<u8> {
     v.as_str()

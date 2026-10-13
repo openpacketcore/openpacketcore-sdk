@@ -273,6 +273,40 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 self.assertIn("--test-threads=1", command)
                 self.assertIn("--exact", command)
 
+    def test_scope_child_read_contracts_run_once_on_the_serial_shard(self) -> None:
+        plan = TEST_SHARDS.load_plan()
+        targets = [plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
+        names = {
+            "child_reads": [
+                "native_scope_child_read_client_keeps_one_barrier_on_fresh_and_reused_connections",
+                "native_scope_child_read_builder_reuses_running_credit_and_bounds_all_exchanges",
+                "native_scope_completion_provenance_rejects_forged_ports_and_early_ack",
+            ],
+            "child_read_guards": [
+                "native_scope_quorum_revision_signals_distinguish_alerts_from_authenticated_frames",
+                "native_scope_child_read_peer_close_releases_cut_and_proof_while_admission_is_held",
+                "native_scope_child_read_ten_second_cut_bound_returns_retry_and_releases_ownership",
+                "native_scope_child_read_promotes_only_after_current_cut_and_clears_stale_hint",
+            ],
+            "child_read_revocation": [
+                "native_scope_child_read_held_policy_revocation_returns_unauthorized_without_observation",
+            ],
+        }
+        for module, tests in names.items():
+            for name in tests:
+                short = f"scope_transport::{module}::{name}"
+                with self.subTest(name=short):
+                    self.assertIn(short, TEST_SHARDS.QUIESCENT_LIB_TESTS)
+                    command = TEST_SHARDS.quiescent_lib_command(short)
+                    owners = [
+                        shard for shard in TEST_SHARDS.shard_ids(plan)
+                        for actual in TEST_SHARDS.commands(plan, shard, targets)
+                        if actual == command
+                    ]
+                    self.assertEqual(owners, ["it-0"])
+                    self.assertIn("--test-threads=1", command)
+                    self.assertIn("--exact", command)
+
     def test_protected_transition_runs_once_in_the_optimized_shard(self) -> None:
         name = (
             "stateless_quorum_consumer::"

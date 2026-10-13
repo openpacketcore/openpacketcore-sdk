@@ -18,6 +18,10 @@ pub(crate) mod roster_snapshot;
 pub(crate) mod scope_authority;
 pub(crate) mod scope_batch;
 mod scope_continuity;
+#[cfg(target_os = "linux")]
+mod scope_payload_cache;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod scope_payload_decode_observer;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -21640,6 +21644,10 @@ fn validate_exact_fenced_transition_v2_log_json(
 /// exact structural schema, including when a V2 discriminant appears only in
 /// data an ordinary derived decoder would ignore.
 pub(crate) fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeConfig>> {
+    #[cfg(target_os = "linux")]
+    if let Some(entry) = scope_payload_cache::decoded(bytes) {
+        return Ok(entry);
+    }
     #[cfg(test)]
     log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::FullDecode);
     if bytes.is_empty() || bytes.len() > SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES {
@@ -21655,6 +21663,10 @@ pub(crate) fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<Sessi
     if typed_v2 || raw_v2 {
         validate_exact_fenced_transition_v2_log_json(bytes, &entry)?;
     }
+    #[cfg(all(test, target_os = "linux"))]
+    scope_payload_decode_observer::decoded(&entry, bytes.len());
+    #[cfg(target_os = "linux")]
+    scope_payload_cache::remember(bytes, &entry);
     Ok(entry)
 }
 
@@ -25309,6 +25321,26 @@ fn last_log_with_optional_capture_sync(
     identity: SessionConsensusIdentity,
     reuse: Option<&mut LogRowReadReuse<'_>>,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    last_log_with_audited_application_sync(conn, identity, reuse, None)
+}
+
+/// Reuse requires a complete earlier payload audit and exact identity/byte
+/// equality. The application owner supplies its privately constructed proof;
+/// every other caller uses the ordinary full decoder.
+trait AuditedLogEntry {
+    fn reuse_for_exact_bytes(
+        &self,
+        identity: SessionConsensusIdentity,
+        encoded: &[u8],
+    ) -> Option<&Entry<SessionRaftTypeConfig>>;
+}
+
+fn last_log_with_audited_application_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    reuse: Option<&mut LogRowReadReuse<'_>>,
+    audited: Option<&dyn AuditedLogEntry>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     let floor = read_purged_sync(conn, identity)?;
     let row = conn
         .query_row(
@@ -25322,7 +25354,10 @@ fn last_log_with_optional_capture_sync(
         return Ok(floor);
     };
     validate_epoch(epoch, identity)?;
-    let entry = decode_consensus_log_entry(&encoded)?;
+    let entry = match audited.and_then(|audit| audit.reuse_for_exact_bytes(identity, &encoded)) {
+        Some(entry) => std::borrow::Cow::Borrowed(entry),
+        None => std::borrow::Cow::Owned(decode_consensus_log_entry(&encoded)?),
+    };
     validate_log_id(&entry.log_id)?;
     if checked_u64(term)? != entry.log_id.leader_id.term
         || checked_u64(index)? != entry.log_id.index
@@ -25338,7 +25373,7 @@ fn last_log_with_optional_capture_sync(
     }
     let log_id = entry.log_id;
     if let Some(reuse) = reuse {
-        reuse.capture_after_full_audit(epoch, term, index, encoded, entry);
+        reuse.capture_after_full_audit(epoch, term, index, encoded, entry.into_owned());
     }
     #[cfg(test)]
     log_row_reuse_test_observer::after_highest_audit(conn);
@@ -40706,6 +40741,10 @@ mod log_row_reuse_test_observer {
         Ineligible,
         BudgetFallback,
         HighestAudit,
+        #[cfg(target_os = "linux")]
+        ApplicationFinalAuditStart,
+        #[cfg(target_os = "linux")]
+        ApplicationFinalAuditEnd,
         AfterBytesDrop,
         AfterEntrySlotDrop,
         Refund,

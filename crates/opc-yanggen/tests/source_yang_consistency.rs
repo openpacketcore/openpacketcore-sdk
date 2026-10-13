@@ -290,7 +290,7 @@ fn source_yang_ingests_numeric_range_metadata() {
     ));
     assert_eq!(checkpoint.numeric_range.len(), 1);
     assert_eq!(checkpoint.numeric_range[0].min, 1);
-    assert_eq!(checkpoint.numeric_range[0].max, i64::from(u32::MAX));
+    assert_eq!(checkpoint.numeric_range[0].max, i128::from(u32::MAX));
 }
 
 #[test]

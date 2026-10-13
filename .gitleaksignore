@@ -40,3 +40,14 @@ ac06cc2ee7f2b47cc5611031633e44239b31b234:docs/rfc/026-scope-authenticated-transp
 388b9a7f68bf227a9012ee0c85d53aa2d9a7f13b:crates/opc-proto-ikev2/tests/recovery_profile/handoff_tests.rs:generic-api-key:17
 388b9a7f68bf227a9012ee0c85d53aa2d9a7f13b:crates/opc-proto-ikev2/tests/recovery_profile/handoff_process.rs:generic-api-key:21
 388b9a7f68bf227a9012ee0c85d53aa2d9a7f13b:crates/opc-proto-ikev2/tests/recovery_profile/crossed_tests.rs:generic-api-key:19
+
+# Public synthetic RFC 026 revision-2 vectors; exact introducing-commit fingerprints.
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:38
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:49
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:98
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:109
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:120
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:131
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:142
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:153
+42bd738547c30b33f3990b24efc4f3f104680f06:docs/rfc/026-scope-transport-revision2-vectors.json:generic-api-key:164

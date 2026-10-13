@@ -14,6 +14,7 @@ categories = ["network-programming", "os::linux-apis"]
 publish = false
 
 [features]
+native-scope = ["opc-local-kernel-lifecycle/native-scope"]
 # Optional conformance coverage for the explicitly volatile session-store lab.
 lab-memory = ["opc-session-store/lab-memory"]
 
@@ -48,6 +49,11 @@ rustix = { version = "1", features = ["fs", "process", "system", "thread", "time
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+rcgen = { workspace = true }
+time = { workspace = true }
+opc-session-net = { path = "../opc-session-net", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 tempfile = "3"

@@ -8,6 +8,7 @@ pub mod paths;
 pub mod redaction;
 pub mod schema_registry;
 pub mod serde;
+mod strings;
 pub mod types;
 pub mod validate;
 
@@ -15,6 +16,267 @@ use crate::emit::{fnv1a64, schema_digest_from_canonical, CanonicalInput};
 use crate::ir::{ConstraintBinding, SchemaNode, SchemaNodeKind, TypeRef};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+
+/// Schema lookup and the shared Rust type namespace for one emission pass.
+struct NodeIndex<'a> {
+    nodes: HashMap<String, &'a SchemaNode>,
+    names: HashMap<String, String>,
+    helpers: HashMap<String, String>,
+    extended_integers: bool,
+    expanded_profile: bool,
+}
+
+impl<'a> NodeIndex<'a> {
+    fn new(nodes: &'a [SchemaNode]) -> Self {
+        let mut structural: Vec<_> = nodes
+            .iter()
+            .filter(|node| matches!(node.kind, SchemaNodeKind::Container | SchemaNodeKind::List))
+            .collect();
+        structural.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut counts = HashMap::<String, usize>::new();
+        for node in &structural {
+            *counts
+                .entry(to_pascal_case(clean_segment(last_segment(&node.path))))
+                .or_default() += 1;
+        }
+        let extended_integers = nodes.iter().any(|node| {
+            matches!(
+                node.type_ref,
+                Some(
+                    TypeRef::Uint8
+                        | TypeRef::Uint64
+                        | TypeRef::Int8
+                        | TypeRef::Int16
+                        | TypeRef::Int32
+                )
+            )
+        });
+        let reserved: Vec<_> = [
+            "LeafPresence",
+            "SecretLeaf",
+            "SensitiveKey",
+            "RedactedKeyFieldDebug",
+            "YangInt64",
+            "YangUint64",
+            "YangDecimal64",
+            "YangEmpty",
+            "String",
+            "Vec",
+            "Option",
+            "Result",
+            "Serialize",
+            "Deserialize",
+            "Default",
+            "Box",
+            "From",
+            "IntoIterator",
+            "ConfigError",
+            "YangPath",
+            "ConfigOp",
+            "ConfigDelta",
+            "PathSegment",
+            "ValidationError",
+            "ValidationContext",
+            "Redactable",
+            "DeterministicHash",
+            "EditConfigNode",
+            "EditOperation",
+            "NetconfEditError",
+            "NetconfXmlEditApplicator",
+            "NodeKind",
+            "GeneratedNetconfXmlEditApplicator",
+        ]
+        .into_iter()
+        .filter(|name| *name != "YangUint64" || extended_integers)
+        .collect();
+        // Keep natural names available even when another node's parent-qualified
+        // name or composite-key companion would otherwise claim them.
+        let mut used: HashSet<String> = counts.keys().cloned().collect();
+        used.extend(reserved.iter().map(|name| (*name).to_string()));
+        let mut names = HashMap::new();
+        let has_key =
+            |node: &SchemaNode| node.kind == SchemaNodeKind::List && node.key_leaves.len() > 1;
+        for node in &structural {
+            let name = to_pascal_case(clean_segment(last_segment(&node.path)));
+            if counts[&name] == 1
+                && !reserved.contains(&name.as_str())
+                && (!has_key(node) || !used.contains(&format!("{name}Key")))
+            {
+                if has_key(node) {
+                    used.insert(format!("{name}Key"));
+                }
+                names.insert(node.path.clone(), name);
+            }
+        }
+        for node in structural {
+            if names.contains_key(&node.path) {
+                continue;
+            }
+            let parts: Vec<_> = node
+                .path
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(clean_segment)
+                .map(to_pascal_case)
+                .collect();
+            let available = |name: &str| {
+                !used.contains(name) && (!has_key(node) || !used.contains(&format!("{name}Key")))
+            };
+            let mut name = (2..=parts.len())
+                .map(|depth| parts[parts.len() - depth..].concat())
+                .find(|name| available(name));
+            if name.is_none() {
+                let base = parts.concat();
+                name = (2..)
+                    .map(|suffix| format!("{base}{suffix}"))
+                    .find(|name| available(name));
+            }
+            if let Some(name) = name {
+                used.insert(name.clone());
+                if has_key(node) {
+                    used.insert(format!("{name}Key"));
+                }
+                names.insert(node.path.clone(), name);
+            }
+        }
+        let expanded_profile = extended_integers
+            || nodes
+                .iter()
+                .any(|node| matches!(node.type_ref, Some(TypeRef::RestrictedString { .. })))
+            || names
+                .iter()
+                .any(|(path, name)| *name != to_pascal_case(clean_segment(last_segment(path))));
+        let mut paths: Vec<_> = nodes.iter().map(|node| &node.path).collect();
+        paths.sort();
+        let natural: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                path.split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(clean_segment)
+                    .map(|s| {
+                        let name = to_snake_case(s);
+                        if expanded_profile {
+                            name.split('_')
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("_")
+                        } else {
+                            name
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("_")
+            })
+            .collect();
+        let mut helper_counts = HashMap::new();
+        for name in &natural {
+            *helper_counts.entry(name.clone()).or_insert(0) += 1;
+        }
+        let mut used_helpers: HashSet<_> = natural.iter().cloned().collect();
+        let list_paths: HashSet<_> = nodes
+            .iter()
+            .filter(|node| node.kind == SchemaNodeKind::List)
+            .map(|node| node.path.as_str())
+            .collect();
+        for (path, name) in paths.iter().zip(&natural) {
+            if list_paths.contains(path.as_str()) {
+                *helper_counts.entry(format!("{name}_entry")).or_insert(0) += 1;
+                used_helpers.insert(format!("{name}_entry"));
+            }
+        }
+        let helpers = paths
+            .into_iter()
+            .zip(natural)
+            .map(|(path, mut name)| {
+                if helper_counts[&name] > 1
+                    || helper_counts
+                        .get(&format!("{name}_entry"))
+                        .is_some_and(|count| *count > 1)
+                {
+                    let base = name.clone();
+                    for suffix in 2.. {
+                        let candidate = format!("{base}_{suffix}");
+                        if !used_helpers.contains(&candidate)
+                            && !used_helpers.contains(&format!("{candidate}_entry"))
+                        {
+                            name = candidate;
+                            break;
+                        }
+                    }
+                    used_helpers.insert(name.clone());
+                    used_helpers.insert(format!("{name}_entry"));
+                }
+                (path.clone(), name)
+            })
+            .collect();
+        Self {
+            expanded_profile,
+            nodes: nodes.iter().map(|node| (node.path.clone(), node)).collect(),
+            names,
+            helpers,
+            extended_integers,
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<&&'a SchemaNode> {
+        self.nodes.get(path)
+    }
+
+    fn type_name(&self, node: &SchemaNode) -> &str {
+        &self.names[&node.path]
+    }
+
+    fn helper_name(&self, path: &str) -> &str {
+        &self.helpers[path]
+    }
+
+    fn legacy_or_resolved(&self, node: &'a SchemaNode) -> &'a SchemaNode {
+        if self.expanded_profile {
+            return self.scalar_node(node);
+        }
+        if let Some(TypeRef::LeafRef { target_path }) = &node.type_ref {
+            if let Some(target) = self.get(target_path) {
+                return target;
+            }
+        }
+        node
+    }
+
+    fn patch_scalar_node(&self, node: &'a SchemaNode) -> &'a SchemaNode {
+        if self.expanded_profile {
+            self.scalar_node(node)
+        } else {
+            node
+        }
+    }
+
+    fn scalar_node(&self, node: &'a SchemaNode) -> &'a SchemaNode {
+        let mut current = node;
+        let mut visited = HashSet::new();
+        while let Some(TypeRef::LeafRef { target_path }) = &current.type_ref {
+            if !visited.insert(current.path.as_str()) {
+                break;
+            }
+            match self.get(target_path) {
+                Some(target) => current = target,
+                None => break,
+            }
+        }
+        current
+    }
+}
+
+fn has_extended_integers(input: &CanonicalInput) -> bool {
+    input.nodes.iter().any(|node| {
+        matches!(
+            node.type_ref,
+            Some(
+                TypeRef::Uint8 | TypeRef::Uint64 | TypeRef::Int8 | TypeRef::Int16 | TypeRef::Int32
+            )
+        )
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustGenerationError {
@@ -59,8 +321,9 @@ pub fn generate_rust(
 ) -> Result<HashMap<String, String>, RustGenerationError> {
     let input = normalize_for_rust_generation(input)?;
     let root = validate_supported_input(&input)?;
-    let root_name = clean_segment(last_segment(&root.path));
-    let root_type = to_pascal_case(root_name);
+    strings::validate_schema(&input)?;
+    let nodes_by_path = NodeIndex::new(&input.nodes);
+    let root_type = nodes_by_path.type_name(root);
     let schema_digest = schema_digest_from_canonical(&input);
     let opc_config_schema_digest = schema_digest_hex_for_opc_config(&schema_digest);
     let mut files = HashMap::new();
@@ -146,13 +409,30 @@ __ORDERED_REPLACEMENT_CHANGED_PATH__            }
     }
 }
 "#
-    .replace("__ROOT_TYPE__", &root_type)
+    .replace("__ROOT_TYPE__", root_type)
     .replace("__OPC_CONFIG_SCHEMA_DIGEST__", &opc_config_schema_digest)
     .replace(
         "__ORDERED_REPLACEMENT_CHANGED_PATH__",
         ordered_replacement_changed_path,
     );
 
+    let mod_rs_content = if strings::has_constraints(&input) {
+        files.insert("strings.rs".to_string(), strings::generate(&input)?);
+        mod_rs_content.replacen("pub mod types;", "pub mod types;\npub mod strings;", 1)
+    } else {
+        mod_rs_content
+    };
+    let mod_rs_content = if nodes_by_path.expanded_profile
+        && input.nodes.iter().any(|node| {
+            clean_segment(last_segment(&node.path))
+                .chars()
+                .any(char::is_uppercase)
+        }) {
+        // Rust fields retain YANG's case-sensitive identifiers, including a/A.
+        format!("// Preserve case-sensitive YANG field names.\n#![allow(non_snake_case)]\n{mod_rs_content}")
+    } else {
+        mod_rs_content
+    };
     files.insert("mod.rs".to_string(), mod_rs_content);
     files.insert("types.rs".to_string(), types::generate(&input)?);
     files.insert("serde.rs".to_string(), serde::generate(&input)?);
@@ -405,12 +685,64 @@ fn validate_supported_input(input: &CanonicalInput) -> Result<&SchemaNode, RustG
         )));
     }
 
+    let nodes = NodeIndex::new(&input.nodes);
     for node in &input.nodes {
         validate_supported_node(input, node)?;
+        validate_integer_default(node, &nodes)?;
     }
     validate_rust_identifier_collisions(input)?;
 
     Ok(root)
+}
+
+fn validate_integer_default(
+    node: &SchemaNode,
+    nodes: &NodeIndex<'_>,
+) -> Result<(), RustGenerationError> {
+    let Some(default) = &node.default else {
+        return Ok(());
+    };
+    let scalar = nodes.scalar_node(node);
+    let Some((min, max)) = scalar.type_ref.as_ref().and_then(TypeRef::integer_bounds) else {
+        return Ok(());
+    };
+    if parse_integer_default(default).is_some_and(|value| {
+        (min..=max).contains(&value)
+            && (scalar.numeric_range.is_empty()
+                || scalar
+                    .numeric_range
+                    .iter()
+                    .any(|range| (range.min..=range.max).contains(&value)))
+    }) {
+        Ok(())
+    } else {
+        Err(RustGenerationError::new(format!(
+            "integer default at {} is invalid or outside its type or declared range",
+            node.path,
+        )))
+    }
+}
+
+// RFC 7950 section 9.2.1 permits decimal, octal, and hexadecimal defaults.
+// This is schema syntax only; protocol values retain their decimal codecs.
+fn parse_integer_default(text: &str) -> Option<i128> {
+    let (negative, digits) = if let Some(digits) = text.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let (digits, radix) = if let Some(digits) = digits.strip_prefix("0x") {
+        (digits, 16)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (&digits[1..], 8)
+    } else {
+        (digits, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
+        return None;
+    }
+    let value = i128::from_str_radix(digits, radix).ok()?;
+    Some(if negative { -value } else { value })
 }
 
 fn validate_rust_identifier_collisions(input: &CanonicalInput) -> Result<(), RustGenerationError> {
@@ -454,24 +786,6 @@ fn validate_rust_identifier_collisions(input: &CanonicalInput) -> Result<(), Rus
         }
     }
 
-    let mut type_idents: HashMap<String, &str> = HashMap::new();
-    for node in input
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind, SchemaNodeKind::Container | SchemaNodeKind::List))
-    {
-        let local = clean_segment(last_segment(&node.path));
-        let ident = to_pascal_case(local);
-        if let Some(existing) = type_idents.insert(ident.clone(), node.path.as_str()) {
-            if existing != node.path {
-                return Err(RustGenerationError::new(format!(
-                    "normalized generated Rust type identifier collision: {} and {} both map to {ident}",
-                    existing, node.path
-                )));
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -505,7 +819,13 @@ fn validate_supported_node(
             Some(
                 TypeRef::Boolean
                 | TypeRef::String
+                | TypeRef::RestrictedString { .. }
                 | TypeRef::Enumeration { .. }
+                | TypeRef::Uint8
+                | TypeRef::Uint64
+                | TypeRef::Int8
+                | TypeRef::Int16
+                | TypeRef::Int32
                 | TypeRef::Uint16
                 | TypeRef::Uint32
                 | TypeRef::Int64
@@ -540,20 +860,27 @@ fn validate_supported_node(
     }
 
     if !node.numeric_range.is_empty() {
-        if !matches!(
-            node.type_ref.as_ref(),
-            Some(TypeRef::Uint16 | TypeRef::Uint32 | TypeRef::Int64)
-        ) {
-            return Err(RustGenerationError::new(format!(
-                "numeric range metadata at {} requires an integer leaf type",
-                node.path
-            )));
-        }
+        let (base_min, base_max) = node
+            .type_ref
+            .as_ref()
+            .and_then(TypeRef::integer_bounds)
+            .ok_or_else(|| {
+                RustGenerationError::new(format!(
+                    "numeric range metadata at {} requires an integer leaf type",
+                    node.path,
+                ))
+            })?;
         for interval in &node.numeric_range {
             if interval.min > interval.max {
                 return Err(RustGenerationError::new(format!(
                     "numeric range metadata at {} has a lower bound greater than upper bound",
                     node.path
+                )));
+            }
+            if interval.min < base_min || interval.max > base_max {
+                return Err(RustGenerationError::new(format!(
+                    "numeric range metadata at {} exceeds the base integer type bounds",
+                    node.path,
                 )));
             }
         }
@@ -681,4 +1008,40 @@ pub fn is_sensitive_name(name: &str) -> bool {
         || name.contains("token")
         || name.contains("credential")
         || name.contains("private-key")
+}
+
+#[cfg(test)]
+mod scalar_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn cyclic_leafrefs_terminate_without_losing_the_declared_node() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for targets in [["/t:a", "/t:b"], ["/t:b", "/t:a"]] {
+                let nodes = ["/t:a", "/t:b"]
+                    .into_iter()
+                    .zip(targets)
+                    .map(|(path, target)| SchemaNode {
+                        path: path.into(),
+                        kind: SchemaNodeKind::Leaf,
+                        type_ref: Some(TypeRef::LeafRef {
+                            target_path: target.into(),
+                        }),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                let index = NodeIndex::new(&nodes);
+                for node in &nodes {
+                    assert_eq!(index.scalar_node(node).path, node.path);
+                }
+            }
+            sender.send(()).unwrap();
+        });
+        // A removed cycle guard must fail this test instead of hanging the
+        // test process. The worker owns only these synthetic schema nodes.
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+    }
 }

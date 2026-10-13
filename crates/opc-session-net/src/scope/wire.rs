@@ -1,4 +1,4 @@
-//! Exact version-one framing and bounded untrusted wire claims.
+//! Exact revision-two framing and bounded untrusted wire claims.
 
 use opc_types::{NetworkFunctionKind, TenantId};
 use sha2::{Digest, Sha256};
@@ -103,6 +103,7 @@ pub(super) enum Method {
     ScanLookup = 14,
     ScanClassify = 15,
     ScanClose = 16,
+    ChildRead = 17,
 }
 impl TryFrom<u8> for Method {
     type Error = WireError;
@@ -124,6 +125,7 @@ impl TryFrom<u8> for Method {
             14 => Ok(Self::ScanLookup),
             15 => Ok(Self::ScanClassify),
             16 => Ok(Self::ScanClose),
+            17 => Ok(Self::ChildRead),
             _ => Err(WireError),
         }
     }
@@ -155,6 +157,7 @@ impl Method {
     pub(super) const fn command_limit(self) -> usize {
         match self {
             Self::ApplyBatch => MAX_SCOPE_COMMAND_BYTES,
+            Self::ChildRead => opc_session_store::scope_batch::MAX_SCOPE_CHILD_READ_REQUEST_BYTES,
             method if method.is_scan() => {
                 opc_session_store::scope_scan::MAX_SCOPE_SCAN_REQUEST_BYTES
             }
@@ -308,6 +311,7 @@ pub(super) fn transport_request_digest(
             b"openpacketcore/scope/read/v1\0"
         }
         method if method.is_scan() => b"openpacketcore/scope/scan/v1\0",
+        Method::ChildRead => b"openpacketcore/scope/child-read/v1\0",
         Method::Liveness | Method::Candidate => b"openpacketcore/scope/startup-request/v1\0",
         _ => return Err(WireError), // Native authority and batch helpers own their digests.
     };
@@ -356,7 +360,7 @@ impl Header {
             }
             FrameKind::Call => self.method.command_limit() + 36,
             FrameKind::Result => {
-                if self.method == Method::ApplyBatch {
+                if matches!(self.method, Method::ApplyBatch | Method::ChildRead) {
                     MAX_SCOPE_FRAME_BYTES - HEADER_BYTES
                 } else if self.method.is_scan() {
                     opc_session_store::scope_scan::MAX_SCOPE_SCAN_REPLY_BYTES + 69
@@ -376,7 +380,7 @@ impl Header {
         }
         let mut reader = Reader::new(bytes);
         let remaining = reader.u32()? as usize;
-        if reader.u16()? != 1 {
+        if reader.u16()? != 2 {
             return Err(WireError);
         }
         let kind = FrameKind::try_from(reader.u8()?)?;
@@ -406,7 +410,7 @@ impl Header {
         self.validate()?;
         let mut bytes = [0; 128];
         bytes[0..4].copy_from_slice(&((124 + self.payload_len) as u32).to_be_bytes());
-        bytes[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        bytes[4..6].copy_from_slice(&2_u16.to_be_bytes());
         bytes[6] = self.kind as u8;
         bytes[7..9].copy_from_slice(&self.class.encode());
         bytes[9] = self.method as u8;
@@ -476,6 +480,7 @@ pub(super) enum ResultStatus {
     CurrentView = 4,
     BatchError = 5,
     ScanObservation = 6,
+    ChildObservation = 7,
 }
 impl TryFrom<u8> for ResultStatus {
     type Error = WireError;
@@ -488,6 +493,7 @@ impl TryFrom<u8> for ResultStatus {
             4 => Ok(Self::CurrentView),
             5 => Ok(Self::BatchError),
             6 => Ok(Self::ScanObservation),
+            7 => Ok(Self::ChildObservation),
             _ => Err(WireError),
         }
     }
@@ -519,7 +525,8 @@ impl ResultPayload {
             ResultStatus::Committed
             | ResultStatus::CurrentView
             | ResultStatus::BatchError
-            | ResultStatus::ScanObservation => !body.is_empty(),
+            | ResultStatus::ScanObservation
+            | ResultStatus::ChildObservation => !body.is_empty(),
         };
         if !valid {
             return Err(WireError);

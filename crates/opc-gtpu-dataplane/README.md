@@ -3128,6 +3128,12 @@ offload support.
 
 ## Scoped local lifecycle
 
+Enable `native-scope` when the worker reaches durable authority through its
+protected `ScopeClient`. The lifecycle's native adapter reads back a supervised
+activation before coordinator acknowledgement and returns the same concrete
+`CommittedScopeEffect` as the local store adapter. Normal and Emergency effects
+retain their original class for later current-child rechecks.
+
 `EbpfGtpuDataplaneBackend::for_local_scope` binds the backend to the shared
 [`LocalKernelLifecycle`](../opc-local-kernel-lifecycle/README.md). All three
 legacy workload resets refuse with `LegacyResetOnLocalScope`; ordinary retained

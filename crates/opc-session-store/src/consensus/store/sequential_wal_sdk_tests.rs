@@ -685,6 +685,8 @@ mod scope_scans;
 #[path = "sequential_wal_sdk_tests/scope_batch.rs"]
 mod scope_batch;
 mod scope_batch_lanes;
+mod scope_child_read;
+mod scope_payload_cost;
 
 #[derive(Debug)]
 struct QuorumAuthorityClock(crate::Timestamp);

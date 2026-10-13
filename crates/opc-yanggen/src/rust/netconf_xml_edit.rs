@@ -7,6 +7,7 @@
 //! and is fail-closed for shapes whose edit semantics remain ambiguous in this
 //! slice (keyless lists, custom typedefs, choice/case).
 
+use super::NodeIndex;
 use super::{
     clean_segment, is_sensitive_name, last_segment, to_pascal_case, to_snake_case,
     RustGenerationError,
@@ -15,14 +16,10 @@ use crate::emit::CanonicalInput;
 use crate::ir::{AllocationStrategy, SchemaNode, SchemaNodeKind, TypeRef};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 
 /// Emits the `netconf_xml_edit` module for the generated crate.
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
-    let mut nodes_by_path = HashMap::new();
-    for node in &input.nodes {
-        nodes_by_path.insert(node.path.clone(), node);
-    }
+    let nodes_by_path = NodeIndex::new(&input.nodes);
 
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
     sorted_nodes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -32,7 +29,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         .find(|n| is_root_path(&n.path))
         .ok_or_else(|| RustGenerationError::new("netconf_xml_edit: no root container found"))?;
 
-    let root_type = to_pascal_case(clean_segment(last_segment(&root.path)));
+    let root_type = nodes_by_path.type_name(root);
     let root_type_ident = format_ident!("{}", root_type);
 
     let mut apply_fns = Vec::new();
@@ -104,25 +101,14 @@ fn is_root_path(path: &str) -> bool {
     !trimmed.is_empty() && !trimmed.contains('/')
 }
 
-fn path_to_snake(path: &str) -> String {
-    path.split('/')
-        .filter(|s| !s.is_empty())
-        .map(clean_segment)
-        .map(to_snake_case)
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
 fn apply_root_fn(
     root: &SchemaNode,
-    _nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let children_fn_ident = format_ident!("apply_children_{}", path_to_snake(&root.path));
+    let children_fn_ident =
+        format_ident!("apply_children_{}", nodes_by_path.helper_name(&root.path));
     let path = &root.path;
-    let root_type_ident = format_ident!(
-        "{}",
-        to_pascal_case(clean_segment(last_segment(&root.path)))
-    );
+    let root_type_ident = format_ident!("{}", nodes_by_path.type_name(root));
 
     Ok(quote! {
         fn apply_root(
@@ -155,14 +141,11 @@ fn apply_root_fn(
 
 fn apply_children_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
     input: &CanonicalInput,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("apply_children_{}", path_to_snake(&node.path));
-    let type_ident = format_ident!(
-        "{}",
-        to_pascal_case(clean_segment(last_segment(&node.path)))
-    );
+    let fn_ident = format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
+    let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
     let mut leaf_list_group_arms = TokenStream::new();
     let mut leaf_list_apply_stmts = TokenStream::new();
@@ -274,7 +257,7 @@ fn apply_children_fn(
                 }
             }
             SchemaNodeKind::Container => {
-                let child_type_ident = format_ident!("{}", to_pascal_case(child_name));
+                let child_type_ident = format_ident!("{}", nodes_by_path.type_name(child));
                 let is_boxed = is_boxed_container(child, input);
                 let new_expr = if is_boxed {
                     quote! { Box::new(#child_type_ident::default()) }
@@ -282,7 +265,7 @@ fn apply_children_fn(
                     quote! { #child_type_ident::default() }
                 };
                 let children_fn_ident =
-                    format_ident!("apply_children_{}", path_to_snake(&child.path));
+                    format_ident!("apply_children_{}", nodes_by_path.helper_name(&child.path));
                 quote! {
                     #child_path_lit => {
                         match child.operation {
@@ -332,11 +315,13 @@ fn apply_children_fn(
                 }
             }
             SchemaNodeKind::List => {
-                let list_fn_ident = format_ident!("apply_{}", path_to_snake(&child.path));
+                let list_fn_ident =
+                    format_ident!("apply_{}", nodes_by_path.helper_name(&child.path));
                 let key_set = if child.key_leaves.is_empty() {
                     TokenStream::new()
                 } else {
-                    let keys_ident = format_ident!("{}_edit_keys", path_to_snake(&child.path));
+                    let keys_ident =
+                        format_ident!("{}_edit_keys", nodes_by_path.helper_name(&child.path));
                     list_key_sets.extend(quote! {
                         let mut #keys_ident = std::collections::BTreeSet::new();
                     });
@@ -349,8 +334,10 @@ fn apply_children_fn(
                 }
             }
             SchemaNodeKind::LeafList => {
-                let leaf_list_fn_ident = format_ident!("apply_{}", path_to_snake(&child.path));
-                let nodes_ident = format_ident!("{}_entries", path_to_snake(&child.path));
+                let leaf_list_fn_ident =
+                    format_ident!("apply_{}", nodes_by_path.helper_name(&child.path));
+                let nodes_ident =
+                    format_ident!("{}_entries", nodes_by_path.helper_name(&child.path));
                 let values = if is_sensitive {
                     quote! { value.#field_ident.get_mut() }
                 } else {
@@ -417,10 +404,24 @@ fn apply_children_fn(
         }
     };
 
+    let value_param = format_ident!(
+        "{}",
+        if !nodes_by_path.expanded_profile
+            || node
+                .child_paths
+                .iter()
+                .any(|path| { nodes_by_path.get(path).is_some_and(|child| child.config) })
+        {
+            "value"
+        } else {
+            "_value"
+        }
+    );
+
     Ok(quote! {
         fn #fn_ident(
             children: &[EditConfigNode],
-            value: &mut #type_ident,
+            #value_param: &mut #type_ident,
         ) -> Result<(), NetconfEditError> {
             #check_singletons
             #list_key_sets
@@ -452,10 +453,10 @@ fn apply_children_fn(
 /// provides a deterministic server order for `ordered-by system`.
 fn apply_leaf_list_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("apply_{}", path_to_snake(&node.path));
-    let key_fn_ident = format_ident!("leaf_list_key_{}", path_to_snake(&node.path));
+    let fn_ident = format_ident!("apply_{}", nodes_by_path.helper_name(&node.path));
+    let key_fn_ident = format_ident!("leaf_list_key_{}", nodes_by_path.helper_name(&node.path));
     let path = &node.path;
     let element_type = raw_type(node, nodes_by_path);
 
@@ -602,20 +603,26 @@ fn apply_leaf_list_fn(
 /// does not appear in errors or logs.
 fn leaf_list_value_key_expr(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean) => Ok(quote! {
             if *value { "true".to_string() } else { "false".to_string() }
         }),
-        Some(TypeRef::Uint16) | Some(TypeRef::Uint32) => Ok(quote! { value.to_string() }),
+        Some(TypeRef::Uint8)
+        | Some(TypeRef::Int8)
+        | Some(TypeRef::Int16)
+        | Some(TypeRef::Int32)
+        | Some(TypeRef::Uint16)
+        | Some(TypeRef::Uint32) => Ok(quote! { value.to_string() }),
+        Some(TypeRef::Uint64) => Ok(quote! { value.0.to_string() }),
         Some(TypeRef::Int64) => Ok(quote! { value.0.to_string() }),
         Some(TypeRef::Decimal64) => Ok(quote! {
             let bits = if value.0 == 0.0 { 0_u64 } else { value.0.to_bits() };
             bits.to_string()
         }),
         Some(TypeRef::Empty) => Ok(quote! { String::new() }),
-        Some(TypeRef::String)
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
         | Some(TypeRef::IdentityRef { .. })
         | Some(TypeRef::LeafRef { .. })
         | Some(TypeRef::Enumeration { .. }) => Ok(quote! { value.clone() }),
@@ -628,14 +635,12 @@ fn leaf_list_value_key_expr(
 
 fn apply_list_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("apply_{}", path_to_snake(&node.path));
-    let children_fn_ident = format_ident!("apply_children_{}", path_to_snake(&node.path));
-    let entry_type_ident = format_ident!(
-        "{}",
-        to_pascal_case(clean_segment(last_segment(&node.path)))
-    );
+    let fn_ident = format_ident!("apply_{}", nodes_by_path.helper_name(&node.path));
+    let children_fn_ident =
+        format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
+    let entry_type_ident = format_ident!("{}", nodes_by_path.type_name(node));
     let path = &node.path;
 
     if node.key_leaves.is_empty() {
@@ -836,12 +841,33 @@ fn apply_list_fn(
 
 fn parse_leaf_value_expr(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
     let path = &node.path;
     let resolved = resolved_type(node, nodes_by_path);
-    let unsigned_range_check = numeric_range_check_expr(node, quote! { i64::from(parsed) }, path);
-    let int64_range_check = numeric_range_check_expr(node, quote! { parsed.0 }, path);
+    let scalar = if nodes_by_path.extended_integers {
+        nodes_by_path.scalar_node(node)
+    } else {
+        node
+    };
+    let integer_type = if nodes_by_path.extended_integers {
+        quote! { i128 }
+    } else {
+        quote! { i64 }
+    };
+    let signed_value = if nodes_by_path.extended_integers {
+        quote! { i128::from(parsed.0) }
+    } else {
+        quote! { parsed.0 }
+    };
+    let unsigned_range_check = numeric_range_check_expr(
+        scalar,
+        quote! { #integer_type::from(parsed) },
+        path,
+        nodes_by_path.extended_integers,
+    );
+    let int64_range_check =
+        numeric_range_check_expr(scalar, signed_value, path, nodes_by_path.extended_integers);
     let expr = match resolved {
         Some(TypeRef::Boolean) => quote! {
             let parsed = match _v.trim() {
@@ -850,6 +876,22 @@ fn parse_leaf_value_expr(
                 _ => return Err(NetconfEditError::InvalidValue { path: #path }),
             };
         },
+        Some(TypeRef::Uint8) => quote! {
+            let parsed = _v.trim().parse::<u8>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            #unsigned_range_check
+        },
+        Some(TypeRef::Int8) => quote! {
+            let parsed = _v.trim().parse::<i8>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            #unsigned_range_check
+        },
+        Some(TypeRef::Int16) => quote! {
+            let parsed = _v.trim().parse::<i16>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            #unsigned_range_check
+        },
+        Some(TypeRef::Int32) => quote! {
+            let parsed = _v.trim().parse::<i32>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            #unsigned_range_check
+        },
         Some(TypeRef::Uint16) => quote! {
             let parsed = _v.trim().parse::<u16>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
             #unsigned_range_check
@@ -857,6 +899,10 @@ fn parse_leaf_value_expr(
         Some(TypeRef::Uint32) => quote! {
             let parsed = _v.trim().parse::<u32>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
             #unsigned_range_check
+        },
+        Some(TypeRef::Uint64) => quote! {
+            let parsed = YangUint64(_v.trim().parse::<u64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
+            #int64_range_check
         },
         Some(TypeRef::Int64) => quote! {
             let parsed = YangInt64(_v.trim().parse::<i64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
@@ -874,6 +920,10 @@ fn parse_leaf_value_expr(
                 return Err(NetconfEditError::InvalidValue { path: #path });
             }
             let parsed = YangEmpty;
+        },
+        Some(TypeRef::RestrictedString { .. }) => quote! {
+            if !super::strings::valid(#path, _v) { return Err(NetconfEditError::InvalidValue { path: #path }); }
+            let parsed = _v.to_string();
         },
         Some(TypeRef::String)
         | Some(TypeRef::IdentityRef { .. })
@@ -899,19 +949,34 @@ fn parse_leaf_value_expr(
     Ok(expr)
 }
 
-fn numeric_range_check_expr(node: &SchemaNode, value_expr: TokenStream, path: &str) -> TokenStream {
+fn numeric_range_check_expr(
+    node: &SchemaNode,
+    value_expr: TokenStream,
+    path: &str,
+    extended: bool,
+) -> TokenStream {
     if node.numeric_range.is_empty() {
         return TokenStream::new();
     }
 
     let checks = node.numeric_range.iter().map(|interval| {
-        let min = interval.min;
-        let max = interval.max;
+        let (min, max) = if extended {
+            let (min, max) = (interval.min, interval.max);
+            (quote! { #min }, quote! { #max })
+        } else {
+            let (min, max) = (interval.min as i64, interval.max as i64);
+            (quote! { #min }, quote! { #max })
+        };
         quote! { (#min <= numeric_value && numeric_value <= #max) }
     });
 
+    let integer_type = if extended {
+        quote! { i128 }
+    } else {
+        quote! { i64 }
+    };
     quote! {
-        let numeric_value: i64 = #value_expr;
+        let numeric_value: #integer_type = #value_expr;
         if !(#(#checks)||*) {
             return Err(NetconfEditError::InvalidValue { path: #path });
         }
@@ -920,15 +985,9 @@ fn numeric_range_check_expr(node: &SchemaNode, value_expr: TokenStream, path: &s
 
 fn resolved_type<'a>(
     node: &'a SchemaNode,
-    nodes_by_path: &'a HashMap<String, &SchemaNode>,
+    nodes_by_path: &'a NodeIndex<'a>,
 ) -> Option<&'a TypeRef> {
-    let mut ty = node.type_ref.as_ref();
-    if let Some(TypeRef::LeafRef { target_path }) = ty {
-        if let Some(target) = nodes_by_path.get(target_path) {
-            ty = target.type_ref.as_ref();
-        }
-    }
-    ty
+    nodes_by_path.legacy_or_resolved(node).type_ref.as_ref()
 }
 
 fn is_sensitive_node(node: &SchemaNode) -> bool {
@@ -948,10 +1007,7 @@ fn is_boxed_container(node: &SchemaNode, input: &CanonicalInput) -> bool {
     false
 }
 
-fn list_key_type(
-    list_node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
-) -> TokenStream {
+fn list_key_type(list_node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     if list_node.key_leaves.len() == 1 {
         let key_name = &list_node.key_leaves[0];
         for child_path in &list_node.child_paths {
@@ -968,20 +1024,19 @@ fn list_key_type(
         }
         quote! { String }
     } else {
-        let name = clean_segment(last_segment(&list_node.path));
-        let struct_name = format_ident!("{}Key", to_pascal_case(name));
+        let struct_name = format_ident!("{}Key", nodes_by_path.type_name(list_node));
         quote! { #struct_name }
     }
 }
 
-fn raw_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
+fn raw_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     let mut visited = std::collections::HashSet::new();
     raw_type_internal(node, nodes_by_path, &mut visited)
 }
 
 fn raw_type_internal(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
     visited: &mut std::collections::HashSet<String>,
 ) -> TokenStream {
     if visited.contains(&node.path) {
@@ -990,9 +1045,15 @@ fn raw_type_internal(
     visited.insert(node.path.clone());
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
+        | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::Uint8) => quote! { u8 },
+        Some(TypeRef::Int8) => quote! { i8 },
+        Some(TypeRef::Int16) => quote! { i16 },
+        Some(TypeRef::Int32) => quote! { i32 },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
+        Some(TypeRef::Uint64) => quote! { YangUint64 },
         Some(TypeRef::Int64) => quote! { YangInt64 },
         Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
         Some(TypeRef::Empty) => quote! { YangEmpty },
@@ -1008,7 +1069,7 @@ fn raw_type_internal(
 fn find_key_leaf_node<'a>(
     list_node: &SchemaNode,
     key_name: &str,
-    nodes_by_path: &'a HashMap<String, &SchemaNode>,
+    nodes_by_path: &'a NodeIndex<'a>,
 ) -> Option<&'a SchemaNode> {
     let key_bare = clean_segment(key_name);
     list_node.child_paths.iter().find_map(|cp| {

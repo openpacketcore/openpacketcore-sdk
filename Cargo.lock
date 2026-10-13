@@ -1566,11 +1566,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2198,6 +2196,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "linux-raw-sys"
@@ -2897,6 +2901,7 @@ dependencies = [
  "opc-crypto",
  "opc-dataplane-observation",
  "opc-gtpu-ebpf-common",
+ "opc-identity",
  "opc-ipsec-xfrm",
  "opc-key",
  "opc-linux-gtpu-sys",
@@ -2905,10 +2910,13 @@ dependencies = [
  "opc-proto-tft",
  "opc-protocol",
  "opc-route-steering",
+ "opc-session-net",
  "opc-session-store",
  "opc-session-testkit",
+ "opc-tls",
  "opc-types",
  "rand 0.10.3",
+ "rcgen",
  "rustix",
  "serde_json",
  "sha1",
@@ -2916,6 +2924,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "zeroize",
 ]
@@ -2999,6 +3008,7 @@ dependencies = [
  "opc-consensus",
  "opc-crypto",
  "opc-crypto-provider",
+ "opc-identity",
  "opc-ipsec-xfrm-ebpf-common",
  "opc-key",
  "opc-linux-gtpu-sys",
@@ -3006,15 +3016,19 @@ dependencies = [
  "opc-local-kernel-lifecycle",
  "opc-proto-ikev2",
  "opc-route-steering",
+ "opc-session-net",
  "opc-session-store",
+ "opc-tls",
  "opc-types",
  "rand 0.10.3",
+ "rcgen",
  "rustix",
  "sha1",
  "sha2 0.11.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "zeroize",
 ]
@@ -3100,17 +3114,23 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "nix",
  "opc-consensus",
  "opc-crypto",
+ "opc-identity",
  "opc-key",
  "opc-linux-gtpu-sys",
  "opc-route-steering",
+ "opc-session-net",
  "opc-session-store",
+ "opc-tls",
  "opc-types",
  "rand 0.10.3",
+ "rcgen",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
 ]
 
@@ -3213,6 +3233,7 @@ dependencies = [
  "opc-config-model",
  "opc-data-governance",
  "opc-redaction",
+ "regex",
 ]
 
 [[package]]
@@ -3890,10 +3911,10 @@ dependencies = [
  "opc-types",
  "serde",
  "serde_json",
- "serde_yaml",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -3934,6 +3955,7 @@ dependencies = [
 name = "opc-yanggen"
 version = "0.2.0"
 dependencies = [
+ "opc-mgmt-schema",
  "proc-macro2",
  "quote",
  "serde",
@@ -4631,14 +4653,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.3",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -4766,6 +4789,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "rand_xorshift"
@@ -5419,19 +5451,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -6235,12 +6254,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "untrusted"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6853,6 +6866,19 @@ name = "xml-no-std"
 version = "0.8.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd223bc94c615fc02bf2f4bbc22a4a9bfe489c2add3ec10b1038df3aca44cac7"
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
 
 [[package]]
 name = "yasna"

@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-const ALPN: &[u8] = b"opc-scope/1";
+const ALPN: &[u8] = b"opc-scope/2";
 const LABEL: &[u8] = b"EXPERIMENTAL-openpacketcore-channel-binding-v1";
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -191,6 +191,10 @@ pub enum ScopeTlsError {
     /// TLS did not complete under the prescribed profile.
     #[error("scope TLS handshake failed")]
     HandshakeFailed,
+    /// No common scope revision was offered. This pre-authentication alert is
+    /// diagnostic only; a later handshake must be allowed to try again.
+    #[error("scope transport revision mismatch")]
+    TransportRevisionMismatch,
     /// The completed connection has the wrong protocol or ALPN.
     #[error("scope TLS protocol mismatch")]
     ProtocolMismatch,
@@ -212,6 +216,19 @@ pub enum ScopeTlsError {
 enum Material {
     Client(TlsClientHandshake),
     Server(TlsServerHandshake),
+}
+
+fn scope_handshake_error(error: io::Error) -> ScopeTlsError {
+    match error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+    {
+        Some(
+            rustls::Error::NoApplicationProtocol
+            | rustls::Error::AlertReceived(rustls::AlertDescription::NoApplicationProtocol),
+        ) => ScopeTlsError::TransportRevisionMismatch,
+        _ => ScopeTlsError::HandshakeFailed,
+    }
 }
 
 impl Material {
@@ -340,16 +357,7 @@ impl<S> ScopeTlsConnection<S> {
         &self,
         time: AuthenticationTimeInterval,
     ) -> Result<ScopeTlsAuthentication, ScopeTlsError> {
-        let state = ScopeTlsAuthentication {
-            material: self.material.clone(),
-            local_validity: self.local_validity,
-            peer_validity: CertificateValidity {
-                not_before: self.peer.certificate_chain_valid_from(),
-                not_after: self.peer.certificate_chain_expires_at(),
-            },
-        };
-        state.revalidate(time)?;
-        Ok(state)
+        ScopeTlsAuthentication::capture(&self.material, self.local_validity, &self.peer, time)
     }
     /// The peer authenticated on this exact stream.
     pub const fn peer_identity(&self) -> &PeerTlsIdentity {
@@ -391,6 +399,23 @@ pub struct ScopeTlsAuthentication {
     peer_validity: CertificateValidity,
 }
 impl ScopeTlsAuthentication {
+    fn capture(
+        material: &Material,
+        local_validity: CertificateValidity,
+        peer: &PeerTlsIdentity,
+        time: AuthenticationTimeInterval,
+    ) -> Result<Self, ScopeTlsError> {
+        let state = Self {
+            material: material.clone(),
+            local_validity,
+            peer_validity: CertificateValidity {
+                not_before: peer.certificate_chain_valid_from(),
+                not_after: peer.certificate_chain_expires_at(),
+            },
+        };
+        state.revalidate(time)?;
+        Ok(state)
+    }
     /// Recheck authentication immediately before and after awaited verification.
     pub fn revalidate(&self, time: AuthenticationTimeInterval) -> Result<(), ScopeTlsError> {
         self.material.admit()?;
@@ -467,7 +492,7 @@ impl TlsClientHandshake {
             let stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
                 .connect(name, io)
                 .await
-                .map_err(|_| ScopeTlsError::HandshakeFailed)?;
+                .map_err(scope_handshake_error)?;
             ScopeTlsConnection::admit(stream.into(), Material::Client(self.clone()), domain)
         })
         .await
@@ -505,7 +530,7 @@ impl TlsServerHandshake {
             let stream = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config))
                 .accept(io)
                 .await
-                .map_err(|_| ScopeTlsError::HandshakeFailed)?;
+                .map_err(scope_handshake_error)?;
             UnboundScopeTlsConnection::admit(stream.into(), Material::Server(self.clone()))
         })
         .await
@@ -521,6 +546,14 @@ pub struct UnboundScopeTlsConnection<S> {
     material: Material,
 }
 impl<S> UnboundScopeTlsConnection<S> {
+    /// Recheck the completed handshake's material and certificate interval
+    /// before interpreting an application header. This confers no scope access.
+    pub fn authentication_state(
+        &self,
+        time: AuthenticationTimeInterval,
+    ) -> Result<ScopeTlsAuthentication, ScopeTlsError> {
+        ScopeTlsAuthentication::capture(&self.material, self.local_validity, &self.peer, time)
+    }
     /// Identity authenticated by this stream's immutable material snapshot.
     pub const fn peer_identity(&self) -> &PeerTlsIdentity {
         &self.peer

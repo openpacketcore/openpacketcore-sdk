@@ -1,21 +1,17 @@
-use super::{clean_segment, last_segment, to_pascal_case, to_snake_case, RustGenerationError};
+use super::NodeIndex;
+use super::{clean_segment, last_segment, to_snake_case, RustGenerationError};
 use crate::emit::CanonicalInput;
 use crate::ir::SchemaNodeKind;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut impls = TokenStream::new();
-    let mut nodes_by_path = HashMap::new();
-    for node in &input.nodes {
-        nodes_by_path.insert(node.path.clone(), node);
-    }
+    let nodes_by_path = NodeIndex::new(&input.nodes);
 
     for node in &input.nodes {
         if node.kind == SchemaNodeKind::Container || node.kind == SchemaNodeKind::List {
-            let name = clean_segment(last_segment(&node.path));
-            let struct_name = format_ident!("{}", to_pascal_case(name));
+            let struct_name = format_ident!("{}", nodes_by_path.type_name(node));
             let mut redactions = TokenStream::new();
 
             for child_path in &node.child_paths {
@@ -189,6 +185,17 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
     }
 
+    let uint64_hash = if super::has_extended_integers(input) {
+        quote! {
+            impl DeterministicHash for YangUint64 {
+                fn deterministic_hash(&self) -> Self {
+                    YangUint64(self.0.deterministic_hash())
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
     let tokens = quote! {
         use super::types::*;
 
@@ -242,6 +249,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         impl_deterministic_hash_int!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+
+        #uint64_hash
 
         impl DeterministicHash for YangInt64 {
             fn deterministic_hash(&self) -> Self {
