@@ -1,0 +1,20 @@
+module expanded-unique {
+  yang-version 1.1;
+  namespace "urn:example:expanded-unique";
+  prefix eu;
+  container root {
+    container state {
+      config false;
+      list row {
+        key name;
+        leaf name { type string; }
+      }
+    }
+    list service {
+      key name;
+      unique port;
+      leaf name { type string; }
+      leaf port { type uint64; }
+    }
+  }
+}

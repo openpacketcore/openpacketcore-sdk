@@ -139,6 +139,11 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
             include_str!("fixtures/deep_keyless_state.yang"),
         ),
         ("combined", include_str!("fixtures/combined_state.yang")),
+        ("state_unique", include_str!("fixtures/state_unique.yang")),
+        (
+            "expanded_unique",
+            include_str!("fixtures/expanded_unique.yang"),
+        ),
         ("leafref_u64", STATE_KEY_LEAFREF),
         ("leafref_u32", state_key_leafref_u32.as_str()),
         (
@@ -214,6 +219,12 @@ time = "={}"
     fs::write(
         tests.join("state_leafrefs.rs"),
         include_str!("fixtures/state_leafrefs_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests.join("state_unique.rs"),
+        include_str!("fixtures/state_unique_test.rs"),
     )
     .unwrap();
 

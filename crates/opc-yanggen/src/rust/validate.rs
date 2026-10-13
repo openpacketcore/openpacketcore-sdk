@@ -34,14 +34,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     // 1. Generate must/when constraints
     for constraint in &input.constraints {
-        let block = generate_constraint_check(constraint, input)?;
+        let block = generate_constraint_check(constraint, input, &nodes_by_path)?;
         validation_checks.extend(block);
     }
 
     // 2. Generate unique constraints
     for node in &input.nodes {
         if node.kind == SchemaNodeKind::List && !node.unique_constraints.is_empty() {
-            let block = generate_unique_check(node, input)?;
+            let block = generate_unique_check(node, input, &nodes_by_path)?;
             validation_checks.extend(block);
         }
     }
@@ -244,7 +244,10 @@ fn generate_path_access(
 fn generate_constraint_check(
     constraint: &ConstraintBinding,
     input: &CanonicalInput,
+    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
+    let keep_legacy_output =
+        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     let target_node = input
         .nodes
         .iter()
@@ -355,6 +358,12 @@ fn generate_constraint_check(
                                 #body
                             }
                         }
+                    } else if !keep_legacy_output {
+                        quote! {
+                            for #next_ident in #current_ident.#field_ident.values() {
+                                #body
+                            }
+                        }
                     } else {
                         quote! {
                             for (_, #next_ident) in &#current_ident.#field_ident {
@@ -389,7 +398,10 @@ fn generate_constraint_check(
 fn generate_unique_check(
     list_node: &SchemaNode,
     input: &CanonicalInput,
+    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
+    let keep_legacy_output =
+        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     let mut checks = TokenStream::new();
     let parent_path = list_node
         .path
@@ -434,7 +446,17 @@ fn generate_unique_check(
                 tuple_exprs.push(quote! { #access.as_option().cloned() });
             } else {
                 presence_checks.push(quote! { #access.is_some() });
-                tuple_exprs.push(quote! { #access.clone() });
+                let value =
+                    if !keep_legacy_output && super::types::is_copy_type(child, nodes_by_path) {
+                        if is_sensitive {
+                            quote! { *#access }
+                        } else {
+                            quote! { #access }
+                        }
+                    } else {
+                        quote! { #access.clone() }
+                    };
+                tuple_exprs.push(value);
             }
         }
 
@@ -481,6 +503,12 @@ fn generate_unique_check(
                                     #body
                                 }
                             }
+                        } else if !keep_legacy_output {
+                            quote! {
+                                for #next_ident in #current_ident.#field_ident.values() {
+                                    #body
+                                }
+                            }
                         } else {
                             quote! {
                                 for (_, #next_ident) in &#current_ident.#field_ident {
@@ -501,6 +529,13 @@ fn generate_unique_check(
             quote! {
                 let mut #set_ident = std::collections::HashSet::new();
                 for entry in &#current_ident.#list_ident {
+                    #loop_body
+                }
+            }
+        } else if !keep_legacy_output {
+            quote! {
+                let mut #set_ident = std::collections::HashSet::new();
+                for entry in #current_ident.#list_ident.values() {
                     #loop_body
                 }
             }

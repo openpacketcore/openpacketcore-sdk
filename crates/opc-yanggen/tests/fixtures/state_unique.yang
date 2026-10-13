@@ -1,0 +1,45 @@
+module state-unique {
+  yang-version 1.1;
+  namespace "urn:example:state-unique";
+  prefix su;
+  container root {
+    list service {
+      key name;
+      ordered-by user;
+      unique port;
+      leaf name { type string; }
+      leaf port { type uint16; }
+      container state {
+        config false;
+        list counter {
+          key name;
+          unique count;
+          unique secret-count;
+          leaf name { type string; }
+          leaf count { type uint32; }
+          leaf secret-count { type uint32; }
+        }
+        list label {
+          key name;
+          unique value;
+          unique secret-value;
+          leaf name { type string; }
+          leaf value { type string; }
+          leaf secret-value { type string; }
+        }
+        list sample {
+          unique count;
+          leaf count { type uint32; }
+        }
+        list group {
+          list observation {
+            key name;
+            unique count;
+            leaf name { type string; }
+            leaf count { type uint32; }
+          }
+        }
+      }
+    }
+  }
+}
