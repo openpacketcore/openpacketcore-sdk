@@ -121,9 +121,10 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
             "deep_keyless",
             include_str!("fixtures/deep_keyless_state.yang"),
         ),
+        ("combined", include_str!("fixtures/combined_state.yang")),
     ] {
-        // Use an already supported counter type so this regression isolates
-        // state-list emission from support for additional integer widths.
+        // The combined fixture also exercises extended scalars, constraints,
+        // and repeated list names together with optional state-list fields.
         let input = generation_input_from_yang_sources(
             "config-false-lists",
             &[YangSource::new(format!("{name}.yang"), source)],
@@ -178,6 +179,12 @@ time = "={}"
     fs::write(
         tests.join("state_lists.rs"),
         include_str!("fixtures/config_false_lists_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests.join("combined_state.rs"),
+        include_str!("fixtures/combined_state_test.rs"),
     )
     .unwrap();
 

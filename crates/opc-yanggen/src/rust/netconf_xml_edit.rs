@@ -480,10 +480,11 @@ fn apply_children_fn(
         "{}",
         if !rejects_every_child
             && (!nodes_by_path.expanded_profile
-                || node
-                    .child_paths
-                    .iter()
-                    .any(|path| { nodes_by_path.get(path).is_some_and(|child| child.config) }))
+                || node.child_paths.iter().any(|path| {
+                    nodes_by_path
+                        .get(path)
+                        .is_some_and(|child| child.config || child.kind != SchemaNodeKind::Leaf)
+                }))
         {
             "value"
         } else {
@@ -1100,7 +1101,11 @@ fn numeric_range_check_expr(
             let (min, max) = (interval.min as i64, interval.max as i64);
             (quote! { #min }, quote! { #max })
         };
-        quote! { (#min <= numeric_value && numeric_value <= #max) }
+        if extended {
+            quote! { (#min..=#max).contains(&numeric_value) }
+        } else {
+            quote! { (#min <= numeric_value && numeric_value <= #max) }
+        }
     });
 
     let integer_type = if extended {

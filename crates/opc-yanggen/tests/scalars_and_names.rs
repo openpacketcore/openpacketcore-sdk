@@ -121,7 +121,9 @@ fn legacy_constructs_keep_every_generated_file_byte_identical() {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fmt::Write;
-    // Captured from d50c92ad1 with its exact locked dependency versions.
+    // Captured from d50c92ad1, then updated for the state-write and value-free
+    // diagnostic changes in 2fc68b0e5. All 13 files match that generator exactly;
+    // expanded scalar/naming support leaves this legacy profile unchanged.
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/legacy_constructs_digests.json")).unwrap();
     let parsed = generation_input_from_yang_sources(

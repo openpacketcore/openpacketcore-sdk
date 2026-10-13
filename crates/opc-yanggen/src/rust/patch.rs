@@ -1183,6 +1183,19 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     } else {
         quote! {}
     };
+    let scalar_constraint_error_helper = if input
+        .nodes
+        .iter()
+        .any(|node| super::types::has_scalar_constraints(node, &nodes_by_path))
+    {
+        quote! {
+            fn scalar_constraint_error(reason: &'static str) -> ConfigError {
+                config_error("invalid-value", reason)
+            }
+        }
+    } else {
+        quote! {}
+    };
     let write_validation = if has_state {
         quote! {
             // Resolve relative helper paths and JSON member paths using the same
@@ -1487,6 +1500,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #json_error_helper
+        #scalar_constraint_error_helper
         #impls
     };
 
@@ -1506,7 +1520,7 @@ fn subtree_constraint_checks(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenS
             child,
             nodes,
             quote! { self.#field },
-            quote! { (|reason| config_error("invalid-value", reason)) },
+            quote! { scalar_constraint_error },
         ));
         let access = if is_sensitive_node(child) {
             quote! { self.#field.get() }
