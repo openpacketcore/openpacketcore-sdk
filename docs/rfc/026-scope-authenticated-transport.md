@@ -276,7 +276,7 @@ key confined to the trusted worker is therefore a deployment prerequisite.
 ## TLS binding and authentication clocks
 
 Use TLS 1.3, mandatory mTLS, no resumption/early data, and exact ALPNs
-`opc-scope/1` and `opc-voter-management/1`. Both ends use constrained `opc-tls`
+`opc-scope/2` and `opc-voter-management/1`. Both ends use constrained `opc-tls`
 `PeerPolicy`, never `allow_any_trusted_peer` or compatibility mode. Keep these
 listeners separate from the consensus ALPN. Use immutable handshake material,
 final material-epoch admission and existing credential/trust/policy retirement.

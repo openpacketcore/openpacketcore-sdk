@@ -97,6 +97,29 @@ pub(crate) fn retired_fixture(before: &ScopeState, n: u8) -> ScopeState {
     after
 }
 
+/// Model retirement for a scope admitted by a real consensus-store fixture.
+#[cfg(target_os = "linux")]
+pub(crate) fn retired_store_fixture(before: &ScopeState, n: u8) -> ScopeState {
+    let request = ScopeAuthorityRequest::new(
+        before.view.scope().clone(),
+        [n; 16],
+        before.view.revision(),
+        ScopeAuthorityOperation::SucceedClosed {
+            predecessor: before.view.stamp().unwrap().clone(),
+            execution: execution(n),
+            evidence: evidence(ScopeClosureKind::FinalTermination, n),
+        },
+    )
+    .unwrap();
+    let mut after = before.transition(&request).unwrap();
+    let old = before.view.current_incarnation().unwrap().get();
+    after.view.retired_through = old;
+    after.view.stamp.as_mut().unwrap().namespace.incarnation =
+        ScopeIncarnation::new(old + 1).unwrap();
+    after.validate().unwrap();
+    after
+}
+
 #[test]
 fn exact_admission_replay_does_not_advance_authority_or_generation() {
     let initial = request(

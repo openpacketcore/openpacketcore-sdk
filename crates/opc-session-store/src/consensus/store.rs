@@ -171,6 +171,7 @@ mod scope_authority;
 mod transport_class;
 pub use transport_class::session_consensus_work_class;
 mod scope_batch;
+pub(crate) mod scope_child_read;
 mod scope_profile;
 mod scope_scan;
 #[cfg(all(test, target_os = "linux"))]
@@ -2001,6 +2002,15 @@ struct ConsensusSessionStoreInner {
     scope_views: Arc<crate::scope_scan::backend::ScopeViewRegistry>,
     #[cfg(any(test, feature = "test-control"))]
     scope_read_barriers_for_test: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    scope_child_read_cuts_for_test: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    scope_child_read_pause: Mutex<
+        Option<(
+            crate::scope_batch::ScopeChildReadStage,
+            Arc<crate::scope_batch::child_read_control::PauseState>,
+        )>,
+    >,
     scope_database: Option<Arc<super::snapshot::PinnedSqliteFile>>,
     #[cfg(target_os = "linux")]
     private_wal: Option<Arc<crate::sqlite::consensus::wal::Wal>>,
@@ -3803,6 +3813,10 @@ impl ConsensusSessionStore {
             scope_views,
             #[cfg(any(test, feature = "test-control"))]
             scope_read_barriers_for_test: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-control"))]
+            scope_child_read_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-control"))]
+            scope_child_read_cuts_for_test: AtomicU64::new(0),
             scope_database,
             #[cfg(target_os = "linux")]
             private_wal,
@@ -4043,6 +4057,10 @@ impl ConsensusSessionStore {
             scope_views,
             #[cfg(any(test, feature = "test-control"))]
             scope_read_barriers_for_test: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-control"))]
+            scope_child_read_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-control"))]
+            scope_child_read_cuts_for_test: AtomicU64::new(0),
             scope_database,
             #[cfg(target_os = "linux")]
             private_wal,
@@ -17735,7 +17753,7 @@ mod membership_tests {
         )
     }
 
-    fn singleton_topology() -> ValidatedQuorumTopology {
+    pub(super) fn singleton_topology() -> ValidatedQuorumTopology {
         let replica_id = ReplicaId::new("membership-admission-singleton").expect("replica ID");
         let descriptor = QuorumReplicaDescriptor::new(
             replica_id.clone(),

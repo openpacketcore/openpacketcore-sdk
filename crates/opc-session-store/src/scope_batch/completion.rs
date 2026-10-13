@@ -91,11 +91,13 @@ pub enum ScopeBatchCompletionOutcome {
 }
 
 /// One exact terminal result, delivered at least once until acknowledged.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ScopeBatchCompletion {
     pub(super) attempt: ScopeBatchAttempt,
     pub(super) outcome: ScopeBatchCompletionOutcome,
     pub(super) refusal: Option<ScopeBatchError>,
+    pub(super) context: Option<ScopeBatchCompletionContext>,
+    pub(super) retention: Option<ScopeBatchCompletionRetention>,
 }
 
 impl ScopeBatchCompletion {
@@ -110,6 +112,8 @@ impl ScopeBatchCompletion {
                 ScopeBatchTerminal::Cancelled => ScopeBatchCompletionOutcome::Cancelled,
             },
             refusal: None,
+            context: None,
+            retention: None,
         })
     }
     /// Complete immutable identity of the resolved request.
@@ -125,7 +129,28 @@ impl ScopeBatchCompletion {
     pub const fn refusal(&self) -> Option<&ScopeBatchError> {
         self.refusal.as_ref()
     }
+    /// Opaque adapter facts, if supplied by the concrete supervising port.
+    /// Presence alone does not prove provenance or grant an effect capability.
+    pub fn context(&self) -> Option<&ScopeBatchCompletionContext> {
+        self.context.as_ref()
+    }
+    /// This supervised completion's retention identity. Bare recovered receipts
+    /// have neither original submission class nor authenticated provenance.
+    pub fn retention(&self) -> Option<&ScopeBatchCompletionRetention> {
+        self.retention.as_ref()
+    }
 }
+
+// Equality compares observed facts, as before. Opaque capability metadata must
+// be verified by its owning adapter, never inferred from observation equality.
+impl PartialEq for ScopeBatchCompletion {
+    fn eq(&self, other: &Self) -> bool {
+        self.attempt == other.attempt
+            && self.outcome == other.outcome
+            && self.refusal == other.refusal
+    }
+}
+impl Eq for ScopeBatchCompletion {}
 
 impl fmt::Debug for ScopeBatchNoApplyProof {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

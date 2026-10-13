@@ -1069,6 +1069,16 @@ fn add_saturating(counter: &AtomicU64, saturated: &AtomicBool, count: u64) {
     }
 }
 
+const SCOPE_REVISION_ROLES: [&str; 5] = ["worker", "observer", "quorum", "issuer", "responder"];
+const SCOPE_REVISION_PURPOSES: [&str; 5] = [
+    "handshake",
+    "scope-request",
+    "scope-response",
+    "boot-liveness",
+    "boot-candidate",
+];
+const SCOPE_REVISION_DIRECTIONS: [&str; 2] = ["inbound", "outbound"];
+
 /// The global SDK metrics registry holding all atomic counters and gauges.
 pub struct SdkMetrics {
     // === Config Bus ===
@@ -1140,6 +1150,9 @@ pub struct SdkMetrics {
     pub session_operator_recovery_audit_pending: AtomicI64,
     pub session_operator_recovery_epoch: AtomicU64,
     pub session_operator_recovery_rejoins: AtomicU64,
+    /// Fixed scope transport revision counters. Use
+    /// [`Self::record_scope_transport_revision_mismatch`] for labelled recording.
+    pub scope_transport_revision_mismatches: [AtomicU64; 50],
     pub session_net_backend_queue_timeouts: AtomicU64,
     pub session_net_backend_execution_timeouts: AtomicU64,
     pub session_net_backend_cancellations: AtomicU64,
@@ -1313,6 +1326,7 @@ impl SdkMetrics {
             session_operator_recovery_audit_pending: AtomicI64::new(0),
             session_operator_recovery_epoch: AtomicU64::new(0),
             session_operator_recovery_rejoins: AtomicU64::new(0),
+            scope_transport_revision_mismatches: std::array::from_fn(|_| AtomicU64::new(0)),
             session_net_backend_queue_timeouts: AtomicU64::new(0),
             session_net_backend_execution_timeouts: AtomicU64::new(0),
             session_net_backend_cancellations: AtomicU64::new(0),
@@ -1406,6 +1420,39 @@ impl SdkMetrics {
             netconf_nacm_denials_total: Mutex::new(HashMap::new()),
             netconf_terminal_audit_failures_total: AtomicU64::new(0),
             gnmi_terminal_audit_failures_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one scope transport revision mismatch using only the fixed local
+    /// role, protocol purpose and connection direction labels. Unknown labels
+    /// are ignored; peer and request values can never allocate metric buckets.
+    pub fn record_scope_transport_revision_mismatch(
+        &self,
+        role: &str,
+        purpose: &str,
+        direction: &str,
+    ) {
+        let (Some(role), Some(purpose), Some(direction)) = (
+            SCOPE_REVISION_ROLES.iter().position(|label| *label == role),
+            SCOPE_REVISION_PURPOSES
+                .iter()
+                .position(|label| *label == purpose),
+            SCOPE_REVISION_DIRECTIONS
+                .iter()
+                .position(|label| *label == direction),
+        ) else {
+            return;
+        };
+        let counter =
+            &self.scope_transport_revision_mismatches[(role * 5 + purpose) * 2 + direction];
+        let mut previous = counter.load(Ordering::Relaxed);
+        while let Err(current) = counter.compare_exchange_weak(
+            previous,
+            previous.saturating_add(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            previous = current;
         }
     }
 
@@ -1518,6 +1565,9 @@ impl SdkMetrics {
             .store(0, Ordering::Relaxed);
         self.session_operator_recovery_rejoins
             .store(0, Ordering::Relaxed);
+        for counter in &self.scope_transport_revision_mismatches {
+            counter.store(0, Ordering::Relaxed);
+        }
         self.session_net_backend_queue_timeouts
             .store(0, Ordering::Relaxed);
         self.session_net_backend_execution_timeouts
@@ -2478,6 +2528,23 @@ pub fn export_prometheus_text() -> String {
         "Operator recovery workflows that completed a fresh rejoin barrier",
         operator_recovery_rejoins as f64,
     );
+
+    out.push_str(
+        "# HELP scope_transport_revision_mismatch_total Scope transport revision mismatch signals by fixed local role, purpose and direction\n",
+    );
+    out.push_str("# TYPE scope_transport_revision_mismatch_total counter\n");
+    for (role_index, role) in SCOPE_REVISION_ROLES.iter().enumerate() {
+        for (purpose_index, purpose) in SCOPE_REVISION_PURPOSES.iter().enumerate() {
+            for (direction_index, direction) in SCOPE_REVISION_DIRECTIONS.iter().enumerate() {
+                let count = METRICS.scope_transport_revision_mismatches
+                    [(role_index * 5 + purpose_index) * 2 + direction_index]
+                    .load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "scope_transport_revision_mismatch_total{{role=\"{role}\",purpose=\"{purpose}\",direction=\"{direction}\"}} {count}\n"
+                ));
+            }
+        }
+    }
 
     let backend_queue_timeouts = METRICS
         .session_net_backend_queue_timeouts

@@ -4,10 +4,11 @@ use opc_session_store::scope_batch::{ScopeChildKey, ScopeClaimKey};
 use opc_session_store::scope_scan::*;
 
 fn succession() -> ScopeAuthorityRequest {
-    let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../docs/rfc/026-scope-authenticated-transport-vectors.json"
+    let vectors: serde_json::Value = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
     ))
-    .unwrap();
+    .unwrap()["authority_startup"]
+        .clone();
     let hex = vectors["authority_requests"][1]["canonical_postcard_hex"]
         .as_str()
         .unwrap();

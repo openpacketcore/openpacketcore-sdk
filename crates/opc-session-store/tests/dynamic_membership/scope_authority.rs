@@ -2,6 +2,9 @@ use super::*;
 use opc_session_store::scope_authority::*;
 use opc_session_store::SessionConsumerIdentity;
 
+#[path = "scope_child_read.rs"]
+mod child_read;
+
 fn principal(name: &str) -> SessionConsumerIdentity {
     SessionConsumerIdentity::new(format!("spiffe://scope.test/{name}")).unwrap()
 }

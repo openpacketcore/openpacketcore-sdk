@@ -19,14 +19,14 @@ the GTP-U workflow's `el9-514-classifier-load` job.
 | --- | --- |
 | GTP-U host job: checkout, stable Rust and build cache | Repeated on the lifecycle job's own runner; its stable cache key is `opc-local-kernel-lifecycle`, pointing at `target/local-kernel-lifecycle` |
 | GTP-U host job: kernel tooling and support preflight | Lifecycle job installs its own tools, checks GTP, WireGuard, VRF, interface stacking, private bpffs, tc and XFRM support, and checks libseccomp availability |
-| GTP-U host job: `Qualify exact local kernel lifecycle` | `rust-local-kernel-lifecycle`, with the same command, manifest, features, build profile, per-case timeout, skip rejection and BPF ID restrictions |
+| GTP-U host job: `Qualify exact local kernel lifecycle` | `rust-local-kernel-lifecycle`, with the lifecycle manifest, `native-scope` enabled for lifecycle, GTP-U and XFRM, and the original build profile, per-case timeout, skip rejection and BPF ID restrictions |
 | GTP-U host job: `Upload local kernel lifecycle evidence` | Lifecycle job, still under `always()`, with the original evidence plus cleanup snapshots; reruns overwrite the artifact |
 | All existing GTP-U host tests and assertions | Original `privileged-gtpu` job, unchanged from main |
 | EL9 lifecycle bundle build, guest run and evidence | Original `el9-514-classifier-load` job, unchanged from the lifecycle implementation |
 | Lifecycle runner cleanup | Explicit `always()` verification after qualification, against the snapshot taken after module setup and before private namespace probes |
 | Required merge result for the host lifecycle qualification | Existing `Rust workspace` aggregate, through `needs: rust-local-kernel-lifecycle` |
 
-The complete 31-case manifest remains in
+The complete 41-case manifest remains in
 [`local-kernel-lifecycle-cases.json`](local-kernel-lifecycle-cases.json). All
 four crates' exact cases run once on the host and once in the existing EL9
 qualification. No case moved out of either kernel qualification, and neither
@@ -51,10 +51,9 @@ the GTP-U job started at 01:32:46 UTC and reached lifecycle qualification at
 artifact shows a successful 3m45s build and three completed cases, so the
 cancelled step is not a measurement of the full lifecycle suite.
 
-Estimate **15–25 minutes cold** for the independent lifecycle job: 2–3 minutes
-for setup, preflight and cache/artifact work, 9–15 minutes for a cold build of
-the four test libraries and their dependencies, and 4–7 minutes for all 31
-native cases. The previous GTP-U job had already compiled shared dependencies;
-its partial lifecycle build cannot be used as a cold-build estimate. The
-45-minute limit provides headroom without changing the original GTP-U limit.
-The next hosted train must confirm the estimate and cleanup verification.
+The earlier **15–25 minute cold** estimate covered 31 cases and did not include
+the native scope transport dependency graph. It is not a measured estimate for
+the current 41-case suite. The previous GTP-U job had already compiled shared
+dependencies, so its partial build cannot establish a cold-build duration.
+The lifecycle job retains its 45-minute limit; hosted qualification measures
+the complete suite and verifies cleanup.

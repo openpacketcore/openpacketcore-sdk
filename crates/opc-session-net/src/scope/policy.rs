@@ -149,7 +149,8 @@ impl ScopePolicy {
                 Method::ApplyBatch
                 | Method::BatchReopen
                 | Method::BatchCancel
-                | Method::BatchLookup,
+                | Method::BatchLookup
+                | Method::ChildRead,
             ) => class != Class::SafetyControl,
             (
                 ScopeRole::Worker,

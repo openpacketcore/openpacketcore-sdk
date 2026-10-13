@@ -15,14 +15,19 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as opc_local_kernel_lifecycle;
 #[cfg(feature = "store")]
 mod authority;
 mod layout;
 #[cfg(feature = "store")]
 mod opening;
+#[cfg(feature = "native-scope")]
+pub use authority::NativeScopeAuthority;
 #[cfg(feature = "store")]
 pub use authority::{
-    CommittedScopeEffect, EffectKey, LocalEffectError, LocalEffectUse, ScopeKernelAuthority,
+    CommittedScopeEffect, EffectKey, LocalEffectError, LocalEffectUse, LocalScopeAuthority,
+    ScopeKernelAuthority,
 };
 mod reset;
 mod retry;
