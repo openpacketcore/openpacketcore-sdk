@@ -953,10 +953,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
 
             // State-only rows and expanded-profile no-op diffs need no inputs.
-            let empty_state_diff = !node.config
-                && node.kind == SchemaNodeKind::List
-                && !node.key_leaves.is_empty()
-                && diff_fields.is_empty();
+            let empty_state_diff = has_state_lists && diff_fields.is_empty();
             let previous_param = format_ident!(
                 "{}",
                 if (nodes_by_path.expanded_profile && diff_fields.is_empty()) || empty_state_diff {

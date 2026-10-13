@@ -61,9 +61,9 @@ values.
 Keyed lists under `config false` retain `Option<T>` key leaves and the same
 scalar or composite map-key types as configuration lists. Generated key
 extraction and edit helpers use that optional representation, including
-sensitive key wrappers. Read-only rows with no configuration differences
-emit warning-free no-op diff helpers. Normal patch and NETCONF XML admission
-continue to reject writes to state paths.
+sensitive key wrappers. Read-only rows and nested containers with no
+configuration differences emit warning-free no-op diff helpers. Normal patch
+and NETCONF XML admission continue to reject writes to state paths.
 Generated modules for these schemas are checked with Clippy warnings denied.
 Their block boundaries preserve literal contents and punctuation; existing
 supported schemas retain their generated output bytes.

@@ -422,9 +422,7 @@ fn apply_children_fn(
         }
     };
 
-    let rejects_every_child = !node.config
-        && node.kind == SchemaNodeKind::List
-        && !node.key_leaves.is_empty()
+    let rejects_every_child = has_state_lists
         && node.child_paths.iter().all(|path| {
             nodes_by_path
                 .get(path)
@@ -779,7 +777,7 @@ fn apply_list_fn(
                 quote! { #key_field_ident },
                 has_state_lists,
             );
-            key_struct_fields.push(if cloned_key.to_string() == key_field_ident.to_string() {
+            key_struct_fields.push(if key_field_ident == cloned_key.to_string() {
                 quote! { #key_field_ident }
             } else {
                 quote! { #key_field_ident: #cloned_key }
