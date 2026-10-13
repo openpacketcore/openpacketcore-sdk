@@ -17,7 +17,7 @@ use opc_mgmt_schema::{NetconfXmlRenderer, SchemaRegistry};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
 use opc_netconf_server::{
     run_read_only_session_with_registry, NetconfConfigBinding, ReadOnlyNetconfServer,
-    SessionConfig, SessionRegistry,
+    SessionConfig, SessionRegistry, WithDefaultsCapability, WithDefaultsMode,
 };
 use opc_types::TenantId;
 use serde_json::{json, Value};
@@ -130,6 +130,12 @@ impl NetconfConfigBinding<Root> for Binding {
     fn nmda_get_data_supported(&self) -> bool {
         true
     }
+    fn with_defaults_capability(&self) -> Option<WithDefaultsCapability> {
+        Some(
+            WithDefaultsCapability::new(WithDefaultsMode::Trim, [WithDefaultsMode::ReportAll])
+                .unwrap(),
+        )
+    }
 }
 fn principal() -> TrustedPrincipal {
     TrustedPrincipal::new(
@@ -143,6 +149,14 @@ struct Fixture {
     netconf: ReadOnlyNetconfServer<Root, Binding, Arc<Policy>, Audit>,
     audit: Audit,
 }
+
+#[derive(Clone, Copy, Debug)]
+enum NetconfRead {
+    GetConfig,
+    Get,
+    GetData,
+}
+
 impl Fixture {
     async fn new(root: Root, policy: Policy) -> Self {
         let policy = Arc::new(policy);
@@ -192,6 +206,45 @@ impl Fixture {
             .map(tonic::Response::into_inner)
     }
     async fn xml(&self, filter: &str) -> String {
+        self.xml_operation(&format!(
+            "<get-config><source><running/></source>{filter}</get-config>"
+        ))
+        .await
+    }
+    async fn xml_read(
+        &self,
+        operation: NetconfRead,
+        selector: Option<&str>,
+        mode: Option<WithDefaultsMode>,
+    ) -> String {
+        let defaults = mode.map_or_else(String::new, |mode| {
+            format!(
+                "<wd:with-defaults xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\">{}</wd:with-defaults>",
+                mode.as_str()
+            )
+        });
+        let filter = selector.map_or_else(String::new, |selector| match operation {
+            NetconfRead::GetConfig | NetconfRead::Get => format!(
+                "<filter type=\"xpath\" xmlns:k=\"urn:keys\" select=\"{}\"/>",
+                xml_escape(selector).replace('"', "&quot;")
+            ),
+            NetconfRead::GetData => format!(
+                "<ncds:xpath-filter xmlns:k=\"urn:keys\">{}</ncds:xpath-filter>",
+                xml_escape(selector)
+            ),
+        });
+        let body = match operation {
+            NetconfRead::GetConfig => format!(
+                "<get-config><source><running/></source>{filter}{defaults}</get-config>"
+            ),
+            NetconfRead::Get => format!("<get>{filter}{defaults}</get>"),
+            NetconfRead::GetData => format!(
+                "<ncds:get-data xmlns:ncds=\"urn:ietf:params:xml:ns:yang:ietf-netconf-nmda\" xmlns:ds=\"urn:ietf:params:xml:ns:yang:ietf-datastores\"><ncds:datastore>ds:running</ncds:datastore>{filter}{defaults}</ncds:get-data>"
+            ),
+        };
+        self.xml_operation(&body).await
+    }
+    async fn xml_operation(&self, operation: &str) -> String {
         let sessions = SessionRegistry::new();
         let principal = principal();
         let (mut client, mut transport) = tokio::io::duplex(65536);
@@ -213,7 +266,7 @@ impl Fixture {
         let exchange = async {
             assert!(frame(&mut client).await.contains("<hello"));
             client.write_all(b"<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities><capability>urn:ietf:params:netconf:base:1.0</capability></capabilities></hello>]]>]]>").await.unwrap();
-            let rpc = format!("<rpc xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\" message-id=\"read\"><get-config><source><running/></source>{filter}</get-config></rpc>]]>]]>");
+            let rpc = format!("<rpc xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\" message-id=\"read\">{operation}</rpc>]]>]]>");
             client.write_all(rpc.as_bytes()).await.unwrap();
             let reply = frame(&mut client).await;
             client.shutdown().await.unwrap();
@@ -253,12 +306,19 @@ fn child_filter(list: &str, leaf: &str) -> String {
 }
 fn data(reply: &str) -> &str {
     assert!(!reply.contains("<rpc-error>"), "{reply}");
-    if reply.contains("<data/>") {
+    if reply.contains("<data/>")
+        || reply.contains("<data xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-nmda\"/>")
+    {
         ""
     } else {
         reply
             .split_once("<data>")
-            .unwrap()
+            .or_else(|| {
+                reply.split_once(
+                    "<data xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-nmda\">",
+                )
+            })
+            .unwrap_or_else(|| panic!("missing data element: {reply}"))
             .1
             .split_once("</data>")
             .unwrap()
@@ -833,4 +893,192 @@ async fn keyed_list_ordering_is_preserved() {
             );
         }
     }
+}
+
+async fn assert_empty_presence_read(operation: NetconfRead) {
+    let root: Root = serde_json::from_value(json!({ "empty-presence": {} })).unwrap();
+    assert!(matches!(
+        &root.empty_presence.as_ref().unwrap().optional,
+        LeafPresence::Absent
+    ));
+    let fixture = Fixture::new(root, full_policy(&[])).await;
+    for selector in [None, Some("/k:root/k:empty-presence")] {
+        let reply = fixture.xml_read(operation, selector, None).await;
+        assert_eq!(
+            data(&reply),
+            "<keys:root xmlns:keys=\"urn:keys\"><keys:empty-presence></keys:empty-presence></keys:root>",
+            "{operation:?}: preserve an authorized stored presence container"
+        );
+    }
+    let absent = Fixture::new(serde_json::from_value(json!({})).unwrap(), full_policy(&[])).await;
+    assert_eq!(
+        data(&absent.xml_read(operation, None, None).await),
+        "",
+        "{operation:?}: do not fabricate an absent presence container"
+    );
+}
+
+async fn assert_default_trimmed_presence_read(operation: NetconfRead) {
+    let mut root: Root = serde_json::from_value(json!({ "default-presence": {} })).unwrap();
+    root.default_presence.as_mut().unwrap().defaulted =
+        LeafPresence::Defaulted("default-value".into());
+    let fixture = Fixture::new(root, full_policy(&[])).await;
+    let report_all = fixture
+        .xml_read(operation, None, Some(WithDefaultsMode::ReportAll))
+        .await;
+    assert_eq!(
+        data(&report_all),
+        "<keys:root xmlns:keys=\"urn:keys\"><keys:default-presence><keys:defaulted>default-value</keys:defaulted></keys:default-presence></keys:root>",
+        "{operation:?}: the stored defaulted child is available in report-all"
+    );
+    let trimmed = fixture
+        .xml_read(operation, None, Some(WithDefaultsMode::Trim))
+        .await;
+    assert_eq!(
+        data(&trimmed),
+        "<keys:root xmlns:keys=\"urn:keys\"><keys:default-presence></keys:default-presence></keys:root>",
+        "{operation:?}: trimming a child must preserve its stored presence container"
+    );
+}
+
+async fn assert_keyed_list_presence_read(operation: NetconfRead) {
+    let root = config(
+        "public-rows",
+        json!([{ "id": "visible-row", "row-presence": {} }]),
+    );
+    assert!(root.public_rows.values().next().unwrap().row_presence.is_some());
+    let fixture = Fixture::new(root, full_policy(&[])).await;
+    for selector in [
+        None,
+        Some("/k:root/k:public-rows[k:id='visible-row']/k:row-presence"),
+    ] {
+        let reply = fixture.xml_read(operation, selector, None).await;
+        assert_eq!(
+            data(&reply),
+            "<keys:root xmlns:keys=\"urn:keys\"><keys:public-rows><keys:id>visible-row</keys:id><keys:row-presence></keys:row-presence></keys:public-rows></keys:root>",
+            "{operation:?}: retain presence inside an authorized keyed entry"
+        );
+    }
+}
+
+async fn assert_presence_omission_controls(operation: NetconfRead) {
+    let root: Root = serde_json::from_value(json!({
+        "scope": { "members": [{ "id": "existing-member", "value": "member-value" }] }
+    }))
+    .unwrap();
+    assert!(root.scope.is_some());
+    let fixture = Fixture::new(root, full_policy(&[])).await;
+    let unmatched = fixture
+        .xml_read(
+            operation,
+            Some("/k:root/k:scope/k:members[k:id='missing-member']/k:value"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        data(&unmatched),
+        "",
+        "{operation:?}: omit presence and structural ancestors of an unmatched instance"
+    );
+    let matched = fixture
+        .xml_read(
+            operation,
+            Some("/k:root/k:scope/k:members[k:id='existing-member']/k:value"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        data(&matched),
+        "<keys:root xmlns:keys=\"urn:keys\"><keys:scope><keys:members><keys:id>existing-member</keys:id><keys:value>member-value</keys:value></keys:members></keys:scope></keys:root>",
+        "{operation:?}: an authorized matching instance still renders"
+    );
+
+    let hidden: Root = serde_json::from_value(json!({
+        "empty-presence": {},
+        "public-rows": [{ "id": "hidden-row", "row-presence": {} }],
+        "sensitive-rows": [{ "id": "visible-sibling", "value": "visible-value" }]
+    }))
+    .unwrap();
+    let fixture = Fixture::new(
+        hidden,
+        full_policy(&[
+            "/keys:root/keys:empty-presence",
+            "/keys:root/keys:public-rows/keys:id",
+        ]),
+    )
+    .await;
+    let denied = fixture
+        .xml_read(
+            operation,
+            Some("/k:root/k:public-rows[k:id='hidden-row']/k:row-presence"),
+            None,
+        )
+        .await;
+    assert_eq!(data(&denied), "", "{operation:?}: a denied key hides presence in its entry");
+    let all = fixture.xml_read(operation, None, None).await;
+    assert_eq!(
+        data(&all),
+        "<keys:root xmlns:keys=\"urn:keys\"><keys:sensitive-rows><keys:id>visible-sibling</keys:id><keys:value>visible-value</keys:value></keys:sensitive-rows></keys:root>",
+        "{operation:?}: hide denied presence branches while preserving a permitted sibling"
+    );
+}
+
+#[tokio::test]
+async fn empty_presence_survives_get_config() {
+    assert_empty_presence_read(NetconfRead::GetConfig).await;
+}
+
+#[tokio::test]
+async fn empty_presence_survives_get() {
+    assert_empty_presence_read(NetconfRead::Get).await;
+}
+
+#[tokio::test]
+async fn empty_presence_survives_get_data() {
+    assert_empty_presence_read(NetconfRead::GetData).await;
+}
+
+#[tokio::test]
+async fn default_trimmed_presence_survives_get_config() {
+    assert_default_trimmed_presence_read(NetconfRead::GetConfig).await;
+}
+
+#[tokio::test]
+async fn default_trimmed_presence_survives_get() {
+    assert_default_trimmed_presence_read(NetconfRead::Get).await;
+}
+
+#[tokio::test]
+async fn default_trimmed_presence_survives_get_data() {
+    assert_default_trimmed_presence_read(NetconfRead::GetData).await;
+}
+
+#[tokio::test]
+async fn keyed_list_presence_survives_get_config() {
+    assert_keyed_list_presence_read(NetconfRead::GetConfig).await;
+}
+
+#[tokio::test]
+async fn keyed_list_presence_survives_get() {
+    assert_keyed_list_presence_read(NetconfRead::Get).await;
+}
+
+#[tokio::test]
+async fn keyed_list_presence_survives_get_data() {
+    assert_keyed_list_presence_read(NetconfRead::GetData).await;
+}
+
+#[tokio::test]
+async fn presence_omission_controls_get_config() {
+    assert_presence_omission_controls(NetconfRead::GetConfig).await;
+}
+
+#[tokio::test]
+async fn presence_omission_controls_get() {
+    assert_presence_omission_controls(NetconfRead::Get).await;
+}
+
+#[tokio::test]
+async fn presence_omission_controls_get_data() {
+    assert_presence_omission_controls(NetconfRead::GetData).await;
 }

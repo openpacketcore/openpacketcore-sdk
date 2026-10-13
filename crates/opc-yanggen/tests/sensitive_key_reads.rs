@@ -105,6 +105,86 @@ fn input() -> CanonicalInput {
             }
         }
     }
+    for (parent, name, child, default) in [
+        ("/keys:root", "empty-presence", "optional", None),
+        (
+            "/keys:root",
+            "default-presence",
+            "defaulted",
+            Some("default-value"),
+        ),
+        (
+            "/keys:root/keys:public-rows",
+            "row-presence",
+            "row-optional",
+            None,
+        ),
+    ] {
+        let path = format!("{parent}/keys:{name}");
+        let child_path = format!("{path}/keys:{child}");
+        nodes
+            .iter_mut()
+            .find(|node| node.path == parent)
+            .unwrap()
+            .child_paths
+            .push(path.clone());
+        nodes.push(SchemaNode {
+            path,
+            module: "keys".into(),
+            kind: SchemaNodeKind::Container,
+            config: true,
+            presence: Some("explicitly configured presence".into()),
+            child_paths: vec![child_path.clone()],
+            source: source.clone(),
+            ..Default::default()
+        });
+        nodes.push(SchemaNode {
+            path: child_path,
+            module: "keys".into(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            default: default.map(str::to_string),
+            source: source.clone(),
+            ..Default::default()
+        });
+    }
+    nodes[0].child_paths.push("/keys:root/keys:scope".into());
+    nodes.push(SchemaNode {
+        path: "/keys:root/keys:scope".into(),
+        module: "keys".into(),
+        kind: SchemaNodeKind::Container,
+        config: true,
+        presence: Some("configured member scope".into()),
+        child_paths: vec!["/keys:root/keys:scope/keys:members".into()],
+        source: source.clone(),
+        ..Default::default()
+    });
+    nodes.push(SchemaNode {
+        path: "/keys:root/keys:scope/keys:members".into(),
+        module: "keys".into(),
+        kind: SchemaNodeKind::List,
+        config: true,
+        key_leaves: vec!["id".into()],
+        child_paths: vec![
+            "/keys:root/keys:scope/keys:members/keys:id".into(),
+            "/keys:root/keys:scope/keys:members/keys:value".into(),
+        ],
+        source: source.clone(),
+        ..Default::default()
+    });
+    for child in ["id", "value"] {
+        nodes.push(SchemaNode {
+            path: format!("/keys:root/keys:scope/keys:members/keys:{child}"),
+            module: "keys".into(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("public".into()),
+            source: source.clone(),
+            ..Default::default()
+        });
+    }
     let ir = opc_yanggen::compile(&GenerationInput {
         profile: "test".into(),
         lockfile: opc_yanggen::ir::ModuleLockfile {
