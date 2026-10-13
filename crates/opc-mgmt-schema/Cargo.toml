@@ -13,6 +13,7 @@ keywords = ["5g", "cnf", "yang", "gnmi", "netconf"]
 categories = ["network-programming"]
 
 [dependencies]
+regex = "1.13.1"
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }

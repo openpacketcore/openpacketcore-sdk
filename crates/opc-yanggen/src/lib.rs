@@ -2,6 +2,26 @@
 //!
 //! YANG-to-Rust type projection, RFC 7951 JSON serde, iterative semantic
 //! constraint validation, and patch applicator.
+//!
+//! All eight YANG integer widths are supported, including exact ranges through
+//! `u64::MAX`. Generated 64-bit integer wrappers use RFC 7951 JSON strings; smaller
+//! integers use JSON numbers. Declared ranges are enforced by deserialization,
+//! syntax validation, patches, gNMI Set, and NETCONF edits. Integer range metadata
+//! has an additive `i128` table; existing generated `i64` tables remain valid.
+//! The generator IR's [`NumericRangeInterval`] bounds are now `i128`.
+//! Schema integer defaults decode decimal, octal, and hexadecimal notation
+//! before range validation. Value-less list-entry patches assign and validate
+//! their path keys in models using the extended scalar constructs.
+//!
+//! Colliding container/list type names are deterministically parent-qualified,
+//! including their composite-key companions. Unique names remain unchanged.
+//!
+//! String `length` counts Unicode scalar values. All declared XSD `pattern`
+//! restrictions apply to the whole value, including `invert-match`. Generated
+//! code compiles each bounded pattern once through `opc-mgmt-schema` and checks
+//! deserialization, syntax validation, patches, gNMI Set, and NETCONF edits.
+//! Source quoting preserves literal strings, restricts double-quoted escapes,
+//! trims physical double-quoted lines, and concatenates only quoted strings.
 
 pub mod diagnostic;
 pub mod emit;
@@ -19,8 +39,8 @@ pub use crate::ir::{
     AllocationStrategy, BooleanOp, CompareOp, ConstraintBinding, ConstraintExpr, EnumValue,
     FunctionCall, FunctionName, Literal, LockedModule, ModuleImport, ModuleLockfile,
     NumericRangeInterval, PathAnchor, PathExpr, RawConstraintExpr, SchemaIr, SchemaModule,
-    SchemaNode, SchemaNodeKind, StackBudget, StackScope, StackShape, TypeRef, UnsupportedFeature,
-    UnsupportedFeatureKind,
+    SchemaNode, SchemaNodeKind, StackBudget, StackScope, StackShape, StringLengthInterval,
+    StringPattern, TypeRef, UnsupportedFeature, UnsupportedFeatureKind,
 };
 pub use crate::lower::{lower_constraint, MAX_CONSTRAINT_EXPR_DEPTH};
 pub use crate::source::{

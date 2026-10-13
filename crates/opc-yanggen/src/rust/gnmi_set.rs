@@ -1,6 +1,6 @@
 //! Generates a schema-backed gNMI Set applicator for generated config roots.
 
-use super::{clean_segment, last_segment, to_pascal_case, RustGenerationError};
+use super::RustGenerationError;
 use crate::emit::CanonicalInput;
 use crate::ir::SchemaNodeKind;
 use quote::{format_ident, quote};
@@ -21,10 +21,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         ));
     }
 
-    let root_type = format_ident!(
-        "{}",
-        to_pascal_case(clean_segment(last_segment(&root.path)))
-    );
+    let nodes_by_path = super::NodeIndex::new(&input.nodes);
+    let root_type = format_ident!("{}", nodes_by_path.type_name(root));
     let user_ordered_lists = input
         .nodes
         .iter()
@@ -60,11 +58,177 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         )
     };
 
+    let extended = super::has_extended_integers(input);
+    let resolve_references = extended || super::strings::has_constraints(input);
+    let resolve_scalar = if resolve_references {
+        quote! { let scalar = scalar_node(node)?; }
+    } else {
+        quote! {}
+    };
+    let scalar_ident = if resolve_references {
+        format_ident!("scalar")
+    } else {
+        format_ident!("node")
+    };
+    let range_path = if resolve_references {
+        quote! { scalar.path }
+    } else {
+        quote! { path }
+    };
+    let numeric_type = if extended {
+        quote! { i128 }
+    } else {
+        quote! { i64 }
+    };
+    let signed_range_value = if extended {
+        quote! { i128::from(parsed) }
+    } else {
+        quote! { parsed }
+    };
+    let extra_json_arms = if extended {
+        quote! {
+                    LeafType::Uint8 => {
+                        let parsed = uint8_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(Value::Number(Number::from(parsed)))
+                    }
+                    LeafType::Int8 => {
+                        let parsed = int8_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(Value::Number(Number::from(parsed)))
+                    }
+                    LeafType::Int16 => {
+                        let parsed = int16_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(Value::Number(Number::from(parsed)))
+                    }
+                    LeafType::Int32 => {
+                        let parsed = int32_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(Value::Number(Number::from(parsed)))
+                    }
+                    LeafType::Uint64 => {
+                        let parsed = uint64_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(Value::String(parsed.to_string()))
+                    }
+        }
+    } else {
+        quote! {}
+    };
+    let extra_patch_arms = if extended {
+        quote! {
+                    LeafType::Uint8 => {
+                        let parsed = uint8_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(parsed.to_string())
+                    }
+                    LeafType::Int8 => {
+                        let parsed = int8_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(parsed.to_string())
+                    }
+                    LeafType::Int16 => {
+                        let parsed = int16_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(parsed.to_string())
+                    }
+                    LeafType::Int32 => {
+                        let parsed = int32_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(parsed.to_string())
+                    }
+                    LeafType::Uint64 => {
+                        let parsed = uint64_value(value)?;
+                        validate_numeric_range(i128::from(parsed), numeric_range)?;
+                        Ok(parsed.to_string())
+                    }
+        }
+    } else {
+        quote! {}
+    };
+    let extra_integer_helpers = if extended {
+        quote! {
+            fn uint8_value(value: &Value) -> Result<u8, GnmiError> {
+                let raw = value
+                    .as_u64()
+                    .ok_or_else(|| GnmiError::invalid("gNMI uint8 leaf value must be a JSON number"))?;
+                u8::try_from(raw)
+                    .map_err(|_| GnmiError::invalid("gNMI uint8 leaf value is out of range"))
+            }
+            fn int8_value(value: &Value) -> Result<i8, GnmiError> {
+                let raw = value
+                    .as_i64()
+                    .ok_or_else(|| GnmiError::invalid("gNMI int8 leaf value must be a JSON number"))?;
+                i8::try_from(raw)
+                    .map_err(|_| GnmiError::invalid("gNMI int8 leaf value is out of range"))
+            }
+            fn int16_value(value: &Value) -> Result<i16, GnmiError> {
+                let raw = value
+                    .as_i64()
+                    .ok_or_else(|| GnmiError::invalid("gNMI int16 leaf value must be a JSON number"))?;
+                i16::try_from(raw)
+                    .map_err(|_| GnmiError::invalid("gNMI int16 leaf value is out of range"))
+            }
+            fn int32_value(value: &Value) -> Result<i32, GnmiError> {
+                let raw = value
+                    .as_i64()
+                    .ok_or_else(|| GnmiError::invalid("gNMI int32 leaf value must be a JSON number"))?;
+                i32::try_from(raw)
+                    .map_err(|_| GnmiError::invalid("gNMI int32 leaf value is out of range"))
+            }
+            fn uint64_value(value: &Value) -> Result<u64, GnmiError> {
+                if let Some(raw) = value.as_u64() {
+                    return Ok(raw);
+                }
+                string_value(value)?
+                    .parse::<u64>()
+                    .map_err(|_| GnmiError::invalid("gNMI uint64 leaf value is invalid"))
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let scalar_helper = if resolve_references {
+        quote! {
+        fn scalar_node(mut node: &NodeMeta) -> Result<&NodeMeta, GnmiError> {
+            let registry = super::schema_registry::registry();
+            for _ in 0..=registry.nodes().len() {
+                if let Some(LeafType::LeafRef { target_path }) = node.leaf_type {
+                    node = registry.node(target_path)
+                        .ok_or_else(|| GnmiError::invalid("gNMI leafref target is missing"))?;
+                } else {
+                    return Ok(node);
+                }
+            }
+            Err(GnmiError::invalid("gNMI leafref cycle"))
+        }    }
+    } else {
+        quote! {}
+    };
+    let range_type = if super::has_extended_integers(input) {
+        quote! { IntegerRangeIntervalMeta as NumericRangeIntervalMeta }
+    } else {
+        quote! { NumericRangeIntervalMeta }
+    };
+    let range_method = if super::has_extended_integers(input) {
+        format_ident!("integer_range")
+    } else {
+        format_ident!("numeric_range")
+    };
+    let string_failure = if super::strings::has_constraints(input) {
+        quote! { |error: opc_config_model::ConfigError| {
+            if error.message() == "string violates YANG constraints" { GnmiError::invalid("string violates YANG constraints") }
+            else { GnmiError::invalid("gNMI Set patch application failed") }
+        } }
+    } else {
+        quote! { |_| { GnmiError::invalid("gNMI Set patch application failed") } }
+    };
     let tokens = quote! {
         use opc_gnmi_server::{
             GnmiError, GnmiPatchApplicator, NormalizedSet, NormalizedValue,
         };
-        use opc_mgmt_schema::{EnumValueMeta, LeafType, NodeKind, NodeMeta, NumericRangeIntervalMeta};
+        use opc_mgmt_schema::{EnumValueMeta, LeafType, NodeKind, NodeMeta, #range_type};
         use serde_json::{Number, Value};
 
         /// Generated gNMI Set applicator for this schema.
@@ -78,9 +242,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             ) -> Result<super::types::#root_type, GnmiError> {
                 let mut candidate = running.clone();
                 let deltas = set_to_deltas(set)?;
-                super::patch::apply_patch(&mut candidate, &deltas).map_err(|_| {
-                    GnmiError::invalid("gNMI Set patch application failed")
-                })?;
+                super::patch::apply_patch(&mut candidate, &deltas).map_err(#string_failure)?;
                 Ok(candidate)
             }
         }
@@ -126,21 +288,23 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 .map_err(|_| GnmiError::invalid("gNMI Set value is not valid JSON"))?;
             match node.kind {
                 NodeKind::Leaf => {
-                    let leaf_type = node
-                        .leaf_type
+                    #resolve_scalar
+                    let leaf_type = #scalar_ident.leaf_type
                         .ok_or_else(|| GnmiError::invalid("gNMI Set leaf has no schema type"))?;
-                    leaf_patch_value(leaf_type, registry.numeric_range(path), &parsed)
+                    leaf_patch_value(leaf_type, registry.#range_method(#range_path), &parsed)
                 }
                 NodeKind::LeafList => {
-                    let leaf_type = node
-                        .leaf_type
+                    #resolve_scalar
+                    let leaf_type = #scalar_ident.leaf_type
                         .ok_or_else(|| GnmiError::invalid("gNMI Set leaf-list has no schema type"))?;
-                    leaf_list_patch_value(leaf_type, registry.numeric_range(path), &parsed)
+                    leaf_list_patch_value(leaf_type, registry.#range_method(#range_path), &parsed)
                 }
                 NodeKind::Container => object_patch_value(&parsed),
                 NodeKind::List => list_patch_value(node, #list_path_argument &parsed),
             }
         }
+
+        #scalar_helper
 
         fn object_patch_value(value: &Value) -> Result<String, GnmiError> {
             if !value.is_object() {
@@ -186,6 +350,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             value: &Value,
         ) -> Result<Value, GnmiError> {
             match leaf_type {
+                #extra_json_arms
                 LeafType::Boolean => Ok(Value::Bool(bool_value(value)?)),
                 LeafType::String | LeafType::IdentityRef { .. } | LeafType::LeafRef { .. } => {
                     Ok(Value::String(string_value(value)?.to_string()))
@@ -193,19 +358,24 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 LeafType::Enumeration { values } => {
                     Ok(Value::String(enum_string_value(values, value)?.to_string()))
                 }
+
+
+
+
                 LeafType::Uint16 => {
                     let parsed = uint16_value(value)?;
-                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    validate_numeric_range(#numeric_type::from(parsed), numeric_range)?;
                     Ok(Value::Number(Number::from(parsed)))
                 }
                 LeafType::Uint32 => {
                     let parsed = uint32_value(value)?;
-                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    validate_numeric_range(#numeric_type::from(parsed), numeric_range)?;
                     Ok(Value::Number(Number::from(parsed)))
                 }
+
                 LeafType::Int64 => {
                     let parsed = int64_value(value)?;
-                    validate_numeric_range(parsed, numeric_range)?;
+                    validate_numeric_range(#signed_range_value, numeric_range)?;
                     Ok(Value::String(parsed.to_string()))
                 }
                 LeafType::Decimal64 => Ok(Value::String(decimal64_value(value)?.to_string())),
@@ -225,6 +395,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             value: &Value,
         ) -> Result<String, GnmiError> {
             match leaf_type {
+                #extra_patch_arms
                 LeafType::Boolean => Ok(bool_value(value)?.to_string()),
                 LeafType::String | LeafType::IdentityRef { .. } | LeafType::LeafRef { .. } => {
                     Ok(string_value(value)?.to_string())
@@ -232,19 +403,24 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 LeafType::Enumeration { values } => {
                     Ok(enum_string_value(values, value)?.to_string())
                 }
+
+
+
+
                 LeafType::Uint16 => {
                     let parsed = uint16_value(value)?;
-                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    validate_numeric_range(#numeric_type::from(parsed), numeric_range)?;
                     Ok(parsed.to_string())
                 }
                 LeafType::Uint32 => {
                     let parsed = uint32_value(value)?;
-                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    validate_numeric_range(#numeric_type::from(parsed), numeric_range)?;
                     Ok(parsed.to_string())
                 }
+
                 LeafType::Int64 => {
                     let parsed = int64_value(value)?;
-                    validate_numeric_range(parsed, numeric_range)?;
+                    validate_numeric_range(#signed_range_value, numeric_range)?;
                     Ok(parsed.to_string())
                 }
                 LeafType::Decimal64 => Ok(decimal64_value(value)?.to_string()),
@@ -290,6 +466,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
+
+
+
+
+
+
+
+
+        #extra_integer_helpers
+
         fn uint16_value(value: &Value) -> Result<u16, GnmiError> {
             let raw = value
                 .as_u64()
@@ -306,6 +492,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 .map_err(|_| GnmiError::invalid("gNMI uint32 leaf value is out of range"))
         }
 
+
+
         fn int64_value(value: &Value) -> Result<i64, GnmiError> {
             if let Some(raw) = value.as_i64() {
                 return Ok(raw);
@@ -316,7 +504,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         fn validate_numeric_range(
-            value: i64,
+            value: #numeric_type,
             numeric_range: &[NumericRangeIntervalMeta],
         ) -> Result<(), GnmiError> {
             if numeric_range.is_empty()

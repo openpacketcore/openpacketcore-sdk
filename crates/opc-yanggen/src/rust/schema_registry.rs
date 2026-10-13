@@ -79,7 +79,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut node_inits = Vec::with_capacity(sorted_nodes.len());
     let mut range_inits = Vec::new();
     for node in sorted_nodes {
-        if !node.numeric_range.is_empty() {
+        if !node.numeric_range.is_empty()
+            && node
+                .numeric_range
+                .iter()
+                .all(|range| i64::try_from(range.min).is_ok() && i64::try_from(range.max).is_ok())
+        {
             range_inits.push(numeric_range_tokens(node));
         }
         node_inits.push(node_meta_tokens(node)?);
@@ -131,6 +136,22 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         .map(discovery_meta_tokens)
         .collect::<Result<Vec<_>, _>>()?;
 
+    let (integer_table, integer_method) = if super::has_extended_integers(input) {
+        let entries = input.nodes.iter().filter(|node| !node.numeric_range.is_empty()).map(|node| {
+            let path = &node.path;
+            let ranges = node.numeric_range.iter().map(|r| {
+                let (min, max) = (r.min, r.max);
+                quote! { opc_mgmt_schema::IntegerRangeIntervalMeta { min: #min, max: #max } }
+            });
+            quote! { opc_mgmt_schema::NodeIntegerRangeMeta { path: #path, intervals: &[#(#ranges),*] } }
+        });
+        (
+            quote! { static INTEGER_RANGES: &[opc_mgmt_schema::NodeIntegerRangeMeta] = &[#(#entries),*]; },
+            quote! { fn integer_ranges(&self) -> &'static [opc_mgmt_schema::NodeIntegerRangeMeta] { INTEGER_RANGES } },
+        )
+    } else {
+        (quote! {}, quote! {})
+    };
     let digest = schema_digest_from_canonical(input);
 
     let tokens = quote! {
@@ -142,6 +163,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             OriginEntry, SchemaRegistry, SchemaSourceError,
         };
 
+        #integer_table
         static NODES: &[NodeMeta] = &[ #(#node_inits),* ];
         static NORMALIZED_NODE_INDEX: &[opc_mgmt_schema::NormalizedNodeEntry] =
             &[ #(#normalized_index_inits),* ];
@@ -157,6 +179,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         static REGISTRY: GeneratedSchemaRegistry = GeneratedSchemaRegistry;
 
         impl SchemaRegistry for GeneratedSchemaRegistry {
+            #integer_method
             fn schema_digest(&self) -> &'static str {
                 DIGEST
             }
@@ -233,8 +256,8 @@ fn numeric_range_tokens(node: &SchemaNode) -> TokenStream {
         .numeric_range
         .iter()
         .map(|interval| {
-            let min = interval.min;
-            let max = interval.max;
+            let min = interval.min as i64;
+            let max = interval.max as i64;
             quote! {
                 opc_mgmt_schema::NumericRangeIntervalMeta {
                     min: #min,
@@ -364,7 +387,9 @@ fn discovery_meta_tokens(m: &crate::ir::SchemaModule) -> Result<TokenStream, Rus
 fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
     match t {
         TypeRef::Boolean => quote! { opc_mgmt_schema::LeafType::Boolean },
-        TypeRef::String => quote! { opc_mgmt_schema::LeafType::String },
+        TypeRef::String | TypeRef::RestrictedString { .. } => {
+            quote! { opc_mgmt_schema::LeafType::String }
+        }
         TypeRef::Enumeration { values } => {
             let value_tokens: Vec<TokenStream> = values
                 .iter()
@@ -388,8 +413,13 @@ fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
                 }
             }
         }
+        TypeRef::Uint8 => quote! { opc_mgmt_schema::LeafType::Uint8 },
+        TypeRef::Int8 => quote! { opc_mgmt_schema::LeafType::Int8 },
+        TypeRef::Int16 => quote! { opc_mgmt_schema::LeafType::Int16 },
+        TypeRef::Int32 => quote! { opc_mgmt_schema::LeafType::Int32 },
         TypeRef::Uint16 => quote! { opc_mgmt_schema::LeafType::Uint16 },
         TypeRef::Uint32 => quote! { opc_mgmt_schema::LeafType::Uint32 },
+        TypeRef::Uint64 => quote! { opc_mgmt_schema::LeafType::Uint64 },
         TypeRef::Int64 => quote! { opc_mgmt_schema::LeafType::Int64 },
         TypeRef::Decimal64 => quote! { opc_mgmt_schema::LeafType::Decimal64 },
         TypeRef::Empty => quote! { opc_mgmt_schema::LeafType::Empty },

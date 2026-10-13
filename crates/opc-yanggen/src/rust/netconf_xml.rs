@@ -7,19 +7,16 @@
 //! shapes outside the generated renderer profile (custom leaf types,
 //! choice/case) with an explicit error.
 
+use super::NodeIndex;
 use super::{clean_segment, last_segment, to_pascal_case, to_snake_case, RustGenerationError};
 use crate::emit::CanonicalInput;
 use crate::ir::{SchemaNode, SchemaNodeKind, TypeRef};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 
 /// Emits the `netconf_xml` module for the generated crate.
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
-    let mut nodes_by_path = HashMap::new();
-    for node in &input.nodes {
-        nodes_by_path.insert(node.path.clone(), node);
-    }
+    let nodes_by_path = NodeIndex::new(&input.nodes);
 
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
     sorted_nodes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -29,7 +26,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         .find(|n| is_root_path(&n.path))
         .ok_or_else(|| RustGenerationError::new("netconf_xml: no root container found"))?;
 
-    let root_type = to_pascal_case(clean_segment(last_segment(&root.path)));
+    let root_type = nodes_by_path.type_name(root);
     let root_type_ident = format_ident!("{}", root_type);
 
     let mut render_fns = Vec::new();
@@ -57,7 +54,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     }
 
     let root_path = &root.path;
-    let root_function = format_ident!("render_{}", path_to_snake(root_path));
+    let root_function = format_ident!("render_{}", nodes_by_path.helper_name(root_path));
 
     let tokens = quote! {
         #[allow(unused_imports)]
@@ -117,15 +114,6 @@ fn is_root_path(path: &str) -> bool {
     !trimmed.is_empty() && !trimmed.contains('/')
 }
 
-fn path_to_snake(path: &str) -> String {
-    path.split('/')
-        .filter(|s| !s.is_empty())
-        .map(clean_segment)
-        .map(to_snake_case)
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
 /// Returns the child paths of `node` in the order they should be rendered.
 ///
 /// For containers this is sorted schema order. For lists, key leaves are
@@ -176,11 +164,10 @@ fn ordered_child_paths(node: &SchemaNode) -> Vec<&String> {
 
 fn render_container_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("render_{}", path_to_snake(&node.path));
-    let local = clean_segment(last_segment(&node.path));
-    let type_ident = format_ident!("{}", to_pascal_case(local));
+    let fn_ident = format_ident!("render_{}", nodes_by_path.helper_name(&node.path));
+    let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
     let child_stmts = child_render_stmts(node, nodes_by_path, false, &format_ident!("children"))?;
 
@@ -221,12 +208,11 @@ fn render_container_fn(
 
 fn render_list_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("render_{}", path_to_snake(&node.path));
-    let entry_fn_ident = format_ident!("render_{}_entry", path_to_snake(&node.path));
-    let local = clean_segment(last_segment(&node.path));
-    let entry_type_ident = format_ident!("{}", to_pascal_case(local));
+    let fn_ident = format_ident!("render_{}", nodes_by_path.helper_name(&node.path));
+    let entry_fn_ident = format_ident!("render_{}_entry", nodes_by_path.helper_name(&node.path));
+    let entry_type_ident = format_ident!("{}", nodes_by_path.type_name(node));
     let field_type = sequence_field_type(node, nodes_by_path);
 
     if super::types::is_sensitive_node(node) {
@@ -282,7 +268,7 @@ fn render_list_fn(
 
 fn render_list_entry_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
     fn_ident: &proc_macro2::Ident,
     type_ident: &proc_macro2::Ident,
 ) -> Result<TokenStream, RustGenerationError> {
@@ -348,9 +334,9 @@ fn render_list_entry_fn(
 
 fn render_leaf_list_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("render_{}", path_to_snake(&node.path));
+    let fn_ident = format_ident!("render_{}", nodes_by_path.helper_name(&node.path));
     let field_type = sequence_field_type(node, nodes_by_path);
     let value_expr = if super::types::is_sensitive_node(node) {
         quote! { value.get() }
@@ -406,9 +392,9 @@ fn render_leaf_list_fn(
 
 fn render_leaf_fn(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let fn_ident = format_ident!("render_{}", path_to_snake(&node.path));
+    let fn_ident = format_ident!("render_{}", nodes_by_path.helper_name(&node.path));
     let field_type = leaf_field_type(node, nodes_by_path);
 
     let is_custom =
@@ -465,7 +451,7 @@ fn render_leaf_fn(
 /// Builds the child-rendering statements shared by containers and list entries.
 fn child_render_stmts(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
     skip_key_leaves: bool,
     target: &proc_macro2::Ident,
 ) -> Result<Vec<TokenStream>, RustGenerationError> {
@@ -474,7 +460,7 @@ fn child_render_stmts(
         let Some(child) = nodes_by_path.get(child_path) else {
             continue;
         };
-        let child_fn = format_ident!("render_{}", path_to_snake(&child.path));
+        let child_fn = format_ident!("render_{}", nodes_by_path.helper_name(&child.path));
         let child_local = clean_segment(last_segment(&child.path));
         if skip_key_leaves
             && node
@@ -512,7 +498,7 @@ fn child_render_stmts(
 
 fn list_key_render_stmts(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
 ) -> Result<Vec<TokenStream>, RustGenerationError> {
     let mut stmts = Vec::new();
     for child_path in ordered_child_paths(node) {
@@ -530,7 +516,7 @@ fn list_key_render_stmts(
         if !matches!(child.kind, SchemaNodeKind::Leaf) {
             continue;
         }
-        let child_fn = format_ident!("render_{}", path_to_snake(&child.path));
+        let child_fn = format_ident!("render_{}", nodes_by_path.helper_name(&child.path));
         let field_ident = format_ident!("{}", to_snake_case(child_local));
         stmts.push(quote! {
             if let Some(fragment) = #child_fn(&value.#field_ident, ctx, #child_path)? {
@@ -542,7 +528,7 @@ fn list_key_render_stmts(
     Ok(stmts)
 }
 
-fn leaf_field_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
+fn leaf_field_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     let base = leaf_base_type(node, nodes_by_path);
     let wrapped = if node.config {
         quote! { super::types::LeafPresence<#base> }
@@ -558,23 +544,23 @@ fn leaf_field_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNod
 
 fn resolved_type<'a>(
     node: &'a SchemaNode,
-    nodes_by_path: &'a HashMap<String, &SchemaNode>,
+    nodes_by_path: &'a NodeIndex<'a>,
 ) -> Option<&'a TypeRef> {
-    let mut ty = node.type_ref.as_ref();
-    if let Some(TypeRef::LeafRef { target_path }) = ty {
-        if let Some(target) = nodes_by_path.get(target_path) {
-            ty = target.type_ref.as_ref();
-        }
-    }
-    ty
+    nodes_by_path.legacy_or_resolved(node).type_ref.as_ref()
 }
 
-fn leaf_base_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
+fn leaf_base_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
+        | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::Uint8) => quote! { u8 },
+        Some(TypeRef::Int8) => quote! { i8 },
+        Some(TypeRef::Int16) => quote! { i16 },
+        Some(TypeRef::Int32) => quote! { i32 },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
+        Some(TypeRef::Uint64) => quote! { super::types::YangUint64 },
         Some(TypeRef::Int64) => quote! { super::types::YangInt64 },
         Some(TypeRef::Decimal64) => quote! { super::types::YangDecimal64 },
         Some(TypeRef::Empty) => quote! { super::types::YangEmpty },
@@ -587,7 +573,7 @@ fn leaf_base_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode
     }
 }
 
-fn leaf_inner_expr(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
+fn leaf_inner_expr(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     let value_expr = if super::types::is_sensitive_node(node) {
         quote! { value.get() }
     } else {
@@ -613,16 +599,22 @@ fn leaf_inner_expr(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNod
 
 fn scalar_to_string_expr(
     node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
+    nodes_by_path: &NodeIndex<'_>,
     value_ident: TokenStream,
 ) -> TokenStream {
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean)
-        | Some(TypeRef::String)
+        | Some(TypeRef::String | TypeRef::RestrictedString { .. })
         | Some(TypeRef::Enumeration { .. })
+        | Some(TypeRef::Uint8)
+        | Some(TypeRef::Int8)
+        | Some(TypeRef::Int16)
+        | Some(TypeRef::Int32)
         | Some(TypeRef::Uint16)
         | Some(TypeRef::Uint32) => quote! { #value_ident.to_string() },
-        Some(TypeRef::Int64) | Some(TypeRef::Decimal64) => quote! { #value_ident.0.to_string() },
+        Some(TypeRef::Uint64) | Some(TypeRef::Int64) | Some(TypeRef::Decimal64) => {
+            quote! { #value_ident.0.to_string() }
+        }
         Some(TypeRef::Empty) => quote! { { let _ = #value_ident; String::new() } },
         Some(TypeRef::IdentityRef { .. }) | Some(TypeRef::LeafRef { .. }) => {
             quote! { #value_ident.clone() }
@@ -631,14 +623,10 @@ fn scalar_to_string_expr(
     }
 }
 
-fn sequence_field_type(
-    node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
-) -> TokenStream {
+fn sequence_field_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     let inner = match node.kind {
         SchemaNodeKind::List => {
-            let local = clean_segment(last_segment(&node.path));
-            let type_ident = format_ident!("{}", to_pascal_case(local));
+            let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
             if node.key_leaves.is_empty() {
                 quote! { Vec<super::types::#type_ident> }
             } else {
@@ -663,7 +651,7 @@ fn sequence_field_type(
     }
 }
 
-fn list_key_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
+fn list_key_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     if node.key_leaves.len() == 1 {
         let key_name = &node.key_leaves[0];
         for child_path in &node.child_paths {
@@ -681,27 +669,24 @@ fn list_key_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>
         }
         quote! { String }
     } else {
-        let local = clean_segment(last_segment(&node.path));
-        let key_ident = format_ident!("{}Key", to_pascal_case(local));
+        let key_ident = format_ident!("{}Key", nodes_by_path.type_name(node));
         quote! { super::types::#key_ident }
     }
 }
 
-fn leaf_list_element_type(
-    node: &SchemaNode,
-    nodes_by_path: &HashMap<String, &SchemaNode>,
-) -> TokenStream {
-    let mut ty = node.type_ref.as_ref();
-    if let Some(TypeRef::LeafRef { target_path }) = ty {
-        if let Some(target) = nodes_by_path.get(target_path) {
-            ty = target.type_ref.as_ref();
-        }
-    }
+fn leaf_list_element_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
+    let ty = nodes_by_path.legacy_or_resolved(node).type_ref.as_ref();
     match ty {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
+        | Some(TypeRef::Enumeration { .. }) => quote! { String },
+        Some(TypeRef::Uint8) => quote! { u8 },
+        Some(TypeRef::Int8) => quote! { i8 },
+        Some(TypeRef::Int16) => quote! { i16 },
+        Some(TypeRef::Int32) => quote! { i32 },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
+        Some(TypeRef::Uint64) => quote! { super::types::YangUint64 },
         Some(TypeRef::Int64) => quote! { super::types::YangInt64 },
         Some(TypeRef::Decimal64) => quote! { super::types::YangDecimal64 },
         Some(TypeRef::Empty) => quote! { super::types::YangEmpty },
