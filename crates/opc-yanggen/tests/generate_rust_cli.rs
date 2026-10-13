@@ -339,8 +339,8 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "netconf_xml.rs",
-            // #1269 carries authorized identifying keys and instance selections into XML.
-            "b3636444f2b3bb7904cf9a1dfc6380e6e2c3c65ff62dcc85adc30abd91904615",
+            // #1270 renders native instance trees for merging before masking.
+            "e7c4521f3878fff6bca8547eb564e560c7c0c5a60a2196490f8477830ecb2586",
         ),
         (
             "netconf_xml_edit.rs",
