@@ -2031,3 +2031,42 @@ async fn subtree_content_masked_state_join_get_config_has_fixed_work() {
 async fn subtree_content_masked_provider_grouping_get_config_has_fixed_work() {
     masked_provider_get_config_boundary_is_independent(true).await;
 }
+
+#[tokio::test]
+async fn subtree_content_discovery_append_is_reserved_from_original_capture() {
+    let matched = Registry.schema_digest().to_owned();
+    let mut unmatched = matched.clone();
+    unmatched.replace_range(..1, if matched.starts_with('a') { "b" } else { "a" });
+    let mut cases = Vec::new();
+    for (literal, selected) in [(matched.clone(), true), (unmatched, false)] {
+        let fixture = Fixture::new(config(), &[]).await;
+        let body = format!("<get><filter><system xmlns=\"{EX}\"><hostname/></system><yang-library xmlns=\"urn:ietf:params:xml:ns:yang:ietf-yang-library\"><content-id>{literal}</content-id><content-id/></yang-library></filter></get>");
+        let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+        assert!(!reply.contains("<rpc-error>"), "{reply}");
+        assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+        let content_ids: Vec<_> = data(&reply).split("<yanglib:content-id>").skip(1)
+            .map(|part| part.split_once("</yanglib:content-id>").unwrap().0).collect();
+        if selected {
+            assert_eq!(content_ids, [matched.as_str()]);
+        } else {
+            assert!(content_ids.is_empty());
+            assert!(!data(&reply).contains("yanglib:"));
+        }
+        let used = MgmtLimits::default().max_subtree_filter_work_units
+            - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+        cases.push((fixture, body, reply, used));
+    }
+    assert_eq!(cases[0].3, cases[1].3, "a predicate result cannot size the later fragment-append reservation");
+    assert_eq!(cases[0].0.observation(), cases[1].0.observation());
+    let boundary = cases[0].3;
+    let mut below = Vec::new();
+    for (fixture, body, generous, _) in &cases {
+        let reply = fixture.rpc(body, MgmtLimits { max_subtree_filter_work_units: boundary, ..MgmtLimits::default() }).await;
+        assert_eq!(&reply, generous);
+        assert_eq!(fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining(), 0);
+        let reply = fixture.rpc(body, MgmtLimits { max_subtree_filter_work_units: boundary.checked_sub(1).unwrap(), ..MgmtLimits::default() }).await;
+        error(&reply, "too-big");
+        below.push((reply, fixture.observation()));
+    }
+    assert_eq!(below[0], below[1]);
+}
