@@ -80,6 +80,7 @@ module subtree-content {
       key "secret";
       leaf secret { type string; opc:data-class "security-secret"; }
       leaf label { type string; opc:data-class "public"; }
+      leaf up { config false; type boolean; opc:data-class "public"; }
     }
     list class-peer {
       key "secret intercept password unclassified";
@@ -88,6 +89,7 @@ module subtree-content {
       leaf password { type string; }
       leaf unclassified { type string; opc:data-class "security-secret"; }
       leaf label { type string; opc:data-class "public"; }
+      leaf up { config false; type boolean; opc:data-class "public"; }
     }
   }
 }

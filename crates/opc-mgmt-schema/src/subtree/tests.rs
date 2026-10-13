@@ -261,3 +261,70 @@ fn leafref_target_names_inherit_the_declaring_module_without_data_access() {
         Err(SubtreeError::Unsupported)
     );
 }
+
+#[test]
+fn projection_rejected_enter_checks_consume_work_before_access() {
+    for structural in [false, true] {
+        let budget = budget();
+        let plan = SubtreePlan::new(
+            vec![SubtreeScope {
+                implicit_outputs: vec![SubtreeOutput {
+                    path: "/m:text",
+                    keys: vec![],
+                }],
+                ..SubtreeScope::default()
+            }],
+            budget.clone(),
+            32,
+        )
+        .unwrap()
+        .authorize(|_| true, 32)
+        .unwrap();
+        let projection = plan.projection(&Registry, crate::DefaultReport::Trim);
+        let before = budget.remaining();
+        assert!(!projection.enter("/m:secret", structural).unwrap());
+        assert!(
+            budget.remaining() < before,
+            "a rejected enter must not be free"
+        );
+        budget.charge(budget.remaining()).unwrap();
+        assert_eq!(
+            projection.enter("/m:secret", structural),
+            Err(SubtreeError::TooBig)
+        );
+    }
+}
+
+#[test]
+fn projection_structural_lookup_probes_share_the_work_budget() {
+    let budget = budget();
+    let paths = [
+        "/m:a/m:value",
+        "/m:b/m:value",
+        "/m:c/m:value",
+        "/m:d/m:value",
+    ];
+    let plan = SubtreePlan::new(
+        vec![SubtreeScope {
+            implicit_outputs: paths
+                .into_iter()
+                .map(|path| SubtreeOutput { path, keys: vec![] })
+                .collect(),
+            ..SubtreeScope::default()
+        }],
+        budget.clone(),
+        32,
+    )
+    .unwrap()
+    .authorize(|_| true, 32)
+    .unwrap();
+    let projection = plan.projection(&Registry, crate::DefaultReport::Trim);
+    assert!(projection.enter("/m:c", true).unwrap());
+    assert!(!projection.enter("/m:cc", true).unwrap());
+    budget.charge(budget.remaining() - 1).unwrap();
+    assert_eq!(
+        projection.enter("/m:c", true),
+        Err(SubtreeError::TooBig),
+        "one admission unit cannot pay for plan-path probes"
+    );
+}

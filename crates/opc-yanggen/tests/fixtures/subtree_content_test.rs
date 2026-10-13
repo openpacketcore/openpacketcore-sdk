@@ -172,11 +172,23 @@ impl SchemaRegistry for Registry {
               leaf.config = false;
               nodes.push(leaf);
           }
+          let mut hidden_list = *nodes.iter().find(|node| node.path == "/ex:system/ex:hidden-peer").unwrap();
+          hidden_list.path = "/ex:system/ex:state-hidden-peer";
+          hidden_list.config = false;
+          hidden_list.child_paths = &["/ex:system/ex:state-hidden-peer/ex:label", "/ex:system/ex:state-hidden-peer/ex:secret"];
+          nodes.push(hidden_list);
+          for (source, path) in [("/ex:system/ex:hidden-peer/ex:secret", "/ex:system/ex:state-hidden-peer/ex:secret"), ("/ex:system/ex:hidden-peer/ex:label", "/ex:system/ex:state-hidden-peer/ex:label")] {
+              let mut leaf = *nodes.iter().find(|node| node.path == source).unwrap();
+              leaf.path = path;
+              leaf.config = false;
+              nodes.push(leaf);
+          }
           static ROOT_CHILDREN: OnceLock<Vec<&'static str>> = OnceLock::new();
           let root = nodes.iter_mut().find(|node| node.path == "/ex:system").unwrap();
           root.child_paths = ROOT_CHILDREN.get_or_init(|| {
               let mut paths = root.child_paths.to_vec();
               paths.push("/ex:system/ex:state-peer");
+              paths.push("/ex:system/ex:state-hidden-peer");
               paths.sort();
               paths
           });
@@ -1511,4 +1523,182 @@ async fn subtree_content_absent_defaults_match_ordinary_presence() {
         assert_eq!(data(&fixture.rpc(&body("<port>7</port><hostname/>"), MgmtLimits::default()).await), "");
       }
     }
+}
+
+#[tokio::test]
+async fn subtree_content_masked_config_keys_have_fixed_work() {
+    for op in ["get-config", "get", "get-data"] {
+      for varied in ["hidden", "secret", "intercept", "password", "unclassified"] {
+        let mut expected = None;
+        let mut fixed_work = None;
+        for size in [1, 4096] {
+            let mut model = config();
+            model.class_peer.clear();
+            let mut values = Vec::new();
+            // Crossing the fixed "bb" identity also changes raw sort order.
+            // Every row has the same visible values, so that is not observable.
+            for identity in ["b".repeat(size), "bb".into()] {
+                if varied == "hidden" {
+                    let mut row = HiddenPeer::default();
+                    row.secret = SecretLeaf::new(LeafPresence::Explicit(identity.clone()));
+                    row.label = LeafPresence::Explicit("row-label".into());
+                    model.hidden_peer.insert(SensitiveKey::new(identity.clone()), row);
+                    values.push(state(&format!("/ex:system/ex:hidden-peer[ex:secret='{identity}']/ex:up"), "true"));
+                } else {
+                    let secret = if varied == "secret" { identity.clone() } else { "fixed-secret".into() };
+                    let intercept = if varied == "intercept" { identity.clone() } else { "fixed-intercept".into() };
+                    let password = if varied == "password" { identity.clone() } else { "fixed-password".into() };
+                    let unclassified = if varied == "unclassified" { identity.clone() } else { "fixed-unclassified".into() };
+                    let mut row = ClassPeer::default();
+                    row.secret = SecretLeaf::new(LeafPresence::Explicit(secret.clone()));
+                    row.intercept = SecretLeaf::new(LeafPresence::Explicit(intercept.clone()));
+                    row.password = SecretLeaf::new(LeafPresence::Explicit(password.clone()));
+                    row.unclassified = SecretLeaf::new(LeafPresence::Explicit(unclassified.clone()));
+                    row.label = LeafPresence::Explicit("row-label".into());
+                    values.push(state(&format!("/ex:system/ex:class-peer[ex:secret='{secret}'][ex:intercept='{intercept}'][ex:password='{password}'][ex:unclassified='{unclassified}']/ex:up"), "true"));
+                    model.class_peer.insert(ClassPeerKey { secret, intercept, password, unclassified }, row);
+                }
+            }
+            let fixture = Fixture::new(model, &[]).await;
+            if op != "get-config" { *fixture.access.values.lock().unwrap() = values; }
+            let list = if varied == "hidden" { "hidden-peer" } else { "class-peer" };
+            let children = format!("<hostname>router-marker</hostname><{list}><label/><up/></{list}><{list}><label/><up/></{list}>");
+            let body = request(op, &children, "");
+            let limits = MgmtLimits { max_value_bytes: 32768, ..MgmtLimits::default() };
+            if fixed_work.is_none() {
+                assert_eq!(tags(&fixture.rpc(&body, limits).await, "label"), ["row-label"; 2]);
+                fixed_work = Some(limits.max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining());
+            }
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap(), ..limits }).await;
+            assert_eq!(tags(&reply, "label"), ["row-label"; 2], "{op}/{varied}/{size}");
+            assert_eq!(tags(&reply, "secret"), ["&lt;redacted&gt;"; 2]);
+            if op != "get-config" { assert_eq!(tags(&reply, "up"), ["true"; 2], "state must join the same configuration identities"); }
+            assert_eq!(fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining(), 0);
+            let observed = (reply, fixture.observation());
+            if let Some(expected) = &expected { assert_eq!(&observed, expected, "masked {varied} key length changed {op} work"); }
+            expected = Some(observed);
+        }
+      }
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_masked_state_keys_have_fixed_work() {
+    for op in ["get", "get-data"] {
+        let mut expected = None;
+        let mut fixed_work = None;
+        for (size, reverse) in [(1, false), (4096, false), (1, true), (4096, true)] {
+            let fixture = Fixture::new(config(), &[]).await;
+            let mut values = Vec::new();
+            for identity in ["b".repeat(size), "bb".into()] {
+                let parent = format!("/ex:system/ex:state-hidden-peer[ex:secret='{identity}']");
+                values.push(state(&format!("{parent}/ex:secret"), &serde_json::to_string(&identity).unwrap()));
+                values.push(state(&format!("{parent}/ex:label"), "\"state-label\""));
+            }
+            if reverse { values.reverse(); }
+            *fixture.access.values.lock().unwrap() = values;
+            let body = request(op, "<hostname>router-marker</hostname><state-hidden-peer><secret/><label/></state-hidden-peer><state-hidden-peer><label/></state-hidden-peer>", "");
+            let limits = MgmtLimits { max_value_bytes: 32768, ..MgmtLimits::default() };
+            if fixed_work.is_none() {
+                assert_eq!(tags(&fixture.rpc(&body, limits).await, "label"), ["state-label"; 2]);
+                fixed_work = Some(limits.max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining());
+            }
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap(), ..limits }).await;
+            assert_eq!(tags(&reply, "label"), ["state-label"; 2]);
+            assert_eq!(tags(&reply, "secret"), ["&lt;redacted&gt;"; 2]);
+            assert_eq!(fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining(), 0);
+            let observed = (reply, fixture.observation());
+            if let Some(expected) = &expected { assert_eq!(&observed, expected, "masked state key length/order changed {op} work"); }
+            expected = Some(observed);
+        }
+        // Hashing must not replace complete raw key and canonical-path validation.
+        let fixture = Fixture::new(config(), &[]).await;
+        let body = request(op, "<hostname>router-marker</hostname><state-hidden-peer><secret/><label/></state-hidden-peer>", "");
+        for values in [
+            vec![state("/ex:system/ex:state-hidden-peer[ex:secret='b']/ex:secret", "\"different\"")],
+            vec![state("/ex:system/ex:state-hidden-peer[ex:secret=\"b\"]/ex:label", "\"state-label\"")],
+            vec![state("/ex:system/ex:state-hidden-peer[ex:secret='b']/ex:label", "\"state-label\""), state("/ex:system/ex:state-hidden-peer[ex:secret='b']/ex:label", "\"state-label\"")],
+        ] {
+            *fixture.access.values.lock().unwrap() = values;
+            error(&fixture.rpc(&body, MgmtLimits::default()).await, "operation-failed");
+        }
+    }
+}
+
+async fn direct_context_never_clones_denied_rows(datastore: &str) {
+    use opc_mgmt_authz::ReadAuthorizer;
+    use opc_netconf_server::operations::get_config::{handle_get_config, GetConfigContext};
+    use opc_netconf_server::operations::get_data::{handle_get_data, GetDataContext};
+    use opc_netconf_server::xml::RpcOperation;
+    for op in ["get-config", "get-data"] {
+        let mut expected = None;
+        let mut fixed_work = None;
+        for populated in [false, true] {
+            let mut snapshot = config();
+            snapshot.hostname = LeafPresence::Explicit("borrowed-marker".into());
+            if !populated { snapshot.peer.clear(); }
+            let access = Arc::new(Access::default());
+            *access.trap.lock().unwrap() = Some("/ex:system/ex:peer");
+            let startup = Arc::new(Startup { config: Mutex::new(None), loads: AtomicUsize::new(0) });
+            let binding = Binding {
+                bus: Arc::new(ConfigBus::new_dev_only(config(), MockManagedDatastore::new()).await.unwrap()),
+                access: access.clone(), startup: Some(startup.clone()), candidate: true,
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let authz = ReadAuthorizer::new(&Registry, Policy {
+                rules: Arc::new(policy(&["/ex:system/ex:peer/ex:label"])), calls: calls.clone(),
+                mode: Arc::new(AtomicUsize::new(0)), alternate: Arc::new(Mutex::new(None)),
+            }).unwrap();
+            let audit = Audit::default();
+            let principal = TrustedPrincipal::new(WorkloadIdentity::User("subtree-reader".into()), TenantId::new("fixture").unwrap()).with_auth_strength(AuthStrength::MutualTls);
+            let children = "<peer><label>hidden</label><id/></peer><hostname/>";
+            let body = if op == "get-config" { request(op, children, "").replace("<running/>", &format!("<{datastore}/>")) }
+                else { nmda(datastore, None, children, "") };
+            let limits = MgmtLimits { max_subtree_filter_work_units: fixed_work.unwrap_or(MgmtLimits::default().max_subtree_filter_work_units), ..MgmtLimits::default() };
+            let parsed = opc_netconf_server::xml::parse_rpc(&format!("<rpc xmlns=\"{NC}\" message-id=\"match\">{body}</rpc>"), &limits).unwrap();
+            let attrs = opc_netconf_server::error::RpcReplyAttributes::default();
+            let candidate_config = (datastore == "candidate").then_some(&snapshot);
+            let startup_config = (datastore == "startup").then_some(&snapshot);
+            SECRET_CLONES.store(0, Ordering::SeqCst);
+            let reply = match parsed.operation {
+                RpcOperation::GetConfig(request) => handle_get_config(&binding, GetConfigContext {
+                    authz: &authz, audit: &audit, transport: TransportType::NetconfTls,
+                    request_id: opc_config_model::RequestId::new(), principal: &principal,
+                    message_id: &parsed.message_id, reply_attrs: &attrs, started: std::time::Instant::now(), limits: &limits,
+                    candidate_config, candidate_supported: true, startup_config, startup_supported: true,
+                }, &request),
+                RpcOperation::GetData(request) => handle_get_data(&binding, GetDataContext {
+                    authz: &authz, audit: &audit, transport: TransportType::NetconfTls,
+                    request_id: opc_config_model::RequestId::new(), principal: &principal,
+                    message_id: &parsed.message_id, reply_attrs: &attrs, started: std::time::Instant::now(), limits: &limits,
+                    candidate_config, candidate_supported: true, startup_config, startup_supported: true,
+                }, &request),
+                _ => panic!("expected a datastore read"),
+            };
+            assert_eq!(tags(&reply, "hostname"), ["borrowed-marker"]);
+            assert_eq!(SECRET_CLONES.load(Ordering::SeqCst), 0, "public {op} cloned its {datastore} snapshot");
+            assert!(tags(&reply, "id").is_empty());
+            assert_eq!(access.model.load(Ordering::SeqCst), 0);
+            assert_eq!(access.provider.load(Ordering::SeqCst), 0);
+            assert_eq!(startup.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let budget = access.budget.lock().unwrap().as_ref().unwrap().clone();
+            let work = limits.max_subtree_filter_work_units - budget.remaining();
+            assert_eq!(budget.predicate_trials(), 0);
+            let observed = (reply, work, access.reads.lock().unwrap().clone());
+            if let Some(expected) = &expected { assert_eq!(&observed, expected); }
+            expected = Some(observed);
+            fixed_work = Some(work);
+        }
+    }
+}
+
+#[tokio::test]
+async fn subtree_content_public_candidate_handler_never_clones_denied_rows() {
+    direct_context_never_clones_denied_rows("candidate").await;
+}
+
+#[tokio::test]
+async fn subtree_content_public_startup_handler_never_clones_denied_rows() {
+    direct_context_never_clones_denied_rows("startup").await;
 }
