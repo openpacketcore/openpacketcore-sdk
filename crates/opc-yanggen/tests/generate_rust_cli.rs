@@ -339,8 +339,8 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "netconf_xml.rs",
-            // #1270 renders native instance trees for merging before masking.
-            "e7c4521f3878fff6bca8547eb564e560c7c0c5a60a2196490f8477830ecb2586",
+            // #1270 native instance trees plus #1272 bounded content projection.
+            "25b13081ea0520b0964bdea1cfa7874033d11b4e96143303cbee46f4f47af656",
         ),
         (
             "netconf_xml_edit.rs",

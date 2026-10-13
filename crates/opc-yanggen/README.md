@@ -159,6 +159,23 @@ the additional integer widths and restricted strings, so exhaustive matches
 must handle them. Runtime registries add `integer_ranges()`/`integer_range()`
 with `i128` bounds while preserving the legacy `i64` numeric-range API.
 
+### Bounded NETCONF content projection
+
+Generated NETCONF renderers implement `supports_subtree_content` and
+`project_subtree_content`. They use `SubtreeProjection` to gate each structural
+node, list row and scalar before inspecting typed fields. Only the authorized
+dependencies are captured; the shared evaluator compares those captured
+values and preserves list order, identity keys, defaults and payload masking.
+No whole-model serialization precedes matching.
+
+Regenerate `netconf_xml.rs` to opt an existing generated binding into this
+contract. Existing renderer implementations retain their key-only read
+support and refuse other content predicates until they supply the typed
+projection. Stored models and the ordinary
+schema-only rendering hooks retain their existing representations. See
+[subtree content reads](../../docs/design/netconf-subtree-content-reads.md)
+for codec restrictions and integration requirements.
+
 ## Relationships
 
 - Emits implementations consumed by `opc-config-model`,

@@ -10,6 +10,7 @@ module subtree-content {
     leaf enabled { type boolean; opc:data-class "public"; }
     leaf port { type uint16; default 7; opc:data-class "public"; }
     leaf count { type uint32; opc:data-class "public"; }
+    leaf bounded { type uint16 { range "5..8 | 11"; } opc:data-class "public"; }
     leaf signed { type int64; opc:data-class "public"; }
     leaf role { type enumeration { enum active; enum standby; } opc:data-class "public"; }
     leaf empty { type empty; opc:data-class "public"; }
@@ -19,11 +20,24 @@ module subtree-content {
     leaf identity { type identityref { base identity-base; } opc:data-class "public"; }
     leaf opaque { type string; opc:data-class "public"; }
     leaf ratio-ref { type decimal64 { fraction-digits 2; } opc:data-class "public"; }
+    leaf identity-ref { type string; opc:data-class "public"; }
+    leaf opaque-ref { type string; opc:data-class "public"; }
     leaf secret { type string; opc:data-class "security-secret"; }
     leaf intercept { type string; opc:data-class "lawful-intercept"; }
     leaf password { type string; }
     leaf unclassified { type string; opc:data-class "security-secret"; }
     leaf uptime { config false; type uint32; opc:data-class "public"; }
+    leaf state-default { config false; type uint16; opc:data-class "public"; }
+    leaf state-ratio { config false; type decimal64 { fraction-digits 2; } opc:data-class "public"; }
+    leaf state-identity { config false; type identityref { base identity-base; } opc:data-class "public"; }
+    leaf state-opaque { config false; type string; opc:data-class "public"; }
+    leaf state-ratio-ref { config false; type string; opc:data-class "public"; }
+    leaf state-identity-ref { config false; type string; opc:data-class "public"; }
+    leaf state-opaque-ref { config false; type string; opc:data-class "public"; }
+    leaf state-secret { config false; type string; opc:data-class "security-secret"; }
+    leaf state-intercept { config false; type string; opc:data-class "lawful-intercept"; }
+    leaf state-password { config false; type string; }
+    leaf state-unclassified { config false; type string; opc:data-class "security-secret"; }
     leaf-list tags { type string; opc:data-class "public"; }
     list peer {
       key "site id";
@@ -40,7 +54,18 @@ module subtree-content {
         leaf slot { type uint16; opc:data-class "public"; }
         leaf kind { type string; opc:data-class "public"; }
         leaf label { type string; opc:data-class "public"; }
+        leaf up { config false; type boolean; opc:data-class "public"; }
       }
+    }
+    container settings {
+      leaf label { type string; opc:data-class "public"; }
+      leaf enabled { type boolean; opc:data-class "public"; }
+    }
+    list typed-peer {
+      key "identity ratio";
+      leaf identity { type string; opc:data-class "public"; }
+      leaf ratio { type string; opc:data-class "public"; }
+      leaf label { type string; opc:data-class "public"; }
     }
     list user-peer {
       key "name";
@@ -51,6 +76,14 @@ module subtree-content {
     list hidden-peer {
       key "secret";
       leaf secret { type string; opc:data-class "security-secret"; }
+      leaf label { type string; opc:data-class "public"; }
+    }
+    list class-peer {
+      key "secret intercept password unclassified";
+      leaf secret { type string; opc:data-class "security-secret"; }
+      leaf intercept { type string; opc:data-class "lawful-intercept"; }
+      leaf password { type string; }
+      leaf unclassified { type string; opc:data-class "security-secret"; }
       leaf label { type string; opc:data-class "public"; }
     }
   }

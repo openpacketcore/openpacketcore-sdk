@@ -202,3 +202,24 @@ pub fn append_key_predicate(
     out.push(']');
     Ok(())
 }
+
+/// Parses an absolute canonical path into owned request segments.
+///
+/// Uses the shared strict literal parser, including duplicate-key and control
+/// character refusal. Schema resolution still validates complete instances.
+pub fn parse_canonical_path(path: &str) -> Result<Vec<PathSegment>, CanonicalPathError> {
+    Ok(CanonicalPath::parse(path)?.to_request().elems)
+}
+
+/// Tests the instance relation between parsed paths of equal depth.
+///
+/// Qualified node/key names and supplied key values compare exactly. Omitted
+/// keys select any value; `*` is a literal. This neither expands descendants
+/// nor validates schema types or completeness of the instance's keys.
+pub fn path_segments_match_selection(selection: &[PathSegment], instance: &[PathSegment]) -> bool {
+    selection.len() == instance.len()
+        && selection.iter().zip(instance).all(|(selected, actual)| {
+            selected.name == actual.name
+                && selected.keys.iter().all(|key| actual.keys.contains(key))
+        })
+}

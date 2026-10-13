@@ -60,6 +60,7 @@ fn generated_subtree_content_service() {
         "opc-mgmt-audit",
         "opc-mgmt-limits",
         "opc-mgmt-opstate",
+        "opc-mgmt-path",
         "opc-nacm",
     ] {
         manifest.push_str(&format!(

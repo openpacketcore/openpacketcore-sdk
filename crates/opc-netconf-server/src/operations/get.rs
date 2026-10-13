@@ -94,6 +94,18 @@ where
     P: PolicySource,
     A: AuditSink,
 {
+    let content = super::content::ContentRequest::Get(request);
+    if content.use_content_handler(binding) {
+        return super::content::handle(
+            binding,
+            ctx,
+            content,
+            |_| Ok(binding.config_bus().current_snapshot().config.clone()),
+            audit_mode,
+        )
+        .await;
+    }
+
     let registry = binding.schema_registry();
     let yang_library_capability = binding.yang_library_capability();
     let monitoring_capability = binding.netconf_monitoring_capability();

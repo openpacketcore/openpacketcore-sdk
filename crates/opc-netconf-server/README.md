@@ -75,6 +75,33 @@ renderers supply this support through `render_selected_config`; other renderers
 refuse predicates by default, before traversing data. Predicate values are
 excluded from `Debug` diagnostics.
 
+## Subtree content reads
+
+`<get-config>`, `<get>` and supported NMDA `<get-data>` requests can match
+scalar leaves inside subtree filters. For example,
+`<peer><id>+007</id><label/></peer>` selects the label and identity keys of the
+row whose numeric `id` is 7. Sibling predicates must match the same instance;
+repeated containment branches remain alternatives. Matching follows the read's
+default-report mode.
+
+Content reads require a binding that supports the typed, bounded
+`project_subtree_content` contract. Regenerated `opc-yanggen` renderers provide
+it. Existing key-only subtree reads remain available through the
+`key_predicates_supported` contract. Bindings without full content support
+refuse other content predicates before data access. A binding with
+custom ordinary default processing must return that same mode from
+`subtree_default_report`; the default rendering hooks use trim.
+
+The server authorizes output, predicates and every ancestor identity key before
+reading rows or requesting operational values. A denied dependency omits its
+branch; a denied output-only leaf leaves authorized siblings available.
+Matching a masked or unclassified leaf is refused from the schema for every
+reader. Non-key identityref, decimal64 and custom codecs are also refused.
+
+See [the subtree content read contract](../../docs/design/netconf-subtree-content-reads.md)
+for supported types, provider validation, namespace and selection semantics,
+and the independent tree, plan and work limits.
+
 ## Async audit and registry atomicity
 
 Production async session paths use `AuditSink::record_async` for reads, writes,

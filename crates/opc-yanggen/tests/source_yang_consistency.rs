@@ -172,16 +172,17 @@ fn system_ordered_models_keep_all_generated_file_digests() {
 
     // All thirteen files originate from 1d880a21c before user ordering support.
     // Pins retain #1268 state-write and safe-diagnostic changes, #1269 authorized
-    // read projection, and #1270 canonical gNMI key literals. Every generated
+    // read projection, #1270 canonical gNMI key literals and native instance trees,
+    // and #1272 bounded NETCONF content projection. Every generated
     // file stays pinned across the four source models.
     // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // enum/gnmi_json.rs: #1270 shared literal predicate construction.
     // range/gnmi_json.rs: #1270 shared literal predicate construction.
-    // base/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
-    // comments/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
-    // enum/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
-    // range/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
+    // base/netconf_xml.rs: #1270 native instance trees plus #1272 bounded content projection.
+    // comments/netconf_xml.rs: #1270 native instance trees plus #1272 bounded content projection.
+    // enum/netconf_xml.rs: #1270 native instance trees plus #1272 bounded content projection.
+    // range/netconf_xml.rs: #1270 native instance trees plus #1272 bounded content projection.
     let expected: BTreeMap<String, BTreeMap<String, String>> =
         serde_json::from_str(include_str!("fixtures/system_ordered_digests.json")).unwrap();
     let models = [

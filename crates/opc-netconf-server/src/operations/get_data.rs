@@ -107,6 +107,46 @@ where
     P: PolicySource,
     A: AuditSink,
 {
+    let content = super::content::ContentRequest::Data(request);
+    if content.use_content_handler(binding) {
+        let read_ctx = super::get::GetContext {
+            authz: ctx.authz,
+            audit: ctx.audit,
+            transport: ctx.transport,
+            request_id: ctx.request_id,
+            principal: ctx.principal,
+            message_id: ctx.message_id,
+            reply_attrs: ctx.reply_attrs,
+            started: ctx.started,
+            limits: ctx.limits,
+        };
+        return super::content::handle(
+            binding,
+            read_ctx,
+            content,
+            |source| {
+                use super::content::ContentSource;
+                match source {
+                    ContentSource::Running => {
+                        Ok(binding.config_bus().current_snapshot().config.clone())
+                    }
+                    ContentSource::Candidate => ctx
+                        .candidate_config
+                        .cloned()
+                        .map(std::sync::Arc::new)
+                        .ok_or_else(RpcError::operation_failed),
+                    ContentSource::Startup => ctx
+                        .startup_config
+                        .cloned()
+                        .map(std::sync::Arc::new)
+                        .ok_or_else(RpcError::data_missing),
+                }
+            },
+            audit_mode,
+        )
+        .await;
+    }
+
     if !binding.nmda_get_data_supported() {
         return fail(
             audit_mode,

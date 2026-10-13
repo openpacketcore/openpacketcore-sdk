@@ -24,6 +24,9 @@ use crate::binding::{BindingError, GetSchemaError, GetSchemaRequest, ReadSelecti
 use crate::capabilities::NETCONF_MONITORING_NS;
 use crate::filter::YANG_LIBRARY_NS;
 
+mod content;
+pub(crate) use content::{project_netconf_monitoring, project_yang_library};
+
 const YANG_LIBRARY_ROOT: &str = "/yanglib:yang-library";
 const YANG_LIBRARY_CONTENT_ID: &str = "/yanglib:yang-library/yanglib:content-id";
 const YANG_LIBRARY_MODULE_SET: &str = "/yanglib:yang-library/yanglib:module-set";
@@ -72,6 +75,7 @@ pub fn render_yang_library(
     registry: &dyn SchemaRegistry,
     selection: ReadSelection<'_>,
 ) -> Result<String, BindingError> {
+    selection.require_schema_only()?;
     let meta = registry.discovery_metadata();
     if meta.is_empty() {
         return Err(BindingError::projection(
@@ -150,6 +154,7 @@ pub fn render_netconf_monitoring(
     registry: &dyn SchemaRegistry,
     selection: ReadSelection<'_>,
 ) -> Result<String, BindingError> {
+    selection.require_schema_only()?;
     let meta = registry.discovery_metadata();
     if meta.is_empty() {
         return Err(BindingError::projection(

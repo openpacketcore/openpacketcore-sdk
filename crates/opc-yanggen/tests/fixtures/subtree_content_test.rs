@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use std::collections::BTreeMap;
+use std::io::Write;
+use tracing::instrument::WithSubscriber;
 
 use subtree_content_service::{netconf_xml, schema_registry, types::*};
 use opc_config_bus::{ConfigBus, MockManagedDatastore};
@@ -10,6 +13,8 @@ use opc_mgmt_authz::{AuthzError, PolicySource};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse, OperationalValue};
 use opc_mgmt_schema::{DataClass, LeafType, ModelData, NetconfXmlRenderer, NodeMeta, OriginEntry, SchemaRegistry};
+use opc_mgmt_schema::subtree::{SubtreeAccessKind, SubtreeAccessObserver, SubtreeBudget, SubtreeError};
+use opc_netconf_server::binding::ReadSelection;
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
 use opc_netconf_server::binding::WithDefaultsCapability;
 use opc_netconf_server::xml::WithDefaultsMode;
@@ -26,11 +31,17 @@ const WD: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults";
 struct Policy {
     rules: Arc<NacmPolicy>,
     calls: Arc<AtomicUsize>,
+    mode: Arc<AtomicUsize>,
+    alternate: Arc<Mutex<Option<Arc<NacmPolicy>>>>,
 }
 
 impl PolicySource for Policy {
     fn active_policy(&self, _: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == 1 { return Err(AuthzError::PolicyUnavailable); }
+        if call % 2 == 1 {
+            if let Some(policy) = self.alternate.lock().unwrap().as_ref() { return Ok(policy.clone()); }
+        }
         Ok(self.rules.clone())
     }
 }
@@ -51,11 +62,65 @@ struct Access {
     provider: AtomicUsize,
     requests: Mutex<Vec<OperationalRequest>>,
     values: Mutex<Vec<OperationalValue>>,
+    reads: Mutex<Vec<(&'static str, SubtreeAccessKind)>>,
+    trap: Mutex<Option<&'static str>>,
+    budget: Mutex<Option<SubtreeBudget>>,
+    logs: Arc<Mutex<Vec<u8>>>,
+    metric_delta: Mutex<BTreeMap<String, u64>>,
+    filter_response: AtomicUsize,
+    provider_trap: Mutex<Option<&'static str>>,
+    unsupported_projection: AtomicUsize,
+    basic_report_all: AtomicUsize,
+}
+
+impl SubtreeAccessObserver for Access {
+    fn before_read(&self, path: &'static str, kind: SubtreeAccessKind) {
+        if let Some(hidden) = *self.trap.lock().unwrap() {
+            assert!(!path.starts_with(hidden), "denied branch was inspected: {path}");
+        }
+        self.reads.lock().unwrap().push((path, kind));
+    }
+}
+
+#[derive(Clone)]
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn metric_counts() -> BTreeMap<String, u64> {
+    let metrics = &opc_redaction::metrics::METRICS;
+    let mut counts = BTreeMap::new();
+    for (kind, map) in [("requests", &metrics.netconf_rpc_requests_total), ("errors", &metrics.netconf_rpc_errors_total)] {
+        for ((operation, outcome), count) in map.lock().unwrap().iter() {
+            counts.insert(format!("{kind}/{operation}/{outcome}"), *count);
+        }
+    }
+    for (action, count) in metrics.netconf_nacm_denials_total.lock().unwrap().iter() { counts.insert(format!("denied/{action}"), *count); }
+    counts
 }
 
 struct Binding {
     bus: Arc<ConfigBus<System>>,
     access: Arc<Access>,
+    startup: Option<Arc<Startup>>,
+    candidate: bool,
+}
+
+struct Startup {
+    config: Mutex<Option<System>>,
+    loads: AtomicUsize,
+}
+
+impl opc_netconf_server::binding::StartupDatastore<System> for Startup {
+    fn load_startup_config(&self) -> Result<Option<System>, opc_netconf_server::binding::StartupDatastoreError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.config.lock().unwrap().clone())
+    }
+    fn store_startup_config(&self, _: &System) -> Result<(), opc_netconf_server::binding::StartupDatastoreError> {
+        Err(opc_netconf_server::binding::StartupDatastoreError::Unsupported)
+    }
 }
 
 // The binding retains generated typed access while supplying leafref/custom
@@ -67,22 +132,69 @@ impl SchemaRegistry for Registry {
     fn schema_digest(&self) -> &'static str { schema_registry::registry().schema_digest() }
     fn served_models(&self) -> &'static [ModelData] { schema_registry::registry().served_models() }
     fn origins(&self) -> &'static [OriginEntry] { schema_registry::registry().origins() }
+    fn discovery_metadata(&self) -> &'static [opc_mgmt_schema::DiscoveryMetadata] { schema_registry::registry().discovery_metadata() }
+    fn numeric_ranges(&self) -> &'static [opc_mgmt_schema::NodeNumericRangeMeta] { schema_registry::registry().numeric_ranges() }
     fn nodes(&self) -> &'static [NodeMeta] {
         static NODES: OnceLock<Vec<NodeMeta>> = OnceLock::new();
-        NODES.get_or_init(|| schema_registry::registry().nodes().iter().map(|node| {
+        NODES.get_or_init(|| {
+          let mut nodes: Vec<_> = schema_registry::registry().nodes().iter().map(|node| {
             let mut node = *node;
+            // Exercise state-default metadata without the baseline generator's
+            // unrelated Option<T>/LeafPresence<T> default initializer defect.
+            if node.path == "/ex:system/ex:state-default" { node.default = Some("7"); node.has_default = true; }
             node.leaf_type = match node.path {
-                "/ex:system/ex:opaque" => Some(LeafType::Custom { name: "opaque" }),
+                "/ex:system/ex:opaque" | "/ex:system/ex:state-opaque" => Some(LeafType::Custom { name: "opaque" }),
                 "/ex:system/ex:port-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:port" }),
                 "/ex:system/ex:chained-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:port-ref" }),
                 "/ex:system/ex:ratio-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:ratio" }),
+                "/ex:system/ex:identity-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:identity" }),
+                "/ex:system/ex:opaque-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:opaque" }),
+                "/ex:system/ex:state-ratio-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:ratio-ref" }),
+                "/ex:system/ex:state-identity-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:identity-ref" }),
+                "/ex:system/ex:state-opaque-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:opaque-ref" }),
+                "/ex:system/ex:typed-peer/ex:identity" => Some(LeafType::IdentityRef { base: "identity-base" }),
+                "/ex:system/ex:typed-peer/ex:ratio" => Some(LeafType::Decimal64),
                 _ => node.leaf_type,
             };
             node
-        }).collect())
+          }).collect();
+          // Provider-owned state identities do not need a config representation.
+          // Supply this registry subtree directly so the fixture does not depend
+          // on the baseline edit generator's unsupported config-false list keys.
+          let mut state_list = *nodes.iter().find(|node| node.path == "/ex:system/ex:peer").unwrap();
+          state_list.path = "/ex:system/ex:state-peer";
+          state_list.config = false;
+          state_list.child_paths = &["/ex:system/ex:state-peer/ex:id", "/ex:system/ex:state-peer/ex:label", "/ex:system/ex:state-peer/ex:site", "/ex:system/ex:state-peer/ex:up"];
+          nodes.push(state_list);
+          for (source, path) in [("/ex:system/ex:peer/ex:site", "/ex:system/ex:state-peer/ex:site"), ("/ex:system/ex:peer/ex:id", "/ex:system/ex:state-peer/ex:id"), ("/ex:system/ex:peer/ex:label", "/ex:system/ex:state-peer/ex:label"), ("/ex:system/ex:peer/ex:up", "/ex:system/ex:state-peer/ex:up")] {
+              let mut leaf = *nodes.iter().find(|node| node.path == source).unwrap();
+              leaf.path = path;
+              leaf.config = false;
+              nodes.push(leaf);
+          }
+          static ROOT_CHILDREN: OnceLock<Vec<&'static str>> = OnceLock::new();
+          let root = nodes.iter_mut().find(|node| node.path == "/ex:system").unwrap();
+          root.child_paths = ROOT_CHILDREN.get_or_init(|| {
+              let mut paths = root.child_paths.to_vec();
+              paths.push("/ex:system/ex:state-peer");
+              paths.sort();
+              paths
+          });
+          let mut top = *nodes.iter().find(|node| node.path == "/ex:system/ex:hostname").unwrap();
+          top.path = "/ex:top-match";
+          nodes.push(top);
+          let mut root = *nodes.iter().find(|node| node.path == "/ex:system").unwrap();
+          root.path = "/ex:yang-library";
+          root.child_paths = &["/ex:yang-library/ex:content-id"];
+          nodes.push(root);
+          top.path = "/ex:yang-library/ex:content-id";
+          nodes.push(top);
+          nodes.sort_by_key(|node| node.path);
+          nodes
+        })
     }
     fn data_class(&self, path: &str) -> Option<DataClass> {
-        if path == "/ex:system/ex:unclassified" { None }
+        if path.ends_with("/ex:unclassified") || path.ends_with("/ex:state-unclassified") { None }
         else { self.node(path).map(|node| node.data_class) }
     }
 }
@@ -98,18 +210,74 @@ impl NetconfConfigBinding<System> for Binding {
     fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<System>> {
         Some(&netconf_xml::GeneratedNetconfXmlRenderer)
     }
+    fn supports_subtree_content(&self) -> bool { self.access.unsupported_projection.load(Ordering::SeqCst) == 0 }
+    fn subtree_default_report(&self) -> opc_mgmt_schema::DefaultReport {
+        if self.access.basic_report_all.load(Ordering::SeqCst) == 0 { opc_mgmt_schema::DefaultReport::Trim }
+        else { opc_mgmt_schema::DefaultReport::ReportAll }
+    }
+    fn render_running_config(&self, config: &System, selection: ReadSelection<'_>)
+        -> Result<String, opc_netconf_server::binding::BindingError>
+    {
+        assert!(selection.subtree_plan().is_none(), "constrained reads must use the typed projection");
+        netconf_xml::GeneratedNetconfXmlRenderer.render_running_config(config, selection.schema_paths(), self.subtree_default_report())
+            .map_err(|_| opc_netconf_server::binding::BindingError::projection("fixture projection failed"))
+    }
+    fn render_get_data(&self, config: &System, selection: ReadSelection<'_>, operational: &OperationalResponse, operational_selection: ReadSelection<'_>)
+        -> Result<String, opc_netconf_server::binding::BindingError>
+    {
+        let mut xml = self.render_running_config(config, selection)?;
+        xml.push_str(&opc_netconf_server::binding::render_operational_xml(self.schema_registry(), operational_selection.schema_paths(), operational)?);
+        Ok(xml)
+    }
+    fn project_subtree_content(&self, config: &System, selection: ReadSelection<'_>, report: opc_mgmt_schema::DefaultReport)
+        -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError>
+    {
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        *self.access.budget.lock().unwrap() = Some(plan.budget().clone());
+        let ctx = plan.projection(self.schema_registry(), report).with_observer(self.access.as_ref());
+        let mut nodes = netconf_xml::GeneratedNetconfXmlRenderer.project_subtree_content(config, &ctx)?;
+        if ctx.enter("/ex:top-match", false)? {
+            if let LeafPresence::Explicit(value) = &config.hostname {
+                if let Some(node) = ctx.scalar("/ex:top-match", opc_mgmt_schema::subtree::SubtreeScalar::Text(value), false)? { ctx.append(&mut nodes, vec![node])?; }
+            }
+        }
+        if ctx.enter("/ex:yang-library", true)? {
+            let mut root = opc_mgmt_schema::NetconfXmlNode::branch("/ex:yang-library");
+            if ctx.enter("/ex:yang-library/ex:content-id", false)? {
+                if let LeafPresence::Explicit(value) = &config.hostname {
+                    if let Some(node) = ctx.scalar("/ex:yang-library/ex:content-id", opc_mgmt_schema::subtree::SubtreeScalar::Text(value), false)? { ctx.append(&mut root.children, vec![node])?; }
+                }
+            }
+            ctx.append(&mut nodes, vec![root])?;
+        }
+        Ok(nodes)
+    }
     fn with_defaults_capability(&self) -> Option<WithDefaultsCapability> {
-        Some(WithDefaultsCapability::new(WithDefaultsMode::Trim, [
+        let basic = if self.access.basic_report_all.load(Ordering::SeqCst) == 0 { WithDefaultsMode::Trim } else { WithDefaultsMode::ReportAll };
+        Some(WithDefaultsCapability::new(basic, [
             WithDefaultsMode::ReportAll, WithDefaultsMode::ReportAllTagged,
-            WithDefaultsMode::Explicit,
+            WithDefaultsMode::Explicit, WithDefaultsMode::Trim,
         ]).unwrap())
     }
     fn nmda_get_data_supported(&self) -> bool { true }
+    fn nmda_intended_equals_running(&self) -> bool { true }
+    fn candidate_datastore_capability(&self) -> bool { self.candidate }
+    fn startup_datastore(&self) -> Option<&dyn opc_netconf_server::binding::StartupDatastore<System>> {
+        self.startup.as_deref().map(|store| store as &dyn opc_netconf_server::binding::StartupDatastore<System>)
+    }
     fn get_operational_state(&self, request: &OperationalRequest)
         -> Result<OperationalResponse, OperationalError>
     {
         self.access.provider.fetch_add(1, Ordering::SeqCst);
+        if let Some(hidden) = *self.access.provider_trap.lock().unwrap() {
+            assert!(!request.paths.iter().any(|path| path.as_str().contains(hidden)), "denied provider dependency requested");
+        }
         self.access.requests.lock().unwrap().push(request.clone());
+        if self.access.filter_response.load(Ordering::SeqCst) != 0 {
+            return Ok(OperationalResponse::new(self.access.values.lock().unwrap().iter()
+                .filter(|value| request.paths.iter().any(|path| opc_mgmt_path::canonical_path_matches(path.as_str(), value.path().as_str())))
+                .take(request.max_values.saturating_add(1)).cloned()));
+        }
         Ok(OperationalResponse::new(self.access.values.lock().unwrap().clone()))
     }
 }
@@ -121,35 +289,30 @@ struct Fixture {
     access: Arc<Access>,
     policy_calls: Arc<AtomicUsize>,
     audit: Audit,
+    policy_mode: Arc<AtomicUsize>,
+    alternate: Arc<Mutex<Option<Arc<NacmPolicy>>>>,
 }
 
 impl Fixture {
     async fn new(config: System, denied: &[&str]) -> Self {
-        let mut modules = ModuleRegistry::new();
-        modules.register_module("subtree-content", "ex").unwrap();
-        modules.register_module("ietf-netconf", "nc").unwrap();
-        let mut rules = NacmPolicy::builder(PolicyVersion::new(1));
-        for path in denied {
-            rules = rules.add_rule(NacmRule::deny(NacmAction::Read,
-                YangPathPattern::parse(path, &modules).unwrap()));
-        }
-        for path in ["/ex:system", "/ex:system/**"] {
-            rules = rules.add_rule(NacmRule::allow(NacmAction::Read,
-                YangPathPattern::parse(path, &modules).unwrap()));
-        }
-        rules = rules.add_rule(NacmRule::allow(NacmAction::Exec,
-            YangPathPattern::parse("/nc:close-session", &modules).unwrap()));
+        Self::with_datastores(config, denied, None, false).await
+    }
+
+    async fn with_datastores(config: System, denied: &[&str], startup: Option<Arc<Startup>>, candidate: bool) -> Self {
+        let rules = policy(denied);
         let policy_calls = Arc::new(AtomicUsize::new(0));
+        let policy_mode = Arc::new(AtomicUsize::new(0));
+        let alternate = Arc::new(Mutex::new(None));
         let access = Arc::new(Access::default());
         let audit = Audit::default();
         let bus = Arc::new(ConfigBus::new_dev_only(config, MockManagedDatastore::new())
             .await.unwrap());
         let server = ReadOnlyNetconfServer::new(
-            Binding { bus, access: access.clone() },
-            Policy { rules: Arc::new(rules.build()), calls: policy_calls.clone() },
+            Binding { bus, access: access.clone(), startup, candidate },
+            Policy { rules: Arc::new(rules), calls: policy_calls.clone(), mode: policy_mode.clone(), alternate: alternate.clone() },
             audit.clone(), TransportType::NetconfTls,
         ).unwrap();
-        Self { server, access, policy_calls, audit }
+        Self { server, access, policy_calls, audit, policy_mode, alternate }
     }
 
     async fn rpc(&self, body: &str, limits: MgmtLimits) -> String {
@@ -158,6 +321,10 @@ impl Fixture {
         ).with_auth_strength(AuthStrength::MutualTls);
         let registry = SessionRegistry::new();
         let (mut client, mut stream) = tokio::io::duplex(262_144);
+        let before_metrics = metric_counts();
+        let writer = LogWriter(self.access.logs.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::TRACE).with_writer(move || writer.clone()).finish();
         let serving = run_read_only_session_with_registry(&self.server, &principal, &mut stream,
             SessionConfig { limits, frame_timeout: Duration::from_secs(5) }, 1, &registry);
         let exchange = async {
@@ -166,6 +333,10 @@ impl Fixture {
             self.access.model.store(0, Ordering::SeqCst);
             self.access.provider.store(0, Ordering::SeqCst);
             self.policy_calls.store(0, Ordering::SeqCst);
+            self.audit.0.lock().unwrap().clear();
+            self.access.reads.lock().unwrap().clear();
+            self.access.logs.lock().unwrap().clear();
+            *self.access.budget.lock().unwrap() = None;
             write_frame(&mut client, &format!("<rpc xmlns=\"{NC}\" message-id=\"match\">{body}</rpc>")).await;
             let reply = read_frame(&mut client).await;
             // End the authenticated session without a second RPC or policy load.
@@ -174,8 +345,10 @@ impl Fixture {
         };
         let (reply, result) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(exchange, serving)
-        }).await.unwrap();
+        }.with_subscriber(subscriber)).await.unwrap();
         result.unwrap();
+        *self.access.metric_delta.lock().unwrap() = metric_counts().into_iter()
+            .filter_map(|(key, value)| { let delta = value - before_metrics.get(&key).copied().unwrap_or(0); (delta > 0).then_some((key, delta)) }).collect();
         reply
     }
 
@@ -183,11 +356,42 @@ impl Fixture {
         self.rpc(&request(op, children, defaults), MgmtLimits::default()).await
     }
 
+    fn direct_rpc(&self, body: &str, limits: MgmtLimits) -> String {
+        self.access.model.store(0, Ordering::SeqCst);
+        self.access.provider.store(0, Ordering::SeqCst);
+        self.policy_calls.store(0, Ordering::SeqCst);
+        self.access.reads.lock().unwrap().clear();
+        let principal = TrustedPrincipal::new(WorkloadIdentity::User("subtree-reader".into()), TenantId::new("fixture").unwrap())
+            .with_auth_strength(AuthStrength::MutualTls);
+        self.server.handle_rpc(opc_config_model::RequestId::new(), &principal, &format!("<rpc xmlns=\"{NC}\" message-id=\"match\">{body}</rpc>"), &limits).reply_xml
+    }
+
     fn no_access(&self) {
         assert_eq!(self.access.model.load(Ordering::SeqCst), 0, "no model access");
         assert_eq!(self.access.provider.load(Ordering::SeqCst), 0, "no provider access");
         assert_eq!(self.policy_calls.load(Ordering::SeqCst), 0, "schema refusal precedes policy");
+        assert!(self.access.reads.lock().unwrap().is_empty());
     }
+
+    fn observation(&self) -> String {
+        let audit: Vec<_> = self.audit.0.lock().unwrap().iter().map(|event| format!("{:?}:{:?}:{:?}", event.operation, event.outcome, event.schema_paths)).collect();
+        format!("{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{}", self.access.model.load(Ordering::SeqCst), self.access.provider.load(Ordering::SeqCst), self.policy_calls.load(Ordering::SeqCst), self.access.reads.lock().unwrap(), self.access.budget.lock().unwrap().as_ref().map(|budget| (budget.remaining(), budget.predicate_trials())), self.access.metric_delta.lock().unwrap(), audit, String::from_utf8(self.access.logs.lock().unwrap().clone()).unwrap())
+    }
+}
+
+fn policy(denied: &[&str]) -> NacmPolicy {
+    let mut modules = ModuleRegistry::new();
+    for (module, prefix) in [("subtree-content", "ex"), ("ietf-netconf", "nc"), ("ietf-yang-library", "yanglib"), ("ietf-netconf-monitoring", "ncm")] {
+        modules.register_module(module, prefix).unwrap();
+    }
+    let mut rules = NacmPolicy::builder(PolicyVersion::new(1));
+    for path in denied {
+        rules = rules.add_rule(NacmRule::deny(NacmAction::Read, YangPathPattern::parse(path, &modules).unwrap()));
+    }
+    for path in ["/ex:system", "/ex:system/**", "/ex:top-match", "/ex:yang-library", "/ex:yang-library/**", "/yanglib:yang-library", "/yanglib:yang-library/**", "/ncm:netconf-state", "/ncm:netconf-state/**"] {
+        rules = rules.add_rule(NacmRule::allow(NacmAction::Read, YangPathPattern::parse(path, &modules).unwrap()));
+    }
+    rules.add_rule(NacmRule::allow(NacmAction::Exec, YangPathPattern::parse("/nc:close-session", &modules).unwrap())).build()
 }
 
 async fn read_frame(stream: &mut DuplexStream) -> String {
@@ -221,23 +425,39 @@ fn request(op: &str, children: &str, defaults: &str) -> String {
     }
 }
 
+fn nmda(datastore: &str, config_filter: Option<bool>, children: &str, defaults: &str) -> String {
+    let filter = config_filter.map(|value| format!("<config-filter>{value}</config-filter>")).unwrap_or_default();
+    request("get-data", children, defaults).replace("ds:operational</datastore>", &format!("ds:{datastore}</datastore>{filter}"))
+}
+
 fn config() -> System {
     let mut config = System::default();
     config.hostname = LeafPresence::Explicit("router-marker".into());
     config.enabled = LeafPresence::Explicit(true);
     config.count = LeafPresence::Explicit(u32::MAX);
+    config.bounded = LeafPresence::Explicit(7);
     config.signed = LeafPresence::Explicit(YangInt64(i64::MIN));
     config.role = serde_json::from_str("\"active\"").unwrap();
     config.port_ref = LeafPresence::Explicit(7);
     config.chained_ref = LeafPresence::Explicit(7);
+    config.ratio = LeafPresence::Explicit(YangDecimal64(1.0));
+    config.ratio_ref = LeafPresence::Explicit(YangDecimal64(1.0));
+    config.identity = LeafPresence::Explicit("a:router".into());
+    config.identity_ref = LeafPresence::Explicit("a:router".into());
+    config.opaque = LeafPresence::Explicit("opaque-marker".into());
+    config.opaque_ref = LeafPresence::Explicit("opaque-marker".into());
     config.secret = SecretLeaf::new(LeafPresence::Explicit("secret-marker".into()));
     config.intercept = SecretLeaf::new(LeafPresence::Explicit("intercept-marker".into()));
     config.password = SecretLeaf::new(LeafPresence::Explicit("password-marker".into()));
     config.unclassified = SecretLeaf::new(LeafPresence::Explicit("unclassified-marker".into()));
+    let mut settings = Settings::default();
+    settings.label = LeafPresence::Explicit("settings-marker".into());
+    settings.enabled = LeafPresence::Explicit(true);
+    config.settings = Some(settings);
     for (site, id, label, cost, enabled) in [
-        ("east", 7, "alpha-marker", 7, true),
-        ("east", 8, "beta-marker", 8, false),
         ("west", 7, "gamma-marker", 8, true),
+        ("east", 8, "beta-marker", 8, false),
+        ("east", 7, "alpha-marker", 7, true),
     ] {
         let mut peer = Peer::default();
         peer.site = LeafPresence::Explicit(site.into());
@@ -255,13 +475,41 @@ fn config() -> System {
         }
         config.peer.insert(PeerKey { site: site.into(), id }, peer);
     }
+    for ratio in ["1.00", "1.0"] {
+        let mut row = TypedPeer::default();
+        row.identity = LeafPresence::Explicit("a:router".into());
+        row.ratio = LeafPresence::Explicit(ratio.into());
+        row.label = LeafPresence::Explicit(format!("ratio-{ratio}"));
+        config.typed_peer.insert(TypedPeerKey { identity: "a:router".into(), ratio: ratio.into() }, row);
+    }
+    for suffix in ["a", "b"] {
+        let mut row = ClassPeer::default();
+        let secret = format!("secret-{suffix}");
+        let intercept = format!("intercept-{suffix}");
+        let password = format!("password-{suffix}");
+        let unclassified = format!("unclassified-{suffix}");
+        row.secret = SecretLeaf::new(LeafPresence::Explicit(secret.clone()));
+        row.intercept = SecretLeaf::new(LeafPresence::Explicit(intercept.clone()));
+        row.password = SecretLeaf::new(LeafPresence::Explicit(password.clone()));
+        row.unclassified = SecretLeaf::new(LeafPresence::Explicit(unclassified.clone()));
+        row.label = LeafPresence::Explicit(format!("class-row-{suffix}"));
+        config.class_peer.insert(ClassPeerKey { secret, intercept, password, unclassified }, row);
+    }
+    for name in ["z", "a", "m"] {
+        let mut row = UserPeer::default();
+        row.name = LeafPresence::Explicit(name.into());
+        row.label = LeafPresence::Explicit(format!("user-{name}-<&\"'\\-marker"));
+        config.user_peer.insert(name.to_string(), row).unwrap();
+    }
     config
 }
 
 fn data(reply: &str) -> &str {
     assert!(!reply.contains("<rpc-error>"), "{reply}");
-    if reply.contains("<data/>") { return ""; }
-    reply.split_once("<data>").expect(reply).1.split_once("</data>").unwrap().0
+    let data = reply.split_once("<data").expect(reply).1;
+    let (start, contents) = data.split_once('>').expect(reply);
+    if start.ends_with('/') { return ""; }
+    contents.split_once("</data>").unwrap().0
 }
 
 fn tags(reply: &str, tag: &str) -> Vec<String> {
@@ -273,7 +521,7 @@ fn tags(reply: &str, tag: &str) -> Vec<String> {
 
 fn error(reply: &str, tag: &str) {
     assert!(reply.contains(&format!("<error-tag>{tag}</error-tag>")), "{reply}");
-    assert!(!reply.contains("<data>"), "errors cannot contain partial data");
+    assert!(!reply.contains("<data"), "errors cannot contain partial data");
 }
 
 fn state(path: &str, json: &str) -> OperationalValue {
@@ -292,6 +540,16 @@ async fn subtree_content_siblings_are_same_instance_and() {
         assert_eq!(data(&reply), "");
         let reply = fixture.read(op, "<hostname>router-marker</hostname><enabled>true</enabled><count/>", "").await;
         assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
+        let reply = fixture.read(op, "<settings><label>settings-marker</label><enabled>true</enabled></settings><hostname/>", "").await;
+        assert_eq!(tags(&reply, "label"), ["settings-marker"]);
+        let reply = fixture.read(op, "<settings><label>settings-marker</label><enabled>false</enabled></settings><hostname/>", "").await;
+        assert!(tags(&reply, "label").is_empty());
+        assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+    }
+    for (literal, matched) in [("router-marker", true), ("wrong-marker", false)] {
+        let reply = fixture.rpc(&format!("<get><filter><top-match xmlns=\"{EX}\">{literal}</top-match><system xmlns=\"{EX}\"><hostname/></system></filter></get>"), MgmtLimits::default()).await;
+        assert_eq!(tags(&reply, "hostname"), if matched { vec!["router-marker"] } else { vec![] });
+        if !matched { assert_eq!(data(&reply), ""); }
     }
 }
 
@@ -305,7 +563,7 @@ async fn subtree_content_node_classification() {
     assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
     let reply = fixture.read("get-config", "<hostname>\u{a0}</hostname><count/>", "").await;
     assert_eq!(data(&reply), "", "Unicode nonbreaking space is content");
-    for contents in ["<peer>text</peer>", "<peer>text<label/></peer>", "<hostname>text<child/></hostname>"] {
+    for contents in ["<peer>text</peer>", "<settings>text</settings>", "<peer>text<label/></peer>", "<hostname>text<child/></hostname>"] {
         error(&fixture.read("get-config", contents, "").await, "bad-element");
         fixture.no_access();
     }
@@ -331,6 +589,11 @@ async fn subtree_content_text_accumulates_before_trim() {
         error(&reply, "malformed-message");
         fixture.no_access();
     }
+    for dtd in ["<!DOCTYPE rpc [<!ENTITY probe 'a & b  c'>]>", "<!DOCTYPE rpc SYSTEM 'file:///not-read-subtree-marker'>"] {
+        let body = format!("{dtd}{}", request("get-config", "<hostname>&probe;</hostname>", ""));
+        error(&fixture.direct_rpc(&body, MgmtLimits::default()), "malformed-message");
+        fixture.no_access();
+    }
     let marker = "predicate-UNIQUE-disclosure-marker";
     let xml = format!("<rpc xmlns=\"{NC}\" message-id=\"redaction\">{}</rpc>", request("get-config", &format!("<hostname>{marker}</hostname>"), ""));
     let parsed = opc_netconf_server::xml::parse_rpc(&xml, &MgmtLimits::default()).unwrap();
@@ -338,6 +601,9 @@ async fn subtree_content_text_accumulates_before_trim() {
     let reply = fixture.read("get-config", &format!("<hostname>{marker}</hostname><count/>"), "").await;
     assert_eq!(data(&reply), "");
     assert!(!format!("{:?}", fixture.audit.0.lock().unwrap()).contains(marker));
+    assert!(!String::from_utf8(fixture.access.logs.lock().unwrap().clone()).unwrap().contains(marker));
+    assert!(!opc_redaction::metrics::export_prometheus_text().contains(marker));
+    assert!(!reply.contains(marker));
 }
 
 #[tokio::test]
@@ -353,6 +619,14 @@ async fn subtree_content_element_namespaces() {
         let body = format!("<get-config><source><running/></source><filter>{tree}</filter></get-config>");
         assert_eq!(fixture.rpc(&body, MgmtLimits::default()).await, expected);
     }
+    for (literal, prefix, excluded) in [("router-marker", "ex", "yanglib"), (Registry.schema_digest(), "yanglib", "ex")] {
+        let reply = fixture.rpc(&format!("<get><filter><yang-library xmlns=\"\"><content-id>{literal}</content-id><content-id/></yang-library></filter></get>"), MgmtLimits::default()).await;
+        assert!(data(&reply).contains(&format!("<{prefix}:content-id>{literal}</{prefix}:content-id>")), "{reply}");
+        assert!(!data(&reply).contains(&format!("<{excluded}:yang-library")), "{reply}");
+    }
+    let reply = fixture.rpc(&format!("<get><filter><q:yang-library xmlns:q=\"{EX}\"><q:content-id>router-marker</q:content-id><q:content-id/></q:yang-library></filter></get>"), MgmtLimits::default()).await;
+    assert!(data(&reply).contains("<ex:content-id>router-marker</ex:content-id>"));
+    assert!(!data(&reply).contains("yanglib:"));
 }
 
 #[tokio::test]
@@ -361,7 +635,7 @@ async fn subtree_content_scalar_canonical_values() {
     for (leaf, literal) in [
         ("port", "+007"), ("enabled", "true"), ("count", "04294967295"),
         ("signed", "-9223372036854775808"), ("role", "active"),
-        ("port-ref", "+007"), ("chained-ref", "007"),
+        ("port-ref", "+007"), ("chained-ref", "007"), ("bounded", "+007"),
     ] {
         let reply = fixture.read("get-config", &format!("<{leaf}>{literal}</{leaf}><hostname/>"), "report-all").await;
         assert_eq!(tags(&reply, "hostname"), ["router-marker"], "{leaf}");
@@ -370,7 +644,7 @@ async fn subtree_content_scalar_canonical_values() {
         ("port", "65536"), ("port", "-1"), ("port", "seven"),
         ("enabled", "TRUE"), ("enabled", "1"), ("count", "4294967296"),
         ("signed", "9223372036854775808"), ("role", "ACTIVE"), ("empty", "present"),
-        ("port-ref", "65536"),
+        ("port-ref", "65536"), ("bounded", "4"), ("bounded", "9"), ("bounded", "12"),
     ] {
         let reply = fixture.read("get-config", &format!("<{leaf}>{literal}</{leaf}><hostname/>"), "report-all").await;
         assert_eq!(data(&reply), "", "{leaf}");
@@ -380,25 +654,47 @@ async fn subtree_content_scalar_canonical_values() {
     let fixture = Fixture::new(model, &[]).await;
     assert_eq!(data(&fixture.read("get-config", "<hostname>7</hostname><count/>", "").await), "");
     assert_eq!(tags(&fixture.read("get-config", "<hostname>+007</hostname><count/>", "").await, "count"), [u32::MAX.to_string()]);
+    for value in [5, 8, 11] {
+        let mut model = config();
+        model.bounded = LeafPresence::Explicit(value);
+        let fixture = Fixture::new(model, &[]).await;
+        assert_eq!(tags(&fixture.read("get-config", &format!("<bounded>{value}</bounded><hostname/>"), "").await, "hostname"), ["router-marker"]);
+    }
+    let fixture = Fixture::new(config(), &["/ex:system/ex:port"]).await;
+    *fixture.access.trap.lock().unwrap() = Some("/ex:system/ex:port");
+    // The chained leafref requires target metadata, never target instance data.
+    assert_eq!(tags(&fixture.read("get-config", "<chained-ref>+007</chained-ref><hostname/>", "").await, "hostname"), ["router-marker"]);
 }
 
 #[tokio::test]
 async fn subtree_content_unsupported_codec_is_schema_only() {
     for denied in [vec![], vec!["/ex:system/**"]] {
-        let fixture = Fixture::new(config(), &denied).await;
+      for model in [config(), System::default()] {
+        let fixture = Fixture::new(model, &denied).await;
         for op in ["get-config", "get", "get-data"] {
-            for leaf in ["ratio", "identity", "opaque", "ratio-ref"] {
+            for leaf in ["ratio", "identity", "opaque", "ratio-ref", "identity-ref", "opaque-ref", "state-ratio", "state-identity", "state-opaque", "state-ratio-ref", "state-identity-ref", "state-opaque-ref"] {
                 for literal in ["unsupported-probe", "1.00"] {
+                  for provider_value in [None, Some("\"unsupported-probe\""), Some("123"), Some("{}") ] {
+                    *fixture.access.values.lock().unwrap() = provider_value.into_iter().map(|value| state(&format!("/ex:system/ex:{leaf}"), value)).collect();
                     let reply = fixture.read(op, &format!("<{leaf}>{literal}</{leaf}>"), "").await;
                     error(&reply, "operation-not-supported");
                     fixture.no_access();
+                  }
                 }
             }
         }
+      }
     }
     let fixture = Fixture::new(config(), &[]).await;
     let reply = fixture.read("get-config", "<port>+007</port><hostname/>", "report-all").await;
     assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+    for op in ["get-config", "get", "get-data"] {
+        let reply = fixture.read(op, "<typed-peer><identity>a:router</identity><ratio>1.00</ratio><label/></typed-peer>", "").await;
+        assert_eq!(tags(&reply, "label"), ["ratio-1.00"]);
+        assert_eq!(tags(&reply, "ratio"), ["1.00"]);
+        assert_eq!(data(&fixture.read(op, "<typed-peer><identity>b:router</identity><ratio>1.00</ratio><label/></typed-peer>", "").await), "");
+        assert_eq!(data(&fixture.read(op, "<typed-peer><identity>a:router</identity><ratio>1</ratio><label/></typed-peer>", "").await), "");
+    }
 }
 
 #[tokio::test]
@@ -443,28 +739,129 @@ async fn subtree_content_key_subsets_and_state_join() {
     }
     fixture.access.values.lock().unwrap().clear();
     assert_eq!(data(&fixture.read("get", "<peer><up>true</up><label/></peer>", "").await), "");
+    fixture.access.filter_response.store(1, Ordering::SeqCst);
+    *fixture.access.values.lock().unwrap() = vec![
+        state("/ex:system/ex:peer[ex:site='east'][ex:id='7']/ex:up", "true"),
+        state("/ex:system/ex:peer[ex:site='east'][ex:id='8']/ex:up", "false"),
+        state("/ex:system/ex:peer[ex:site='west'][ex:id='7']/ex:up", "true"),
+        state("/ex:system/ex:peer[ex:site='east'][ex:id='7']/ex:lane[ex:slot='1'][ex:kind='a']/ex:up", "true"),
+        state("/ex:system/ex:peer[ex:site='west'][ex:id='7']/ex:lane[ex:slot='2'][ex:kind='b']/ex:up", "true"),
+    ];
+    for keys in ["<site>east</site>", "<id>+007</id>", "<site>east</site><id>007</id>"] {
+        let reply = fixture.read("get", &format!("<peer>{keys}<cost>7</cost><up>true</up><label/></peer>"), "").await;
+        assert_eq!(tags(&reply, "label"), ["alpha-marker"]);
+        assert_eq!(tags(&reply, "up"), ["true"]);
+        let requests = fixture.access.requests.lock().unwrap();
+        let paths: Vec<_> = requests.last().unwrap().paths.iter().map(|path| path.as_str()).collect();
+        if keys.contains("<id>") { assert!(paths.iter().any(|path| path.contains("[ex:id='7']"))); }
+        if keys.contains("<site>") { assert!(paths.iter().any(|path| path.contains("[ex:site='east']"))); }
+        assert!(!format!("{:?}", requests.last().unwrap()).contains("east"));
+    }
+    let reply = fixture.read("get", "<peer><site>east</site><id>7</id><lane><slot>1</slot><up>true</up><label/></lane></peer><peer><site>west</site><lane><slot>2</slot><up>true</up><label/></lane></peer>", "").await;
+    assert_eq!(tags(&reply, "label"), ["alpha-marker-1", "gamma-marker-2"]);
+    assert_eq!(tags(&reply, "kind"), ["a", "b"]);
+    let reply = fixture.rpc(&nmda("operational", Some(false), "<peer><site>east</site><id>7</id><up>true</up><up/></peer>", ""), MgmtLimits::default()).await;
+    assert_eq!(tags(&reply, "up"), ["true"]);
+    assert!(tags(&reply, "label").is_empty());
+    assert!(fixture.access.reads.lock().unwrap().is_empty(), "state-only reads do not inspect config rows");
+    for datastore in ["running", "operational"] {
+        let reply = fixture.rpc(&nmda(datastore, Some(true), "<peer><up>true</up><label/></peer>", ""), MgmtLimits::default()).await;
+        assert_eq!(data(&reply), "");
+        assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+    }
+    *fixture.access.values.lock().unwrap() = vec![
+        state("/ex:system/ex:state-peer[ex:site='north'][ex:id='7']/ex:label", "\"state-alpha\""),
+        state("/ex:system/ex:state-peer[ex:site='south'][ex:id='7']/ex:label", "\"state-beta\""),
+    ];
+    for op in ["get", "get-data"] {
+        let reply = fixture.read(op, "<state-peer><site>north</site><id>+007</id><label/></state-peer>", "").await;
+        assert_eq!(tags(&reply, "label"), ["state-alpha"]);
+        assert_eq!(tags(&reply, "site"), ["north"]);
+        assert_eq!(tags(&reply, "id"), ["7"]);
+    }
+    assert_eq!(data(&fixture.read("get-config", "<state-peer><site>north</site><label/></state-peer>", "").await), "");
+    assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+
+    let mut model = config();
+    let mut row = model.peer.remove(&PeerKey { site: "east".into(), id: 7 }).unwrap();
+    let site = "e\\ast'one";
+    row.site = LeafPresence::Explicit(site.into());
+    model.peer.insert(PeerKey { site: site.into(), id: 7 }, row);
+    let fixture = Fixture::new(model, &[]).await;
+    let canonical = "/ex:system/ex:peer[ex:site=\"e\\ast'one\"][ex:id='7']/ex:up";
+    *fixture.access.values.lock().unwrap() = vec![state(canonical, "true")];
+    for op in ["get", "get-data"] {
+        let reply = fixture.read(op, "<peer><site>e\\ast'one</site><id>+007</id><up>true</up><label/></peer>", "").await;
+        assert_eq!(tags(&reply, "label"), ["alpha-marker"]);
+        assert_eq!(tags(&reply, "site"), [site]);
+        assert_eq!(tags(&reply, "up"), ["true"]);
+        assert!(fixture.access.requests.lock().unwrap().last().unwrap().paths.iter().any(|path| path.as_str() == canonical));
+    }
 }
 
 #[tokio::test]
 async fn subtree_content_denied_dependencies_precede_access() {
-    for denied in ["/ex:system/ex:peer/ex:cost", "/ex:system/ex:peer/ex:site", "/ex:system/ex:peer/ex:id"] {
+    for (denied, branch, trap) in [
+        ("/ex:system/ex:peer/ex:cost", "<peer><cost>7</cost><label/><lane><label/></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:peer/ex:site", "<peer><lane><label>alpha-marker-1</label></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:peer/ex:id", "<peer><lane><label>alpha-marker-1</label></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:peer/ex:lane/ex:slot", "<peer><lane><label>alpha-marker-1</label></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:peer/ex:lane/ex:kind", "<peer><lane><label>alpha-marker-1</label></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:peer/ex:lane/ex:label", "<peer><lane><label>alpha-marker-1</label></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:peer/ex:lane/ex:up", "<peer><lane><up>true</up><label/></lane></peer>", "/ex:system/ex:peer"),
+        ("/ex:system/ex:settings/ex:enabled", "<settings><enabled>true</enabled><label/></settings>", "/ex:system/ex:settings"),
+    ] {
+      for op in ["get-config", "get", "get-data"] {
         let mut previous = None;
         for rows in 0..3 {
             let mut model = config();
-            if rows == 0 { model.peer.clear(); }
+            if rows == 0 { model.peer.clear(); model.settings = None; }
             if rows == 2 {
                 for row in model.peer.values_mut() {
                     row.site = LeafPresence::Absent;
                     row.id = LeafPresence::Absent;
                     row.cost = LeafPresence::Absent;
+                    for lane in row.lane.values_mut() {
+                        lane.slot = LeafPresence::Absent;
+                        lane.kind = LeafPresence::Absent;
+                        lane.label = LeafPresence::Absent;
+                    }
                 }
+                model.settings.as_mut().unwrap().enabled = LeafPresence::Absent;
             }
             let fixture = Fixture::new(model, &[denied]).await;
-            let reply = fixture.read("get", "<peer><cost>7</cost><label/></peer><hostname/>", "").await;
+            *fixture.access.trap.lock().unwrap() = Some(trap);
+            *fixture.access.provider_trap.lock().unwrap() = Some(trap);
+            fixture.access.filter_response.store(1, Ordering::SeqCst);
+            *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:uptime", "42")];
+            if rows != 0 { fixture.access.values.lock().unwrap().push(state(
+                if rows == 1 { "/ex:system/ex:peer[ex:site='east'][ex:id='7']/ex:lane[ex:slot='1'][ex:kind='a']/ex:up" }
+                else { "/ex:system/ex:peer/ex:lane/ex:up" }, "true")); }
+            let reply = fixture.read(op, &format!("{branch}<hostname/><uptime/>"), "").await;
             assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
             assert!(tags(&reply, "label").is_empty());
-            assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
-            let observation = (reply, fixture.policy_calls.load(Ordering::SeqCst));
+            assert_eq!(fixture.access.provider.load(Ordering::SeqCst), usize::from(op != "get-config"));
+            assert_eq!(tags(&reply, "uptime"), if op == "get-config" { vec![] } else { vec!["42"] });
+            assert_eq!(fixture.access.budget.lock().unwrap().as_ref().map(SubtreeBudget::predicate_trials), Some(0));
+            let observation = (reply, fixture.observation());
+            if let Some(previous) = &previous { assert_eq!(&observation, previous); }
+            previous = Some(observation);
+        }
+      }
+    }
+    // One alternative on this list is denied while another still reads rows.
+    // Changing only the denied leaf cannot change trials, charges or output.
+    for op in ["get-config", "get", "get-data"] {
+        let mut previous = None;
+        for cost in [LeafPresence::Absent, LeafPresence::Explicit(7), LeafPresence::Explicit(u16::MAX)] {
+            let mut model = config();
+            for row in model.peer.values_mut() { row.cost = cost.clone(); }
+            let fixture = Fixture::new(model, &["/ex:system/ex:peer/ex:cost"]).await;
+            *fixture.access.trap.lock().unwrap() = Some("/ex:system/ex:peer/ex:cost");
+            let reply = fixture.read(op, "<peer><cost>7</cost><label/></peer><peer><site>west</site><label/></peer>", "").await;
+            assert_eq!(tags(&reply, "label"), ["gamma-marker"]);
+            assert_eq!(fixture.access.budget.lock().unwrap().as_ref().map(SubtreeBudget::predicate_trials), Some(3));
+            let observation = (reply, fixture.observation());
             if let Some(previous) = &previous { assert_eq!(&observation, previous); }
             previous = Some(observation);
         }
@@ -474,12 +871,25 @@ async fn subtree_content_denied_dependencies_precede_access() {
 #[tokio::test]
 async fn subtree_content_denied_output_preserves_siblings() {
     let fixture = Fixture::new(config(), &["/ex:system/ex:peer/ex:label"]).await;
-    let reply = fixture.read("get-config", "<peer><cost>7</cost><label/><enabled/><credential/></peer>", "").await;
+    for op in ["get-config", "get", "get-data"] {
+    let reply = fixture.read(op, "<peer><cost>7</cost><label/><enabled/><credential/></peer>", "").await;
     assert!(tags(&reply, "label").is_empty());
     assert_eq!(tags(&reply, "enabled"), ["true"]);
     assert_eq!(tags(&reply, "cost"), ["7"]);
     assert_eq!(tags(&reply, "credential"), ["&lt;redacted&gt;"]);
     assert_eq!(tags(&reply, "id"), ["7"]);
+    let reply = fixture.read(op, "<hostname>router-marker</hostname><peer/>", "").await;
+    assert_eq!(tags(&reply, "label"), ["alpha-marker-1", "alpha-marker-2", "beta-marker-1", "beta-marker-2", "gamma-marker-1", "gamma-marker-2"]);
+    assert_eq!(tags(&reply, "cost"), ["7", "8", "8"]);
+    }
+    let fixture = Fixture::new(config(), &["/ex:system/ex:settings/ex:label", "/ex:system/ex:settings/ex:enabled"]).await;
+    *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:uptime", "7")];
+    for op in ["get", "get-data"] {
+        let reply = fixture.read(op, "<uptime>7</uptime><settings/>", "").await;
+        assert!(data(&reply).contains("<ex:settings></ex:settings>"), "a selected existing container survives child denials: {reply}");
+        assert!(tags(&reply, "label").is_empty());
+        assert!(tags(&reply, "enabled").is_empty());
+    }
 }
 
 #[tokio::test]
@@ -488,9 +898,18 @@ async fn subtree_content_non_cleartext_leaf_is_refused() {
         for model in [config(), System::default()] {
             let fixture = Fixture::new(model, &denied).await;
             for op in ["get-config", "get", "get-data"] {
-                for leaf in ["secret", "intercept", "password", "unclassified"] {
+                for leaf in ["secret", "intercept", "password", "unclassified", "state-secret", "state-intercept", "state-password", "state-unclassified"] {
                     for value in [format!("{leaf}-marker"), "incorrect-guess".into()] {
+                      for provider_value in [None, Some("\"incorrect-guess\""), Some("\"secret-marker\""), Some("{}") ] {
+                        *fixture.access.values.lock().unwrap() = provider_value.into_iter().map(|value| state(&format!("/ex:system/ex:{leaf}"), value)).collect();
                         let reply = fixture.read(op, &format!("<{leaf}>{value}</{leaf}>"), "").await;
+                        error(&reply, "operation-not-supported");
+                        fixture.no_access();
+                      }
+                    }
+                    if leaf.starts_with("state-") { continue; }
+                    for value in [format!("{leaf}-a"), "wrong-key".into()] {
+                        let reply = fixture.read(op, &format!("<class-peer><{leaf}>{value}</{leaf}><label/></class-peer>"), "").await;
                         error(&reply, "operation-not-supported");
                         fixture.no_access();
                     }
@@ -504,6 +923,19 @@ async fn subtree_content_non_cleartext_leaf_is_refused() {
     let fixture = Fixture::new(config(), &[]).await;
     let reply = fixture.read("get-config", "<hostname>router-marker</hostname><secret/>", "").await;
     assert_eq!(tags(&reply, "secret"), ["&lt;redacted&gt;"]);
+    for op in ["get-config", "get", "get-data"] {
+        let reply = fixture.read(op, "<hostname>router-marker</hostname><class-peer><label/></class-peer>", "").await;
+        assert_eq!(tags(&reply, "label"), ["class-row-a", "class-row-b"]);
+        for key in ["secret", "intercept", "password", "unclassified"] { assert_eq!(tags(&reply, key), ["&lt;redacted&gt;", "&lt;redacted&gt;"]); }
+    }
+    for op in ["get", "get-data"] {
+        for leaf in ["state-secret", "state-intercept", "state-password", "state-unclassified"] {
+            *fixture.access.values.lock().unwrap() = vec![state(&format!("/ex:system/ex:{leaf}"), "\"hidden-state-marker\"")];
+            let reply = fixture.read(op, &format!("<hostname>router-marker</hostname><{leaf}/>"), "").await;
+            assert_eq!(tags(&reply, leaf), ["&lt;redacted&gt;"]);
+            assert!(!reply.contains("hidden-state-marker"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -512,6 +944,26 @@ async fn subtree_content_dependencies_share_policy_context() {
     let reply = fixture.read("get", "<peer><site>east</site><cost>7</cost><label/></peer>", "").await;
     assert_eq!(tags(&reply, "label"), ["alpha-marker"]);
     assert_eq!(fixture.policy_calls.load(Ordering::SeqCst), 1);
+    // A separate registry must reuse the initial context. The two policies
+    // separately deny opposite projections; combining them would reveal both.
+    let fixture = Fixture::new(config(), &["/yanglib:yang-library/**"]).await;
+    *fixture.alternate.lock().unwrap() = Some(Arc::new(policy(&["/ex:system/**"])));
+    let body = format!("<get><filter><system xmlns=\"{EX}\"><hostname>router-marker</hostname><count/></system><yang-library xmlns=\"urn:ietf:params:xml:ns:yang:ietf-yang-library\"><content-id>{}</content-id><module-set><name/></module-set></yang-library></filter></get>", Registry.schema_digest());
+    let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+    assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
+    assert!(!data(&reply).contains("yanglib:"));
+    assert_eq!(fixture.policy_calls.load(Ordering::SeqCst), 1);
+    let fixture = Fixture::new(config(), &[]).await;
+    let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+    assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
+    assert!(data(&reply).contains("<yanglib:name>complete</yanglib:name>"), "{reply}");
+    assert_eq!(fixture.policy_calls.load(Ordering::SeqCst), 1);
+    fixture.policy_mode.store(1, Ordering::SeqCst);
+    let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+    error(&reply, "resource-denied");
+    assert_eq!(fixture.policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.access.model.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -533,13 +985,37 @@ async fn subtree_content_matches_after_defaults() {
         let mut model = config();
         if explicit { model.port = LeafPresence::Explicit(7); }
         let fixture = Fixture::new(model, &[]).await;
-        for mode in ["", "report-all", "report-all-tagged", "trim", "explicit"] {
-            let baseline = fixture.read("get-config", "<port/>", mode).await;
-            let matched = fixture.read("get-config", "<port>+007</port><hostname/>", mode).await;
+        for op in ["get-config", "get", "get-data"] {
+          for mode in ["", "report-all", "report-all-tagged", "trim", "explicit"] {
+            let body = if op == "get-data" { nmda("running", None, "<port/>", mode) } else { request(op, "<port/>", mode) };
+            let baseline = fixture.rpc(&body, MgmtLimits::default()).await;
+            assert!(!baseline.contains("<rpc-error>"), "baseline {op} {mode}: {baseline}");
+            let body = if op == "get-data" { nmda("running", None, "<port>+007</port><hostname/>", mode) } else { request(op, "<port>+007</port><hostname/>", mode) };
+            let matched = fixture.rpc(&body, MgmtLimits::default()).await;
             let reported = data(&baseline).contains(">7</ex:port>");
             assert_eq!(tags(&matched, "hostname"), if reported { vec!["router-marker"] } else { vec![] });
             if !reported { assert_eq!(data(&matched), ""); }
+            if reported && mode == "report-all-tagged" && !explicit { assert!(data(&matched).contains("wd:default=\"true\"")); }
+            let body = if op == "get-data" { nmda("running", None, "<peer><mode>auto</mode><label/></peer>", mode) } else { request(op, "<peer><mode>auto</mode><label/></peer>", mode) };
+            let matched = fixture.rpc(&body, MgmtLimits::default()).await;
+            assert_eq!(tags(&matched, "label"), if matches!(mode, "report-all" | "report-all-tagged") { vec!["alpha-marker", "beta-marker", "gamma-marker"] } else { vec![] });
+            if op != "get-data" || mode.is_empty() {
+                assert_eq!(data(&fixture.read(op, "<state-default>7</state-default><hostname/>", mode).await), "", "state defaults are never invented");
+            }
+          }
         }
+    }
+    let fixture = Fixture::new(System::default(), &[]).await;
+    for mode in ["report-all", "report-all-tagged"] {
+        assert_eq!(data(&fixture.read("get-config", "<peer><mode>auto</mode><label/></peer>", mode).await), "", "defaults never create list instances");
+    }
+    let fixture = Fixture::new(config(), &[]).await;
+    fixture.access.basic_report_all.store(1, Ordering::SeqCst);
+    for op in ["get-config", "get", "get-data"] {
+        let body = if op == "get-data" { nmda("running", None, "<port/>", "") } else { request(op, "<port/>", "") };
+        assert_eq!(tags(&fixture.rpc(&body, MgmtLimits::default()).await, "port"), ["7"]);
+        let body = if op == "get-data" { nmda("running", None, "<port>+007</port><hostname/>", "") } else { request(op, "<port>+007</port><hostname/>", "") };
+        assert_eq!(tags(&fixture.rpc(&body, MgmtLimits::default()).await, "hostname"), ["router-marker"]);
     }
 }
 
@@ -557,6 +1033,57 @@ async fn subtree_content_provider_validation_is_atomic() {
         error(&reply, "operation-failed");
         assert!(!reply.contains("router-marker"));
     }
+    let valid = "/ex:system/ex:peer[ex:site='east'][ex:id='7']/ex:up";
+    for op in ["get", "get-data"] {
+        for (bad_path, bad_value) in [
+            (valid, "false"),
+            ("/ex:system/ex:peer/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='east']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='east'][ex:id='7'][ex:extra='x']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='east'][ex:site='east'][ex:id='8']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:id='8'][ex:site='east']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='east'][ex:id='008']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='east'][ex:id=8]/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site=\"east\"][ex:id='8']/ex:up", "false"),
+            ("/ex:system/ex:peer[site='east'][id='8']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='west'][ex:id='8']/ex:up", "false"),
+            ("/ex:system/ex:peer[ex:site='east'][ex:id='8']/ex:label", "\"unsolicited\""),
+            ("/ex:system/ex:peer[ex:site='east'][ex:id='8']/ex:up", "{}"),
+            ("/ex:system/ex:peer[ex:site='east'][ex:id='8']/ex:up", "[false]"),
+        ] {
+            *fixture.access.values.lock().unwrap() = vec![state(valid, "true"), state(bad_path, bad_value)];
+            let reply = fixture.read(op, "<peer><site>east</site><up>true</up><label/></peer>", "").await;
+            error(&reply, "operation-failed");
+            assert!(!reply.contains("alpha-marker"));
+            assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 1);
+        }
+        *fixture.access.values.lock().unwrap() = vec![state(valid, "true"), state("/ex:system/ex:peer[ex:site='east'][ex:id='8']/ex:up", "false").with_origin(Some(opc_mgmt_opstate::Origin::System))];
+        error(&fixture.read(op, "<peer><up>true</up><label/></peer>", "").await, "operation-failed");
+        *fixture.access.values.lock().unwrap() = vec![
+            state("/ex:system/ex:state-peer[ex:site='north'][ex:id='7']/ex:label", "\"state-marker\""),
+            state("/ex:system/ex:state-peer[ex:site='north'][ex:id='7']/ex:id", "8"),
+        ];
+        error(&fixture.read(op, "<state-peer><label>state-marker</label><id/></state-peer>", "").await, "operation-failed");
+        let body = request(op, "<peer><up>true</up><up/></peer>", "");
+        let limits = MgmtLimits { max_paths_per_request: 16, max_value_bytes: 64, ..MgmtLimits::default() };
+        *fixture.access.values.lock().unwrap() = (0..16).map(|id| state(&format!("/ex:system/ex:peer[ex:site='east'][ex:id='{id}']/ex:up"), "true")).collect();
+        let reply = fixture.rpc(&body, limits).await;
+        assert_eq!(tags(&reply, "up"), vec!["true"; 16]);
+        assert_eq!(fixture.access.requests.lock().unwrap().last().unwrap().max_values, 16);
+        fixture.access.values.lock().unwrap().push(state("/ex:system/ex:peer[ex:site='east'][ex:id='16']/ex:up", "false"));
+        error(&fixture.rpc(&body, limits).await, "too-big");
+        let path = format!("/ex:system/ex:peer[ex:site='{}'][ex:id='7']/ex:up", "x".repeat(64 - valid.len() + 4));
+        assert_eq!(path.len(), 64);
+        *fixture.access.values.lock().unwrap() = vec![state(&path, "true")];
+        assert_eq!(tags(&fixture.rpc(&body, limits).await, "up"), ["true"]);
+        fixture.access.values.lock().unwrap().push(state(&path.replace("xxx", "xxxx"), "false"));
+        error(&fixture.rpc(&body, limits).await, "too-big");
+        let body = request(op, "<uptime>7</uptime><hostname/>", "");
+        *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:uptime", &format!("7{}", " ".repeat(63)))];
+        assert_eq!(tags(&fixture.rpc(&body, limits).await, "hostname"), ["router-marker"]);
+        *fixture.access.values.lock().unwrap() = vec![state("/ex:system/ex:uptime", &format!("7{}", " ".repeat(64)))];
+        error(&fixture.rpc(&body, limits).await, "too-big");
+    }
 }
 
 #[tokio::test]
@@ -570,6 +1097,38 @@ async fn subtree_content_size_and_plan_limits() {
     fixture.no_access();
     let body = request("get-config", "<hostname>router-marker</hostname><enabled>true</enabled>", "");
     error(&fixture.rpc(&body, limits).await, "too-big");
+    fixture.no_access();
+    let body = request("get-config", "<hostname>router-marker</hostname><count/>", "");
+    let xml = format!("<rpc xmlns=\"{NC}\" message-id=\"match\">{body}</rpc>");
+    let exact = MgmtLimits { max_request_bytes: xml.len(), max_value_bytes: 64, max_xpath_filter_bytes: 1, ..MgmtLimits::default() };
+    let reply = fixture.direct_rpc(&body, exact);
+    assert!(!reply.contains("<rpc-error>"), "exact request bytes: {reply}");
+    assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
+    error(&fixture.direct_rpc(&body, MgmtLimits { max_request_bytes: xml.len() - 1, ..exact }), "too-big");
+    fixture.no_access();
+    let exact = MgmtLimits { max_xml_depth: 5, max_xml_attributes_per_element: 2, max_xml_namespace_decls: 1, ..MgmtLimits::default() };
+    let reply = fixture.rpc(&body, exact).await;
+    assert!(!reply.contains("<rpc-error>"), "exact XML shape: {reply}");
+    assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]);
+    for small in [MgmtLimits { max_xml_depth: 4, ..exact }, MgmtLimits { max_xml_attributes_per_element: 1, ..exact }] {
+        error(&fixture.direct_rpc(&body, small), "too-big"); fixture.no_access();
+    }
+    let extra_ns = body.replace(&format!("<system xmlns=\"{EX}\">"), &format!("<system xmlns=\"{EX}\" xmlns:extra=\"urn:unused\">"));
+    error(&fixture.direct_rpc(&extra_ns, exact), "too-big"); fixture.no_access();
+    // Three raw nodes fit before expansion. A separate plan bound then rejects
+    // additional resolved scopes and dependencies, without data access.
+    let raw_exact = MgmtLimits { max_subtree_filter_nodes: 3, ..MgmtLimits::default() };
+    assert!(opc_netconf_server::xml::parse_rpc(&xml, &raw_exact).is_ok());
+    assert!(opc_netconf_server::xml::parse_rpc(&xml, &MgmtLimits { max_subtree_filter_nodes: 2, ..raw_exact }).is_err());
+    error(&fixture.direct_rpc(&body, raw_exact), "too-big"); fixture.no_access();
+    let mut first = None;
+    for bound in 4..128 {
+        let reply = fixture.direct_rpc(&body, MgmtLimits { max_subtree_filter_nodes: bound, ..MgmtLimits::default() });
+        if !reply.contains("<rpc-error>") { first = Some(bound); assert_eq!(tags(&reply, "count"), [u32::MAX.to_string()]); break; }
+        error(&reply, "too-big"); fixture.no_access();
+    }
+    let first = first.expect("small plan fits a small node cap");
+    error(&fixture.direct_rpc(&body, MgmtLimits { max_subtree_filter_nodes: first - 1, ..MgmtLimits::default() }), "too-big");
     fixture.no_access();
 }
 
@@ -588,6 +1147,41 @@ async fn subtree_content_work_is_bounded_without_output() {
     }
     let fixture = Fixture::new(model, &[]).await;
     error(&fixture.read("get-config", "<peer><label>missing</label></peer>", "").await, "too-big");
+    for content in [
+        "<peer><label>missing</label><id/></peer>",
+        "<peer><label>missing</label><id/></peer><peer><label>missing</label><id/></peer>",
+        "<peer><lane><label>missing</label><slot/></lane></peer>",
+    ] {
+        let fixture = Fixture::new(config(), &[]).await;
+        let body = request("get-config", content, "");
+        assert_eq!(data(&fixture.rpc(&body, MgmtLimits::default()).await), "");
+        let used = MgmtLimits::default().max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+        assert!(used < 250_000, "small fixtures need a small allowance");
+        let exact = MgmtLimits { max_subtree_filter_work_units: used, ..MgmtLimits::default() };
+        assert_eq!(data(&fixture.rpc(&body, exact).await), "");
+        assert_eq!(fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining(), 0);
+        let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: used - 1, ..exact }).await;
+        error(&reply, "too-big");
+        assert!(!reply.contains("<data"));
+    }
+    let mut previous = None;
+    let mut hidden_budget = None;
+    for mut model in [config(), System::default(), config()] {
+        if previous.is_some() { for row in model.peer.values_mut() { row.id = LeafPresence::Absent; row.label = LeafPresence::Explicit("hidden".repeat(500)); } }
+        model.hostname = LeafPresence::Explicit("router-marker".into());
+        let fixture = Fixture::new(model, &["/ex:system/ex:peer/ex:label"]).await;
+        *fixture.access.trap.lock().unwrap() = Some("/ex:system/ex:peer");
+        let body = request("get-config", "<peer><label>missing</label><id/></peer><hostname/>", "");
+        if hidden_budget.is_none() {
+            assert_eq!(tags(&fixture.rpc(&body, MgmtLimits::default()).await, "hostname"), ["router-marker"]);
+            hidden_budget = Some(MgmtLimits::default().max_subtree_filter_work_units - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining());
+        }
+        let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: hidden_budget.unwrap(), ..MgmtLimits::default() }).await;
+        assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+        let observation = fixture.observation();
+        if let Some(previous) = &previous { assert_eq!(&observation, previous); }
+        previous = Some(observation);
+    }
 }
 
 #[tokio::test]
@@ -598,5 +1192,56 @@ async fn subtree_content_read_preservation() {
         assert_eq!(tags(&reply, "label"), ["alpha-marker", "beta-marker"]);
         assert_eq!(tags(&reply, "credential"), ["&lt;redacted&gt;", "&lt;redacted&gt;"]);
         assert_eq!(tags(&reply, "id"), ["7", "8"]);
+        let reply = fixture.read(op, "<hostname>router-marker</hostname><user-peer><name/><label/></user-peer>", "").await;
+        assert_eq!(tags(&reply, "name"), ["z", "a", "m"]);
+        assert_eq!(tags(&reply, "label"), ["user-z-&lt;&amp;\"'\\-marker", "user-a-&lt;&amp;\"'\\-marker", "user-m-&lt;&amp;\"'\\-marker"]);
+        let reply = fixture.read(op, "<user-peer><name>m</name><label/></user-peer><user-peer><name>z</name><label/></user-peer><user-peer><name>z</name><label/></user-peer>", "").await;
+        assert_eq!(tags(&reply, "name"), ["z", "m"]);
+        let reply = fixture.read(op, "<peer><site>west</site><label/></peer><peer><site>east</site><label/></peer>", "").await;
+        assert_eq!(tags(&reply, "label"), ["alpha-marker", "beta-marker", "gamma-marker"]);
+        let structural = fixture.read(op, "<user-peer><name/><label/></user-peer>", "").await;
+        assert_eq!(tags(&structural, "name"), ["z", "a", "m"]);
+    }
+    let mut stored = config();
+    stored.hostname = LeafPresence::Explicit("startup-marker".into());
+    let startup = Arc::new(Startup { config: Mutex::new(Some(stored)), loads: AtomicUsize::new(0) });
+    let fixture = Fixture::with_datastores(config(), &[], Some(startup.clone()), true).await;
+    for datastore in ["running", "candidate", "startup", "intended"] {
+      for op in ["get-config", "get-data"] {
+        if op == "get-config" && datastore == "intended" { continue; }
+        let hostname = if datastore == "startup" { "startup-marker" } else { "router-marker" };
+        let children = format!("<hostname>{hostname}</hostname><peer><label/><credential/></peer>");
+        let body = if op == "get-config" { request(op, &children, "").replace("<running/>", &format!("<{datastore}/>")) }
+            else { nmda(datastore, None, &children, "") };
+        let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+        assert_eq!(tags(&reply, "hostname"), [hostname]);
+        assert_eq!(tags(&reply, "label"), ["alpha-marker", "beta-marker", "gamma-marker"]);
+        assert_eq!(tags(&reply, "credential"), ["&lt;redacted&gt;"; 3]);
+        assert_eq!(fixture.access.provider.load(Ordering::SeqCst), 0);
+      }
+    }
+    for denied in [vec![], vec!["/ex:system/**"]] {
+      let fixture = Fixture::with_datastores(config(), &denied, Some(startup.clone()), true).await;
+      for datastore in ["candidate", "startup"] {
+        for op in ["get-config", "get-data"] {
+          for (children, schema_refusal) in [("<secret>probe</secret>", true), ("<peer><cost>7</cost><label/></peer>", false)] {
+            if !schema_refusal && denied.is_empty() { continue; }
+            startup.loads.store(0, Ordering::SeqCst);
+            let body = if op == "get-config" { request(op, children, "").replace("<running/>", &format!("<{datastore}/>")) }
+                else { nmda(datastore, None, children, "") };
+            let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+            if schema_refusal { error(&reply, "operation-not-supported"); fixture.no_access(); }
+            else { assert_eq!(data(&reply), ""); assert_eq!(fixture.access.model.load(Ordering::SeqCst), 0); }
+            assert_eq!(startup.loads.load(Ordering::SeqCst), 0);
+          }
+        }
+      }
+    }
+    let fixture = Fixture::new(config(), &[]).await;
+    fixture.access.unsupported_projection.store(1, Ordering::SeqCst);
+    for op in ["get-config", "get", "get-data"] {
+        error(&fixture.read(op, "<hostname>router-marker</hostname><count/>", "").await, "operation-not-supported");
+        fixture.no_access();
+        assert_eq!(tags(&fixture.read(op, "<hostname/>", "").await, "hostname"), ["router-marker"]);
     }
 }

@@ -1039,6 +1039,15 @@ impl ParserState {
         if self.root_closed && self.stack.is_empty() {
             return Err(XmlError::MultipleRoots);
         }
+        limits.check_depth(
+            self.stack
+                .len()
+                .checked_add(1)
+                .ok_or(XmlError::SubtreeFilterLimit)?,
+        )?;
+        if self.filter_depth > 0 {
+            self.charge_filter_namespaces(start.as_ref().len())?;
+        }
 
         let scoped = scoped_attributes(start, limits, self.scopes.last())?;
         let raw_name = start.name();
@@ -1050,7 +1059,6 @@ impl ParserState {
             namespace,
         };
 
-        limits.check_depth(self.stack.len() + 1)?;
         let capture_root =
             self.edit_config_capture.is_none() && self.is_edit_config_config_start(&element);
         let capture_start = self.edit_config_capture.is_some() || capture_root;
@@ -1078,6 +1086,9 @@ impl ParserState {
     }
 
     fn pop_end(&mut self, raw_name: &str) -> Result<(), XmlError> {
+        if self.filter_depth > 0 {
+            self.charge_filter_namespaces(raw_name.len())?;
+        }
         let scope = self.scopes.last().ok_or(XmlError::Malformed)?;
         let (prefix, local) = split_qname(raw_name)?;
         let namespace = resolve_namespace(prefix, scope)?;
@@ -1119,6 +1130,37 @@ impl ParserState {
             self.root_closed = true;
         }
         Ok(())
+    }
+
+    fn charge_filter_namespaces(&mut self, raw_bytes: usize) -> Result<(), XmlError> {
+        let entries = self.scopes.last().map_or(0, |scope| scope.bindings.len());
+        self.charge_filter_work(entries.checked_add(1).ok_or(XmlError::SubtreeFilterLimit)?)?;
+        let inherited = self
+            .scopes
+            .last()
+            .map(|scope| {
+                scope.bindings.iter().try_fold(
+                    scope.default.as_ref().map_or(0, String::len),
+                    |sum, (key, value)| {
+                        sum.checked_add(key.len())
+                            .and_then(|sum| sum.checked_add(value.len()))
+                            .ok_or(XmlError::SubtreeFilterLimit)
+                    },
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        // Precharge attribute decoding/retention, inherited scope copies and
+        // namespace resolution before the XML library allocates their strings.
+        let work = raw_bytes
+            .checked_mul(4)
+            .and_then(|sum| {
+                inherited
+                    .checked_mul(2)
+                    .and_then(|bytes| sum.checked_add(bytes))
+            })
+            .ok_or(XmlError::SubtreeFilterLimit)?;
+        self.charge_filter_work(work)
     }
 
     fn charge_filter_work(&mut self, units: usize) -> Result<(), XmlError> {
@@ -2663,18 +2705,31 @@ impl ParserState {
         if !matches!(self.active_filter(), Some(Filter::Subtree(_))) {
             return Err(XmlError::UnsupportedFilterContent);
         }
-        self.filter_node_count += 1;
+        self.filter_node_count = self
+            .filter_node_count
+            .checked_add(1)
+            .ok_or(XmlError::SubtreeFilterLimit)?;
         self.limits
             .check_subtree_filter_nodes(self.filter_node_count)
             .map_err(|_| XmlError::SubtreeFilterLimit)?;
-        let path_bytes = self.filter_stack.last().map_or(0, |frame| {
-            frame
-                .path
-                .iter()
-                .map(|name| name.namespace.len() + name.local.len())
-                .sum()
-        });
-        self.charge_filter_work(1 + path_bytes + element.namespace.len() + element.local.len())?;
+        let path_bytes = self
+            .filter_stack
+            .last()
+            .map(|frame| {
+                frame.path.iter().try_fold(0usize, |sum, name| {
+                    sum.checked_add(name.namespace.len())
+                        .and_then(|sum| sum.checked_add(name.local.len()))
+                        .ok_or(XmlError::SubtreeFilterLimit)
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let work = path_bytes
+            .checked_add(element.namespace.len())
+            .and_then(|sum| sum.checked_add(element.local.len()))
+            .and_then(|sum| sum.checked_add(1))
+            .ok_or(XmlError::SubtreeFilterLimit)?;
+        self.charge_filter_work(work)?;
         let mut suppress_subtree = self
             .filter_stack
             .last()
@@ -2721,7 +2776,14 @@ impl ParserState {
             return Err(XmlError::UnsupportedFilterContent);
         }
         let element = frame.path.last().ok_or(XmlError::Malformed)?;
-        self.charge_filter_work(element.namespace.len() + element.local.len())?;
+        self.charge_filter_work(
+            element
+                .namespace
+                .len()
+                .checked_add(element.local.len())
+                .and_then(|bytes| bytes.checked_add(2))
+                .ok_or(XmlError::SubtreeFilterLimit)?,
+        )?;
         let node = SubtreeNode {
             element: element.clone(),
             text: frame.text,
@@ -3138,6 +3200,9 @@ fn parse_message_with_context(
                     .check_value_bytes(reference.len())
                     .map_err(|err| parse_error(&state, err.into()))?;
                 if state.filter_depth > 0 {
+                    state
+                        .charge_filter_work(reference.len())
+                        .map_err(|err| parse_error(&state, err))?;
                     let character = filter_reference(reference.as_ref())
                         .ok_or_else(|| parse_error(&state, XmlError::EntityForbidden))?;
                     let mut bytes = [0; 4];
@@ -3227,17 +3292,40 @@ fn scoped_attributes(
     limits: &MgmtLimits,
     parent: Option<&NamespaceScope>,
 ) -> Result<ScopedAttributes, XmlError> {
+    // Reject the first excess attribute before decoding or retaining any value.
+    let mut attr_count = 0usize;
+    let mut ns_count = 0usize;
+    for attr in start.attributes().with_checks(true) {
+        let attr = attr.map_err(|_| XmlError::Malformed)?;
+        attr_count = attr_count.checked_add(1).ok_or(XmlError::Malformed)?;
+        if attr_count > limits.max_xml_attributes_per_element {
+            return Err(LimitsError::Exceeded {
+                limit: "xml_attributes_per_element",
+                max: limits.max_xml_attributes_per_element,
+                actual: attr_count,
+            }
+            .into());
+        }
+        if attr.key.as_ref() == "xmlns" || attr.key.as_ref().starts_with("xmlns:") {
+            ns_count = ns_count.checked_add(1).ok_or(XmlError::Malformed)?;
+            if ns_count > limits.max_xml_namespace_decls {
+                return Err(LimitsError::Exceeded {
+                    limit: "xml_namespace_decls",
+                    max: limits.max_xml_namespace_decls,
+                    actual: ns_count,
+                }
+                .into());
+            }
+        }
+    }
     let mut scope = parent.cloned().unwrap_or_default();
     let mut attrs = Vec::new();
     let mut reply_attrs = Vec::new();
-    let mut attr_count = 0usize;
-    let mut ns_count = 0usize;
     let mut default_declared = false;
     let mut declared_prefixes = BTreeSet::new();
 
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| XmlError::Malformed)?;
-        attr_count += 1;
         let key = attr.key.as_ref();
         let value = attr
             .normalized_value(XmlVersion::Implicit1_0)
@@ -3247,7 +3335,6 @@ fn scoped_attributes(
         reply_attrs.push((key.to_string(), value.clone()));
 
         if key == "xmlns" {
-            ns_count += 1;
             if default_declared {
                 return Err(XmlError::Malformed);
             }
@@ -3255,7 +3342,6 @@ fn scoped_attributes(
             validate_namespace_binding(None, &value)?;
             scope.default = Some(value);
         } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-            ns_count += 1;
             if prefix.is_empty() {
                 return Err(XmlError::Malformed);
             }
@@ -3269,22 +3355,6 @@ fn scoped_attributes(
         }
     }
 
-    if attr_count > limits.max_xml_attributes_per_element {
-        return Err(LimitsError::Exceeded {
-            limit: "xml_attributes_per_element",
-            max: limits.max_xml_attributes_per_element,
-            actual: attr_count,
-        }
-        .into());
-    }
-    if ns_count > limits.max_xml_namespace_decls {
-        return Err(LimitsError::Exceeded {
-            limit: "xml_namespace_decls",
-            max: limits.max_xml_namespace_decls,
-            actual: ns_count,
-        }
-        .into());
-    }
     validate_attribute_names(&attrs, &scope)?;
 
     Ok(ScopedAttributes {
@@ -5049,6 +5119,44 @@ mod tests {
             .expect_err("first node overflow"),
             XmlError::SubtreeFilterLimit
         );
+    }
+
+    #[test]
+    fn subtree_aggregate_decoded_bytes_are_checked_before_retention() {
+        // Wire XML overhead makes this aggregate cap unreachable before the
+        // request-byte cap. Exercise the retention boundary directly as well.
+        let limits = MgmtLimits {
+            max_request_bytes: 4,
+            max_value_bytes: 4,
+            max_xpath_filter_bytes: 1,
+            ..MgmtLimits::default()
+        };
+        let mut state = ParserState::new(limits);
+        state.get = Some(PartialGet {
+            filter: Some(Filter::Subtree(SubtreeFilter::default())),
+            ..PartialGet::default()
+        });
+        for text in ["ab", "cd"] {
+            let element = Element {
+                namespace: "urn:test".into(),
+                local: "value".into(),
+            };
+            state.process_filter_content_start(&element, &[]).unwrap();
+            state.append_filter_text(text).unwrap();
+            state.finish_filter_content_element().unwrap();
+        }
+        assert_eq!(state.filter_decoded_bytes, 4);
+        let element = Element {
+            namespace: "urn:test".into(),
+            local: "value".into(),
+        };
+        state.process_filter_content_start(&element, &[]).unwrap();
+        assert_eq!(
+            state.append_filter_text("e"),
+            Err(XmlError::SubtreeFilterLimit)
+        );
+        assert_eq!(state.filter_decoded_bytes, 4);
+        assert!(state.filter_stack.last().unwrap().text.0.is_empty());
     }
 
     #[test]

@@ -80,6 +80,13 @@
       "kind": "assertions-decreased",
       "reason": "Denied operational events now omit per-event audit work. The former audit-record assertions are replaced by an empty audit sink assertion; authenticated hidden-event and blocked-audit regressions cover omission and independent authorization termination.",
       "issue": 1269
+    },
+    {
+      "test": "rust:crates/opc-netconf-server::lib=lib::xml::tests::rejects_subtree_filter_content_match_until_supported",
+      "kind": "removed",
+      "reason": "Subtree scalar content matching is now supported under RFC 6241 section 6.2.5. The replacement checks bounded tree retention without flattening; authenticated generated-service tests cover matching, authorization, masking and resource limits.",
+      "issue": 1272,
+      "renamed_to": "rust:crates/opc-netconf-server::lib=lib::xml::tests::parses_subtree_filter_content_match_without_flattening"
     }
   ]
 }

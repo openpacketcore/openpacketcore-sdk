@@ -124,7 +124,8 @@ fn legacy_constructs_keep_every_generated_file_byte_identical() {
     // Captured from d50c92ad1, with #1268 state-write and value-free diagnostic
     // changes in patch.rs, netconf_xml_edit.rs, and validate.rs. Read pins include
     // #1269 authorized keys and hidden-ancestor omission plus #1270 canonical key
-    // literals and native instance trees. Every complete generated file stays pinned.
+    // literals and native instance trees, plus #1272 bounded content projection.
+    // Every complete generated file stays pinned.
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/legacy_constructs_digests.json")).unwrap();
     let parsed = generation_input_from_yang_sources(

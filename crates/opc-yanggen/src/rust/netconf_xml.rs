@@ -14,6 +14,8 @@ use crate::ir::{SchemaNode, SchemaNodeKind, TypeRef};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+mod content;
+
 /// Emits the `netconf_xml` module for the generated crate.
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let nodes_by_path = NodeIndex::new(&input.nodes);
@@ -55,6 +57,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     let root_path = &root.path;
     let root_function = format_ident!("render_{}", nodes_by_path.helper_name(root_path));
+    let content_function = format_ident!("content_{}", nodes_by_path.helper_name(root_path));
+    let content_functions = content::functions(root, &nodes_by_path)?;
 
     let tokens = quote! {
         #[allow(unused_imports)]
@@ -67,6 +71,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         pub struct GeneratedNetconfXmlRenderer;
 
         impl NetconfXmlRenderer<super::types::#root_type_ident> for GeneratedNetconfXmlRenderer {
+            fn supports_subtree_content(&self) -> bool { true }
+
+            fn project_subtree_content(
+                &self,
+                config: &super::types::#root_type_ident,
+                context: &opc_mgmt_schema::subtree::SubtreeProjection<'_>,
+            ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, opc_mgmt_schema::subtree::SubtreeError> {
+                #content_function(config, context)
+            }
+
             fn render_running_config(
                 &self,
                 config: &super::types::#root_type_ident,
@@ -122,6 +136,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #(#render_fns)*
+        #(#content_functions)*
 
         /// Returns the generated NETCONF XML renderer for this schema.
         pub fn renderer() -> GeneratedNetconfXmlRenderer {

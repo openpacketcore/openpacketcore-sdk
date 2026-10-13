@@ -5,6 +5,7 @@ use std::sync::Arc;
 use opc_config_bus::ConfigBus;
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
+use opc_mgmt_schema::subtree::{AuthorizedSubtreePlan, SubtreeError};
 use opc_mgmt_schema::{
     merge_netconf_data, render_netconf_data, DefaultReport, EditOperation, NetconfEditError,
     NetconfProjectionError, NetconfXmlEditApplicator, NetconfXmlRenderer, NodeKind, SchemaRegistry,
@@ -247,6 +248,7 @@ pub struct ReadSelection<'a> {
     schema_paths: &'a [&'static str],
     predicates: &'a [opc_mgmt_schema::NetconfKeyPredicate],
     instances: &'a [opc_mgmt_schema::NetconfInstanceBranch],
+    subtree_plan: Option<&'a AuthorizedSubtreePlan>,
 }
 
 impl<'a> ReadSelection<'a> {
@@ -256,6 +258,7 @@ impl<'a> ReadSelection<'a> {
             schema_paths,
             predicates: &[],
             instances: &[],
+            subtree_plan: None,
         }
     }
 
@@ -285,6 +288,30 @@ impl<'a> ReadSelection<'a> {
     /// Original instance constraints, separate from schema authorization.
     pub const fn instances(&self) -> &'a [opc_mgmt_schema::NetconfInstanceBranch] {
         self.instances
+    }
+
+    /// Carries a completely authorized content plan into typed projection.
+    pub fn with_subtree_plan(plan: &'a AuthorizedSubtreePlan) -> Self {
+        Self {
+            schema_paths: plan.paths(),
+            predicates: &[],
+            instances: &[],
+            subtree_plan: Some(plan),
+        }
+    }
+
+    /// The constrained plan, which a renderer must honor or explicitly refuse.
+    pub const fn subtree_plan(&self) -> Option<&'a AuthorizedSubtreePlan> {
+        self.subtree_plan
+    }
+
+    pub(crate) fn require_schema_only(self) -> Result<(), BindingError> {
+        if self.subtree_plan.is_some() {
+            return Err(BindingError::projection(
+                "constrained subtree projection is required",
+            ));
+        }
+        Ok(())
     }
 
     /// Predicate-free schema-node paths the caller may read.
@@ -407,6 +434,74 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Whether this binding can honor the typed, bounded content-plan contract.
+    fn supports_subtree_content(&self) -> bool {
+        self.generated_xml_renderer()
+            .is_some_and(|renderer| renderer.supports_subtree_content())
+    }
+
+    /// Default processing used by an ordinary read without `with-defaults`.
+    ///
+    /// The default XML rendering hooks use trim. A binding that overrides
+    /// their ordinary default processing must return the same report here so
+    /// content matches see exactly the values its unfiltered read reports.
+    fn subtree_default_report(&self) -> DefaultReport {
+        DefaultReport::Trim
+    }
+
+    /// Captures only authorized typed values before content matching.
+    ///
+    /// Implementations must gate every row and value through the plan's shared
+    /// projection context. A schema-only or pre-rendered XML fallback is unsafe.
+    fn project_subtree_content(
+        &self,
+        config: &C,
+        selection: ReadSelection<'_>,
+        report: DefaultReport,
+    ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError> {
+        let renderer = self
+            .generated_xml_renderer()
+            .ok_or(SubtreeError::Unsupported)?;
+        if !renderer.supports_subtree_content()
+            || !renderer.supported_default_reports().contains(&report)
+        {
+            return Err(SubtreeError::Unsupported);
+        }
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        renderer.project_subtree_content(config, &plan.projection(self.schema_registry(), report))
+    }
+
+    /// Typed, bounded YANG Library projection for a constrained content read.
+    /// Custom discovery bindings must implement this hook or refuse the read.
+    fn project_yang_library_content(
+        &self,
+        selection: ReadSelection<'_>,
+    ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError> {
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        discovery::project_yang_library(
+            self.schema_registry(),
+            &plan.projection(
+                crate::filter::yang_library_registry(),
+                DefaultReport::Explicit,
+            ),
+        )
+    }
+
+    /// Typed, bounded NETCONF monitoring projection for a constrained read.
+    fn project_netconf_monitoring_content(
+        &self,
+        selection: ReadSelection<'_>,
+    ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError> {
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        discovery::project_netconf_monitoring(
+            self.schema_registry(),
+            &plan.projection(
+                crate::filter::netconf_monitoring_registry(),
+                DefaultReport::Explicit,
+            ),
+        )
+    }
+
     /// Optional generated NETCONF XML edit applicator for this binding.
     ///
     /// When a CNF returns `Some`, the default
@@ -436,6 +531,7 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         config: &C,
         selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
+        selection.require_schema_only()?;
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
             BindingError::projection(
                 "NETCONF running XML projection is not provided by this binding",
@@ -521,6 +617,7 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         selection: ReadSelection<'_>,
         mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
+        selection.require_schema_only()?;
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
             BindingError::projection(
                 "NETCONF with-defaults running projection is not provided by this binding",
@@ -569,6 +666,8 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         operational: &OperationalResponse,
         operational_selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
+        config_selection.require_schema_only()?;
+        operational_selection.require_schema_only()?;
         render_selected_data(
             self.schema_registry(),
             self.generated_xml_renderer(),
@@ -594,6 +693,8 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         operational_selection: ReadSelection<'_>,
         mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
+        config_selection.require_schema_only()?;
+        operational_selection.require_schema_only()?;
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
             BindingError::projection(
                 "NETCONF with-defaults data projection is not provided by this binding",

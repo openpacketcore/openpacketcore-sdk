@@ -16,6 +16,9 @@ pub(crate) use key_predicates::prepare_read_filter;
 mod instances;
 pub(crate) use instances::prepare_instance_read_filter;
 
+mod content;
+pub(crate) use content::{compile_content, ContentScope};
+
 /// RFC 8525 `ietf-yang-library` XML namespace.
 pub const YANG_LIBRARY_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-yang-library";
 /// RFC 8525 `ietf-yang-library` module name.
@@ -766,6 +769,9 @@ pub enum FilterError {
     /// A constrained subtree requires the content-plan evaluator.
     #[error("NETCONF subtree content plan is not supported")]
     UnsupportedContent,
+    /// A content plan exhausted a fixed node or work bound.
+    #[error("NETCONF subtree filter exceeds a limit")]
+    ContentLimit,
     /// The XPath filter used a valid XPath construct outside the currently
     /// supported bounded schema-selection subset.
     #[error("NETCONF XPath filter is not supported")]
@@ -803,7 +809,7 @@ impl FilterError {
                 NetconfError::new(NetconfErrorType::Protocol, NetconfErrorTag::BadElement),
                 "bad element",
             ),
-            Self::Limit(_) => RpcError::too_big(),
+            Self::Limit(_) | Self::ContentLimit => RpcError::too_big(),
             Self::UnknownNamespace => RpcError::new(
                 NetconfError::new(
                     NetconfErrorType::Protocol,
@@ -826,7 +832,7 @@ impl FilterError {
             }
             Self::MaskedKeyMatch => "invalid-value",
             Self::InvalidXPath => "bad-element",
-            Self::Limit(_) => "too-big",
+            Self::Limit(_) | Self::ContentLimit => "too-big",
             Self::UnknownNamespace => "unknown-namespace",
             Self::UnknownNode => "bad-element",
         }
@@ -982,6 +988,7 @@ impl SelectionOutcome {
             | FilterError::UnsupportedSubtree
             | FilterError::MaskedKeyMatch
             | FilterError::UnsupportedContent
+            | FilterError::ContentLimit
             | FilterError::InvalidXPath
             | FilterError::Limit(_) => {}
             FilterError::UnknownNamespace => self.unknown_namespace = true,

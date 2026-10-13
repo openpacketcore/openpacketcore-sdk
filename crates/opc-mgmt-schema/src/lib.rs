@@ -34,6 +34,11 @@ pub use netconf_data::{
     merge_netconf_data, render_netconf_data, NetconfDataNode, NetconfInstanceBranch,
 };
 
+pub mod subtree;
+
+mod netconf_tree;
+pub use netconf_tree::{merge_netconf_nodes, NetconfInstanceSelector, NetconfXmlNode};
+
 pub use opc_data_governance::DataClass;
 
 /// Leaf value type, a closed mirror of `opc_yanggen::ir::TypeRef` minus the
@@ -891,6 +896,24 @@ impl std::error::Error for NetconfProjectionError {}
 /// so the server can render running config (and the config part of `<get>`)
 /// without hand-written XML projection.
 pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
+    /// Whether this renderer supports bounded typed subtree-content projection.
+    /// A constrained read must never fall back to a schema-only renderer.
+    fn supports_subtree_content(&self) -> bool {
+        false
+    }
+
+    /// Projects only the authorized paths in a constrained subtree plan.
+    /// Implementations gate every field and row access through the context and
+    /// charge visits and copies before performing them. Defaults are applied
+    /// before values become available to predicate evaluation.
+    fn project_subtree_content(
+        &self,
+        _config: &C,
+        _context: &subtree::SubtreeProjection<'_>,
+    ) -> Result<Vec<NetconfXmlNode>, subtree::SubtreeError> {
+        Err(subtree::SubtreeError::Unsupported)
+    }
+
     /// Render the running-config XML fragment for the authorized `selection`.
     fn render_running_config(
         &self,

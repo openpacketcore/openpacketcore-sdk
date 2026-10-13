@@ -777,6 +777,11 @@ where
         operation: &RpcOperation,
         limits: &MgmtLimits,
     ) -> Option<(NetconfOperation, crate::filter::FilterError)> {
+        if crate::operations::content::ContentRequest::from_operation(operation)
+            .is_some_and(|request| request.use_content_handler(&self.binding))
+        {
+            return None;
+        }
         let (metric, filter) = match operation {
             RpcOperation::Get(request) => (NetconfOperation::Get, request.filter.as_ref()),
             RpcOperation::GetData(request)
@@ -1141,6 +1146,57 @@ where
             ));
         }
 
+        if let Some(request) =
+            crate::operations::content::ContentRequest::from_operation(&parsed.operation)
+                .filter(|request| request.use_content_handler(&self.binding))
+        {
+            return RpcHandlingResult::keep_open(crate::operations::poll_ready(
+                crate::operations::content::handle_with_gate(
+                    &self.binding,
+                    GetContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                    |source| self.load_content_config(source),
+                    AuditMode::Synchronous,
+                    || async {
+                        let gate = config_authority_gate(&parsed.operation)?;
+                        if self.config_authority.is_some()
+                            || self
+                                .binding
+                                .config_bus()
+                                .authority_mode()
+                                .requires_external_authority()
+                        {
+                            return Some(
+                                self.authority_rejection_reply_sync(
+                                    RpcExecContext {
+                                        request_id,
+                                        principal,
+                                        message_id: &parsed.message_id,
+                                        reply_attrs: &parsed.reply_attrs,
+                                        started,
+                                    },
+                                    gate,
+                                    ConfigAuthorityOutcome::Unavailable,
+                                )
+                                .reply_xml,
+                            );
+                        }
+                        None
+                    },
+                ),
+            ));
+        }
+
         if let Some(gate) = config_authority_gate(&parsed.operation) {
             if self.config_authority.is_some()
                 || self
@@ -1486,6 +1542,52 @@ where
                 &parsed.reply_attrs,
                 RpcError::operation_failed(),
             ))
+            .into();
+        }
+
+        if let Some(request) =
+            crate::operations::content::ContentRequest::from_operation(&parsed.operation)
+                .filter(|request| request.use_content_handler(&self.binding))
+        {
+            return RpcHandlingResult::keep_open(
+                crate::operations::content::handle_with_gate(
+                    &self.binding,
+                    GetContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                    |source| self.load_content_config(source),
+                    AuditMode::Asynchronous,
+                    || async {
+                        let gate = config_authority_gate(&parsed.operation)?;
+                        let outcome = self.ensure_config_authority(gate.operation).await.err()?;
+                        Some(
+                            self.authority_rejection_reply_async(
+                                RpcExecContext {
+                                    request_id,
+                                    principal,
+                                    message_id: &parsed.message_id,
+                                    reply_attrs: &parsed.reply_attrs,
+                                    started,
+                                },
+                                gate,
+                                outcome,
+                            )
+                            .await
+                            .reply_xml,
+                        )
+                    },
+                )
+                .await,
+            )
             .into();
         }
 
@@ -2139,6 +2241,39 @@ where
             .filter(|node| node.config)
             .map(|node| node.path)
             .collect()
+    }
+
+    fn load_content_config(
+        &self,
+        source: crate::operations::content::ContentSource,
+    ) -> Result<Arc<C>, RpcError> {
+        use crate::operations::content::ContentSource;
+        match source {
+            ContentSource::Running => {
+                Ok(self.binding.config_bus().current_snapshot().config.clone())
+            }
+            ContentSource::Candidate => {
+                let running = self.binding.config_bus().current_snapshot();
+                let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
+                let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
+                if candidate.base_version != running.version {
+                    return Err(RpcError::operation_failed());
+                }
+                Ok(Arc::new(candidate.config))
+            }
+            ContentSource::Startup => self
+                .binding
+                .startup_datastore()
+                .ok_or_else(RpcError::operation_not_supported)?
+                .load_startup_config()
+                .map_err(|error| match error {
+                    StartupDatastoreError::NotFound => RpcError::data_missing(),
+                    StartupDatastoreError::Unsupported => RpcError::operation_not_supported(),
+                    StartupDatastoreError::Failed { .. } => RpcError::operation_failed(),
+                })?
+                .map(Arc::new)
+                .ok_or_else(RpcError::data_missing),
+        }
     }
 
     fn candidate_config_for_get_config(&self, request: &crate::xml::GetConfigRequest) -> Option<C> {
