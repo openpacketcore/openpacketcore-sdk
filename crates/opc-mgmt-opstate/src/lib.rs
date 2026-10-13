@@ -152,6 +152,17 @@ impl OperationalRequest {
     }
 }
 
+/// JSON shape established when an immutable operational value is constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationalValueShape {
+    /// A non-null JSON string, number or boolean.
+    Scalar,
+    /// JSON null, representing no reported scalar.
+    Null,
+    /// An array or object, unsuitable for a scalar-only response.
+    Structured,
+}
+
 /// One reported operational value.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OperationalValue {
@@ -159,6 +170,8 @@ pub struct OperationalValue {
     path: YangPath,
     /// RFC 7951 JSON encoding of the value or subtree.
     value_json: String,
+    /// Immutable syntax proof permits shape checks without decoding masked data.
+    json_shape: OperationalValueShape,
     /// NMDA origin, present only when requested and genuinely known.
     origin: Option<Origin>,
 }
@@ -173,11 +186,21 @@ impl OperationalValue {
         value_json: impl Into<String>,
     ) -> Result<Self, OperationalValueError> {
         let value_json = value_json.into();
-        serde_json::from_str::<serde_json::Value>(&value_json)
+        let parsed = serde_json::from_str::<serde_json::Value>(&value_json)
             .map_err(|_| OperationalValueError::InvalidJson)?;
+        let json_shape = match parsed {
+            serde_json::Value::Null => OperationalValueShape::Null,
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => OperationalValueShape::Scalar,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                OperationalValueShape::Structured
+            }
+        };
         Ok(Self {
             path,
             value_json,
+            json_shape,
             origin: None,
         })
     }
@@ -197,6 +220,12 @@ impl OperationalValue {
     /// RFC 7951 JSON encoding of the value or subtree.
     pub fn value_json(&self) -> &str {
         &self.value_json
+    }
+
+    /// Returns the validated shape without parsing or copying the payload.
+    /// The encoded JSON is private and immutable, so this cannot become stale.
+    pub fn json_shape(&self) -> OperationalValueShape {
+        self.json_shape
     }
 
     /// NMDA origin, present only when requested and genuinely known.

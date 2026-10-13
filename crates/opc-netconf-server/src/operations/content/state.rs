@@ -2,7 +2,7 @@
 
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_limits::MgmtLimits;
-use opc_mgmt_opstate::OperationalRequest;
+use opc_mgmt_opstate::{OperationalRequest, OperationalValueShape};
 use opc_mgmt_path::{append_key_predicate, parse_canonical_path};
 use opc_mgmt_schema::subtree::{
     canonical_key, merge_bounded, AuthorizedSubtreePlan, SubtreeBudget, SubtreeError,
@@ -118,38 +118,61 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         }
         budget.charge(1)?;
         seen.push(budget.copy(path)?);
-        // JSON parsing/copies are bounded in advance by the encoded byte count.
-        budget.charge(
-            value
-                .value_json()
-                .len()
-                .checked_mul(3)
-                .ok_or(SubtreeError::TooBig)?,
-        )?;
-        let json: serde_json::Value =
-            serde_json::from_str(value.value_json()).map_err(|_| SubtreeError::Projection)?;
-        let raw = match json {
-            serde_json::Value::Null => continue,
-            serde_json::Value::String(raw) => raw,
-            serde_json::Value::Bool(value) => budget.copy(if value { "true" } else { "false" })?,
-            serde_json::Value::Number(value) => {
-                budget.charge(327)?;
-                value.to_string()
-            }
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                return Err(SubtreeError::Projection);
-            }
-        };
-        // Even values which would fail a predicate must pass identity validation.
+        // OperationalValue has already validated the immutable JSON. Its shape
+        // proof lets masked non-key output avoid decoding or retaining raw text.
+        budget.charge(1)?;
+        match value.json_shape() {
+            OperationalValueShape::Null => continue,
+            OperationalValueShape::Structured => return Err(SubtreeError::Projection),
+            OperationalValueShape::Scalar => {}
+        }
+        let mut identity_value = None;
         for (path, key) in &identity {
             budget.charge(1)?;
             if budget.compare(path, node.path)? {
-                let canonical = canonical_key(registry, node.path, &raw, budget)?
-                    .ok_or(SubtreeError::Projection)?;
-                if !budget.compare(key, &canonical)? {
+                identity_value = Some(key);
+                break;
+            }
+        }
+        budget.charge(1)?;
+        let masked = identity_value.is_none()
+            && !registry
+                .data_class(node.path)
+                .is_some_and(opc_mgmt_schema::DataClass::allows_cleartext);
+        let raw = if masked {
+            budget.copy("<redacted>")?
+        } else {
+            // JSON parsing/copies are bounded in advance by the encoded byte count.
+            budget.charge(
+                value
+                    .value_json()
+                    .len()
+                    .checked_mul(3)
+                    .ok_or(SubtreeError::TooBig)?,
+            )?;
+            let json: serde_json::Value =
+                serde_json::from_str(value.value_json()).map_err(|_| SubtreeError::Projection)?;
+            match json {
+                serde_json::Value::Null => continue,
+                serde_json::Value::String(raw) => raw,
+                serde_json::Value::Bool(value) => {
+                    budget.copy(if value { "true" } else { "false" })?
+                }
+                serde_json::Value::Number(value) => {
+                    budget.charge(327)?;
+                    value.to_string()
+                }
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
                     return Err(SubtreeError::Projection);
                 }
-                break;
+            }
+        };
+        // Even values which would fail a predicate must pass identity validation.
+        if let Some(key) = identity_value {
+            let canonical = canonical_key(registry, node.path, &raw, budget)?
+                .ok_or(SubtreeError::Projection)?;
+            if !budget.compare(key, &canonical)? {
+                return Err(SubtreeError::Projection);
             }
         }
         budget.charge(1)?;

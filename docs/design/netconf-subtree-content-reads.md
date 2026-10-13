@@ -111,6 +111,10 @@ preferred, double quotes represent a key containing an apostrophe, and
 backslashes remain literal. A key requiring both quote delimiters is refused.
 After complete validation, state instances are ordered by canonical path under
 the shared budget. Merging retains configuration order for existing instances.
+`OperationalValue` validates JSON at construction and retains its shape with
+the immutable payload. Masked non-key state selections check this proof before
+capturing only the fixed placeholder. Complete provider byte and count limits
+still apply, and identifying key payloads still undergo identity validation.
 
 A binding must opt into `supports_subtree_content` and honor
 `project_subtree_content`. Regenerated renderers supply both. A binding that
