@@ -438,6 +438,14 @@ impl Wal {
                     if control == ApplyControl::BeforeSqliteCommit {
                         return Err(io::Error::other("private WAL injected pre-commit failure"));
                     }
+                    // Marker triggers may change the log after the original
+                    // apply validators. Audit the stored final row before its
+                    // connection counters can establish a reusable proof.
+                    let final_entry = entries
+                        .last()
+                        .ok_or_else(|| invalid_data("private WAL application batch is empty"))?;
+                    let audited_last_log =
+                        audit_final_application_log(tx, self.binding, final_entry)?;
                     let token = state
                         .application_guard
                         .as_ref()
@@ -446,10 +454,9 @@ impl Wal {
                         })?
                         .token;
                     let mut guard = read_cache_guard(tx, token)?;
-                    // The original append/commit/apply validators just proved
-                    // this frontier in the same transaction. Publication still
-                    // waits for projection and response verification below.
-                    guard.audited_last_log = Some(Some(last));
+                    // Publication still waits for projection and response
+                    // verification below.
+                    guard.audited_last_log = Some(audited_last_log);
                     *next_guard.borrow_mut() = Some(guard);
                     commit_started.set(Some(Instant::now()));
                     Ok(())
@@ -630,6 +637,32 @@ fn validate_cache_frontier(conn: &Connection, state: &State, binding: Binding) -
     }
     validate_marker(conn, state, binding, applied)?;
     Ok(())
+}
+
+fn audit_final_application_log(
+    conn: &Connection,
+    binding: Binding,
+    expected: &Entry<SessionRaftTypeConfig>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    let encoded = encode_json(expected)?;
+    let stored = conn
+        .query_row(
+            "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
+            [consensus::checked_i64(expected.log_id.index)?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if stored.as_ref() != Some(&encoded) {
+        return Err(invalid_data("private WAL application final log differs"));
+    }
+    // Retain the original highest-row, purge-floor, row/ID and command checks.
+    // Payload equality above also refuses a different valid entry at the same ID.
+    let audited = consensus::last_log_sync(conn, binding.identity)?;
+    if audited != Some(expected.log_id) {
+        return Err(invalid_data("private WAL application final log differs"));
+    }
+    Ok(audited)
 }
 
 fn require_exact_entries(
