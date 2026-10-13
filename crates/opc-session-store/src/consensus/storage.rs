@@ -2667,15 +2667,16 @@ async fn attach_native_wal_before_snapshot_cleanup(
     persistence: SessionPersistenceMode,
 ) -> io::Result<()> {
     let policy = core.snapshot_integrity;
-    owner
-        .attach_with_descriptors(
-            core,
-            persistence,
-            |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
-            WalSnapshotAdmissions::verify,
-            WalSnapshotAdmissions::install_source,
-        )
-        .await
+    // Keep the large admission state out of parent open futures, which may
+    // be nested on an ordinary runtime thread's stack.
+    Box::pin(owner.attach_with_descriptors(
+        core,
+        persistence,
+        |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
+        WalSnapshotAdmissions::verify,
+        WalSnapshotAdmissions::install_source,
+    ))
+    .await
 }
 
 #[cfg(target_os = "linux")]
