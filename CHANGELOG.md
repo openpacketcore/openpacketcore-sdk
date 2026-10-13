@@ -689,8 +689,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including collection removals. Keep patch diagnostics free of input field
   names, instance paths, and values, including JSON and numeric decoding.
   Leafref leaf-list validation errors identify the index and target schema
-  without including the referenced value. Compile generated fixtures
-  and check them with Clippy warnings denied (#1268).
+  without including the referenced value. Omit unreachable NETCONF edit helpers
+  throughout keyless-list subtrees while preserving their rejection stubs.
+  Compile generated fixtures and check them with Clippy warnings denied (#1268).
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at

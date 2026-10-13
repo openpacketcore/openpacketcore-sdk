@@ -69,6 +69,9 @@ values, including their `Display` and `Debug` output. This covers invalid and
 read-only paths, numeric parsing, JSON decoding, and unsupported fields.
 Configuration diffs exclude every read-only node kind, including removed rows, containers,
 keyless lists and leaf-lists; writable siblings still emit their own deltas.
+NETCONF edit generation omits helpers beneath keyless lists, including nested
+container, leaf-list and list helpers, while retaining the reachable list's
+unsupported-shape rejection.
 Generated modules for these schemas are checked with Clippy warnings denied.
 Their block boundaries preserve literal contents and punctuation. The legacy
 output fixtures change only in `patch.rs` for safe diagnostics and state-diff

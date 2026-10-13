@@ -35,6 +35,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     let mut apply_fns = Vec::new();
     for node in &sorted_nodes {
+        if has_keyless_list_ancestor(node, &nodes_by_path) {
+            continue;
+        }
         match node.kind {
             SchemaNodeKind::Container | SchemaNodeKind::List => {
                 // Keyless lists are rejected by their list applicator before
@@ -59,7 +62,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // Generate list applicator functions after children functions so every
     // apply_children_<list> helper is in scope.
     for node in &sorted_nodes {
-        if node.kind == SchemaNodeKind::List {
+        if node.kind == SchemaNodeKind::List && !has_keyless_list_ancestor(node, &nodes_by_path) {
             apply_fns.push(apply_list_fn(node, &nodes_by_path, has_state_lists)?);
         }
     }
@@ -99,6 +102,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
 
     Ok(tokens.to_string())
+}
+
+// A keyless list's rejection stub never dispatches to its children. Keep that
+// stub reachable, but omit every helper beneath it, including nested lists.
+fn has_keyless_list_ancestor(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> bool {
+    let mut path = node.path.as_str();
+    while let Some((parent, _)) = path.rsplit_once('/') {
+        if nodes_by_path.get(parent).is_some_and(|ancestor| {
+            ancestor.kind == SchemaNodeKind::List && ancestor.key_leaves.is_empty()
+        }) {
+            return true;
+        }
+        path = parent;
+    }
+    false
 }
 
 fn is_root_path(path: &str) -> bool {
