@@ -97,6 +97,22 @@ module nested-state {
 }
 "#;
 
+const STATE_KEY_LEAFREF: &str = r#"
+module leafref-state {
+  yang-version 1.1;
+  namespace "urn:example:leafref-state";
+  prefix ls;
+  container state {
+    config false;
+    leaf target { type uint64; }
+    list row {
+      key id;
+      leaf id { type leafref { path '/ls:state/ls:target'; } }
+    }
+  }
+}
+"#;
+
 #[test]
 fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -108,6 +124,7 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
     let src = scratch.path().join("src");
     fs::create_dir(&src).unwrap();
     let mut lib = String::new();
+    let state_key_leafref_u32 = STATE_KEY_LEAFREF.replace("uint64", "uint32");
     for (name, source) in [
         ("minimal", MINIMAL_STATE),
         ("mixed", MIXED_STATE),
@@ -122,6 +139,12 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
             include_str!("fixtures/deep_keyless_state.yang"),
         ),
         ("combined", include_str!("fixtures/combined_state.yang")),
+        ("leafref_u64", STATE_KEY_LEAFREF),
+        ("leafref_u32", state_key_leafref_u32.as_str()),
+        (
+            "leafref_traversal",
+            include_str!("fixtures/state_leafref_traversal.yang"),
+        ),
     ] {
         // The combined fixture also exercises extended scalars, constraints,
         // and repeated list names together with optional state-list fields.
@@ -185,6 +208,12 @@ time = "={}"
     fs::write(
         tests.join("combined_state.rs"),
         include_str!("fixtures/combined_state_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests.join("state_leafrefs.rs"),
+        include_str!("fixtures/state_leafrefs_test.rs"),
     )
     .unwrap();
 

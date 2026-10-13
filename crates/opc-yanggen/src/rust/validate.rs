@@ -49,7 +49,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // 3. Generate leafref constraints
     for node in &input.nodes {
         if let Some(TypeRef::LeafRef { target_path }) = &node.type_ref {
-            let block = generate_leafref_check(node, target_path, input)?;
+            let block = generate_leafref_check(node, target_path, input, &nodes_by_path)?;
             validation_checks.extend(block);
         }
     }
@@ -527,7 +527,12 @@ fn generate_leafref_check(
     leaf_node: &SchemaNode,
     target_path: &str,
     input: &CanonicalInput,
+    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
+    // Keep established output bytes for models outside the newer scalar and
+    // state-list profiles, just as the other emitters do.
+    let keep_legacy_output =
+        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     // Collect target values into set
     let target_parent_path = target_path
         .rsplit_once('/')
@@ -559,16 +564,22 @@ fn generate_leafref_check(
         quote! { entry.#target_field_ident }
     };
 
+    let target_value =
+        if !keep_legacy_output && super::types::is_copy_type(target_node, nodes_by_path) {
+            quote! { *v }
+        } else {
+            quote! { v.clone() }
+        };
     let insert_expr = if target_node.config {
         quote! {
             if let Some(v) = #target_access.as_option() {
-                #set_ident.insert(v.clone());
+                #set_ident.insert(#target_value);
             }
         }
     } else {
         quote! {
             if let Some(ref v) = #target_access {
-                #set_ident.insert(v.clone());
+                #set_ident.insert(#target_value);
             }
         }
     };
@@ -600,6 +611,12 @@ fn generate_leafref_check(
                     if ancestor.key_leaves.is_empty() {
                         quote! {
                             for #next_ident in &#current_ident.#field_ident {
+                                #body
+                            }
+                        }
+                    } else if !keep_legacy_output {
+                        quote! {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }
@@ -660,6 +677,14 @@ fn generate_leafref_check(
                 }
             }
         }
+    } else if leaf_node.config && !keep_legacy_output {
+        quote! {
+            if let Some(v) = #leaf_access.as_option() {
+                if !#set_ident.contains(v) {
+                    return Err(ValidationError::semantics(format!("Value not found in target path {}", #target_path)));
+                }
+            }
+        }
     } else if leaf_node.config {
         quote! {
             if let Some(ref v) = #leaf_access.as_option() {
@@ -705,6 +730,12 @@ fn generate_leafref_check(
                     if ancestor.key_leaves.is_empty() {
                         quote! {
                             for #next_ident in &#current_ident.#field_ident {
+                                #body
+                            }
+                        }
+                    } else if !keep_legacy_output {
+                        quote! {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }

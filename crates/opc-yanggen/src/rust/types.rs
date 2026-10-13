@@ -38,33 +38,35 @@ pub(super) fn cloned_key_value(
     value: TokenStream,
     has_state_lists: bool,
 ) -> TokenStream {
-    let raw_type = get_raw_type(node, nodes_by_path).to_string();
-    if has_state_lists
-        && matches!(
-            raw_type.as_str(),
-            "bool"
-                | "u8"
-                | "u16"
-                | "u32"
-                | "u64"
-                | "u128"
-                | "usize"
-                | "i8"
-                | "i16"
-                | "i32"
-                | "i64"
-                | "i128"
-                | "isize"
-                | "YangUint64"
-                | "YangInt64"
-                | "YangDecimal64"
-                | "YangEmpty"
-        )
-    {
+    if has_state_lists && is_copy_type(node, nodes_by_path) {
         value
     } else {
         quote! { #value.clone() }
     }
+}
+
+/// Whether the emitted scalar type is Copy, including resolved leafrefs.
+pub(super) fn is_copy_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> bool {
+    matches!(
+        get_raw_type(node, nodes_by_path).to_string().as_str(),
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "YangUint64"
+            | "YangInt64"
+            | "YangDecimal64"
+            | "YangEmpty"
+    )
 }
 
 fn get_raw_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
