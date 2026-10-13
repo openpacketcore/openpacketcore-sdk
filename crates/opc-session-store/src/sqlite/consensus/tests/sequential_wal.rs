@@ -6708,6 +6708,89 @@ fn application_frontier_reads_reuse_the_guarded_log_audit() {
 }
 
 #[test]
+fn application_frontier_proof_requires_the_final_stored_payload() {
+    for replacement in [b"invalid".to_vec(), encode_json(&blank(2)).unwrap()] {
+        let fixture = fixture();
+        let source =
+            SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
+        let conn = source.conn.blocking_lock();
+        fixture
+            .wal
+            .submit(append(&[batch(1)]))
+            .unwrap()
+            .wait()
+            .unwrap();
+        fixture
+            .wal
+            .submit(Operation::Committed(Some(log_id(1))))
+            .unwrap()
+            .wait()
+            .unwrap();
+        fixture
+            .wal
+            .apply_committed(&conn, &source.caps, vec![batch(1)], ApplyControl::Normal)
+            .unwrap();
+        fixture.wal.shutdown().unwrap();
+
+        // Reopen admits this trigger while every stored payload is still valid.
+        // It changes the last row only after the next batch's original checks,
+        // when that transaction inserts its application marker.
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER replace_log_after_marker \
+             AFTER INSERT ON consensus_wal_application BEGIN \
+             UPDATE consensus_log SET entry_json = X'{}' \
+             WHERE log_index = (SELECT MAX(log_index) FROM consensus_log); END;",
+            hex::encode(&replacement)
+        ))
+        .unwrap();
+        let reopened = fixture
+            .reopen(Limits::default(), IoControl::default())
+            .unwrap();
+        reopened.restore_application(&conn, &source.caps).unwrap();
+        assert_eq!(reopened.with_application_read(&conn, || 7).unwrap(), 7);
+        let before = super::super::wal::application::full_image_digest(&conn).unwrap();
+        reopened
+            .submit(append(&[batch(2)]))
+            .unwrap()
+            .wait()
+            .unwrap();
+        reopened
+            .submit(Operation::Committed(Some(log_id(2))))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let error = reopened
+            .apply_committed(&conn, &source.caps, vec![batch(2)], ApplyControl::Normal)
+            .expect_err("the final stored payload must match the accepted entry");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "private WAL application final log differs"
+        );
+        assert_eq!(
+            super::super::wal::application::full_image_digest(&conn).unwrap(),
+            before,
+            "the failed final audit rolls back the complete original transaction"
+        );
+        assert_eq!(
+            super::super::last_log_sync(&conn, identity()).unwrap(),
+            Some(log_id(1))
+        );
+        let called = std::cell::Cell::new(false);
+        assert!(reopened
+            .with_application_read(&conn, || {
+                called.set(true);
+                7
+            })
+            .is_err());
+        assert!(!called.get(), "the fenced owner cannot run a read body");
+        assert!(reopened.vote().is_err());
+        assert!(reopened.shutdown().is_err());
+    }
+}
+
+#[test]
 fn application_frontier_reuse_rejects_log_replacement_before_and_during_reads() {
     for separate_connection in [false, true] {
         for mutate_before_read in [false, true] {
@@ -6760,9 +6843,11 @@ fn application_frontier_reuse_rejects_log_replacement_before_and_during_reads() 
                 }
                 7
             });
-            assert!(
-                result.is_err(),
-                "a changed cache cannot reuse its old audit"
+            let error = result.expect_err("a changed cache cannot reuse its old audit");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "private WAL application cache changed outside its owner"
             );
             assert_eq!(read_called, !mutate_before_read);
             assert!(fixture.wal.read(1, 2).is_err());
