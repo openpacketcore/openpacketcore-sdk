@@ -1013,14 +1013,12 @@ impl Wal {
                 } else {
                     transform.finish_metadata_tx(tx, self.binding, &candidate)?;
                 }
-                application::audit_snapshot_cache(
-                    tx,
-                    &state.conn,
-                    self.binding,
-                    &state.application_marker,
-                )?;
                 (self.control.hook)(Point::BeforeSnapshotCacheCommit)?;
-                *next_guard.borrow_mut() = Some(application::capture_cache_guard(tx, &state)?);
+                *next_guard.borrow_mut() = Some(application::audit_snapshot_cache_guard(
+                    tx,
+                    &state,
+                    self.binding,
+                )?);
                 Ok(())
             };
             if let Some(installation) = &installation {
@@ -1453,7 +1451,7 @@ impl Opening {
             chosen.audit
         };
         let (disk, _) = audit.finish(&self.directory, self.lock, &self.control)?;
-        tx.commit().map_err(db_error)?;
+        application::commit_restore(tx, &restored)?;
         application::finish_restore(&mut state, cache, self.binding, restored)?;
         Wal::start_state(self.binding, self.limits, state, disk, self.control, None)
     }

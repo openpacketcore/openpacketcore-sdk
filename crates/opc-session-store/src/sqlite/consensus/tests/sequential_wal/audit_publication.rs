@@ -135,6 +135,11 @@ fn application_restore_audit_covers_connection_token_writes() {
             before,
             "a rejected restore must roll back its post-audit SQL write"
         );
+        let called = std::cell::Cell::new(false);
+        assert!(reopened
+            .with_application_read(&conn, || called.set(true))
+            .is_err());
+        assert!(!called.get());
         assert!(reopened.vote().is_err());
         assert!(reopened.shutdown().is_err());
         return;
@@ -163,6 +168,117 @@ fn application_restore_audit_covers_connection_token_writes() {
     assert!(!called.get());
     assert!(reopened.vote().is_err());
     assert!(reopened.shutdown().is_err());
+}
+
+#[test]
+fn application_snapshot_audit_covers_metadata_trigger_writes() {
+    let fixture = fixture();
+    let source =
+        SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
+    let conn = source.conn.blocking_lock();
+    application_seed_applied_one(&fixture, &conn, &source.caps);
+    conn.execute_batch(
+        "CREATE TEMP TRIGGER change_log_after_snapshot_metadata \
+         AFTER INSERT ON consensus_snapshot BEGIN \
+         UPDATE consensus_log SET entry_json = CAST('invalid' AS BLOB) \
+         WHERE log_index = (SELECT MAX(log_index) FROM consensus_log); END;",
+    )
+    .unwrap();
+    fixture
+        .wal
+        .restore_application(&conn, &source.caps)
+        .unwrap();
+    let before = super::super::super::wal::application::full_image_digest(&conn).unwrap();
+    let candidate = snapshot_metadata_candidate(&conn);
+    let error = fixture
+        .wal
+        .publish_snapshot(&conn, candidate)
+        .expect_err("snapshot metadata effects must precede the final audit");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "session consensus decoding failed");
+    assert_eq!(
+        super::super::super::wal::application::full_image_digest(&conn).unwrap(),
+        before
+    );
+    assert_eq!(
+        super::super::super::last_log_sync(&conn, identity()).unwrap(),
+        Some(log_id(1))
+    );
+    let called = std::cell::Cell::new(false);
+    assert!(fixture
+        .wal
+        .with_application_read(&conn, || called.set(true))
+        .is_err());
+    assert!(!called.get());
+    assert!(fixture.wal.shutdown().is_err());
+}
+
+#[test]
+fn application_snapshot_publication_discards_an_audit_after_a_later_write() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let incoming = install_source_at(2);
+    for transform in ["metadata", "compact", "install"] {
+        let cache_path = Arc::new(Mutex::new(None::<PathBuf>));
+        let hook_path = Arc::clone(&cache_path);
+        let wrote = Arc::new(AtomicBool::new(false));
+        let hook_wrote = Arc::clone(&wrote);
+        let control = IoControl {
+            hook: Arc::new(move |point| {
+                if point == Point::AfterSnapshotCacheCommit {
+                    let path = hook_path.lock().unwrap().clone().unwrap();
+                    let other = Connection::open(path).unwrap();
+                    assert_eq!(other.execute(
+                        "UPDATE consensus_machine SET application_sequence = application_sequence + 1 WHERE singleton = 1", [],
+                    ).unwrap(), 1);
+                    hook_wrote.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+            ..IoControl::default()
+        };
+        let fixture = Fixture::new(Limits::default(), control, None, true);
+        let path = fixture.directory.path().join("source.sqlite");
+        let source = SqliteSessionBackend::open(&path).unwrap();
+        let conn = source.conn.blocking_lock();
+        *cache_path.lock().unwrap() = Some(path);
+        application_seed_applied_one(&fixture, &conn, &source.caps);
+        let candidate = if transform == "install" {
+            incoming.candidate.clone()
+        } else {
+            snapshot_metadata_candidate(&conn)
+        };
+        let result = match transform {
+            "metadata" => fixture.wal.publish_snapshot(&conn, candidate.clone()),
+            "compact" => fixture
+                .wal
+                .publish_compacting_snapshot(&conn, candidate.clone()),
+            "install" => fixture
+                .wal
+                .install_snapshot(&conn, incoming.source().unwrap()),
+            _ => unreachable!(),
+        };
+        assert!(wrote.load(Ordering::SeqCst), "{transform}");
+        let error = result.expect_err("post-commit writes cannot inherit the transaction audit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{transform}");
+        assert_eq!(
+            error.to_string(),
+            "private WAL application cache changed outside its owner",
+            "{transform}"
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&conn, identity()).unwrap(),
+            Some(candidate)
+        );
+        let called = std::cell::Cell::new(false);
+        assert!(fixture
+            .wal
+            .with_application_read(&conn, || called.set(true))
+            .is_err());
+        assert!(!called.get());
+        assert!(fixture.wal.vote().is_err());
+        assert!(fixture.wal.shutdown().is_err());
+    }
 }
 
 fn application_marker_change_is_rejected(statement: &str, expected_reason: &str) {
