@@ -150,6 +150,141 @@ fn nested_state_counter_changes_do_not_create_configuration_deltas() {
 }
 
 #[test]
+fn removing_state_row_does_not_create_configuration_deltas() {
+    let previous = sample();
+    let mut current = previous.clone();
+    current.error.clear();
+    assert!(current.diff(&previous).unwrap().is_empty());
+}
+
+#[test]
+fn removing_state_container_does_not_create_configuration_deltas() {
+    let previous: mixed::types::Root = serde_json::from_value(json!({
+        "hostname": "router",
+        "state": {"error": [{"reason": "temporary", "count": 7}]}
+    }))
+    .unwrap();
+    let mut current = previous.clone();
+    current.state = None;
+    assert!(current.diff(&previous).unwrap().is_empty());
+}
+
+#[test]
+fn removing_nested_state_container_does_not_create_configuration_deltas() {
+    let previous: nested::types::State = serde_json::from_value(json!({
+        "sample": [{"name": "edge", "detail": {"count": 7}}]
+    }))
+    .unwrap();
+    let mut current = previous.clone();
+    current.sample.get_mut("edge").unwrap().detail = None;
+    assert!(current.diff(&previous).unwrap().is_empty());
+}
+
+#[test]
+fn state_leaf_list_changes_do_not_create_configuration_deltas() {
+    let previous: nested::types::State = serde_json::from_value(json!({
+        "label": ["ready", "active"]
+    }))
+    .unwrap();
+    let mut current = previous.clone();
+    current.label.clear();
+    assert!(current.diff(&previous).unwrap().is_empty());
+    current.label.push("available".to_owned());
+    assert!(current.diff(&previous).unwrap().is_empty());
+}
+
+#[test]
+fn state_keyless_list_changes_do_not_create_configuration_deltas() {
+    let previous: nested::types::State = serde_json::from_value(json!({
+        "observation": [{"value": 7}]
+    }))
+    .unwrap();
+    let mut current = previous.clone();
+    current.observation[0].value = Some(8);
+    assert!(current.diff(&previous).unwrap().is_empty());
+    current.observation.clear();
+    assert!(current.diff(&previous).unwrap().is_empty());
+}
+
+#[test]
+fn state_removal_preserves_writable_sibling_delta() {
+    let previous: mixed::types::Root = serde_json::from_value(json!({
+        "hostname": "old",
+        "state": {"error": [{"reason": "temporary", "count": 7}]}
+    }))
+    .unwrap();
+    let mut current = previous.clone();
+    current.state = None;
+    current.hostname = mixed::types::LeafPresence::Explicit("new".to_owned());
+    assert_eq!(
+        current.diff(&previous).unwrap(),
+        vec![mixed::patch::ConfigDelta::Update(
+            YangPath::new("/mx:root/mx:hostname").unwrap(),
+            "new".to_owned()
+        )]
+    );
+}
+
+fn assert_safe_patch_error(error: &opc_config_model::ConfigError, kind: &str, message: &str) {
+    assert_eq!(error.kind(), kind);
+    assert_eq!(error.message(), message);
+    for text in [error.message().to_owned(), error.to_string(), format!("{error:?}")] {
+        assert!(!text.contains("synthetic-secret"));
+        assert!(!text.contains("token="));
+    }
+}
+
+#[test]
+fn state_sensitive_key_patch_errors_do_not_disclose_values() {
+    let previous: keys::types::State = serde_json::from_value(json!({
+        "account": [{"token": "synthetic-secret", "count": 7}],
+        "session": [{"token": "synthetic-secret", "region": 2, "active": true}]
+    }))
+    .unwrap();
+    for text in [
+        "/sk:state/sk:account[token='synthetic-secret']",
+        "/sk:state/sk:account[token='synthetic-secret']/sk:count",
+        "/sk:state/sk:session[token='synthetic-secret'][region='2']/sk:active",
+    ] {
+        let path = YangPath::new(text).unwrap();
+        for delta in [
+            keys::patch::ConfigDelta::Update(path.clone(), "8".to_owned()),
+            keys::patch::ConfigDelta::Replace(path.clone(), "8".to_owned()),
+            keys::patch::ConfigDelta::Merge(path.clone(), "8".to_owned()),
+            keys::patch::ConfigDelta::Delete(path.clone()),
+            keys::patch::ConfigDelta::Remove(path.clone()),
+        ] {
+            let mut state = previous.clone();
+            let error = keys::patch::apply_patch(&mut state, &[delta]).unwrap_err();
+            assert_eq!(state, previous);
+            assert_safe_patch_error(&error, "read-only", "cannot modify read-only path");
+        }
+    }
+}
+
+#[test]
+fn invalid_patch_paths_do_not_disclose_sensitive_keys() {
+    let previous: keys::types::State = serde_json::from_value(json!({
+        "account": [{"token": "synthetic-secret", "count": 7}]
+    }))
+    .unwrap();
+    for text in [
+        "/sk:state/sk:account[token='synthetic-secret']/sk:unknown",
+        "/sk:unknown[token='synthetic-secret']",
+    ] {
+        let mut state = previous.clone();
+        let path = YangPath::new(text).unwrap();
+        let error = keys::patch::apply_patch(
+            &mut state,
+            &[keys::patch::ConfigDelta::Delete(path)],
+        )
+        .unwrap_err();
+        assert_eq!(state, previous);
+        assert_safe_patch_error(&error, "invalid-path", "invalid path");
+    }
+}
+
+#[test]
 fn state_list_patch_is_refused_without_mutation() {
     let mut state = sample();
     let previous = state.clone();
@@ -162,7 +297,7 @@ fn state_list_patch_is_refused_without_mutation() {
     assert_eq!(error.kind(), "read-only");
     assert_eq!(
         error.message(),
-        "cannot modify read-only path: /ms:state/ms:error[reason='temporary']/ms:count"
+        "cannot modify read-only path"
     );
     assert_eq!(state, previous);
 }

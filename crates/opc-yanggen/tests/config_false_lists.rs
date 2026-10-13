@@ -50,6 +50,10 @@ module nested-state {
   revision 2026-10-12;
   container state {
     config false;
+    leaf-list label { type string; }
+    list observation {
+      leaf value { type uint32; }
+    }
     list sample {
       key "name";
       leaf name { type string; }
