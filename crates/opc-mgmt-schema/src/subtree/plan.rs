@@ -1193,3 +1193,6 @@ fn order_reserved(
     *selected = ordered;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

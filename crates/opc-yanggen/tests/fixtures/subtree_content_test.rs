@@ -1808,3 +1808,106 @@ async fn subtree_content_masked_key_reorders_rejected_rows_without_changing_work
     }
     assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked identities changed exact-boundary replies, work or complete observations: {summaries:?}");
 }
+
+#[tokio::test]
+async fn subtree_content_masked_state_join_shape_has_fixed_work() {
+    let mut summaries = Vec::new();
+    for op in ["get", "get-data"] {
+        let body = request(op, "<hidden-peer><up>true</up><label/></hidden-peer><hostname/>", "");
+        let mut fixtures = Vec::new();
+        let mut controls = Vec::new();
+        for size in [1, 4096] {
+            let mut model = config();
+            model.hidden_peer.clear();
+            let mut row = HiddenPeer::default();
+            row.secret = SecretLeaf::new(LeafPresence::Explicit("b".into()));
+            row.label = LeafPresence::Explicit("configuration-row".into());
+            model.hidden_peer.insert(SensitiveKey::new("b".into()), row);
+            let fixture = Fixture::new(model, &[]).await;
+            let key = "b".repeat(size);
+            *fixture.access.values.lock().unwrap() = vec![state(&format!("/ex:system/ex:hidden-peer[ex:secret='{key}']/ex:up"), "false")];
+            let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+            assert!(!reply.contains("<rpc-error>"), "{reply}");
+            assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+            assert!(tags(&reply, "label").is_empty());
+            assert!(tags(&reply, "up").is_empty());
+            let used = MgmtLimits::default().max_subtree_filter_work_units
+                - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+            controls.push((reply, used, fixture.observation()));
+            fixtures.push(fixture);
+        }
+        assert_eq!(controls[0].0, controls[1].0);
+        let limit = controls.iter().map(|(_, used, _)| *used).min().unwrap();
+        let mut bounded = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit, ..MgmtLimits::default() }).await;
+            if reply.contains("<rpc-error>") { error(&reply, "too-big"); }
+            bounded.push((reply, fixture.observation(), fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining()));
+        }
+        eprintln!("cross-phase-config-state {op}: work={:?}, fixed_limit={limit}, too_big={:?}", controls.iter().map(|x| x.1).collect::<Vec<_>>(), bounded.iter().map(|(reply, _, _)| reply.contains("<error-tag>too-big</error-tag>")).collect::<Vec<_>>());
+        let mut below = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit.checked_sub(1).unwrap(), ..MgmtLimits::default() }).await;
+            error(&reply, "too-big");
+            below.push((reply, fixture.observation()));
+        }
+        let invariant = controls[0].1 == controls[1].1
+            && controls[0].2 == controls[1].2
+            && bounded[0] == bounded[1]
+            && bounded[0].0 == controls[0].0
+            && bounded[0].2 == 0
+            && below[0] == below[1];
+        summaries.push((op, controls[0].1, controls[1].1, invariant));
+    }
+    assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked join identity changed later accounting: {summaries:?}");
+}
+
+#[tokio::test]
+async fn subtree_content_masked_provider_grouping_has_fixed_work() {
+    let mut summaries = Vec::new();
+    for op in ["get", "get-data"] {
+        let body = request(op, "<state-hidden-peer><label>selected-row</label></state-hidden-peer><hostname/>", "");
+        let mut fixtures = Vec::new();
+        let mut controls = Vec::new();
+        for size in [1, 4096] {
+            let fixture = Fixture::new(config(), &[]).await;
+            let key = "b".repeat(size);
+            *fixture.access.values.lock().unwrap() = vec![
+                state("/ex:system/ex:state-hidden-peer[ex:secret='b']/ex:label", "\"selected-row\""),
+                state(&format!("/ex:system/ex:state-hidden-peer[ex:secret='{key}']/ex:secret"), &serde_json::to_string(&key).unwrap()),
+            ];
+            let reply = fixture.rpc(&body, MgmtLimits::default()).await;
+            assert!(!reply.contains("<rpc-error>"), "{reply}");
+            assert_eq!(tags(&reply, "hostname"), ["router-marker"]);
+            assert_eq!(tags(&reply, "label"), ["selected-row"]);
+            assert_eq!(tags(&reply, "secret"), ["&lt;redacted&gt;"]);
+            let used = MgmtLimits::default().max_subtree_filter_work_units
+                - fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining();
+            controls.push((reply, used, fixture.observation()));
+            fixtures.push(fixture);
+        }
+        assert_eq!(controls[0].0, controls[1].0);
+        let limit = controls.iter().map(|(_, used, _)| *used).min().unwrap();
+        let mut bounded = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit, ..MgmtLimits::default() }).await;
+            if reply.contains("<rpc-error>") { error(&reply, "too-big"); }
+            bounded.push((reply, fixture.observation(), fixture.access.budget.lock().unwrap().as_ref().unwrap().remaining()));
+        }
+        eprintln!("cross-phase-provider-grouping {op}: work={:?}, fixed_limit={limit}, too_big={:?}", controls.iter().map(|x| x.1).collect::<Vec<_>>(), bounded.iter().map(|(reply, _, _)| reply.contains("<error-tag>too-big</error-tag>")).collect::<Vec<_>>());
+        let mut below = Vec::new();
+        for fixture in &fixtures {
+            let reply = fixture.rpc(&body, MgmtLimits { max_subtree_filter_work_units: limit.checked_sub(1).unwrap(), ..MgmtLimits::default() }).await;
+            error(&reply, "too-big");
+            below.push((reply, fixture.observation()));
+        }
+        let invariant = controls[0].1 == controls[1].1
+            && controls[0].2 == controls[1].2
+            && bounded[0] == bounded[1]
+            && bounded[0].0 == controls[0].0
+            && bounded[0].2 == 0
+            && below[0] == below[1];
+        summaries.push((op, controls[0].1, controls[1].1, invariant));
+    }
+    assert!(summaries.iter().all(|(_, _, _, invariant)| *invariant), "masked provider grouping changed later accounting: {summaries:?}");
+}
