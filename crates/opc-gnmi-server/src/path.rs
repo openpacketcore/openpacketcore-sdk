@@ -7,7 +7,7 @@ use opc_mgmt_schema::{NodeMeta, SchemaRegistry};
 use crate::GnmiError;
 
 /// One gNMI `PathElem` represented without protobuf.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GnmiPathElem {
     /// Element name.
     pub name: String,
@@ -41,7 +41,7 @@ impl GnmiPathElem {
 }
 
 /// A gNMI `Path` represented without protobuf.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct GnmiPath {
     /// gNMI origin.
     pub origin: Option<String>,
@@ -77,7 +77,7 @@ impl GnmiPath {
 }
 
 /// A schema-resolved gNMI path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedGnmiPath {
     /// Predicate-free schema path.
     pub schema_path: String,
@@ -162,6 +162,24 @@ fn to_segment(elem: &GnmiPathElem) -> PathSegment {
     PathSegment {
         name: elem.name.clone(),
         keys: elem.keys.clone(),
+    }
+}
+
+impl std::fmt::Debug for GnmiPathElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiPathElem").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for GnmiPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiPath").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResolvedGnmiPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedGnmiPath").finish_non_exhaustive()
     }
 }
 

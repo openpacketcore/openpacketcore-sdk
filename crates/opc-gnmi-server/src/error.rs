@@ -12,7 +12,7 @@ use crate::encoding::{Encoding, EncodingError};
 /// `Display` is intentionally generic and payload-free. Details can contain
 /// schema paths or local diagnostics and must stay in server logs/audit context,
 /// not in future gRPC status messages.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 pub enum GnmiError {
     /// Invalid request syntax or semantics.
     #[error("invalid gNMI request")]
@@ -171,6 +171,12 @@ impl From<EncodingError> for GnmiError {
 impl From<Encoding> for GnmiError {
     fn from(encoding: Encoding) -> Self {
         Self::unimplemented(format!("unsupported encoding {}", encoding.as_str()))
+    }
+}
+
+impl std::fmt::Debug for GnmiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiError").finish_non_exhaustive()
     }
 }
 

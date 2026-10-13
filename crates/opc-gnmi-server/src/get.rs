@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal, YangPath};
 use opc_mgmt_audit::{AuditOperation, AuditOutcome, SchemaNodePath};
-use opc_mgmt_authz::{ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{ReadAction, ReadAuthorizer, ReadNode};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
@@ -37,6 +37,7 @@ where
         request,
         ReadAction::Read,
         GnmiNacmAction::Read,
+        None,
     ) {
         Ok(result) => {
             if !result.denied_audit_paths.is_empty() {
@@ -86,9 +87,62 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    execute_read_request(server, principal, request, read_action, metric_action)
+    execute_read_request(server, principal, request, read_action, metric_action, None)
         .map(|result| result.response)
         .map_err(|err| err.error)
+}
+
+pub(crate) fn handle_subscribed_read<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    request: &gnmi::GetRequest,
+    authorization: &crate::subscription_auth::StreamAuthorization,
+) -> Result<gnmi::GetResponse, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    execute_read_request(
+        server,
+        principal,
+        request,
+        ReadAction::Subscribe,
+        GnmiNacmAction::Subscribe,
+        Some(authorization),
+    )
+    .map(|result| result.response)
+    .map_err(|err| err.error)
+}
+
+pub(crate) fn select_read_request<C, B>(
+    server: &GnmiServer<C, B>,
+    request: &gnmi::GetRequest,
+) -> Result<Vec<ReadSelectionEntry>, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let data_type = GetDataType::from_proto(request.r#type)?;
+    let model_filter = ModelFilter::new(server.binding().schema(), &request.use_models)?;
+    let prefix = request.prefix.as_ref().map(path_from_proto).transpose()?;
+    let request_paths = request
+        .path
+        .iter()
+        .map(path_from_proto)
+        .collect::<Result<Vec<_>, _>>()?;
+    if prefix.as_ref().is_some_and(path_has_target) || request_paths.iter().any(path_has_target) {
+        return Err(GnmiError::unimplemented(
+            "non-empty gNMI target is not supported",
+        ));
+    }
+    select_paths(
+        server.binding().schema(),
+        server.limits(),
+        prefix.as_ref(),
+        &request_paths,
+        data_type,
+        &model_filter,
+    )
 }
 
 fn execute_read_request<C, B>(
@@ -97,6 +151,7 @@ fn execute_read_request<C, B>(
     request: &gnmi::GetRequest,
     read_action: ReadAction,
     metric_action: GnmiNacmAction,
+    stream_authorization: Option<&crate::subscription_auth::StreamAuthorization>,
 ) -> Result<ReadResult, ReadFailure>
 where
     C: OpcConfig,
@@ -107,25 +162,7 @@ where
         return Err(GnmiError::from(encoding).into());
     }
 
-    let data_type = GetDataType::from_proto(request.r#type)?;
-    let model_filter = ModelFilter::new(server.binding().schema(), &request.use_models)?;
-    let prefix = request.prefix.as_ref().map(path_from_proto).transpose()?;
-    let request_paths = request
-        .path
-        .iter()
-        .map(path_from_proto)
-        .collect::<Result<Vec<_>, _>>()?;
-    if prefix.as_ref().is_some_and(path_has_target) || request_paths.iter().any(path_has_target) {
-        return Err(GnmiError::unimplemented("non-empty gNMI target is not supported").into());
-    }
-    let selected_entries = select_paths(
-        server.binding().schema(),
-        server.limits(),
-        prefix.as_ref(),
-        &request_paths,
-        data_type,
-        &model_filter,
-    )?;
+    let selected_entries = select_read_request(server, request)?;
     let selected_audit_paths = audit_paths_for_entries(&selected_entries)?;
 
     if selected_entries.is_empty() {
@@ -141,17 +178,28 @@ where
         .map_err(|_| GnmiError::schema("gNMI read authorizer setup failed"))?;
     let decision_input = selected_entries
         .iter()
-        .map(ReadSelectionEntry::schema_path)
+        .map(
+            |entry| match server.binding().schema().node(entry.schema_path()) {
+                Some(node) if !node.config => ReadNode::operational(entry.schema_path()),
+                _ => ReadNode::projected(entry.schema_path()),
+            },
+        )
         .collect::<Vec<_>>();
-    let decisions = authz
-        .authorize(principal, read_action, &decision_input)
-        .map_err(|_| {
-            ReadFailure::new(
-                GnmiError::unavailable("gNMI read policy source unavailable"),
-                selected_audit_paths.clone(),
-            )
-        })?;
+    let authorization = match stream_authorization {
+        Some(stream) => stream
+            .snapshot(&decision_input)
+            .map_err(|error| ReadFailure::new(error, selected_audit_paths.clone()))?,
+        None => authz
+            .authorize_selection(principal, read_action, &decision_input, &Default::default())
+            .map_err(|_| {
+                ReadFailure::new(
+                    GnmiError::unavailable("gNMI read policy source unavailable"),
+                    selected_audit_paths.clone(),
+                )
+            })?,
+    };
 
+    let decisions = &authorization.decisions;
     let denied_count = decisions
         .iter()
         .filter(|decision| !decision.allowed)

@@ -17,10 +17,18 @@ use crate::{GnmiError, NormalizedSet};
 /// predicates from the client request. Generated renderers use it to restrict
 /// keyed list output to the addressed instances without making NACM
 /// instance-aware.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReadSelectionEntry {
     schema_path: &'static str,
     canonical_path: YangPath,
+}
+
+impl std::fmt::Debug for ReadSelectionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadSelectionEntry")
+            .field("schema_path", &self.schema_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReadSelectionEntry {
@@ -277,10 +285,16 @@ fn unescape_predicate_value(value: &str) -> Result<String, ()> {
 }
 
 /// One JSON/RFC 7951 gNMI update produced by a CNF/generated renderer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GnmiJsonUpdate {
     path: YangPath,
     value_json: String,
+}
+
+impl std::fmt::Debug for GnmiJsonUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiJsonUpdate").finish_non_exhaustive()
+    }
 }
 
 impl GnmiJsonUpdate {
@@ -292,7 +306,7 @@ impl GnmiJsonUpdate {
     ) -> Result<Self, GnmiJsonProjectionError> {
         let value_json = value_json.into();
         serde_json::from_str::<serde_json::Value>(&value_json)
-            .map_err(|_| GnmiJsonProjectionError::invalid_json(path.as_str()))?;
+            .map_err(|_| GnmiJsonProjectionError::invalid_json())?;
         Ok(Self { path, value_json })
     }
 
@@ -308,10 +322,17 @@ impl GnmiJsonUpdate {
 }
 
 /// CNF/generated-code gNMI projection failure.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[error("gNMI JSON projection failed")]
 pub struct GnmiJsonProjectionError {
     detail: String,
+}
+
+impl std::fmt::Debug for GnmiJsonProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiJsonProjectionError")
+            .finish_non_exhaustive()
+    }
 }
 
 impl GnmiJsonProjectionError {
@@ -322,8 +343,8 @@ impl GnmiJsonProjectionError {
         }
     }
 
-    fn invalid_json(path: &str) -> Self {
-        Self::projection(format!("invalid JSON at {path}"))
+    fn invalid_json() -> Self {
+        Self::projection("invalid gNMI projection JSON")
     }
 
     /// Server-local detail. Never send this directly to a client.

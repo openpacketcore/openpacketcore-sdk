@@ -20,6 +20,12 @@ fn main() {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(false)
+        .skip_debug([
+            ".gnmi.Path",
+            ".gnmi.PathElem",
+            ".gnmi.TypedValue",
+            ".gnmi.Value",
+        ])
         .file_descriptor_set_path(out_dir.join("gnmi_descriptor.bin"))
         .compile_protos(&[GNMI_PROTO, GNMI_EXT_PROTO], &["proto"])
         .expect("vendored OpenConfig gNMI protos compile");

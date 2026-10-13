@@ -4,7 +4,7 @@ use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer, ReadNode};
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
 
@@ -342,10 +342,15 @@ where
         return ok_reply(&ctx, "");
     }
 
-    let decisions = match ctx
-        .authz
-        .authorize(ctx.principal, ReadAction::Read, &config_paths)
-    {
+    let authorization = match ctx.authz.authorize_selection(
+        ctx.principal,
+        ReadAction::Read,
+        &config_paths
+            .iter()
+            .map(|path| ReadNode::projected(path))
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    ) {
         Ok(decisions) => decisions,
         Err(_) => {
             if audit_failure(
@@ -381,17 +386,14 @@ where
         }
     };
 
-    let denied_count = decisions
+    let denied_count = authorization
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
     record_nacm_denials(NetconfNacmAction::Read, denied_count);
 
-    let allowed_paths = decisions
-        .iter()
-        .zip(config_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_paths = authorization.xml_paths(&config_paths);
 
     if allowed_paths.is_empty() {
         if audit_success(

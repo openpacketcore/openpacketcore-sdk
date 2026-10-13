@@ -91,7 +91,7 @@ impl Origin {
 }
 
 /// A request for operational state at one or more schema paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct OperationalRequest {
     /// SDK-canonical paths the server is reading; list instances include their
     /// canonical key predicates when the northbound request addressed one.
@@ -123,7 +123,7 @@ impl OperationalRequest {
 }
 
 /// One reported operational value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OperationalValue {
     /// The SDK-canonical path the value is reported at.
     path: YangPath,
@@ -184,7 +184,7 @@ pub enum OperationalValueError {
 }
 
 /// The values a provider could supply for a request.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct OperationalResponse {
     /// Reported values. Contains only paths the provider can supply; requested
     /// paths with no data are simply absent (anti-fabrication).
@@ -192,7 +192,7 @@ pub struct OperationalResponse {
 }
 
 /// A request for operational-state change events.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct OperationalSubscriptionRequest {
     /// SDK-canonical paths the server is subscribing to. List instances include
     /// canonical key predicates when the northbound request addressed one.
@@ -230,7 +230,7 @@ impl OperationalSubscriptionRequest {
 }
 
 /// One operational-state change event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum OperationalEvent {
     /// An operational value was created or changed.
     Update(OperationalValue),
@@ -548,7 +548,7 @@ pub enum OperationalResponseError {
 /// A failure reading operational state. A path the provider simply does not have
 /// is **not** an error (it is omitted from the response); these variants are for
 /// genuine failures.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 pub enum OperationalError {
     /// The operational data source is temporarily unavailable (retryable).
     #[error("operational state unavailable")]
@@ -631,6 +631,44 @@ pub trait OperationalEventSource: Send + Sync {
         &self,
         request: &OperationalSubscriptionRequest,
     ) -> Result<OperationalEventReceiver, OperationalError>;
+}
+
+impl std::fmt::Debug for OperationalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalRequest").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OperationalValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalValue").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OperationalResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalResponse")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OperationalSubscriptionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalSubscriptionRequest")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OperationalEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalEvent").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OperationalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalError").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

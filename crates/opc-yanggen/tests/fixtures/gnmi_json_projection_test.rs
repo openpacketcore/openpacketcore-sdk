@@ -278,7 +278,7 @@ fn unsupported_custom_leaf_list_fails_closed() {
 }
 
 #[test]
-fn sensitive_list_key_fails_closed_without_key_value_leak() {
+fn sensitive_list_key_renders_without_diagnostic_value_leak() {
     let system = sample_config();
     let entries = vec![entry(
         "/ex:system/ex:subscriber/ex:tier",
@@ -289,11 +289,12 @@ fn sensitive_list_key_fails_closed_without_key_value_leak() {
         .map(ReadSelectionEntry::schema_path)
         .collect::<Vec<_>>();
 
-    let err = renderer()
+    let updates = renderer()
         .render_running_json(&system, ReadSelection::with_entries(&schema_paths, &entries))
-        .unwrap_err();
+        .unwrap();
 
-    assert!(!err.detail().contains("001010000000001"));
+    assert_eq!(updates.len(), 1);
+    assert!(!format!("{updates:?}").contains("001010000000001"));
 }
 
 fn decode_error(value: Value) -> String {

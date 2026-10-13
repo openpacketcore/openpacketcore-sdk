@@ -4,7 +4,9 @@ use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal, Ya
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{
+    AuthorizedReadSelection, PolicySource, ReadAction, ReadAuthorizer, ReadNode, ResolvedPolicy,
+};
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{OperationalRequest, OperationalResponse};
@@ -242,60 +244,73 @@ where
         return ok_reply(&ctx, "");
     }
 
-    let decisions =
-        match ctx
-            .authz
-            .authorize(ctx.principal, ReadAction::Read, &selected_paths.data_paths)
-        {
-            Ok(decisions) => decisions,
-            Err(_) => {
-                if audit_failure(
-                    audit_mode,
-                    ctx.audit,
-                    ctx.request_id,
-                    ctx.principal,
-                    ctx.transport,
-                    "resource-denied",
-                    schema_paths(&selected_paths.data_paths),
-                )
-                .await
-                .is_err()
-                {
-                    record_rpc_error(
-                        NetconfOperation::Get,
-                        NetconfErrorTag::OperationFailed,
-                        ctx.started.elapsed(),
-                    );
-                    return error_reply(&ctx, RpcError::operation_failed());
-                }
+    let resolved = match ctx
+        .authz
+        .policy_source()
+        .active_policy_context_for_principal(ctx.principal)
+    {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            if audit_failure(
+                audit_mode,
+                ctx.audit,
+                ctx.request_id,
+                ctx.principal,
+                ctx.transport,
+                "resource-denied",
+                schema_paths(&selected_paths.data_paths),
+            )
+            .await
+            .is_err()
+            {
                 record_rpc_error(
                     NetconfOperation::Get,
-                    NetconfErrorTag::ResourceDenied,
+                    NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                tracing::debug!(
-                    operation = "get",
-                    error_tag = NetconfErrorTag::ResourceDenied.as_str(),
-                    "NETCONF get failed closed on policy source error"
-                );
-                return error_reply(&ctx, RpcError::resource_denied());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
-        };
+            record_rpc_error(
+                NetconfOperation::Get,
+                NetconfErrorTag::ResourceDenied,
+                ctx.started.elapsed(),
+            );
+            tracing::debug!(
+                operation = "get",
+                error_tag = NetconfErrorTag::ResourceDenied.as_str(),
+                "NETCONF get failed closed on policy source error"
+            );
+            return error_reply(&ctx, RpcError::resource_denied());
+        }
+    };
 
-    let denied_count = decisions
+    let authorization = ctx.authz.authorize_selection_resolved(
+        &resolved,
+        ReadAction::Read,
+        &selected_paths
+            .data_paths
+            .iter()
+            .map(|path| {
+                if registry.node(path).is_some_and(|node| !node.config) {
+                    ReadNode::operational(path)
+                } else {
+                    ReadNode::projected(path)
+                }
+            })
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    );
+    let denied_count = authorization
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
 
-    let allowed_paths = decisions
-        .iter()
-        .zip(selected_paths.data_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_paths = authorization.xml_paths(&selected_paths.data_paths);
 
     let yang_library_authz = match authorize_yang_library(
         ctx.authz.policy_source(),
-        ctx.principal,
+        &resolved,
         &selected_paths.yang_library_paths,
     ) {
         Ok(decisions) => decisions,
@@ -334,13 +349,14 @@ where
     };
 
     let yang_library_denied = yang_library_authz
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
 
     let netconf_monitoring_authz = match authorize_netconf_monitoring(
         ctx.authz.policy_source(),
-        ctx.principal,
+        &resolved,
         &selected_paths.netconf_monitoring_paths,
     ) {
         Ok(decisions) => decisions,
@@ -379,6 +395,7 @@ where
     };
 
     let netconf_monitoring_denied = netconf_monitoring_authz
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
@@ -389,17 +406,11 @@ where
             .saturating_add(netconf_monitoring_denied),
     );
 
-    let allowed_yang_library_paths = yang_library_authz
-        .iter()
-        .zip(selected_paths.yang_library_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_yang_library_paths =
+        yang_library_authz.xml_paths(&selected_paths.yang_library_paths);
 
-    let allowed_netconf_monitoring_paths = netconf_monitoring_authz
-        .iter()
-        .zip(selected_paths.netconf_monitoring_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_netconf_monitoring_paths =
+        netconf_monitoring_authz.xml_paths(&selected_paths.netconf_monitoring_paths);
 
     let config_paths = allowed_paths
         .iter()
@@ -574,20 +585,20 @@ where
 
 fn authorize_yang_library<P: PolicySource>(
     policy_source: &P,
-    principal: &TrustedPrincipal,
+    resolved: &ResolvedPolicy,
     paths: &[&'static str],
-) -> Result<Vec<opc_mgmt_authz::PathDecision>, ()> {
-    authorize_builtin_registry(policy_source, principal, yang_library_registry(), paths)
+) -> Result<AuthorizedReadSelection, ()> {
+    authorize_builtin_registry(policy_source, resolved, yang_library_registry(), paths)
 }
 
 fn authorize_netconf_monitoring<P: PolicySource>(
     policy_source: &P,
-    principal: &TrustedPrincipal,
+    resolved: &ResolvedPolicy,
     paths: &[&'static str],
-) -> Result<Vec<opc_mgmt_authz::PathDecision>, ()> {
+) -> Result<AuthorizedReadSelection, ()> {
     authorize_builtin_registry(
         policy_source,
-        principal,
+        resolved,
         netconf_monitoring_registry(),
         paths,
     )
@@ -595,17 +606,20 @@ fn authorize_netconf_monitoring<P: PolicySource>(
 
 fn authorize_builtin_registry<P: PolicySource>(
     policy_source: &P,
-    principal: &TrustedPrincipal,
+    resolved: &ResolvedPolicy,
     registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
     paths: &[&'static str],
-) -> Result<Vec<opc_mgmt_authz::PathDecision>, ()> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<AuthorizedReadSelection, ()> {
     let authz = ReadAuthorizer::new(registry, policy_source).map_err(|_| ())?;
-    authz
-        .authorize(principal, ReadAction::Read, paths)
-        .map_err(|_| ())
+    Ok(authz.authorize_selection_resolved(
+        resolved,
+        ReadAction::Read,
+        &paths
+            .iter()
+            .map(|path| ReadNode::projected(path))
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    ))
 }
 
 fn render_yang_library_if_selected<C, B>(

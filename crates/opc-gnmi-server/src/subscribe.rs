@@ -6,10 +6,11 @@ use std::future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::subscription_auth::{authorization_failure, StreamAuthorization};
 use opc_config_bus::{ConfigEvent, SubscriberLagPolicy};
 use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal, YangPath};
 use opc_mgmt_audit::{AuditOperation, AuditOutcome, SchemaNodePath};
-use opc_mgmt_authz::{ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{AuthorizationGate, ReadAction, ReadAuthorizer, ReadNode};
 use opc_mgmt_opstate::{
     OperationalEvent, OperationalEventReceiver, OperationalSubscriptionRequest,
 };
@@ -19,8 +20,9 @@ use tonic::{Status, Streaming};
 
 use crate::audit::{outcome_for_error, record_audit, schema_paths_for_schema};
 use crate::get::{
-    encoding_from_proto, handle_read_request, now_nanos, operational_error, select_paths,
-    update_to_proto, yang_path_to_proto, GetDataType, ModelFilter,
+    encoding_from_proto, handle_read_request, handle_subscribed_read, now_nanos, operational_error,
+    select_paths, select_read_request, update_to_proto, yang_path_to_proto, GetDataType,
+    ModelFilter,
 };
 use crate::metrics::{
     active_stream, record_nacm_denials, record_rpc_error, GnmiNacmAction, GnmiOperation,
@@ -35,11 +37,33 @@ const RESPONSE_QUEUE_BYTES_ESTIMATE: usize = 4096;
 const MAX_SUBSCRIBE_QUEUE_MESSAGES: usize = 1024;
 
 /// Serves one authenticated gNMI Subscribe request stream.
+#[cfg(test)]
 pub(crate) async fn serve_subscribe_stream<C, B>(
+    server: Arc<GnmiServer<C, B>>,
+    principal: TrustedPrincipal,
+    inbound: Streaming<gnmi::SubscribeRequest>,
+    outbound: mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
+) -> Result<(), GnmiError>
+where
+    C: OpcConfig + 'static,
+    B: GnmiConfigBinding<C> + 'static,
+{
+    serve_subscribe_stream_with_gate(
+        server,
+        principal,
+        inbound,
+        outbound,
+        AuthorizationGate::default(),
+    )
+    .await
+}
+
+pub(crate) async fn serve_subscribe_stream_with_gate<C, B>(
     server: Arc<GnmiServer<C, B>>,
     principal: TrustedPrincipal,
     mut inbound: Streaming<gnmi::SubscribeRequest>,
     outbound: mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
+    gate: AuthorizationGate,
 ) -> Result<(), GnmiError>
 where
     C: OpcConfig + 'static,
@@ -88,7 +112,7 @@ where
         .await?;
         return Err(err);
     }
-    let plan = match SubscribePlan::from_first_request(server.as_ref(), first) {
+    let mut plan = match SubscribePlan::from_first_request(server.as_ref(), first) {
         Ok(plan) => plan,
         Err(err) => {
             audit_subscribe_result(
@@ -102,36 +126,84 @@ where
             return Err(err);
         }
     };
-    audit_subscribe_result(
-        server.as_ref(),
-        request_id,
-        &principal,
-        AuditOutcome::Success,
-        plan.audit_paths.clone(),
-    )
-    .await?;
+    let source = server.binding().policy_source();
+    let mut watch = source
+        .watch_authorization(&principal, gate.clone())
+        .map_err(|_| {
+            gate.terminate();
+            authorization_failure()
+        })?;
+    let initial = watch.take_initial().map_err(|_| authorization_failure())?;
+    let selected = select_read_request(server.as_ref(), &plan.get_request)?;
+    let authorization = Arc::new(StreamAuthorization::new(
+        server.binding().schema(),
+        source,
+        principal.clone(),
+        &selected,
+        initial,
+        watch.revision(),
+        gate.clone(),
+    )?);
+    plan.authorization = Some(authorization.clone());
+    watch
+        .initial_evaluated()
+        .map_err(|_| authorization_failure())?;
     let _guard = active_stream(plan.metric_mode());
-
-    match plan.mode {
-        SubscribeListMode::Once => serve_once(server.as_ref(), &principal, &plan, &outbound).await,
-        SubscribeListMode::Poll => {
-            serve_poll(server, request_id, principal, plan, inbound, outbound).await
+    let data_outbound = outbound.clone();
+    let work = async move {
+        audit_subscribe_result(
+            server.as_ref(),
+            request_id,
+            &principal,
+            AuditOutcome::Success,
+            plan.audit_paths.clone(),
+        )
+        .await?;
+        match plan.mode {
+            SubscribeListMode::Once => serve_once(&server, &principal, &plan, &data_outbound).await,
+            SubscribeListMode::Poll => {
+                serve_poll(server, request_id, principal, plan, inbound, data_outbound).await
+            }
+            SubscribeListMode::Stream => {
+                serve_stream(server, request_id, principal, plan, inbound, data_outbound).await
+            }
         }
-        SubscribeListMode::Stream => {
-            serve_stream(server, request_id, principal, plan, inbound, outbound).await
+    };
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            change = watch.changed() => {
+                let change = match change {
+                    Ok(change) => change,
+                    Err(_) => { gate.terminate(); return Err(authorization_failure()); }
+                };
+                if authorization.reevaluate().is_err() {
+                    gate.terminate();
+                    // Dropping the notification acknowledges server-side closure.
+                    drop(change);
+                    return Err(authorization_failure());
+                }
+                if watch.acknowledge(change).is_err() {
+                    gate.terminate();
+                    return Err(authorization_failure());
+                }
+            }
+            _ = outbound.closed() => return Ok(()),
+            result = &mut work => return result,
         }
     }
 }
 
 async fn serve_once<C, B>(
-    server: &GnmiServer<C, B>,
+    server: &Arc<GnmiServer<C, B>>,
     principal: &TrustedPrincipal,
     plan: &SubscribePlan,
     outbound: &mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
 ) -> Result<(), GnmiError>
 where
-    C: OpcConfig,
-    B: GnmiConfigBinding<C>,
+    C: OpcConfig + 'static,
+    B: GnmiConfigBinding<C> + 'static,
 {
     if !plan.updates_only {
         let mut dedupe = SnapshotDedupe::default();
@@ -183,15 +255,8 @@ where
             Some(gnmi::subscribe_request::Request::Poll(_)) => {
                 if !plan.updates_only {
                     let mut dedupe = SnapshotDedupe::default();
-                    if !send_snapshot(
-                        server.as_ref(),
-                        &principal,
-                        &plan,
-                        &outbound,
-                        &mut dedupe,
-                        true,
-                    )
-                    .await?
+                    if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true)
+                        .await?
                     {
                         return Ok(());
                     }
@@ -242,17 +307,13 @@ where
 {
     let mut dedupe = SnapshotDedupe::default();
     if !plan.updates_only
-        && !send_snapshot(
-            server.as_ref(),
-            &principal,
-            &plan,
-            &outbound,
-            &mut dedupe,
-            true,
-        )
-        .await?
+        && !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true).await?
     {
         return Ok(());
+    }
+    if plan.updates_only {
+        let responses = render_snapshot_async(&server, &principal, &plan).await?;
+        dedupe.last = Some(fingerprint_responses(&responses));
     }
     send_sync(&outbound).await?;
 
@@ -262,7 +323,7 @@ where
         .as_ref()
         .and_then(|stream| stream.operational_request.as_ref())
     {
-        Some(request) => Some(subscribe_operational_events(server.as_ref(), request)?),
+        Some(request) => subscribe_operational_events(server.as_ref(), &plan, request)?,
         None => None,
     };
     let config_rx = plan
@@ -362,15 +423,15 @@ where
             }, if config_rx.is_some() => {
                 match event {
                     Some(ConfigEvent::Change(_)) => {
-                        if !send_snapshot(server.as_ref(), &principal, &plan, &outbound, &mut dedupe, false).await? {
+                        if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, false).await? {
                             return Ok(());
                         }
                     }
                     Some(ConfigEvent::ResyncRequired { .. }) => {
-                        if !send_snapshot(server.as_ref(), &principal, &plan, &outbound, &mut dedupe, true).await? {
+                        if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, false).await? {
                             return Ok(());
                         }
-                        send_sync(&outbound).await?;
+                        if dedupe.changed { send_sync(&outbound).await?; }
                     }
                     None => return Ok(()),
                 }
@@ -383,7 +444,7 @@ where
             }, if operational_rx.is_some() => {
                 match event {
                     Some(Ok(event)) => {
-                        if !send_operational_event(server.as_ref(), request_id, &principal, &plan, event, &outbound).await? {
+                        if !send_operational_event_owned(&server, &principal, &plan, event, &outbound).await? {
                             return Ok(());
                         }
                     }
@@ -398,7 +459,7 @@ where
                 }
             }, if sample.is_some() => {
                 let suppress = plan.stream.as_ref().is_some_and(|stream| stream.suppress_redundant);
-                if !send_snapshot(server.as_ref(), &principal, &plan, &outbound, &mut dedupe, !suppress).await? {
+                if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, !suppress).await? {
                     return Ok(());
                 }
             }
@@ -408,7 +469,7 @@ where
                     None => future::pending().await,
                 }
             }, if heartbeat.is_some() => {
-                if !send_snapshot(server.as_ref(), &principal, &plan, &outbound, &mut dedupe, true).await? {
+                if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true).await? {
                     return Ok(());
                 }
             }
@@ -425,8 +486,27 @@ pub(crate) async fn send_subscribe_error(
     let _ = outbound.send(Err(status_from_error(err))).await;
 }
 
+async fn render_snapshot_async<C, B>(
+    server: &Arc<GnmiServer<C, B>>,
+    principal: &TrustedPrincipal,
+    plan: &SubscribePlan,
+) -> Result<Vec<gnmi::SubscribeResponse>, GnmiError>
+where
+    C: OpcConfig + 'static,
+    B: GnmiConfigBinding<C> + 'static,
+{
+    let server = server.clone();
+    let principal = principal.clone();
+    let plan = plan.clone();
+    tokio::task::spawn_blocking(move || {
+        render_snapshot_responses(server.as_ref(), &principal, &plan)
+    })
+    .await
+    .map_err(|_| GnmiError::unavailable("gNMI snapshot work failed"))?
+}
+
 async fn send_snapshot<C, B>(
-    server: &GnmiServer<C, B>,
+    server: &Arc<GnmiServer<C, B>>,
     principal: &TrustedPrincipal,
     plan: &SubscribePlan,
     outbound: &mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
@@ -434,15 +514,14 @@ async fn send_snapshot<C, B>(
     force: bool,
 ) -> Result<bool, GnmiError>
 where
-    C: OpcConfig,
-    B: GnmiConfigBinding<C>,
+    C: OpcConfig + 'static,
+    B: GnmiConfigBinding<C> + 'static,
 {
-    let responses = render_snapshot_responses(server, principal, plan)?;
-    if responses.is_empty() {
-        return Ok(true);
-    }
+    let responses = render_snapshot_async(server, principal, plan).await?;
     let fingerprint = fingerprint_responses(&responses);
-    if !force && dedupe.last.as_ref() == Some(&fingerprint) {
+    dedupe.changed = dedupe.last.as_ref() != Some(&fingerprint);
+    dedupe.last = Some(fingerprint);
+    if !force && !dedupe.changed {
         return Ok(true);
     }
     for response in responses {
@@ -450,7 +529,6 @@ where
             return Ok(false);
         }
     }
-    dedupe.last = Some(fingerprint);
     Ok(true)
 }
 
@@ -464,13 +542,18 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    let response = handle_read_request(
-        server,
-        principal,
-        &plan.get_request,
-        ReadAction::Subscribe,
-        GnmiNacmAction::Subscribe,
-    )?;
+    let response = match &plan.authorization {
+        Some(authorization) => {
+            handle_subscribed_read(server, principal, &plan.get_request, authorization)?
+        }
+        None => handle_read_request(
+            server,
+            principal,
+            &plan.get_request,
+            ReadAction::Subscribe,
+            GnmiNacmAction::Subscribe,
+        )?,
+    };
     Ok(response
         .notification
         .into_iter()
@@ -483,30 +566,95 @@ where
 
 fn subscribe_operational_events<C, B>(
     server: &GnmiServer<C, B>,
+    plan: &SubscribePlan,
     request: &OperationalSubscriptionRequest,
-) -> Result<OperationalEventReceiver, GnmiError>
+) -> Result<Option<OperationalEventReceiver>, GnmiError>
 where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
+    let paths = request
+        .paths()
+        .iter()
+        .filter(|path| {
+            server
+                .binding()
+                .schema()
+                .node(path.as_str())
+                .is_some_and(|node| {
+                    plan.authorization
+                        .as_ref()
+                        .is_some_and(|auth| auth.permits_request(node.path))
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let request = OperationalSubscriptionRequest::new(paths)
+        .with_max_queued_events(request.max_queued_events());
     server
         .binding()
         .operational_events()
         .ok_or_else(|| {
             GnmiError::unimplemented("gNMI operational on-change event source is not configured")
         })?
-        .subscribe(request)
+        .subscribe(&request)
+        .map(Some)
         .map_err(operational_error)
 }
 
+#[cfg(test)]
 pub(crate) async fn send_operational_event<C, B>(
     server: &GnmiServer<C, B>,
-    request_id: RequestId,
+    _request_id: RequestId,
     principal: &TrustedPrincipal,
     plan: &SubscribePlan,
     event: OperationalEvent,
     outbound: &mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
 ) -> Result<bool, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let Some(response) = prepare_operational_event(server, principal, plan, event)? else {
+        return Ok(true);
+    };
+    Ok(outbound.send(Ok(response)).await.is_ok())
+}
+
+async fn send_operational_event_owned<C, B>(
+    server: &Arc<GnmiServer<C, B>>,
+    principal: &TrustedPrincipal,
+    plan: &SubscribePlan,
+    event: OperationalEvent,
+    outbound: &mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
+) -> Result<bool, GnmiError>
+where
+    C: OpcConfig + 'static,
+    B: GnmiConfigBinding<C> + 'static,
+{
+    let server = server.clone();
+    let principal = principal.clone();
+    let plan = plan.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        prepare_operational_event(server.as_ref(), &principal, &plan, event)
+    })
+    .await
+    .map_err(|_| GnmiError::unavailable("gNMI event work failed"))??;
+    let Some(response) = response else {
+        return Ok(true);
+    };
+    Ok(outbound.send(Ok(response)).await.is_ok())
+}
+
+fn prepare_operational_event<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    plan: &SubscribePlan,
+    event: OperationalEvent,
+) -> Result<Option<gnmi::SubscribeResponse>, GnmiError>
 where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
@@ -519,39 +667,40 @@ where
         .operational_request
         .as_ref()
         .ok_or_else(|| GnmiError::schema("operational event sent without subscription request"))?;
-    event
-        .validate_for_request(request)
-        .map_err(|_| GnmiError::schema("invalid operational event"))?;
-
-    let node = server
-        .binding()
-        .schema()
-        .node(event.path().as_str())
-        .ok_or_else(|| GnmiError::schema("operational event path is outside schema"))?;
+    let Some(node) = server.binding().schema().node(event.path().as_str()) else {
+        return Ok(None);
+    };
+    let allowed = match &plan.authorization {
+        Some(auth) => auth.event(node.path)?,
+        None => {
+            let policy = server.binding().policy_source();
+            let authz = ReadAuthorizer::new(server.binding().schema(), policy.as_ref())
+                .map_err(|_| authorization_failure())?;
+            authz
+                .authorize_selection(
+                    principal,
+                    ReadAction::Subscribe,
+                    &[ReadNode::operational(node.path)],
+                    &Default::default(),
+                )
+                .map_err(|_| authorization_failure())?
+                .decisions
+                .first()
+                .is_some_and(|decision| decision.allowed)
+        }
+    };
+    if !allowed {
+        record_nacm_denials(GnmiNacmAction::Subscribe, 1);
+        return Ok(None);
+    }
     if node.config {
         return Err(GnmiError::schema(
             "operational event path resolved to config data",
         ));
     }
-
-    let policy = server.binding().policy_source();
-    let authz = ReadAuthorizer::new(server.binding().schema(), policy.as_ref())
-        .map_err(|_| GnmiError::schema("gNMI subscribe authorizer setup failed"))?;
-    let decisions = authz
-        .authorize(principal, ReadAction::Subscribe, &[node.path])
-        .map_err(|_| GnmiError::unavailable("gNMI subscribe policy source unavailable"))?;
-    if decisions.first().is_none_or(|decision| !decision.allowed) {
-        record_nacm_denials(GnmiNacmAction::Subscribe, 1);
-        audit_subscribe_result(
-            server,
-            request_id,
-            principal,
-            AuditOutcome::denied_code(opc_mgmt_audit::AuditReasonCode::ACCESS_DENIED),
-            schema_paths_for_schema([node.path])?,
-        )
-        .await?;
-        return Ok(true);
-    }
+    event
+        .validate_for_request(request)
+        .map_err(|_| GnmiError::schema("invalid operational event"))?;
 
     let encoding = encoding_from_proto(plan.get_request.encoding)?;
     if !server.profile().encodings().supports(encoding) {
@@ -583,10 +732,7 @@ where
         response: Some(gnmi::subscribe_response::Response::Update(notification)),
         extension: Vec::new(),
     };
-    if outbound.send(Ok(response)).await.is_err() {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(Some(response))
 }
 
 async fn audit_subscribe_result<C, B>(
@@ -629,7 +775,13 @@ async fn send_sync(
 fn fingerprint_responses(responses: &[gnmi::SubscribeResponse]) -> Vec<u8> {
     let mut out = Vec::new();
     for response in responses {
-        response
+        let mut content = response.clone();
+        if let Some(gnmi::subscribe_response::Response::Update(notification)) =
+            &mut content.response
+        {
+            notification.timestamp = 0;
+        }
+        content
             .encode_length_delimited(&mut out)
             .expect("encoding SubscribeResponse to Vec cannot fail");
     }
@@ -639,6 +791,7 @@ fn fingerprint_responses(responses: &[gnmi::SubscribeResponse]) -> Vec<u8> {
 #[derive(Default)]
 struct SnapshotDedupe {
     last: Option<Vec<u8>>,
+    changed: bool,
 }
 
 /// Parsed and validated Subscribe request plan.
@@ -649,6 +802,7 @@ pub(crate) struct SubscribePlan {
     get_request: gnmi::GetRequest,
     stream: Option<StreamPlan>,
     audit_paths: Vec<SchemaNodePath>,
+    authorization: Option<Arc<StreamAuthorization>>,
 }
 
 impl SubscribePlan {
@@ -733,6 +887,7 @@ impl SubscribePlan {
             get_request,
             stream,
             audit_paths,
+            authorization: None,
         })
     }
 

@@ -41,7 +41,7 @@ use thiserror::Error;
 
 /// One element of a northbound path: a node name (bare or `prefix:name`) and any
 /// list-key predicates supplied for it (in arbitrary order; canonicalized here).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PathSegment {
     /// Node name, optionally module-prefixed (`prefix:name`).
     pub name: String,
@@ -77,7 +77,7 @@ impl PathSegment {
 
 /// A northbound request path: an optional gNMI origin, a prefix applied before
 /// the elements, and the elements themselves.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct RequestPath {
     /// gNMI origin, if any. `None` for NETCONF.
     pub origin: Option<String>,
@@ -99,7 +99,7 @@ impl RequestPath {
 }
 
 /// A resolved, validated path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
     /// Predicate-free, prefix-qualified schema path (registry / NACM lookup key),
     /// e.g. `/sys:system/sys:user`.
@@ -499,6 +499,24 @@ fn module_for_prefix(
 /// Returns the module prefix of a `prefix:name` segment, if present.
 fn prefix_of(seg: &str) -> Option<&str> {
     seg.split_once(':').map(|(prefix, _)| prefix)
+}
+
+impl std::fmt::Debug for PathSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathSegment").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RequestPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestPath").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResolvedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPath").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
