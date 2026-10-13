@@ -621,6 +621,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_normalization_preserves_charges_across_interleaved_schema_groups() {
+        fn shape(path: &'static str, children: Vec<Shape>, budget: &SubtreeBudget) -> Shape {
+            let value_bytes = children.is_empty().then_some(5);
+            let shell = Footprint::shell(
+                path,
+                CapturedWork {
+                    nodes: 1,
+                    schema_bytes: path.len(),
+                    value_bytes: value_bytes.unwrap_or(0),
+                    ..CapturedWork::default()
+                },
+                budget,
+            )
+            .unwrap();
+            let mut tree = shell.copy_metadata(budget).unwrap();
+            for child in &children {
+                tree.append(&child.tree, budget).unwrap();
+            }
+            Shape {
+                path,
+                value_bytes,
+                keys: Vec::new(),
+                children,
+                shell,
+                tree,
+            }
+        }
+        let mut expected = None;
+        for order in [[0, 0, 1], [0, 1, 0], [1, 0, 0]] {
+            let budget = SubtreeBudget::new(1_000_000, 0).unwrap();
+            let mut captures = Vec::new();
+            for index in order {
+                let (branch, leaf) = [
+                    ("/m:root/m:a", "/m:root/m:a/m:value"),
+                    ("/m:root/m:b", "/m:root/m:b/m:value"),
+                ][index];
+                let leaf = shape(leaf, Vec::new(), &budget);
+                let branch = shape(branch, vec![leaf], &budget);
+                captures.push(shape("/m:root", vec![branch], &budget));
+            }
+            normalize_shapes(&mut captures, &budget).unwrap();
+            let nodes: Vec<_> = captures.iter().collect();
+            let footprint = forest_work(&nodes, &budget).unwrap();
+            assert_eq!(footprint.total.nodes, 9);
+            if let Some(expected) = expected {
+                assert_eq!(budget.remaining(), expected);
+            } else {
+                expected = Some(budget.remaining());
+            }
+        }
+    }
+
+    #[test]
     fn evaluation_envelope_arithmetic_is_checked() {
         let one = CapturedWork {
             nodes: 1,
