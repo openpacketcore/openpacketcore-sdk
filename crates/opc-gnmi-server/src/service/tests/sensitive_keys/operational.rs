@@ -485,7 +485,9 @@ async fn operational_subtree_with_forbidden_key_class_is_omitted() {
             &[
                 YangPath::new("/sys:system/sys:contact").unwrap(),
                 YangPath::new("/sys:system/sys:hostname").unwrap(),
-                YangPath::new("/sys:system/sys:uptime").unwrap()
+                YangPath::new("/sys:system/sys:uptime").unwrap(),
+                YangPath::new("/sys:system/sys:user/sys:name").unwrap(),
+                YangPath::new("/sys:system/sys:user/sys:role").unwrap()
             ]
         );
         let mut stream = service
