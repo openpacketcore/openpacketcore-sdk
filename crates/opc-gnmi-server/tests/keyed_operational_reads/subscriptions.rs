@@ -1011,6 +1011,143 @@ async fn non_cleartext_operational_key_is_refused_in_delete() {
 
 static DIAGNOSTICS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+struct AuthorizationTraceCount(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for AuthorizationTraceCount {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "opc_mgmt_authz"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Tenant(bool);
+        impl tracing::field::Visit for Tenant {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "tenant" && value == "trace-observer" {
+                    self.0 = true;
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut tenant = Tenant(false);
+        event.record(&mut tenant);
+        if self.enabled(event.metadata()) && tenant.0 {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hidden_operational_events_do_not_add_authorization_traces() {
+    let _diagnostics = DIAGNOSTICS.lock().await;
+    let traces = Arc::new(AtomicUsize::new(0));
+    // Event authorization runs on blocking-pool threads. Capture this test's
+    // synthetic tenant there as well, without counting other parallel tests.
+    tracing::subscriber::set_global_default(AuthorizationTraceCount(traces.clone())).unwrap();
+    tokio::task::spawn_blocking(|| {
+        tracing::debug!(target: "opc_mgmt_authz", tenant = "trace-observer", "capture probe");
+    })
+    .await
+    .unwrap();
+    assert_eq!(traces.swap(0, Ordering::SeqCst), 1);
+    let control = "/ex:system/ex:visible";
+    let (service, binding, sender) = subscription_fixture(
+        Vec::new(),
+        policy(&[control, "/ex:system/ex:peer/ex:up"]),
+        MgmtLimits::default(),
+    )
+    .await;
+    let mut list = subscription(selection(&[], "up"));
+    list.subscription.push(gnmi::Subscription {
+        path: Some(gnmi::Path {
+            elem: vec![
+                gnmi::PathElem {
+                    name: "system".into(),
+                    key: HashMap::new(),
+                },
+                gnmi::PathElem {
+                    name: "visible".into(),
+                    key: HashMap::new(),
+                },
+            ],
+            ..Default::default()
+        }),
+        mode: gnmi::SubscriptionMode::OnChange as i32,
+        ..Default::default()
+    });
+    let mut request = open_requests(list, false);
+    request
+        .extensions_mut()
+        .insert(AuthenticatedGnmiPrincipal::new(
+            TrustedPrincipal::new(
+                WorkloadIdentity::User("reader".into()),
+                TenantId::from_static("trace-observer"),
+            )
+            .with_auth_strength(AuthStrength::MutualTls),
+        ));
+    let mut stream = service.subscribe(request).await.unwrap().into_inner();
+    sync(stream.next().await.unwrap().unwrap());
+    assert!(
+        traces.load(Ordering::SeqCst) > 0,
+        "request tracing is enabled"
+    );
+    let mut visible_only_traces = None;
+    for hidden in [false, true] {
+        let before = traces.load(Ordering::SeqCst);
+        let calls = binding.policy.calls.load(Ordering::SeqCst);
+        if hidden {
+            sender
+                .send(OperationalEvent::Update(peer("hidden", "up", "true")))
+                .await
+                .unwrap();
+        }
+        sender
+            .send(OperationalEvent::Update(value(control, "17")))
+            .await
+            .unwrap();
+        let data = notification(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(data.update.len(), 1);
+        assert_eq!(
+            data.update[0].path.as_ref().unwrap().elem[1].name,
+            "ex:visible"
+        );
+        assert_eq!(
+            data.update[0].val.as_ref().unwrap().value,
+            Some(gnmi::typed_value::Value::JsonIetfVal(b"17".to_vec()))
+        );
+        assert_eq!(
+            binding.policy.calls.load(Ordering::SeqCst),
+            calls + 1 + usize::from(hidden)
+        );
+        let observed = traces.load(Ordering::SeqCst) - before;
+        if let Some(baseline) = visible_only_traces {
+            assert_eq!(
+                observed, baseline,
+                "hidden activity adds no authorization traces"
+            );
+        } else {
+            visible_only_traces = Some(observed);
+        }
+    }
+}
+
 fn group_key_policy() -> NacmPolicy {
     let mut modules = ModuleRegistry::new();
     modules.register_module("example", "ex").unwrap();
