@@ -862,7 +862,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                     // Build default expression
                     let def_expr = get_field_default_expr(child, &nodes_by_path);
-                    if child.default.is_some() {
+                    if child.config && child.default.is_some() {
                         has_defaults = true;
                     }
                     default_fields.push(quote! {
@@ -1144,6 +1144,15 @@ pub(super) fn numeric_range_check(
 }
 
 fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
+    // Operational values represent observations, not configuration defaults.
+    // Keep their optional field representation even when the schema has a default.
+    if !child.config && child.kind == SchemaNodeKind::Leaf {
+        return if is_sensitive_node(child) {
+            quote! { SecretLeaf::new(None) }
+        } else {
+            quote! { None }
+        };
+    }
     if let Some(ref def_str) = child.default {
         let resolved_type = nodes_by_path.legacy_or_resolved(child).type_ref.as_ref();
         let val_expr = match resolved_type {
