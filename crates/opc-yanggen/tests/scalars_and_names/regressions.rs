@@ -361,6 +361,92 @@ fn integer_comparisons_cover_current_count_and_mixed_width_paths() {
     compile_canonical_fixture("integer-comparison-operands", &canonical, &tests, 4);
 }
 
+mod comparison_guards {
+    use super::{generate_rust, input};
+    use opc_yanggen::{
+        CanonicalInput, CompareOp, ConstraintBinding, ConstraintExpr, FunctionCall, FunctionName,
+        Literal, PathAnchor, PathExpr,
+    };
+
+    fn comparison(target: &str, left: ConstraintExpr, right: ConstraintExpr) -> CanonicalInput {
+        let mut canonical = input(
+            r#"module n {
+              namespace "urn:n"; prefix n;
+              container root {
+                leaf value { type uint8; }
+                leaf label { type string; }
+                leaf-list values { type uint8; }
+              }
+            }"#,
+        )
+        .to_canonical();
+        canonical.constraints.push(ConstraintBinding {
+            target_path: target.into(),
+            expr: ConstraintExpr::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            ..Default::default()
+        });
+        canonical
+    }
+
+    fn path(name: &str) -> ConstraintExpr {
+        ConstraintExpr::Path(PathExpr {
+            anchor: PathAnchor::Current,
+            segments: vec![name.into()],
+        })
+    }
+
+    fn number() -> ConstraintExpr {
+        ConstraintExpr::Literal(Literal::Number(1))
+    }
+
+    #[test]
+    fn integer_current_rejects_arguments_before_emission() {
+        let current = |args| {
+            ConstraintExpr::Function(FunctionCall {
+                name: FunctionName::Current,
+                args,
+            })
+        };
+        generate_rust(&comparison("/n:root/n:value", current(vec![]), number())).unwrap();
+        assert_eq!(
+            generate_rust(&comparison(
+                "/n:root/n:value",
+                current(vec![number()]),
+                number(),
+            ))
+            .unwrap_err()
+            .message(),
+            "current() expects no arguments"
+        );
+    }
+
+    #[test]
+    fn integer_comparison_rejects_a_leaf_list_operand() {
+        generate_rust(&comparison("/n:root", path("value"), number())).unwrap();
+        assert_eq!(
+            generate_rust(&comparison("/n:root", path("values"), number()))
+                .unwrap_err()
+                .message(),
+            "integer comparisons require scalar leaf operands"
+        );
+    }
+
+    #[test]
+    fn integer_comparison_rejects_a_mixed_scalar_operand() {
+        generate_rust(&comparison("/n:root", path("value"), number())).unwrap();
+        assert_eq!(
+            generate_rust(&comparison("/n:root", path("label"), number()))
+                .unwrap_err()
+                .message(),
+            "integer comparisons require integer leaf or number operands"
+        );
+    }
+}
+
 #[test]
 fn case_distinct_pattern_helpers_compile_and_keep_their_own_constraints() {
     compile_fixture(
