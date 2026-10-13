@@ -327,6 +327,111 @@ fn application_marker_change_is_rejected(statement: &str, expected_reason: &str)
 }
 
 #[test]
+fn application_log_audit_rejects_an_intervening_same_connection_write() {
+    use super::super::super::log_row_reuse_test_observer::Scope;
+    let fixture = fixture();
+    let source =
+        SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
+    let conn = source.conn.blocking_lock();
+    application_seed_applied_one(&fixture, &conn, &source.caps);
+    fixture
+        .wal
+        .submit(append(&[batch(2)]))
+        .unwrap()
+        .wait()
+        .unwrap();
+    fixture
+        .wal
+        .submit(Operation::Committed(Some(log_id(2))))
+        .unwrap()
+        .wait()
+        .unwrap();
+    let observation = Scope::new();
+    observation.after_highest_audit(|private| {
+        assert_eq!(
+            private
+                .execute(
+                    "UPDATE consensus_log SET entry_json = entry_json WHERE log_index = 2",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+    });
+    let error = fixture
+        .wal
+        .apply_committed(&conn, &source.caps, vec![batch(2)], ApplyControl::Normal)
+        .expect_err("a write during the audit must not establish payload reuse");
+    observation.finish();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "private WAL application log changed during audit"
+    );
+    assert_eq!(
+        super::super::super::last_log_sync(&conn, identity()).unwrap(),
+        Some(log_id(1)),
+        "the cache transaction must not apply the rejected entry"
+    );
+    assert!(fixture.wal.shutdown().is_err());
+}
+
+#[test]
+fn application_final_audit_reuses_the_exact_private_log_decode() {
+    use super::super::super::log_row_reuse_test_observer::{Event, Scope};
+    let fixture = fixture();
+    let source =
+        SqliteSessionBackend::open(fixture.directory.path().join("source.sqlite")).unwrap();
+    let conn = source.conn.blocking_lock();
+    application_seed_applied_one(&fixture, &conn, &source.caps);
+    for index in 2..=3 {
+        fixture
+            .wal
+            .submit(append(&[batch(index)]))
+            .unwrap()
+            .wait()
+            .unwrap();
+        fixture
+            .wal
+            .submit(Operation::Committed(Some(log_id(index))))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let observation = Scope::new();
+        fixture
+            .wal
+            .apply_committed(
+                &conn,
+                &source.caps,
+                vec![batch(index)],
+                ApplyControl::Normal,
+            )
+            .unwrap();
+        let events = observation.finish();
+        let begin = events
+            .iter()
+            .position(|event| *event == Event::ApplicationFinalAuditStart)
+            .expect("apply performs its final transaction audit");
+        let end = events
+            .iter()
+            .position(|event| *event == Event::ApplicationFinalAuditEnd)
+            .expect("the final transaction audit completed");
+        assert!(events[..begin].contains(&Event::FullDecode));
+        assert!(events[begin..end].contains(&Event::HighestAudit));
+        assert!(
+            !events[begin..end].contains(&Event::FullDecode),
+            "exact stored-byte equality must reuse the earlier complete payload decode"
+        );
+        assert_eq!(
+            super::super::super::last_log_sync(&conn, identity()).unwrap(),
+            Some(log_id(index))
+        );
+        assert_eq!(fixture.wal.with_application_read(&conn, || 7).unwrap(), 7);
+    }
+    fixture.wal.shutdown().unwrap();
+}
+
+#[test]
 fn application_final_application_audit_rejects_a_different_valid_payload() {
     let statement = format!(
         "UPDATE consensus_log SET entry_json = X'{}' WHERE log_index = 2",
@@ -359,6 +464,43 @@ fn application_final_application_audit_rejects_a_missing_final_row() {
         "DELETE FROM consensus_log WHERE log_index = 2",
         "private WAL application final log differs",
     );
+}
+
+#[test]
+fn application_frontier_cache_detects_same_connection_schema_change() {
+    use super::super::super::log_row_reuse_test_observer::{Event, Scope};
+    let fixture = fixture();
+    let path = fixture.directory.path().join("source.sqlite");
+    let source = SqliteSessionBackend::open(&path).unwrap();
+    let conn = source.conn.blocking_lock();
+    application_seed_applied_one(&fixture, &conn, &source.caps);
+    let changes = conn.total_changes();
+    let data_version: i64 = conn
+        .pragma_query_value(Some("main"), "data_version", |row| row.get(0))
+        .unwrap();
+    conn.execute_batch("ALTER TABLE consensus_log RENAME TO consensus_log_detached")
+        .unwrap();
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(
+        conn.pragma_query_value(Some("main"), "data_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        data_version,
+        "the schema counter must catch changes missed by both write counters"
+    );
+    let observation = Scope::new();
+    let called = std::cell::Cell::new(false);
+    let error = fixture
+        .wal
+        .with_application_read(&conn, || called.set(true))
+        .expect_err("a schema change must invalidate the published frontier");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "private WAL application cache changed outside its owner"
+    );
+    assert!(!called.get());
+    assert!(!observation.finish().contains(&Event::FullDecode));
+    assert!(fixture.wal.shutdown().is_err());
 }
 
 #[test]

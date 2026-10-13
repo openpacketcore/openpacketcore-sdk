@@ -25309,6 +25309,26 @@ fn last_log_with_optional_capture_sync(
     identity: SessionConsensusIdentity,
     reuse: Option<&mut LogRowReadReuse<'_>>,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    last_log_with_audited_application_sync(conn, identity, reuse, None)
+}
+
+/// Reuse requires a complete earlier payload audit and exact identity/byte
+/// equality. The application owner supplies its privately constructed proof;
+/// every other caller uses the ordinary full decoder.
+trait AuditedLogEntry {
+    fn reuse_for_exact_bytes(
+        &self,
+        identity: SessionConsensusIdentity,
+        encoded: &[u8],
+    ) -> Option<&Entry<SessionRaftTypeConfig>>;
+}
+
+fn last_log_with_audited_application_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    reuse: Option<&mut LogRowReadReuse<'_>>,
+    audited: Option<&dyn AuditedLogEntry>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     let floor = read_purged_sync(conn, identity)?;
     let row = conn
         .query_row(
@@ -25322,7 +25342,10 @@ fn last_log_with_optional_capture_sync(
         return Ok(floor);
     };
     validate_epoch(epoch, identity)?;
-    let entry = decode_consensus_log_entry(&encoded)?;
+    let entry = match audited.and_then(|audit| audit.reuse_for_exact_bytes(identity, &encoded)) {
+        Some(entry) => std::borrow::Cow::Borrowed(entry),
+        None => std::borrow::Cow::Owned(decode_consensus_log_entry(&encoded)?),
+    };
     validate_log_id(&entry.log_id)?;
     if checked_u64(term)? != entry.log_id.leader_id.term
         || checked_u64(index)? != entry.log_id.index
@@ -25338,7 +25361,7 @@ fn last_log_with_optional_capture_sync(
     }
     let log_id = entry.log_id;
     if let Some(reuse) = reuse {
-        reuse.capture_after_full_audit(epoch, term, index, encoded, entry);
+        reuse.capture_after_full_audit(epoch, term, index, encoded, entry.into_owned());
     }
     #[cfg(test)]
     log_row_reuse_test_observer::after_highest_audit(conn);
@@ -40706,6 +40729,10 @@ mod log_row_reuse_test_observer {
         Ineligible,
         BudgetFallback,
         HighestAudit,
+        #[cfg(target_os = "linux")]
+        ApplicationFinalAuditStart,
+        #[cfg(target_os = "linux")]
+        ApplicationFinalAuditEnd,
         AfterBytesDrop,
         AfterEntrySlotDrop,
         Refund,

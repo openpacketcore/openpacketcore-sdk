@@ -18,7 +18,8 @@ use super::{
     Binding, Digest, Entry, LogId, Operation, Sha256, State, Wal, MAX_ENTRIES,
 };
 use crate::sqlite::consensus::{
-    self, AppliedBatch, BackendCapabilities, SessionConsensusNodeId, SessionRaftTypeConfig,
+    self, AppliedBatch, BackendCapabilities, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionRaftTypeConfig,
 };
 use std::io;
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ pub(super) struct Marker {
 
 /// Writer-exclusion evidence for one live connection, without a content proof.
 /// Only `audit_cache_guard` can bind these counters to an audited frontier.
+/// `schema_version` also detects DDL, which changes neither write counter.
 struct CacheCounters {
     token: [u8; 16],
     changes: u64,
@@ -52,9 +54,39 @@ pub(super) struct CacheGuard {
 }
 
 enum CacheAudit<'a> {
-    Apply(&'a Entry<SessionRaftTypeConfig>),
+    Apply(&'a AuditedApplicationBatch),
     Restore(&'a BackendCapabilities),
     Snapshot,
+}
+
+/// One canonical encoding whose exact bytes passed the original private-log
+/// range audit. Only `require_exact_entries` constructs it, while holding the
+/// private connection's State lock and checking its unchanged counters. The
+/// final cache audit may borrow the supplied entry only after exact byte
+/// equality; its row, command, floor and publication checks still run.
+/// This moves the original apply batch and retains only its last entry's
+/// already-produced comparison buffer. It adds no decoded payload copy or
+/// published cache, and is consumed by the original private-log apply.
+struct AuditedApplicationBatch {
+    identity: SessionConsensusIdentity,
+    entries: Vec<Entry<SessionRaftTypeConfig>>,
+    last_log_id: LogId<SessionConsensusNodeId>,
+    encoded: Vec<u8>,
+    canonical_source: bool,
+}
+
+impl consensus::AuditedLogEntry for AuditedApplicationBatch {
+    fn reuse_for_exact_bytes(
+        &self,
+        identity: SessionConsensusIdentity,
+        encoded: &[u8],
+    ) -> Option<&Entry<SessionRaftTypeConfig>> {
+        if self.canonical_source && identity == self.identity && encoded == self.encoded {
+            self.entries.last()
+        } else {
+            None
+        }
+    }
 }
 
 /// A full audit (or an audited extension) proved this exact applied prefix.
@@ -391,18 +423,22 @@ impl Wal {
         if entries.first().map(|entry| entry.log_id.index) != Some(next) {
             return Err(invalid_data("private WAL application is not contiguous"));
         }
-        if let Err(error) = require_durable_committed(&state, self.binding, last).and_then(|()| {
-            require_exact_entries(&state.conn, self.binding, next, last.index, &entries)
-        }) {
-            if !matches!(
-                error.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::WouldBlock
-            ) {
-                fence(&mut state);
-                self.shared.ready.notify_all();
+        let final_entry_audit = match require_durable_committed(&state, self.binding, last)
+            .and_then(|()| {
+                require_exact_entries(&state.conn, self.binding, next, last.index, entries)
+            }) {
+            Ok(audit) => audit,
+            Err(error) => {
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::WouldBlock
+                ) {
+                    fence(&mut state);
+                    self.shared.ready.notify_all();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         let (&cut_sequence, cut) = state
             .durable_cuts
             .last_key_value()
@@ -414,7 +450,7 @@ impl Wal {
             applied: last,
         };
         let preflight = preflight_started.elapsed();
-        let entry_count = entries.len() as u64;
+        let entry_count = final_entry_audit.entries.len() as u64;
         let mut sqlite_apply = Duration::ZERO;
         let mut sqlite_commit_and_return = Duration::ZERO;
         let mut projection_apply = Duration::ZERO;
@@ -431,14 +467,14 @@ impl Wal {
                 &state.authority.members,
                 &state.authority.bindings,
                 state.authority.placement,
-                entries.clone(),
+                final_entry_audit.entries.clone(),
                 None,
                 |tx| {
                     // No SQL log write occurs before the original apply
                     // transaction or for an uncommitted/pending WAL record.
                     validate_cache_guard(tx, &state)?;
                     validate_cache_frontier(tx, &state, self.binding)?;
-                    append_logs_in_tx(tx, self.binding.identity, &entries)?;
+                    append_logs_in_tx(tx, self.binding.identity, &final_entry_audit.entries)?;
                     save_committed_in_tx(tx, self.binding.identity, Some(last))
                 },
                 |tx| {
@@ -447,9 +483,6 @@ impl Wal {
                         return Err(io::Error::other("private WAL injected pre-commit failure"));
                     }
                     // Marker triggers are part of the operation's final write.
-                    let final_entry = entries
-                        .last()
-                        .ok_or_else(|| invalid_data("private WAL application batch is empty"))?;
                     let token = state
                         .application_guard
                         .as_ref()
@@ -463,7 +496,7 @@ impl Wal {
                         &state,
                         self.binding,
                         token,
-                        CacheAudit::Apply(final_entry),
+                        CacheAudit::Apply(&final_entry_audit),
                     )?);
                     commit_started.set(Some(Instant::now()));
                     Ok(())
@@ -482,7 +515,13 @@ impl Wal {
             // same original apply advances its base; admission still replays
             // the entire unapplied suffix with the original validators.
             let projection_started = Instant::now();
-            let projected = apply_original(&state.conn, caps, &state, self.binding, entries)?;
+            let projected = apply_original(
+                &state.conn,
+                caps,
+                &state,
+                self.binding,
+                final_entry_audit.entries,
+            )?;
             projection_apply = projection_started.elapsed();
             let verification_started = Instant::now();
             if encode_json(&applied.responses)? != encode_json(&projected.responses)?
@@ -650,26 +689,39 @@ fn validate_cache_frontier(conn: &Connection, state: &State, binding: Binding) -
 fn audit_final_application_log(
     conn: &Connection,
     binding: Binding,
-    expected: &Entry<SessionRaftTypeConfig>,
+    expected: &AuditedApplicationBatch,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
-    let encoded = encode_json(expected)?;
+    #[cfg(test)]
+    consensus::log_row_reuse_test_observer::note(
+        consensus::log_row_reuse_test_observer::Event::ApplicationFinalAuditStart,
+    );
+    let encoded = &expected.encoded;
     let stored = conn
         .query_row(
             "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
-            [consensus::checked_i64(expected.log_id.index)?],
+            [consensus::checked_i64(expected.last_log_id.index)?],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
         .map_err(db_error)?;
-    if stored.as_ref() != Some(&encoded) {
+    if stored.as_ref() != Some(encoded) {
         return Err(invalid_data("private WAL application final log differs"));
     }
     // Retain the original highest-row, purge-floor, row/ID and command checks.
     // Payload equality above also refuses a different valid entry at the same ID.
-    let audited = consensus::last_log_sync(conn, binding.identity)?;
-    if audited != Some(expected.log_id) {
+    let audited = consensus::last_log_with_audited_application_sync(
+        conn,
+        binding.identity,
+        None,
+        Some(expected),
+    )?;
+    if audited != Some(expected.last_log_id) {
         return Err(invalid_data("private WAL application final log differs"));
     }
+    #[cfg(test)]
+    consensus::log_row_reuse_test_observer::note(
+        consensus::log_row_reuse_test_observer::Event::ApplicationFinalAuditEnd,
+    );
     Ok(audited)
 }
 
@@ -678,8 +730,8 @@ fn require_exact_entries(
     binding: Binding,
     start: u64,
     last: u64,
-    entries: &[Entry<SessionRaftTypeConfig>],
-) -> io::Result<()> {
+    entries: Vec<Entry<SessionRaftTypeConfig>>,
+) -> io::Result<AuditedApplicationBatch> {
     let end = last
         .checked_add(1)
         .ok_or_else(|| invalid_data("private WAL log range exhausted"))?;
@@ -691,6 +743,10 @@ fn require_exact_entries(
             "private WAL application entries differ from WAL",
         ));
     }
+    let source_changes = conn.total_changes();
+    let source_data_version = projection_data_version(conn)?;
+    let source_schema_version = projection_schema_version(conn)?;
+    let mut final_entry_audit = None;
     let mut next = start;
     for chunk in entries.chunks(MAX_ENTRIES) {
         let chunk_end = next
@@ -711,16 +767,48 @@ fn require_exact_entries(
         // Compare one complete entry at a time, without serializing an
         // arbitrarily large apply batch into another aggregate allocation.
         for (persisted, expected) in persisted.iter().zip(chunk) {
-            if encode_json(persisted)? != encode_json(expected)? {
+            let encoded = encode_json(expected)?;
+            if encoded != encode_json(persisted)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "private WAL application entries differ from WAL",
                 ));
             }
+            if expected.log_id.index == last {
+                // The range reader just decoded this exact physical row. Bind
+                // its canonical comparison buffer to that audit before reuse.
+                // A noncanonical spelling keeps the original decoder.
+                let stored = conn
+                    .query_row(
+                        "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
+                        [consensus::checked_i64(last)?],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                let canonical_source = stored.as_ref() == Some(&encoded);
+                final_entry_audit = Some((expected.log_id, encoded, canonical_source));
+            }
         }
         next = chunk_end;
     }
-    Ok(())
+    if conn.total_changes() != source_changes
+        || projection_data_version(conn)? != source_data_version
+        || projection_schema_version(conn)? != source_schema_version
+    {
+        return Err(invalid_data(
+            "private WAL application log changed during audit",
+        ));
+    }
+    let (last_log_id, encoded, canonical_source) =
+        final_entry_audit.ok_or_else(|| invalid_data("private WAL application batch is empty"))?;
+    Ok(AuditedApplicationBatch {
+        identity: binding.identity,
+        entries,
+        last_log_id,
+        encoded,
+        canonical_source,
+    })
 }
 
 fn apply_original(
