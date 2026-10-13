@@ -1581,6 +1581,51 @@ impl SqliteSessionBackend {
         consensus::voter_slots::preflight(&conn, self.voter_seed.as_deref())
     }
 
+    #[cfg(target_os = "linux")]
+    async fn run_native_format_preflight(
+        scan: impl FnOnce(&AtomicBool) -> std::io::Result<Vec<consensus::CurrentSnapshot>>
+            + Send
+            + 'static,
+    ) -> Result<
+        Vec<consensus::CurrentSnapshot>,
+        crate::consensus::storage::SessionConsensusStorageError,
+    > {
+        use crate::consensus::storage::SessionConsensusStorageError;
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let task_cancellation = Arc::clone(&cancellation);
+        // Retire queued captures immediately if the opener is abandoned;
+        // aborting a blocking task alone can retain them until a worker is free.
+        let queued = Arc::new(StdMutex::new(Some(scan)));
+        let task_queued = Arc::clone(&queued);
+        let task = tokio::task::spawn_blocking(move || {
+            let scan = task_queued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()?;
+            Some(scan(&task_cancellation))
+        });
+        let mut cancel_on_drop = RestoreScanCancellation {
+            cancellation,
+            abort: task.abort_handle(),
+            armed: true,
+            cancel_queued: Some(Box::new(move || {
+                drop(
+                    queued
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take(),
+                );
+            })),
+        };
+        let completed = task.await;
+        cancel_on_drop.disarm();
+        completed
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+            .ok_or(SessionConsensusStorageError::BackendUnavailable)?
+            .map_err(SessionConsensusStorageError::from_validation_error)
+    }
+
     /// Validate the selected native root before comparing caller scope. Only
     /// a root that also verifies against its original SQLite identity can
     /// distinguish a different requested identity from corrupt recovery input.
@@ -1610,11 +1655,10 @@ impl SqliteSessionBackend {
             Ok(mode) => {
                 if mode.is_some() {
                     let scan_owner = Arc::clone(owner);
-                    let snapshots =
-                        tokio::task::spawn_blocking(move || scan_owner.preflight_formats(expected))
-                            .await
-                            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
-                            .map_err(SessionConsensusStorageError::from_validation_error)?;
+                    let snapshots = Self::run_native_format_preflight(move |cancellation| {
+                        scan_owner.preflight_formats(expected, cancellation)
+                    })
+                    .await?;
                     preflight_snapshots(snapshots).await?;
                 }
                 Ok(mode)
@@ -1631,12 +1675,10 @@ impl SqliteSessionBackend {
             }
             Err(_) => {
                 let scan_owner = Arc::clone(owner);
-                let snapshots = tokio::task::spawn_blocking(move || {
-                    scan_owner.preflight_formats_before_scope_lookup()
+                let snapshots = Self::run_native_format_preflight(move |cancellation| {
+                    scan_owner.preflight_formats_before_scope_lookup(cancellation)
                 })
-                .await
-                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
-                .map_err(SessionConsensusStorageError::from_validation_error)?;
+                .await?;
                 preflight_snapshots(snapshots).await?;
                 let conn = self.conn.lock().await;
                 let persisted = consensus::read_storage_identity_sync(&conn)

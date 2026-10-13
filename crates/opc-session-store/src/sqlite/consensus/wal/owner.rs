@@ -324,13 +324,14 @@ impl NativeOwner {
     pub(crate) fn preflight_formats(
         &self,
         identity_expected: consensus::SessionConsensusIdentity,
+        cancellation: &AtomicBool,
     ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
         let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
         let binding = self.read_root(&pin, identity_expected)?;
         let directory = directory_path(&pin);
         let anchor = super::checkpoint::read(&directory, binding, Limits::default())?
             .ok_or_else(|| invalid_data("native selected generation is missing"))?;
-        self.preflight_generation_format(&directory, &anchor)
+        self.preflight_generation_format(&directory, &anchor, cancellation)
     }
 
     /// Compatibility inspection precedes even the SQLite query that classifies
@@ -338,6 +339,7 @@ impl NativeOwner {
     /// are checked here; its scope binding remains the ordinary opener's job.
     pub(crate) fn preflight_formats_before_scope_lookup(
         &self,
+        cancellation: &AtomicBool,
     ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
         let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
         let (bytes, persistence) = self.read_root_record(&pin)?;
@@ -351,13 +353,14 @@ impl NativeOwner {
             Limits::default(),
         )?
         .ok_or_else(|| invalid_data("native selected generation is missing"))?;
-        self.preflight_generation_format(&directory, &anchor)
+        self.preflight_generation_format(&directory, &anchor, cancellation)
     }
 
     fn preflight_generation_format(
         &self,
         directory: &Path,
         anchor: &super::checkpoint::Anchor,
+        cancellation: &AtomicBool,
     ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
         #[cfg(test)]
         let hook = self.preflight_hook.lock().unwrap().clone();
@@ -370,9 +373,21 @@ impl NativeOwner {
             super::MAX_BASIS,
             anchor.native_cut_binding()?,
             &|| {
+                if cancellation.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native generation preflight cancelled",
+                    ));
+                }
                 #[cfg(test)]
                 if let Some(hook) = &hook {
                     hook()?;
+                    if cancellation.load(Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "native generation preflight cancelled",
+                        ));
+                    }
                 }
                 Ok(())
             },
