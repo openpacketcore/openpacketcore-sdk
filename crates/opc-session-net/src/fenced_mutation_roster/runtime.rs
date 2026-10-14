@@ -6122,6 +6122,7 @@ mod local_authority_registry_tests {
 #[cfg(test)]
 mod production_runtime_cut_matrix_tests {
     mod async_provider_authority_tests;
+    mod fenced_non_execution_registry_tests;
 
     use super::*;
     use crate::fenced_mutation_roster::canonical::{

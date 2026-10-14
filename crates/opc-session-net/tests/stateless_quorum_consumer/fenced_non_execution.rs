@@ -222,7 +222,7 @@ struct SettlementFixture {
 impl SettlementFixture {
     async fn start(lose_admission: bool) -> Self {
         let pki = Arc::new(TestPki::new());
-        let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+        let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
             Arc::clone(&pki),
             ProductionRosterAttestationIssuer::trust_root(),
         )

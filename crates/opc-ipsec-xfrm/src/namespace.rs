@@ -5737,6 +5737,8 @@ impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
 mod tests {
     #[cfg(unix)]
     include!("namespace/reset_tests.rs");
+    #[cfg(unix)]
+    include!("namespace/fenced_non_execution_tests.rs");
     use std::collections::VecDeque;
     #[cfg(unix)]
     use std::future::Future;
