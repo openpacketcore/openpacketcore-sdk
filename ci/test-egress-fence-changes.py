@@ -109,6 +109,7 @@ class DecisionTests(unittest.TestCase):
             "ci/test-egress-fence-changes.py",
             "ci/egress-fence-tests.py",
             "ci/test-egress-fence-tests.py",
+            "ci/cargo_test_selection.py",
             "ci/egress-fence-tools.sh",
             "ci/egress-fence-kernel.sh",
             "ci/egress-fence-cleanup.sh",
