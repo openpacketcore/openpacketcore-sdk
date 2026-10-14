@@ -5,9 +5,13 @@ import copy
 import importlib.util
 from pathlib import Path
 import re
+import sys
 import unittest
+from unittest.mock import patch
 
 
+# The workflow runs this test with -I; import only the explicit CI module path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 SPEC = importlib.util.spec_from_file_location(
     "egress_fence_tests", Path(__file__).with_name("egress-fence-tests.py"))
 assert SPEC is not None and SPEC.loader is not None
@@ -17,7 +21,7 @@ SPEC.loader.exec_module(FENCE)
 
 def fixture():
     rows = []
-    for name in FENCE.SPECIAL:
+    for name in FENCE.ISOLATED_TESTS:
         integration = name in FENCE.ISOLATED_INTEGRATION
         rows.append({"package": "opc-session-store",
                      "target": "consensus_openraft" if integration else "opc_session_store",
@@ -38,9 +42,161 @@ def fixture():
     return rows
 
 
+def ordinary(commands):
+    return next(command for command in commands if command["name"] == "ordinary")
+
+
 def skips(command):
     argv = command["argv"]
     return {argv[i + 1] for i, value in enumerate(argv) if value == "--skip"}
+
+
+class ScopePayloadSerialPhaseTests(unittest.TestCase):
+    NAMES = (
+        "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
+        "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history",
+        "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
+        "scope_child_read_three_large_children_refuse_the_whole_observation",
+    )
+
+    def setUp(self):
+        packages = [{
+            "id": name, "name": name, "version": "0.1.0", "targets": [
+                {"name": name.replace("-", "_"), "kind": ["lib"], "test": True},
+            ],
+        } for name in (*FENCE.PACKAGES, "opc-session-testkit")]
+        for package, target in (("opc-session-store", "consensus_openraft"),
+                                ("opc-session-testkit", "qualification_profile")):
+            next(p for p in packages if p["name"] == package)["targets"].append(
+                {"name": target, "kind": ["test"], "test": True})
+        metadata = {"workspace_root": str(FENCE.ROOT), "packages": packages,
+                    "workspace_members": [p["id"] for p in packages],
+                    "workspace_default_members": [p["id"] for p in packages]}
+        patcher = patch.object(FENCE.cargo_test_selection, "workspace_metadata", return_value=metadata)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def rows(self):
+        return [row for row in fixture() if row["name"] not in self.NAMES] + [
+            {"package": "opc-session-store", "target": "opc_session_store",
+             "kind": ["lib"], "name": name, "ignored": False, "shard": 1}
+            for name in self.NAMES
+        ]
+
+    def test_serial_phase_runs_first_once_and_preserves_original_selection(self):
+        plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+        self.assertEqual(plans[1][:len(self.NAMES)], [{"name": name, "env": {}, "argv": [
+            "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
+            "--test-threads=1", "--nocapture", "--exact", name,
+        ]} for name in self.NAMES])
+        exact = [(shard, command) for shard, plan in plans.items()
+                 for command in plan if command["name"] in self.NAMES]
+        self.assertEqual(exact, [(1, command) for command in plans[1][:len(self.NAMES)]])
+        self.assertEqual(plans[1][len(self.NAMES)]["name"], "ordinary")
+        for shard in FENCE.ORDINARY_SHARDS:
+            ordinary = next(c for c in plans[shard] if c["name"] == "ordinary")
+            self.assertIn("--exact", ordinary["argv"])
+            for name in self.NAMES:
+                self.assertEqual(ordinary["argv"].count(name), 1)
+                self.assertIn(name, skips(ordinary))
+        FENCE.verify_plans(plans)
+
+    def test_missing_ignored_duplicate_or_wrong_harness_fails(self):
+        for name in self.NAMES:
+            for mutation in ("missing", "ignored", "duplicate", "target", "package", "kind"):
+                rows = self.rows()
+                row = next(row for row in rows if row["name"] == name)
+                if mutation == "missing":
+                    rows.remove(row)
+                elif mutation == "duplicate":
+                    rows.append(dict(row, package="another-package"))
+                elif mutation == "ignored":
+                    row["ignored"] = True
+                else:
+                    row[mutation] = ["test"] if mutation == "kind" else "other"
+                with self.subTest(test=name, mutation=mutation), self.assertRaises(ValueError):
+                    FENCE.verify(rows)
+
+    def test_missing_duplicate_late_or_overlapping_serial_commands_fail(self):
+        for serial_index, name in enumerate(self.NAMES):
+            for mutation in ("missing", "duplicate", "renamed-duplicate", "late", "overlap", "threads", "profile"):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                ordinary_index = len(self.NAMES)
+                if mutation == "missing":
+                    plans[1].pop(serial_index)
+                elif mutation == "duplicate":
+                    plans[1].insert(serial_index, copy.deepcopy(plans[1][serial_index]))
+                elif mutation == "renamed-duplicate":
+                    duplicate = copy.deepcopy(plans[1][serial_index])
+                    duplicate["name"] = "another-command"
+                    plans[0].append(duplicate)
+                elif mutation == "late":
+                    plans[1][serial_index], plans[1][ordinary_index] = plans[1][ordinary_index], plans[1][serial_index]
+                elif mutation == "overlap":
+                    argv = plans[1][ordinary_index]["argv"]
+                    index = argv.index(name)
+                    del argv[index - 1:index + 1]
+                elif mutation == "threads":
+                    argv = plans[1][serial_index]["argv"]
+                    argv[argv.index("--test-threads=1")] = "--test-threads=4"
+                else:
+                    plans[1][serial_index]["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] = "1"
+                with self.subTest(test=name, mutation=mutation), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
+
+    def test_equivalent_cargo_selectors_cannot_duplicate_a_serial_test(self):
+        for name in self.NAMES:
+            for selector in ([], ["--lib"], ["--tests"], ["--all-targets"]):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                plans[0].append({"name": "second-scope-execution", "env": {}, "argv": [
+                    "cargo", "test", *FENCE.SELECTION, "--quiet", *selector,
+                    "--", "--test-threads=4", "--exact", name,
+                ]})
+                with self.subTest(test=name, selector=selector), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
+
+    def test_same_filter_in_another_package_does_not_duplicate_the_library_test(self):
+        for name in self.NAMES:
+            plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+            plans[0].append({"name": "another-package", "env": {}, "argv": [
+                "cargo", "test", "--locked", "--package=opc-runtime", "--all-features",
+                "--lib", "--", "--test-threads=4", "--exact", name,
+            ]})
+            with self.subTest(test=name):
+                FENCE.verify_plans(plans)
+
+    def test_cargo_filters_and_libtest_value_spellings_cannot_hide_overlap(self):
+        for name in self.NAMES:
+            for suffix in (["--", "--test-threads", "4", "--exact", name],
+                           [name, "--", "--exact", "--test-threads=4"],
+                           ["--", "--skip=unrelated", "--exact", name]):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                plans[0].append({"name": "second-scope-execution", "env": {}, "argv": [
+                    "cargo", "test", *FENCE.SELECTION, "--tests", *suffix,
+                ]})
+                with self.subTest(test=name, suffix=suffix), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
+
+    def test_non_library_targets_and_skipped_names_do_not_overlap(self):
+        for name in self.NAMES:
+            for suffix in (["--test=consensus_*", "--", "--exact", name],
+                           ["--all-targets", "--", "--exact", "--skip=" + name, name],
+                           ["--doc", "--", "--exact", name],
+                           ["--lib", "--no-run", "--", "--exact", name]):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                plans[0].append({"name": "another-command", "env": {}, "argv": [
+                    "cargo", "test", *FENCE.SELECTION, *suffix,
+                ]})
+                with self.subTest(test=name, suffix=suffix):
+                    FENCE.verify_plans(plans)
+
+    def test_unmodeled_target_selector_is_rejected(self):
+        plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+        plans[0].append({"name": "unknown-selection", "env": {}, "argv": [
+            "cargo", "test", *FENCE.SELECTION, "--future-selector",
+        ]})
+        with self.assertRaisesRegex(ValueError, "unsupported Cargo test option"):
+            FENCE.verify_plans(plans)
 
 
 class PartitionTests(unittest.TestCase):
@@ -49,24 +205,24 @@ class PartitionTests(unittest.TestCase):
         plans = {shard: FENCE.plans(rows, shard) for shard in FENCE.SHARDS}
         for row in rows:
             with self.subTest(name=row["name"], target=row["target"]):
-                ordinary = [i for i in FENCE.ORDINARY_SHARDS if row["name"] not in skips(plans[i][0])]
+                ordinary_owners = [i for i in FENCE.ORDINARY_SHARDS if row["name"] not in skips(ordinary(plans[i]))]
                 isolated = [i for i, plan in plans.items()
                             if any(c["name"] == row["name"] for c in plan)]
-                self.assertEqual(ordinary + isolated, [row["shard"]])
+                self.assertEqual(ordinary_owners + isolated, [row["shard"]])
 
     def test_new_tests_and_same_prefix_siblings_are_included(self):
         rows = fixture()
-        for prefix in [FENCE.OPTIMIZED_LIB[0], "new_module"]:
+        for prefix in [FENCE.OPTIMIZED_LIB[0], *FENCE.SERIAL_LIB_TESTS, "new_module"]:
             name = prefix + "::new_test"
             row = dict(rows[-1], name=name, shard=FENCE.owner(name))
             rows.append(row)
-            self.assertNotIn(name, skips(FENCE.plans(rows, row["shard"])[0]))
+            self.assertNotIn(name, skips(ordinary(FENCE.plans(rows, row["shard"]))))
             for shard in set(FENCE.ORDINARY_SHARDS) - {row["shard"]}:
-                self.assertIn(name, skips(FENCE.plans(rows, shard)[0]))
+                self.assertIn(name, skips(ordinary(FENCE.plans(rows, shard))))
 
     def test_every_ordinary_shard_keeps_feature_unification_and_exact_skips(self):
         for shard in FENCE.ORDINARY_SHARDS:
-            command = FENCE.plans(fixture(), shard)[0]
+            command = ordinary(FENCE.plans(fixture(), shard))
             argv = command["argv"]
             self.assertEqual(argv[:2 + len(FENCE.SELECTION)], ["cargo", "test", *FENCE.SELECTION])
             self.assertIn("--tests", argv)
