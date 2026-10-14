@@ -80,10 +80,14 @@ fn project_function(
 ) -> Result<TokenStream, RustGenerationError> {
     let name = format_ident!("content_{}", nodes.helper_name(&node.path));
     let path = &node.path;
+    let mut value_name = format_ident!("value");
     let (ty, body) = match node.kind {
         SchemaNodeKind::Container => {
             let ty = format_ident!("{}", nodes.type_name(node));
             let children = child_statements(node, nodes)?;
+            if children.is_empty() {
+                value_name = format_ident!("_value");
+            }
             (
                 quote! { super::types::#ty },
                 quote! {
@@ -116,7 +120,7 @@ fn project_function(
         }
     };
     Ok(quote! {
-        fn #name(value: &#ty, ctx: &opc_mgmt_schema::subtree::SubtreeProjection<'_>)
+        fn #name(#value_name: &#ty, ctx: &opc_mgmt_schema::subtree::SubtreeProjection<'_>)
             -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, opc_mgmt_schema::subtree::SubtreeError>
         { #body }
     })
