@@ -171,6 +171,7 @@ enum NetconfRead {
     GetConfig,
     Get,
     GetData,
+    GetDataOperational,
 }
 
 impl Fixture {
@@ -252,7 +253,7 @@ impl Fixture {
                 "<filter type=\"xpath\" xmlns:k=\"urn:keys\" select=\"{}\"/>",
                 xml_escape(selector).replace('"', "&quot;")
             ),
-            NetconfRead::GetData => format!(
+            NetconfRead::GetData | NetconfRead::GetDataOperational => format!(
                 "<ncds:xpath-filter xmlns:k=\"urn:keys\">{}</ncds:xpath-filter>",
                 xml_escape(selector)
             ),
@@ -264,6 +265,9 @@ impl Fixture {
             NetconfRead::Get => format!("<get>{filter}{defaults}</get>"),
             NetconfRead::GetData => format!(
                 "<ncds:get-data xmlns:ncds=\"urn:ietf:params:xml:ns:yang:ietf-netconf-nmda\" xmlns:ds=\"urn:ietf:params:xml:ns:yang:ietf-datastores\"><ncds:datastore>ds:running</ncds:datastore>{filter}{defaults}</ncds:get-data>"
+            ),
+            NetconfRead::GetDataOperational => format!(
+                "<ncds:get-data xmlns:ncds=\"urn:ietf:params:xml:ns:yang:ietf-netconf-nmda\" xmlns:ds=\"urn:ietf:params:xml:ns:yang:ietf-datastores\"><ncds:datastore>ds:operational</ncds:datastore>{filter}{defaults}</ncds:get-data>"
             ),
         };
         self.xml_operation(&body).await
@@ -1243,4 +1247,19 @@ async fn presence_omission_controls_get() {
 #[tokio::test]
 async fn presence_omission_controls_get_data() {
     assert_presence_omission_controls(NetconfRead::GetData).await;
+}
+
+#[tokio::test]
+async fn empty_presence_survives_operational_get_data() {
+    assert_empty_presence_read(NetconfRead::GetDataOperational).await;
+}
+
+#[tokio::test]
+async fn keyed_list_presence_survives_operational_get_data() {
+    assert_keyed_list_presence_read(NetconfRead::GetDataOperational).await;
+}
+
+#[tokio::test]
+async fn presence_omission_controls_operational_get_data() {
+    assert_presence_omission_controls(NetconfRead::GetDataOperational).await;
 }

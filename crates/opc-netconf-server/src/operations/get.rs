@@ -139,20 +139,21 @@ where
         }
         None => None,
     };
-    let (selected_paths, branches) = match crate::filter::prepare_instance_read_filter(
+    let (selected_paths, predicates, branches) = match crate::filter::prepare_instance_read_filter(
         registry,
         request.filter.as_ref(),
         ctx.limits,
+        binding.key_predicates_supported(),
     )
-    .and_then(|(filter, branches)| {
+    .and_then(|prepared| {
         get_paths_with_discovery(
             registry,
-            filter.as_ref(),
+            prepared.filter.as_ref(),
             yang_library_capability.is_some(),
             monitoring_capability.is_some(),
             ctx.limits,
         )
-        .map(|paths| (paths, branches))
+        .map(|paths| (paths, prepared.predicates, prepared.branches))
     }) {
         Ok(paths) => paths,
         Err(err) => {
@@ -476,7 +477,9 @@ where
         Ok(String::new())
     } else {
         let snapshot = binding.config_bus().current_snapshot();
-        let config_selection = ReadSelection::new(&render_config_paths).with_instances(&branches);
+        let config_selection = ReadSelection::new(&render_config_paths)
+            .with_predicates(&predicates)
+            .with_instances(&branches);
         let state_selection = ReadSelection::new(&render_state_paths).with_instances(&branches);
         match with_defaults_mode {
             Some(mode) => binding.render_get_data_with_defaults(

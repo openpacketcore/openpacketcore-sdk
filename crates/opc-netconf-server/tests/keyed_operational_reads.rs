@@ -25,6 +25,8 @@ use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 
 #[path = "keyed_operational_reads/key_payloads.rs"]
 mod key_payloads;
+#[path = "keyed_operational_reads/xpath_compatibility.rs"]
+mod xpath_compatibility;
 
 struct Registry;
 const fn leaf(path: &'static str, config: bool, class: DataClass) -> NodeMeta {

@@ -123,8 +123,10 @@ existing XML limits, including text split across parser events.
 
 Supported predicate-free XPath absolute paths, unions and wildcards must expand
 the same concrete operational instances and apply the same authorization as
-equivalent subtree reads. XPath predicates, including list-key predicates, remain
-operation-not-supported; this change does not provide keyed XPath selection.
+equivalent subtree reads. XPath predicates selecting operational data, including
+list-key predicates, remain operation-not-supported. Preserve the existing
+configuration-only list-key XPath predicates in generated configuration projection;
+this change does not add a keyed XPath subset.
 General non-key content matching and attribute matching remain unsupported.
 Preserve `get-config`'s current filter subset and operational `get-data` capability,
 config-filter, origin and max-depth restrictions. Do not silently discard an

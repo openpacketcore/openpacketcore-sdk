@@ -1,9 +1,15 @@
-//! Schema-only planning for correlated subtree list-key content matches.
+//! Schema-only planning for configuration XPath and correlated subtree matches.
 
 use opc_mgmt_schema::{NetconfInstanceBranch, NetconfKeyPredicate};
 
 use super::*;
 use crate::xml::{FilterElement, SubtreeNode};
+
+pub(crate) struct PreparedInstanceRead {
+    pub(crate) filter: Option<Filter>,
+    pub(crate) predicates: Vec<NetconfKeyPredicate>,
+    pub(crate) branches: Vec<NetconfInstanceBranch>,
+}
 
 /// Normalizes structural selection while preserving each branch's literal
 /// instance constraints. This runs before authorization or any stored-row access.
@@ -11,17 +17,29 @@ pub(crate) fn prepare_instance_read_filter(
     registry: &'static dyn SchemaRegistry,
     filter: Option<&Filter>,
     limits: &MgmtLimits,
-) -> Result<(Option<Filter>, Vec<NetconfInstanceBranch>), FilterError> {
-    let Some(Filter::Subtree(tree)) = filter else {
-        if let Some(Filter::XPath(xpath)) = filter {
-            if xpath.select().contains('[') {
-                return Err(FilterError::UnsupportedXPath);
-            }
-        }
-        return Ok((filter.cloned(), Vec::new()));
+    configuration_predicates_supported: bool,
+) -> Result<PreparedInstanceRead, FilterError> {
+    let (filter, predicates) =
+        prepare_read_filter(registry, filter, limits, configuration_predicates_supported)?;
+    if predicates
+        .iter()
+        .any(|predicate| !opc_mgmt_path::key_allows_cleartext(registry, predicate.key_path))
+    {
+        return Err(FilterError::MaskedKeyMatch);
+    }
+    let Some(Filter::Subtree(tree)) = filter.as_ref() else {
+        return Ok(PreparedInstanceRead {
+            filter,
+            predicates,
+            branches: Vec::new(),
+        });
     };
     if tree.roots().is_empty() {
-        return Ok((filter.cloned(), Vec::new()));
+        return Ok(PreparedInstanceRead {
+            filter,
+            predicates,
+            branches: Vec::new(),
+        });
     }
     let mut plan = Planner {
         registry,
@@ -53,7 +71,11 @@ pub(crate) fn prepare_instance_read_filter(
             }
         }
     }
-    Ok((Some(Filter::Subtree(plan.normalized)), plan.branches))
+    Ok(PreparedInstanceRead {
+        filter: Some(Filter::Subtree(plan.normalized)),
+        predicates,
+        branches: plan.branches,
+    })
 }
 
 fn has_text(node: &SubtreeNode) -> bool {

@@ -786,9 +786,14 @@ where
             }
             _ => return None,
         };
-        crate::filter::prepare_instance_read_filter(self.binding.schema_registry(), filter, limits)
-            .err()
-            .map(|error| (metric, error))
+        crate::filter::prepare_instance_read_filter(
+            self.binding.schema_registry(),
+            filter,
+            limits,
+            self.binding.key_predicates_supported(),
+        )
+        .err()
+        .map(|error| (metric, error))
     }
 
     async fn ensure_config_authority(
