@@ -314,11 +314,11 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 
-    // Captured from the generator before user ordering support (1d880a21c).
+    // All generated files are pinned, including the NETCONF projector's
+    // operation admission observations. Output changes require a baseline update.
     // The patch.rs pin retains #1268 safe diagnostics. Read renderer pins include
     // #1269 authorized projection and #1270 canonical gNMI key literals. Every
     // generated file remains covered by its complete-file assertion.
-    // Changing unaffected generated output requires an explicit baseline update.
     let expected = [
         (
             "gnmi_json.rs",

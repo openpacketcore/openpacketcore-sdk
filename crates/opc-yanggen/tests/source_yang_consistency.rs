@@ -170,7 +170,7 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
-    // All thirteen files originate from 1d880a21c before user ordering support.
+    // All thirteen files are pinned, including NETCONF admission observations.
     // Pins retain #1268 state-write and safe-diagnostic changes, #1269 authorized
     // read projection, #1270 canonical gNMI key literals and native instance trees,
     // and #1272 bounded NETCONF content projection. Every generated
