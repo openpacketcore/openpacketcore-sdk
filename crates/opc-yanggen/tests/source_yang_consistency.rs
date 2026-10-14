@@ -176,6 +176,8 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     // file stays pinned across the four source models.
     // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
+    // enum/gnmi_json.rs: #1270 shared literal predicate construction.
+    // range/gnmi_json.rs: #1270 shared literal predicate construction.
     // base/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
     // comments/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
     // enum/netconf_xml.rs: #1270 renders native instance trees for merging before masking.
