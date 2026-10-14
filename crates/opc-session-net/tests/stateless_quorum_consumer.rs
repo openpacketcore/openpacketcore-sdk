@@ -2,6 +2,9 @@
 
 #![cfg(feature = "test-control")]
 
+#[cfg(target_os = "linux")]
+#[path = "stateless_quorum_consumer/fenced_non_execution.rs"]
+mod fenced_non_execution;
 #[path = "stateless_quorum_consumer/normal_forward_hold.rs"]
 mod normal_forward_hold;
 #[path = "stateless_quorum_consumer/publication_authority_failover.rs"]

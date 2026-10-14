@@ -3784,6 +3784,7 @@ dependencies = [
  "opc-crypto",
  "opc-fs-verity-sys",
  "opc-identity",
+ "opc-ipsec-xfrm",
  "opc-key",
  "opc-persist",
  "opc-redaction",
