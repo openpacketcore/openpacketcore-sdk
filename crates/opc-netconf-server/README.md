@@ -88,8 +88,9 @@ Content reads require a binding that supports the typed, bounded
 `project_subtree_content` contract. Regenerated `opc-yanggen` renderers provide
 it. Existing key-only subtree reads remain available through the
 `key_predicates_supported` contract. Bindings without full content support
-refuse other content predicates before data access. A binding with
-custom ordinary default processing must return that same mode from
+retain nonempty key literals verbatim and the input-node bound from
+`max_paths_per_request`, and refuse other content predicates before data access.
+A binding with custom ordinary default processing must return that same mode from
 `subtree_default_report`; the default rendering hooks use trim.
 
 The server authorizes output, predicates and every ancestor identity key before

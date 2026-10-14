@@ -622,7 +622,11 @@ impl SubtreeNode {
     }
     /// Decoded predicate with only outer XML whitespace removed.
     pub fn text(&self) -> Option<&str> {
-        (!self.text.0.is_empty()).then_some(self.text.0.as_str())
+        (!self.text.1.is_empty()).then(|| &self.text.0[self.text.1.clone()])
+    }
+    /// The key-only read profile retains spaces in a nonempty key literal.
+    pub(crate) fn literal_text(&self) -> Option<&str> {
+        (!self.text.1.is_empty()).then_some(self.text.0.as_str())
     }
     /// Child scopes, without flattening repeated containment branches.
     pub fn children(&self) -> &[SubtreeNode] {
@@ -631,7 +635,7 @@ impl SubtreeNode {
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
-struct FilterText(String);
+struct FilterText(String, std::ops::Range<usize>);
 
 impl std::fmt::Debug for FilterText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2777,9 +2781,10 @@ impl ParserState {
         let trimmed = frame.text.0.trim_matches(is_xml_whitespace);
         let start = frame.text.0.len() - frame.text.0.trim_start_matches(is_xml_whitespace).len();
         let end = start + trimmed.len();
-        frame.text.0.truncate(end);
-        frame.text.0.drain(..start);
-        if !frame.text.0.is_empty() && frame.child_count != 0 {
+        // Retain one decoded allocation. Content reads use the trimmed span;
+        // the existing key-only profile uses the complete nonempty literal.
+        frame.text.1 = start..end;
+        if !frame.text.1.is_empty() && frame.child_count != 0 {
             return Err(XmlError::UnsupportedFilterContent);
         }
         let element = frame.path.last().ok_or(XmlError::Malformed)?;

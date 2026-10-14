@@ -19,6 +19,11 @@ pub(crate) fn prepare_instance_read_filter(
     limits: &MgmtLimits,
     configuration_predicates_supported: bool,
 ) -> Result<PreparedInstanceRead, FilterError> {
+    if let Some(Filter::Subtree(tree)) = filter {
+        // Preserve this profile's input-node bound alongside the parser's
+        // independent content-filter node and work budgets.
+        limits.check_paths(tree.selections().len())?;
+    }
     let (filter, predicates) =
         prepare_read_filter(registry, filter, limits, configuration_predicates_supported)?;
     if predicates
@@ -144,7 +149,9 @@ impl Planner<'_> {
             if !opc_mgmt_path::key_allows_cleartext(self.registry, key.path) {
                 return Err(FilterError::MaskedKeyMatch);
             }
-            let raw = child.text().ok_or(FilterError::UnsupportedSubtree)?;
+            let raw = child
+                .literal_text()
+                .ok_or(FilterError::UnsupportedSubtree)?;
             if let Some(value) = opc_mgmt_path::canonical_key_value(self.registry, key.path, raw) {
                 let mut literal = String::new();
                 opc_mgmt_path::append_key_predicate(&mut literal, name, &value)
