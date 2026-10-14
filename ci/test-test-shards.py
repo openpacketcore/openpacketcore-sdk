@@ -455,7 +455,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
         mentions = [command for command in ordinary + optimized if name in command]
 
         self.assertEqual(len(mentions), 2)
-        self.assertEqual(mentions[0], ordinary[1])
+        self.assertEqual(mentions[0], ordinary[len(TEST_SHARDS.SERIAL_LIB_TESTS)])
         self.assertEqual(mentions[0].count(name), 1)
         self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
         self.assertEqual(
