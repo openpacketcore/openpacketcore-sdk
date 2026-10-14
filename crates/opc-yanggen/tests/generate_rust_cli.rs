@@ -340,7 +340,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         (
             "netconf_xml.rs",
             // #1270 native instance trees plus #1272 bounded content projection.
-            "c9a55f9a301702cd022ce68080c899025a3434b026b5960790d710af75b877f7",
+            "1f9f22c7a9c4f169eb1787754fdd0f6a79e35c0608d94692c58fad4cf1825b7b",
         ),
         (
             "netconf_xml_edit.rs",
