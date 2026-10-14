@@ -394,6 +394,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             .map_err(|_| config_error("invalid-value", #list_error))?;
                                     }
                                 } else {
+                                    // A single map key has the scalar's Copy semantics,
+                                    // including SensitiveKey<T> when T is Copy. Composite
+                                    // keys and owned scalar keys still need their clone.
+                                    let cloned_map_key = match child.key_leaves.as_slice() {
+                                        [key_leaf] => child
+                                            .child_paths
+                                            .iter()
+                                            .filter_map(|path| nodes_by_path.get(path))
+                                            .find(|node| {
+                                                clean_segment(last_segment(&node.path)) == key_leaf
+                                            })
+                                            .map(|node| {
+                                                super::types::cloned_key_value(
+                                                    node,
+                                                    &nodes_by_path,
+                                                    quote! { key },
+                                                    has_state_lists,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| quote! { key.clone() }),
+                                        _ => quote! { key.clone() },
+                                    };
                                     quote! {
                                         let parsed_rows: Vec<#ty_name> = serde_json::from_str(value)
                                             .map_err(|_| config_error("invalid-value", #list_error))?;
@@ -402,7 +424,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         for row in parsed_rows {
                                             let key: #key_type = super::serde::ExtractKey::extract_key(&row)
                                                 .ok_or_else(|| config_error("invalid-value", #list_error))?;
-                                            if !keys.insert(key.clone()) {
+                                            if !keys.insert(#cloned_map_key) {
                                                 return Err(config_error("invalid-value", #list_error));
                                             }
                                             rows.push((key, row));

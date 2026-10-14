@@ -113,6 +113,32 @@ module leafref-state {
 }
 "#;
 
+const ORDERED_PARENT_COPY_CHILD: &str = r#"
+module ordered-numeric {
+  yang-version 1.1;
+  namespace "urn:example:ordered-numeric";
+  prefix on;
+  container root {
+    list service {
+      key name;
+      ordered-by user;
+      leaf name { type string; }
+      list counter {
+        key count;
+        leaf count { type uint32; }
+      }
+    }
+    container state {
+      config false;
+      list sample {
+        key name;
+        leaf name { type string; }
+      }
+    }
+  }
+}
+"#;
+
 #[test]
 fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -129,6 +155,7 @@ fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
         ("minimal", MINIMAL_STATE),
         ("mixed", MIXED_STATE),
         ("nested", NESTED_STATE),
+        ("ordered_numeric", ORDERED_PARENT_COPY_CHILD),
         ("keys", include_str!("fixtures/config_false_lists.yang")),
         (
             "keyless",
