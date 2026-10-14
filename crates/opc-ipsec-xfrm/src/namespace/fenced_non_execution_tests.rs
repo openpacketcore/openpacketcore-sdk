@@ -345,4 +345,181 @@ mod fenced_non_execution {
             "the accepted object remains available for normal exact adoption"
         );
     }
+    #[tokio::test]
+    async fn fenced_non_execution_preserves_applied_state_for_exact_adoption() {
+        let root = DurableTestRoot::new();
+        let transport = RosterConvergenceTransport::new();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD1);
+        let group = roster_group(0xD2);
+        let generation = roster_generation(37);
+        let roster = sa_roster(2);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        backend
+            .detector_cut_roster_applied(authority)
+            .await
+            .unwrap();
+        transport
+            .converge((0..2).map(|index| durable_object_readback_body(&roster_sa_request(index))));
+        let before = transport.operations().len();
+        let closure = close_generation(&backend, &store, group, generation, &roster).await;
+        assert!(
+            !closed_without_effect(&closure),
+            "Applied can never become a never-started receipt"
+        );
+        let after = transport.operations();
+        let mutations = after[before..]
+            .iter()
+            .filter(|operation| **operation != "query_sa")
+            .count();
+        assert_eq!(
+            mutations, 0,
+            "closing execution must preserve Applied; it grants no aborting proof set"
+        );
+        assert_eq!(
+            durable_object_roster_phase(&store, group, generation, &roster),
+            Ok(XfrmObjectRosterDurablePhase::Applied)
+        );
+        transport
+            .converge((0..2).map(|index| durable_object_readback_body(&roster_sa_request(index))));
+        assert_eq!(
+            backend
+                .adopt_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap()
+                .as_str(),
+            "adopted"
+        );
+        let repeated = close_generation(&backend, &store, group, generation, &roster).await;
+        assert!(!closed_without_effect(&repeated));
+        assert_eq!(
+            durable_object_roster_phase(&store, group, generation, &roster),
+            Ok(XfrmObjectRosterDurablePhase::Committed)
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_preserves_partially_issued_prefix_without_compensation_authority()
+    {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD3);
+        let group = roster_group(0xD4);
+        let generation = roster_generation(37);
+        let roster = sa_roster(3);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        backend
+            .detector_cut_roster_issuing_at_member(authority, 1, false)
+            .await
+            .unwrap();
+        let before = transport.operations();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            1
+        );
+        let closure = close_generation(&backend, &store, group, generation, &roster).await;
+        assert!(
+            !closed_without_effect(&closure),
+            "a partially issued roster is not never-started"
+        );
+        let after = transport.operations();
+        assert!(after[before.len()..].iter().all(|operation| *operation == "query_sa"),
+            "closure must leave the owned prefix for separately authorized recovery; extra operations={:?}", &after[before.len()..]);
+        assert_eq!(
+            durable_object_roster_phase(&store, group, generation, &roster),
+            Ok(XfrmObjectRosterDurablePhase::Issuing)
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_conflicting_foreign_object_is_never_deleted() {
+        let root = DurableTestRoot::new();
+        let transport = RosterConvergenceTransport::new();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD5);
+        let group = roster_group(0xD6);
+        let generation = roster_generation(37);
+        let roster = sa_roster(1);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        // Even an equal-looking object predating our effect is foreign.
+        transport.converge([durable_object_readback_body(&roster_sa_request(0))]);
+        let run = backend.run_durable_object_roster(authority).await.unwrap();
+        assert_eq!(run.as_str(), "no_mutation");
+        let closure = close_generation(&backend, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert_eq!(closure.as_str(), "foreign_untouched");
+        assert!(transport
+            .operations()
+            .iter()
+            .all(|operation| *operation == "query_sa"));
+        assert!(closure.members().has_conflict());
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct UnavailableAfterCutTransport {
+        inner: RecordingSuccessTransport,
+        unavailable: Arc<AtomicBool>,
+    }
+
+    impl LinuxXfrmTransport for UnavailableAfterCutTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            class: crate::linux::NetlinkOperationClass,
+            request: &[u8],
+            sequence: u32,
+            config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            if matches!(class, crate::linux::NetlinkOperationClass::ReadOnly)
+                && self.unavailable.load(Ordering::SeqCst)
+            {
+                return Err(XfrmError::Unavailable);
+            }
+            self.inner
+                .transact(operation, class, request, sequence, config)
+        }
+        fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_unavailable_issuing_readback_stays_unresolved() {
+        let root = DurableTestRoot::new();
+        let transport = UnavailableAfterCutTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD7);
+        let group = roster_group(0xD8);
+        let generation = roster_generation(37);
+        let roster = sa_roster(1);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        backend
+            .detector_cut_roster_issuing_at_member(authority, 0, false)
+            .await
+            .unwrap();
+        transport.unavailable.store(true, Ordering::SeqCst);
+        let before = transport.inner.operations();
+        let closure = close_generation(&backend, &store, group, generation, &roster).await;
+        assert!(!closed_without_effect(&closure));
+        assert_eq!(closure.unwrap().as_str(), "indeterminate");
+        assert_eq!(
+            transport.inner.operations(),
+            before,
+            "unavailable readback grants no mutation authority"
+        );
+        assert!(store.has_unresolved_writer_authority().unwrap());
+    }
 }
