@@ -147,6 +147,87 @@ fn operational_requested_integer_keys_are_canonicalized() {
     }
 }
 
+fn assert_integer_key_width(key_type: LeafType, minimum: &str, maximum: &str) {
+    let registry = Registry {
+        key_type,
+        ..public()
+    };
+    let instance = |value: &str| {
+        YangPath::new(format!(
+            "/ex:system/ex:list[ex:id='{value}'][ex:zone='east']/ex:value"
+        ))
+        .unwrap()
+    };
+    for value in [minimum, maximum, "0", "1"] {
+        assert_eq!(
+            resolve_read(&registry, &request(value))
+                .unwrap()
+                .unwrap()
+                .canonical,
+            instance(value)
+        );
+        assert_eq!(
+            resolve_instance(&registry, &instance(value))
+                .unwrap()
+                .canonical,
+            instance(value)
+        );
+    }
+    for value in ["+001", "001"] {
+        assert_eq!(
+            resolve_read(&registry, &request(value))
+                .unwrap()
+                .unwrap()
+                .canonical,
+            instance("1")
+        );
+        assert_eq!(
+            resolve_instance(&registry, &instance(value))
+                .unwrap_err()
+                .to_string(),
+            "malformed path: non-canonical instance path"
+        );
+    }
+    for value in [
+        (minimum.parse::<i128>().unwrap() - 1).to_string(),
+        (maximum.parse::<i128>().unwrap() + 1).to_string(),
+        "not-an-integer".to_string(),
+    ] {
+        assert!(resolve_read(&registry, &request(&value)).unwrap().is_none());
+        assert_eq!(
+            resolve_instance(&registry, &instance(&value))
+                .unwrap_err()
+                .to_string(),
+            "malformed path: invalid canonical key"
+        );
+    }
+}
+
+#[test]
+fn operational_uint8_keys_follow_declared_width() {
+    assert_integer_key_width(LeafType::Uint8, "0", "255");
+}
+
+#[test]
+fn operational_uint64_keys_follow_declared_width() {
+    assert_integer_key_width(LeafType::Uint64, "0", "18446744073709551615");
+}
+
+#[test]
+fn operational_int8_keys_follow_declared_width() {
+    assert_integer_key_width(LeafType::Int8, "-128", "127");
+}
+
+#[test]
+fn operational_int16_keys_follow_declared_width() {
+    assert_integer_key_width(LeafType::Int16, "-32768", "32767");
+}
+
+#[test]
+fn operational_int32_keys_follow_declared_width() {
+    assert_integer_key_width(LeafType::Int32, "-2147483648", "2147483647");
+}
+
 #[test]
 fn operational_requested_boolean_keys_use_the_leafref_target_type() {
     for key_type in [

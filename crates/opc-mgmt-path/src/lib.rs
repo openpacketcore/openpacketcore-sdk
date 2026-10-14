@@ -545,8 +545,13 @@ pub fn canonical_key_value(
     // A leafref chain cannot validly visit more schema nodes than exist.
     for _ in 0..=registry.nodes().len() {
         match registry.leaf_type(current)? {
+            LeafType::Uint8 => return value.parse::<u8>().ok().map(|value| value.to_string()),
             LeafType::Uint16 => return value.parse::<u16>().ok().map(|value| value.to_string()),
             LeafType::Uint32 => return value.parse::<u32>().ok().map(|value| value.to_string()),
+            LeafType::Uint64 => return value.parse::<u64>().ok().map(|value| value.to_string()),
+            LeafType::Int8 => return value.parse::<i8>().ok().map(|value| value.to_string()),
+            LeafType::Int16 => return value.parse::<i16>().ok().map(|value| value.to_string()),
+            LeafType::Int32 => return value.parse::<i32>().ok().map(|value| value.to_string()),
             LeafType::Int64 => return value.parse::<i64>().ok().map(|value| value.to_string()),
             LeafType::Boolean => {
                 return matches!(value, "true" | "false").then(|| value.to_string())
