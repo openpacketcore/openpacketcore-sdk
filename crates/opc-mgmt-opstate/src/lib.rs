@@ -21,10 +21,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-use opc_mgmt_path::canonical_path_matches;
+use opc_mgmt_path::{canonical_path_matches, CanonicalPath};
 
 use opc_config_model::YangPath;
 use thiserror::Error;
@@ -414,6 +414,19 @@ impl OperationalResponse {
         &self,
         request: &OperationalRequest,
     ) -> Result<(), OperationalResponseError> {
+        self.validate_and_match(request).map(|_| ())
+    }
+
+    /// Validates the response and returns one matching request-path index per
+    /// reported value, in the order of [`Self::values`].
+    ///
+    /// Each selector and reported path is parsed once for matching. Selectors
+    /// are indexed by schema path, so unrelated schema nodes are never compared.
+    /// Adapters can reuse these indices when constructing render selections.
+    pub fn validate_and_match(
+        &self,
+        request: &OperationalRequest,
+    ) -> Result<Vec<usize>, OperationalResponseError> {
         if self.values.len() > request.max_values {
             return Err(OperationalResponseError::LimitExceeded);
         }
@@ -423,25 +436,42 @@ impl OperationalResponse {
         }) {
             return Err(OperationalResponseError::LimitExceeded);
         }
-        let mut seen = HashSet::new();
+        if self.values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut selectors = BTreeMap::new();
+        for (index, path) in request.paths.iter().enumerate() {
+            if let Ok(parsed) = CanonicalPath::parse(path.as_str()) {
+                selectors
+                    .entry(parsed.schema_path())
+                    .or_insert_with(Vec::new)
+                    .push((index, parsed));
+            }
+        }
+        let mut seen = HashSet::with_capacity(self.values.len());
+        let mut matches = Vec::with_capacity(self.values.len());
 
         for value in &self.values {
-            if !request
-                .paths
-                .iter()
-                .any(|selected| canonical_path_matches(selected.as_str(), value.path().as_str()))
-            {
-                return Err(OperationalResponseError::UnexpectedPath);
-            }
+            let parsed = CanonicalPath::parse(value.path().as_str())
+                .map_err(|_| OperationalResponseError::UnexpectedPath)?;
+            let matched = selectors
+                .get(&parsed.schema_path())
+                .and_then(|candidates| {
+                    candidates.iter().find_map(|(index, selected)| {
+                        selected.matches_instance(&parsed).then_some(*index)
+                    })
+                })
+                .ok_or(OperationalResponseError::UnexpectedPath)?;
             if !seen.insert(value.path()) {
                 return Err(OperationalResponseError::DuplicatePath);
             }
             if !request.include_origin && value.origin().is_some() {
                 return Err(OperationalResponseError::UnexpectedOrigin);
             }
+            matches.push(matched);
         }
 
-        Ok(())
+        Ok(matches)
     }
 }
 

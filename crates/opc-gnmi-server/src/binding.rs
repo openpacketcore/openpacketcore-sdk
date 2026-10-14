@@ -57,6 +57,7 @@ impl ReadSelectionEntry {
 pub struct ReadSelection<'a> {
     schema_paths: &'a [&'static str],
     entries: &'a [ReadSelectionEntry],
+    validated: bool,
 }
 
 impl<'a> ReadSelection<'a> {
@@ -69,6 +70,7 @@ impl<'a> ReadSelection<'a> {
         Self {
             schema_paths,
             entries: &[],
+            validated: false,
         }
     }
 
@@ -80,6 +82,19 @@ impl<'a> ReadSelection<'a> {
         Self {
             schema_paths,
             entries,
+            validated: false,
+        }
+    }
+
+    /// Uses already matched concrete entries, sorted by canonical path.
+    pub(crate) const fn with_validated_entries(
+        schema_paths: &'a [&'static str],
+        entries: &'a [ReadSelectionEntry],
+    ) -> Self {
+        Self {
+            schema_paths,
+            entries,
+            validated: true,
         }
     }
 
@@ -120,7 +135,14 @@ impl<'a> ReadSelection<'a> {
     /// predicates in the selection are treated as a subset: a request for
     /// `/list[k='a']` matches descendants under that entry, while a request for
     /// `/list/leaf` with no predicates matches every list entry's leaf.
+    /// Server-validated operational selections contain only the exact reported
+    /// identities and reuse their previously established matches.
     pub fn contains_path(&self, schema_path: &str, canonical_path: &YangPath) -> bool {
+        if self.validated {
+            return self
+                .reported_entry(canonical_path)
+                .is_some_and(|entry| entry.schema_path == schema_path);
+        }
         if self.entries.is_empty() {
             return self.contains(schema_path);
         }
@@ -136,12 +158,22 @@ impl<'a> ReadSelection<'a> {
     /// already returns SDK canonical paths instead of generated-model field
     /// values.
     pub fn contains_reported_path(&self, canonical_path: &YangPath) -> bool {
+        if self.validated {
+            return self.reported_entry(canonical_path).is_some();
+        }
         if self.entries.is_empty() {
             return self.contains(canonical_path.as_str());
         }
         self.entries.iter().any(|entry| {
             canonical_path_matches(entry.canonical_path.as_str(), canonical_path.as_str())
         })
+    }
+
+    fn reported_entry(&self, canonical_path: &YangPath) -> Option<&ReadSelectionEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.canonical_path.as_str().cmp(canonical_path.as_str()))
+            .ok()
+            .and_then(|index| self.entries.get(index))
     }
 }
 

@@ -237,9 +237,9 @@ where
         .collect::<Vec<_>>();
 
     let state_audit_paths = audit_paths_for_entries(&state_entries)?;
-    let operational = read_operational(server.binding(), &state_entries, server.limits())
-        .map_err(|error| ReadFailure::new(error, state_audit_paths))?;
-    let state_entries_with_values = state_entries_with_values(&state_entries, &operational);
+    let (operational, state_entries_with_values) =
+        read_operational(server.binding(), &state_entries, server.limits())
+            .map_err(|error| ReadFailure::new(error, state_audit_paths))?;
     let config_entries = config_entries_for_render(server.binding().schema(), &config_entries);
 
     if config_entries.is_empty() && state_entries_with_values.is_empty() {
@@ -265,7 +265,7 @@ where
             snapshot.config.as_ref(),
             ReadSelection::with_entries(&config_paths, &config_entries),
             &operational,
-            ReadSelection::with_entries(&state_paths, &state_entries_with_values),
+            ReadSelection::with_validated_entries(&state_paths, &state_entries_with_values),
         )
         .map_err(|err| {
             ReadFailure::new(
@@ -641,13 +641,13 @@ fn read_operational<C, B>(
     binding: &B,
     state_entries: &[ReadSelectionEntry],
     limits: &opc_mgmt_limits::MgmtLimits,
-) -> Result<OperationalResponse, GnmiError>
+) -> Result<(OperationalResponse, Vec<ReadSelectionEntry>), GnmiError>
 where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
     if state_entries.is_empty() {
-        return Ok(OperationalResponse::default());
+        return Ok((OperationalResponse::default(), Vec::new()));
     }
     let requested = state_entries
         .iter()
@@ -660,8 +660,8 @@ where
         .operational_state()
         .get(&request)
         .map_err(operational_error)?;
-    response
-        .validate_for_request(&request)
+    let matches = response
+        .validate_and_match(&request)
         .map_err(|error| match error {
             opc_mgmt_opstate::OperationalResponseError::LimitExceeded => {
                 GnmiError::invalid("management-plane limit exceeded")
@@ -669,19 +669,33 @@ where
             _ => GnmiError::schema("invalid operational response"),
         })?;
     let registry = binding.schema();
-    for value in &mut response.values {
+    let exact_paths = request
+        .paths
+        .iter()
+        .map(YangPath::as_str)
+        .collect::<HashSet<_>>();
+    let mut reported_entries = Vec::with_capacity(response.values.len());
+    for (value, matched) in response.values.iter_mut().zip(matches) {
         let resolved = opc_mgmt_path::resolve_instance(registry, value.path())
             .map_err(|_| GnmiError::schema("invalid operational instance"))?;
         if resolved.node.config {
             return Err(GnmiError::schema("invalid operational instance"));
         }
-        let exact = request.paths.contains(value.path());
+        let exact = exact_paths.contains(value.path().as_str());
         *value = project_operational_value(registry, value, resolved.node, exact)?;
+        let selected = state_entries
+            .get(matched)
+            .ok_or_else(|| GnmiError::schema("invalid operational selection"))?;
+        reported_entries.push(ReadSelectionEntry::new(
+            selected.schema_path(),
+            value.path().clone(),
+        ));
     }
     response
         .values
         .sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
-    Ok(response)
+    reported_entries.sort_by(|a, b| a.canonical_path().as_str().cmp(b.canonical_path().as_str()));
+    Ok((response, reported_entries))
 }
 
 pub(crate) fn read_node<'a>(registry: &dyn SchemaRegistry, path: &'a str) -> ReadNode<'a> {
@@ -785,27 +799,6 @@ pub(crate) fn operational_error(err: OperationalError) -> GnmiError {
             GnmiError::schema("gNMI operational provider failed")
         }
     }
-}
-
-fn state_entries_with_values(
-    state_entries: &[ReadSelectionEntry],
-    operational: &OperationalResponse,
-) -> Vec<ReadSelectionEntry> {
-    operational
-        .values
-        .iter()
-        .filter_map(|value| {
-            state_entries
-                .iter()
-                .find(|entry| {
-                    opc_mgmt_path::canonical_path_matches(
-                        entry.canonical_path().as_str(),
-                        value.path().as_str(),
-                    )
-                })
-                .map(|entry| ReadSelectionEntry::new(entry.schema_path(), value.path().clone()))
-        })
-        .collect()
 }
 
 pub(crate) fn encoding_from_proto(value: i32) -> Result<Encoding, GnmiError> {
