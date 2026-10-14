@@ -29,7 +29,8 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             Err(error) => return Err(error),
         };
         if !node.config && matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList) {
-            budget.charge(1)?;
+            let _admission = budget.audit_admission("state read visit 1", || budget.charge(1))?;
+            _admission.visit();
             selectors.push(selector);
         }
     }
@@ -41,7 +42,8 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         let canonical = request_path(registry, selector, budget, limits.max_value_bytes)?;
         let mut duplicate = false;
         for previous in &requested {
-            budget.charge(1)?;
+            let _admission = budget.audit_admission("state read visit 2", || budget.charge(1))?;
+            _admission.visit();
             if budget.compare(previous.as_str(), &canonical)? {
                 duplicate = true;
                 break;
@@ -51,7 +53,8 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             if requested.len() >= limits.max_paths_per_request {
                 return Err(SubtreeError::TooBig);
             }
-            budget.charge(1)?;
+            let _admission = budget.audit_admission("state read visit 3", || budget.charge(1))?;
+            _admission.visit();
             requested.push(YangPath::new(canonical).map_err(|_| SubtreeError::Projection)?);
         }
     }
@@ -65,8 +68,10 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
     if response.values.len() > request.max_values {
         return Err(SubtreeError::TooBig);
     }
-    budget.charge(response.values.len())?;
-    for value in &response.values {
+    let limit_audit = budget.audit_admission("provider response limits", || {
+        budget.charge(response.values.len())
+    })?;
+    for value in limit_audit.iter(&response.values) {
         if value.path().as_str().len() > limits.max_value_bytes
             || value.value_json().len() > limits.max_value_bytes
         {
@@ -76,7 +81,8 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
     let mut accepted = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for value in &response.values {
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state read visit 5", || budget.charge(1))?;
+        _admission.visit();
         if value.origin().is_some() {
             return Err(SubtreeError::Projection);
         }
@@ -90,21 +96,25 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         if !requested_instance(&selectors, node.path, &identity, budget)? {
             return Err(SubtreeError::Projection);
         }
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state read visit 6", || budget.charge(1))?;
+        _admission.visit();
         seen.push(path_identity);
         // OperationalValue has already validated the immutable JSON. Its shape
         // proof lets masked non-key output avoid decoding or retaining raw text.
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state read visit 7", || budget.charge(1))?;
+        _admission.visit();
         match value.json_shape() {
             OperationalValueShape::Null => continue,
             OperationalValueShape::Structured => return Err(SubtreeError::Projection),
             OperationalValueShape::Scalar => {}
         }
-        budget.charge(identity.len())?;
+        let key_sizing = budget.audit_admission("provider key search sizing", || {
+            budget.charge(identity.len())
+        })?;
         let mut key_search_work = identity.len();
         #[cfg(test)]
         let mut masked_keys = false;
-        for key in &identity {
+        for key in key_sizing.iter(&identity) {
             #[cfg(test)]
             {
                 masked_keys |= key.masked;
@@ -112,9 +122,13 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             add_work(&mut key_search_work, key.path.len())?;
             add_work(&mut key_search_work, node.path.len())?;
         }
-        budget.charge(key_search_work)?;
-        let identity_value = identity.iter().find(|key| key.path == node.path);
-        budget.charge(1)?;
+        let key_search =
+            budget.audit_admission("provider key lookup", || budget.charge(key_search_work))?;
+        let identity_value = key_search
+            .iter(&identity)
+            .find(|key| key_search.text_cmp(key.path, node.path).is_eq());
+        let _admission = budget.audit_admission("state read visit 10", || budget.charge(1))?;
+        _admission.visit();
         let masked = !registry
             .data_class(node.path)
             .is_some_and(opc_mgmt_schema::DataClass::allows_cleartext);
@@ -124,15 +138,22 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             // A masked key still requires raw key/payload consistency validation.
             // Its bytes are independently capped above; matching charges one
             // fixed validation unit and retains only the captured surrogate.
-            budget.charge(if masked {
-                1
-            } else {
-                value
-                    .value_json()
-                    .len()
-                    .checked_mul(3)
-                    .ok_or(SubtreeError::TooBig)?
+            let decoding = budget.audit_admission("provider scalar decoding", || {
+                budget.charge(if masked {
+                    1
+                } else {
+                    value
+                        .value_json()
+                        .len()
+                        .checked_mul(3)
+                        .ok_or(SubtreeError::TooBig)?
+                })
             })?;
+            if masked {
+                decoding.visit();
+            } else {
+                decoding.bytes_read(value.value_json());
+            }
             let json: serde_json::Value =
                 serde_json::from_str(value.value_json()).map_err(|_| SubtreeError::Projection)?;
             match json {
@@ -147,10 +168,19 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
                     }
                 }
                 serde_json::Value::Number(value) => {
-                    if !masked {
-                        budget.charge(327)?;
+                    let rendering =
+                        if !masked {
+                            Some(budget.audit_admission("provider number rendering", || {
+                                budget.charge(327)
+                            })?)
+                        } else {
+                            None
+                        };
+                    let rendered = value.to_string();
+                    if let Some(rendering) = rendering {
+                        rendering.moved(rendered.len());
                     }
-                    value.to_string()
+                    rendered
                 }
                 serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
                     return Err(SubtreeError::Projection);
@@ -162,7 +192,9 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             let canonical = canonical_key(registry, node.path, &raw, budget)?
                 .ok_or(SubtreeError::Projection)?;
             let consistent = if masked {
-                budget.charge(1)?;
+                let _admission =
+                    budget.audit_admission("state read visit 13", || budget.charge(1))?;
+                _admission.visit();
                 key.raw == canonical
             } else {
                 budget.compare(&key.raw, &canonical)?
@@ -178,14 +210,17 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         } else {
             raw
         };
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state read visit 14", || budget.charge(1))?;
+        _admission.visit();
         let mut tree = NetconfXmlNode::scalar(node.path, captured, false);
         for mut parent in ancestors.into_iter().rev() {
-            budget.charge(1)?;
+            let _admission = budget.audit_admission("state read visit 15", || budget.charge(1))?;
+            _admission.visit();
             parent.children.push(tree);
             tree = parent;
         }
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state read visit 16", || budget.charge(1))?;
+        _admission.visit();
         accepted.push(Accepted {
             path,
             captured_bytes: path_work,
@@ -418,8 +453,10 @@ fn append(
     if len > limit {
         return Err(SubtreeError::TooBig);
     }
-    budget.charge(value.len())?;
+    let work = budget.audit_admission("provider path append", || budget.charge(value.len()))?;
+    let before = out.len();
     out.push_str(value);
+    work.moved(out.len() - before);
     Ok(())
 }
 
@@ -438,8 +475,14 @@ fn append_key(
     if out.len().checked_add(extra).ok_or(SubtreeError::TooBig)? > limit {
         return Err(SubtreeError::TooBig);
     }
-    budget.charge(extra.checked_add(value.len()).ok_or(SubtreeError::TooBig)?)?;
-    append_key_predicate(out, name, value).map_err(|_| SubtreeError::Projection)
+    let work = budget.audit_admission("provider key path rendering", || {
+        budget.charge(extra.checked_add(value.len()).ok_or(SubtreeError::TooBig)?)
+    })?;
+    work.bytes_read(value);
+    let before = out.len();
+    append_key_predicate(out, name, value).map_err(|_| SubtreeError::Projection)?;
+    work.moved(out.len() - before);
+    Ok(())
 }
 
 fn key_nodes(
@@ -455,25 +498,30 @@ fn key_nodes(
         .and_then(|name| name.split_once(':'))
         .ok_or(SubtreeError::Projection)?;
     for name in list.key_leaves {
-        budget.charge(1)?;
-        budget.charge(
-            list.path
-                .len()
-                .checked_add(prefix.len())
-                .and_then(|len| len.checked_add(name.len()))
-                .and_then(|len| len.checked_add(2))
-                .ok_or(SubtreeError::TooBig)?,
-        )?;
+        let _admission = budget.audit_admission("state key_nodes visit 1", || budget.charge(1))?;
+        _admission.visit();
+        let work = budget.audit_admission("provider key schema rendering", || {
+            budget.charge(
+                list.path
+                    .len()
+                    .checked_add(prefix.len())
+                    .and_then(|len| len.checked_add(name.len()))
+                    .and_then(|len| len.checked_add(2))
+                    .ok_or(SubtreeError::TooBig)?,
+            )
+        })?;
         let path = if name.contains(':') {
             format!("{}/{name}", list.path)
         } else {
             format!("{}/{prefix}:{name}", list.path)
         };
+        work.moved(path.len());
         let node = budget.node(registry, &path)?;
         if node.kind != NodeKind::Leaf {
             return Err(SubtreeError::Projection);
         }
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state key_nodes visit 3", || budget.charge(1))?;
+        _admission.visit();
         keys.push(node);
     }
     Ok(keys)
@@ -488,7 +536,9 @@ fn request_path(
     let mut schema = String::new();
     let mut canonical = String::new();
     for name in selector.schema_path.trim_start_matches('/').split('/') {
-        budget.charge(1)?;
+        let _admission =
+            budget.audit_admission("state request_path visit 1", || budget.charge(1))?;
+        _admission.visit();
         append(&mut schema, "/", budget, limit)?;
         append(&mut schema, name, budget, limit)?;
         append(&mut canonical, "/", budget, limit)?;
@@ -496,7 +546,9 @@ fn request_path(
         let node = budget.node(registry, &schema)?;
         for key in key_nodes(registry, node, budget)? {
             for (path, value) in &selector.keys {
-                budget.charge(1)?;
+                let _admission =
+                    budget.audit_admission("state request_path visit 2", || budget.charge(1))?;
+                _admission.visit();
                 if budget.compare(path, key.path)? {
                     let name = key
                         .path
@@ -540,7 +592,8 @@ fn instance(
     // key validation has a fixed admission charge; cleartext names and keys are
     // metered below, before their canonical copies. Hidden lengths never enter
     // the matching allowance, including this path's later equality/sort costs.
-    budget.charge(1)?;
+    let _admission = budget.audit_admission("state instance visit 1", || budget.charge(1))?;
+    _admission.visit();
     let segments = parse_canonical_path(path).map_err(|_| SubtreeError::Projection)?;
     let mut schema = String::new();
     let mut canonical = String::new();
@@ -548,15 +601,20 @@ fn instance(
     let mut ancestors = Vec::new();
     let mut identity = Vec::new();
     let mut leaf = None;
+    let mut masked_keys = false;
     for (index, segment) in segments.iter().enumerate() {
-        budget.charge(1)?;
-        budget.charge(
-            segment
-                .name
-                .len()
-                .checked_add(1)
-                .ok_or(SubtreeError::TooBig)?,
-        )?;
+        let _admission = budget.audit_admission("state instance visit 2", || budget.charge(1))?;
+        _admission.visit();
+        let segment_audit = budget.audit_admission("provider segment metadata", || {
+            budget.charge(
+                segment
+                    .name
+                    .len()
+                    .checked_add(1)
+                    .ok_or(SubtreeError::TooBig)?,
+            )
+        })?;
+        segment_audit.bytes_read(&segment.name);
         append(&mut schema, "/", budget, limit)?;
         append(&mut schema, &segment.name, budget, limit)?;
         let node = budget.node(registry, &schema).map_err(|error| {
@@ -570,7 +628,8 @@ fn instance(
         append(&mut canonical, &segment.name, budget, limit)?;
         append(&mut path_identity, "/", budget, usize::MAX)?;
         append(&mut path_identity, &segment.name, budget, usize::MAX)?;
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("state instance visit 4", || budget.charge(1))?;
+        _admission.visit();
         let mut branch = NetconfXmlNode::branch(node.path);
         match node.kind {
             NodeKind::List => {
@@ -587,14 +646,19 @@ fn instance(
                     if !budget.compare(expected, name)? {
                         return Err(SubtreeError::Projection);
                     }
-                    budget.charge(1)?;
+                    let _admission =
+                        budget.audit_admission("state instance visit 5", || budget.charge(1))?;
+                    _admission.visit();
                     let masked = !registry
                         .data_class(key.path)
                         .is_some_and(opc_mgmt_schema::DataClass::allows_cleartext);
+                    masked_keys |= masked;
                     let normalized = canonical_key(registry, key.path, value, budget)?
                         .ok_or(SubtreeError::Projection)?;
                     let captured = if masked {
-                        budget.charge(1)?;
+                        let _admission = budget
+                            .audit_admission("state instance visit 6", || budget.charge(1))?;
+                        _admission.visit();
                         if normalized != *value {
                             return Err(SubtreeError::Projection);
                         }
@@ -613,9 +677,17 @@ fn instance(
                         {
                             return Err(SubtreeError::TooBig);
                         }
-                        budget.charge(name.len().checked_add(6).ok_or(SubtreeError::TooBig)?)?;
+                        let work =
+                            budget.audit_admission("provider masked key rendering", || {
+                                budget
+                                    .charge(name.len().checked_add(6).ok_or(SubtreeError::TooBig)?)
+                            })?;
+                        work.visit();
+                        let before = canonical.len();
                         append_key_predicate(&mut canonical, name, &normalized)
                             .map_err(|_| SubtreeError::Projection)?;
+                        // Raw secret bytes are outside the logical matching model.
+                        work.moved(canonical.len() - before - normalized.len());
                         budget.masked_identity(&normalized)?
                     } else {
                         if !budget.compare(&normalized, value)? {
@@ -625,7 +697,8 @@ fn instance(
                         budget.copy(&normalized)?
                     };
                     append_key(&mut path_identity, name, &captured, budget, usize::MAX)?;
-                    budget.charge(2)?;
+                    let key_retention =
+                        budget.audit_admission("provider key retention", || budget.charge(2))?;
                     identity.push(InstanceKey {
                         path: key.path,
                         #[cfg(test)]
@@ -633,7 +706,9 @@ fn instance(
                         raw: normalized,
                         captured: budget.copy(&captured)?,
                     });
+                    key_retention.moved(1);
                     branch.keys.push((key.path, captured));
+                    key_retention.moved(1);
                 }
             }
             _ if !segment.keys.is_empty() => return Err(SubtreeError::Projection),
@@ -645,17 +720,27 @@ fn instance(
             if !matches!(node.kind, NodeKind::Container | NodeKind::List) {
                 return Err(SubtreeError::Projection);
             }
-            budget.charge(1)?;
+            let _admission =
+                budget.audit_admission("state instance visit 9", || budget.charge(1))?;
+            _admission.visit();
             ancestors.push(branch);
         }
     }
-    budget.charge(
-        path_identity
-            .len()
-            .checked_mul(2)
-            .ok_or(SubtreeError::TooBig)?,
-    )?;
-    if path != canonical {
+    let canonical_audit = budget.audit_admission("provider canonical validation", || {
+        budget.charge(
+            path_identity
+                .len()
+                .checked_mul(2)
+                .ok_or(SubtreeError::TooBig)?,
+        )
+    })?;
+    let canonical_matches = if masked_keys {
+        canonical_audit.visit();
+        path == canonical
+    } else {
+        canonical_audit.text_cmp(path, &canonical).is_eq()
+    };
+    if !canonical_matches {
         return Err(SubtreeError::Projection);
     }
     Ok((

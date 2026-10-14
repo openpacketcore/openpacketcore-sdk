@@ -92,9 +92,10 @@ fn project_function(
                     let mut children = Vec::new();
                     #(#children)*
                     if children.is_empty() && !ctx.selected(#path)? { return Ok(Vec::new()); }
-                    ctx.budget().charge(1)?;
+                    let retention = ctx.budget().audit_admission("generated container retention", || ctx.budget().charge(1))?;
                     let mut node = opc_mgmt_schema::NetconfXmlNode::branch(#path);
                     node.children = children;
+                    retention.moved(1);
                     Ok(vec![node])
                 },
             )
@@ -204,8 +205,13 @@ fn leaf_list_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
         if !ctx.enter(#path, false)? { return Ok(Vec::new()); }
         let mut projected = Vec::new();
         for (ordinal, item) in #value.iter().enumerate() {
-            ctx.budget().charge(1)?;
-            if let Some(node) = ctx.leaf_list_scalar(#path, #scalar, ordinal)? { ctx.budget().charge(1)?; projected.push(node); }
+            let access = ctx.budget().audit_admission("generated leaf-list access", || ctx.budget().charge(1))?;
+            access.visit();
+            if let Some(node) = ctx.leaf_list_scalar(#path, #scalar, ordinal)? {
+                let retention = ctx.budget().audit_admission("generated leaf-list retention", || ctx.budget().charge(1))?;
+                projected.push(node);
+                retention.moved(1);
+            }
         }
         Ok(projected)
     }
@@ -248,6 +254,7 @@ fn list_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> Result<TokenStream, Ru
                 super::types::LeafPresence::Absent => return Err(opc_mgmt_schema::subtree::SubtreeError::Projection),
             };
             keys.push((#child_path, raw));
+            key_retention.moved(1);
         });
     }
     if key_paths.len() != node.key_leaves.len() {
@@ -261,17 +268,18 @@ fn list_body(node: &SchemaNode, nodes: &NodeIndex<'_>) -> Result<TokenStream, Ru
         let mut projected = Vec::new();
         for value in value.values() {
             ctx.row(#path)?;
-            ctx.budget().charge(#key_count)?;
+            let key_retention = ctx.budget().audit_admission("generated row key retention", || ctx.budget().charge(#key_count))?;
             let mut keys = Vec::with_capacity(#key_count);
             #(#keys)*
             #[allow(unused_mut)]
             let mut children = Vec::new();
             #(#children)*
-            ctx.budget().charge(1)?;
+            let retention = ctx.budget().audit_admission("generated row retention", || ctx.budget().charge(1))?;
             let mut row = opc_mgmt_schema::NetconfXmlNode::branch(#path);
             row.keys = keys;
             row.children = children;
             projected.push(row);
+            retention.moved(1);
         }
         Ok(projected)
     })

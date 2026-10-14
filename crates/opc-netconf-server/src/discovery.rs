@@ -541,6 +541,78 @@ mod tests {
     ];
 
     #[test]
+    fn content_projection_observes_features_and_deviations() {
+        use opc_mgmt_schema::subtree::{
+            take_admission_observations, SubtreeBudget, SubtreeOutput, SubtreePlan, SubtreeScope,
+        };
+        use opc_mgmt_schema::DefaultReport;
+
+        let registry = test_registry();
+        let limits = opc_mgmt_limits::MgmtLimits::default();
+        let budget = SubtreeBudget::new(limits.max_subtree_filter_work_units, 0).unwrap();
+        let outputs = YANG_LIBRARY_FULL_SELECTION
+            .iter()
+            .map(|path| SubtreeOutput {
+                path,
+                keys: Vec::new(),
+            })
+            .collect();
+        let plan = SubtreePlan::new(
+            vec![SubtreeScope {
+                implicit_outputs: outputs,
+                ..SubtreeScope::default()
+            }],
+            budget,
+            limits.max_subtree_filter_nodes,
+        )
+        .unwrap()
+        .authorize(|_| true, limits.max_subtree_filter_nodes)
+        .unwrap();
+        let ctx = plan.projection(
+            crate::filter::yang_library_registry(),
+            DefaultReport::Explicit,
+        );
+        take_admission_observations();
+        let nodes = project_yang_library(&registry, &ctx).unwrap();
+        assert_eq!(nodes.len(), 1);
+        let set = nodes[0]
+            .children
+            .iter()
+            .find(|node| node.schema_path == YANG_LIBRARY_MODULE_SET)
+            .unwrap();
+        let module = set
+            .children
+            .iter()
+            .find(|node| {
+                node.keys
+                    .iter()
+                    .any(|(path, value)| *path == YANG_LIBRARY_MODULE_NAME && value == "example")
+            })
+            .unwrap();
+        for (path, value) in [
+            (YANG_LIBRARY_MODULE_FEATURE, "feature-a"),
+            (YANG_LIBRARY_MODULE_DEVIATION, "example-devs"),
+        ] {
+            assert!(module
+                .children
+                .iter()
+                .any(|node| node.schema_path == path && node.value.as_deref() == Some(value)));
+        }
+        let observations = take_admission_observations();
+        for phase in [
+            "content project_yang_library visit 1",
+            "content project_yang_library visit 2",
+        ] {
+            let observed = observations
+                .iter()
+                .find(|item| item.phase == phase)
+                .unwrap();
+            assert!(observed.actual() > 0, "{observed:?}");
+            assert!(observed.actual() <= observed.admitted, "{observed:?}");
+        }
+    }
+
+    #[test]
     fn yang_library_renders_content_id_from_schema_digest() {
         let registry = test_registry();
         let xml = render_yang_library(&registry, ReadSelection::new(&[YANG_LIBRARY_CONTENT_ID]))

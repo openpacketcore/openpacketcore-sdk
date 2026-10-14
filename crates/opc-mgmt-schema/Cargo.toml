@@ -12,6 +12,10 @@ documentation = "https://docs.rs/opc-mgmt-schema"
 keywords = ["5g", "cnf", "yang", "gnmi", "netconf"]
 categories = ["network-programming"]
 
+[features]
+# Independent logical-work observations for downstream test harnesses.
+testkit = []
+
 [dependencies]
 regex = "1.13.1"
 

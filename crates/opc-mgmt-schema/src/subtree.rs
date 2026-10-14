@@ -7,6 +7,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{LeafType, NodeKind, NodeMeta, NumericRangeIntervalMeta, SchemaRegistry};
 
+mod admission_audit;
+#[doc(hidden)]
+pub use admission_audit::AdmissionAudit;
+#[cfg(any(test, feature = "testkit"))]
+#[doc(hidden)]
+pub use admission_audit::{take_admission_observations, AdmissionObservation};
+
 mod plan;
 #[cfg(test)]
 mod work_audit;
@@ -64,6 +71,18 @@ impl std::fmt::Debug for SubtreeBudget {
 }
 
 impl SubtreeBudget {
+    /// Measures a single deduction before independently observed work begins.
+    /// Only `testkit` and unit-test builds retain or enforce observations.
+    #[doc(hidden)]
+    #[inline]
+    pub fn audit_admission(
+        &self,
+        phase: &'static str,
+        charge: impl FnOnce() -> Result<(), SubtreeError>,
+    ) -> Result<AdmissionAudit, SubtreeError> {
+        AdmissionAudit::measure(self, phase, charge)
+    }
+
     /// Remaining allowance for deterministic server-side work accounting.
     /// Never include this in a client error or predicate diagnostic.
     pub fn remaining(&self) -> usize {
@@ -77,7 +96,8 @@ impl SubtreeBudget {
     }
 
     fn begin_predicate_trial(&self) -> Result<(), SubtreeError> {
-        self.charge(1)?;
+        let work = self.audit_admission("predicate trial", || self.charge(1))?;
+        work.visit();
         self.record_predicate_trials(1);
         Ok(())
     }
@@ -122,19 +142,26 @@ impl SubtreeBudget {
 
     /// Charges both inputs before a text comparison, including failed matches.
     pub fn compare(&self, left: &str, right: &str) -> Result<bool, SubtreeError> {
-        self.charge(
-            left.len()
-                .checked_add(right.len())
-                .ok_or(SubtreeError::TooBig)?,
-        )?;
-        Ok(self.audit_text_cmp(left, right).is_eq())
+        let work = self.audit_admission("text comparison", || {
+            self.charge(
+                left.len()
+                    .checked_add(right.len())
+                    .ok_or(SubtreeError::TooBig)?,
+            )
+        })?;
+        let result = work.text_cmp(left, right).is_eq();
+        #[cfg(test)]
+        self.audit_text_cmp(left, right);
+        Ok(result)
     }
 
     /// Copies text only after charging every retained byte.
     pub fn copy(&self, text: &str) -> Result<String, SubtreeError> {
-        self.charge(text.len())?;
+        let work = self.audit_admission("text copy", || self.charge(text.len()))?;
         self.audit_move(text.len());
-        Ok(text.to_owned())
+        let copied = text.to_owned();
+        work.moved(copied.len());
+        Ok(copied)
     }
 
     /// Captures a masked key as a fixed-width identity, never as wire text.
@@ -144,7 +171,8 @@ impl SubtreeBudget {
     /// Hashing charges one fixed visit and the 64 retained hexadecimal bytes,
     /// independent of raw key length. This is not a constant-time guarantee.
     pub fn masked_identity(&self, value: &str) -> Result<String, SubtreeError> {
-        self.charge(65)?;
+        let work = self.audit_admission("masked identity", || self.charge(65))?;
+        work.visit();
         let digest = Sha256::digest(value.as_bytes());
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut identity = String::with_capacity(64);
@@ -152,6 +180,7 @@ impl SubtreeBudget {
             identity.push(char::from(HEX[usize::from(byte >> 4)]));
             identity.push(char::from(HEX[usize::from(byte & 15)]));
         }
+        work.moved(identity.len());
         Ok(identity)
     }
 
@@ -166,16 +195,21 @@ impl SubtreeBudget {
         let mut lo = 0;
         let mut hi = nodes.len();
         while lo < hi {
-            self.charge(1)?;
+            let visit = self.audit_admission("schema index visit", || self.charge(1))?;
             self.audit_visit(1);
             let middle = lo + (hi - lo) / 2;
+            visit.visit();
             let node = &nodes[middle];
-            self.charge(
-                path.len()
-                    .checked_add(node.path.len())
-                    .ok_or(SubtreeError::TooBig)?,
-            )?;
-            match self.audit_text_cmp(node.path, path) {
+            let work = self.audit_admission("schema path comparison", || {
+                self.charge(
+                    path.len()
+                        .checked_add(node.path.len())
+                        .ok_or(SubtreeError::TooBig)?,
+                )
+            })?;
+            #[cfg(test)]
+            self.audit_text_cmp(node.path, path);
+            match work.text_cmp(node.path, path) {
                 std::cmp::Ordering::Equal => return Ok(node),
                 std::cmp::Ordering::Less => lo = middle + 1,
                 std::cmp::Ordering::Greater => hi = middle,
@@ -222,20 +256,16 @@ impl SubtreeBudget {
         self.audit_add(2, _units);
     }
 
+    #[cfg(test)]
     pub(crate) fn audit_text_cmp(&self, left: &str, right: &str) -> std::cmp::Ordering {
-        #[cfg(test)]
-        {
-            for (left, right) in left.bytes().zip(right.bytes()) {
-                self.audit_add(1, 1);
-                let order = left.cmp(&right);
-                if !order.is_eq() {
-                    return order;
-                }
+        for (left, right) in left.bytes().zip(right.bytes()) {
+            self.audit_add(1, 1);
+            let order = left.cmp(&right);
+            if !order.is_eq() {
+                return order;
             }
-            left.len().cmp(&right.len())
         }
-        #[cfg(not(test))]
-        left.cmp(right)
+        left.len().cmp(&right.len())
     }
 }
 
@@ -284,7 +314,8 @@ impl ScalarPredicate {
         }
         // The registry method is authoritative: absent classification must not
         // inherit a permissive class from a different lookup or target leaf.
-        budget.charge(1)?;
+        let work = budget.audit_admission("predicate classification", || budget.charge(1))?;
+        work.visit();
         if !registry
             .data_class(path)
             .is_some_and(crate::DataClass::allows_cleartext)
@@ -336,8 +367,11 @@ impl ScalarPredicate {
                 budget.copy(if *value { "true" } else { "false" }).map(Some)
             }
             ScalarValue::Integer(value) => {
-                budget.charge(20)?;
-                Ok(Some(value.to_string()))
+                let work =
+                    budget.audit_admission("integer literal rendering", || budget.charge(20))?;
+                let rendered = value.to_string();
+                work.moved(rendered.len());
+                Ok(Some(rendered))
             }
             ScalarValue::Text(value) => budget.copy(value).map(Some),
         }
@@ -346,8 +380,17 @@ impl ScalarPredicate {
     /// Compares one authorized, reported scalar without decoding unrelated data.
     pub fn matches(&self, reported: &str, budget: &SubtreeBudget) -> Result<bool, SubtreeError> {
         budget.begin_predicate_trial()?;
-        budget.charge(self.comparison_work(reported.len())?)?;
-        Ok(self.matches_value(reported))
+        let work = budget.audit_admission("scalar comparison", || {
+            budget.charge(self.comparison_work(reported.len())?)
+        })?;
+        Ok(match &self.value {
+            ScalarValue::Never => false,
+            ScalarValue::Text(expected) => work.text_cmp(expected, reported).is_eq(),
+            _ => {
+                work.bytes_read(reported);
+                self.matches_value(reported)
+            }
+        })
     }
 
     fn comparison_work(&self, reported_bytes: usize) -> Result<usize, SubtreeError> {
@@ -388,7 +431,8 @@ pub fn canonical_key(
     let node = budget.node(registry, path)?;
     let target = resolve_scalar_target(registry, node, budget)?;
     let kind = target.leaf_type.ok_or(SubtreeError::Unsupported)?;
-    budget.charge(1)?;
+    let classification = budget.audit_admission("key classification", || budget.charge(1))?;
+    classification.visit();
     if !registry
         .data_class(path)
         .is_some_and(crate::DataClass::allows_cleartext)
@@ -397,7 +441,8 @@ pub fn canonical_key(
         // Its independently bounded input cannot contribute hidden byte counts
         // to the caller's matching allowance. Charge one validation unit;
         // downstream matching retains only masked_identity's fixed-width form.
-        budget.charge(1)?;
+        let work = budget.audit_admission("masked key validation", || budget.charge(1))?;
+        work.visit();
         return Ok(match kind {
             LeafType::Boolean => matches!(value, "true" | "false").then(|| value.to_owned()),
             LeafType::Uint16 | LeafType::Uint32 | LeafType::Int64 => {
@@ -432,7 +477,8 @@ fn parse_scalar(
     key: bool,
     budget: &SubtreeBudget,
 ) -> Result<ScalarValue, SubtreeError> {
-    budget.charge(literal.len())?;
+    let decoding = budget.audit_admission("scalar decoding", || budget.charge(literal.len()))?;
+    decoding.bytes_read(literal);
     Ok(match kind {
         LeafType::Boolean => match literal {
             "true" => ScalarValue::Boolean(true),
@@ -445,7 +491,8 @@ fn parse_scalar(
             };
             let mut allowed = ranges.is_empty();
             for interval in ranges {
-                budget.charge(1)?;
+                let work = budget.audit_admission("numeric range interval", || budget.charge(1))?;
+                work.visit();
                 allowed |= integer >= interval.min && integer <= interval.max;
             }
             if allowed {
@@ -457,7 +504,8 @@ fn parse_scalar(
         LeafType::Enumeration { values } if !key => {
             let mut allowed = false;
             for value in values {
-                budget.charge(1)?;
+                let work = budget.audit_admission("enumeration member", || budget.charge(1))?;
+                work.visit();
                 allowed |= budget.compare(value.name, literal)?;
             }
             if allowed {
@@ -477,7 +525,8 @@ fn scalar_ranges(
     budget: &SubtreeBudget,
 ) -> Result<&'static [NumericRangeIntervalMeta], SubtreeError> {
     for range in registry.numeric_ranges() {
-        budget.charge(1)?;
+        let work = budget.audit_admission("range schema visit", || budget.charge(1))?;
+        work.visit();
         if budget.compare(range.path, path)? {
             return Ok(range.intervals);
         }
@@ -494,9 +543,11 @@ fn resolve_scalar_target(
     // repeated node is refused without examining any referenced instance.
     let mut visited = [""; 64];
     for depth in 0..visited.len() {
-        budget.charge(1)?;
+        let target_visit = budget.audit_admission("leafref target visit", || budget.charge(1))?;
+        target_visit.visit();
         for previous in &visited[..depth] {
-            budget.charge(1)?;
+            let work = budget.audit_admission("leafref cycle visit", || budget.charge(1))?;
+            work.visit();
             if budget.compare(previous, node.path)? {
                 return Err(SubtreeError::Unsupported);
             }
@@ -522,12 +573,16 @@ fn resolve_relative_target(
     target: &str,
     budget: &SubtreeBudget,
 ) -> Result<String, SubtreeError> {
-    budget.charge(
-        source
-            .len()
-            .checked_add(target.len())
-            .ok_or(SubtreeError::TooBig)?,
-    )?;
+    let decoding = budget.audit_admission("leafref path decoding", || {
+        budget.charge(
+            source
+                .len()
+                .checked_add(target.len())
+                .ok_or(SubtreeError::TooBig)?,
+        )
+    })?;
+    decoding.bytes_read(source);
+    decoding.bytes_read(target);
     let prefix = source
         .rsplit('/')
         .next()
@@ -537,12 +592,14 @@ fn resolve_relative_target(
     let mut segments = Vec::new();
     if !target.starts_with('/') {
         for segment in source.trim_start_matches('/').split('/') {
-            budget.charge(1)?;
+            let work = budget.audit_admission("leafref source segment", || budget.charge(1))?;
+            work.moved(1);
             segments.push(segment);
         }
     }
     for segment in target.strip_prefix('/').unwrap_or(target).split('/') {
-        budget.charge(1)?;
+        let work = budget.audit_admission("leafref target segment", || budget.charge(1))?;
+        work.visit();
         match segment {
             ".." => {
                 segments.pop().ok_or(SubtreeError::Unsupported)?;
@@ -550,7 +607,8 @@ fn resolve_relative_target(
             "." => {}
             "" => return Err(SubtreeError::Unsupported),
             name => {
-                budget.charge(1)?;
+                let work = budget.audit_admission("leafref segment append", || budget.charge(1))?;
+                work.moved(1);
                 segments.push(name);
             }
         }
@@ -569,7 +627,7 @@ fn resolve_relative_target(
             .and_then(|sum| sum.checked_add(segment.len()))
             .ok_or(SubtreeError::TooBig)
     })?;
-    budget.charge(bytes)?;
+    let rendering = budget.audit_admission("leafref path rendering", || budget.charge(bytes))?;
     let mut result = String::with_capacity(bytes);
     for segment in segments {
         result.push('/');
@@ -579,6 +637,7 @@ fn resolve_relative_target(
         }
         result.push_str(segment);
     }
+    rendering.moved(result.len());
     Ok(result)
 }
 

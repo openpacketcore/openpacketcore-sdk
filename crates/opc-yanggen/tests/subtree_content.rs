@@ -93,6 +93,10 @@ impl<T: Clone> Clone for SecretLeaf<T> {
             workspace.join("crates").join(name),
         ));
     }
+    manifest.push_str(&format!(
+        "\n[dev-dependencies]\nopc-mgmt-schema = {{ path = {:?}, features = [\"testkit\"] }}\n",
+        workspace.join("crates/opc-mgmt-schema"),
+    ));
     manifest.push_str("\n[workspace]\n");
     fs::write(project.path().join("Cargo.toml"), manifest).unwrap();
     let tests = project.path().join("tests");

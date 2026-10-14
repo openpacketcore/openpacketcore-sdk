@@ -75,13 +75,23 @@ pub(crate) fn project_yang_library(
                 if !import_only {
                     if ctx.enter(YANG_LIBRARY_MODULE_FEATURE, false)? {
                         for feature in metadata.features {
-                            ctx.budget().charge(1)?;
+                            let _admission = ctx
+                                .budget()
+                                .audit_admission("content project_yang_library visit 1", || {
+                                    ctx.budget().charge(1)
+                                })?;
+                            _admission.visit();
                             scalar(&mut module, YANG_LIBRARY_MODULE_FEATURE, feature, ctx)?;
                         }
                     }
                     if ctx.enter(YANG_LIBRARY_MODULE_DEVIATION, false)? {
                         for deviation in metadata.deviations {
-                            ctx.budget().charge(1)?;
+                            let _admission = ctx
+                                .budget()
+                                .audit_admission("content project_yang_library visit 2", || {
+                                    ctx.budget().charge(1)
+                                })?;
+                            _admission.visit();
                             scalar(&mut module, YANG_LIBRARY_MODULE_DEVIATION, deviation, ctx)?;
                         }
                     }
@@ -144,7 +154,10 @@ pub(crate) fn project_netconf_monitoring(
 }
 
 fn branch(path: &'static str, ctx: &SubtreeProjection<'_>) -> Result<NetconfXmlNode, SubtreeError> {
-    ctx.budget().charge(1)?;
+    let _admission = ctx
+        .budget()
+        .audit_admission("content branch visit 1", || ctx.budget().charge(1))?;
+    _admission.visit();
     Ok(NetconfXmlNode::branch(path))
 }
 
@@ -181,7 +194,10 @@ fn key(
     if !ctx.enter(path, false)? {
         return Err(SubtreeError::Projection);
     }
-    ctx.budget().charge(1)?;
+    let _admission = ctx
+        .budget()
+        .audit_admission("content key visit 1", || ctx.budget().charge(1))?;
+    _admission.visit();
     node.keys.push((path, ctx.budget().copy(value)?));
     Ok(())
 }
@@ -192,7 +208,10 @@ fn namespace_for(
     ctx: &SubtreeProjection<'_>,
 ) -> Result<&'static str, SubtreeError> {
     for model in registry.served_models() {
-        ctx.budget().charge(1)?;
+        let _admission = ctx
+            .budget()
+            .audit_admission("content namespace_for visit 1", || ctx.budget().charge(1))?;
+        _admission.visit();
         if ctx.budget().compare(model.name, metadata.name)?
             && ctx.budget().compare(model.revision, metadata.revision)?
         {

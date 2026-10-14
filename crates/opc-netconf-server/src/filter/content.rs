@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::subtree::{
-    ScalarPredicate, SubtreeBranch, SubtreeBudget, SubtreeError, SubtreeMatch, SubtreeOutput,
-    SubtreePlan, SubtreePredicate, SubtreeScope,
+    AdmissionAudit, ScalarPredicate, SubtreeBranch, SubtreeBudget, SubtreeError, SubtreeMatch,
+    SubtreeOutput, SubtreePlan, SubtreePredicate, SubtreeScope,
 };
 use opc_mgmt_schema::{NodeKind, NodeMeta, SchemaRegistry};
 
@@ -66,12 +66,19 @@ pub(crate) fn compile_content(
         let mut per_namespace = BTreeMap::<&'static str, Vec<Resolved>>::new();
         for node in nodes {
             let namespace = compiler.namespace(node)?;
-            compiler.namespace_index_work(&per_namespace, namespace)?;
+            let lookup = compiler.namespace_index_work(&per_namespace, namespace)?;
+            // An occupied index consumes the lookup text in its opaque comparison.
+            if !per_namespace.is_empty() {
+                lookup.bytes_read(namespace);
+            }
             compiler.retain()?;
             per_namespace.entry(namespace).or_default().push(node);
         }
         for (namespace, nodes) in per_namespace {
-            compiler.namespace_index_work(&groups, namespace)?;
+            let lookup = compiler.namespace_index_work(&groups, namespace)?;
+            if !groups.is_empty() {
+                lookup.bytes_read(namespace);
+            }
             compiler.retain()?;
             groups.entry(namespace).or_default().push((raw, nodes));
         }
@@ -97,27 +104,40 @@ impl Compiler<'_> {
         &self,
         index: &BTreeMap<&str, T>,
         namespace: &str,
-    ) -> Result<(), FilterError> {
-        self.budget.charge(index.len()).map_err(map_error)?;
-        let bytes = index.keys().try_fold(0usize, |sum, key| {
+    ) -> Result<AdmissionAudit, FilterError> {
+        let sizing = self
+            .budget
+            .audit_admission("namespace index sizing", || self.budget.charge(index.len()))
+            .map_err(map_error)?;
+        let bytes = sizing.iter(index.keys()).try_fold(0usize, |sum, key| {
             sum.checked_add(key.len())
                 .and_then(|sum| sum.checked_add(namespace.len()))
                 .ok_or(FilterError::ContentLimit)
         })?;
-        self.budget.charge(bytes).map_err(map_error)
+        self.budget
+            .audit_admission("namespace index lookup", || self.budget.charge(bytes))
+            .map_err(map_error)
     }
     fn retain(&mut self) -> Result<(), FilterError> {
         if self.retained >= self.limit {
             return Err(FilterError::ContentLimit);
         }
-        self.budget.charge(1).map_err(map_error)?;
+        let _admission = self
+            .budget
+            .audit_admission("content retain visit 1", || self.budget.charge(1))
+            .map_err(map_error)?;
+        _admission.visit();
         self.retained += 1;
         Ok(())
     }
 
     fn namespace(&self, resolved: Resolved) -> Result<&'static str, FilterError> {
         for model in resolved.registry.served_models() {
-            self.budget.charge(1).map_err(map_error)?;
+            let _admission = self
+                .budget
+                .audit_admission("content namespace visit 1", || self.budget.charge(1))
+                .map_err(map_error)?;
+            _admission.visit();
             if self
                 .budget
                 .compare(model.name, resolved.node.module)
@@ -139,7 +159,11 @@ impl Compiler<'_> {
             let mut known = false;
             for registry in self.registries {
                 for model in registry.served_models() {
-                    self.budget.charge(1).map_err(map_error)?;
+                    let _admission = self
+                        .budget
+                        .audit_admission("content resolve visit 1", || self.budget.charge(1))
+                        .map_err(map_error)?;
+                    _admission.visit();
                     known |= self
                         .budget
                         .compare(&name.namespace, model.namespace)
@@ -166,8 +190,16 @@ impl Compiler<'_> {
         } else {
             for registry in self.registries {
                 for node in registry.nodes() {
-                    self.budget.charge(1).map_err(map_error)?;
-                    self.budget.charge(node.path.len()).map_err(map_error)?;
+                    let _admission = self
+                        .budget
+                        .audit_admission("content resolve visit 2", || self.budget.charge(1))
+                        .map_err(map_error)?;
+                    _admission.visit();
+                    let path_audit = self
+                        .budget
+                        .audit_admission("root schema scan", || self.budget.charge(node.path.len()))
+                        .map_err(map_error)?;
+                    path_audit.bytes_read(node.path);
                     if !node.path.trim_start_matches('/').contains('/') {
                         self.consider(
                             Resolved {
@@ -194,7 +226,11 @@ impl Compiler<'_> {
         raw: &SubtreeNode,
         found: &mut Vec<Resolved>,
     ) -> Result<(), FilterError> {
-        self.budget.charge(1).map_err(map_error)?;
+        let _admission = self
+            .budget
+            .audit_admission("content consider visit 1", || self.budget.charge(1))
+            .map_err(map_error)?;
+        _admission.visit();
         let local = node
             .node
             .path
@@ -259,7 +295,13 @@ impl Compiler<'_> {
                     let keys = self.keys(resolved)?;
                     let mut key = false;
                     for path in &keys {
-                        self.budget.charge(1).map_err(map_error)?;
+                        let _admission = self
+                            .budget
+                            .audit_admission("content resolved_scope visit 1", || {
+                                self.budget.charge(1)
+                            })
+                            .map_err(map_error)?;
+                        _admission.visit();
                         key |= self
                             .budget
                             .compare(path, resolved.node.path)
@@ -315,16 +357,33 @@ impl Compiler<'_> {
                         registry: parent.registry,
                         node,
                     })?;
-                    self.budget.charge(expanded.len()).map_err(map_error)?;
-                    scope.implicit_outputs.extend(expanded);
+                    let outputs = self
+                        .budget
+                        .audit_admission("implicit child outputs", || {
+                            self.budget.charge(expanded.len())
+                        })
+                        .map_err(map_error)?;
+                    scope.implicit_outputs.extend(outputs.iter(expanded));
                 }
             } else {
                 // A root sibling set is bounded to the predicate's namespace.
                 if let Some(namespace) = root_namespace {
                     for registry in self.registries {
                         for node in registry.nodes() {
-                            self.budget.charge(1).map_err(map_error)?;
-                            self.budget.charge(node.path.len()).map_err(map_error)?;
+                            let _admission = self
+                                .budget
+                                .audit_admission("content resolved_scope visit 3", || {
+                                    self.budget.charge(1)
+                                })
+                                .map_err(map_error)?;
+                            _admission.visit();
+                            let path_audit = self
+                                .budget
+                                .audit_admission("implicit root schema scan", || {
+                                    self.budget.charge(node.path.len())
+                                })
+                                .map_err(map_error)?;
+                            path_audit.bytes_read(node.path);
                             if node.path.trim_start_matches('/').contains('/') {
                                 continue;
                             }
@@ -338,8 +397,13 @@ impl Compiler<'_> {
                                 .map_err(map_error)?
                             {
                                 let expanded = self.expand(resolved)?;
-                                self.budget.charge(expanded.len()).map_err(map_error)?;
-                                scope.implicit_outputs.extend(expanded);
+                                let outputs = self
+                                    .budget
+                                    .audit_admission("implicit root outputs", || {
+                                        self.budget.charge(expanded.len())
+                                    })
+                                    .map_err(map_error)?;
+                                scope.implicit_outputs.extend(outputs.iter(expanded));
                             }
                         }
                     }
@@ -361,7 +425,11 @@ impl Compiler<'_> {
                 if node.key_leaves.is_empty() {
                     return Err(FilterError::UnsupportedContent);
                 }
-                self.budget.charge(1).map_err(map_error)?;
+                let _admission = self
+                    .budget
+                    .audit_admission("content keys visit 1", || self.budget.charge(1))
+                    .map_err(map_error)?;
+                _admission.visit();
                 ancestry.push(node);
             }
             let Some((parent, _)) = path.rsplit_once('/') else {
@@ -403,7 +471,11 @@ impl Compiler<'_> {
         let mut pending = vec![root];
         let mut outputs = Vec::new();
         while let Some(resolved) = pending.pop() {
-            self.budget.charge(1).map_err(map_error)?;
+            let _admission = self
+                .budget
+                .audit_admission("content expand visit 1", || self.budget.charge(1))
+                .map_err(map_error)?;
+            _admission.visit();
             if self.scope.contains(resolved.node.config) {
                 let keys = self.keys(resolved)?;
                 self.retain()?;

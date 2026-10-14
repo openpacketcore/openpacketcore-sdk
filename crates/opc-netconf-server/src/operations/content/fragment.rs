@@ -27,7 +27,8 @@ struct XmlBounds {
 
 impl XmlBounds {
     fn new(registry: &dyn SchemaRegistry, budget: &SubtreeBudget) -> Result<Self, SubtreeError> {
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("fragment new visit 1", || budget.charge(1))?;
+        _admission.visit();
         let models = registry.served_models();
         // Among M used prefixes, wd or one of wd1..wdM must be available.
         let default_prefix_bytes = add(3, models.len().max(1).ilog10() as usize)?;
@@ -37,7 +38,8 @@ impl XmlBounds {
             namespace_bytes: namespace_bytes(default_prefix_bytes, WITH_DEFAULTS_NS.len())?,
         };
         for model in models {
-            budget.charge(1)?;
+            let _admission = budget.audit_admission("fragment new visit 2", || budget.charge(1))?;
+            _admission.visit();
             bounds.prefix_bytes = bounds.prefix_bytes.max(model.prefix.len());
             bounds.namespace_bytes = add(
                 bounds.namespace_bytes,
@@ -68,7 +70,9 @@ impl XmlBounds {
     ) -> Result<usize, SubtreeError> {
         let mut bytes = 0;
         for node in nodes {
-            budget.charge(1)?;
+            let _admission =
+                budget.audit_admission("fragment node_bytes visit 1", || budget.charge(1))?;
+            _admission.visit();
             bytes = add(
                 bytes,
                 self.element_bytes(node.schema_path.len(), node.value.as_ref().map(String::len))?,
@@ -76,7 +80,9 @@ impl XmlBounds {
             // A key may be emitted by its owner or materialized as a selected
             // scalar. Count every original key, including duplicate children.
             for (path, value) in &node.keys {
-                budget.charge(1)?;
+                let _admission =
+                    budget.audit_admission("fragment node_bytes visit 2", || budget.charge(1))?;
+                _admission.visit();
                 bytes = add(bytes, self.element_bytes(path.len(), Some(value.len()))?)?;
             }
             bytes = add(bytes, self.node_bytes(&node.children, budget)?)?;

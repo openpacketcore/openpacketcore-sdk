@@ -28,6 +28,8 @@ use super::{record_audit, AuditMode};
 
 mod fragment;
 mod state;
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy)]
 pub(crate) enum ContentRequest<'a> {
@@ -335,10 +337,15 @@ where
         return Err(RpcError::operation_not_supported());
     }
     for path in plan.authorization_paths() {
-        plan.budget()
-            .charge(path.len().checked_add(1).ok_or_else(RpcError::too_big)?)
+        let units = path.len().checked_add(1).ok_or_else(RpcError::too_big)?;
+        let copying = plan
+            .budget()
+            .audit_admission("authorization audit path", || plan.budget().charge(units))
             .map_err(rpc_error)?;
-        audit_paths.push(SchemaNodePath::new(*path).map_err(|_| RpcError::operation_failed())?);
+        let retained = SchemaNodePath::new(*path).map_err(|_| RpcError::operation_failed())?;
+        copying.moved(retained.as_str().len());
+        audit_paths.push(retained);
+        copying.moved(1);
     }
     let resolved = ctx
         .authz
@@ -352,10 +359,16 @@ where
             match plan.budget().node(*selected_registry, path) {
                 Ok(_) => {
                     // The decision retains one schema path; never a predicate value.
-                    plan.budget()
-                        .charge(path.len().checked_add(1).ok_or_else(RpcError::too_big)?)
+                    let units = path.len().checked_add(1).ok_or_else(RpcError::too_big)?;
+                    let retention = plan
+                        .budget()
+                        .audit_admission("authorization decision path", || {
+                            plan.budget().charge(units)
+                        })
                         .map_err(rpc_error)?;
+                    retention.bytes_read(path);
                     paths.push(*path);
+                    retention.moved(1);
                 }
                 Err(SubtreeError::Unsupported) => {}
                 Err(error) => return Err(rpc_error(error)),
@@ -378,9 +391,17 @@ where
             .count();
         record_nacm_denials(NetconfNacmAction::Read, denied);
         for (path, decision) in paths.into_iter().zip(decisions) {
-            plan.budget().charge(1).map_err(rpc_error)?;
+            let _admission = plan
+                .budget()
+                .audit_admission("content read visit 3", || plan.budget().charge(1))
+                .map_err(rpc_error)?;
+            _admission.visit();
             if decision.allowed {
-                plan.budget().charge(1).map_err(rpc_error)?;
+                let _admission = plan
+                    .budget()
+                    .audit_admission("content read visit 4", || plan.budget().charge(1))
+                    .map_err(rpc_error)?;
+                _admission.visit();
                 allowed.insert(path);
             }
         }
@@ -398,7 +419,11 @@ where
         return Ok(ReadResult::Reply(reply));
     }
     let config = if needs_config(&plan, registry, scope).map_err(rpc_error)? {
-        plan.budget().charge(1).map_err(rpc_error)?;
+        let _admission = plan
+            .budget()
+            .audit_admission("content read visit 5", || plan.budget().charge(1))
+            .map_err(rpc_error)?;
+        _admission.visit();
         Some(load(source)?)
     } else {
         None
@@ -411,8 +436,15 @@ where
             .map_err(rpc_error)?;
         // Preserve both original forests until the evaluator has admitted the
         // complete envelope. No intermediate identity join may determine fees.
-        plan.budget().charge(input.len()).map_err(rpc_error)?;
+        let movement = plan
+            .budget()
+            .audit_admission("capture forest append", || {
+                plan.budget().charge(input.len())
+            })
+            .map_err(rpc_error)?;
+        let before = configuration.len();
         configuration.append(&mut input);
+        movement.moved(configuration.len() - before);
         input = configuration;
     }
     let selected = plan.evaluate(registry, &input).map_err(rpc_error)?;

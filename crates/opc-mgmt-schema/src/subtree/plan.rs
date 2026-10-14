@@ -112,7 +112,10 @@ impl SubtreePlan {
         let mut scopes = Vec::new();
         for scope in self.scopes {
             if let Some(scope) = prune_scope(scope, &allowed, &self.budget)? {
-                self.budget.charge(1)?;
+                let _admission = self
+                    .budget
+                    .audit_admission("plan authorize visit 1", || self.budget.charge(1))?;
+                _admission.visit();
                 scopes.push(scope);
             }
         }
@@ -126,8 +129,11 @@ impl SubtreePlan {
         for path in &paths {
             let mut prefix = *path;
             while !prefix.is_empty() {
-                self.budget
-                    .charge(prefix.len().checked_add(1).ok_or(SubtreeError::TooBig)?)?;
+                let work = self.budget.audit_admission("structural prefix scan", || {
+                    self.budget
+                        .charge(prefix.len().checked_add(1).ok_or(SubtreeError::TooBig)?)
+                })?;
+                work.bytes_read(prefix);
                 insert_path(&mut structural_paths, prefix, &self.budget, node_limit)?;
                 prefix = prefix.rsplit_once('/').map_or("", |(parent, _)| parent);
             }
@@ -254,7 +260,9 @@ fn scope_selectors(
 ) -> Result<(), SubtreeError> {
     let mut keys = Vec::new();
     for (path, value) in inherited {
-        budget.charge(1)?;
+        let _admission =
+            budget.audit_admission("plan scope_selectors visit 1", || budget.charge(1))?;
+        _admission.visit();
         keys.push((*path, budget.copy(value)?));
     }
     for predicate in &scope.predicates {
@@ -263,7 +271,9 @@ fn scope_selectors(
         if let [test] = predicate.alternatives.as_slice() {
             let mut identifying = false;
             for key in &test.keys {
-                budget.charge(1)?;
+                let _admission =
+                    budget.audit_admission("plan scope_selectors visit 2", || budget.charge(1))?;
+                _admission.visit();
                 identifying |= budget.compare(key, test.path)?;
             }
             if identifying {
@@ -272,7 +282,9 @@ fn scope_selectors(
                 };
                 let mut exists = false;
                 for (path, previous) in &keys {
-                    budget.charge(1)?;
+                    let _admission = budget
+                        .audit_admission("plan scope_selectors visit 3", || budget.charge(1))?;
+                    _admission.visit();
                     if budget.compare(path, test.path)? {
                         if !budget.compare(previous, &value)? {
                             return Ok(());
@@ -281,7 +293,9 @@ fn scope_selectors(
                     }
                 }
                 if !exists {
-                    budget.charge(1)?;
+                    let _admission = budget
+                        .audit_admission("plan scope_selectors visit 4", || budget.charge(1))?;
+                    _admission.visit();
                     keys.push((test.path, value));
                 }
             }
@@ -293,21 +307,31 @@ fn scope_selectors(
         }
         let mut constraints = Vec::new();
         for (key, value) in &keys {
-            budget.charge(1)?;
-            budget.charge(
-                path.len()
-                    .checked_add(key.len())
-                    .ok_or(SubtreeError::TooBig)?,
-            )?;
+            let _admission =
+                budget.audit_admission("plan scope_selectors visit 5", || budget.charge(1))?;
+            _admission.visit();
+            let work = budget.audit_admission("selector ancestor scan", || {
+                budget.charge(
+                    path.len()
+                        .checked_add(key.len())
+                        .ok_or(SubtreeError::TooBig)?,
+                )
+            })?;
+            work.bytes_read(key);
             if key.rsplit_once('/').is_some_and(|(parent, _)| {
+                work.bytes_read(path);
                 path.strip_prefix(parent)
                     .is_some_and(|rest| rest.starts_with('/'))
             }) {
-                budget.charge(1)?;
+                let _admission =
+                    budget.audit_admission("plan scope_selectors visit 7", || budget.charge(1))?;
+                _admission.visit();
                 constraints.push((*key, budget.copy(value)?));
             }
         }
-        budget.charge(1)?;
+        let _admission =
+            budget.audit_admission("plan scope_selectors visit 8", || budget.charge(1))?;
+        _admission.visit();
         selectors.push(NetconfInstanceSelector {
             schema_path: path,
             keys: constraints,
@@ -344,14 +368,17 @@ fn insert_path(
     let mut lo = 0;
     let mut hi = paths.len();
     while lo < hi {
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("plan insert_path visit 1", || budget.charge(1))?;
+        _admission.visit();
         let middle = lo + (hi - lo) / 2;
-        budget.charge(
-            path.len()
-                .checked_add(paths[middle].len())
-                .ok_or(SubtreeError::TooBig)?,
-        )?;
-        match paths[middle].cmp(path) {
+        let work = budget.audit_admission("path index comparison", || {
+            budget.charge(
+                path.len()
+                    .checked_add(paths[middle].len())
+                    .ok_or(SubtreeError::TooBig)?,
+            )
+        })?;
+        match work.text_cmp(paths[middle], path) {
             std::cmp::Ordering::Equal => return Ok(()),
             std::cmp::Ordering::Less => lo = middle + 1,
             std::cmp::Ordering::Greater => hi = middle,
@@ -360,8 +387,11 @@ fn insert_path(
     if paths.len() >= limit {
         return Err(SubtreeError::TooBig);
     }
-    budget.charge(paths.len() - lo + 1)?;
+    let work = budget.audit_admission("path index insertion", || {
+        budget.charge(paths.len() - lo + 1)
+    })?;
     paths.insert(lo, path);
+    work.moved(paths[lo..].len());
     Ok(())
 }
 
@@ -408,7 +438,11 @@ fn permitted(
     allowed: &impl Fn(&str) -> bool,
     budget: &SubtreeBudget,
 ) -> Result<bool, SubtreeError> {
-    budget.charge(path.len().checked_add(1).ok_or(SubtreeError::TooBig)?)?;
+    let work = budget.audit_admission("policy path lookup", || {
+        budget.charge(path.len().checked_add(1).ok_or(SubtreeError::TooBig)?)
+    })?;
+    work.visit();
+    work.bytes_read(path);
     Ok(allowed(path))
 }
 
@@ -432,11 +466,15 @@ fn prune_outputs(
 ) -> Result<Vec<SubtreeOutput>, SubtreeError> {
     let mut retained = Vec::new();
     for output in outputs {
-        budget.charge(1)?;
+        let _admission =
+            budget.audit_admission("plan prune_outputs visit 1", || budget.charge(1))?;
+        _admission.visit();
         if permitted(output.path, allowed, budget)?
             && permitted_keys(&output.keys, allowed, budget)?
         {
-            budget.charge(1)?;
+            let _admission =
+                budget.audit_admission("plan prune_outputs visit 2", || budget.charge(1))?;
+            _admission.visit();
             retained.push(output);
         }
     }
@@ -448,17 +486,22 @@ fn prune_scope(
     allowed: &impl Fn(&str) -> bool,
     budget: &SubtreeBudget,
 ) -> Result<Option<SubtreeScope>, SubtreeError> {
-    budget.charge(1)?;
+    let _admission = budget.audit_admission("plan prune_scope visit 1", || budget.charge(1))?;
+    _admission.visit();
     for predicate in &mut scope.predicates {
         let mut alternatives = Vec::new();
         for test in std::mem::take(&mut predicate.alternatives) {
-            budget.charge(1)?;
+            let _admission =
+                budget.audit_admission("plan prune_scope visit 2", || budget.charge(1))?;
+            _admission.visit();
             if test.in_scope
                 && test.predicate.is_satisfiable()
                 && permitted(test.path, allowed, budget)?
                 && permitted_keys(&test.keys, allowed, budget)?
             {
-                budget.charge(1)?;
+                let _admission =
+                    budget.audit_admission("plan prune_scope visit 3", || budget.charge(1))?;
+                _admission.visit();
                 alternatives.push(test);
             }
         }
@@ -470,7 +513,8 @@ fn prune_scope(
     scope.implicit_outputs = prune_outputs(scope.implicit_outputs, allowed, budget)?;
     let mut branches = Vec::new();
     for mut branch in scope.branches {
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("plan prune_scope visit 4", || budget.charge(1))?;
+        _admission.visit();
         if !permitted_keys(&branch.keys, allowed, budget)? {
             continue;
         }
@@ -478,7 +522,9 @@ fn prune_scope(
             let Some(children) = prune_scope(*children, allowed, budget)? else {
                 continue;
             };
-            budget.charge(1)?;
+            let _admission =
+                budget.audit_admission("plan prune_scope visit 5", || budget.charge(1))?;
+            _admission.visit();
             branch.children = Some(Box::new(children));
         } else {
             branch.outputs = prune_outputs(branch.outputs, allowed, budget)?;
@@ -486,7 +532,8 @@ fn prune_scope(
                 continue;
             }
         }
-        budget.charge(1)?;
+        let _admission = budget.audit_admission("plan prune_scope visit 6", || budget.charge(1))?;
+        _admission.visit();
         branches.push(branch);
     }
     scope.branches = branches;
@@ -501,7 +548,10 @@ fn scope_needs_configuration(
     registry: &dyn SchemaRegistry,
     budget: &SubtreeBudget,
 ) -> Result<bool, SubtreeError> {
-    budget.charge(1)?;
+    let _admission = budget.audit_admission("plan scope_needs_configuration visit 1", || {
+        budget.charge(1)
+    })?;
+    _admission.visit();
     let config = |path: &str| match budget.node(registry, path) {
         Ok(node) => Ok(node.config),
         Err(SubtreeError::Unsupported) => Ok(false),
@@ -561,27 +611,43 @@ impl SubtreeScalar<'_> {
     // Only the public schema default determines comparison work. Masked text
     // is borrowed, never encoded or copied merely to decide default omission.
     fn matches_default(self, default: &str, budget: &SubtreeBudget) -> Result<bool, SubtreeError> {
-        budget.charge(default.len().checked_mul(2).ok_or(SubtreeError::TooBig)?)?;
+        let comparison = budget.audit_admission("default comparison", || {
+            budget.charge(default.len().checked_mul(2).ok_or(SubtreeError::TooBig)?)
+        })?;
         Ok(match self {
-            Self::Text(value) => value == default,
+            Self::Text(value) => comparison.text_cmp(value, default).is_eq(),
             Self::Empty => default.is_empty(),
-            Self::Boolean(value) => default == if value { "true" } else { "false" },
+            Self::Boolean(value) => comparison
+                .text_cmp(default, if value { "true" } else { "false" })
+                .is_eq(),
             Self::Integer(value) => {
-                budget.charge(20)?;
-                default
-                    .parse::<i64>()
-                    .is_ok_and(|expected| expected.to_string() == default && value == expected)
+                let work =
+                    budget.audit_admission("signed default rendering", || budget.charge(20))?;
+                comparison.bytes_read(default);
+                default.parse::<i64>().is_ok_and(|expected| {
+                    let rendered = expected.to_string();
+                    work.moved(rendered.len());
+                    comparison.text_cmp(&rendered, default).is_eq() && value == expected
+                })
             }
             Self::Unsigned(value) => {
-                budget.charge(20)?;
-                default
-                    .parse::<u64>()
-                    .is_ok_and(|expected| expected.to_string() == default && value == expected)
+                let work =
+                    budget.audit_admission("unsigned default rendering", || budget.charge(20))?;
+                comparison.bytes_read(default);
+                default.parse::<u64>().is_ok_and(|expected| {
+                    let rendered = expected.to_string();
+                    work.moved(rendered.len());
+                    comparison.text_cmp(&rendered, default).is_eq() && value == expected
+                })
             }
             Self::Decimal(value) => {
-                budget.charge(327)?;
+                let work =
+                    budget.audit_admission("decimal default rendering", || budget.charge(327))?;
+                comparison.bytes_read(default);
                 default.parse::<f64>().is_ok_and(|expected| {
-                    expected.to_string() == default
+                    let rendered = expected.to_string();
+                    work.moved(rendered.len());
+                    comparison.text_cmp(&rendered, default).is_eq()
                         && ((value.is_nan() && expected.is_nan())
                             || (value == expected
                                 && value.is_sign_negative() == expected.is_sign_negative()))
@@ -597,16 +663,25 @@ impl SubtreeScalar<'_> {
             Self::Empty => Ok(String::new()),
             Self::Boolean(value) => budget.copy(if value { "true" } else { "false" }),
             Self::Integer(value) => {
-                budget.charge(20)?;
-                Ok(value.to_string())
+                let work =
+                    budget.audit_admission("signed scalar rendering", || budget.charge(20))?;
+                let rendered = value.to_string();
+                work.moved(rendered.len());
+                Ok(rendered)
             }
             Self::Unsigned(value) => {
-                budget.charge(20)?;
-                Ok(value.to_string())
+                let work =
+                    budget.audit_admission("unsigned scalar rendering", || budget.charge(20))?;
+                let rendered = value.to_string();
+                work.moved(rendered.len());
+                Ok(rendered)
             }
             Self::Decimal(value) => {
-                budget.charge(327)?;
-                Ok(value.to_string())
+                let work =
+                    budget.audit_admission("decimal scalar rendering", || budget.charge(327))?;
+                let rendered = value.to_string();
+                work.moved(rendered.len());
+                Ok(rendered)
             }
         }
     }
@@ -649,7 +724,10 @@ impl<'a> SubtreeProjection<'a> {
 
     /// Gates one row before key extraction or projection consistency checks.
     pub fn row(&self, path: &'static str) -> Result<(), SubtreeError> {
-        self.budget.charge(1)?;
+        let _admission = self
+            .budget
+            .audit_admission("plan row visit 1", || self.budget.charge(1))?;
+        _admission.visit();
         if let Some(observer) = self.observer {
             observer.before_read(path, SubtreeAccessKind::Row);
         }
@@ -665,8 +743,10 @@ impl<'a> SubtreeProjection<'a> {
         target: &mut Vec<NetconfXmlNode>,
         incoming: Vec<NetconfXmlNode>,
     ) -> Result<(), SubtreeError> {
-        self.budget.charge(incoming.len())?;
-        target.extend(incoming);
+        let work = self
+            .budget
+            .audit_admission("projection append", || self.budget.charge(incoming.len()))?;
+        target.extend(work.iter(incoming));
         Ok(())
     }
     /// Whether this exact schema node has a surviving authorized dependency.
@@ -684,14 +764,21 @@ impl<'a> SubtreeProjection<'a> {
         let mut lo = 0;
         let mut hi = paths.len();
         while lo < hi {
-            self.budget.charge(1)?;
+            let _admission = self
+                .budget
+                .audit_admission("plan contains_path visit 1", || self.budget.charge(1))?;
+            _admission.visit();
             let middle = lo + (hi - lo) / 2;
-            self.budget.charge(
-                path.len()
-                    .checked_add(paths[middle].len())
-                    .ok_or(SubtreeError::TooBig)?,
-            )?;
-            match paths[middle].cmp(path) {
+            let work = self
+                .budget
+                .audit_admission("projection path comparison", || {
+                    self.budget.charge(
+                        path.len()
+                            .checked_add(paths[middle].len())
+                            .ok_or(SubtreeError::TooBig)?,
+                    )
+                })?;
+            match work.text_cmp(paths[middle], path) {
                 std::cmp::Ordering::Equal => return Ok(true),
                 std::cmp::Ordering::Less => lo = middle + 1,
                 std::cmp::Ordering::Greater => hi = middle,
@@ -701,7 +788,10 @@ impl<'a> SubtreeProjection<'a> {
     }
     /// Gates a candidate node before any field, value or row access.
     pub fn enter(&self, path: &'static str, structural: bool) -> Result<bool, SubtreeError> {
-        self.budget.charge(1)?;
+        let _admission = self
+            .budget
+            .audit_admission("plan enter visit 1", || self.budget.charge(1))?;
+        _admission.visit();
         let permitted = if structural {
             self.subtree_selected(path)?
         } else {
@@ -738,7 +828,10 @@ impl<'a> SubtreeProjection<'a> {
         path: &'static str,
         value: SubtreeScalar<'_>,
     ) -> Result<String, SubtreeError> {
-        self.budget.charge(1)?;
+        let _admission = self
+            .budget
+            .audit_admission("plan key visit 1", || self.budget.charge(1))?;
+        _admission.visit();
         if self
             .registry
             .data_class(path)
@@ -746,7 +839,10 @@ impl<'a> SubtreeProjection<'a> {
         {
             return value.encode(self.budget);
         }
-        self.budget.charge(1)?;
+        let _admission = self
+            .budget
+            .audit_admission("plan key visit 2", || self.budget.charge(1))?;
+        _admission.visit();
         use std::borrow::Cow;
         let raw = match value {
             SubtreeScalar::Text(value) => Cow::Borrowed(value),
@@ -797,7 +893,10 @@ impl<'a> SubtreeProjection<'a> {
                 }
             }
         }
-        self.budget.charge(1)?;
+        let _admission = self
+            .budget
+            .audit_admission("plan scalar_at visit 1", || self.budget.charge(1))?;
+        _admission.visit();
         let masked = !self
             .registry
             .data_class(path)
@@ -809,7 +908,10 @@ impl<'a> SubtreeProjection<'a> {
         } else {
             value.encode(self.budget)?
         };
-        self.budget.charge(1)?;
+        let _admission = self
+            .budget
+            .audit_admission("plan scalar_at visit 2", || self.budget.charge(1))?;
+        _admission.visit();
         let mut node = NetconfXmlNode::scalar(path, payload, is_defaulted);
         if masked {
             node.masked_ordinal = ordinal;
@@ -861,11 +963,12 @@ fn normalize_leaf_lists(
 ) -> Result<usize, SubtreeError> {
     #[cfg(test)]
     let _audit = budget.audit_scope("leaf-list normalization");
-    budget.charge(paths.len())?;
+    let sizing = budget.audit_admission("leaf-list path sizing", || budget.charge(paths.len()))?;
     let largest = paths
         .iter()
         .map(|path| {
             budget.audit_visit(1);
+            sizing.visit();
             path.len()
         })
         .max()
@@ -879,20 +982,32 @@ fn normalize_leaf_lists(
     )?;
     add_work(&mut per_path, comparison)?;
     add_work(&mut per_path, 4)?;
-    budget.charge(multiply_work(paths.len(), per_path)?)?;
+    let ordering = budget.audit_admission("leaf-list path ordering", || {
+        budget.charge(multiply_work(paths.len(), per_path)?)
+    })?;
+    let compare = |left: &str, right: &str| {
+        #[cfg(test)]
+        budget.audit_text_cmp(left, right);
+        ordering.text_cmp(left, right)
+    };
     let order = identity::sorted_indices(
         paths.len(),
-        |left, right| budget.audit_text_cmp(paths[left], paths[right]),
-        |units| budget.audit_move(units),
+        |left, right| compare(paths[left], paths[right]),
+        |units| {
+            budget.audit_move(units);
+            ordering.moved(units);
+        },
     );
     let mut normalized: Vec<&'static str> = Vec::new();
     for index in order {
         budget.audit_visit(1);
+        ordering.visit();
         if normalized
             .last()
-            .is_none_or(|previous| !budget.audit_text_cmp(previous, paths[index]).is_eq())
+            .is_none_or(|previous| !compare(previous, paths[index]).is_eq())
         {
             budget.audit_move(1);
+            ordering.moved(1);
             normalized.push(paths[index]);
         }
     }
@@ -922,9 +1037,9 @@ impl CapturedWork {
         budget: &SubtreeBudget,
     ) -> Result<(), SubtreeError> {
         // Admit the metadata visits before inspecting any tuple component.
-        budget.charge(keys.len())?;
+        let work = budget.audit_admission("captured key metadata", || budget.charge(keys.len()))?;
         add_work(&mut self.keys, keys.len())?;
-        for (path, value) in keys {
+        for (path, value) in work.iter(keys) {
             add_work(&mut self.key_bytes, path.len())?;
             add_work(&mut self.key_bytes, value.len())?;
             self.largest_key_path = self.largest_key_path.max(path.len());
@@ -940,7 +1055,9 @@ impl CapturedWork {
         budget: &SubtreeBudget,
     ) -> Result<(), SubtreeError> {
         for node in nodes {
-            budget.charge(1)?;
+            let _admission =
+                budget.audit_admission("plan include_nodes visit 1", || budget.charge(1))?;
+            _admission.visit();
             add_work(&mut self.nodes, 1)?;
             add_work(&mut self.row_nodes, 1)?;
             add_work(&mut self.schema_bytes, node.schema_path.len())?;
@@ -963,7 +1080,9 @@ impl CapturedWork {
                 // Resolve every input node before a merge can skip descendants
                 // or stop at a matching row. These searches use schema only.
                 if budget.node(registry, node.schema_path)?.kind == NodeKind::LeafList {
-                    budget.charge(1)?;
+                    let _admission = budget
+                        .audit_admission("plan include_nodes visit 2", || budget.charge(1))?;
+                    _admission.visit();
                     self.leaf_lists.push(node.schema_path);
                 }
             }

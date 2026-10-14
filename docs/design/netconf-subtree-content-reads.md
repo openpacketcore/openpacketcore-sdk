@@ -233,6 +233,24 @@ allowance cannot cushion an executor overrun. Paired-byte comparisons count each
 position once. Canonical ordering of masked provider keys retains its fixed
 logical comparison cost; the counters do not bound raw secret-byte CPU time.
 
+Local admission checks also measure the actual budget deduction around
+the charged operation, then observe visits, comparison byte positions and
+retained elements or bytes at that operation. Opaque bounded text operations
+record their input bytes. Selector sizing and correlation have separate checks,
+as do schema lookup, compilation, projection and provider validation. A missing
+deduction cannot borrow spare allowance from a different operation. The schema
+crate's `testkit` feature enables these checks when linked by server unit tests
+and the authenticated generated-service harness; ordinary builds keep empty
+tokens and no counters.
+
+`ci/subtree-charge-mutations.py` inventories production charge calls across the
+schema, server and generator source trees, including generated projection code.
+It removes one deduction at a time while preserving argument evaluation, runs
+the complete server unit and authenticated suites, and restores the source.
+Every mutation needs a failing test; compiler errors, timeouts and incomplete
+test runs are invalid results. Its evidence records the source, patch, commands
+and logs separately from the reusable development build cache.
+
 Existing request, XML depth, namespace, attribute and content-node limits
 remain in force. Each accumulated decoded value is bounded by
 `max_value_bytes`, and aggregate decoded text is bounded by
