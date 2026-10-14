@@ -100,10 +100,13 @@ fn project_function(
                 },
             )
         }
-        SchemaNodeKind::List => (sequence_field_type(node, nodes), list_body(node, nodes)?),
+        SchemaNodeKind::List => (
+            sequence_parameter_type(node, nodes),
+            list_body(node, nodes)?,
+        ),
         SchemaNodeKind::Leaf => (leaf_field_type(node, nodes), leaf_body(node, nodes)),
         SchemaNodeKind::LeafList => (
-            sequence_field_type(node, nodes),
+            sequence_parameter_type(node, nodes),
             leaf_list_body(node, nodes),
         ),
         _ => {
@@ -117,6 +120,23 @@ fn project_function(
             -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, opc_mgmt_schema::subtree::SubtreeError>
         { #body }
     })
+}
+
+fn sequence_parameter_type(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
+    if super::super::types::is_sensitive_node(node) {
+        return sequence_field_type(node, nodes);
+    }
+    match node.kind {
+        SchemaNodeKind::LeafList => {
+            let element = super::leaf_list_element_type(node, nodes);
+            quote! { [#element] }
+        }
+        SchemaNodeKind::List if node.key_leaves.is_empty() => {
+            let element = format_ident!("{}", nodes.type_name(node));
+            quote! { [super::types::#element] }
+        }
+        _ => sequence_field_type(node, nodes),
+    }
 }
 
 fn child_statements(
