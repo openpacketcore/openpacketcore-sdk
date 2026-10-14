@@ -155,12 +155,34 @@ impl ScopeServer {
         let mut bound = addresses;
         let mut listeners = Vec::with_capacity(5);
         for (index, address) in addresses.into_iter().enumerate() {
-            let listener = TcpListener::bind(address)
-                .await
-                .map_err(|_| ScopeRpcError::Retry)?;
+            let listener = TcpListener::bind(address).await;
+            #[cfg(test)]
+            let listener = listener.inspect_err(|error| {
+                eprintln!("scope listener {index} bind at {address} failed: {error:?}");
+            });
+            let listener = listener.map_err(|_| ScopeRpcError::Retry)?;
             bound[index] = listener.local_addr().map_err(|_| ScopeRpcError::Retry)?;
             listeners.push(listener);
         }
+        Ok(self.serve_listeners(bound, listeners))
+    }
+    #[cfg(test)]
+    pub(crate) fn serve_reserved_for_test(
+        self: Arc<Self>,
+        listeners: [TcpListener; 5],
+    ) -> ScopeServerHandle {
+        let bound = std::array::from_fn(|index| {
+            listeners[index]
+                .local_addr()
+                .expect("reserved scope listener address")
+        });
+        self.serve_listeners(bound, listeners.into())
+    }
+    fn serve_listeners(
+        self: Arc<Self>,
+        addresses: [SocketAddr; 5],
+        listeners: Vec<TcpListener>,
+    ) -> ScopeServerHandle {
         let views = Arc::new(ScanViews::default());
         let (stop, receive) = watch::channel(false);
         let tasks: Vec<_> = listeners
@@ -205,12 +227,12 @@ impl ScopeServer {
             }
             cleanup.shutdown().await;
         });
-        Ok(ScopeServerHandle {
-            addresses: bound,
+        ScopeServerHandle {
+            addresses,
             stop,
             tasks: vec![supervisor],
             views,
-        })
+        }
     }
     async fn connection(
         &self,

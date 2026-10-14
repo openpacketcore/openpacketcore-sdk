@@ -716,6 +716,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-net` tests: reserve scope listener sockets across endpoint
+  replacement and full fleet reopen so restarted ephemeral consensus listeners
+  cannot take their saved ports. Keep bind-error diagnostics and exercise
+  competing binds in the existing snapshot/leader-loss regression. (#1284)
+
 - `opc-testbed`: replace deprecated `serde_yaml` and unmaintained `unsafe-libyaml`
   with the YAML Organization's `yaml_serde` and `libyaml-rs`, resolving
   RUSTSEC-2024-0449. Preserve the scenario fixture's complete parsed values and
