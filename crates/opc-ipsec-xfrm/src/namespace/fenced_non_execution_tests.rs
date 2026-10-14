@@ -11,7 +11,9 @@ mod fenced_non_execution {
         generation: XfrmObjectRosterOperationGeneration,
         roster: &XfrmObjectRosterRequest,
     ) -> Result<XfrmObjectRosterRestartOutcome, XfrmObjectRosterDurableError> {
-        backend.recover_durable_object_roster(store, group, generation, roster).await
+        backend
+            .recover_durable_object_roster(store, group, generation, roster)
+            .await
     }
 
     #[derive(Debug, Default)]
@@ -36,14 +38,17 @@ mod fenced_non_execution {
         }
 
         async fn wait_entered(&self) {
-            tokio::time::timeout(Duration::from_secs(2), self.entered.notified()).await
+            tokio::time::timeout(Duration::from_secs(2), self.entered.notified())
+                .await
                 .expect("actor must reach the explicit test latch");
         }
     }
 
     struct ReleaseOnDrop(Arc<EffectGate>);
     impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) { self.0.release(); }
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -68,10 +73,14 @@ mod fenced_non_execution {
     }
 
     impl LinuxXfrmTransport for PreEffectTransport {
-        fn transact(&self, operation: &'static str,
-            class: crate::linux::NetlinkOperationClass, _: &[u8], _: u32,
-            _: LinuxXfrmBackendConfig) -> Result<Option<SensitiveBuffer>, XfrmError>
-        {
+        fn transact(
+            &self,
+            operation: &'static str,
+            class: crate::linux::NetlinkOperationClass,
+            _: &[u8],
+            _: u32,
+            _: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
             self.operations.lock().unwrap().push(operation);
             match class {
                 crate::linux::NetlinkOperationClass::ReadOnly => {
@@ -88,13 +97,18 @@ mod fenced_non_execution {
                 }
             }
         }
-        fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe { XfrmProbe::unsupported() }
+        fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
     }
 
     fn closed_without_effect(
         result: &Result<XfrmObjectRosterRestartOutcome, XfrmObjectRosterDurableError>,
     ) -> bool {
-        matches!(result, Ok(XfrmObjectRosterRestartOutcome::NoMutation { .. }))
+        matches!(
+            result,
+            Ok(XfrmObjectRosterRestartOutcome::NoMutation { .. })
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,16 +119,27 @@ mod fenced_non_execution {
         let group = roster_group(0xB2);
         let generation = roster_generation(37);
         let roster = sa_roster(2);
-        let authority = backend.prepare_durable_object_roster(
-            &store, group, generation, roster.clone()).await.unwrap();
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
         // Retain the original affine authority without polling its run future.
         let fence = close_generation(&backend, &store, group, generation, &roster).await;
         let fenced = closed_without_effect(&fence);
-        let label = match &fence { Ok(outcome) => outcome.as_str(), Err(error) => error.as_str() };
+        let label = match &fence {
+            Ok(outcome) => outcome.as_str(),
+            Err(error) => error.as_str(),
+        };
         let delayed = backend.run_durable_object_roster(authority).await;
-        let effects = transport.operations().iter().filter(|operation| **operation == "install_sa").count();
+        let effects = transport
+            .operations()
+            .iter()
+            .filter(|operation| **operation == "install_sa")
+            .count();
         // Drain/retire the baseline's unsafe late run before the RED assertion.
-        let _ = backend.recover_durable_object_roster(&store, group, generation, &roster).await;
+        let _ = backend
+            .recover_durable_object_roster(&store, group, generation, &roster)
+            .await;
         assert!(fenced && delayed.is_err() && effects == 0,
             "exact closure must precede delayed provider dispatch: fence={label}, late_effects={effects}, refused={}", delayed.is_err());
     }
@@ -130,17 +155,26 @@ mod fenced_non_execution {
         let group = roster_group(0xB4);
         let generation = roster_generation(37);
         let roster = sa_roster(2);
-        let authority = backend.prepare_durable_object_roster(
-            &store, group, generation, roster.clone()).await.unwrap();
-        let run = tokio::spawn({ let backend = backend.clone();
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        let run = tokio::spawn({
+            let backend = backend.clone();
             async move { backend.run_durable_object_roster(authority).await }
         });
         transport.gate.wait_entered().await;
         assert_eq!(transport.effects.load(Ordering::SeqCst), 0);
-        let fence = tokio::time::timeout(Duration::from_secs(2),
-            close_generation(&backend, &store, group, generation, &roster)).await;
+        let fence = tokio::time::timeout(
+            Duration::from_secs(2),
+            close_generation(&backend, &store, group, generation, &roster),
+        )
+        .await;
         let fenced_while_held = fence.as_ref().is_ok_and(closed_without_effect);
-        assert!(!*transport.gate.released.lock().unwrap(), "the fence cannot release the test latch");
+        assert!(
+            !*transport.gate.released.lock().unwrap(),
+            "the fence cannot release the test latch"
+        );
         transport.gate.release();
         let delayed = run.await.unwrap();
         // The baseline's queued recover must finish before inspecting counters.
@@ -155,33 +189,160 @@ mod fenced_non_execution {
         let root = DurableTestRoot::new();
         let transport = PreEffectTransport::new(0);
         let (backend, _, _, store) = bind_with_capacity_and_recovery(
-            LinuxXfrmBackend::with_transport(transport.clone()), 1, None, None,
-            Some((root.path().to_path_buf(), XfrmObjectRosterRecoveryProofKey::new([0xB5; 32]).unwrap())),
-        ).unwrap();
+            LinuxXfrmBackend::with_transport(transport.clone()),
+            1,
+            None,
+            None,
+            Some((
+                root.path().to_path_buf(),
+                XfrmObjectRosterRecoveryProofKey::new([0xB5; 32]).unwrap(),
+            )),
+        )
+        .unwrap();
         let store = store.unwrap();
         let _release = ReleaseOnDrop(Arc::clone(&transport.gate));
         let group = roster_group(0xB6);
         let generation = roster_generation(37);
         let roster = sa_roster(2);
-        let authority = backend.prepare_durable_object_roster(
-            &store, group, generation, roster.clone()).await.unwrap();
-        let blocking_read = tokio::spawn({ let backend = backend.clone();
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        let blocking_read = tokio::spawn({
+            let backend = backend.clone();
             async move { backend.query_sa(query_request()).await }
         });
         transport.gate.wait_entered().await;
-        let queued_run = tokio::spawn({ let backend = backend.clone();
+        let queued_run = tokio::spawn({
+            let backend = backend.clone();
             async move { backend.run_durable_object_roster(authority).await }
         });
         wait_until(|| backend.inner.sender.capacity() == 0).await;
-        let fence = tokio::time::timeout(Duration::from_secs(2),
-            close_generation(&backend, &store, group, generation, &roster)).await;
+        let fence = tokio::time::timeout(
+            Duration::from_secs(2),
+            close_generation(&backend, &store, group, generation, &roster),
+        )
+        .await;
         let fenced_while_queued = fence.as_ref().is_ok_and(closed_without_effect);
         transport.gate.release();
         let _ = blocking_read.await.unwrap();
         let delayed = queued_run.await.unwrap();
         let effects = transport.effects.load(Ordering::SeqCst);
-        let _ = backend.recover_durable_object_roster(&store, group, generation, &roster).await;
+        let _ = backend
+            .recover_durable_object_roster(&store, group, generation, &roster)
+            .await;
         assert!(fenced_while_queued && delayed.is_err() && effects == 0,
             "queue admission is not physical acceptance: fenced_while_queued={fenced_while_queued}, late_effects={effects}, refused={}", delayed.is_err());
+    }
+    /// The object becomes visible before its acknowledgement is released.
+    /// Exact readback remains available after the observer disappears.
+    #[derive(Debug, Clone, Default)]
+    struct AcceptedEffectTransport {
+        gate: Arc<EffectGate>,
+        accepted: Arc<AtomicUsize>,
+        removals: Arc<AtomicUsize>,
+        visible: Arc<AtomicBool>,
+    }
+
+    impl LinuxXfrmTransport for AcceptedEffectTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            class: crate::linux::NetlinkOperationClass,
+            _: &[u8],
+            _: u32,
+            _: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            match class {
+                crate::linux::NetlinkOperationClass::ReadOnly => {
+                    if self.visible.load(Ordering::SeqCst) {
+                        Ok(Some(durable_object_readback_body(&roster_sa_request(0))))
+                    } else {
+                        Err(XfrmError::NotFound)
+                    }
+                }
+                crate::linux::NetlinkOperationClass::Mutation => {
+                    match operation {
+                        "install_sa" => {
+                            self.visible.store(true, Ordering::SeqCst);
+                            self.accepted.fetch_add(1, Ordering::SeqCst);
+                            self.gate.hold();
+                        }
+                        "remove_sa" => {
+                            self.removals.fetch_add(1, Ordering::SeqCst);
+                            self.visible.store(false, Ordering::SeqCst);
+                        }
+                        _ => panic!("unexpected synthetic transport mutation"),
+                    }
+                    Ok(None)
+                }
+            }
+        }
+
+        fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fenced_non_execution_joins_accepted_work_without_granting_compensation() {
+        let root = DurableTestRoot::new();
+        let transport = AcceptedEffectTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xC1);
+        let _release = ReleaseOnDrop(Arc::clone(&transport.gate));
+        let group = roster_group(0xC2);
+        let generation = roster_generation(37);
+        let roster = sa_roster(1);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        let observer = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                backend
+                    .detector_cut_roster_issuing_at_member(authority, 0, true)
+                    .await
+            }
+        });
+        transport.gate.wait_entered().await;
+        assert_eq!(transport.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            durable_object_roster_phase(&store, group, generation, &roster),
+            Ok(XfrmObjectRosterDurablePhase::Issuing)
+        );
+        // Lose the outer acknowledgement while the physically accepted work
+        // remains owned by the actor. Cancellation cannot prove non-execution.
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        let pending = tokio::time::timeout(
+            Duration::from_secs(2),
+            close_generation(&backend, &store, group, generation, &roster),
+        )
+        .await;
+        assert!(
+            !pending.as_ref().is_ok_and(closed_without_effect),
+            "an accepted, unquiesced effect cannot produce a negative receipt"
+        );
+        assert_eq!(transport.removals.load(Ordering::SeqCst), 0);
+        transport.gate.release();
+        // Drain accepted work and any retained closure after caller timeout.
+        let _ = backend.query_sa(query_request()).await;
+        let observed = close_generation(&backend, &store, group, generation, &roster).await;
+        assert!(
+            !closed_without_effect(&observed),
+            "a lost acknowledgement must never relabel accepted work as never-started"
+        );
+        assert_eq!(
+            transport.accepted.load(Ordering::SeqCst),
+            1,
+            "reconciliation must not replay the effect"
+        );
+        assert_eq!(transport.removals.load(Ordering::SeqCst), 0,
+            "closure alone cannot compensate an accepted object; complete abort authority is absent");
+        assert!(
+            transport.visible.load(Ordering::SeqCst),
+            "the accepted object remains available for normal exact adoption"
+        );
     }
 }
