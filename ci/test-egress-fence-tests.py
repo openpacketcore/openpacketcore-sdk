@@ -17,7 +17,7 @@ SPEC.loader.exec_module(FENCE)
 
 def fixture():
     rows = []
-    for name in FENCE.SPECIAL:
+    for name in FENCE.ISOLATED_TESTS:
         integration = name in FENCE.ISOLATED_INTEGRATION
         rows.append({"package": "opc-session-store",
                      "target": "consensus_openraft" if integration else "opc_session_store",
@@ -38,9 +38,82 @@ def fixture():
     return rows
 
 
+def ordinary(commands):
+    return next(command for command in commands if command["name"] == "ordinary")
+
+
 def skips(command):
     argv = command["argv"]
     return {argv[i + 1] for i, value in enumerate(argv) if value == "--skip"}
+
+
+class ScopePayloadSerialPhaseTests(unittest.TestCase):
+    NAME = (
+        "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
+        "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history"
+    )
+
+    def rows(self):
+        return [row for row in fixture() if row["name"] != self.NAME] + [
+            {"package": "opc-session-store", "target": "opc_session_store",
+             "kind": ["lib"], "name": self.NAME, "ignored": False, "shard": 1},
+        ]
+
+    def test_serial_phase_runs_first_once_and_preserves_original_selection(self):
+        plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+        self.assertEqual(plans[1][0], {"name": self.NAME, "env": {}, "argv": [
+            "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
+            "--test-threads=1", "--nocapture", "--exact", self.NAME,
+        ]})
+        exact = [(shard, command) for shard, plan in plans.items()
+                 for command in plan if command["name"] == self.NAME]
+        self.assertEqual(exact, [(1, plans[1][0])])
+        self.assertEqual(plans[1][1]["name"], "ordinary")
+        for shard in FENCE.ORDINARY_SHARDS:
+            ordinary = next(c for c in plans[shard] if c["name"] == "ordinary")
+            self.assertIn("--exact", ordinary["argv"])
+            self.assertEqual(ordinary["argv"].count(self.NAME), 1)
+            self.assertIn(self.NAME, skips(ordinary))
+        FENCE.verify_plans(plans)
+
+    def test_missing_ignored_duplicate_or_wrong_harness_fails(self):
+        for mutation in ("missing", "ignored", "duplicate", "target", "package", "kind"):
+            rows = self.rows()
+            if mutation == "missing":
+                rows.pop()
+            elif mutation == "duplicate":
+                rows.append(dict(rows[-1], package="another-package"))
+            elif mutation == "ignored":
+                rows[-1]["ignored"] = True
+            else:
+                rows[-1][mutation] = ["test"] if mutation == "kind" else "other"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                FENCE.verify(rows)
+
+    def test_missing_duplicate_late_or_overlapping_serial_commands_fail(self):
+        for mutation in ("missing", "duplicate", "renamed-duplicate", "late", "overlap", "threads", "profile"):
+            plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+            if mutation == "missing":
+                plans[1].pop(0)
+            elif mutation == "duplicate":
+                plans[1].insert(0, copy.deepcopy(plans[1][0]))
+            elif mutation == "renamed-duplicate":
+                duplicate = copy.deepcopy(plans[1][0])
+                duplicate["name"] = "another-command"
+                plans[0].append(duplicate)
+            elif mutation == "late":
+                plans[1][0], plans[1][1] = plans[1][1], plans[1][0]
+            elif mutation == "overlap":
+                argv = plans[1][1]["argv"]
+                index = argv.index(self.NAME)
+                del argv[index - 1:index + 1]
+            elif mutation == "threads":
+                argv = plans[1][0]["argv"]
+                argv[argv.index("--test-threads=1")] = "--test-threads=4"
+            else:
+                plans[1][0]["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] = "1"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                FENCE.verify_plans(plans)
 
 
 class PartitionTests(unittest.TestCase):
@@ -49,24 +122,24 @@ class PartitionTests(unittest.TestCase):
         plans = {shard: FENCE.plans(rows, shard) for shard in FENCE.SHARDS}
         for row in rows:
             with self.subTest(name=row["name"], target=row["target"]):
-                ordinary = [i for i in FENCE.ORDINARY_SHARDS if row["name"] not in skips(plans[i][0])]
+                ordinary_owners = [i for i in FENCE.ORDINARY_SHARDS if row["name"] not in skips(ordinary(plans[i]))]
                 isolated = [i for i, plan in plans.items()
                             if any(c["name"] == row["name"] for c in plan)]
-                self.assertEqual(ordinary + isolated, [row["shard"]])
+                self.assertEqual(ordinary_owners + isolated, [row["shard"]])
 
     def test_new_tests_and_same_prefix_siblings_are_included(self):
         rows = fixture()
-        for prefix in [FENCE.OPTIMIZED_LIB[0], "new_module"]:
+        for prefix in [FENCE.OPTIMIZED_LIB[0], FENCE.SERIAL_LIB_TEST, "new_module"]:
             name = prefix + "::new_test"
             row = dict(rows[-1], name=name, shard=FENCE.owner(name))
             rows.append(row)
-            self.assertNotIn(name, skips(FENCE.plans(rows, row["shard"])[0]))
+            self.assertNotIn(name, skips(ordinary(FENCE.plans(rows, row["shard"]))))
             for shard in set(FENCE.ORDINARY_SHARDS) - {row["shard"]}:
-                self.assertIn(name, skips(FENCE.plans(rows, shard)[0]))
+                self.assertIn(name, skips(ordinary(FENCE.plans(rows, shard))))
 
     def test_every_ordinary_shard_keeps_feature_unification_and_exact_skips(self):
         for shard in FENCE.ORDINARY_SHARDS:
-            command = FENCE.plans(fixture(), shard)[0]
+            command = ordinary(FENCE.plans(fixture(), shard))
             argv = command["argv"]
             self.assertEqual(argv[:2 + len(FENCE.SELECTION)], ["cargo", "test", *FENCE.SELECTION])
             self.assertIn("--tests", argv)

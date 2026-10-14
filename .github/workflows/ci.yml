@@ -869,6 +869,10 @@ jobs:
         with:
           shared-key: ${{ matrix.cache_key }}
 
+      - name: Verify future i686 test target coverage
+        if: matrix.slice == 'ordinary-integration'
+        run: python3 ci/test-i686-target-selection.py
+
       - name: Run opc-session-net tests on i686
         # The stateless three-voter consumer proofs retain literal authority
         # and snapshot budgets. Run every functional test exactly once,
@@ -913,14 +917,15 @@ jobs:
                 "${skips[@]}"
               ;;
             ordinary-integration)
-              # The wildcard includes every registered integration binary,
-              # including future additions. Target selection omits doctests,
+              # Include executable unit tests and every registered integration
+              # binary, including future additions. Selection omits doctests,
               # so retain them explicitly in the same shard.
               cargo test --locked \
                 -p opc-session-net \
                 --all-features \
                 --target i686-unknown-linux-gnu \
                 --quiet \
+                --bins \
                 --test '*' \
                 -- \
                 --test-threads=1

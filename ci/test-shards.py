@@ -59,6 +59,13 @@ SELECTION = ["cargo", "test", *PACKAGES, "--quiet"]
 EXAMPLES = ["cargo", "build", *PACKAGES, "--quiet", "--examples"]
 HARNESS = ["--test-threads=4"]
 
+# Run before any parallel tests on misc, with the same package/features/profile.
+# The operation and all-voter apply deadlines remain unchanged in the test.
+SERIAL_LIB_TESTS = (
+    "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
+    "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history",
+)
+
 # These tests intentionally prove literal authority or operation budgets.
 # Running them beside unrelated Tokio runtimes makes the assertion measure
 # process scheduling and fixture teardown instead of the request path. Keep
@@ -239,9 +246,20 @@ def manifest_test_source_errors(
     return errors
 
 
+def i686_test_target_errors(packages: list[dict]) -> list[str]:
+    """Reject test target kinds the required i686 selectors do not cover."""
+    return [
+        f"i686 test target {package['name']}:{target['name']} has uncovered "
+        f"kind {target['kind']!r}; assign it to a required shard"
+        for package in packages if package["name"] == "opc-session-net"
+        for target in package["targets"]
+        if target.get("test", True) and target["kind"] not in (["lib"], ["bin"], ["test"])
+    ]
+
+
 def verify_manifest_test_sources(packages: list[dict]) -> None:
     """Fail closed if a direct integration source cannot reach any shard."""
-    errors = manifest_test_source_errors(packages)
+    errors = manifest_test_source_errors(packages) + i686_test_target_errors(packages)
     if errors:
         sys.exit("\n".join(errors))
     print(
@@ -365,8 +383,16 @@ def lib_group_names(group: dict) -> list[str]:
 
 
 def moved_lib_names(plan: dict) -> list[str]:
-    return [qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS] + [
+    return [*SERIAL_LIB_TESTS, *(
+        qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS
+    )] + [
         name for group in plan.get("lib_groups", []) for name in lib_group_names(group)
+    ]
+
+
+def serial_lib_command(name: str) -> list[str]:
+    return SELECTION + [
+        "--lib", "--", "--test-threads=1", "--nocapture", "--exact", name,
     ]
 
 
@@ -434,6 +460,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
             for arg in ("--skip", name)
         ]
         return [
+            *(serial_lib_command(name) for name in SERIAL_LIB_TESTS),
             SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_skips],
             *extra,
             # Library names must never filter a binary's unrelated tests.
@@ -558,6 +585,11 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     if len(set(qualification)) != len(qualification) or set(qualification) & set(named):
         sys.exit("qualification names are duplicated or also assigned to a required shard")
     misc_commands = commands(plan, "misc", targets)
+    serial = [serial_lib_command(name) for name in SERIAL_LIB_TESTS]
+    if misc_commands[:len(serial)] != serial:
+        sys.exit("misc must run its exact serial library phase before parallel tests")
+    ordinary_index = len(serial)
+    ordinary = misc_commands[ordinary_index]
     heavy_remainder = SELECTION + [
         "--test", plan["heavy"]["target"], "--", *HARNESS, "--exact",
         *[arg for name in [*named, *qualification] for arg in ("--skip", name)],
@@ -584,7 +616,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         for name in moved_lib_names(plan)
         for arg in ("--skip", name)
     ]
-    if misc_commands[0][-len(lib_skip) :] != lib_skip:
+    if ordinary[-len(lib_skip) :] != lib_skip:
         sys.exit(
             "the misc ordinary --lib process must skip every private-lib "
             "timing contract and moved library test exactly once"
@@ -593,7 +625,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         quiescent_lib_command(name)
         for name in quiescent_lib_tests_for_shard("misc", plan)
     ]
-    if misc_commands[1 : 1 + len(expected_misc_isolated)] != expected_misc_isolated:
+    if misc_commands[ordinary_index + 1 : ordinary_index + 1 + len(expected_misc_isolated)] != expected_misc_isolated:
         sys.exit(
             "the misc shard must run its private-lib timing contracts once each, "
             "in their declared module-qualified name order"
@@ -612,9 +644,10 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         actual = commands(plan, shard, targets)
         library_commands = [
             command for command in actual
-            if "--lib" in command and command != misc_commands[0]
+            if "--lib" in command and command != ordinary
         ]
-        if library_commands != extra_lib_commands(plan, shard):
+        expected = (serial if shard == "misc" else []) + extra_lib_commands(plan, shard)
+        if library_commands != expected:
             sys.exit(f"{shard} must run every assigned library group exactly once")
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
@@ -683,6 +716,8 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
 
 def verify_lib_plan(plan: dict) -> None:
     """Keep exact library filters disjoint and timing profiles unchanged."""
+    if len(SERIAL_LIB_TESTS) != len(set(SERIAL_LIB_TESTS)):
+        sys.exit("serial library tests are duplicated")
     ordinary_shards = set(shard_ids(plan)) - {"misc", OPTIMIZED_QUIESCENT_SHARD}
     overrides = plan.get("quiescent_lib_shards", {})
     for name, shard in overrides.items():
@@ -691,6 +726,9 @@ def verify_lib_plan(plan: dict) -> None:
         if shard not in ordinary_shards:
             sys.exit(f"invalid ordinary timing-contract shard: {shard!r}")
     claimed = {qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS}
+    if claimed & set(SERIAL_LIB_TESTS):
+        sys.exit("serial library test also belongs to an isolated timing contract")
+    claimed.update(SERIAL_LIB_TESTS)
     rust_path = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*")
     for group in plan.get("lib_groups", []):
         if group["shard"] not in ordinary_shards:
@@ -799,6 +837,27 @@ def list_quiescent_lib_test(name: str) -> list[str]:
     ]
 
 
+def verify_serial_lib_tests() -> None:
+    """A renamed, ignored or ambiguous filter must never pass as a no-op."""
+    for name in SERIAL_LIB_TESTS:
+        inventories = []
+        for flags in ([], ["--ignored"]):
+            output = subprocess.run(
+                serial_lib_command(name) + ["--list", *flags],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True,
+            ).stdout
+            inventories.append([
+                line.rsplit(":", 1)[0] for line in output.splitlines()
+                if line.endswith(": test")
+            ])
+        selected, ignored = inventories
+        if selected != [name]:
+            sys.exit(f"serial library test must resolve exactly once: {name!r}, got {selected!r}")
+        if ignored:
+            sys.exit(f"serial library test must not be ignored: {name!r}")
+    print(f"serial library tests resolve exactly once and remain enabled: {len(SERIAL_LIB_TESTS)}")
+
+
 def precheck(plan: dict, shard: str) -> None:
     """Fail a heavy shard whose named tests no longer resolve.
 
@@ -817,6 +876,7 @@ def precheck(plan: dict, shard: str) -> None:
         # Run before the suite: a stale exclusion must fail even if another
         # required test would stop the shard before its final partition audit.
         verify_heavy(plan)
+        verify_serial_lib_tests()
     groups = [group for group in plan.get("lib_groups", []) if group["shard"] == shard]
     if groups:
         # Resolve all groups in one Cargo invocation. Keep a multiset: a

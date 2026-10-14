@@ -53,10 +53,17 @@ OPTIMIZED_LIB = (
     "sqlite::consensus::tests::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression",
 )
 SPECIAL = (*ISOLATED_LIB, *ISOLATED_INTEGRATION, *OPTIMIZED_LIB)
+SERIAL_LIB_TEST = (
+    "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
+    "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history"
+)
+ISOLATED_TESTS = (*SPECIAL, SERIAL_LIB_TEST)
 
 
 def owner(name: str) -> int:
     """The same name in two harnesses must have the same owner: skips are global."""
+    if name == SERIAL_LIB_TEST:
+        return 1
     if name in SPECIAL:
         return PROOF_SHARD
     return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % len(ORDINARY_SHARDS)
@@ -126,7 +133,7 @@ def verify(rows: list[dict]) -> None:
     identities = [(r["package"], r["target"], tuple(r["kind"]), r["name"]) for r in rows]
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate test identity")
-    for name in SPECIAL:
+    for name in ISOLATED_TESTS:
         matches = [r for r in rows if r["name"] == name]
         target = "consensus_openraft" if name in ISOLATED_INTEGRATION else "opc_session_store"
         kind = ["test"] if name in ISOLATED_INTEGRATION else ["lib"]
@@ -137,8 +144,16 @@ def verify(rows: list[dict]) -> None:
         if row["shard"] != owner(row["name"]):
             raise ValueError("test assigned to the wrong shard")
     for shard in ORDINARY_SHARDS:
-        if not any(r["shard"] == shard and not r["ignored"] and r["name"] not in SPECIAL for r in rows):
+        if not any(r["shard"] == shard and not r["ignored"] and r["name"] not in ISOLATED_TESTS for r in rows):
             raise ValueError("empty ordinary shard")
+
+
+def serial_lib_command() -> dict:
+    # Preserve the ordinary six-package feature unification and test profile.
+    return {"name": SERIAL_LIB_TEST, "env": {}, "argv": [
+        "cargo", "test", *SELECTION, "--quiet", "--lib", "--",
+        "--test-threads=1", "--nocapture", "--exact", SERIAL_LIB_TEST,
+    ]}
 
 
 def plans(rows: list[dict], shard: int) -> list[dict]:
@@ -146,8 +161,10 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
         raise ValueError("unknown shard")
     verify(rows)
     commands = []
+    if shard == 1:
+        commands.append(serial_lib_command())
     if shard in ORDINARY_SHARDS:
-        skipped = sorted({r["name"] for r in rows if r["name"] in SPECIAL or r["shard"] != shard})
+        skipped = sorted({r["name"] for r in rows if r["name"] in ISOLATED_TESTS or r["shard"] != shard})
         commands.append({"name": "ordinary", "env": {}, "argv": [
             "cargo", "test", *SELECTION, "--quiet", "--tests", "--", "--test-threads=4",
             "--exact", *[arg for name in skipped for arg in ("--skip", name)],
@@ -182,6 +199,40 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
     return commands
 
 
+def verify_plans(planned: dict[int, list[dict]]) -> None:
+    """The required serial phase must precede, and not overlap, ordinary tests."""
+    if set(planned) != set(SHARDS):
+        raise ValueError("missing or unexpected test shard")
+    isolated = [(shard, index, command) for shard, commands in planned.items()
+                for index, command in enumerate(commands) if command["name"] == SERIAL_LIB_TEST]
+    if isolated != [(1, 0, serial_lib_command())]:
+        raise ValueError("serial library test must run exactly once, first on shard 1")
+    selections = []
+    for shard, commands in planned.items():
+        for index, command in enumerate(commands):
+            argv = command["argv"]
+            if not ({"--lib", "--tests"} & set(argv)):
+                continue
+            harness = argv[argv.index("--") + 1:]
+            skips = [harness[i + 1] for i, arg in enumerate(harness[:-1]) if arg == "--skip"]
+            filters = [arg for i, arg in enumerate(harness)
+                       if not arg.startswith("--") and (i == 0 or harness[i - 1] != "--skip")]
+            def matches(value: str) -> bool:
+                return value == SERIAL_LIB_TEST if "--exact" in harness else value in SERIAL_LIB_TEST
+            if (not filters or any(matches(value) for value in filters)) and not any(matches(value) for value in skips):
+                selections.append((shard, index))
+    if selections != [(1, 0)]:
+        raise ValueError("serial library test selections are missing or overlapping")
+    for shard in ORDINARY_SHARDS:
+        ordinary = [c for c in planned[shard] if c["name"] == "ordinary"]
+        if len(ordinary) != 1:
+            raise ValueError("ordinary test command must run exactly once per shard")
+        argv = ordinary[0]["argv"]
+        skips = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--skip"]
+        if "--exact" not in argv or skips.count(SERIAL_LIB_TEST) != 1:
+            raise ValueError("ordinary tests must exclude exactly the serial library test")
+
+
 def require_jobs(needs: dict) -> None:
     if set(needs) != {"changes", *REQUIRED_JOBS}:
         raise ValueError("missing or unexpected qualification job")
@@ -208,6 +259,7 @@ def main() -> int:
         parser.error("--output and either --shard or --inventory-only are required")
     rows = inventory()
     plan = {str(shard): plans(rows, shard) for shard in SHARDS}
+    verify_plans({int(shard): commands for shard, commands in plan.items()})
     report = {"head": capture(["git", "rev-parse", "HEAD"]).strip(), "tests": rows,
               "ordinary_selection": SELECTION, "plans": plan,
               "isolated_proofs_shard": PROOF_SHARD,

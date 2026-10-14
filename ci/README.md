@@ -6,6 +6,22 @@ shards in [ci.yml](../.github/workflows/ci.yml). Use
 to reproduce the shards with the profile and disk setup in
 [CONTRIBUTING](../CONTRIBUTING.md#validation-gates).
 
+The scope-payload decode regression runs first in a fresh serial process on
+`misc` and egress shard `1`, followed by each runner's parallel suite. Exact
+exclusions prevent duplicate execution. Live inventories reject a missing,
+ignored or ambiguous test, and command-plan checks preserve its serial position,
+package selection, features and profile. Its four Tokio workers, decode/history
+assertions and both ten-second timeouts are unchanged. Successful runs print each
+write's elapsed time and decode/audit counts for hosted validation.
+
+The required i686 matrix separates session-net library tests from executable
+unit tests, integration tests and doctests. The integration runner exercises the
+workflow selectors against a fixture with a newly discovered executable and a
+new integration target. The required manifest audit rejects other test-enabled
+target kinds until a shard explicitly covers them; future targets cannot silently
+fall outside the split. Both ordinary shards and the isolated contracts remain
+required by the same aggregate.
+
 ## Secret scan scope
 
 The [security workflow](../.github/workflows/security.yml) scans a pull request's
