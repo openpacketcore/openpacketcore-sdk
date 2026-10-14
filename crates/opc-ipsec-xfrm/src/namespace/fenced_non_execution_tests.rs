@@ -683,9 +683,61 @@ mod fenced_non_execution {
                 .count(),
             2
         );
-        assert!(!transport
-            .operations()
-            .iter()
-            .any(|operation| *operation == "remove_sa"));
+        assert!(!transport.operations().contains(&"remove_sa"));
+    }
+    #[tokio::test]
+    async fn fenced_non_execution_rejects_substituted_roster_and_store_before_any_io() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xF1);
+        let group = roster_group(0xF2);
+        let generation = roster_generation(37);
+        let roster = sa_roster(2);
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            close_generation(&backend, &store, group, generation, &policy_roster(2))
+                .await
+                .unwrap_err(),
+            XfrmObjectRosterDurableError::WrongBinding
+        );
+        let other_root = DurableTestRoot::new();
+        let (other_actor, other_store) =
+            bind_with_roster_recovery(transport.clone(), &other_root, 0xF3);
+        assert_eq!(
+            close_generation(&backend, &other_store, group, generation, &roster)
+                .await
+                .unwrap_err(),
+            XfrmObjectRosterDurableError::WrongBinding
+        );
+        assert!(transport.operations().is_empty());
+        assert!(closed_without_effect(
+            &close_generation(&backend, &store, group, generation, &roster).await
+        ));
+        // A refused substituted request cannot poison an independent binding.
+        let independent = other_actor
+            .prepare_durable_object_roster(&other_store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            other_actor
+                .run_durable_object_roster(independent)
+                .await
+                .unwrap()
+                .as_str(),
+            "applied"
+        );
+        assert_eq!(
+            transport
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            2
+        );
     }
 }
