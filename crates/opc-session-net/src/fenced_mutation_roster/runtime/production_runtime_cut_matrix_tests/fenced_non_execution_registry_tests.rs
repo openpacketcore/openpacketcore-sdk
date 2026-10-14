@@ -101,3 +101,64 @@ async fn fenced_non_execution_reconcile_revokes_stale_sdk_execution_for_all_memb
     assert_eq!(backend.admission_calls().len(), 1);
     assert_eq!(backend.terminal_calls().len(), 1);
 }
+
+#[tokio::test]
+async fn fenced_non_execution_successor_rebuilds_identical_terminal_after_lost_closure_reply() {
+    let request = request_with_members(2);
+    let provider = Arc::new(ClosureProbeProvider {
+        prepares: AtomicUsize::new(0),
+        executions: AtomicUsize::new(0),
+        close_unknown: false,
+    });
+    let backend = Arc::new(CutBackend::default());
+    let first = closure_executor(Arc::clone(&provider), Arc::clone(&backend));
+    let _stale = first.register(request.clone()).await.unwrap();
+    let current = recovered(first.admission_status(request.clone()).await.unwrap());
+    // The caller never consumes this first signed closure response.
+    let _ = first.reconcile_member(&current, 0).await.unwrap();
+    let repeated = recovered(first.admission_status(request.clone()).await.unwrap());
+    let first_proofs = vec![
+        conclusive(first.reconcile_member(&repeated, 0).await.unwrap()),
+        conclusive(first.reconcile_member(&repeated, 1).await.unwrap()),
+    ];
+    let evidence = first_proofs
+        .iter()
+        .map(|proof| proof.evidence_commitment)
+        .collect::<Vec<_>>();
+    let prepared = first
+        .prepare_terminal(&repeated, first_proofs)
+        .await
+        .unwrap();
+    let recovery = successor(&request, (1_u64 << 40) + 1);
+    backend.install_successor_authority(recovery.authority().clone());
+    let second = closure_executor(Arc::clone(&provider), Arc::clone(&backend));
+    let recovered = recovered(second.recover(recovery).await.unwrap());
+    let successor_proofs = vec![
+        conclusive(second.reconcile_member(&recovered, 0).await.unwrap()),
+        conclusive(second.reconcile_member(&recovered, 1).await.unwrap()),
+    ];
+    assert_eq!(
+        successor_proofs
+            .iter()
+            .map(|proof| proof.evidence_commitment)
+            .collect::<Vec<_>>(),
+        evidence
+    );
+    let rebuilt = second
+        .prepare_terminal(&recovered, successor_proofs)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.body.commitment(), prepared.body.commitment());
+    backend.lose_next_terminal_reply();
+    assert!(matches!(
+        second.terminalize(&recovered, &rebuilt).await,
+        Err(ExecutorError::TerminalizeOutcomeUnknown)
+    ));
+    match second.terminal_status(&recovered, &rebuilt).await.unwrap() {
+        TerminalStatusResult::Recorded(receipt) => assert_eq!(receipt.phase(), Phase::Aborted),
+        _ => panic!("lost terminal reply must retain the exact Aborted body"),
+    }
+    assert_eq!(provider.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.admission_calls().len(), 1);
+    assert_eq!(backend.terminal_calls().len(), 1);
+}

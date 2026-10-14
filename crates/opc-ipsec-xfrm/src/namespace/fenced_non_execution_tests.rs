@@ -1,5 +1,6 @@
 mod fenced_non_execution {
     use super::*;
+    use crate::XfrmObjectRosterMemberPhase;
 
     // Baseline composition seam. During implementation this one call is wired
     // to the proposed close-and-observe actor API. It must never synthesize
@@ -521,5 +522,170 @@ mod fenced_non_execution {
             "unavailable readback grants no mutation authority"
         );
         assert!(store.has_unresolved_writer_authority().unwrap());
+    }
+    #[tokio::test]
+    async fn fenced_non_execution_survives_terminal_pruning_and_unrelated_preparation() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xE1);
+        let group = roster_group(0xE2);
+        let generation = roster_generation(37);
+        let roster = sa_roster(2);
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                .await
+                .unwrap(),
+        );
+        // Simulate a lost closure reply: wait for publication, discard its body.
+        let _lost = close_generation(&backend, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        let repeated = close_generation(&backend, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(repeated
+            .members()
+            .iter()
+            .all(|member| member.member_phase() == XfrmObjectRosterMemberPhase::Pending));
+        let unrelated = backend
+            .prepare_durable_object_roster(&store, roster_group(0xE3), generation, policy_roster(2))
+            .await
+            .unwrap();
+        // Preparing the independent binding exercises normal terminal pruning.
+        let replay = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await;
+        let excluded = replay.is_err();
+        drop(replay);
+        drop(unrelated);
+        assert!(
+            excluded,
+            "a closed binding became executable again after its terminal record was pruned"
+        );
+        let after_prune = close_generation(&backend, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(after_prune
+            .members()
+            .iter()
+            .all(|member| member.member_phase() == XfrmObjectRosterMemberPhase::Pending));
+        assert!(transport.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_closed_binding_survives_real_store_reopen_and_empty_reset() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xE4);
+        let binding = backend.network_namespace_binding().durable_bytes().unwrap();
+        let group = roster_group(0xE5);
+        let generation = roster_generation(37);
+        let roster = sa_roster(2);
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                .await
+                .unwrap(),
+        );
+        assert!(closed_without_effect(
+            &close_generation(&backend, &store, group, generation, &roster).await
+        ));
+        // No effect was ever submitted: the namespace-empty precondition is
+        // proved by this transport's complete log, not guessed from a missing file.
+        assert!(transport.operations().is_empty());
+        store.reset_after_namespace_empty().unwrap();
+        drop(store);
+        drop(backend);
+        // Waiting for the lease release also joins the old actor's ownership.
+        wait_until(|| {
+            XfrmObjectRosterRecoveryStore::open_bound(
+                root.path(),
+                XfrmObjectRosterRecoveryProofKey::new([0xE4; 32]).unwrap(),
+                binding,
+            )
+            .is_ok()
+        })
+        .await;
+        let (reopened, store) = bind_with_roster_recovery(transport.clone(), &root, 0xE4);
+        let replay = reopened
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await;
+        let excluded = replay.is_err();
+        drop(replay);
+        assert!(
+            excluded,
+            "store reopen after empty reset forgot execution closure for the exact binding"
+        );
+        let recovered = close_generation(&reopened, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(recovered
+            .members()
+            .iter()
+            .all(|member| member.member_phase() == XfrmObjectRosterMemberPhase::Pending));
+        assert!(transport.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_never_calls_pruned_applied_history_never_started() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xE6);
+        let group = roster_group(0xE7);
+        let generation = roster_generation(37);
+        let roster = sa_roster(2);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .run_durable_object_roster(authority)
+                .await
+                .unwrap()
+                .as_str(),
+            "applied"
+        );
+        assert_eq!(
+            backend
+                .finalize_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
+        drop(
+            backend
+                .prepare_durable_object_roster(
+                    &store,
+                    roster_group(0xE8),
+                    generation,
+                    policy_roster(2),
+                )
+                .await
+                .unwrap(),
+        );
+        let observed = close_generation(&backend, &store, group, generation, &roster).await;
+        assert!(
+            !closed_without_effect(&observed),
+            "pruned Applied history cannot become non-execution evidence"
+        );
+        assert!(
+            observed.is_ok(),
+            "immutable applied disposition must survive normal pruning; observed={observed:?}"
+        );
+        assert_eq!(observed.unwrap().as_str(), "committed");
+        assert_eq!(
+            transport
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            2
+        );
+        assert!(!transport
+            .operations()
+            .iter()
+            .any(|operation| *operation == "remove_sa"));
     }
 }
