@@ -2179,3 +2179,42 @@ async fn subtree_content_default_limits_populated_config_and_state_over_100_entr
         assert_eq!(policy_calls, 1);
     }
 }
+
+#[tokio::test]
+async fn subtree_content_default_limits_scale_matrix() {
+    let mut failures = Vec::new();
+    for provider_values in [100u16, 1024] {
+        let (model, _) = populated_peers(100);
+        let (_, values) = populated_peers(provider_values);
+        let fixture = Fixture::new(model, &[]).await;
+        *fixture.access.values.lock().unwrap() = values;
+        fixture.access.filter_response.store(1, Ordering::SeqCst);
+        for op in ["get-config", "get", "get-data"] {
+            let operational = op != "get-config";
+            for (name, filter, rows, labels, credentials, up, provider_calls) in [
+                ("key", "<peer><site>s</site><id>49</id></peer>", 1, 1, 1, usize::from(operational), usize::from(operational)),
+                ("config", "<peer><enabled>true</enabled><label/><credential/></peer>", 100, 100, 100, 0, 0),
+                ("selected-state", "<peer><enabled>true</enabled><up/></peer>", 100, 0, 0, if operational { 100 } else { 0 }, usize::from(operational)),
+                ("whole-state", "<peer><up>true</up></peer>", if operational { usize::from(provider_values) } else { 0 }, if operational { 100 } else { 0 }, if operational { 100 } else { 0 }, if operational { usize::from(provider_values) } else { 0 }, usize::from(operational)),
+                ("overlap", "<peer><site>s</site><label/></peer><peer><up>true</up><up/></peer>", if operational { usize::from(provider_values) } else { 100 }, 100, 0, if operational { usize::from(provider_values) } else { 0 }, usize::from(operational)),
+                ("no-match", "<peer><up>false</up><label/></peer>", 0, 0, 0, 0, usize::from(operational)),
+            ] {
+                let reply = fixture.rpc(&request(op, filter, ""), MgmtLimits::default()).await;
+                if reply.contains("<rpc-error>") {
+                    failures.push(format!("{op} {name}, 100 config rows / {provider_values} provider values: {reply}"));
+                    continue;
+                }
+                assert_eq!(data(&reply).matches("<ex:peer>").count(), rows, "{op} {name}, {provider_values}");
+                assert_eq!(tags(&reply, "label").len(), labels, "{op} {name}");
+                assert_eq!(tags(&reply, "credential"), vec!["&lt;redacted&gt;"; credentials], "{op} {name}");
+                assert_eq!(tags(&reply, "up"), vec!["true"; up], "{op} {name}");
+                assert_eq!(tags(&reply, "site"), vec!["s"; rows], "{op} {name}");
+                assert_eq!(tags(&reply, "id").iter().collect::<std::collections::BTreeSet<_>>().len(), rows, "{op} {name}");
+                assert!(!reply.contains("secret"));
+                assert_eq!(fixture.access.provider.load(Ordering::SeqCst), provider_calls, "{op} {name}");
+                assert_eq!(fixture.policy_calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "default-limit scale failures: {failures:?}");
+}
