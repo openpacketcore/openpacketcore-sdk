@@ -625,3 +625,102 @@ async fn hidden_config_change_does_not_end_stream_before_revocation_acknowledgem
     assert_eq!(error.message(), "gNMI service unavailable");
     assert!(stream.next().await.is_none());
 }
+
+#[tokio::test]
+async fn hidden_config_refresh_failure_waits_for_acknowledgement() {
+    let policy = Arc::new(ChangingContext::new());
+    *policy.policy.lock().unwrap() = selected_policy(
+        &["/sys:system", "/sys:system/sys:hostname"],
+        NacmAction::Subscribe,
+    );
+    let service = config_service(policy.clone(), Arc::new(RenderProbe::default())).await;
+    let mut stream = service
+        .subscribe(open_subscribe_request(list(
+            gnmi::subscription_list::Mode::Stream,
+            gnmi::SubscriptionMode::OnChange,
+            true,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    expect_value(&mut stream, "/sys:system/sys:hostname", "amf-1").await;
+    expect_sync(&mut stream).await;
+    let pending = policy
+        .hub
+        .prepare_change(|| {
+            policy.invalid.store(true, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+    commit(&service, None, "first-hidden-key-marker").await;
+    tokio::time::timeout(Duration::from_secs(5), policy.wait_calls(2))
+        .await
+        .expect("the hidden config change reaches snapshot authorization");
+    // A second resolution proves the first data-path snapshot completed while
+    // the control notification was still held, without relying on a sleep.
+    commit(&service, None, "second-hidden-key-marker").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            response = stream.next() => panic!(
+                "hidden config activity must not emit or terminate before acknowledgement: {response:?}"
+            ),
+            _ = policy.wait_calls(3) => {},
+        }
+    })
+    .await
+    .expect("the pending invalidation leaves the config stream running");
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            stream.as_mut().poll_next(cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), pending.complete())
+            .await
+            .expect("control acknowledges the invalidation independently")
+            .unwrap(),
+        1
+    );
+    let terminal =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(stream.as_mut().poll_next(cx))).await;
+    let std::task::Poll::Ready(Some(Err(error))) = terminal else {
+        panic!("termination must be ready at acknowledgement")
+    };
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(error.message(), "gNMI service unavailable");
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn hidden_config_refresh_failure_without_pending_reevaluation_ends_stream() {
+    let policy = Arc::new(ChangingContext::new());
+    *policy.policy.lock().unwrap() = selected_policy(
+        &["/sys:system", "/sys:system/sys:hostname"],
+        NacmAction::Subscribe,
+    );
+    let service = config_service(policy.clone(), Arc::new(RenderProbe::default())).await;
+    let mut stream = service
+        .subscribe(open_subscribe_request(list(
+            gnmi::subscription_list::Mode::Stream,
+            gnmi::SubscriptionMode::OnChange,
+            true,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    expect_value(&mut stream, "/sys:system/sys:hostname", "amf-1").await;
+    expect_sync(&mut stream).await;
+
+    policy.invalid.store(true, Ordering::SeqCst);
+    commit(&service, None, "hidden-key-marker").await;
+    let error = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("refresh failure without pending control terminates the stream")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(error.message(), "gNMI service unavailable");
+    assert!(stream.next().await.is_none());
+}

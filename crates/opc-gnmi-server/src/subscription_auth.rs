@@ -102,10 +102,18 @@ impl StreamAuthorization {
             };
             let resolved = match initial {
                 Some((initial_revision, initial)) if revision == initial_revision => initial,
-                _ => self
+                _ => match self
                     .source
                     .active_policy_context_for_principal(&self.principal)
-                    .map_err(|_| authorization_failure())?,
+                {
+                    Ok(resolved) => resolved,
+                    Err(_) if self.gate.reevaluation_pending() == Ok(true) => {
+                        // Output is already gated by the activated revision.
+                        // Independent control owns refresh failure and termination.
+                        return Ok(AuthorizedReadSelection::default());
+                    }
+                    Err(_) => return Err(authorization_failure()),
+                },
             };
             let selection = self.evaluate(&resolved, requested, &previous)?;
             match self.record(revision, &selection)? {
