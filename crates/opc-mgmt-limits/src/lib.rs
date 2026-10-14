@@ -109,10 +109,13 @@ pub struct MgmtLimits {
     /// will accept.
     pub max_sessions: usize,
     /// Maximum number of subtree-filter content-match nodes (leaf text values)
-    /// permitted in one `<filter>`. The server does not implement content-match
-    /// semantics, but the bound still limits how many rejected nodes a client can
-    /// force the parser to classify before failing closed.
+    /// permitted in one subtree filter, counting a split text value once.
     pub max_subtree_filter_content_match_nodes: usize,
+    /// Maximum nodes in a raw subtree filter or its expanded schema plan.
+    pub max_subtree_filter_nodes: usize,
+    /// Maximum charged node visits and bytes during subtree compilation and
+    /// evaluation, including failed comparisons and overlapping alternatives.
+    pub max_subtree_filter_work_units: usize,
     /// Maximum number of subtree-filter attribute-match nodes (element attributes)
     /// permitted in one `<filter>`. The server does not implement attribute-match
     /// semantics, but the bound still limits how many rejected nodes a client can
@@ -148,6 +151,8 @@ impl Default for MgmtLimits {
             max_subscriptions_per_session: 256,
             max_sessions: 1024,
             max_subtree_filter_content_match_nodes: 16,
+            max_subtree_filter_nodes: 1024,
+            max_subtree_filter_work_units: 16 * 1024 * 1024,
             max_subtree_filter_attribute_match_nodes: 16,
             max_xpath_filter_bytes: 4096,
             max_xpath_filter_unions: 32,
@@ -162,7 +167,7 @@ impl MgmtLimits {
     /// is never "unbounded"), and a single value/queue may not be larger than a
     /// whole message would allow, which would make the per-value bound dead.
     pub fn validate(&self) -> Result<(), LimitsError> {
-        let fields: [(&'static str, usize); 16] = [
+        let fields: [(&'static str, usize); 18] = [
             ("request_bytes", self.max_request_bytes),
             (
                 "frame_chunks_per_message",
@@ -185,6 +190,11 @@ impl MgmtLimits {
             (
                 "subtree_filter_content_match_nodes",
                 self.max_subtree_filter_content_match_nodes,
+            ),
+            ("subtree_filter_nodes", self.max_subtree_filter_nodes),
+            (
+                "subtree_filter_work_units",
+                self.max_subtree_filter_work_units,
             ),
             (
                 "subtree_filter_attribute_match_nodes",
@@ -282,6 +292,24 @@ impl MgmtLimits {
         Self::check(
             "subtree_filter_content_match_nodes",
             self.max_subtree_filter_content_match_nodes,
+            actual,
+        )
+    }
+
+    /// Rejects a raw or expanded subtree filter exceeding its node bound.
+    pub fn check_subtree_filter_nodes(&self, actual: usize) -> Result<(), LimitsError> {
+        Self::check(
+            "subtree_filter_nodes",
+            self.max_subtree_filter_nodes,
+            actual,
+        )
+    }
+
+    /// Rejects subtree work exceeding its shared compilation/evaluation bound.
+    pub fn check_subtree_filter_work(&self, actual: usize) -> Result<(), LimitsError> {
+        Self::check(
+            "subtree_filter_work_units",
+            self.max_subtree_filter_work_units,
             actual,
         )
     }
@@ -397,6 +425,14 @@ mod tests {
                 ..base
             },
             MgmtLimits {
+                max_subtree_filter_nodes: 0,
+                ..base
+            },
+            MgmtLimits {
+                max_subtree_filter_work_units: 0,
+                ..base
+            },
+            MgmtLimits {
                 max_subtree_filter_content_match_nodes: 0,
                 ..base
             },
@@ -456,6 +492,8 @@ mod tests {
             max_subscriptions_per_session: 2,
             max_sessions: 3,
             max_subtree_filter_content_match_nodes: 1,
+            max_subtree_filter_nodes: 2,
+            max_subtree_filter_work_units: 32,
             max_subtree_filter_attribute_match_nodes: 1,
             max_xpath_filter_bytes: 10,
             max_xpath_filter_unions: 2,
@@ -463,6 +501,10 @@ mod tests {
             min_sample_interval: Duration::from_millis(100),
         };
 
+        assert!(limits.check_subtree_filter_nodes(2).is_ok());
+        assert!(limits.check_subtree_filter_nodes(3).is_err());
+        assert!(limits.check_subtree_filter_work(32).is_ok());
+        assert!(limits.check_subtree_filter_work(33).is_err());
         // At the limit is allowed; one past is rejected with the named limit.
         assert!(limits.check_request_bytes(100).is_ok());
         assert_eq!(

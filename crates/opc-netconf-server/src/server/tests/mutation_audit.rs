@@ -95,7 +95,7 @@ async fn check_local_mutation<A: AuditSink + Clone + 'static>(
         .lock()
         .expect("candidate")
         .snapshot()
-        .map(|snapshot| snapshot.config.hostname);
+        .map(|snapshot| snapshot.config.hostname.clone());
     let startup = startup.current().map(|config| config.hostname);
     assert_eq!(
         (candidate.as_deref(), startup.as_deref()),

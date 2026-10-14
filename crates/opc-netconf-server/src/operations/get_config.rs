@@ -4,7 +4,7 @@ use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer, ReadNode};
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
 
@@ -104,6 +104,44 @@ where
     P: PolicySource,
     A: AuditSink,
 {
+    let content = super::content::ContentRequest::Config(request);
+    if content.use_content_handler(binding) {
+        let read_ctx = super::get::GetContext {
+            authz: ctx.authz,
+            audit: ctx.audit,
+            transport: ctx.transport,
+            request_id: ctx.request_id,
+            principal: ctx.principal,
+            message_id: ctx.message_id,
+            reply_attrs: ctx.reply_attrs,
+            started: ctx.started,
+            limits: ctx.limits,
+        };
+        return super::content::handle(
+            binding,
+            read_ctx,
+            content,
+            |source| {
+                use super::content::{ContentConfig, ContentSource};
+                match source {
+                    ContentSource::Running => Ok(ContentConfig::Shared(
+                        binding.config_bus().current_snapshot().config.clone(),
+                    )),
+                    ContentSource::Candidate => ctx
+                        .candidate_config
+                        .map(ContentConfig::Borrowed)
+                        .ok_or_else(RpcError::operation_failed),
+                    ContentSource::Startup => ctx
+                        .startup_config
+                        .map(ContentConfig::Borrowed)
+                        .ok_or_else(RpcError::data_missing),
+                }
+            },
+            audit_mode,
+        )
+        .await;
+    }
+
     if request.source == Datastore::Candidate
         && ctx.candidate_supported
         && ctx.candidate_config.is_none()
@@ -244,44 +282,52 @@ where
     };
 
     let registry = binding.schema_registry();
-    let config_paths =
-        match get_config_paths_with_limits(registry, request.filter.as_ref(), ctx.limits) {
-            Ok(paths) => paths,
-            Err(err) => {
-                let rpc_error = err.rpc_error();
-                let error_tag = rpc_error.classification.tag;
-                if audit_failure(
-                    audit_mode,
-                    ctx.audit,
-                    ctx.request_id,
-                    ctx.principal,
-                    ctx.transport,
-                    err.audit_reason(),
-                    Vec::new(),
-                )
-                .await
-                .is_err()
-                {
-                    record_rpc_error(
-                        NetconfOperation::GetConfig,
-                        NetconfErrorTag::OperationFailed,
-                        ctx.started.elapsed(),
-                    );
-                    return error_reply(&ctx, RpcError::operation_failed());
-                }
+    let (config_paths, predicates) = match crate::filter::prepare_read_filter(
+        registry,
+        request.filter.as_ref(),
+        ctx.limits,
+        binding.key_predicates_supported(),
+    )
+    .and_then(|(filter, predicates)| {
+        get_config_paths_with_limits(registry, filter.as_ref(), ctx.limits)
+            .map(|paths| (paths, predicates))
+    }) {
+        Ok(paths) => paths,
+        Err(err) => {
+            let rpc_error = err.rpc_error();
+            let error_tag = rpc_error.classification.tag;
+            if audit_failure(
+                audit_mode,
+                ctx.audit,
+                ctx.request_id,
+                ctx.principal,
+                ctx.transport,
+                err.audit_reason(),
+                Vec::new(),
+            )
+            .await
+            .is_err()
+            {
                 record_rpc_error(
                     NetconfOperation::GetConfig,
-                    error_tag,
+                    NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                tracing::debug!(
-                    operation = "get-config",
-                    error_tag = error_tag.as_str(),
-                    "NETCONF get-config rejected unsupported or invalid filter"
-                );
-                return error_reply(&ctx, rpc_error);
+                return error_reply(&ctx, RpcError::operation_failed());
             }
-        };
+            record_rpc_error(
+                NetconfOperation::GetConfig,
+                error_tag,
+                ctx.started.elapsed(),
+            );
+            tracing::debug!(
+                operation = "get-config",
+                error_tag = error_tag.as_str(),
+                "NETCONF get-config rejected unsupported or invalid filter"
+            );
+            return error_reply(&ctx, rpc_error);
+        }
+    };
     if ctx.limits.check_paths(config_paths.len()).is_err() {
         if audit_failure(
             audit_mode,
@@ -342,10 +388,15 @@ where
         return ok_reply(&ctx, "");
     }
 
-    let decisions = match ctx
-        .authz
-        .authorize(ctx.principal, ReadAction::Read, &config_paths)
-    {
+    let authorization = match ctx.authz.authorize_selection(
+        ctx.principal,
+        ReadAction::Read,
+        &config_paths
+            .iter()
+            .map(|path| ReadNode::projected(path))
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    ) {
         Ok(decisions) => decisions,
         Err(_) => {
             if audit_failure(
@@ -381,17 +432,14 @@ where
         }
     };
 
-    let denied_count = decisions
+    let denied_count = authorization
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
     record_nacm_denials(NetconfNacmAction::Read, denied_count);
 
-    let allowed_paths = decisions
-        .iter()
-        .zip(config_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_paths = authorization.xml_paths(&config_paths);
 
     if allowed_paths.is_empty() {
         if audit_success(
@@ -435,7 +483,7 @@ where
             .startup_config
             .expect("startup support checked before rendering"),
     };
-    let selection = ReadSelection::new(&allowed_paths);
+    let selection = ReadSelection::new(&allowed_paths).with_predicates(&predicates);
     let rendered = match with_defaults_mode {
         Some(mode) => binding.render_running_config_with_defaults(config, selection, mode),
         None => binding.render_running_config(config, selection),

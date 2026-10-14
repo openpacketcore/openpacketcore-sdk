@@ -19,6 +19,7 @@ use quote::{format_ident, quote};
 
 /// Emits the `netconf_xml_edit` module for the generated crate.
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let nodes_by_path = NodeIndex::new(&input.nodes);
 
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
@@ -34,9 +35,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     let mut apply_fns = Vec::new();
     for node in &sorted_nodes {
+        if has_keyless_list_ancestor(node, &nodes_by_path) {
+            continue;
+        }
         match node.kind {
             SchemaNodeKind::Container | SchemaNodeKind::List => {
-                apply_fns.push(apply_children_fn(node, &nodes_by_path, input)?);
+                // Keyless lists are rejected by their list applicator before
+                // reaching children, so no child helper can be called.
+                if node.kind == SchemaNodeKind::Container || !node.key_leaves.is_empty() {
+                    apply_fns.push(apply_children_fn(node, &nodes_by_path, input)?);
+                }
             }
             SchemaNodeKind::Leaf => {}
             SchemaNodeKind::LeafList => {
@@ -54,12 +62,39 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // Generate list applicator functions after children functions so every
     // apply_children_<list> helper is in scope.
     for node in &sorted_nodes {
-        if node.kind == SchemaNodeKind::List {
-            apply_fns.push(apply_list_fn(node, &nodes_by_path)?);
+        if node.kind == SchemaNodeKind::List && !has_keyless_list_ancestor(node, &nodes_by_path) {
+            apply_fns.push(apply_list_fn(node, &nodes_by_path, has_state_lists)?);
         }
     }
 
     let root_apply = apply_root_fn(root, &nodes_by_path)?;
+    let has_state = input.nodes.iter().any(|node| !node.config);
+    let (validate_edit, validate_state, write_validation) = if has_state {
+        let path = &root.path;
+        (
+            quote! { validate_edit_write(edit)?; },
+            quote! {
+                if !candidate.state_matches(running) {
+                    return Err(NetconfEditError::ReadOnly { path: #path });
+                }
+            },
+            quote! {
+                fn validate_edit_write(edit: &EditConfigNode) -> Result<(), NetconfEditError> {
+                    if let Some(node) = super::schema_registry::registry().node(edit.schema_path) {
+                        if !node.config {
+                            return Err(NetconfEditError::ReadOnly { path: node.path });
+                        }
+                    }
+                    for child in &edit.children {
+                        validate_edit_write(child)?;
+                    }
+                    Ok(())
+                }
+            },
+        )
+    } else {
+        (quote! {}, quote! {}, quote! {})
+    };
 
     let tokens = quote! {
         #[allow(unused_imports)]
@@ -77,8 +112,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 running: &super::types::#root_type_ident,
                 edit: &EditConfigNode,
             ) -> Result<super::types::#root_type_ident, NetconfEditError> {
+                #validate_edit
                 let mut candidate = running.clone();
                 apply_root(edit, &mut candidate)?;
+                #validate_state
                 Ok(candidate)
             }
         }
@@ -90,10 +127,27 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
         #root_apply
 
+        #write_validation
+
         #(#apply_fns)*
     };
 
     Ok(tokens.to_string())
+}
+
+// A keyless list's rejection stub never dispatches to its children. Keep that
+// stub reachable, but omit every helper beneath it, including nested lists.
+fn has_keyless_list_ancestor(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> bool {
+    let mut path = node.path.as_str();
+    while let Some((parent, _)) = path.rsplit_once('/') {
+        if nodes_by_path.get(parent).is_some_and(|ancestor| {
+            ancestor.kind == SchemaNodeKind::List && ancestor.key_leaves.is_empty()
+        }) {
+            return true;
+        }
+        path = parent;
+    }
+    false
 }
 
 fn is_root_path(path: &str) -> bool {
@@ -144,10 +198,11 @@ fn apply_children_fn(
     nodes_by_path: &NodeIndex<'_>,
     input: &CanonicalInput,
 ) -> Result<TokenStream, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let fn_ident = format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
     let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
-    let mut leaf_list_group_arms = TokenStream::new();
+    let mut leaf_list_paths = Vec::new();
     let mut leaf_list_apply_stmts = TokenStream::new();
     let mut list_key_sets = TokenStream::new();
     let mut singleton_paths = Vec::new();
@@ -264,6 +319,11 @@ fn apply_children_fn(
                 } else {
                     quote! { #child_type_ident::default() }
                 };
+                let default_constructor = if has_state_lists && !is_boxed {
+                    quote! { #child_type_ident::default }
+                } else {
+                    quote! { || #new_expr }
+                };
                 let children_fn_ident =
                     format_ident!("apply_children_{}", nodes_by_path.helper_name(&child.path));
                 quote! {
@@ -295,7 +355,7 @@ fn apply_children_fn(
                                 value.#field_ident = Some(new_container);
                             }
                             EditOperation::Merge => {
-                                let container = value.#field_ident.get_or_insert_with(|| #new_expr);
+                                let container = value.#field_ident.get_or_insert_with(#default_constructor);
                                 #children_fn_ident(&child.children, container)?;
                             }
                             EditOperation::None => {
@@ -343,14 +403,7 @@ fn apply_children_fn(
                 } else {
                     quote! { &mut value.#field_ident }
                 };
-                leaf_list_group_arms.extend(quote! {
-                    #child_path_lit => {
-                        leaf_list_children
-                            .entry(child.schema_path)
-                            .or_default()
-                            .push(child);
-                    }
-                });
+                leaf_list_paths.push(child_path_lit);
                 leaf_list_apply_stmts.extend(quote! {
                     if let Some(#nodes_ident) = leaf_list_children.get(#child_path_lit) {
                         #leaf_list_fn_ident(#nodes_ident, #values)?;
@@ -365,7 +418,7 @@ fn apply_children_fn(
         arms.extend(arm);
     }
 
-    let leaf_list_grouping = if leaf_list_group_arms.is_empty() {
+    let leaf_list_grouping = if leaf_list_paths.is_empty() {
         TokenStream::new()
     } else {
         quote! {
@@ -374,9 +427,11 @@ fn apply_children_fn(
                 Vec<&EditConfigNode>,
             > = std::collections::BTreeMap::new();
             for child in children {
-                match child.schema_path {
-                    #leaf_list_group_arms
-                    _ => {}
+                if matches!(child.schema_path, #(#leaf_list_paths)|*) {
+                    leaf_list_children
+                        .entry(child.schema_path)
+                        .or_default()
+                        .push(child);
                 }
             }
             #leaf_list_apply_stmts
@@ -386,6 +441,21 @@ fn apply_children_fn(
     let check_singletons = if singleton_paths.is_empty() {
         TokenStream::new()
     } else {
+        let singleton_arm = if has_state_lists {
+            quote! {
+                #(#singleton_paths)|* if !singletons.insert(child.schema_path) => {
+                    return Err(NetconfEditError::InvalidValue { path: child.schema_path });
+                }
+            }
+        } else {
+            quote! {
+                #(#singleton_paths)|* => {
+                    if !singletons.insert(child.schema_path) {
+                        return Err(NetconfEditError::InvalidValue { path: child.schema_path });
+                    }
+                }
+            }
+        };
         quote! {
             // RFC 6241 section 7.2 leaves repeated operations on one
             // conceptual node undefined. Reject them before applying children;
@@ -393,30 +463,57 @@ fn apply_children_fn(
             let mut singletons = std::collections::BTreeSet::new();
             for child in children {
                 match child.schema_path {
-                    #(#singleton_paths)|* => {
-                        if !singletons.insert(child.schema_path) {
-                            return Err(NetconfEditError::InvalidValue { path: child.schema_path });
-                        }
-                    }
+                    #singleton_arm
                     _ => {}
                 }
             }
         }
     };
 
+    let rejects_every_child = has_state_lists
+        && node.child_paths.iter().all(|path| {
+            nodes_by_path
+                .get(path)
+                .is_some_and(|child| child.kind == SchemaNodeKind::Leaf && !child.config)
+        });
     let value_param = format_ident!(
         "{}",
-        if !nodes_by_path.expanded_profile
-            || node
-                .child_paths
-                .iter()
-                .any(|path| { nodes_by_path.get(path).is_some_and(|child| child.config) })
+        if !rejects_every_child
+            && (!nodes_by_path.expanded_profile
+                || node.child_paths.iter().any(|path| {
+                    nodes_by_path
+                        .get(path)
+                        .is_some_and(|child| child.config || child.kind != SchemaNodeKind::Leaf)
+                }))
         {
             "value"
         } else {
             "_value"
         }
     );
+    let apply_child = quote! {
+        match child.schema_path {
+            #arms
+            _ => {
+                return Err(NetconfEditError::UnknownPath(
+                    child.schema_path.to_string(),
+                ));
+            }
+        }
+    };
+    let apply_children = if rejects_every_child {
+        quote! {
+            if let Some(child) = children.first() {
+                #apply_child
+            }
+        }
+    } else {
+        quote! {
+            for child in children {
+                #apply_child
+            }
+        }
+    };
 
     Ok(quote! {
         fn #fn_ident(
@@ -426,16 +523,7 @@ fn apply_children_fn(
             #check_singletons
             #list_key_sets
             #leaf_list_grouping
-            for child in children {
-                match child.schema_path {
-                    #arms
-                    _ => {
-                        return Err(NetconfEditError::UnknownPath(
-                            child.schema_path.to_string(),
-                        ));
-                    }
-                }
-            }
+            #apply_children
             Ok(())
         }
     })
@@ -492,9 +580,16 @@ fn apply_leaf_list_fn(
 
     let parse_expr = parse_leaf_value_expr(node, nodes_by_path)?;
     let key_expr = leaf_list_value_key_expr(node, nodes_by_path)?;
+    let key_value_type = match resolved_type(node, nodes_by_path) {
+        Some(TypeRef::String | TypeRef::RestrictedString { .. })
+        | Some(TypeRef::IdentityRef { .. })
+        | Some(TypeRef::LeafRef { .. })
+        | Some(TypeRef::Enumeration { .. }) => quote! { str },
+        _ => element_type.clone(),
+    };
 
     Ok(quote! {
-        fn #key_fn_ident(value: &#element_type) -> String {
+        fn #key_fn_ident(value: &#key_value_type) -> String {
             #key_expr
         }
 
@@ -625,7 +720,7 @@ fn leaf_list_value_key_expr(
         Some(TypeRef::String | TypeRef::RestrictedString { .. })
         | Some(TypeRef::IdentityRef { .. })
         | Some(TypeRef::LeafRef { .. })
-        | Some(TypeRef::Enumeration { .. }) => Ok(quote! { value.clone() }),
+        | Some(TypeRef::Enumeration { .. }) => Ok(quote! { value.to_owned() }),
         Some(TypeRef::Custom { .. }) | None => Err(RustGenerationError::new(format!(
             "netconf_xml_edit: unsupported leaf-list type at {}",
             node.path
@@ -636,6 +731,7 @@ fn leaf_list_value_key_expr(
 fn apply_list_fn(
     node: &SchemaNode,
     nodes_by_path: &NodeIndex<'_>,
+    has_state_lists: bool,
 ) -> Result<TokenStream, RustGenerationError> {
     let fn_ident = format_ident!("apply_{}", nodes_by_path.helper_name(&node.path));
     let children_fn_ident =
@@ -661,8 +757,11 @@ fn apply_list_fn(
 
     let mut parse_keys = Vec::new();
     let mut key_assigns = Vec::new();
+    let mut key_initializers = Vec::new();
     let mut key_struct_fields = Vec::new();
     let mut single_key_is_sensitive = false;
+    let mut cloned_parsed = quote! { parsed.clone() };
+    let mut cloned_map_key = quote! { parsed_key.clone() };
 
     if node.key_leaves.len() == 1 {
         let key_leaf = &node.key_leaves[0];
@@ -685,12 +784,26 @@ fn apply_list_fn(
         });
         let is_sensitive = is_sensitive_node(key_leaf_node);
         single_key_is_sensitive = is_sensitive;
-        let assign = if is_sensitive {
-            quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed.clone())); }
+        cloned_parsed = super::types::cloned_key_value(
+            key_leaf_node,
+            nodes_by_path,
+            quote! { parsed },
+            has_state_lists,
+        );
+        cloned_map_key = super::types::cloned_key_value(
+            key_leaf_node,
+            nodes_by_path,
+            quote! { parsed_key },
+            has_state_lists,
+        );
+        let raw_key = if is_sensitive {
+            cloned_parsed.clone()
         } else {
-            quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
+            cloned_map_key.clone()
         };
-        key_assigns.push(assign);
+        let key_value = super::types::explicit_leaf_value(key_leaf_node, raw_key);
+        key_assigns.push(quote! { entry.#key_field_ident = #key_value; });
+        key_initializers.push(quote! { #key_field_ident: #key_value, });
     } else {
         for key_leaf in &node.key_leaves {
             let key_bare = clean_segment(key_leaf);
@@ -712,19 +825,25 @@ fn apply_list_fn(
                 #parse
                 let #key_field_ident = parsed;
             });
-            key_struct_fields.push(quote! { #key_field_ident: #key_field_ident.clone() });
-            let is_sensitive = is_sensitive_node(key_leaf_node);
-            let assign = if is_sensitive {
-                quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_field_ident.clone())); }
+            let cloned_key = super::types::cloned_key_value(
+                key_leaf_node,
+                nodes_by_path,
+                quote! { #key_field_ident },
+                has_state_lists,
+            );
+            key_struct_fields.push(if key_field_ident == cloned_key.to_string() {
+                quote! { #key_field_ident }
             } else {
-                quote! { entry.#key_field_ident = LeafPresence::Explicit(#key_field_ident.clone()); }
-            };
-            key_assigns.push(assign);
+                quote! { #key_field_ident: #cloned_key }
+            });
+            let key_value = super::types::explicit_leaf_value(key_leaf_node, cloned_key);
+            key_assigns.push(quote! { entry.#key_field_ident = #key_value; });
+            key_initializers.push(quote! { #key_field_ident: #key_value, });
         }
     }
 
     let build_key = if node.key_leaves.len() == 1 && single_key_is_sensitive {
-        quote! { let parsed_key = SensitiveKey::from(parsed.clone()); }
+        quote! { let parsed_key = SensitiveKey::from(#cloned_parsed); }
     } else if node.key_leaves.len() == 1 {
         quote! { let parsed_key = parsed; }
     } else {
@@ -754,6 +873,24 @@ fn apply_list_fn(
     } else {
         quote! { map.insert(parsed_key, entry); }
     };
+    let new_entry = if has_state_lists {
+        let remaining_fields = if node.child_paths.len() == node.key_leaves.len() {
+            quote! {}
+        } else {
+            quote! { ..Default::default() }
+        };
+        quote! {
+            let mut entry = #entry_type_ident {
+                #(#key_initializers)*
+                #remaining_fields
+            };
+        }
+    } else {
+        quote! {
+            let mut entry = #entry_type_ident::default();
+            #(#key_assigns)*
+        }
+    };
 
     Ok(quote! {
         fn #fn_ident(
@@ -780,7 +917,7 @@ fn apply_list_fn(
             // spellings can address the same typed list entry. A separate
             // set for each sibling list prevents repeated parents from
             // hiding duplicate or conflicting leaf-list entry operations.
-            if !edit_keys.insert(parsed_key.clone()) {
+            if !edit_keys.insert(#cloned_map_key) {
                 return Err(NetconfEditError::InvalidValue { path: node.schema_path });
             }
             match node.operation {
@@ -804,19 +941,17 @@ fn apply_list_fn(
                             kind: NodeKind::List,
                         });
                     }
-                    let mut entry = #entry_type_ident::default();
-                    #(#key_assigns)*
+                    #new_entry
                     #children_fn_ident(&node.children, &mut entry)?;
                     #upsert
                 }
                 EditOperation::Replace => {
-                    let mut entry = #entry_type_ident::default();
-                    #(#key_assigns)*
+                    #new_entry
                     #children_fn_ident(&node.children, &mut entry)?;
                     #upsert
                 }
                 EditOperation::Merge => {
-                    let entry = map.entry(parsed_key.clone()).or_default();
+                    let entry = map.entry(#cloned_map_key).or_default();
                     #(#key_assigns)*
                     #children_fn_ident(&node.children, entry)?;
                 }
@@ -824,8 +959,7 @@ fn apply_list_fn(
                     if let Some(entry) = map.get_mut(&parsed_key) {
                         #children_fn_ident(&node.children, entry)?;
                     } else if node.children.iter().any(|child| child.operation != EditOperation::None) {
-                        let mut entry = #entry_type_ident::default();
-                        #(#key_assigns)*
+                        #new_entry
                         let baseline = entry.clone();
                         #children_fn_ident(&node.children, &mut entry)?;
                         if entry != baseline {
@@ -967,7 +1101,11 @@ fn numeric_range_check_expr(
             let (min, max) = (interval.min as i64, interval.max as i64);
             (quote! { #min }, quote! { #max })
         };
-        quote! { (#min <= numeric_value && numeric_value <= #max) }
+        if extended {
+            quote! { (#min..=#max).contains(&numeric_value) }
+        } else {
+            quote! { (#min <= numeric_value && numeric_value <= #max) }
+        }
     });
 
     let integer_type = if extended {

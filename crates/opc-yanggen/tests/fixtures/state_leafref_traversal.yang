@@ -1,0 +1,30 @@
+module state-leafref-traversal {
+  yang-version 1.1;
+  namespace "urn:example:state-leafref-traversal";
+  prefix st;
+  container root {
+    leaf number { type uint64; }
+    leaf number-alias { type leafref { path '/st:root/st:number'; } }
+    container state {
+      config false;
+      list linked-number {
+        key id;
+        leaf id { type leafref { path '/st:root/st:number-alias'; } }
+      }
+      list target {
+        key name;
+        leaf name { type string; }
+      }
+      list reference {
+        key id;
+        leaf id { type leafref { path '/st:root/st:state/st:target/st:name'; } }
+      }
+      list sample {
+        leaf flag { type boolean; }
+      }
+      list sample-reference {
+        leaf value { type leafref { path '/st:root/st:state/st:sample/st:flag'; } }
+      }
+    }
+  }
+}

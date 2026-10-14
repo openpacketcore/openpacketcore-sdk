@@ -16,25 +16,39 @@ Public API:
   and node metadata.
 - `PathError`, covering malformed segments, unknown origin or prefix, unknown
   schema nodes, missing or unexpected list keys, and unsafe key values.
-- `resolve`, the main resolver.
+- `resolve`, the complete-key resolver for writes.
+- `resolve_read`, which accepts omitted keys and canonicalizes integer and
+  boolean selectors, returning no selection for an invalid typed value.
+- `resolve_instance`, which requires complete declared keys and canonical
+  encoding for a provider's concrete path.
+- `CanonicalPath`, `canonical_path_matches`, and `append_key_predicate`, the
+  shared literal path parser, instance matcher, and builder.
 
 Example:
 
 ```rust
-use opc_mgmt_path::{resolve, RequestPath};
+use opc_mgmt_path::{resolve_read, RequestPath};
 use opc_mgmt_schema::SchemaRegistry;
 
 fn resolve_for_read(
     registry: &dyn SchemaRegistry,
     path: &RequestPath,
-) -> Result<String, opc_mgmt_path::PathError> {
-    Ok(resolve(registry, path)?.schema_path)
+) -> Result<Option<String>, opc_mgmt_path::PathError> {
+    Ok(resolve_read(registry, path)?.map(|resolved| resolved.schema_path))
 }
 ```
 
-The canonical `YangPath` orders list keys by schema metadata and emits
-single-quoted predicates. Key values containing a single quote are rejected
-rather than escaped privately.
+The canonical `YangPath` orders list keys by schema metadata. Read literals use
+single quotes, or double quotes when the value contains an apostrophe, and keep
+backslashes literal. Values containing both quote characters fail closed. The
+write resolver retains its complete-key and apostrophe rejection contract.
+
+Read key-value matches against masked or unclassified key leaves are refused
+using schema metadata before callers consult policy or data. Omitted keys carry
+no value constraint. A canonical asterisk is literal; protocol adapters handle
+their own wildcard conventions. Matching requires equal depth and qualified
+node names, with every selected key present and equal on the reported instance.
+The syntax matcher alone does not establish schema validity or complete keys.
 
 ## Relationships
 

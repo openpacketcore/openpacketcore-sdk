@@ -84,8 +84,15 @@ fn subtree_list_leaf_list_and_secret_constraints_are_not_bypassed() {
         assert_eq!(serde_json::from_value::<Root>(value.clone()).unwrap_err().to_string(), "string violates YANG constraints");
         let mut candidate = Root::default();
         let error = patch::apply_patch(&mut candidate, &[patch::ConfigDelta::Replace(YangPath::new("/ex:root").unwrap(), value.to_string())]).unwrap_err();
-        assert_eq!(error.kind(), "invalid-value");
-        assert_eq!(error.message(), "string violates YANG constraints");
+        // State admission precedes scalar parsing; direct deserialization above
+        // still verifies the exact string constraint reason for every body.
+        let (kind, reason) = if value.get("example:state").is_some() {
+            ("read-only", "cannot modify read-only path")
+        } else {
+            ("invalid-value", "string violates YANG constraints")
+        };
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.message(), reason);
         assert!(!format!("{error:?}").contains("bad-value"));
         assert_eq!(candidate, Root::default());
     }

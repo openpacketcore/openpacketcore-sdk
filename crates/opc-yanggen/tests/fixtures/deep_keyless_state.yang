@@ -1,0 +1,32 @@
+module deep-keyless {
+  yang-version 1.1;
+  namespace "urn:example:deep-keyless";
+  prefix dk;
+  revision 2026-10-13;
+  container state {
+    config false;
+    list keyed {
+      key "name";
+      leaf name { type string; }
+      list observation {
+        container detail {
+          leaf count { type uint32; }
+          list measurement {
+            key "code";
+            leaf code { type uint32; }
+            leaf value { type string; }
+          }
+        }
+        leaf-list label { type string; }
+        list note {
+          container text { leaf value { type string; } }
+        }
+      }
+      list observation-extra {
+        key "code";
+        leaf code { type uint32; }
+        leaf value { type string; }
+      }
+    }
+  }
+}

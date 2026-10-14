@@ -1,15 +1,16 @@
 //! RFC 8526 `<get-data>` operation handling.
 
-use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal, YangPath};
+use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{
+    AuthorizedReadSelection, PolicySource, ReadAction, ReadAuthorizer, ReadNode, ResolvedPolicy,
+};
 use opc_mgmt_errors::NetconfErrorTag;
 use opc_mgmt_limits::MgmtLimits;
-use opc_mgmt_opstate::{OperationalRequest, OperationalResponse};
-use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
+use super::operational_reads::{read_node, read_operational};
 use crate::binding::{NetconfConfigBinding, ReadSelection};
 use crate::capabilities::NETCONF_NMDA_NS;
 use crate::error::{
@@ -106,6 +107,44 @@ where
     P: PolicySource,
     A: AuditSink,
 {
+    let content = super::content::ContentRequest::Data(request);
+    if content.use_content_handler(binding) {
+        let read_ctx = super::get::GetContext {
+            authz: ctx.authz,
+            audit: ctx.audit,
+            transport: ctx.transport,
+            request_id: ctx.request_id,
+            principal: ctx.principal,
+            message_id: ctx.message_id,
+            reply_attrs: ctx.reply_attrs,
+            started: ctx.started,
+            limits: ctx.limits,
+        };
+        return super::content::handle(
+            binding,
+            read_ctx,
+            content,
+            |source| {
+                use super::content::{ContentConfig, ContentSource};
+                match source {
+                    ContentSource::Running => Ok(ContentConfig::Shared(
+                        binding.config_bus().current_snapshot().config.clone(),
+                    )),
+                    ContentSource::Candidate => ctx
+                        .candidate_config
+                        .map(ContentConfig::Borrowed)
+                        .ok_or_else(RpcError::operation_failed),
+                    ContentSource::Startup => ctx
+                        .startup_config
+                        .map(ContentConfig::Borrowed)
+                        .ok_or_else(RpcError::data_missing),
+                }
+            },
+            audit_mode,
+        )
+        .await;
+    }
+
     if !binding.nmda_get_data_supported() {
         return fail(
             audit_mode,
@@ -265,20 +304,28 @@ where
     }
 
     let registry = binding.schema_registry();
-    let config_paths =
-        match get_config_paths_with_limits(registry, request.filter.as_ref(), ctx.limits) {
-            Ok(paths) => paths,
-            Err(err) => {
-                return fail(
-                    audit_mode,
-                    &ctx,
-                    err.rpc_error(),
-                    err.audit_reason(),
-                    Vec::new(),
-                )
-                .await
-            }
-        };
+    let (config_paths, predicates) = match crate::filter::prepare_read_filter(
+        registry,
+        request.filter.as_ref(),
+        ctx.limits,
+        binding.key_predicates_supported(),
+    )
+    .and_then(|(filter, predicates)| {
+        get_config_paths_with_limits(registry, filter.as_ref(), ctx.limits)
+            .map(|paths| (paths, predicates))
+    }) {
+        Ok(paths) => paths,
+        Err(err) => {
+            return fail(
+                audit_mode,
+                &ctx,
+                err.rpc_error(),
+                err.audit_reason(),
+                Vec::new(),
+            )
+            .await
+        }
+    };
     if ctx.limits.check_paths(config_paths.len()).is_err() {
         return fail(audit_mode, &ctx, RpcError::too_big(), "too-big", Vec::new()).await;
     }
@@ -286,10 +333,15 @@ where
         return success(audit_mode, &ctx, Vec::new(), "").await;
     }
 
-    let decisions = match ctx
-        .authz
-        .authorize(ctx.principal, ReadAction::Read, &config_paths)
-    {
+    let authorization = match ctx.authz.authorize_selection(
+        ctx.principal,
+        ReadAction::Read,
+        &config_paths
+            .iter()
+            .map(|path| ReadNode::projected(path))
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    ) {
         Ok(decisions) => decisions,
         Err(_) => {
             return fail(
@@ -302,16 +354,13 @@ where
             .await
         }
     };
-    let denied_count = decisions
+    let denied_count = authorization
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
     record_nacm_denials(NetconfNacmAction::Read, denied_count);
-    let allowed_paths = decisions
-        .iter()
-        .zip(config_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_paths = authorization.xml_paths(&config_paths);
     if allowed_paths.is_empty() {
         return success(audit_mode, &ctx, Vec::new(), "").await;
     }
@@ -331,7 +380,7 @@ where
             .startup_config
             .expect("startup support checked before rendering"),
     };
-    let selection = ReadSelection::new(&allowed_paths);
+    let selection = ReadSelection::new(&allowed_paths).with_predicates(&predicates);
     let rendered = match request.with_defaults {
         Some(mode) => binding.render_running_config_with_defaults(config, selection, mode),
         None => binding.render_running_config(config, selection),
@@ -376,13 +425,22 @@ where
     }
 
     let registry = binding.schema_registry();
-    let selected_paths = match get_paths_with_discovery(
+    let (selected_paths, predicates, branches) = match crate::filter::prepare_instance_read_filter(
         registry,
         request.filter.as_ref(),
-        binding.yang_library_capability().is_some(),
-        binding.netconf_monitoring_capability().is_some(),
         ctx.limits,
-    ) {
+        binding.key_predicates_supported(),
+    )
+    .and_then(|prepared| {
+        get_paths_with_discovery(
+            registry,
+            prepared.filter.as_ref(),
+            binding.yang_library_capability().is_some(),
+            binding.netconf_monitoring_capability().is_some(),
+            ctx.limits,
+        )
+        .map(|paths| (paths, prepared.predicates, prepared.branches))
+    }) {
         Ok(paths) => paths,
         Err(err) => {
             return fail(
@@ -395,34 +453,40 @@ where
             .await
         }
     };
-    let decisions =
-        match ctx
-            .authz
-            .authorize(ctx.principal, ReadAction::Read, &selected_paths.data_paths)
-        {
-            Ok(decisions) => decisions,
-            Err(_) => {
-                return fail(
-                    audit_mode,
-                    &ctx,
-                    RpcError::resource_denied(),
-                    "resource-denied",
-                    schema_paths(&selected_paths.data_paths),
-                )
-                .await
-            }
-        };
-    let allowed_paths = decisions
-        .iter()
-        .zip(selected_paths.data_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let resolved = match ctx
+        .authz
+        .policy_source()
+        .active_policy_context_for_principal(ctx.principal)
+    {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            return fail(
+                audit_mode,
+                &ctx,
+                RpcError::resource_denied(),
+                "resource-denied",
+                schema_paths(&selected_paths.data_paths),
+            )
+            .await
+        }
+    };
+    let authorization = ctx.authz.authorize_selection_resolved(
+        &resolved,
+        ReadAction::Read,
+        &selected_paths
+            .data_paths
+            .iter()
+            .map(|path| read_node(registry, path))
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    );
+    let allowed_paths = authorization.xml_paths(&selected_paths.data_paths);
 
     let allow_builtin_state = request.config_filter != Some(true);
     let yang_library_authz = if allow_builtin_state {
         match authorize_yang_library(
             ctx.authz.policy_source(),
-            ctx.principal,
+            &resolved,
             &selected_paths.yang_library_paths,
         ) {
             Ok(decisions) => decisions,
@@ -438,12 +502,12 @@ where
             }
         }
     } else {
-        Vec::new()
+        AuthorizedReadSelection::default()
     };
     let netconf_monitoring_authz = if allow_builtin_state {
         match authorize_netconf_monitoring(
             ctx.authz.policy_source(),
-            ctx.principal,
+            &resolved,
             &selected_paths.netconf_monitoring_paths,
         ) {
             Ok(decisions) => decisions,
@@ -459,33 +523,30 @@ where
             }
         }
     } else {
-        Vec::new()
+        AuthorizedReadSelection::default()
     };
 
-    let denied_count = decisions
+    let denied_count = authorization
+        .decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count()
         + yang_library_authz
+            .decisions
             .iter()
             .filter(|decision| !decision.allowed)
             .count()
         + netconf_monitoring_authz
+            .decisions
             .iter()
             .filter(|decision| !decision.allowed)
             .count();
     record_nacm_denials(NetconfNacmAction::Read, denied_count);
 
-    let allowed_yang_library_paths = yang_library_authz
-        .iter()
-        .zip(selected_paths.yang_library_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
-    let allowed_netconf_monitoring_paths = netconf_monitoring_authz
-        .iter()
-        .zip(selected_paths.netconf_monitoring_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
-        .collect::<Vec<_>>();
+    let allowed_yang_library_paths =
+        yang_library_authz.xml_paths(&selected_paths.yang_library_paths);
+    let allowed_netconf_monitoring_paths =
+        netconf_monitoring_authz.xml_paths(&selected_paths.netconf_monitoring_paths);
 
     let mut config_paths = allowed_paths
         .iter()
@@ -512,21 +573,37 @@ where
         return fail(audit_mode, &ctx, RpcError::too_big(), "too-big", Vec::new()).await;
     }
 
-    let operational = match read_operational(binding, &state_paths) {
-        Ok(response) => response,
-        Err(()) => {
-            return fail(
-                audit_mode,
-                &ctx,
-                RpcError::operation_failed(),
-                "operation-failed",
-                schema_paths(&allowed_paths),
-            )
-            .await
-        }
+    let (operational, available_state_paths) =
+        match read_operational(binding, &state_paths, &branches, ctx.limits) {
+            Ok(response) => response,
+            Err(rpc_error) => {
+                let reason = if rpc_error.classification.tag == NetconfErrorTag::TooBig {
+                    "too-big"
+                } else {
+                    "operation-failed"
+                };
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    rpc_error,
+                    reason,
+                    schema_paths(&allowed_paths),
+                )
+                .await;
+            }
+        };
+    let render_config_paths = if request.config_filter == Some(false) {
+        Vec::new()
+    } else {
+        super::operational_reads::config_render_paths(
+            registry,
+            &authorization,
+            &selected_paths.data_paths,
+            &config_paths,
+            &available_state_paths,
+        )
     };
-    let render_state_paths = state_paths_with_values(&state_paths, &operational);
-    let render_config_paths = config_paths_for_render(registry, &config_paths, &render_state_paths);
+    let render_state_paths = available_state_paths;
 
     let rendered_data = if render_config_paths.is_empty() && render_state_paths.is_empty() {
         Ok(String::new())
@@ -534,9 +611,11 @@ where
         let snapshot = binding.config_bus().current_snapshot();
         binding.render_get_data(
             snapshot.config.as_ref(),
-            ReadSelection::new(&render_config_paths),
+            ReadSelection::new(&render_config_paths)
+                .with_predicates(&predicates)
+                .with_instances(&branches),
             &operational,
-            ReadSelection::new(&render_state_paths),
+            ReadSelection::new(&render_state_paths).with_instances(&branches),
         )
     };
 
@@ -585,20 +664,20 @@ where
 
 fn authorize_yang_library<P: PolicySource>(
     policy_source: &P,
-    principal: &TrustedPrincipal,
+    resolved: &ResolvedPolicy,
     paths: &[&'static str],
-) -> Result<Vec<opc_mgmt_authz::PathDecision>, ()> {
-    authorize_builtin_registry(policy_source, principal, yang_library_registry(), paths)
+) -> Result<AuthorizedReadSelection, ()> {
+    authorize_builtin_registry(policy_source, resolved, yang_library_registry(), paths)
 }
 
 fn authorize_netconf_monitoring<P: PolicySource>(
     policy_source: &P,
-    principal: &TrustedPrincipal,
+    resolved: &ResolvedPolicy,
     paths: &[&'static str],
-) -> Result<Vec<opc_mgmt_authz::PathDecision>, ()> {
+) -> Result<AuthorizedReadSelection, ()> {
     authorize_builtin_registry(
         policy_source,
-        principal,
+        resolved,
         netconf_monitoring_registry(),
         paths,
     )
@@ -606,77 +685,20 @@ fn authorize_netconf_monitoring<P: PolicySource>(
 
 fn authorize_builtin_registry<P: PolicySource>(
     policy_source: &P,
-    principal: &TrustedPrincipal,
+    resolved: &ResolvedPolicy,
     registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
     paths: &[&'static str],
-) -> Result<Vec<opc_mgmt_authz::PathDecision>, ()> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<AuthorizedReadSelection, ()> {
     let authz = ReadAuthorizer::new(registry, policy_source).map_err(|_| ())?;
-    authz
-        .authorize(principal, ReadAction::Read, paths)
-        .map_err(|_| ())
-}
-
-fn read_operational<C, B>(
-    binding: &B,
-    state_paths: &[&'static str],
-) -> Result<OperationalResponse, ()>
-where
-    C: OpcConfig,
-    B: NetconfConfigBinding<C>,
-{
-    if state_paths.is_empty() {
-        return Ok(OperationalResponse::default());
-    }
-    let requested = state_paths
-        .iter()
-        .map(|path| YangPath::new(*path).map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let request = OperationalRequest::new(requested);
-    let response = binding.get_operational_state(&request).map_err(|_| ())?;
-    response.validate_for_request(&request).map_err(|_| ())?;
-    Ok(response)
-}
-
-fn state_paths_with_values(
-    state_paths: &[&'static str],
-    operational: &OperationalResponse,
-) -> Vec<&'static str> {
-    state_paths
-        .iter()
-        .copied()
-        .filter(|path| {
-            YangPath::new(*path)
-                .ok()
-                .is_some_and(|path| operational.value_for(&path).is_some())
-        })
-        .collect()
-}
-
-fn config_paths_for_render(
-    registry: &'static dyn SchemaRegistry,
-    config_paths: &[&'static str],
-    render_state_paths: &[&'static str],
-) -> Vec<&'static str> {
-    if !render_state_paths.is_empty() || has_data_bearing_config_path(registry, config_paths) {
-        config_paths.to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-fn has_data_bearing_config_path(
-    registry: &'static dyn SchemaRegistry,
-    config_paths: &[&'static str],
-) -> bool {
-    config_paths.iter().any(|path| {
-        registry.node(path).is_some_and(|node| {
-            node.config
-                && (node.presence || matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList))
-        })
-    })
+    Ok(authz.authorize_selection_resolved(
+        resolved,
+        ReadAction::Read,
+        &paths
+            .iter()
+            .map(|path| ReadNode::projected(path))
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    ))
 }
 
 async fn success<C, P, A>(

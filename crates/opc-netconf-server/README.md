@@ -48,6 +48,61 @@ schema-source lookup, and edit-config candidate construction. Default render and
 edit hooks fail closed unless a generated or CNF-specific binding implements
 them.
 
+## Keyed read selection
+
+`<get>`, `<get-config>` and `<get-data>` authorize each selected descendant and
+all composite and ancestor-list keys against one resolved policy context. A
+denied or unknown dependency omits its entire entry before stored-row traversal.
+The server adds permitted identifying keys to XML selections; a selected
+structural parent alone contributes no key-only entry. An allowed key whose
+stored value is missing still produces the existing fixed projection failure.
+Sensitive keys keep their data-class formatting, including masked XML elements
+for security-secret and lawful-intercept keys.
+
+Generated configuration projection supports bounded XPath key equalities such
+as `/k:root/k:rows[k:id='chosen-instance']/k:value`. Predicates must identify
+actual list keys using bound namespace prefixes and XPath 1.0 string literals.
+Composite and ancestor predicates restrict instances after authorization.
+Expressions, non-key predicates, unions with predicates, wildcard predicates
+and opaque operational instance filtering remain unsupported. Existing schema
+selection and structural subtree filters retain their behavior.
+Predicates on keys whose data class forbids cleartext (security-secret, lawful-intercept or a secret-like name) are refused with `operation-not-supported` before authorization or data access.
+
+Custom bindings must honor both `ReadSelection::schema_paths()` and
+`ReadSelection::predicates()`. They must explicitly implement
+`key_predicates_supported` when they implement instance matching. Generated
+renderers supply this support through `render_selected_config`; other renderers
+refuse predicates by default, before traversing data. Predicate values are
+excluded from `Debug` diagnostics.
+
+## Subtree content reads
+
+`<get-config>`, `<get>` and supported NMDA `<get-data>` requests can match
+scalar leaves inside subtree filters. For example,
+`<peer><id>+007</id><label/></peer>` selects the label and identity keys of the
+row whose numeric `id` is 7. Sibling predicates must match the same instance;
+repeated containment branches remain alternatives. Matching follows the read's
+default-report mode.
+
+Content reads require a binding that supports the typed, bounded
+`project_subtree_content` contract. Regenerated `opc-yanggen` renderers provide
+it. Existing key-only subtree reads remain available through the
+`key_predicates_supported` contract. Bindings without full content support
+retain nonempty key literals verbatim and the input-node bound from
+`max_paths_per_request`, and refuse other content predicates before data access.
+A binding with custom ordinary default processing must return that same mode from
+`subtree_default_report`; the default rendering hooks use trim.
+
+The server authorizes output, predicates and every ancestor identity key before
+reading rows or requesting operational values. A denied dependency omits its
+branch; a denied output-only leaf leaves authorized siblings available.
+Matching a masked or unclassified leaf is refused from the schema for every
+reader. Non-key identityref, decimal64 and custom codecs are also refused.
+
+See [the subtree content read contract](../../docs/design/netconf-subtree-content-reads.md)
+for supported types, provider validation, namespace and selection semantics,
+and the independent tree, plan and work limits.
+
 ## Async audit and registry atomicity
 
 Production async session paths use `AuditSink::record_async` for reads, writes,

@@ -121,7 +121,11 @@ fn legacy_constructs_keep_every_generated_file_byte_identical() {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fmt::Write;
-    // Captured from d50c92ad1 with its exact locked dependency versions.
+    // Captured from d50c92ad1, with #1268 state-write and value-free diagnostic
+    // changes in patch.rs, netconf_xml_edit.rs, and validate.rs. Read pins include
+    // #1269 authorized keys and hidden-ancestor omission plus #1270 canonical key
+    // literals and native instance trees, plus #1272 bounded content projection.
+    // Every complete generated file stays pinned.
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/legacy_constructs_digests.json")).unwrap();
     let parsed = generation_input_from_yang_sources(

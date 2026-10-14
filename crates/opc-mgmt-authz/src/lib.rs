@@ -24,6 +24,15 @@
 
 #![forbid(unsafe_code)]
 
+mod changes;
+pub use changes::{
+    AuthorizationChange, AuthorizationChangeHub, AuthorizationGate, AuthorizationWatch,
+    PendingAuthorizationChange,
+};
+
+mod read_selection;
+pub use read_selection::{AuthorizedReadSelection, ReadNode};
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -73,6 +82,20 @@ pub trait PolicySource: Send + Sync {
     /// Returns the active compiled NACM policy for `tenant`.
     fn active_policy(&self, tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError>;
 
+    /// Atomically registers an authorization-context watch and captures its
+    /// initial resolved policy and revision. Subscriptions fail closed unless
+    /// the source implements this contract. Use [`AuthorizationChangeHub`] to
+    /// serialize activation behind every affected stream's acknowledgement.
+    /// A source whose context can never change may explicitly return
+    /// [`AuthorizationWatch::immutable`].
+    fn watch_authorization(
+        &self,
+        _principal: &TrustedPrincipal,
+        _gate: AuthorizationGate,
+    ) -> Result<AuthorizationWatch, AuthzError> {
+        Err(AuthzError::PolicyUnavailable)
+    }
+
     /// Returns the active compiled NACM policy for a fully resolved principal.
     ///
     /// The default preserves the existing tenant-only behavior. Implementations
@@ -112,6 +135,14 @@ where
         (*self).active_policy(tenant)
     }
 
+    fn watch_authorization(
+        &self,
+        principal: &TrustedPrincipal,
+        gate: AuthorizationGate,
+    ) -> Result<AuthorizationWatch, AuthzError> {
+        (*self).watch_authorization(principal, gate)
+    }
+
     fn active_policy_for_principal(
         &self,
         principal: &TrustedPrincipal,
@@ -133,6 +164,14 @@ where
 {
     fn active_policy(&self, tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
         self.as_ref().active_policy(tenant)
+    }
+
+    fn watch_authorization(
+        &self,
+        principal: &TrustedPrincipal,
+        gate: AuthorizationGate,
+    ) -> Result<AuthorizationWatch, AuthzError> {
+        self.as_ref().watch_authorization(principal, gate)
     }
 
     fn active_policy_for_principal(
@@ -214,6 +253,12 @@ pub struct WritePathDecision {
     pub allowed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ReadTrace {
+    Emit,
+    Suppress,
+}
+
 /// Read-side NACM authorizer over a schema registry and a tenant policy source.
 pub struct ReadAuthorizer<'r, P: PolicySource> {
     registry: &'r dyn SchemaRegistry,
@@ -268,6 +313,30 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
         paths: &[&str],
     ) -> Result<Vec<PathDecision>, AuthzError> {
         let resolved = self.source.active_policy_context_for_principal(principal)?;
+        Ok(self.authorize_resolved(&resolved, action, paths))
+    }
+
+    /// Evaluates a batch using an already resolved policy context.
+    ///
+    /// Protocol adapters that serve multiple schema registries in one request
+    /// must resolve once and share this context across all of their batches.
+    /// Never combine decisions obtained from different contexts.
+    pub fn authorize_resolved(
+        &self,
+        resolved: &ResolvedPolicy,
+        action: ReadAction,
+        paths: &[&str],
+    ) -> Vec<PathDecision> {
+        self.authorize_resolved_with_trace(resolved, action, paths, ReadTrace::Emit)
+    }
+
+    fn authorize_resolved_with_trace(
+        &self,
+        resolved: &ResolvedPolicy,
+        action: ReadAction,
+        paths: &[&str],
+        trace: ReadTrace,
+    ) -> Vec<PathDecision> {
         let policy = &resolved.policy;
         let authz_principal = &resolved.principal;
         let nacm_action = action.to_nacm();
@@ -306,14 +375,16 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
                 }
             })
             .collect();
-        trace_read_decisions(
-            authz_principal,
-            policy,
-            resolved.mode.as_deref(),
-            nacm_action,
-            &decisions,
-        );
-        Ok(decisions)
+        if matches!(trace, ReadTrace::Emit) {
+            trace_read_decisions(
+                authz_principal,
+                policy,
+                resolved.mode.as_deref(),
+                nacm_action,
+                &decisions,
+            );
+        }
+        decisions
     }
 
     /// Convenience single-path check.

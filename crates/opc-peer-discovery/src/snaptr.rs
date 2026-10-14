@@ -271,13 +271,38 @@ impl SnaptrSrv {
 }
 
 /// One complete derivation of an endpoint. At most 16 records and 14 NAPTR hops.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct SnaptrPath {
+    // Original traversal positions, including the address suffix. This private
+    // selection metadata is deliberately excluded from path identity and Debug.
+    pub(crate) rank: Box<[usize]>,
     pub(crate) records: Arc<[DnsRecord]>,
     pub(crate) hops: Box<[SnaptrHop]>,
     pub(crate) terminal_host: DnsName,
     pub(crate) srv: Option<SnaptrSrv>,
+}
+
+impl PartialEq for SnaptrPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.records == other.records
+            && self.hops == other.hops
+            && self.terminal_host == other.terminal_host
+            && self.srv == other.srv
+    }
+}
+
+impl Eq for SnaptrPath {}
+
+impl fmt::Debug for SnaptrPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnaptrPath")
+            .field("records", &self.records)
+            .field("hops", &self.hops)
+            .field("terminal_host", &self.terminal_host)
+            .field("srv", &self.srv)
+            .finish()
+    }
 }
 
 impl SnaptrPath {
@@ -493,6 +518,7 @@ mod tests {
                     .collect();
                 let host = long_name((endpoint + alternate) % 16);
                 paths.push(SnaptrPath {
+                    rank: vec![usize::MAX; 16].into_boxed_slice(),
                     records: records.into(),
                     hops,
                     terminal_host: host.clone(),
@@ -551,6 +577,13 @@ mod tests {
                 + provenance.filter.protocol.capacity();
             bytes += size_of_val(provenance.paths());
             for path in provenance.paths() {
+                let mut same_path = path.clone();
+                same_path.rank[0] = 0;
+                assert_eq!(
+                    path, &same_path,
+                    "private rank must not change path identity"
+                );
+                assert_eq!(format!("{path:?}"), format!("{same_path:?}"));
                 // One Arc allocation per path; primary records share this
                 // allocation with DnsCandidate rather than retaining a copy.
                 bytes += 2 * size_of::<usize>() + size_of_val(path.records());
@@ -559,7 +592,9 @@ mod tests {
                     .iter()
                     .map(|r| r.owner.retained_capacity())
                     .sum::<usize>();
-                bytes += size_of_val(path.hops()) + path.terminal_host.retained_capacity();
+                bytes += size_of_val(path.hops())
+                    + size_of_val(path.rank.as_ref())
+                    + path.terminal_host.retained_capacity();
                 bytes += path
                     .hops()
                     .iter()

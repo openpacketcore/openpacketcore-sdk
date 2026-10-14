@@ -523,6 +523,16 @@ mod tests {
                 opc_nacm::PolicyVersion::new(1),
             )))
         }
+        fn watch_authorization(
+            &self,
+            principal: &opc_config_model::TrustedPrincipal,
+            gate: opc_mgmt_authz::AuthorizationGate,
+        ) -> Result<opc_mgmt_authz::AuthorizationWatch, AuthzError> {
+            opc_mgmt_authz::AuthorizationWatch::immutable(
+                self.active_policy_context_for_principal(principal)?,
+                gate,
+            )
+        }
     }
 
     struct EmptyOperationalState;

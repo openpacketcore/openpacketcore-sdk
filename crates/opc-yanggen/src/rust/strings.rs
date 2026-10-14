@@ -47,7 +47,11 @@ pub(super) fn generate(input: &CanonicalInput) -> Result<String, RustGenerationE
             let scalar_index = pattern_paths.binary_search(&scalar.path.as_str()).expect("declared pattern node");
             let name = format_ident!("PATTERN_{}_{}", scalar_index, i);
             let expression = &pattern.expression;
-            let inverted = pattern.invert_match;
+            let matches = if pattern.invert_match {
+                quote! { !pattern.is_match(value) }
+            } else {
+                quote! { pattern.is_match(value) }
+            };
             if scalar.path == node.path {
                 patterns.extend(quote! {
                     static #name: std::sync::OnceLock<Result<opc_mgmt_schema::string_constraints::CompiledYangPattern, opc_mgmt_schema::string_constraints::PatternError>> = std::sync::OnceLock::new();
@@ -55,7 +59,7 @@ pub(super) fn generate(input: &CanonicalInput) -> Result<String, RustGenerationE
             }
             quote! {
                 #name.get_or_init(|| opc_mgmt_schema::string_constraints::CompiledYangPattern::compile(#expression))
-                    .as_ref().is_ok_and(|pattern| pattern.is_match(value) != #inverted)
+                    .as_ref().is_ok_and(|pattern| #matches)
             }
         }).collect::<Vec<_>>();
         let check = if checks.is_empty() {

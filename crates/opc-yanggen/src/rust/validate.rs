@@ -34,14 +34,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     // 1. Generate must/when constraints
     for constraint in &input.constraints {
-        let block = generate_constraint_check(constraint, input)?;
+        let block = generate_constraint_check(constraint, input, &nodes_by_path)?;
         validation_checks.extend(block);
     }
 
     // 2. Generate unique constraints
     for node in &input.nodes {
         if node.kind == SchemaNodeKind::List && !node.unique_constraints.is_empty() {
-            let block = generate_unique_check(node, input)?;
+            let block = generate_unique_check(node, input, &nodes_by_path)?;
             validation_checks.extend(block);
         }
     }
@@ -49,7 +49,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // 3. Generate leafref constraints
     for node in &input.nodes {
         if let Some(TypeRef::LeafRef { target_path }) = &node.type_ref {
-            let block = generate_leafref_check(node, target_path, input)?;
+            let block = generate_leafref_check(node, target_path, input, &nodes_by_path)?;
             validation_checks.extend(block);
         }
     }
@@ -244,7 +244,10 @@ fn generate_path_access(
 fn generate_constraint_check(
     constraint: &ConstraintBinding,
     input: &CanonicalInput,
+    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
+    let keep_legacy_output =
+        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     let target_node = input
         .nodes
         .iter()
@@ -355,6 +358,12 @@ fn generate_constraint_check(
                                 #body
                             }
                         }
+                    } else if !keep_legacy_output {
+                        quote! {
+                            for #next_ident in #current_ident.#field_ident.values() {
+                                #body
+                            }
+                        }
                     } else {
                         quote! {
                             for (_, #next_ident) in &#current_ident.#field_ident {
@@ -389,7 +398,10 @@ fn generate_constraint_check(
 fn generate_unique_check(
     list_node: &SchemaNode,
     input: &CanonicalInput,
+    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
+    let keep_legacy_output =
+        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     let mut checks = TokenStream::new();
     let parent_path = list_node
         .path
@@ -434,7 +446,17 @@ fn generate_unique_check(
                 tuple_exprs.push(quote! { #access.as_option().cloned() });
             } else {
                 presence_checks.push(quote! { #access.is_some() });
-                tuple_exprs.push(quote! { #access.clone() });
+                let value =
+                    if !keep_legacy_output && super::types::is_copy_type(child, nodes_by_path) {
+                        if is_sensitive {
+                            quote! { *#access }
+                        } else {
+                            quote! { #access }
+                        }
+                    } else {
+                        quote! { #access.clone() }
+                    };
+                tuple_exprs.push(value);
             }
         }
 
@@ -481,6 +503,12 @@ fn generate_unique_check(
                                     #body
                                 }
                             }
+                        } else if !keep_legacy_output {
+                            quote! {
+                                for #next_ident in #current_ident.#field_ident.values() {
+                                    #body
+                                }
+                            }
                         } else {
                             quote! {
                                 for (_, #next_ident) in &#current_ident.#field_ident {
@@ -501,6 +529,13 @@ fn generate_unique_check(
             quote! {
                 let mut #set_ident = std::collections::HashSet::new();
                 for entry in &#current_ident.#list_ident {
+                    #loop_body
+                }
+            }
+        } else if !keep_legacy_output {
+            quote! {
+                let mut #set_ident = std::collections::HashSet::new();
+                for entry in #current_ident.#list_ident.values() {
                     #loop_body
                 }
             }
@@ -527,7 +562,12 @@ fn generate_leafref_check(
     leaf_node: &SchemaNode,
     target_path: &str,
     input: &CanonicalInput,
+    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
+    // Keep established output bytes for models outside the newer scalar and
+    // state-list profiles, just as the other emitters do.
+    let keep_legacy_output =
+        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     // Collect target values into set
     let target_parent_path = target_path
         .rsplit_once('/')
@@ -559,16 +599,22 @@ fn generate_leafref_check(
         quote! { entry.#target_field_ident }
     };
 
+    let target_value =
+        if !keep_legacy_output && super::types::is_copy_type(target_node, nodes_by_path) {
+            quote! { *v }
+        } else {
+            quote! { v.clone() }
+        };
     let insert_expr = if target_node.config {
         quote! {
-            if let Some(ref v) = #target_access.as_option() {
-                #set_ident.insert((*v).clone());
+            if let Some(v) = #target_access.as_option() {
+                #set_ident.insert(#target_value);
             }
         }
     } else {
         quote! {
             if let Some(ref v) = #target_access {
-                #set_ident.insert(v.clone());
+                #set_ident.insert(#target_value);
             }
         }
     };
@@ -600,6 +646,12 @@ fn generate_leafref_check(
                     if ancestor.key_leaves.is_empty() {
                         quote! {
                             for #next_ident in &#current_ident.#field_ident {
+                                #body
+                            }
+                        }
+                    } else if !keep_legacy_output {
+                        quote! {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }
@@ -646,28 +698,25 @@ fn generate_leafref_check(
     };
 
     let validate_expr = if leaf_node.kind == SchemaNodeKind::LeafList {
-        let missing_error = if is_leaf_sensitive {
-            quote! {
-                ValidationError::semantics(format!(
-                    "Leaf-list value at index {} not found in target path {}",
-                    index,
-                    #target_path,
-                ))
-            }
-        } else {
-            quote! {
-                ValidationError::semantics(format!(
-                    "Leaf-list value {:?} at index {} not found in target path {}",
-                    v,
-                    index,
-                    #target_path,
-                ))
-            }
+        let missing_error = quote! {
+            ValidationError::semantics(format!(
+                "Leaf-list value at index {} not found in target path {}",
+                index,
+                #target_path,
+            ))
         };
         quote! {
             for (index, v) in #leaf_access.iter().enumerate() {
                 if !#set_ident.contains(v) {
                     return Err(#missing_error);
+                }
+            }
+        }
+    } else if leaf_node.config && !keep_legacy_output {
+        quote! {
+            if let Some(v) = #leaf_access.as_option() {
+                if !#set_ident.contains(v) {
+                    return Err(ValidationError::semantics(format!("Value not found in target path {}", #target_path)));
                 }
             }
         }
@@ -716,6 +765,12 @@ fn generate_leafref_check(
                     if ancestor.key_leaves.is_empty() {
                         quote! {
                             for #next_ident in &#current_ident.#field_ident {
+                                #body
+                            }
+                        }
+                    } else if !keep_legacy_output {
+                        quote! {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }

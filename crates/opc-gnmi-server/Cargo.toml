@@ -45,6 +45,7 @@ protoc-bin-vendored = "3.2.0"
 tonic-prost-build = { version = "0.14.6", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 opc-config-bus-consensus = { path = "../opc-config-bus-consensus", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
@@ -60,7 +61,7 @@ opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 rcgen = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time", "test-util"] }
 tonic = { version = "0.14.6", default-features = false, features = ["channel"] }
 
 [lints]

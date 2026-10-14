@@ -20,7 +20,7 @@ use crate::{
     },
     proto::{gnmi, gnmi_ext},
     set::handle_set,
-    subscribe::{send_subscribe_error, serve_subscribe_stream},
+    subscribe::{send_subscribe_error, serve_subscribe_stream_with_gate},
     GnmiConfigBinding, GnmiError, GnmiServer,
 };
 
@@ -31,6 +31,37 @@ type SubscribeStream = Pin<
             + 'static,
     >,
 >;
+
+struct AuthorizedSubscribeOutput {
+    receiver: tokio::sync::mpsc::Receiver<Result<gnmi::SubscribeResponse, Status>>,
+    gate: opc_mgmt_authz::AuthorizationGate,
+    terminal_sent: bool,
+}
+
+impl tonic::codegen::tokio_stream::Stream for AuthorizedSubscribeOutput {
+    type Item = Result<gnmi::SubscribeResponse, Status>;
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.terminal_sent {
+            return std::task::Poll::Ready(None);
+        }
+        let gate = this.gate.clone();
+        match gate.poll_output(cx, |cx| this.receiver.poll_recv(cx)) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(item)) => std::task::Poll::Ready(item),
+            std::task::Poll::Ready(Err(_)) => {
+                this.receiver.close();
+                this.terminal_sent = true;
+                std::task::Poll::Ready(Some(Err(status_from_error(
+                    crate::subscription_auth::authorization_failure(),
+                ))))
+            }
+        }
+    }
+}
 
 /// gRPC response-metadata key carrying an opaque current-leader hint.
 pub const GNMI_LEADER_HINT_METADATA_KEY: &str = "opc-leader-hint";
@@ -330,6 +361,23 @@ where
             record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
             return Err(status_from_error(final_err));
         }
+        // Refuse schema-forbidden key matches before consulting configuration
+        // authority, policy, a provider or stored rows.
+        if let Err(err) = crate::get::select_read_request(&self.server, request.get_ref()) {
+            let final_err = record_audit(
+                self.server.audit(),
+                RequestId::new(),
+                principal.principal(),
+                AuditOperation::Read,
+                outcome_for_error(&err),
+                Vec::new(),
+            )
+            .await
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
+            return Err(status_from_error(final_err));
+        }
         if let Err(err) = self
             .server
             .ensure_config_authority(ConfigAuthorityOperation::LinearizableRead)
@@ -452,20 +500,35 @@ where
         };
         let capacity = subscribe_response_queue_capacity(self.server.limits());
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let gate = opc_mgmt_authz::AuthorizationGate::default();
+        let worker_gate = gate.clone();
         let server = Arc::clone(&self.server);
         tokio::spawn(async move {
             let _subscribe_permit = permit;
-            if let Err(err) =
-                serve_subscribe_stream(server, principal, request.into_inner(), tx.clone()).await
+            if let Err(err) = serve_subscribe_stream_with_gate(
+                server,
+                principal,
+                request.into_inner(),
+                tx.clone(),
+                worker_gate.clone(),
+            )
+            .await
             {
-                send_subscribe_error(&tx, err).await;
+                if err.status() == opc_mgmt_errors::MgmtStatus::Unavailable {
+                    worker_gate.terminate();
+                }
+                if worker_gate.revision().is_ok() {
+                    send_subscribe_error(&tx, err).await;
+                }
             } else {
                 record_rpc_success(GnmiOperation::Subscribe, start.elapsed());
             }
         });
-        Ok(Response::new(Box::pin(
-            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
+        Ok(Response::new(Box::pin(AuthorizedSubscribeOutput {
+            receiver: rx,
+            gate,
+            terminal_sent: false,
+        })))
     }
 }
 
@@ -598,6 +661,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[cfg(test)]
 #[allow(deprecated, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    mod sensitive_keys;
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -834,6 +898,16 @@ mod tests {
     impl PolicySource for FixedPolicy {
         fn active_policy(&self, _tenant: &str) -> Result<Arc<opc_nacm::NacmPolicy>, AuthzError> {
             Ok(Arc::new(self.0.clone()))
+        }
+        fn watch_authorization(
+            &self,
+            principal: &TrustedPrincipal,
+            gate: opc_mgmt_authz::AuthorizationGate,
+        ) -> Result<opc_mgmt_authz::AuthorizationWatch, AuthzError> {
+            opc_mgmt_authz::AuthorizationWatch::immutable(
+                self.active_policy_context_for_principal(principal)?,
+                gate,
+            )
         }
     }
 
@@ -5451,15 +5525,9 @@ mod tests {
         assert!(sent);
         assert!(rx.try_recv().is_err());
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, AuditOperation::Subscribe);
-        assert_eq!(
-            events[0].outcome,
-            audit_denied(AuditReasonCode::ACCESS_DENIED)
-        );
-        assert_eq!(
-            events[0].schema_paths,
-            vec![schema_node_path("/sys:system/sys:uptime")]
+        assert!(
+            events.is_empty(),
+            "hidden events do not perform per-event audit work"
         );
     }
 

@@ -5,15 +5,18 @@ use std::sync::Arc;
 use opc_config_bus::ConfigBus;
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
+use opc_mgmt_schema::subtree::{AuthorizedSubtreePlan, SubtreeError};
 use opc_mgmt_schema::{
-    DefaultReport, EditOperation, NetconfEditError, NetconfProjectionError,
-    NetconfXmlEditApplicator, NetconfXmlRenderContext, NetconfXmlRenderer, NodeKind,
-    SchemaRegistry,
+    merge_netconf_data, render_netconf_data, DefaultReport, EditOperation, NetconfEditError,
+    NetconfProjectionError, NetconfXmlEditApplicator, NetconfXmlRenderer, NodeKind, SchemaRegistry,
 };
 use thiserror::Error;
 
 use crate::discovery;
 use crate::xml::{EditConfigRequest, WithDefaultsMode};
+
+mod operational_xml;
+pub(crate) use operational_xml::validate_key_payload;
 
 /// RFC 8525 YANG Library advertisement data supplied by the embedding CNF.
 ///
@@ -243,12 +246,72 @@ impl EditConfigError {
 #[derive(Debug, Clone, Copy)]
 pub struct ReadSelection<'a> {
     schema_paths: &'a [&'static str],
+    predicates: &'a [opc_mgmt_schema::NetconfKeyPredicate],
+    instances: &'a [opc_mgmt_schema::NetconfInstanceBranch],
+    subtree_plan: Option<&'a AuthorizedSubtreePlan>,
 }
 
 impl<'a> ReadSelection<'a> {
     /// Creates a selection from predicate-free schema-node paths.
     pub const fn new(schema_paths: &'a [&'static str]) -> Self {
-        Self { schema_paths }
+        Self {
+            schema_paths,
+            predicates: &[],
+            instances: &[],
+            subtree_plan: None,
+        }
+    }
+
+    /// Restricts already-authorized entries to schema-validated key equalities.
+    pub const fn with_predicates(
+        mut self,
+        predicates: &'a [opc_mgmt_schema::NetconfKeyPredicate],
+    ) -> Self {
+        self.predicates = predicates;
+        self
+    }
+
+    /// Instance selectors; these never grant permission to any schema node.
+    pub const fn predicates(&self) -> &'a [opc_mgmt_schema::NetconfKeyPredicate] {
+        self.predicates
+    }
+
+    /// Retains correlated alternatives from a subtree instance selection.
+    pub const fn with_instances(
+        mut self,
+        instances: &'a [opc_mgmt_schema::NetconfInstanceBranch],
+    ) -> Self {
+        self.instances = instances;
+        self
+    }
+
+    /// Original instance constraints, separate from schema authorization.
+    pub const fn instances(&self) -> &'a [opc_mgmt_schema::NetconfInstanceBranch] {
+        self.instances
+    }
+
+    /// Carries a completely authorized content plan into typed projection.
+    pub fn with_subtree_plan(plan: &'a AuthorizedSubtreePlan) -> Self {
+        Self {
+            schema_paths: plan.paths(),
+            predicates: &[],
+            instances: &[],
+            subtree_plan: Some(plan),
+        }
+    }
+
+    /// The constrained plan, which a renderer must honor or explicitly refuse.
+    pub const fn subtree_plan(&self) -> Option<&'a AuthorizedSubtreePlan> {
+        self.subtree_plan
+    }
+
+    pub(crate) fn require_schema_only(self) -> Result<(), BindingError> {
+        if self.subtree_plan.is_some() {
+            return Err(BindingError::projection(
+                "constrained subtree projection is required",
+            ));
+        }
+        Ok(())
     }
 
     /// Predicate-free schema-node paths the caller may read.
@@ -331,6 +394,12 @@ impl StartupDatastoreError {
 /// responsible for durable, atomic writes appropriate for their CNF.
 pub trait StartupDatastore<C: OpcConfig>: Send + Sync {
     /// Loads the complete startup config, if one exists.
+    ///
+    /// Implementations must enforce their datastore's stored-byte, collection
+    /// and allocation limits before loading or decoding the configuration.
+    /// This interface supplies a complete snapshot, including rows a subsequent
+    /// read may deny. NETCONF subtree authorization gates projection of that
+    /// snapshot; its work budget does not bound this storage or decoding step.
     fn load_startup_config(&self) -> Result<Option<C>, StartupDatastoreError>;
 
     /// Replaces the complete startup config.
@@ -371,6 +440,74 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Whether this binding can honor the typed, bounded content-plan contract.
+    fn supports_subtree_content(&self) -> bool {
+        self.generated_xml_renderer()
+            .is_some_and(|renderer| renderer.supports_subtree_content())
+    }
+
+    /// Default processing used by an ordinary read without `with-defaults`.
+    ///
+    /// The default XML rendering hooks use trim. A binding that overrides
+    /// their ordinary default processing must return the same report here so
+    /// content matches see exactly the values its unfiltered read reports.
+    fn subtree_default_report(&self) -> DefaultReport {
+        DefaultReport::Trim
+    }
+
+    /// Captures only authorized typed values before content matching.
+    ///
+    /// Implementations must gate every row and value through the plan's shared
+    /// projection context. A schema-only or pre-rendered XML fallback is unsafe.
+    fn project_subtree_content(
+        &self,
+        config: &C,
+        selection: ReadSelection<'_>,
+        report: DefaultReport,
+    ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError> {
+        let renderer = self
+            .generated_xml_renderer()
+            .ok_or(SubtreeError::Unsupported)?;
+        if !renderer.supports_subtree_content()
+            || !renderer.supported_default_reports().contains(&report)
+        {
+            return Err(SubtreeError::Unsupported);
+        }
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        renderer.project_subtree_content(config, &plan.projection(self.schema_registry(), report))
+    }
+
+    /// Typed, bounded YANG Library projection for a constrained content read.
+    /// Custom discovery bindings must implement this hook or refuse the read.
+    fn project_yang_library_content(
+        &self,
+        selection: ReadSelection<'_>,
+    ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError> {
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        discovery::project_yang_library(
+            self.schema_registry(),
+            &plan.projection(
+                crate::filter::yang_library_registry(),
+                DefaultReport::Explicit,
+            ),
+        )
+    }
+
+    /// Typed, bounded NETCONF monitoring projection for a constrained read.
+    fn project_netconf_monitoring_content(
+        &self,
+        selection: ReadSelection<'_>,
+    ) -> Result<Vec<opc_mgmt_schema::NetconfXmlNode>, SubtreeError> {
+        let plan = selection.subtree_plan().ok_or(SubtreeError::Unsupported)?;
+        discovery::project_netconf_monitoring(
+            self.schema_registry(),
+            &plan.projection(
+                crate::filter::netconf_monitoring_registry(),
+                DefaultReport::Explicit,
+            ),
+        )
+    }
+
     /// Optional generated NETCONF XML edit applicator for this binding.
     ///
     /// When a CNF returns `Some`, the default
@@ -380,6 +517,14 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     /// decline running writes even when `:writable-running` is advertised.
     fn generated_xml_edit_applicator(&self) -> Option<&dyn NetconfXmlEditApplicator<C>> {
         None
+    }
+
+    /// Whether configuration projection honors every key predicate in
+    /// [`ReadSelection::predicates`]. The generated renderer implements this.
+    /// A custom renderer must explicitly opt in after implementing instance
+    /// matching; otherwise keyed XPath filters fail before projection.
+    fn key_predicates_supported(&self) -> bool {
+        self.generated_xml_renderer().is_some()
     }
 
     /// Renders the currently published running config for the authorized paths.
@@ -392,13 +537,19 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         config: &C,
         selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
+        selection.require_schema_only()?;
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
             BindingError::projection(
                 "NETCONF running XML projection is not provided by this binding",
             )
         })?;
         renderer
-            .render_running_config(config, selection.schema_paths(), DefaultReport::Trim)
+            .render_selected_config(
+                config,
+                selection.schema_paths(),
+                selection.predicates(),
+                DefaultReport::Trim,
+            )
             .map_err(projection_error)
     }
 
@@ -472,6 +623,7 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         selection: ReadSelection<'_>,
         mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
+        selection.require_schema_only()?;
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
             BindingError::projection(
                 "NETCONF with-defaults running projection is not provided by this binding",
@@ -484,7 +636,12 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
             ));
         }
         renderer
-            .render_running_config(config, selection.schema_paths(), report)
+            .render_selected_config(
+                config,
+                selection.schema_paths(),
+                selection.predicates(),
+                report,
+            )
             .map_err(projection_error)
     }
 
@@ -515,28 +672,17 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         operational: &OperationalResponse,
         operational_selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
-        let mut out = String::new();
-        if let Some(renderer) = self.generated_xml_renderer() {
-            out.push_str(
-                &renderer
-                    .render_running_config(
-                        config,
-                        config_selection.schema_paths(),
-                        DefaultReport::Trim,
-                    )
-                    .map_err(projection_error)?,
-            );
-        } else if !operational.values.is_empty() {
-            return Err(BindingError::projection(
-                "NETCONF operational XML projection is not provided by this binding",
-            ));
-        }
-        out.push_str(&render_operational_xml(
+        config_selection.require_schema_only()?;
+        operational_selection.require_schema_only()?;
+        render_selected_data(
             self.schema_registry(),
-            operational_selection.schema_paths(),
+            self.generated_xml_renderer(),
+            config,
+            config_selection,
             operational,
-        )?);
-        Ok(out)
+            operational_selection,
+            DefaultReport::Trim,
+        )
     }
 
     /// Renders NETCONF `<get>` data for an RFC 6243 with-defaults request.
@@ -553,6 +699,8 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         operational_selection: ReadSelection<'_>,
         mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
+        config_selection.require_schema_only()?;
+        operational_selection.require_schema_only()?;
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
             BindingError::projection(
                 "NETCONF with-defaults data projection is not provided by this binding",
@@ -564,15 +712,15 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
                 "NETCONF with-defaults report mode is not supported by the generated renderer",
             ));
         }
-        let mut out = renderer
-            .render_running_config(config, config_selection.schema_paths(), report)
-            .map_err(projection_error)?;
-        out.push_str(&render_operational_xml(
+        render_selected_data(
             self.schema_registry(),
-            operational_selection.schema_paths(),
+            Some(renderer),
+            config,
+            config_selection,
             operational,
-        )?);
-        Ok(out)
+            operational_selection,
+            report,
+        )
     }
 
     /// Returns the advertised RFC 8525 YANG Library capability, if this binding
@@ -792,45 +940,45 @@ pub fn render_operational_xml(
     paths: &[&'static str],
     operational: &OperationalResponse,
 ) -> Result<String, BindingError> {
-    if paths.is_empty() || operational.values.is_empty() {
-        return Ok(String::new());
-    }
+    let nodes = operational_xml::operational_nodes(registry, paths, operational)?;
+    render_netconf_data(registry, &nodes, DefaultReport::Trim).map_err(projection_error)
+}
 
-    let ctx = NetconfXmlRenderContext::new(registry, paths, DefaultReport::Trim);
-    let mut out = String::new();
-
-    for path in paths {
-        let Some(node) = registry.node(path) else {
-            continue;
-        };
-        if node.config || node.kind != opc_mgmt_schema::NodeKind::Leaf {
-            continue;
-        }
-
-        let yang_path = YangPath::new(*path).map_err(|_| {
-            BindingError::projection("NETCONF operational path is not a valid YangPath")
-        })?;
-        let Some(value) = operational.value_for(&yang_path) else {
-            continue;
-        };
-
-        let json_value: serde_json::Value = serde_json::from_str(value.value_json())
-            .map_err(|_| BindingError::projection("NETCONF operational value is not valid JSON"))?;
-
-        let raw = match json_value {
-            serde_json::Value::Null => continue,
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                return Err(BindingError::projection(
-                    "NETCONF operational value is not a scalar and cannot be rendered as XML",
-                ));
-            }
-        };
-
-        out.push_str(&ctx.format_leaf(path, &raw).map_err(projection_error)?);
-    }
-
-    Ok(out)
+fn render_selected_data<C: OpcConfig>(
+    registry: &'static dyn SchemaRegistry,
+    renderer: Option<&dyn NetconfXmlRenderer<C>>,
+    config: &C,
+    config_selection: ReadSelection<'_>,
+    operational: &OperationalResponse,
+    operational_selection: ReadSelection<'_>,
+    report: DefaultReport,
+) -> Result<String, BindingError> {
+    let has_config_data = config_selection.schema_paths().iter().any(|path| {
+        registry.node(path).is_some_and(|node| {
+            node.presence || matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList)
+        })
+    });
+    let mut nodes = if !has_config_data {
+        Vec::new()
+    } else {
+        renderer
+            .ok_or_else(|| {
+                BindingError::projection("NETCONF XML projection is not provided by this binding")
+            })?
+            .render_selected_nodes(
+                config,
+                config_selection.schema_paths(),
+                config_selection.predicates(),
+                config_selection.instances(),
+                report,
+            )
+            .map_err(projection_error)?
+    };
+    let state = operational_xml::operational_nodes(
+        registry,
+        operational_selection.schema_paths(),
+        operational,
+    )?;
+    merge_netconf_data(registry, &mut nodes, state).map_err(projection_error)?;
+    render_netconf_data(registry, &nodes, report).map_err(projection_error)
 }

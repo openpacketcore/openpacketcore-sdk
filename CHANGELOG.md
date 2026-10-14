@@ -9,10 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-mgmt-authz` and `opc-gnmi-server`: gNMI Subscribe requires the policy source to implement the new `PolicySource::watch_authorization`; the default refuses every subscription with `UNAVAILABLE`. Register live sources through `AuthorizationChangeHub` and install each policy or principal-context change with `activate`; use `AuthorizationWatch::immutable` only for a context that cannot change during a subscription. A stream that loses a previously allowed schema permission closes with `UNAVAILABLE` and no keyed delete. Denied operational events no longer write per-event `ACCESS_DENIED` audit records. `Debug` for path-bearing gNMI, path-resolver and operational-state types and for `GnmiError` now prints only the type name. (#1269)
+
 - `opc-yanggen`: `NumericRangeInterval` IR bounds are now `i128` to represent
   all YANG integer limits; convert typed `i64` inputs with `.into()`. `TypeRef`
   adds integer-width and restricted-string variants. Existing runtime `i64`
   range metadata remains compatible. (#1006, #1263)
+
+- `opc-mgmt-schema`: NETCONF renderers used by the default `<get>` and
+  operational `<get-data>` binding hooks must implement `render_selected_nodes`.
+  Regenerate model bindings or project authorized configuration into
+  `NetconfDataNode` values so configuration and state merge by complete list
+  identity before masking. Renderers without this contract fail closed.
+  Regenerate gNMI JSON bindings as well. Key predicates are literal XPath strings:
+  double-quoted when the value contains an apostrophe, with backslashes kept
+  literal. Predicates written by earlier generated renderers are no longer
+  unescaped. `OperationalRequest` adds public `max_values` and `max_value_bytes`
+  fields; construct it with `OperationalRequest::new`. `OperationalResponseError`,
+  `PathError` and `FilterError` add variants. (#1270)
 
 - `opc-proto-nas`: `MmMessageBody::ConfigurationUpdateCommand` and
   `MmMessageBody::ConfigurationUpdateComplete` now carry the typed
@@ -38,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-peer-discovery`: add `DnsAnswer::filter_snaptr_paths` to apply consumer
+  path policy while preserving the original seeded S-NAPTR traversal order.
+  Surviving paths determine endpoint order and primary provenance; original
+  discovery coverage, record times and failure bounds are retained. (#1276)
+
 - `opc-yanggen`: support all eight integer widths, exact declared ranges,
   RFC 7951 strings for 64-bit values, and deterministic distinct Rust types for
   nested nodes sharing a local name. Support Unicode string lengths, multiple
@@ -50,6 +69,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whitespace trimming, and quoted concatenation. Value-less list-entry patches
   assign and validate path keys, and integer defaults decode octal and
   hexadecimal notation for every width.
+
+- Management reads expand unkeyed and partially keyed operational selections
+  into bounded, canonical instances. gNMI Get and Subscribe preserve literal
+  keys, mask operational payloads, and reject incomplete identities; NETCONF
+  `<get>` and operational `<get-data>` preserve subtree key matches, branch
+  selections, list ancestry, and configuration order. Matches against masked
+  keys are refused before authorization or data access. Providers receive the
+  response count and byte budgets; overflows fail without truncation. (#1270)
+
+- `opc-netconf-server`, `opc-mgmt-schema`, `opc-mgmt-limits`, `opc-yanggen`:
+  subtree content matching on scalar key and non-key leaves for `<get-config>`,
+  `<get>` and `<get-data>` (RFC 6241 section 6.2.5). Output, match leaves and
+  identifying keys are authorized together in one policy context before data
+  access; matches on leaves whose data class does not allow cleartext are
+  refused from the schema; matching follows with-defaults handling and preserves
+  instance correlation, masking and list order. New limits
+  `MgmtLimits::max_subtree_filter_nodes` (default 1024) and
+  `MgmtLimits::max_subtree_filter_work_units` (default 16777216) bound the filter
+  and plan size and the checked work of parsing, compilation and evaluation.
+  Masked list keys are captured as fixed-width request-local identities, and
+  evaluation work is reserved from the original captures before any identity
+  comparison. Startup content reads load the stored snapshot through
+  `StartupDatastore`, whose implementations must bound loading and decoding.
+  (#1272)
 
 - `opc-proto-nas`: frame optional elements with complete per-message tables
   from TS 24.501 V18.11.1: Registration Request (42), Registration Accept (60),
@@ -454,6 +497,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `opc-mgmt-authz`, `opc-gnmi-server`, `opc-netconf-server` and `opc-yanggen`: reads authorize each requested node with every composite and ancestor-list key in one policy context, using the Read or Subscribe action. An entry with a denied or unknown key is omitted before stored rows or providers are read, in gNMI Get and Subscribe and in NETCONF `<get>`, `<get-config>` and `<get-data>`; NETCONF previously failed with `operation-failed` when such an entry existed. NETCONF list-child selections now carry their keys. gNMI reads lists whose sensitive keys allow cleartext; security-secret, lawful-intercept and secret-name keys keep the fixed gNMI refusal and masked NETCONF elements. NETCONF XPath filters accept equalities on configuration list keys whose data class allows cleartext. ON_CHANGE compares authorized content without timestamps, `updates_only` seeds that comparison without sending it, and a lag resync sends `sync_response` only when that content changed. (#1269)
+
 - `opc-yanggen`: JSON, XML, gNMI reads, canonical configuration, diff and apply
   retain user order. A key index gives expected constant-time lookup and
   amortized constant-time removal; deserialization, unchanged-list diff,
@@ -681,6 +726,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previous children no longer add payload decodes to sequential large-child
   writes. Row, authority, projection and final stored-byte audits remain intact,
   with the original operation deadline.
+
+- `opc-yanggen`: use the declared optional key-leaf representation when
+  extracting or assigning keys of `config false` lists, including composite
+  and sensitive keys. Emit warning-free state-list helpers and statement
+  boundaries; omit state data from configuration diffs for every node kind,
+  including collection removals. Keep patch diagnostics free of input field
+  names, instance paths, and values, including JSON and numeric decoding.
+  Leafref leaf-list validation errors identify the index and target schema
+  without including the referenced value. Omit unreachable NETCONF edit helpers
+  throughout keyless-list subtrees while preserving their rejection stubs.
+  Reject state writes through direct patch helpers, gNMI Set, and NETCONF edit
+  application, including state in ancestor bodies and implicit state removal.
+  Keep defaulted state leaves optional and sensitive numeric key copies lint-free.
+  Compile generated fixtures and check them with Clippy warnings denied (#1268).
+
+- `opc-netconf-server` subtree content reads use fixed-width masked list-key
+  identities so the matching allowance cannot expose hidden key lengths.
+  Original, uncoalesced captures size one complete bound for joins, predicates,
+  copies, deduplication and ordering before comparison. Masked identity equality
+  cannot change downstream fees or the count of admitted predicate trials.
+  Public candidate/startup handlers borrow supplied snapshots, and projection
+  selection checks charge their bounded path lookups. Document the separate
+  startup binding limits required before full-snapshot loading. (#1272)
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at

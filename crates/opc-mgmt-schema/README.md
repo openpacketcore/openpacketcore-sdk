@@ -22,6 +22,10 @@ Core exports:
   `NetconfXmlRenderer`, `NetconfXmlEditApplicator`, `EditConfigNode`,
   `NetconfXmlRenderContext`, `EditOperation`, and NETCONF projection/edit
   error types.
+- `NetconfXmlNode`, canonical instance selectors and `NetconfXmlRenderContext::render_nodes` for
+  serializing an authorized, validated projection with existing masking rules.
+- The `subtree` module's scalar codec, authorization-pruned plans, shared work
+  budget and typed projection context for bounded subtree content reads.
 
 Typical generated use:
 
@@ -66,9 +70,14 @@ Current scope is intentionally small and contract-oriented:
 
 - Default discovery and schema-source methods are empty unless implementors
   provide metadata.
-- NETCONF XML render/apply traits are contracts only; there is no generic XML
-  projection engine in this crate.
+- NETCONF typed model access remains a generated or binding-specific contract.
+  The shared tree serializer and subtree evaluator consume an already
+  authorized projection; they do not traverse arbitrary config models.
 - NACM actions are metadata hints, not an authorization engine.
+
+The [subtree content read contract](../../docs/design/netconf-subtree-content-reads.md)
+describes supported scalar comparisons, default handling, pre-access
+authorization and budget obligations for custom projectors.
 
 ## Roadmap
 

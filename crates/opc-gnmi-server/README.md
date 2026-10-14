@@ -40,6 +40,45 @@ policy source, config JSON renderer, and optional operational-state providers.
 Default config rendering fails closed unless implemented by generated or
 CNF-specific code.
 
+## Reading keyed lists
+
+Get and every Subscribe emission require permission for the requested node and
+all identifying key leaves in one active policy context. Denied dependencies
+omit the entry before projection or provider calls, including malformed hidden
+rows. Unrequested key dependencies do not add key-leaf updates. A structural
+parent grants no child permission.
+
+Generated projection uses the real key for data classes that allow cleartext,
+including subscriber identifiers and network-sensitive keys. A selected key
+leaf has the same value as its path predicate. Security-secret, lawful-intercept,
+and secret-name-inferred keys remain unaddressable in gNMI: a granted nonempty
+configuration list returns the existing fixed schema refusal; a denied list is
+omitted. Payload masking and the model's redacted formatters remain in effect.
+Read paths escape quotes and backslashes consistently with generated projection;
+the public write-path resolver retains its existing XPath literal contract.
+
+Operational provider requests are pruned before invocation. An opaque container,
+entry, or list value is admitted only when every descendant and identifying key
+is allowed and no identifying key forbids cleartext. The server does not edit
+provider JSON. Hidden events are dropped before event validation, JSON/size work
+and per-event auditing. Path-bearing protocol/provider `Debug` output omits
+values; diagnostics, audit paths and metric labels must remain schema-only.
+
+Live subscriptions require the
+[`PolicySource` change contract](../opc-mgmt-authz/README.md#list-identity-and-subscription-contexts).
+Control reevaluation has priority over data work and does not wait for providers,
+audit acknowledgements or output capacity. Losing any previously allowed schema
+permission closes the stream with `UNAVAILABLE` and the fixed message
+`gNMI service unavailable`; no keyed delete is sent. Clients re-subscribe under
+the new context. Registration, notification delivery or refresh failure also
+fails closed. Hidden events do not supply or accelerate this control trigger.
+
+ON_CHANGE compares authorized content without observation timestamps.
+`updates_only` seeds that comparison without sending a snapshot. A lag resync
+sends a snapshot and `sync_response` only when that content changed. Requested
+SAMPLE and heartbeat intervals retain their cadence independently of excluded
+keys and values.
+
 ## Async audit acknowledgement
 
 Capabilities, Get, Set, and Subscribe audit through

@@ -49,6 +49,7 @@ pub mod service;
 pub mod set;
 pub mod smoke;
 pub mod subscribe;
+mod subscription_auth;
 pub mod supervision;
 pub mod transport;
 pub mod value;

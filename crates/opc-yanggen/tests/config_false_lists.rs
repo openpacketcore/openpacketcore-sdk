@@ -1,0 +1,274 @@
+mod common;
+
+use opc_yanggen::{generation_input_from_yang_sources, rust::generate_rust, YangSource};
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+const MINIMAL_STATE: &str = r#"
+module minimal-state {
+  yang-version 1.1;
+  namespace "urn:example:minimal-state";
+  prefix ms;
+  revision 2026-10-12;
+  container state {
+    config false;
+    list error {
+      key "reason";
+      leaf reason { type string; }
+      leaf count { type uint32; }
+    }
+  }
+}
+"#;
+
+const MIXED_STATE: &str = r#"
+module mixed-state {
+  yang-version 1.1;
+  namespace "urn:example:mixed-state";
+  prefix mx;
+  revision 2026-10-12;
+  container root {
+    leaf hostname { type string; }
+    leaf count { type uint32; }
+    leaf health { config false; type boolean; }
+    leaf-list state-label { config false; type string; }
+    leaf-list counters { type uint32; }
+    leaf-list references { type leafref { path '/mx:root/mx:hostname'; } }
+    leaf-list api-token { type leafref { path '/mx:root/mx:hostname'; } }
+    list account {
+      key 'token';
+      leaf token { type string; }
+      leaf count { type uint32; }
+      container telemetry {
+        config false;
+        leaf packets { type uint32; }
+      }
+    }
+    list channel {
+      key "name";
+      ordered-by user;
+      leaf name { type string; }
+      leaf setting { type string; }
+      container status {
+        config false;
+        leaf count { type uint32; }
+      }
+    }
+    container branch {
+      leaf setting { type string; }
+      container branch-state {
+        config false;
+        leaf count { type uint32; }
+      }
+    }
+    container state {
+      config false;
+      list error {
+        key "reason";
+        leaf reason { type string; }
+        leaf count { type uint32; }
+      }
+    }
+  }
+}
+"#;
+
+const NESTED_STATE: &str = r#"
+module nested-state {
+  yang-version 1.1;
+  namespace "urn:example:nested-state";
+  prefix ns;
+  revision 2026-10-12;
+  container state {
+    config false;
+    leaf-list label { type string; }
+    list observation {
+      leaf value { type uint32; }
+    }
+    list sample {
+      key "name";
+      leaf name { type string; }
+      container detail {
+        leaf count { type uint32; }
+      }
+    }
+  }
+}
+"#;
+
+const STATE_KEY_LEAFREF: &str = r#"
+module leafref-state {
+  yang-version 1.1;
+  namespace "urn:example:leafref-state";
+  prefix ls;
+  container state {
+    config false;
+    leaf target { type uint64; }
+    list row {
+      key id;
+      leaf id { type leafref { path '/ls:state/ls:target'; } }
+    }
+  }
+}
+"#;
+
+const ORDERED_PARENT_COPY_CHILD: &str = r#"
+module ordered-numeric {
+  yang-version 1.1;
+  namespace "urn:example:ordered-numeric";
+  prefix on;
+  container root {
+    list service {
+      key name;
+      ordered-by user;
+      leaf name { type string; }
+      list counter {
+        key count;
+        leaf count { type uint32; }
+      }
+    }
+    container state {
+      config false;
+      list sample {
+        key name;
+        leaf name { type string; }
+      }
+    }
+  }
+}
+"#;
+
+#[test]
+fn generated_config_false_keyed_lists_compile_and_pass_clippy() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let src = scratch.path().join("src");
+    fs::create_dir(&src).unwrap();
+    let mut lib = String::new();
+    let state_key_leafref_u32 = STATE_KEY_LEAFREF.replace("uint64", "uint32");
+    for (name, source) in [
+        ("minimal", MINIMAL_STATE),
+        ("mixed", MIXED_STATE),
+        ("nested", NESTED_STATE),
+        ("ordered_numeric", ORDERED_PARENT_COPY_CHILD),
+        ("keys", include_str!("fixtures/config_false_lists.yang")),
+        (
+            "keyless",
+            include_str!("fixtures/nested_keyless_state.yang"),
+        ),
+        (
+            "deep_keyless",
+            include_str!("fixtures/deep_keyless_state.yang"),
+        ),
+        ("combined", include_str!("fixtures/combined_state.yang")),
+        ("state_unique", include_str!("fixtures/state_unique.yang")),
+        (
+            "expanded_unique",
+            include_str!("fixtures/expanded_unique.yang"),
+        ),
+        ("leafref_u64", STATE_KEY_LEAFREF),
+        ("leafref_u32", state_key_leafref_u32.as_str()),
+        (
+            "leafref_traversal",
+            include_str!("fixtures/state_leafref_traversal.yang"),
+        ),
+    ] {
+        // The combined fixture also exercises extended scalars, constraints,
+        // and repeated list names together with optional state-list fields.
+        let input = generation_input_from_yang_sources(
+            "config-false-lists",
+            &[YangSource::new(format!("{name}.yang"), source)],
+        )
+        .unwrap();
+        let output = src.join(name);
+        fs::create_dir(&output).unwrap();
+        for (file, content) in generate_rust(&input.to_canonical()).unwrap() {
+            fs::write(output.join(file), content).unwrap();
+        }
+        lib.push_str(&format!("pub mod {name};\n"));
+    }
+    fs::write(src.join("lib.rs"), lib).unwrap();
+    let dependencies = [
+        "opc-config-model",
+        "opc-types",
+        "opc-data-governance",
+        "opc-mgmt-schema",
+        "opc-mgmt-limits",
+        "opc-redaction",
+        "opc-gnmi-server",
+        "opc-netconf-server",
+    ]
+    .into_iter()
+    .map(|name| {
+        format!(
+            "{name} = {{ path = {:?} }}\n",
+            workspace.join("crates").join(name)
+        )
+    })
+    .collect::<String>();
+    fs::write(
+        scratch.path().join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "generated-config-false-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = {{ version = "1.0", features = ["derive"] }}
+serde_json = "1.0"
+time = "={}"
+{}"#,
+            common::locked_version(workspace, "time"),
+            dependencies,
+        ),
+    )
+    .unwrap();
+    let tests = scratch.path().join("tests");
+    fs::create_dir(&tests).unwrap();
+    fs::write(
+        tests.join("state_lists.rs"),
+        include_str!("fixtures/config_false_lists_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests.join("combined_state.rs"),
+        include_str!("fixtures/combined_state_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests.join("state_leafrefs.rs"),
+        include_str!("fixtures/state_leafrefs_test.rs"),
+    )
+    .unwrap();
+
+    fs::write(
+        tests.join("state_unique.rs"),
+        include_str!("fixtures/state_unique_test.rs"),
+    )
+    .unwrap();
+
+    for args in [
+        vec!["test", "--no-fail-fast", "--", "--test-threads=4"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let status = Command::new("cargo")
+            .args(&args)
+            .env("RUSTFLAGS", "-Dwarnings")
+            .env(
+                "CARGO_TARGET_DIR",
+                workspace.join("target/yanggen-generated"),
+            )
+            .current_dir(scratch.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "generated state-list {args:?} failed");
+    }
+}

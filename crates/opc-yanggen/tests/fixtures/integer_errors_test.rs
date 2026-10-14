@@ -45,12 +45,19 @@ fn integer_json_refusals_have_exact_value_free_reasons() {
 fn malformed_subtree_patches_are_atomic_and_value_free() {
     let baseline: Root = serde_json::from_value(json!({"example:secret-uint8": 1})).unwrap();
     for body in invalid_integer_bodies() {
+        // State writes are rejected before parsing their values. The serde test
+        // above still checks the exact integer diagnostic for this same body.
+        let (kind, reason) = if body.get("example:state").is_some() {
+            ("read-only", "cannot modify read-only path")
+        } else {
+            ("invalid-value", "invalid integer value")
+        };
         for operation in [patch::ConfigOp::Update, patch::ConfigOp::Merge, patch::ConfigOp::Replace] {
             let mut candidate = baseline.clone();
             let segments = patch::parse_path("").unwrap();
             let error = candidate.apply_patch_segments(&operation, &segments, Some(&body.to_string())).unwrap_err();
-            assert_eq!(error.kind(), "invalid-value");
-            assert_eq!(error.message(), "invalid integer value");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.message(), reason);
             assert_eq!(candidate, baseline);
         }
         let mut candidate = baseline.clone();
@@ -58,8 +65,8 @@ fn malformed_subtree_patches_are_atomic_and_value_free() {
             patch::ConfigDelta::Update(YangPath::new("/ex:root/ex:secret-uint8").unwrap(), "2".into()),
             patch::ConfigDelta::Replace(YangPath::new("/ex:root").unwrap(), body.to_string()),
         ]).unwrap_err();
-        assert_eq!(error.kind(), "invalid-value");
-        assert_eq!(error.message(), "invalid integer value");
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.message(), reason);
         assert_eq!(candidate, baseline);
     }
     assert_eq!(baseline.validate_syntax(), Ok(()));

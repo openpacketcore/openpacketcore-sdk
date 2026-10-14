@@ -86,6 +86,39 @@ fn sensitive_key_preserves_conditional_scalar_traits() {
 }
 
 #[test]
+fn sensitive_key_permitted_read() {
+    let marker = "subscriber/'\\]sensitive-key";
+    let system: System = serde_json::from_value(json!({
+        "subscriber": [{ "imsi": marker, "tier": "selected-tier" }],
+        "secret": "non-key-secret-marker"
+    })).expect("synthetic configuration");
+    let updates = render(&system, vec![
+        entry("/ex:system/ex:subscriber/ex:imsi", "/ex:system/ex:subscriber/ex:imsi"),
+        entry("/ex:system/ex:subscriber/ex:tier", "/ex:system/ex:subscriber/ex:tier"),
+        entry("/ex:system/ex:secret", "/ex:system/ex:secret"),
+    ]);
+    let canonical = r#"/ex:system/ex:subscriber[ex:imsi="subscriber/'\]sensitive-key"]"#;
+    assert_eq!(updates.len(), 3);
+    assert!(updates.contains(&(format!("{canonical}/ex:imsi"), serde_json::to_string(marker).unwrap())));
+    assert!(updates.contains(&(format!("{canonical}/ex:tier"), "\"selected-tier\"".to_string())));
+    let secret = updates.iter().find(|(path, _)| path == "/ex:system/ex:secret").unwrap();
+    assert!(!secret.1.contains("non-key-secret-marker"));
+    assert_eq!(serde_json::from_str::<String>(&secret.1).unwrap(), "<redacted>");
+}
+
+#[test]
+fn sensitive_key_direct_child_read() {
+    let system = sample_config();
+    assert_eq!(render(&system, vec![entry(
+        "/ex:system/ex:subscriber/ex:tier",
+        "/ex:system/ex:subscriber[ex:imsi='001010000000001']/ex:tier",
+    )]), vec![(
+        "/ex:system/ex:subscriber[ex:imsi='001010000000001']/ex:tier".to_string(),
+        "\"gold\"".to_string(),
+    )]);
+}
+
+#[test]
 fn selected_leaf_only_does_not_leak_siblings() {
     let system = sample_config();
     let updates = render(
@@ -193,6 +226,76 @@ fn multi_key_list_paths_use_schema_key_order() {
 }
 
 #[test]
+fn generated_key_paths_preserve_literal_and_trailing_backslashes() {
+    let mut system = System::default();
+    let name = r"branch\tail\";
+    let mut interface = Interfaces::default();
+    interface.name = LeafPresence::Explicit(name.to_string());
+    interface.mtu = LeafPresence::Explicit(1500);
+    system.interfaces.insert(name.to_string(), interface);
+
+    let updates = render(
+        &system,
+        vec![entry(
+            "/ex:system/ex:interfaces/ex:mtu",
+            "/ex:system/ex:interfaces/ex:mtu",
+        )],
+    );
+    assert_eq!(
+        updates,
+        vec![(
+            r"/ex:system/ex:interfaces[ex:name='branch\tail\']/ex:mtu".to_string(),
+            "1500".to_string(),
+        )]
+    );
+}
+
+#[test]
+fn generated_key_paths_use_xpath_literals_for_apostrophes() {
+    let mut system = System::default();
+    let name = "branch'/[]=";
+    let mut interface = Interfaces::default();
+    interface.name = LeafPresence::Explicit(name.to_string());
+    interface.mtu = LeafPresence::Explicit(1500);
+    system.interfaces.insert(name.to_string(), interface);
+
+    let updates = render(
+        &system,
+        vec![entry(
+            "/ex:system/ex:interfaces/ex:mtu",
+            "/ex:system/ex:interfaces/ex:mtu",
+        )],
+    );
+    assert_eq!(
+        updates,
+        vec![(
+            r#"/ex:system/ex:interfaces[ex:name="branch'/[]="]/ex:mtu"#.to_string(),
+            "1500".to_string(),
+        )]
+    );
+}
+
+#[test]
+fn generated_key_paths_refuse_both_quote_characters_without_value_detail() {
+    let mut system = System::default();
+    let name = "private-key'\"";
+    let mut interface = Interfaces::default();
+    interface.name = LeafPresence::Explicit(name.to_string());
+    interface.mtu = LeafPresence::Explicit(1500);
+    system.interfaces.insert(name.to_string(), interface);
+    let entries = vec![entry(
+        "/ex:system/ex:interfaces/ex:mtu",
+        "/ex:system/ex:interfaces/ex:mtu",
+    )];
+    let schema_paths = ["/ex:system/ex:interfaces/ex:mtu"];
+    let err = renderer()
+        .render_running_json(&system, ReadSelection::with_entries(&schema_paths, &entries))
+        .expect_err("unrepresentable identity must fail closed");
+    assert!(!err.detail().contains("private-key"));
+    assert!(!format!("{err:?}").contains("private-key"));
+}
+
+#[test]
 fn leaf_list_renders_json_array() {
     let system = sample_config();
     let updates = render(
@@ -245,7 +348,7 @@ fn unsupported_custom_leaf_list_fails_closed() {
 }
 
 #[test]
-fn sensitive_list_key_fails_closed_without_key_value_leak() {
+fn sensitive_list_key_renders_without_diagnostic_value_leak() {
     let system = sample_config();
     let entries = vec![entry(
         "/ex:system/ex:subscriber/ex:tier",
@@ -256,11 +359,12 @@ fn sensitive_list_key_fails_closed_without_key_value_leak() {
         .map(ReadSelectionEntry::schema_path)
         .collect::<Vec<_>>();
 
-    let err = renderer()
+    let updates = renderer()
         .render_running_json(&system, ReadSelection::with_entries(&schema_paths, &entries))
-        .unwrap_err();
+        .unwrap();
 
-    assert!(!err.detail().contains("001010000000001"));
+    assert_eq!(updates.len(), 1);
+    assert!(!format!("{updates:?}").contains("001010000000001"));
 }
 
 fn decode_error(value: Value) -> String {

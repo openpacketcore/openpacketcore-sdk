@@ -1788,3 +1788,6 @@ async fn running_dead_sibling_does_not_cut_a_slow_healthy_answer() {
     );
     assert_eq!(answer.snaptr_coverage().unwrap().failed_branches, 1);
 }
+
+#[path = "dns_snaptr_filter_tests.rs"]
+mod path_filter;

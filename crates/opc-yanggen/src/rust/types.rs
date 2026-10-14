@@ -16,6 +16,60 @@ pub fn is_sensitive_node(node: &SchemaNode) -> bool {
     }
 }
 
+/// Wrap a parsed leaf value in the same representation as its generated field.
+pub(super) fn explicit_leaf_value(node: &SchemaNode, value: TokenStream) -> TokenStream {
+    let presence = if node.config {
+        quote! { LeafPresence::Explicit(#value) }
+    } else {
+        quote! { Some(#value) }
+    };
+    if is_sensitive_node(node) {
+        quote! { SecretLeaf::new(#presence) }
+    } else {
+        presence
+    }
+}
+
+/// Copies scalar keys in expanded and state-list models, including Copy
+/// sensitive wrappers, and clones keys that own data.
+/// Other models retain their established emitted bytes.
+pub(super) fn cloned_key_value(
+    node: &SchemaNode,
+    nodes_by_path: &NodeIndex<'_>,
+    value: TokenStream,
+    has_state_lists: bool,
+) -> TokenStream {
+    if (has_state_lists || nodes_by_path.expanded_profile) && is_copy_type(node, nodes_by_path) {
+        value
+    } else {
+        quote! { #value.clone() }
+    }
+}
+
+/// Whether the emitted scalar type is Copy, including resolved leafrefs.
+pub(super) fn is_copy_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> bool {
+    matches!(
+        get_raw_type(node, nodes_by_path).to_string().as_str(),
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "YangUint64"
+            | "YangInt64"
+            | "YangDecimal64"
+            | "YangEmpty"
+    )
+}
+
 fn get_raw_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
     get_raw_type_internal(node, nodes_by_path, &mut std::collections::HashSet::new())
 }
@@ -124,6 +178,7 @@ fn normalized_deserializer(struct_name: &proc_macro2::Ident, fields: &TokenStrea
 }
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let mut tokens = TokenStream::new();
     let nodes_by_path = NodeIndex::new(&input.nodes);
     let normalize_errors =
@@ -359,6 +414,26 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
     };
 
+    let (presence_default_derive, absent_default, presence_default_impl) = if has_state_lists {
+        (
+            quote! { #[derive(Default)] },
+            quote! { #[default] },
+            quote! {},
+        )
+    } else {
+        (
+            quote! {},
+            quote! {},
+            quote! {
+                impl<T: Default> Default for LeafPresence<T> {
+                    fn default() -> Self {
+                        Self::Absent
+                    }
+                }
+            },
+        )
+    };
+
     // Emit helper types
     tokens.extend(quote! {
         use serde::{Serialize, Deserialize};
@@ -421,7 +496,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #[derive(Clone, PartialEq)]
+        #presence_default_derive
         pub enum LeafPresence<T> {
+            #absent_default
             Absent,
             Defaulted(T),
             Explicit(T),
@@ -454,11 +531,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 matches!(self, Self::Absent)
             }
         }
-        impl<T: Default> Default for LeafPresence<T> {
-            fn default() -> Self {
-                Self::Absent
-            }
-        }
+        #presence_default_impl
         impl<T: Serialize> Serialize for LeafPresence<T> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
@@ -792,7 +865,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                     // Build default expression
                     let def_expr = get_field_default_expr(child, &nodes_by_path);
-                    if child.default.is_some() {
+                    if child.config && child.default.is_some() {
                         has_defaults = true;
                     }
                     default_fields.push(quote! {
@@ -927,16 +1000,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     }
                     let child = child_node.unwrap();
                     let is_sensitive = is_sensitive_node(child);
+                    let accessor = if child.config {
+                        format_ident!("as_option")
+                    } else {
+                        format_ident!("as_ref")
+                    };
                     if is_sensitive {
                         quote! {
                             self.#field_ident
                                 .get()
-                                .as_option()
+                                .#accessor()
                                 .cloned()
                                 .map(SensitiveKey::from)
                         }
                     } else {
-                        quote! { self.#field_ident.as_option().cloned() }
+                        quote! { self.#field_ident.#accessor().cloned() }
                     }
                 } else {
                     let key_struct_ident = format_ident!("{}Key", nodes_by_path.type_name(node));
@@ -954,10 +1032,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         let child = child_node.unwrap();
                         let is_sensitive = is_sensitive_node(child);
                         let field_ident = format_ident!("{}", to_snake_case(key_field));
-                        let val_expr = if is_sensitive {
-                            quote! { self.#field_ident.get().as_option().cloned()? }
+                        let accessor = if child.config {
+                            format_ident!("as_option")
                         } else {
-                            quote! { self.#field_ident.as_option().cloned()? }
+                            format_ident!("as_ref")
+                        };
+                        let val_expr = if is_sensitive {
+                            quote! { self.#field_ident.get().#accessor().cloned()? }
+                        } else {
+                            quote! { self.#field_ident.#accessor().cloned()? }
                         };
                         key_constructors.extend(quote! {
                             #field_ident: #val_expr,
@@ -1064,6 +1147,15 @@ pub(super) fn numeric_range_check(
 }
 
 fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
+    // Operational values represent observations, not configuration defaults.
+    // Keep their optional field representation even when the schema has a default.
+    if !child.config && child.kind == SchemaNodeKind::Leaf {
+        return if is_sensitive_node(child) {
+            quote! { SecretLeaf::new(None) }
+        } else {
+            quote! { None }
+        };
+    }
     if let Some(ref def_str) = child.default {
         let resolved_type = nodes_by_path.legacy_or_resolved(child).type_ref.as_ref();
         let val_expr = match resolved_type {

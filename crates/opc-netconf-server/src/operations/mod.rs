@@ -5,9 +5,11 @@ use std::future::Future;
 use futures_util::FutureExt;
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditSink};
 
+pub(crate) mod content;
 pub mod get;
 pub mod get_config;
 pub mod get_data;
+mod operational_reads;
 
 #[derive(Clone, Copy)]
 pub(crate) enum AuditMode {

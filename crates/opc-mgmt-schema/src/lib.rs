@@ -29,6 +29,16 @@
 
 pub mod string_constraints;
 
+mod netconf_data;
+pub use netconf_data::{
+    merge_netconf_data, render_netconf_data, NetconfDataNode, NetconfInstanceBranch,
+};
+
+pub mod subtree;
+
+mod netconf_tree;
+pub use netconf_tree::{merge_netconf_nodes, NetconfInstanceSelector, NetconfXmlNode};
+
 pub use opc_data_governance::DataClass;
 
 /// Leaf value type, a closed mirror of `opc_yanggen::ir::TypeRef` minus the
@@ -886,6 +896,24 @@ impl std::error::Error for NetconfProjectionError {}
 /// so the server can render running config (and the config part of `<get>`)
 /// without hand-written XML projection.
 pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
+    /// Whether this renderer supports bounded typed subtree-content projection.
+    /// A constrained read must never fall back to a schema-only renderer.
+    fn supports_subtree_content(&self) -> bool {
+        false
+    }
+
+    /// Projects only the authorized paths in a constrained subtree plan.
+    /// Implementations gate every field and row access through the context and
+    /// charge visits and copies before performing them. Defaults are applied
+    /// before values become available to predicate evaluation.
+    fn project_subtree_content(
+        &self,
+        _config: &C,
+        _context: &subtree::SubtreeProjection<'_>,
+    ) -> Result<Vec<NetconfXmlNode>, subtree::SubtreeError> {
+        Err(subtree::SubtreeError::Unsupported)
+    }
+
     /// Render the running-config XML fragment for the authorized `selection`.
     fn render_running_config(
         &self,
@@ -893,6 +921,43 @@ pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
         selection: &[&str],
         report: DefaultReport,
     ) -> Result<String, NetconfProjectionError>;
+
+    /// Render an authorized selection restricted to matching list instances.
+    /// A renderer that has not implemented predicates must refuse them instead
+    /// of silently returning other instances.
+    fn render_selected_config(
+        &self,
+        config: &C,
+        selection: &[&str],
+        predicates: &[NetconfKeyPredicate],
+        report: DefaultReport,
+    ) -> Result<String, NetconfProjectionError> {
+        if let Some(predicate) = predicates.first() {
+            return Err(NetconfProjectionError::UnsupportedShape {
+                path: predicate.list_path,
+                kind: NodeKind::List,
+            });
+        }
+        self.render_running_config(config, selection, report)
+    }
+
+    /// Projects authorized configuration into nodes that retain real identities
+    /// until configuration and operational state have been merged. Renderers
+    /// must honor each alternative branch and refuse this contract if they
+    /// cannot preserve concrete selection; a schema-only fallback is unsafe.
+    fn render_selected_nodes(
+        &self,
+        _config: &C,
+        _selection: &[&str],
+        _predicates: &[NetconfKeyPredicate],
+        _branches: &[NetconfInstanceBranch],
+        _report: DefaultReport,
+    ) -> Result<Vec<NetconfDataNode>, NetconfProjectionError> {
+        Err(NetconfProjectionError::UnsupportedShape {
+            path: "/",
+            kind: NodeKind::Container,
+        })
+    }
 
     /// Reports which with-defaults modes this renderer implements.
     fn supported_default_reports(&self) -> &'static [DefaultReport];
@@ -1072,6 +1137,27 @@ impl std::fmt::Debug for EditConfigNode {
     }
 }
 
+/// One schema-validated list-key equality used only to select instances.
+/// It never grants access; the entire entry must already be authorized.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NetconfKeyPredicate {
+    /// List schema path.
+    pub list_path: &'static str,
+    /// Key leaf schema path, a direct child of the list.
+    pub key_path: &'static str,
+    /// Literal key value. Values are deliberately excluded from diagnostics.
+    pub value: String,
+}
+
+impl std::fmt::Debug for NetconfKeyPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetconfKeyPredicate")
+            .field("list_path", &self.list_path)
+            .field("key_path", &self.key_path)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Context shared by generated NETCONF XML renderers.
 ///
 /// The context is intentionally immutable: generated container renderers build
@@ -1082,6 +1168,8 @@ pub struct NetconfXmlRenderContext<'a> {
     registry: &'a dyn SchemaRegistry,
     selection: &'a [&'a str],
     report: DefaultReport,
+    predicates: &'a [NetconfKeyPredicate],
+    instances: &'a [&'a NetconfInstanceBranch],
 }
 
 impl<'a> NetconfXmlRenderContext<'a> {
@@ -1095,7 +1183,104 @@ impl<'a> NetconfXmlRenderContext<'a> {
             registry,
             selection,
             report,
+            predicates: &[],
+            instances: &[],
         }
+    }
+
+    /// Restrict authorized entries by their real key values before masking.
+    pub fn with_predicates(mut self, predicates: &'a [NetconfKeyPredicate]) -> Self {
+        self.predicates = predicates;
+        self
+    }
+
+    /// Retains alternative selection branches for the current ancestor tuple.
+    pub fn with_instances<'b>(
+        self,
+        instances: &'b [&'b NetconfInstanceBranch],
+    ) -> NetconfXmlRenderContext<'b>
+    where
+        'a: 'b,
+    {
+        NetconfXmlRenderContext {
+            registry: self.registry,
+            selection: self.selection,
+            report: self.report,
+            predicates: self.predicates,
+            instances,
+        }
+    }
+
+    /// Whether this context contains concrete subtree branch constraints.
+    pub fn has_instance_selection(&self) -> bool {
+        !self.instances.is_empty()
+    }
+
+    /// Filters alternatives using this entry's complete unredacted key tuple.
+    /// Pass the resulting references into the context used for its descendants
+    /// so one sibling branch cannot select another branch's child payload.
+    pub fn matching_instances(
+        &self,
+        list: &str,
+        keys: &[(&str, &str)],
+    ) -> Vec<&'a NetconfInstanceBranch> {
+        self.instances
+            .iter()
+            .copied()
+            .filter(|branch| {
+                branch.schema_paths.iter().any(|path| {
+                    *path == list
+                        || path
+                            .strip_prefix(list)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                }) && branch
+                    .predicates
+                    .iter()
+                    .filter(|predicate| predicate.list_path == list)
+                    .all(|predicate| {
+                        keys.iter().any(|(path, value)| {
+                            *path == predicate.key_path && *value == predicate.value
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    fn instance_selects(&self, path: &str) -> bool {
+        self.instances.is_empty()
+            || self
+                .instances
+                .iter()
+                .any(|branch| branch.schema_paths.contains(&path))
+    }
+
+    /// Whether this key participates in instance selection.
+    pub fn has_key_predicate(&self, path: &str) -> bool {
+        self.predicates
+            .iter()
+            .any(|predicate| predicate.key_path == path)
+    }
+
+    /// Whether an instance filter selects a list strictly below this node.
+    /// Ancestor identifying keys alone cannot satisfy that descendant read.
+    pub fn has_descendant_instance_selection(&self, path: &str) -> bool {
+        self.predicates
+            .iter()
+            .chain(self.instances.iter().flat_map(|branch| &branch.predicates))
+            .any(|predicate| {
+                predicate
+                    .list_path
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+    }
+
+    /// Match one already-authorized key against every equality for that key.
+    pub fn key_matches(&self, path: &str, value: &str) -> bool {
+        self.predicates
+            .iter()
+            .filter(|predicate| predicate.key_path == path)
+            .all(|predicate| predicate.value == value)
     }
 
     /// The report mode in effect for this render.
@@ -1105,7 +1290,7 @@ impl<'a> NetconfXmlRenderContext<'a> {
 
     /// Returns whether `path` itself is in the authorized selection.
     pub fn is_selected(&self, path: &str) -> bool {
-        self.selection.contains(&path)
+        self.selection.contains(&path) && self.instance_selects(path)
     }
 
     /// Returns whether `path` itself or one of its descendants is selected.
@@ -1115,9 +1300,17 @@ impl<'a> NetconfXmlRenderContext<'a> {
     /// ancestor does **not** cover all descendants here: `ReadSelection` is
     /// post-NACM, and structural containers must not authorize sibling leaves.
     pub fn is_subtree_selected(&self, path: &str) -> bool {
-        self.selection.iter().any(|p| {
-            *p == path
-                || p.strip_prefix(path)
+        self.is_selected(path) || self.is_descendant_selected(path)
+    }
+
+    /// Returns whether an authorized node strictly below `path` is selected.
+    /// This distinguishes an explicitly selected empty structural container
+    /// from an ancestor whose requested descendants produced no data.
+    pub fn is_descendant_selected(&self, path: &str) -> bool {
+        self.selection.iter().any(|selected| {
+            self.instance_selects(selected)
+                && selected
+                    .strip_prefix(path)
                     .is_some_and(|suffix| suffix.starts_with('/'))
         })
     }

@@ -42,8 +42,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 render_fns.push(render_list_fn(node, &nodes_by_path)?);
                 has_ordered_projection |= super::is_user_ordered(node)
                     && !node.key_leaves.is_empty()
-                    && !super::types::is_sensitive_node(node)
-                    && !list_has_sensitive_key(node, &nodes_by_path)?;
+                    && !super::types::is_sensitive_node(node);
             }
             SchemaNodeKind::LeafList => {
                 render_fns.push(render_leaf_list_fn(node, &nodes_by_path)?);
@@ -154,17 +153,13 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #[allow(dead_code)]
-        fn append_key_predicate(path: &mut String, key_name: &'static str, raw_value: &str) {
-            path.push('[');
-            path.push_str(key_name);
-            path.push_str("='");
-            for ch in raw_value.chars() {
-                if ch == '\\' || ch == '\'' {
-                    path.push('\\');
-                }
-                path.push(ch);
-            }
-            path.push_str("']");
+        fn append_key_predicate(
+            path: &mut String,
+            key_name: &'static str,
+            raw_value: &str,
+        ) -> Result<(), GnmiJsonProjectionError> {
+            opc_gnmi_server::path::append_key_predicate(path, key_name, raw_value)
+                .map_err(|_| GnmiJsonProjectionError::projection("invalid canonical key literal"))
         }
 
         /// Returns the generated gNMI JSON/RFC 7951 renderer for this schema.
@@ -256,12 +251,13 @@ fn render_list_fn(
     let fn_ident = format_ident!("render_{}", nodes_by_path.helper_name(&node.path));
     let entry_fn_ident = format_ident!("render_{}_entry", nodes_by_path.helper_name(&node.path));
     let entry_type_ident = format_ident!("{}", nodes_by_path.type_name(node));
-    let field_type = sequence_field_type(node, nodes_by_path);
+    let field_type = if node.key_leaves.is_empty() && !super::types::is_sensitive_node(node) {
+        quote! { [super::types::#entry_type_ident] }
+    } else {
+        sequence_field_type(node, nodes_by_path)
+    };
 
-    if super::types::is_sensitive_node(node)
-        || node.key_leaves.is_empty()
-        || list_has_sensitive_key(node, nodes_by_path)?
-    {
+    if super::types::is_sensitive_node(node) || node.key_leaves.is_empty() {
         return Ok(quote! {
             #[allow(dead_code)]
             fn #fn_ident(
@@ -285,6 +281,7 @@ fn render_list_fn(
     }
 
     let entry_fn = render_list_entry_fn(node, nodes_by_path, &entry_fn_ident, &entry_type_ident)?;
+    let key_paths = list_key_schema_paths(node, nodes_by_path)?;
     let iter_expr = quote! { value.values() };
     let render_entries = quote! {
         for entry in #iter_expr {
@@ -305,6 +302,20 @@ fn render_list_fn(
         ) -> Result<(), GnmiJsonProjectionError> {
             if !selection.is_subtree_selected(schema_path) {
                 return Ok(());
+            }
+            // The server has authorized all identifying keys. Data classes
+            // still decide whether a key can be carried in a protocol path.
+            // Refuse before extracting or formatting any stored key value.
+            if ![#(#key_paths),*].iter().all(|path| {
+                super::schema_registry::registry().data_class(path)
+                    .is_some_and(|class| class.allows_cleartext())
+            }) {
+                if value.is_empty() {
+                    return Ok(());
+                }
+                return Err(GnmiJsonProjectionError::projection(format!(
+                    "gNMI JSON projection does not support list at {schema_path}"
+                )));
             }
             #render_entries
             Ok(())
@@ -685,17 +696,18 @@ fn list_key_predicate_stmts(
                 )));
             };
             let raw = #raw;
-            append_key_predicate(&mut entry_canonical_path, #key_schema_name, &raw);
+            append_key_predicate(&mut entry_canonical_path, #key_schema_name, &raw)?;
             let _ = &value.#field_ident;
         });
     }
     Ok(stmts)
 }
 
-fn list_has_sensitive_key(
+fn list_key_schema_paths(
     node: &SchemaNode,
     nodes_by_path: &NodeIndex<'_>,
-) -> Result<bool, RustGenerationError> {
+) -> Result<Vec<String>, RustGenerationError> {
+    let mut paths = Vec::new();
     for key_name in &node.key_leaves {
         let Some(child) = node.child_paths.iter().find_map(|child_path| {
             let child = nodes_by_path.get(child_path)?;
@@ -706,11 +718,9 @@ fn list_has_sensitive_key(
                 node.path, key_name
             )));
         };
-        if super::types::is_sensitive_node(child) {
-            return Ok(true);
-        }
+        paths.push(child.path.clone());
     }
-    Ok(false)
+    Ok(paths)
 }
 
 fn leaf_field_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
