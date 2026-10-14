@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-mgmt-authz` and `opc-gnmi-server`: gNMI Subscribe requires the policy source to implement the new `PolicySource::watch_authorization`; the default refuses every subscription with `UNAVAILABLE`. Register live sources through `AuthorizationChangeHub` and install each policy or principal-context change with `activate`; use `AuthorizationWatch::immutable` only for a context that cannot change during a subscription. A stream that loses a previously allowed schema permission closes with `UNAVAILABLE` and no keyed delete. Denied operational events no longer write per-event `ACCESS_DENIED` audit records. `Debug` for path-bearing gNMI, path-resolver and operational-state types and for `GnmiError` now prints only the type name. (#1269)
+
 - `opc-yanggen`: `NumericRangeInterval` IR bounds are now `i128` to represent
   all YANG integer limits; convert typed `i64` inputs with `.into()`. `TypeRef`
   adds integer-width and restricted-string variants. Existing runtime `i64`
@@ -453,6 +455,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-sorted.
 
 ### Changed
+
+- `opc-mgmt-authz`, `opc-gnmi-server`, `opc-netconf-server` and `opc-yanggen`: reads authorize each requested node with every composite and ancestor-list key in one policy context, using the Read or Subscribe action. An entry with a denied or unknown key is omitted before stored rows or providers are read, in gNMI Get and Subscribe and in NETCONF `<get>`, `<get-config>` and `<get-data>`; NETCONF previously failed with `operation-failed` when such an entry existed. NETCONF list-child selections now carry their keys. gNMI reads lists whose sensitive keys allow cleartext; security-secret, lawful-intercept and secret-name keys keep the fixed gNMI refusal and masked NETCONF elements. NETCONF XPath filters accept equalities on configuration list keys whose data class allows cleartext. ON_CHANGE compares authorized content without timestamps, `updates_only` seeds that comparison without sending it, and a lag resync sends `sync_response` only when that content changed. (#1269)
 
 - `opc-yanggen`: JSON, XML, gNMI reads, canonical configuration, diff and apply
   retain user order. A key index gives expected constant-time lookup and
