@@ -284,6 +284,14 @@ fn resolve_mode(
         let input_seg = segments[i];
 
         if matches!(ancestor_node.kind, NodeKind::List) {
+            // An exact list-node value may omit its own identity. Lists above
+            // the target and partially supplied target tuples stay complete.
+            if mode == ResolutionMode::Instance
+                && i + 1 == target_segs.len()
+                && input_seg.keys.is_empty()
+            {
+                continue;
+            }
             if !render_keys(
                 registry,
                 seg_name,
@@ -321,8 +329,9 @@ pub fn resolve_read(
     resolve_mode(registry, request, ResolutionMode::Read)
 }
 
-/// Resolves a reported concrete instance with complete declared keys and
-/// requires canonical encoding. This is never partial-key read selection.
+/// Resolves a reported value with complete declared ancestor keys and canonical
+/// encoding. A target list may omit all of its own keys for an exact aggregate;
+/// partially supplied tuples remain invalid.
 pub fn resolve_instance(
     registry: &dyn SchemaRegistry,
     path: &YangPath,

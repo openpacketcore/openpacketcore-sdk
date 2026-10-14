@@ -675,7 +675,8 @@ where
         if resolved.node.config {
             return Err(GnmiError::schema("invalid operational instance"));
         }
-        *value = project_operational_value(registry, value, resolved.node)?;
+        let exact = request.paths.contains(value.path());
+        *value = project_operational_value(registry, value, resolved.node, exact)?;
     }
     response
         .values
@@ -722,6 +723,7 @@ pub(crate) fn project_operational_value(
     registry: &dyn SchemaRegistry,
     value: &opc_mgmt_opstate::OperationalValue,
     node: &'static opc_mgmt_schema::NodeMeta,
+    exact: bool,
 ) -> Result<opc_mgmt_opstate::OperationalValue, GnmiError> {
     let parsed = validate_operational_identity(registry, value.path())?;
     let mut schema = String::new();
@@ -751,7 +753,8 @@ pub(crate) fn project_operational_value(
             }
         }
     }
-    if matches!(node.kind, NodeKind::Container | NodeKind::List)
+    if !exact
+        && matches!(node.kind, NodeKind::Container | NodeKind::List)
         && parsed.segments().iter().any(|s| !s.keys.is_empty())
     {
         return Err(GnmiError::schema(

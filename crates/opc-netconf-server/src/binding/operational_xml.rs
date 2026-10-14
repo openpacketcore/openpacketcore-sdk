@@ -66,11 +66,21 @@ pub(super) fn operational_nodes(
         if !paths.contains(&resolved.node.path) {
             continue;
         }
-        if resolved.node.config || resolved.node.kind != NodeKind::Leaf {
+        if resolved.node.config {
+            return Err(invalid());
+        }
+        let parsed = CanonicalPath::parse(value.path().as_str()).map_err(|_| invalid())?;
+        if resolved.node.kind != NodeKind::Leaf {
+            if parsed
+                .segments()
+                .iter()
+                .all(|segment| segment.keys.is_empty())
+            {
+                continue;
+            }
             return Err(invalid());
         }
         validate_key_payload(registry, &resolved, value.value_json())?;
-        let parsed = CanonicalPath::parse(value.path().as_str()).map_err(|_| invalid())?;
         let Some(raw) = scalar_value(value.value_json())? else {
             continue;
         };

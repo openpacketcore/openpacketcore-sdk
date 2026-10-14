@@ -725,7 +725,8 @@ where
 
     let notification = match event {
         OperationalEvent::Update(value) => {
-            let value = project_operational_value(registry, &value, node)?;
+            let exact = request.paths().contains(value.path());
+            let value = project_operational_value(registry, &value, node, exact)?;
             let update = GnmiJsonUpdate::new(value.path().clone(), value.value_json().to_string())
                 .map_err(|err| GnmiError::schema(err.detail().to_string()))?;
             gnmi::Notification {
