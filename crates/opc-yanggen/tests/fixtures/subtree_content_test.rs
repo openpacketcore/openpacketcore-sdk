@@ -2131,3 +2131,51 @@ async fn subtree_content_discovery_append_is_reserved_from_original_capture() {
     }
     assert_eq!(below[0], below[1]);
 }
+
+fn populated_peers(count: u16) -> (System, Vec<OperationalValue>) {
+    let mut model = System::default();
+    let mut values = Vec::new();
+    for id in 0..count {
+        let mut peer = Peer::default();
+        peer.site = LeafPresence::Explicit("s".into());
+        peer.id = LeafPresence::Explicit(id);
+        peer.label = LeafPresence::Explicit(format!("p{id}"));
+        peer.cost = LeafPresence::Explicit(id);
+        peer.enabled = LeafPresence::Explicit(true);
+        peer.credential = SecretLeaf::new(LeafPresence::Explicit("secret".into()));
+        model.peer.insert(PeerKey { site: "s".into(), id }, peer);
+        values.push(state(&format!("/ex:system/ex:peer[ex:site='s'][ex:id='{id}']/ex:up"), "true"));
+    }
+    (model, values)
+}
+
+#[tokio::test]
+async fn subtree_content_default_limits_populated_config_and_state_over_100_entries() {
+    let (model, values) = populated_peers(100);
+    let fixture = Fixture::new(model, &[]).await;
+    *fixture.access.values.lock().unwrap() = values;
+    let mut replies = Vec::new();
+    for op in ["get", "get-data"] {
+        for filter in ["<peer><enabled>true</enabled><up/></peer>", "<peer><up>true</up></peer>"] {
+            let reply = fixture.rpc(&request(op, filter, ""), MgmtLimits::default()).await;
+            replies.push((op, filter, reply, fixture.access.provider.load(Ordering::SeqCst), fixture.policy_calls.load(Ordering::SeqCst)));
+        }
+    }
+    assert!(replies.iter().all(|(_, _, reply, _, _)| !reply.contains("<rpc-error>")), "default-limit populated config/state reads: {replies:?}");
+    for (op, filter, reply, provider_calls, policy_calls) in replies {
+        assert_eq!(data(&reply).matches("<ex:peer>").count(), 100, "{op}: {filter}");
+        assert_eq!(tags(&reply, "site"), vec!["s"; 100]);
+        assert_eq!(tags(&reply, "up"), vec!["true"; 100]);
+        assert_eq!(tags(&reply, "id").iter().map(|id| id.parse::<u16>().unwrap()).collect::<std::collections::BTreeSet<_>>(), (0..100u16).collect());
+        assert!(!reply.contains("secret"));
+        if filter.contains("<enabled>") {
+            assert!(tags(&reply, "credential").is_empty());
+        } else {
+            assert_eq!(tags(&reply, "credential"), vec!["&lt;redacted&gt;"; 100]);
+            assert_eq!(tags(&reply, "enabled"), vec!["true"; 100]);
+            assert_eq!(tags(&reply, "label").len(), 100);
+        }
+        assert_eq!(provider_calls, 1);
+        assert_eq!(policy_calls, 1);
+    }
+}

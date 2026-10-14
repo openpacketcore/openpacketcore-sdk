@@ -863,6 +863,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_normalization_charges_the_sum_at_each_level() {
+        fn shape(children: Vec<Shape>) -> Shape {
+            let path = "/m:root";
+            Shape {
+                path,
+                kind: NodeKind::Container,
+                metadata_work: metadata_units(path, &[], &children).unwrap(),
+                value_bytes: None,
+                keys: Vec::new(),
+                children,
+                shell: Footprint::default(),
+                tree: Footprint::default(),
+            }
+        }
+        for count in [0, 1, 2, 7, 100, 1024] {
+            let large = shape((0..100).map(|_| shape(Vec::new())).collect());
+            let large_metadata = large.metadata_work;
+            let small_metadata = shape(Vec::new()).metadata_work;
+            let mut shapes = vec![large];
+            shapes.extend((0..count).map(|_| shape(Vec::new())));
+            let n = count + 1;
+            let expected = n
+                + sort_levels(n) * (2 * (large_metadata + count * small_metadata) + 2 * n)
+                + 8 * n;
+            let budget = SubtreeBudget::new(usize::MAX, 0).unwrap();
+            normalize_shapes(&mut shapes, &budget).unwrap();
+            assert_eq!(
+                usize::MAX - budget.remaining(),
+                expected,
+                "{count} small shapes"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_normalization_preserves_charges_across_interleaved_schema_groups() {
         fn shape(path: &'static str, children: Vec<Shape>, budget: &SubtreeBudget) -> Shape {
             let value_bytes = children.is_empty().then_some(5);
