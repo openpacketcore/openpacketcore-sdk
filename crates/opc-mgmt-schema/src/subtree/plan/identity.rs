@@ -570,3 +570,59 @@ pub(super) fn order_reserved(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    #[test]
+    fn tuple_comparison_bound_covers_full_prefixes_and_leaf_list_values() {
+        for bytes in [0, 1, 64, 1024] {
+            for keys in 0..4 {
+                for mismatch in 0..3 {
+                    let mut left =
+                        NetconfXmlNode::scalar("/m:root/m:peer", "v".repeat(bytes), false);
+                    for path in [
+                        "/m:root/m:peer/m:first",
+                        "/m:root/m:peer/m:second",
+                        "/m:root/m:peer/m:third",
+                    ]
+                    .into_iter()
+                    .take(keys)
+                    {
+                        left.keys.push((path, "k".repeat(bytes)));
+                    }
+                    let mut right = left.clone();
+                    if mismatch == 1 {
+                        right.value.as_mut().unwrap().push('x');
+                    }
+                    if mismatch == 2 {
+                        if let Some((_, key)) = right.keys.last_mut() {
+                            key.push('x');
+                        } else {
+                            right.masked_ordinal = Some(1);
+                        }
+                    }
+                    let metadata = SubtreeBudget::new(1_000_000, 0).unwrap();
+                    let mut work = CapturedWork::default();
+                    work.include_nodes(&[left.clone(), right.clone()], None, &metadata)
+                        .unwrap();
+                    let allowance = work.comparison_units().unwrap();
+                    let budget = SubtreeBudget::new(allowance, 0).unwrap();
+                    take_audits();
+                    {
+                        let reservation = IdentityReservation::admit(&budget, allowance).unwrap();
+                        let order = reservation
+                            .identity_cmp(&left, &right)
+                            .then_with(|| reservation.value_cmp(&left.value, &right.value));
+                        assert_eq!(order.is_eq(), mismatch == 0);
+                    }
+                    let audits = take_audits();
+                    assert_eq!(audits.len(), 1);
+                    assert_eq!(audits[0].admitted, allowance);
+                    assert!(audits[0].comparisons > 0 && audits[0].actual() <= allowance);
+                }
+            }
+        }
+    }
+}

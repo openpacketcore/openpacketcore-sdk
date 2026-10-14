@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use crate::{LeafType, NodeKind, NodeMeta, NumericRangeIntervalMeta, SchemaRegistry};
 
 mod plan;
+#[cfg(test)]
+mod work_audit;
 pub use plan::{
     merge_bounded, AuthorizedSubtreePlan, SubtreeAccessKind, SubtreeAccessObserver, SubtreeBranch,
     SubtreeMatch, SubtreeOutput, SubtreePlan, SubtreePredicate, SubtreeProjection, SubtreeScalar,
@@ -51,6 +53,8 @@ pub struct SubtreeBudget(Arc<SubtreeWork>);
 struct SubtreeWork {
     remaining: AtomicUsize,
     predicate_trials: AtomicUsize,
+    #[cfg(test)]
+    observed: [AtomicUsize; 3],
 }
 
 impl std::fmt::Debug for SubtreeBudget {
@@ -94,6 +98,8 @@ impl SubtreeBudget {
         Ok(Self(Arc::new(SubtreeWork {
             remaining: AtomicUsize::new(remaining),
             predicate_trials: AtomicUsize::new(0),
+            #[cfg(test)]
+            observed: std::array::from_fn(|_| AtomicUsize::new(0)),
         })))
     }
 
@@ -121,12 +127,13 @@ impl SubtreeBudget {
                 .checked_add(right.len())
                 .ok_or(SubtreeError::TooBig)?,
         )?;
-        Ok(left == right)
+        Ok(self.audit_text_cmp(left, right).is_eq())
     }
 
     /// Copies text only after charging every retained byte.
     pub fn copy(&self, text: &str) -> Result<String, SubtreeError> {
         self.charge(text.len())?;
+        self.audit_move(text.len());
         Ok(text.to_owned())
     }
 
@@ -160,6 +167,7 @@ impl SubtreeBudget {
         let mut hi = nodes.len();
         while lo < hi {
             self.charge(1)?;
+            self.audit_visit(1);
             let middle = lo + (hi - lo) / 2;
             let node = &nodes[middle];
             self.charge(
@@ -167,13 +175,67 @@ impl SubtreeBudget {
                     .checked_add(node.path.len())
                     .ok_or(SubtreeError::TooBig)?,
             )?;
-            match node.path.cmp(path) {
+            match self.audit_text_cmp(node.path, path) {
                 std::cmp::Ordering::Equal => return Ok(node),
                 std::cmp::Ordering::Less => lo = middle + 1,
                 std::cmp::Ordering::Greater => hi = middle,
             }
         }
         Err(SubtreeError::Unsupported)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_scope(&self, phase: &'static str) -> work_audit::Scope {
+        work_audit::Scope::new(self, phase)
+    }
+
+    #[cfg(test)]
+    fn audit_observed(&self) -> [usize; 3] {
+        std::array::from_fn(|index| self.0.observed[index].load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    fn audit_add(&self, index: usize, units: usize) {
+        let counter = &self.0.observed[index];
+        let mut observed = counter.load(Ordering::Relaxed);
+        loop {
+            let next = observed.checked_add(units).expect("observed work overflow");
+            match counter.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    pub(crate) fn audit_visit(&self, _units: usize) {
+        #[cfg(test)]
+        self.audit_add(0, _units);
+    }
+
+    pub(crate) fn audit_move(&self, _units: usize) {
+        #[cfg(test)]
+        self.audit_add(2, _units);
+    }
+
+    pub(crate) fn audit_text_cmp(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        #[cfg(test)]
+        {
+            for (left, right) in left.bytes().zip(right.bytes()) {
+                self.audit_add(1, 1);
+                let order = left.cmp(&right);
+                if !order.is_eq() {
+                    return order;
+                }
+            }
+            left.len().cmp(&right.len())
+        }
+        #[cfg(not(test))]
+        left.cmp(right)
     }
 }
 

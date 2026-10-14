@@ -38,26 +38,48 @@ fn metadata_units(path: &str, keys: &[KeySize], children: &[Shape]) -> Result<us
 }
 
 impl Shape {
-    fn compare_metadata(&self, other: &Self) -> std::cmp::Ordering {
-        self.path
-            .cmp(other.path)
-            .then_with(|| self.value_bytes.cmp(&other.value_bytes))
-            .then_with(|| self.keys.cmp(&other.keys))
+    fn compare_metadata(&self, other: &Self, budget: &SubtreeBudget) -> std::cmp::Ordering {
+        budget
+            .audit_text_cmp(self.path, other.path)
+            .then_with(|| {
+                budget.audit_visit(1);
+                self.value_bytes.cmp(&other.value_bytes)
+            })
+            .then_with(|| {
+                for (left, right) in self.keys.iter().zip(&other.keys) {
+                    budget.audit_visit(1);
+                    let order = budget.audit_text_cmp(left.path, right.path).then_with(|| {
+                        budget.audit_visit(1);
+                        left.bytes.cmp(&right.bytes)
+                    });
+                    if !order.is_eq() {
+                        return order;
+                    }
+                }
+                budget.audit_visit(1);
+                self.keys.len().cmp(&other.keys.len())
+            })
             .then_with(|| {
                 self.children
                     .iter()
                     .zip(&other.children)
-                    .map(|(left, right)| left.compare_metadata(right))
+                    .map(|(left, right)| left.compare_metadata(right, budget))
                     .find(|order| !order.is_eq())
-                    .unwrap_or_else(|| self.children.len().cmp(&other.children.len()))
+                    .unwrap_or_else(|| {
+                        budget.audit_visit(1);
+                        self.children.len().cmp(&other.children.len())
+                    })
             })
     }
 }
 
 fn normalize_shapes(shapes: &mut [Shape], budget: &SubtreeBudget) -> Result<(), SubtreeError> {
+    #[cfg(test)]
+    let _audit = budget.audit_scope("shape normalization");
     budget.charge(shapes.len())?;
     let mut per_level = 0;
     for shape in shapes.iter() {
+        budget.audit_visit(1);
         add_work(&mut per_level, multiply_work(shape.metadata_work, 2)?)?;
         add_work(&mut per_level, 2)?;
     }
@@ -68,18 +90,22 @@ fn normalize_shapes(shapes: &mut [Shape], budget: &SubtreeBudget) -> Result<(), 
     // capture order and every identity/payload remain outside this operation.
     let order = identity::sorted_indices(
         shapes.len(),
-        |left, right| shapes[left].compare_metadata(&shapes[right]),
-        |_| {},
+        |left, right| shapes[left].compare_metadata(&shapes[right], budget),
+        |units| budget.audit_move(units),
     );
     let mut destination = vec![0; shapes.len()];
+    budget.audit_move(destination.len());
     for (to, from) in order.into_iter().enumerate() {
+        budget.audit_move(1);
         destination[from] = to;
     }
     for index in 0..shapes.len() {
+        budget.audit_visit(1);
         while destination[index] != index {
             let next = destination[index];
             shapes.swap(index, next);
             destination.swap(index, next);
+            budget.audit_move(2);
         }
     }
     Ok(())
@@ -179,11 +205,13 @@ fn add_group(
 ) -> Result<(), SubtreeError> {
     for group in groups.iter_mut() {
         budget.charge(1)?;
+        budget.audit_visit(1);
         if budget.compare(group.parent, parent)? {
             return group.work.append(work);
         }
     }
     budget.charge(1)?;
+    budget.audit_move(1);
     groups.push(SiblingGroup {
         parent,
         work: work.clone(),
@@ -198,9 +226,11 @@ fn clamp_groups(
 ) -> Result<(), SubtreeError> {
     for group in groups {
         budget.charge(1)?;
+        budget.audit_visit(1);
         let mut cap = &CapturedWork::default();
         for candidate in caps {
             budget.charge(1)?;
+            budget.audit_visit(1);
             if budget.compare(candidate.parent, group.parent)? {
                 cap = &candidate.work;
                 break;
@@ -218,6 +248,7 @@ fn group_work(
 ) -> Result<CapturedWork, SubtreeError> {
     for group in groups {
         budget.charge(1)?;
+        budget.audit_visit(1);
         if budget.compare(group.parent, parent)? {
             return Ok(group.work.clone());
         }
@@ -232,8 +263,10 @@ impl Footprint {
         budget: &SubtreeBudget,
     ) -> Result<Self, SubtreeError> {
         budget.charge(path.len())?;
+        budget.audit_visit(path.len());
         let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
         budget.charge(1)?;
+        budget.audit_move(1);
         let siblings = vec![SiblingGroup {
             parent,
             work: total.clone(),
@@ -241,6 +274,7 @@ impl Footprint {
         let mut child_keys = Vec::new();
         if total.keys != 0 {
             budget.charge(1)?;
+            budget.audit_move(1);
             child_keys.push(SiblingGroup {
                 parent: path,
                 work: CapturedWork {
@@ -263,6 +297,8 @@ impl Footprint {
     fn copy_metadata(&self, budget: &SubtreeBudget) -> Result<Self, SubtreeError> {
         budget.charge(self.siblings.len())?;
         budget.charge(self.child_keys.len())?;
+        budget.audit_move(self.siblings.len());
+        budget.audit_move(self.child_keys.len());
         Ok(self.clone())
     }
 
@@ -285,6 +321,7 @@ impl Footprint {
         let mut units = 0;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
+            budget.audit_visit(1);
             add_work(&mut units, group.work.merge_units()?)?;
         }
         Ok(units)
@@ -294,6 +331,7 @@ impl Footprint {
         let mut units = 0;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
+            budget.audit_visit(1);
             add_work(&mut units, group.work.selection_merge_units()?)?;
         }
         Ok(units)
@@ -303,6 +341,7 @@ impl Footprint {
         let mut units = 0;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
+            budget.audit_visit(1);
             let work = &group.work;
             let mut per_node = multiply_work(sort_levels(work.row_nodes.min(work.nodes)), 2)?;
             add_work(&mut per_node, 6)?;
@@ -319,6 +358,7 @@ impl Footprint {
         let mut units = 0;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
+            budget.audit_visit(1);
             let keys = group_work(owner_keys, group.parent, budget)?;
             if keys.largest_keys == 0 {
                 continue;
@@ -343,6 +383,7 @@ impl Footprint {
     ) -> Result<(), SubtreeError> {
         for group in &mut self.siblings {
             budget.charge(1)?;
+            budget.audit_visit(1);
             let width = group_work(bounds, group.parent, budget)?.nodes;
             group.work.row_nodes = group.work.row_nodes.min(multiply_work(width, copies)?);
         }
@@ -354,6 +395,7 @@ impl Footprint {
         let mut units = multiply_work(input.total.nodes, 4)?;
         budget.charge(self.siblings.len())?;
         for group in &self.siblings {
+            budget.audit_visit(1);
             let selected = &group.work;
             let source = group_work(&input.siblings, group.parent, budget)?;
             let keys = group_work(&input.child_keys, group.parent, budget)?;
@@ -423,13 +465,17 @@ fn capture_shape(
     leaf_lists: &mut Vec<&'static str>,
     parent: &str,
 ) -> Result<Vec<Shape>, SubtreeError> {
+    #[cfg(test)]
+    let _audit = budget.audit_scope("capture sizing");
     budget.charge(nodes.len())?;
     let mut shapes = Vec::new();
     for node in nodes {
+        budget.audit_visit(1);
         let mut path_work = node.schema_path.len();
         add_work(&mut path_work, parent.len())?;
         add_work(&mut path_work, 1)?;
         budget.charge(path_work)?;
+        budget.audit_visit(node.schema_path.len());
         if node.schema_path.rsplit_once('/').map(|(parent, _)| parent) != Some(parent) {
             return Err(SubtreeError::Projection);
         }
@@ -437,9 +483,12 @@ fn capture_shape(
         let keys: Vec<_> = node
             .keys
             .iter()
-            .map(|(path, value)| KeySize {
-                path,
-                bytes: value.len(),
+            .map(|(path, value)| {
+                budget.audit_move(1);
+                KeySize {
+                    path,
+                    bytes: value.len(),
+                }
             })
             .collect();
         let mut shell = CapturedWork {
@@ -449,6 +498,7 @@ fn capture_shape(
             value_bytes: node.value.as_ref().map_or(0, String::len),
             ..CapturedWork::default()
         };
+        budget.audit_visit(keys.len());
         shell.add_keys(&keys)?;
         shell.largest_identity = shell.identity_bytes()?;
         shell.largest_value = shell.value_bytes;
@@ -472,6 +522,7 @@ fn capture_shape(
                 add_work(&mut units, multiply_work(declared.len(), 2)?)?;
                 add_work(&mut units, 2)?;
                 budget.charge(units)?;
+                budget.audit_visit(path.len());
                 let Some((parent, name)) = path.rsplit_once('/') else {
                     return Err(SubtreeError::Projection);
                 };
@@ -483,6 +534,7 @@ fn capture_shape(
         }
         if kind == NodeKind::LeafList {
             budget.charge(1)?;
+            budget.audit_move(1);
             leaf_lists.push(node.schema_path);
         }
         let children = capture_shape(
@@ -501,6 +553,8 @@ fn capture_shape(
                 .checked_add(children.len())
                 .ok_or(SubtreeError::TooBig)?,
         )?;
+        budget.audit_visit(keys.len());
+        budget.audit_visit(children.len());
         let metadata_work = metadata_units(node.schema_path, &keys, &children)?;
         shapes.push(Shape {
             path: node.schema_path,
@@ -521,6 +575,7 @@ fn forest_work(input: &[&Shape], budget: &SubtreeBudget) -> Result<Footprint, Su
     budget.charge(input.len())?;
     let mut work = Footprint::default();
     for node in input {
+        budget.audit_visit(1);
         work.append(&node.tree, budget)?;
     }
     Ok(work)
@@ -546,6 +601,8 @@ fn scalar_work(key: &KeySize, budget: &SubtreeBudget) -> Result<Footprint, Subtr
 // under any one parent. Lists and leaf-lists may retain every original node.
 // These are schema bounds, not observations of a joined or selected forest.
 fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGroup>, SubtreeError> {
+    #[cfg(test)]
+    let _audit = budget.audit_scope("row bounds");
     fn add_path(
         paths: &mut Vec<(&'static str, usize)>,
         path: &'static str,
@@ -554,6 +611,7 @@ fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGro
     ) -> Result<(), SubtreeError> {
         for (previous, count) in paths.iter_mut() {
             budget.charge(1)?;
+            budget.audit_visit(1);
             if budget.compare(previous, path)? {
                 if repeating {
                     add_work(count, 1)?;
@@ -562,6 +620,7 @@ fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGro
             }
         }
         budget.charge(1)?;
+        budget.audit_move(1);
         paths.push((path, 1));
         Ok(())
     }
@@ -572,6 +631,7 @@ fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGro
     ) -> Result<(), SubtreeError> {
         for shape in shapes {
             budget.charge(1)?;
+            budget.audit_visit(1);
             add_path(
                 paths,
                 shape.path,
@@ -580,6 +640,7 @@ fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGro
             )?;
             for key in &shape.keys {
                 budget.charge(1)?;
+                budget.audit_visit(1);
                 add_path(paths, key.path, false, budget)?;
             }
             visit(&shape.children, paths, budget)?;
@@ -591,6 +652,7 @@ fn row_bounds(shapes: &[Shape], budget: &SubtreeBudget) -> Result<Vec<SiblingGro
     let mut groups = Vec::new();
     for (path, nodes) in paths {
         budget.charge(path.len())?;
+        budget.audit_visit(path.len());
         let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
         add_group(
             &mut groups,
@@ -621,6 +683,8 @@ impl EvaluationWork {
         registry: &dyn SchemaRegistry,
         budget: &SubtreeBudget,
     ) -> Result<Self, SubtreeError> {
+        #[cfg(test)]
+        let _audit = budget.audit_scope("sizing");
         let mut work = Self {
             units: 0,
             predicate_trials: 0,
@@ -632,9 +696,15 @@ impl EvaluationWork {
         let shapes = capture_shape(input, registry, budget, &mut work.leaf_lists, "")?;
         work.row_bounds = row_bounds(&shapes, budget)?;
         budget.charge(shapes.len())?;
-        let input: Vec<_> = shapes.iter().collect();
+        let input: Vec<_> = shapes
+            .iter()
+            .inspect(|_| {
+                budget.audit_move(1);
+            })
+            .collect();
         let raw = forest_work(&input, budget)?;
         budget.charge(raw.child_keys.len())?;
+        budget.audit_move(raw.child_keys.len());
         work.owner_keys = raw.child_keys.clone();
         work.leaf_list_bytes = normalize_leaf_lists(&mut work.leaf_lists, budget)?;
         add_work(&mut work.units, raw.copy_units()?)?;
@@ -642,6 +712,7 @@ impl EvaluationWork {
         let mut candidates = SelectionEstimate::default();
         for scope in scopes {
             budget.charge(1)?;
+            budget.audit_visit(1);
             let selected = work.scope(scope, &input, &[], "", budget)?;
             add_work(&mut work.units, selected.roots)?;
             candidates.append(&selected.work, selected.roots, budget)?;
@@ -732,6 +803,7 @@ impl EvaluationWork {
         add_work(&mut self.units, input.total.nodes)?;
         budget.charge(outputs.len())?;
         for output in outputs {
+            budget.audit_visit(1);
             let per_node = output
                 .path
                 .len()
@@ -751,13 +823,17 @@ impl EvaluationWork {
         parent: &'static str,
         budget: &SubtreeBudget,
     ) -> Result<SelectionEstimate, SubtreeError> {
+        #[cfg(test)]
+        let _audit = budget.audit_scope("scope sizing");
         let mut available = forest_work(input, budget)?;
         available.limit_rows(&self.row_bounds, 1, budget)?;
         let mut candidates = SelectionEstimate::default();
         budget.charge(scope.predicates.len())?;
         for predicate in &scope.predicates {
+            budget.audit_visit(1);
             budget.charge(predicate.alternatives.len())?;
             for alternative in &predicate.alternatives {
+                budget.audit_visit(1);
                 for key in keys {
                     if self.path_probe(key.path, alternative.path, budget)? {
                         self.predicate(&alternative.predicate, key.bytes)?;
@@ -784,6 +860,7 @@ impl EvaluationWork {
         }
         budget.charge(scope.branches.len())?;
         for branch in &scope.branches {
+            budget.audit_visit(1);
             for key in keys {
                 if self.path_probe(key.path, branch.path, budget)? && branch.children.is_none() {
                     for output in &branch.outputs {
@@ -798,6 +875,7 @@ impl EvaluationWork {
             for node in input {
                 if self.path_probe(node.path, branch.path, budget)? {
                     budget.charge(1)?;
+                    budget.audit_move(1);
                     matching.push(*node);
                 }
             }
@@ -807,7 +885,9 @@ impl EvaluationWork {
                 for node in matching {
                     budget.charge(node.children.len())?;
                     budget.charge(node.keys.len())?;
+                    budget.audit_move(node.children.len());
                     children.extend(node.children.iter());
+                    budget.audit_move(node.keys.len());
                     child_keys.extend_from_slice(&node.keys);
                     self.copy(&node.shell, budget)?;
                     candidates.append(&node.shell, 1, budget)?;
@@ -842,6 +922,7 @@ impl EvaluationWork {
         let mut cap = available.selection_cap(budget)?;
         budget.charge(keys.len())?;
         for key in keys {
+            budget.audit_visit(1);
             cap.append(&scalar_work(key, budget)?, budget)?;
         }
         candidates.work.clamp(&cap, budget)?;
@@ -990,6 +1071,82 @@ mod tests {
                 assert_eq!(value.copy_units(), Err(SubtreeError::TooBig));
             }
         }
+        let counted = CapturedWork {
+            row_nodes: 1,
+            largest_identity: 1,
+            largest_value: 1,
+            largest_keys: 1,
+            largest_key_path: 1,
+            largest_key_value: 1,
+            ..one.clone()
+        };
+        for field in 0..6 {
+            let mut value = counted.clone();
+            match field {
+                0 => value.row_nodes = usize::MAX,
+                1 => value.largest_identity = usize::MAX,
+                2 => value.largest_value = usize::MAX,
+                3 => value.largest_keys = usize::MAX,
+                4 => value.largest_key_path = usize::MAX,
+                5 => value.largest_key_value = usize::MAX,
+                _ => unreachable!(),
+            }
+            let budget = SubtreeBudget::new(1_000_000, 0).unwrap();
+            if field == 0 {
+                assert_eq!(value.clone().append(&counted), Err(SubtreeError::TooBig));
+            } else if field <= 3 {
+                assert_eq!(value.merge_units(), Err(SubtreeError::TooBig));
+            }
+            if field != 0 {
+                let shape = Footprint::shell("/m:a", value.clone(), &budget).unwrap();
+                let owners = [SiblingGroup {
+                    parent: "",
+                    work: value,
+                }];
+                assert_eq!(
+                    shape.position_lookup_units(&owners, &budget),
+                    Err(SubtreeError::TooBig)
+                );
+            }
+        }
+        let budget = SubtreeBudget::new(1_000_000, 0).unwrap();
+        let huge = CapturedWork {
+            nodes: usize::MAX,
+            row_nodes: usize::MAX,
+            ..counted.clone()
+        };
+        assert_eq!(huge.selection_merge_units(), Err(SubtreeError::TooBig));
+        let shape = Footprint::shell("/m:a", huge, &budget).unwrap();
+        assert_eq!(
+            shape.selection_merge_units(&budget),
+            Err(SubtreeError::TooBig)
+        );
+        assert_eq!(
+            shape.position_ordering_units(&budget),
+            Err(SubtreeError::TooBig)
+        );
+        assert_eq!(
+            shape.position_lookup_units(
+                &[SiblingGroup {
+                    parent: "",
+                    work: counted.clone()
+                }],
+                &budget
+            ),
+            Err(SubtreeError::TooBig)
+        );
+        let mut shape = Footprint::shell("/m:a", counted, &budget).unwrap();
+        let bounds = [SiblingGroup {
+            parent: "",
+            work: CapturedWork {
+                nodes: usize::MAX,
+                ..CapturedWork::default()
+            },
+        }];
+        assert_eq!(
+            shape.limit_rows(&bounds, 2, &budget),
+            Err(SubtreeError::TooBig)
+        );
         let make = || EvaluationWork {
             units: 0,
             predicate_trials: 0,

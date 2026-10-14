@@ -360,6 +360,7 @@ fn whole_evaluation_counts_actual_index_comparisons_copies_and_moves() {
                 let budget = SubtreeBudget::new(16_777_216, 0).unwrap();
                 let plan = evaluation_plan(budget.clone());
                 identity::take_audits();
+                crate::subtree::work_audit::take_audits();
                 let selected = plan.evaluate(&TypedRegistry, &input).unwrap_or_else(|error| {
                     let sizing = SubtreeBudget::new(usize::MAX, 0).unwrap();
                     let measured = evaluation::EvaluationWork::measure(&plan.scopes, &input, &TypedRegistry, &sizing).unwrap();
@@ -368,6 +369,31 @@ fn whole_evaluation_counts_actual_index_comparisons_copies_and_moves() {
                 let audits = identity::take_audits();
                 assert_eq!(audits.len(), 1, "one admission for the whole evaluation");
                 let audit = audits[0];
+                let phases = crate::subtree::work_audit::take_audits();
+                for phase in [
+                    "capture sizing",
+                    "shape normalization",
+                    "leaf-list normalization",
+                    "row bounds",
+                    "scope sizing",
+                    "sizing",
+                ] {
+                    assert!(
+                        phases.iter().any(|audit| audit.phase == phase),
+                        "missing {phase}: {phases:?}"
+                    );
+                }
+                for phase in &phases {
+                    assert!(phase.actual() <= phase.admitted, "{phase:?}");
+                }
+                let sizing = phases.iter().find(|audit| audit.phase == "sizing").unwrap();
+                assert_eq!(sizing.admitted, audit.admitted - audit.executor_allowance);
+                if count != 0 {
+                    assert!(
+                        sizing.visits > 0 && sizing.comparisons > 0 && sizing.moves > 0,
+                        "{sizing:?}"
+                    );
+                }
                 assert_eq!(audit.admitted, 16_777_216 - budget.remaining());
                 if let Some(expected) = expected_allowance {
                     assert_eq!(
@@ -607,6 +633,68 @@ fn indexed_sort_is_stable_and_respects_the_comparison_and_move_bound() {
             assert_eq!(sorted, expected);
             assert!(comparisons.get() <= count * sort_levels(count));
             assert!(moves.get() <= count * (sort_levels(count) + 2));
+        }
+    }
+}
+
+#[test]
+fn all_phases_cover_a_populated_capture_and_many_fragments() {
+    for count in [100, 1024] {
+        let mut admitted = None;
+        for coalescing in [false, true] {
+            for matching in [false, true] {
+                let make = |index| {
+                    let mut root =
+                        forest(&[("a", if matching { "first" } else { "other" })]).remove(0);
+                    root.children[0].keys[0].1 =
+                        format!("{:064x}", if coalescing { 0 } else { index });
+                    root
+                };
+                let mut populated = NetconfXmlNode::branch("/m:root");
+                for index in 0..100 {
+                    populated.children.extend(make(index).children);
+                }
+                let mut captures = vec![populated];
+                captures.extend((0..count).map(make));
+                if matching {
+                    captures.reverse();
+                }
+                let budget = SubtreeBudget::new(16_777_216, 0).unwrap();
+                identity::take_audits();
+                crate::subtree::work_audit::take_audits();
+                let output = evaluation_plan(budget.clone())
+                    .evaluate(&TypedRegistry, &captures)
+                    .unwrap();
+                assert_eq!(
+                    output.first().map_or(0, |root| root.children.len()),
+                    if matching {
+                        if coalescing {
+                            1
+                        } else {
+                            count
+                        }
+                    } else {
+                        0
+                    }
+                );
+                let used = 16_777_216 - budget.remaining();
+                if let Some(previous) = admitted {
+                    assert_eq!(used, previous);
+                }
+                admitted = Some(used);
+                let executors = identity::take_audits();
+                assert_eq!(executors.len(), 1);
+                assert!(executors[0].actual() <= executors[0].executor_allowance);
+                let phases = crate::subtree::work_audit::take_audits();
+                let sizing = phases.iter().find(|audit| audit.phase == "sizing").unwrap();
+                assert_eq!(sizing.admitted, used - executors[0].executor_allowance);
+                assert!(phases.iter().all(|audit| audit.actual() <= audit.admitted));
+                assert!(phases
+                    .iter()
+                    .any(|audit| audit.phase == "shape normalization"
+                        && audit.comparisons > 0
+                        && audit.moves > 0));
+            }
         }
     }
 }

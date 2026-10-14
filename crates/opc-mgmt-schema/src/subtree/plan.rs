@@ -859,8 +859,17 @@ fn normalize_leaf_lists(
     paths: &mut Vec<&'static str>,
     budget: &SubtreeBudget,
 ) -> Result<usize, SubtreeError> {
+    #[cfg(test)]
+    let _audit = budget.audit_scope("leaf-list normalization");
     budget.charge(paths.len())?;
-    let largest = paths.iter().map(|path| path.len()).max().unwrap_or(0);
+    let largest = paths
+        .iter()
+        .map(|path| {
+            budget.audit_visit(1);
+            path.len()
+        })
+        .max()
+        .unwrap_or(0);
     let comparison = multiply_work(largest, 2)?
         .checked_add(1)
         .ok_or(SubtreeError::TooBig)?;
@@ -873,12 +882,17 @@ fn normalize_leaf_lists(
     budget.charge(multiply_work(paths.len(), per_path)?)?;
     let order = identity::sorted_indices(
         paths.len(),
-        |left, right| paths[left].cmp(paths[right]),
-        |_| {},
+        |left, right| budget.audit_text_cmp(paths[left], paths[right]),
+        |units| budget.audit_move(units),
     );
-    let mut normalized = Vec::new();
+    let mut normalized: Vec<&'static str> = Vec::new();
     for index in order {
-        if normalized.last() != Some(&paths[index]) {
+        budget.audit_visit(1);
+        if normalized
+            .last()
+            .is_none_or(|previous| !budget.audit_text_cmp(previous, paths[index]).is_eq())
+        {
+            budget.audit_move(1);
             normalized.push(paths[index]);
         }
     }
@@ -965,10 +979,13 @@ impl CapturedWork {
     }
 
     fn comparison_units(&self) -> Result<usize, SubtreeError> {
-        let mut units = multiply_work(self.largest_identity, 2)?;
-        add_work(&mut units, multiply_work(self.largest_value, 2)?)?;
-        add_work(&mut units, multiply_work(self.largest_keys, 2)?)?;
-        add_work(&mut units, 8)?;
+        // Tuple and leaf-list comparisons advance both operands together.
+        // Each byte position is visited once; key/option/length probes add
+        // three units per key and five per complete comparison.
+        let mut units = self.largest_identity;
+        add_work(&mut units, self.largest_value)?;
+        add_work(&mut units, multiply_work(self.largest_keys, 3)?)?;
+        add_work(&mut units, 5)?;
         Ok(units)
     }
 

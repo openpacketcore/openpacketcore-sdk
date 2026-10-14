@@ -225,9 +225,13 @@ identities, including fixed-width masked components.
 All additions and products are checked. Metadata sizing and the full executor
 bound are admitted together before the initial configuration/state join. Refusal leaves
 the input, shared allowance and predicate admissions unchanged; early exits do
-not refund work. Test-only counters record executor byte comparisons, copies
-and moves at their operation sites and assert against the executor portion of
-the reservation, without using unused metadata allowance as a cushion.
+not refund work. Test-only counters record visits, byte comparisons, copies and
+moves at their operation sites. Separate checks cover capture and scope sizing,
+row bounds, both metadata normalizations, provider identity and ordering sorts,
+provider output moves, and the executor portion of the reservation. Unused sizing
+allowance cannot cushion an executor overrun. Paired-byte comparisons count each
+position once. Canonical ordering of masked provider keys retains its fixed
+logical comparison cost; the counters do not bound raw secret-byte CPU time.
 
 Existing request, XML depth, namespace, attribute and content-node limits
 remain in force. Each accumulated decoded value is bounded by

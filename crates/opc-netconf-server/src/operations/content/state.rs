@@ -11,6 +11,9 @@ use opc_mgmt_schema::{
 
 use crate::binding::NetconfConfigBinding;
 
+mod audit;
+use audit::Reservation;
+
 pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
     binding: &B,
     plan: &AuthorizedSubtreePlan,
@@ -99,7 +102,13 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
         }
         budget.charge(identity.len())?;
         let mut key_search_work = identity.len();
+        #[cfg(test)]
+        let mut masked_keys = false;
         for key in &identity {
+            #[cfg(test)]
+            {
+                masked_keys |= key.masked;
+            }
             add_work(&mut key_search_work, key.path.len())?;
             add_work(&mut key_search_work, node.path.len())?;
         }
@@ -177,39 +186,105 @@ pub(super) fn read<C: OpcConfig, B: NetconfConfigBinding<C>>(
             tree = parent;
         }
         budget.charge(1)?;
-        accepted.push((path, path_work, tree));
+        accepted.push(Accepted {
+            path,
+            captured_bytes: path_work,
+            #[cfg(test)]
+            masked_keys,
+            tree,
+        });
     }
     // Detect duplicate complete identities in one indexed batch. A failed
     // equality test or an early duplicate never changes the prepaid work.
-    budget.charge(seen.len())?;
-    let max_identity = seen.iter().map(String::len).max().unwrap_or(0);
-    let identities = sorted_positions(seen.len(), max_identity, budget, |left, right| {
-        seen[left].cmp(&seen[right])
-    })?;
-    if identities
-        .windows(2)
-        .any(|pair| seen[pair[0]] == seen[pair[1]])
-    {
-        return Err(SubtreeError::Projection);
-    }
+    ensure_unique(&seen, budget)?;
     // Canonical output order still uses raw validated paths, with work sized
     // exclusively from captured path identities (fixed width for masked keys).
     // Sorting positions and moving each tree once avoids quadratic shifts.
-    budget.charge(accepted.len())?;
-    let max_path_work = accepted.iter().map(|(_, work, _)| *work).max().unwrap_or(0);
-    let order = sorted_positions(accepted.len(), max_path_work, budget, |left, right| {
-        accepted[left].0.cmp(accepted[right].0)
-    })?;
-    budget.charge(accepted.len().checked_mul(2).ok_or(SubtreeError::TooBig)?)?;
+    order_accepted(accepted, budget)
+}
+
+fn ensure_unique(seen: &[String], budget: &SubtreeBudget) -> Result<(), SubtreeError> {
+    let sizing = Reservation::admit(budget, seen.len(), "provider identity sizing")?;
+    let max_identity = seen
+        .iter()
+        .map(|value| {
+            sizing.visit();
+            value.len()
+        })
+        .max()
+        .unwrap_or(0);
+    let (identities, reservation) = sorted_positions(
+        seen.len(),
+        max_identity,
+        budget,
+        "provider identities",
+        |left, right, reservation| reservation.text_cmp(&seen[left], &seen[right]),
+    )?;
+    for pair in identities.windows(2) {
+        reservation.compared();
+        if reservation.text_cmp(&seen[pair[0]], &seen[pair[1]]).is_eq() {
+            return Err(SubtreeError::Projection);
+        }
+    }
+    Ok(())
+}
+
+struct Accepted<'a> {
+    path: &'a str,
+    captured_bytes: usize,
+    #[cfg(test)]
+    masked_keys: bool,
+    tree: NetconfXmlNode,
+}
+
+fn order_accepted(
+    accepted: Vec<Accepted<'_>>,
+    budget: &SubtreeBudget,
+) -> Result<Vec<NetconfXmlNode>, SubtreeError> {
+    let sizing = Reservation::admit(budget, accepted.len(), "provider order sizing")?;
+    let max_path_work = accepted
+        .iter()
+        .map(|entry| {
+            sizing.visit();
+            entry.captured_bytes
+        })
+        .max()
+        .unwrap_or(0);
+    let (order, _reservation) = sorted_positions(
+        accepted.len(),
+        max_path_work,
+        budget,
+        "provider ordering",
+        |left, right, _reservation| {
+            // The established hidden-key contract treats raw canonical ordering
+            // as a logical comparison, not a raw-secret byte/CPU bound.
+            #[cfg(test)]
+            if !accepted[left].masked_keys && !accepted[right].masked_keys {
+                return _reservation.text_cmp(accepted[left].path, accepted[right].path);
+            }
+            accepted[left].path.cmp(accepted[right].path)
+        },
+    )?;
+    let movement = Reservation::admit(
+        budget,
+        accepted.len().checked_mul(2).ok_or(SubtreeError::TooBig)?,
+        "provider output",
+    )?;
     let mut slots: Vec<_> = accepted
         .into_iter()
-        .map(|(_, _, tree)| Some(tree))
+        .map(|entry| {
+            movement.moved(1);
+            Some(entry.tree)
+        })
         .collect();
     // Retain every original chain; only the evaluator may coalesce identities
     // after admitting its complete capture-derived envelope.
     order
         .into_iter()
-        .map(|index| slots[index].take().ok_or(SubtreeError::Projection))
+        .map(|index| {
+            movement.moved(1);
+            slots[index].take().ok_or(SubtreeError::Projection)
+        })
         .collect()
 }
 
@@ -224,21 +299,28 @@ fn sorted_positions(
     count: usize,
     captured_bytes: usize,
     budget: &SubtreeBudget,
-    mut compare: impl FnMut(usize, usize) -> std::cmp::Ordering,
-) -> Result<Vec<usize>, SubtreeError> {
+    phase: &'static str,
+    mut compare: impl FnMut(usize, usize, &Reservation) -> std::cmp::Ordering,
+) -> Result<(Vec<usize>, Reservation), SubtreeError> {
     let levels = (usize::BITS - count.saturating_sub(1).leading_zeros()) as usize;
-    let per_compare = captured_bytes
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(2))
-        .ok_or(SubtreeError::TooBig)?;
+    // A captured-text comparison visits at most the smaller operand's bytes.
+    // Add one comparison and one position move; canonical-order comparisons
+    // are fixed logical operations under the masked-key contract.
+    let per_compare = captured_bytes.checked_add(2).ok_or(SubtreeError::TooBig)?;
     let per_node = levels
         .checked_add(1)
         .and_then(|levels| levels.checked_mul(per_compare))
         .and_then(|work| work.checked_add(2))
         .ok_or(SubtreeError::TooBig)?;
-    budget.charge(count.checked_mul(per_node).ok_or(SubtreeError::TooBig)?)?;
+    let reservation = Reservation::admit(
+        budget,
+        count.checked_mul(per_node).ok_or(SubtreeError::TooBig)?,
+        phase,
+    )?;
     let mut order: Vec<_> = (0..count).collect();
     let mut scratch = vec![0; count];
+    reservation.moved(count);
+    reservation.moved(count);
     let mut width = 1usize;
     while width < count {
         let mut start = 0;
@@ -247,20 +329,26 @@ fn sorted_positions(
             let end = middle.saturating_add(width).min(count);
             let (mut left, mut right) = (start, middle);
             for slot in &mut scratch[start..end] {
-                if left < middle && (right == end || !compare(order[left], order[right]).is_gt()) {
+                if left < middle
+                    && (right == end || {
+                        reservation.compared();
+                        !compare(order[left], order[right], &reservation).is_gt()
+                    })
+                {
                     *slot = order[left];
                     left += 1;
                 } else {
                     *slot = order[right];
                     right += 1;
                 }
+                reservation.moved(1);
             }
             start = end;
         }
         std::mem::swap(&mut order, &mut scratch);
         width = width.saturating_mul(2);
     }
-    Ok(order)
+    Ok((order, reservation))
 }
 
 fn requested_instance(
@@ -410,6 +498,9 @@ fn request_path(
 
 struct InstanceKey {
     path: &'static str,
+    // Public schema classification for the test-only work counter.
+    #[cfg(test)]
+    masked: bool,
     // Raw text survives only until mandatory provider consistency validation.
     raw: String,
     // All selection, joins, copies and output identity use this representation.
@@ -521,6 +612,8 @@ fn instance(
                     budget.charge(2)?;
                     identity.push(InstanceKey {
                         path: key.path,
+                        #[cfg(test)]
+                        masked,
                         raw: normalized,
                         captured: budget.copy(&captured)?,
                     });
@@ -563,6 +656,111 @@ mod index_tests {
     use super::*;
 
     #[test]
+    fn provider_phases_count_work_at_capacity_and_preserve_order() {
+        for count in [0, 1, 2, 3, 7, 31, 100, 1024] {
+            let mut expected = None;
+            for arrangement in 0..3 {
+                let mut paths: Vec<_> = (0..count)
+                    .map(|index| format!("{}-{index:04}", "p".repeat(64)))
+                    .collect();
+                if arrangement == 1 {
+                    paths.reverse();
+                }
+                if arrangement == 2 {
+                    paths.sort_by_key(|path| path.as_bytes().last().copied());
+                }
+                let budget =
+                    SubtreeBudget::new(MgmtLimits::default().max_subtree_filter_work_units, 0)
+                        .unwrap();
+                audit::take_audits();
+                ensure_unique(&paths, &budget).unwrap();
+                let accepted = paths
+                    .iter()
+                    .map(|path| Accepted {
+                        path,
+                        captured_bytes: path.len(),
+                        masked_keys: false,
+                        tree: NetconfXmlNode::scalar("/m:value", path.clone(), false),
+                    })
+                    .collect();
+                let ordered = order_accepted(accepted, &budget).unwrap();
+                let mut sorted = paths.clone();
+                sorted.sort();
+                assert_eq!(
+                    ordered
+                        .iter()
+                        .map(|node| node.value.as_ref().unwrap())
+                        .collect::<Vec<_>>(),
+                    sorted.iter().collect::<Vec<_>>()
+                );
+                let used = MgmtLimits::default().max_subtree_filter_work_units - budget.remaining();
+                if let Some(previous) = expected {
+                    assert_eq!(used, previous);
+                }
+                expected = Some(used);
+                let audits = audit::take_audits();
+                assert_eq!(audits.len(), 5);
+                for phase in [
+                    "provider identity sizing",
+                    "provider identities",
+                    "provider order sizing",
+                    "provider ordering",
+                    "provider output",
+                ] {
+                    let audit = audits.iter().find(|audit| audit.phase == phase).unwrap();
+                    assert!(audit.actual() <= audit.admitted, "{audit:?}");
+                    if count > 1 {
+                        assert!(audit.actual() > 0, "{audit:?}");
+                    }
+                }
+                if count > 1 {
+                    let identity = audits
+                        .iter()
+                        .find(|audit| audit.phase == "provider identities")
+                        .unwrap();
+                    assert!(identity.comparisons > 0 && identity.bytes > 0 && identity.moves > 0);
+                    let ordering = audits
+                        .iter()
+                        .find(|audit| audit.phase == "provider ordering")
+                        .unwrap();
+                    assert!(ordering.comparisons > 0 && ordering.bytes > 0 && ordering.moves > 0);
+                    paths[1] = paths[0].clone();
+                    let budget = SubtreeBudget::new(usize::MAX, 0).unwrap();
+                    assert_eq!(
+                        ensure_unique(&paths, &budget),
+                        Err(SubtreeError::Projection)
+                    );
+                    assert!(audit::take_audits()
+                        .iter()
+                        .all(|audit| audit.actual() <= audit.admitted));
+                }
+            }
+        }
+        // Raw masked-key lengths are intentionally outside logical ordering
+        // charges. Preserve canonical order even with long shared prefixes.
+        let paths: Vec<_> = (0..100)
+            .rev()
+            .map(|index| format!("{}-{index:04}", "hidden".repeat(512)))
+            .collect();
+        let budget =
+            SubtreeBudget::new(MgmtLimits::default().max_subtree_filter_work_units, 0).unwrap();
+        let accepted = paths
+            .iter()
+            .map(|path| Accepted {
+                path,
+                captured_bytes: 64,
+                masked_keys: true,
+                tree: NetconfXmlNode::scalar("/m:value", path.clone(), false),
+            })
+            .collect();
+        let ordered = order_accepted(accepted, &budget).unwrap();
+        assert!(ordered.windows(2).all(|pair| pair[0].value < pair[1].value));
+        assert!(audit::take_audits()
+            .iter()
+            .all(|audit| audit.actual() <= audit.admitted));
+    }
+
+    #[test]
     fn provider_index_sort_admits_before_comparing_and_is_order_independent() {
         let count = 1024;
         let mut expected_used = None;
@@ -574,10 +772,16 @@ mod index_tests {
             let budget =
                 SubtreeBudget::new(MgmtLimits::default().max_subtree_filter_work_units, 0).unwrap();
             let mut comparisons = 0;
-            let order = sorted_positions(count, 64, &budget, |left, right| {
-                comparisons += 1;
-                paths[left].cmp(&paths[right])
-            })
+            let (order, _reservation) = sorted_positions(
+                count,
+                64,
+                &budget,
+                "test sort",
+                |left, right, reservation| {
+                    comparisons += 1;
+                    reservation.text_cmp(&paths[left], &paths[right])
+                },
+            )
             .unwrap();
             assert_eq!(
                 order.iter().map(|index| &paths[*index]).collect::<Vec<_>>(),
@@ -598,18 +802,24 @@ mod index_tests {
             expected_used = Some(used);
             let refused = SubtreeBudget::new(used - 1, 0).unwrap();
             assert_eq!(
-                sorted_positions(count, 64, &refused, |_, _| panic!(
+                sorted_positions(count, 64, &refused, "refused sort", |_, _, _| panic!(
                     "comparison before admission"
-                )),
+                ))
+                .map(|(order, _)| order),
                 Err(SubtreeError::TooBig)
             );
             assert_eq!(refused.remaining(), used - 1);
         }
         let budget = SubtreeBudget::new(1, 0).unwrap();
         assert_eq!(
-            sorted_positions(usize::MAX, usize::MAX, &budget, |_, _| panic!(
-                "overflow before admission"
-            )),
+            sorted_positions(
+                usize::MAX,
+                usize::MAX,
+                &budget,
+                "overflow sort",
+                |_, _, _| panic!("overflow before admission")
+            )
+            .map(|(order, _)| order),
             Err(SubtreeError::TooBig)
         );
         assert_eq!(budget.remaining(), 1);
