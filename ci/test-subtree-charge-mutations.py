@@ -40,6 +40,24 @@ fn production(budget: &Budget) -> Result<(), SubtreeError> {
         self.assertIn(b'opc_mgmt_schema::subtree::SubtreeError', changed)
         self.assertNotIn(b'.charge(', changed)
 
+    def test_inventory_discovers_charge_sites_in_new_read_path_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in mutations.ROOTS:
+                candidate = root / name
+                if candidate.suffix == '.rs':
+                    candidate.parent.mkdir(parents=True, exist_ok=True)
+                    candidate.write_text('')
+                else:
+                    candidate.mkdir(parents=True, exist_ok=True)
+            path = root / 'crates/opc-netconf-server/src/discovery/new_content.rs'
+            path.parent.mkdir(parents=True)
+            path.write_text('fn project() { budget.charge(7); }')
+            sources, sites = mutations.inventory(root)
+            self.assertEqual(len(sites), 1)
+            self.assertEqual(sites[0]['path'], str(path.relative_to(root)))
+            self.assertEqual(sources[sites[0]['path']], path.read_bytes())
+
     def test_failed_compilation_and_timeouts_are_not_killed_mutations(self):
         failed = 'test real_test ... FAILED\ntest result: FAILED. 4 passed; 1 failed; 0 ignored;'
         self.assertEqual(mutations.outcome(101, failed), 'killed')

@@ -19,12 +19,11 @@ import subprocess
 import time
 
 from test_inventory.syntax import checked_parse, walk, COMMENTS, STRINGS
-ROOTS = ('crates/opc-mgmt-schema/src/subtree.rs',
-         'crates/opc-mgmt-schema/src/subtree',
-         'crates/opc-netconf-server/src/operations/content.rs',
-         'crates/opc-netconf-server/src/operations/content',
-         'crates/opc-netconf-server/src/filter/content.rs',
-         'crates/opc-yanggen/src/rust/netconf_xml/content.rs')
+# Discover calls across the complete producer/consumer source trees, including
+# discovery and generated projection. New read-path files need no allowlist edit.
+ROOTS = ('crates/opc-mgmt-schema/src',
+         'crates/opc-netconf-server/src',
+         'crates/opc-yanggen/src')
 TEST_MODULES = {'tests.rs', 'work_audit.rs'}
 COMMANDS = {
     'server': ['cargo', 'test', '--locked', '-p', 'opc-netconf-server', '--lib',
@@ -101,12 +100,14 @@ def sites_in(path, source):
 
 
 def inventory(root):
-    paths = set()
-    for name in ROOTS:
-        path = root / name
-        paths.update(path.rglob('*.rs') if path.is_dir() else [path])
-    sources = {str(path.relative_to(root)): path.read_bytes()
-               for path in sorted(paths) if path.name not in TEST_MODULES}
+    paths = {path for name in ROOTS for path in (root / name).rglob('*.rs')}
+    sources = {}
+    for path in sorted(paths):
+        if path.name in TEST_MODULES:
+            continue
+        source = path.read_bytes()
+        if re.search(rb'\.\s*charge\s*\(', source):
+            sources[str(path.relative_to(root))] = source
     sites = [site for name, source in sources.items() for site in sites_in(name, source)]
     return sources, sites
 
