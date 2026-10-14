@@ -1,6 +1,8 @@
 use super::*;
 use crate::{DataClass, EnumValueMeta, ModelData, NodeNumericRangeMeta, OriginEntry};
 
+mod integer_keys;
+
 const fn leaf(path: &'static str, leaf_type: LeafType, data_class: DataClass) -> NodeMeta {
     NodeMeta {
         path,

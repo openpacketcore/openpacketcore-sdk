@@ -272,7 +272,7 @@ impl SubtreeBudget {
 #[derive(Clone, PartialEq, Eq)]
 enum ScalarValue {
     Boolean(bool),
-    Integer(i64),
+    Integer(i128),
     Text(String),
     Never,
 }
@@ -445,9 +445,14 @@ pub fn canonical_key(
         work.visit();
         return Ok(match kind {
             LeafType::Boolean => matches!(value, "true" | "false").then(|| value.to_owned()),
-            LeafType::Uint16 | LeafType::Uint32 | LeafType::Int64 => {
-                parse_integer(kind, value).map(|integer| integer.to_string())
-            }
+            LeafType::Uint8
+            | LeafType::Uint16
+            | LeafType::Uint32
+            | LeafType::Uint64
+            | LeafType::Int8
+            | LeafType::Int16
+            | LeafType::Int32
+            | LeafType::Int64 => parse_key_integer(kind, value).map(|integer| integer.to_string()),
             _ => Some(value.to_owned()),
         });
     }
@@ -460,14 +465,33 @@ pub fn canonical_key(
     .canonical_literal(budget)
 }
 
-fn parse_integer(kind: LeafType, text: &str) -> Option<i64> {
-    let value = text.parse::<i64>().ok()?;
+fn parse_integer(kind: LeafType, text: &str) -> Option<i128> {
+    let value = text.parse::<i128>().ok()?;
     match kind {
+        LeafType::Uint8 if u8::try_from(value).is_ok() => Some(value),
         LeafType::Uint16 if u16::try_from(value).is_ok() => Some(value),
         LeafType::Uint32 if u32::try_from(value).is_ok() => Some(value),
-        LeafType::Int64 => Some(value),
+        LeafType::Uint64 if u64::try_from(value).is_ok() => Some(value),
+        LeafType::Int8 if i8::try_from(value).is_ok() => Some(value),
+        LeafType::Int16 if i16::try_from(value).is_ok() => Some(value),
+        LeafType::Int32 if i32::try_from(value).is_ok() => Some(value),
+        LeafType::Int64 if i64::try_from(value).is_ok() => Some(value),
         _ => None,
     }
+}
+
+fn parse_key_integer(kind: LeafType, text: &str) -> Option<i128> {
+    // Key identity follows the path codec's unsigned lexical rules, including
+    // rejection of negative zero. Non-key comparisons retain their own codec.
+    if text.starts_with('-')
+        && matches!(
+            kind,
+            LeafType::Uint8 | LeafType::Uint16 | LeafType::Uint32 | LeafType::Uint64
+        )
+    {
+        return None;
+    }
+    parse_integer(kind, text)
 }
 
 fn parse_scalar(
@@ -485,15 +509,28 @@ fn parse_scalar(
             "false" => ScalarValue::Boolean(false),
             _ => ScalarValue::Never,
         },
-        LeafType::Uint16 | LeafType::Uint32 | LeafType::Int64 => {
-            let Some(integer) = parse_integer(kind, literal) else {
+        LeafType::Uint8
+        | LeafType::Uint16
+        | LeafType::Uint32
+        | LeafType::Uint64
+        | LeafType::Int8
+        | LeafType::Int16
+        | LeafType::Int32
+        | LeafType::Int64 => {
+            let integer = if key {
+                parse_key_integer(kind, literal)
+            } else {
+                parse_integer(kind, literal)
+            };
+            let Some(integer) = integer else {
                 return Ok(ScalarValue::Never);
             };
             let mut allowed = ranges.is_empty();
             for interval in ranges {
                 let work = budget.audit_admission("numeric range interval", || budget.charge(1))?;
                 work.visit();
-                allowed |= integer >= interval.min && integer <= interval.max;
+                allowed |=
+                    integer >= i128::from(interval.min) && integer <= i128::from(interval.max);
             }
             if allowed {
                 ScalarValue::Integer(integer)
