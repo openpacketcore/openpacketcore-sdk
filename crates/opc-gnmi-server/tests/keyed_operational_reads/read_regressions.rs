@@ -600,3 +600,206 @@ async fn operational_render_selection_reuses_validated_matches_without_allocatin
         "validated render selection must not parse paths again"
     );
 }
+
+struct ClassificationRegistry {
+    inner: &'static AggregateRegistry,
+    path: &'static str,
+    class: Option<DataClass>,
+}
+
+impl SchemaRegistry for ClassificationRegistry {
+    fn schema_digest(&self) -> &'static str {
+        self.inner.schema_digest()
+    }
+    fn served_models(&self) -> &'static [ModelData] {
+        self.inner.served_models()
+    }
+    fn origins(&self) -> &'static [OriginEntry] {
+        self.inner.origins()
+    }
+    fn nodes(&self) -> &'static [NodeMeta] {
+        self.inner.nodes()
+    }
+    fn data_class(&self, path: &str) -> Option<DataClass> {
+        if path == self.path {
+            self.class
+        } else {
+            self.inner.data_class(path)
+        }
+    }
+}
+
+fn classification_registry(
+    path: &'static str,
+    class: Option<DataClass>,
+) -> &'static ClassificationRegistry {
+    let registry = Box::leak(Box::new(ClassificationRegistry {
+        inner: aggregate_registry(DataClass::Public, DataClass::Public),
+        path,
+        class,
+    }));
+    assert_eq!(registry.node(path).unwrap().data_class, DataClass::Public);
+    assert_eq!(registry.data_class(path), class);
+    registry
+}
+
+const OPAQUE_PATH: &str = "/ex:system/ex:opaque";
+const HIDDEN_PATH: &str = "/ex:system/ex:opaque/ex:hidden";
+const VISIBLE_PATH: &str = "/ex:system/ex:visible";
+const OPAQUE_JSON: &str = r#"{"hidden":"protected-marker","public":"public"}"#;
+
+async fn registry_classification_masks_leaf(class: Option<DataClass>) {
+    let registry = classification_registry(HIDDEN_PATH, class);
+    let (service, binding, _) = fixture_with_registry(
+        vec![value(HIDDEN_PATH, r#""protected-marker""#)],
+        vec![policy(&["/ex:system", "/ex:system/**"])],
+        MgmtLimits::default(),
+        registry,
+    )
+    .await;
+    let response = service
+        .get(get(vec![wire_path(HIDDEN_PATH)], None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        decoded(response),
+        vec![(wire_path(HIDDEN_PATH).elem, br#""<redacted>""#.to_vec())]
+    );
+    assert_eq!(
+        binding.provider.requests.lock().unwrap()[0].paths,
+        vec![YangPath::new(HIDDEN_PATH).unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn registry_classification_masks_overridden_leaf() {
+    registry_classification_masks_leaf(Some(DataClass::SecuritySecret)).await;
+}
+
+#[tokio::test]
+async fn registry_classification_masks_unclassified_leaf() {
+    registry_classification_masks_leaf(None).await;
+}
+
+async fn registry_classification_prunes_get(path: &'static str, class: Option<DataClass>) {
+    let registry = classification_registry(path, class);
+    let (service, binding, _) = fixture_with_registry(
+        vec![value(OPAQUE_PATH, OPAQUE_JSON), value(VISIBLE_PATH, "true")],
+        vec![policy(&["/ex:system", "/ex:system/**"])],
+        MgmtLimits::default(),
+        registry,
+    )
+    .await;
+    let response = service
+        .get(get(
+            vec![wire_path(OPAQUE_PATH), wire_path(VISIBLE_PATH)],
+            None,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        decoded(response),
+        vec![(wire_path(VISIBLE_PATH).elem, b"true".to_vec())]
+    );
+    let requests = binding.provider.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    for request in requests.iter() {
+        assert_eq!(request.paths, vec![YangPath::new(VISIBLE_PATH).unwrap()]);
+    }
+}
+
+#[tokio::test]
+async fn registry_classification_get_prunes_overridden_descendant() {
+    registry_classification_prunes_get(HIDDEN_PATH, Some(DataClass::SecuritySecret)).await;
+}
+
+#[tokio::test]
+async fn registry_classification_get_prunes_unclassified_descendant() {
+    registry_classification_prunes_get(HIDDEN_PATH, None).await;
+}
+
+#[tokio::test]
+async fn registry_classification_get_prunes_overridden_aggregate() {
+    registry_classification_prunes_get(OPAQUE_PATH, Some(DataClass::SecuritySecret)).await;
+}
+
+#[tokio::test]
+async fn registry_classification_get_prunes_unclassified_aggregate() {
+    registry_classification_prunes_get(OPAQUE_PATH, None).await;
+}
+
+async fn registry_classification_prunes_event(path: &'static str, class: Option<DataClass>) {
+    let registry = classification_registry(path, class);
+    let (service, binding, sender) = subscription_fixture_with_registry(
+        vec![],
+        policy(&["/ex:system", "/ex:system/**"]),
+        MgmtLimits::default(),
+        registry,
+    )
+    .await;
+    let mut stream = service
+        .subscribe(open_requests(
+            list(
+                ReadMode::Event,
+                &[wire_path(OPAQUE_PATH), wire_path(VISIBLE_PATH)],
+            ),
+            false,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    sync(stream.next().await.unwrap().unwrap());
+    sender
+        .send(OperationalEvent::Update(value(OPAQUE_PATH, OPAQUE_JSON)))
+        .await
+        .unwrap();
+    sender
+        .send(OperationalEvent::Update(value(VISIBLE_PATH, "true")))
+        .await
+        .unwrap();
+    let data = notification(
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(data.update.len(), 1);
+    assert_eq!(
+        data.update[0].path.as_ref().unwrap().elem,
+        wire_path(VISIBLE_PATH).elem
+    );
+    assert_eq!(
+        data.update[0].val.as_ref().unwrap().value,
+        Some(gnmi::typed_value::Value::JsonIetfVal(b"true".to_vec()))
+    );
+    assert!(data.delete.is_empty());
+    let requests = binding.events.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].paths,
+        vec![YangPath::new(VISIBLE_PATH).unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn registry_classification_event_prunes_overridden_descendant() {
+    registry_classification_prunes_event(HIDDEN_PATH, Some(DataClass::SecuritySecret)).await;
+}
+
+#[tokio::test]
+async fn registry_classification_event_prunes_unclassified_descendant() {
+    registry_classification_prunes_event(HIDDEN_PATH, None).await;
+}
+
+#[tokio::test]
+async fn registry_classification_event_prunes_overridden_aggregate() {
+    registry_classification_prunes_event(OPAQUE_PATH, Some(DataClass::SecuritySecret)).await;
+}
+
+#[tokio::test]
+async fn registry_classification_event_prunes_unclassified_aggregate() {
+    registry_classification_prunes_event(OPAQUE_PATH, None).await;
+}
