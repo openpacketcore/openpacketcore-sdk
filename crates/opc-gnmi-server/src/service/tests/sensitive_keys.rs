@@ -592,6 +592,7 @@ struct ChangingContext {
     calls: AtomicUsize,
     registrations: AtomicUsize,
     evaluated: tokio::sync::Notify,
+    resolve_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl ChangingContext {
     fn new() -> Self {
@@ -603,6 +604,7 @@ impl ChangingContext {
             calls: AtomicUsize::new(0),
             registrations: AtomicUsize::new(0),
             evaluated: Default::default(),
+            resolve_hook: Mutex::new(None),
         }
     }
     async fn wait_calls(&self, count: usize) {
@@ -623,6 +625,10 @@ impl PolicySource for ChangingContext {
         &self,
         principal: &TrustedPrincipal,
     ) -> Result<opc_mgmt_authz::ResolvedPolicy, AuthzError> {
+        let hook = self.resolve_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.evaluated.notify_one();
         if self.invalid.load(Ordering::SeqCst) {

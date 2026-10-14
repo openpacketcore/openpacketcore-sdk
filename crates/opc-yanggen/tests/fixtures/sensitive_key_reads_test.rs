@@ -707,6 +707,54 @@ async fn sensitive_key_outputs_are_value_free() {
 }
 
 #[tokio::test]
+async fn no_cleartext_key_predicate_is_refused() {
+    let mut failures = Vec::new();
+    for (list, key) in [
+        ("blocked-rows", "id"),
+        ("lawful-rows", "id"),
+        ("named-rows", "password"),
+    ] {
+        let fixture = Fixture::new(
+            config(
+                list,
+                json!([{ key: "forbidden-key-marker", "value": "selected-value" }]),
+            ),
+            full_policy(&[]),
+        )
+        .await;
+        for operation in [NetconfRead::GetConfig, NetconfRead::Get, NetconfRead::GetData] {
+            let matching = fixture
+                .xml_read(
+                    operation,
+                    Some(&format!(
+                        "/k:root/k:{list}[k:{key}='forbidden-key-marker']/k:value"
+                    )),
+                    None,
+                )
+                .await;
+            let missing = fixture
+                .xml_read(
+                    operation,
+                    Some(&format!("/k:root/k:{list}[k:{key}='other-marker']/k:value")),
+                    None,
+                )
+                .await;
+            let refused = matching == missing
+                && matching.contains("<error-tag>operation-not-supported</error-tag>")
+                && ["forbidden-key-marker", "other-marker", "selected-value", "<data", "<keys:"]
+                    .iter()
+                    .all(|marker| !matching.contains(marker));
+            if !refused {
+                failures.push(format!(
+                    "{list}/{key} {operation:?}: matching and missing predicates must return byte-identical operation-not-supported errors without data; matching={matching:?}, missing={missing:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn no_cleartext_key_class_is_refused() {
     for (list, key) in [
         ("blocked-rows", "id"),

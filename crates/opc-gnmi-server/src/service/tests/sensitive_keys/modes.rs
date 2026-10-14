@@ -497,3 +497,131 @@ async fn configuration_subscription_registers_before_initial_snapshot() {
     )
     .await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_revision_move_keeps_on_change_and_sample_stream_open() {
+    let policy = Arc::new(ChangingContext::new());
+    *policy.policy.lock().unwrap() = selected_policy(
+        &["/sys:system", "/sys:system/sys:hostname"],
+        NacmAction::Subscribe,
+    );
+    let service = config_service(policy.clone(), Arc::new(RenderProbe::default())).await;
+    let mut requested = list(
+        gnmi::subscription_list::Mode::Stream,
+        gnmi::SubscriptionMode::OnChange,
+        true,
+    );
+    let mut sample = requested.subscription[0].clone();
+    sample.mode = gnmi::SubscriptionMode::Sample as i32;
+    sample.sample_interval = 100_000_000;
+    requested.subscription.push(sample);
+    let mut stream = service
+        .subscribe(open_subscribe_request(requested))
+        .await
+        .unwrap()
+        .into_inner();
+    expect_value(&mut stream, "/sys:system/sys:hostname", "amf-1").await;
+    expect_sync(&mut stream).await;
+
+    let (activated, activation) = tokio::sync::oneshot::channel();
+    let hub = policy.hub.clone();
+    *policy.resolve_hook.lock().unwrap() = Some(Box::new(move || {
+        // Snapshot policy resolution runs on a blocking worker. Activate after
+        // it read the old revision, but retain control delivery until the test.
+        let pending = tokio::runtime::Handle::current()
+            .block_on(hub.prepare_change(|| {}))
+            .unwrap();
+        assert!(activated.send(pending).is_ok());
+    }));
+    commit(&service, Some("after-activation"), "hidden-key-marker").await;
+    let pending = tokio::time::timeout(Duration::from_secs(5), activation)
+        .await
+        .expect("snapshot resolves the activated context")
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), pending.complete())
+            .await
+            .expect("non-revoking change is acknowledged")
+            .unwrap(),
+        1
+    );
+    expect_value(&mut stream, "/sys:system/sys:hostname", "after-activation").await;
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    expect_value(&mut stream, "/sys:system/sys:hostname", "after-activation").await;
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            stream.as_mut().poll_next(cx).is_pending()
+        ))
+        .await,
+        "a non-revoking activation must preserve both delivery modes"
+    );
+}
+
+#[tokio::test]
+async fn hidden_config_change_does_not_end_stream_before_revocation_acknowledgement() {
+    let policy = Arc::new(ChangingContext::new());
+    *policy.policy.lock().unwrap() = selected_policy(
+        &["/sys:system", "/sys:system/sys:hostname"],
+        NacmAction::Subscribe,
+    );
+    let service = config_service(policy.clone(), Arc::new(RenderProbe::default())).await;
+    let mut stream = service
+        .subscribe(open_subscribe_request(list(
+            gnmi::subscription_list::Mode::Stream,
+            gnmi::SubscriptionMode::OnChange,
+            true,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    expect_value(&mut stream, "/sys:system/sys:hostname", "amf-1").await;
+    expect_sync(&mut stream).await;
+    let pending = policy
+        .hub
+        .prepare_change(|| {
+            *policy.policy.lock().unwrap() =
+                selected_policy(&["/sys:system"], NacmAction::Subscribe);
+        })
+        .await
+        .unwrap();
+    commit(&service, None, "first-hidden-key-marker").await;
+    tokio::time::timeout(Duration::from_secs(5), policy.wait_calls(2))
+        .await
+        .expect("the hidden config change reaches snapshot authorization");
+    // A second resolution proves the first data-path snapshot completed while
+    // the control notification was still held, without relying on a sleep.
+    commit(&service, None, "second-hidden-key-marker").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            response = stream.next() => panic!(
+                "hidden config activity must not emit or terminate before acknowledgement: {response:?}"
+            ),
+            _ = policy.wait_calls(3) => {},
+        }
+    })
+    .await
+    .expect("the pending revocation leaves the config stream running");
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            stream.as_mut().poll_next(cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), pending.complete())
+            .await
+            .expect("control acknowledges the revocation independently")
+            .unwrap(),
+        1
+    );
+    let terminal =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(stream.as_mut().poll_next(cx))).await;
+    let std::task::Poll::Ready(Some(Err(error))) = terminal else {
+        panic!("termination must be ready at acknowledgement")
+    };
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(error.message(), "gNMI service unavailable");
+    assert!(stream.next().await.is_none());
+}

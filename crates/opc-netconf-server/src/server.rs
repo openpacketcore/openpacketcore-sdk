@@ -11445,6 +11445,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notification_stream_does_not_emit_changes_with_denied_list_keys() {
+        struct KeyRegistry;
+        impl SchemaRegistry for KeyRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "fnv1a64:notification-key"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                ORIGINS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                static KEY_NODES: std::sync::OnceLock<Vec<NodeMeta>> = std::sync::OnceLock::new();
+                KEY_NODES.get_or_init(|| {
+                    vec![
+                        NodeMeta {
+                            child_paths: &["/sys:system/sys:rows"],
+                            ..NODES[0]
+                        },
+                        NodeMeta {
+                            path: "/sys:system/sys:rows",
+                            kind: NodeKind::List,
+                            key_leaves: &["id"],
+                            child_paths: &[
+                                "/sys:system/sys:rows/sys:id",
+                                "/sys:system/sys:rows/sys:value",
+                            ],
+                            ..NODES[0]
+                        },
+                        NodeMeta {
+                            path: "/sys:system/sys:rows/sys:id",
+                            data_class: DataClass::SubscriberId,
+                            ..NODES[1]
+                        },
+                        NodeMeta {
+                            path: "/sys:system/sys:rows/sys:value",
+                            ..NODES[1]
+                        },
+                    ]
+                })
+            }
+        }
+        struct KeyBinding(Arc<ConfigBus<DemoConfig>>);
+        impl NetconfConfigBinding<DemoConfig> for KeyBinding {
+            fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+                self.0.clone()
+            }
+            fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+                &KeyRegistry
+            }
+        }
+
+        let previous = DemoConfig {
+            hostname: "old-value-marker".into(),
+            secret: "key-value-marker".into(),
+        };
+        let current = DemoConfig {
+            hostname: "new-value-marker".into(),
+            ..previous.clone()
+        };
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(current.clone(), MockManagedDatastore::new())
+                .await
+                .unwrap(),
+        );
+        let change = ConfigChange {
+            tx_id: opc_types::TxId::new(),
+            version: ConfigVersion::new(1),
+            previous: Arc::new(previous),
+            current: Arc::new(current),
+            deltas: Arc::from([]),
+            changed_paths: Arc::from([YangPath::new("/sys:system/sys:rows/sys:value").unwrap()]),
+        };
+        let mut modules = ModuleRegistry::new();
+        modules.register_module("demo-system", "sys").unwrap();
+        for allow_key in [true, false] {
+            let key = YangPathPattern::parse("/sys:system/sys:rows/sys:id", &modules).unwrap();
+            let policy = NacmPolicy::builder(PolicyVersion::new(1))
+                .add_rule(if allow_key {
+                    NacmRule::allow(NacmAction::Subscribe, key)
+                } else {
+                    NacmRule::deny(NacmAction::Subscribe, key)
+                })
+                .add_rule(NacmRule::allow(
+                    NacmAction::Subscribe,
+                    YangPathPattern::parse("/sys:system/sys:rows/sys:value", &modules).unwrap(),
+                ))
+                .build();
+            let server = ReadOnlyNetconfServer::new(
+                KeyBinding(bus.clone()),
+                FixedPolicy(policy),
+                CapturingAudit::default(),
+                TransportType::NetconfTls,
+            )
+            .unwrap();
+            let notification = server
+                .notification_xml_for_event(&principal(), ConfigEvent::Change(change.clone()));
+            if allow_key {
+                let xml = notification.expect("allowed value and key notify");
+                assert!(xml.contains("netconf-config-change"));
+                assert!(xml.contains("/sys:system/sys:rows/sys:value"));
+                assert!(!xml.contains("/sys:system/sys:rows/sys:id"));
+                assert!(!xml.contains("value-marker"));
+            } else {
+                assert!(
+                    notification.is_none(),
+                    "a denied list key must suppress the value change"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn duplicate_create_subscription_fails_closed() {
         let (server, _bus, _audit) = server_fixture_with_notifications().await;
         let registry = SessionRegistry::new();
