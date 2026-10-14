@@ -24,6 +24,7 @@ opc-mgmt-authz = { path = "../opc-mgmt-authz", version = "0.2.0" }
 opc-mgmt-errors = { path = "../opc-mgmt-errors", version = "0.2.0" }
 opc-mgmt-limits = { path = "../opc-mgmt-limits", version = "0.2.0" }
 opc-mgmt-opstate = { path = "../opc-mgmt-opstate", version = "0.2.0" }
+opc-mgmt-path = { path = "../opc-mgmt-path", version = "0.2.0" }
 opc-mgmt-principal = { path = "../opc-mgmt-principal", version = "0.2.0" }
 opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
 opc-mgmt-transport = { path = "../opc-mgmt-transport", version = "0.2.0" }
@@ -43,6 +44,7 @@ tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0", features = ["testkit"] }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-config-bus-consensus = { path = "../opc-config-bus-consensus", version = "0.2.0" }
 async-trait = { workspace = true }

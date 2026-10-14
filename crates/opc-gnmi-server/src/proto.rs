@@ -22,6 +22,30 @@ pub mod gnmi {
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("gnmi_descriptor");
 }
 
+// Protobuf serialization retains the authorized protocol values. Diagnostics
+// must not copy path predicates or payloads into logs, including when a parent
+// request/notification uses its derived formatter.
+macro_rules! redacted_debug {
+    ($($type:ty => $name:literal),+ $(,)?) => {
+        $(
+            #[allow(deprecated)]
+            impl std::fmt::Debug for $type {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.debug_struct($name).finish_non_exhaustive()
+                }
+            }
+        )+
+    };
+}
+
+redacted_debug!(
+    gnmi::Path => "Path",
+    gnmi::PathElem => "PathElem",
+    gnmi::TypedValue => "TypedValue",
+    gnmi::typed_value::Value => "TypedValue",
+    gnmi::Value => "Value",
+);
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

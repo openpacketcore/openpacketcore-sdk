@@ -2840,6 +2840,7 @@ dependencies = [
 name = "opc-gnmi-server"
 version = "0.2.0"
 dependencies = [
+ "allocation-counter",
  "async-trait",
  "bytes",
  "http-body-util",
@@ -3171,6 +3172,7 @@ dependencies = [
  "opc-nacm",
  "opc-types",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 
@@ -3199,8 +3201,10 @@ dependencies = [
 name = "opc-mgmt-opstate"
 version = "0.2.0"
 dependencies = [
+ "allocation-counter",
  "opc-config-model",
  "opc-mgmt-errors",
+ "opc-mgmt-path",
  "opc-types",
  "serde",
  "serde_json",
@@ -3234,6 +3238,7 @@ dependencies = [
  "opc-data-governance",
  "opc-redaction",
  "regex",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3308,6 +3313,7 @@ dependencies = [
  "opc-mgmt-errors",
  "opc-mgmt-limits",
  "opc-mgmt-opstate",
+ "opc-mgmt-path",
  "opc-mgmt-principal",
  "opc-mgmt-schema",
  "opc-mgmt-transport",
@@ -5231,9 +5237,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",

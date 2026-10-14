@@ -6,8 +6,11 @@ use opc_mgmt_schema::{NodeMeta, SchemaRegistry};
 
 use crate::GnmiError;
 
+/// Shared literal key builder for generated gNMI renderers.
+pub use opc_mgmt_path::append_key_predicate;
+
 /// One gNMI `PathElem` represented without protobuf.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GnmiPathElem {
     /// Element name.
     pub name: String,
@@ -41,7 +44,7 @@ impl GnmiPathElem {
 }
 
 /// A gNMI `Path` represented without protobuf.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct GnmiPath {
     /// gNMI origin.
     pub origin: Option<String>,
@@ -77,7 +80,7 @@ impl GnmiPath {
 }
 
 /// A schema-resolved gNMI path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedGnmiPath {
     /// Predicate-free schema path.
     pub schema_path: String,
@@ -101,6 +104,66 @@ pub fn resolve_path(
         canonical: resolved.canonical,
         node: resolved.node,
     })
+}
+
+/// Resolves a gNMI read selection. Exactly `*` in a key value means omission;
+/// other canonical-key values remain literal. Writes use [`resolve_path`].
+pub(crate) fn resolve_read_path(
+    registry: &dyn SchemaRegistry,
+    prefix: Option<&GnmiPath>,
+    path: &GnmiPath,
+) -> Result<Option<ResolvedGnmiPath>, GnmiError> {
+    let mut request = to_request_path(prefix, path)?;
+    if request
+        .prefix
+        .iter()
+        .chain(&request.elems)
+        .any(|segment| segment.keys.iter().any(|(_, value)| value == "*"))
+    {
+        // Wildcards omit a value constraint, not validation of its key name.
+        // Resolve the structural path before dropping wildcard predicates so
+        // unknown keys, keys on non-lists and duplicate aliases stay invalid.
+        let mut structural = request.clone();
+        for segment in structural.prefix.iter_mut().chain(&mut structural.elems) {
+            segment.keys.clear();
+        }
+        let resolved = opc_mgmt_path::resolve_read(registry, &structural)
+            .map_err(|_| GnmiError::invalid("invalid gNMI read selection"))?
+            .ok_or_else(|| GnmiError::invalid("invalid gNMI read selection"))?;
+        let mut ancestor = String::new();
+        for (name, input) in resolved
+            .schema_path
+            .trim_start_matches('/')
+            .split('/')
+            .zip(request.prefix.iter().chain(&request.elems))
+        {
+            ancestor.push('/');
+            ancestor.push_str(name);
+            let node = registry
+                .node(&ancestor)
+                .ok_or_else(|| GnmiError::invalid("invalid gNMI read selection"))?;
+            let mut keys = std::collections::BTreeSet::new();
+            for (name, _) in &input.keys {
+                let key = opc_mgmt_path::declared_key(registry, node, name)
+                    .ok_or_else(|| GnmiError::invalid("invalid gNMI read selection"))?;
+                if !keys.insert(key.path) {
+                    return Err(GnmiError::invalid("invalid gNMI read selection"));
+                }
+            }
+        }
+    }
+    for segment in request.prefix.iter_mut().chain(&mut request.elems) {
+        segment.keys.retain(|(_, value)| value != "*");
+    }
+    opc_mgmt_path::resolve_read(registry, &request)
+        .map(|resolved| {
+            resolved.map(|resolved| ResolvedGnmiPath {
+                schema_path: resolved.schema_path,
+                canonical: resolved.canonical,
+                node: resolved.node,
+            })
+        })
+        .map_err(|_| GnmiError::invalid("invalid gNMI read selection"))
 }
 
 /// Resolves a batch of paths and enforces `max_paths_per_request`.
@@ -162,6 +225,24 @@ fn to_segment(elem: &GnmiPathElem) -> PathSegment {
     PathSegment {
         name: elem.name.clone(),
         keys: elem.keys.clone(),
+    }
+}
+
+impl std::fmt::Debug for GnmiPathElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiPathElem").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for GnmiPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiPath").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResolvedGnmiPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedGnmiPath").finish_non_exhaustive()
     }
 }
 

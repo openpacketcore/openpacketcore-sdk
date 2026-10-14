@@ -804,7 +804,8 @@ fn test_production_proof_codegen() {
 
         sys.backup_interfaces.push("missing-peer".to_string());
         let error = sys.validate_semantics(&ctx).unwrap_err().to_string();
-        assert!(error.contains("missing-peer"), "missing value absent from: {error}");
+        assert!(!error.contains("missing-peer"), "missing value leaked in: {error}");
+        assert_eq!(error, "semantics validation failed: Leaf-list value at index 1 not found in target path /proof:system/proof:interfaces/proof:interface/proof:name");
         assert!(error.contains("index 1"), "element index absent from: {error}");
     }
 

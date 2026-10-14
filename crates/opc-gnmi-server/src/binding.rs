@@ -1,5 +1,6 @@
 //! CNF binding points for the gNMI server foundation.
 
+use opc_mgmt_path::canonical_path_matches;
 use std::sync::Arc;
 
 use opc_config_bus::ConfigBus;
@@ -17,10 +18,18 @@ use crate::{GnmiError, NormalizedSet};
 /// predicates from the client request. Generated renderers use it to restrict
 /// keyed list output to the addressed instances without making NACM
 /// instance-aware.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReadSelectionEntry {
     schema_path: &'static str,
     canonical_path: YangPath,
+}
+
+impl std::fmt::Debug for ReadSelectionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadSelectionEntry")
+            .field("schema_path", &self.schema_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReadSelectionEntry {
@@ -48,6 +57,7 @@ impl ReadSelectionEntry {
 pub struct ReadSelection<'a> {
     schema_paths: &'a [&'static str],
     entries: &'a [ReadSelectionEntry],
+    validated: bool,
 }
 
 impl<'a> ReadSelection<'a> {
@@ -60,6 +70,7 @@ impl<'a> ReadSelection<'a> {
         Self {
             schema_paths,
             entries: &[],
+            validated: false,
         }
     }
 
@@ -71,6 +82,19 @@ impl<'a> ReadSelection<'a> {
         Self {
             schema_paths,
             entries,
+            validated: false,
+        }
+    }
+
+    /// Uses already matched concrete entries, sorted by canonical path.
+    pub(crate) const fn with_validated_entries(
+        schema_paths: &'a [&'static str],
+        entries: &'a [ReadSelectionEntry],
+    ) -> Self {
+        Self {
+            schema_paths,
+            entries,
+            validated: true,
         }
     }
 
@@ -111,7 +135,14 @@ impl<'a> ReadSelection<'a> {
     /// predicates in the selection are treated as a subset: a request for
     /// `/list[k='a']` matches descendants under that entry, while a request for
     /// `/list/leaf` with no predicates matches every list entry's leaf.
+    /// Server-validated operational selections contain only the exact reported
+    /// identities and reuse their previously established matches.
     pub fn contains_path(&self, schema_path: &str, canonical_path: &YangPath) -> bool {
+        if self.validated {
+            return self
+                .reported_entry(canonical_path)
+                .is_some_and(|entry| entry.schema_path == schema_path);
+        }
         if self.entries.is_empty() {
             return self.contains(schema_path);
         }
@@ -127,12 +158,22 @@ impl<'a> ReadSelection<'a> {
     /// already returns SDK canonical paths instead of generated-model field
     /// values.
     pub fn contains_reported_path(&self, canonical_path: &YangPath) -> bool {
+        if self.validated {
+            return self.reported_entry(canonical_path).is_some();
+        }
         if self.entries.is_empty() {
             return self.contains(canonical_path.as_str());
         }
         self.entries.iter().any(|entry| {
             canonical_path_matches(entry.canonical_path.as_str(), canonical_path.as_str())
         })
+    }
+
+    fn reported_entry(&self, canonical_path: &YangPath) -> Option<&ReadSelectionEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.canonical_path.as_str().cmp(canonical_path.as_str()))
+            .ok()
+            .and_then(|index| self.entries.get(index))
     }
 }
 
@@ -146,141 +187,17 @@ pub trait GnmiJsonRenderer<C: OpcConfig>: Send + Sync {
     ) -> Result<Vec<GnmiJsonUpdate>, GnmiJsonProjectionError>;
 }
 
-fn canonical_path_matches(selection: &str, candidate: &str) -> bool {
-    let Ok(selection) = parse_canonical_path(selection) else {
-        return false;
-    };
-    let Ok(candidate) = parse_canonical_path(candidate) else {
-        return false;
-    };
-    if selection.len() != candidate.len() {
-        return false;
-    }
-    selection
-        .iter()
-        .zip(candidate.iter())
-        .all(|(selected, actual)| {
-            selected.name == actual.name
-                && selected.keys.iter().all(|(key, value)| {
-                    actual.keys.iter().any(|(actual_key, actual_value)| {
-                        actual_key == key && actual_value == value
-                    })
-                })
-        })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CanonicalSegment<'a> {
-    name: &'a str,
-    keys: Vec<(&'a str, String)>,
-}
-
-fn parse_canonical_path(path: &str) -> Result<Vec<CanonicalSegment<'_>>, ()> {
-    let mut segments = Vec::new();
-    for segment in split_canonical_segments(path)? {
-        let (name, predicates) = segment
-            .split_once('[')
-            .map(|(name, rest)| (name, Some(rest)))
-            .unwrap_or((segment, None));
-        if name.is_empty() {
-            return Err(());
-        }
-        let mut keys = Vec::new();
-        if let Some(mut rest) = predicates {
-            loop {
-                let end = find_predicate_end(rest)?;
-                let predicate = &rest[..end];
-                let (key, value) = parse_predicate(predicate)?;
-                keys.push((key, value));
-                rest = &rest[end + 1..];
-                if rest.is_empty() {
-                    break;
-                }
-                rest = rest.strip_prefix('[').ok_or(())?;
-            }
-        }
-        segments.push(CanonicalSegment { name, keys });
-    }
-    Ok(segments)
-}
-
-fn split_canonical_segments(path: &str) -> Result<Vec<&str>, ()> {
-    if !path.starts_with('/') {
-        return Err(());
-    }
-    let mut out = Vec::new();
-    let mut start = 1;
-    let mut quote = false;
-    let mut escape = false;
-    for (idx, ch) in path.char_indices().skip(1) {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' if quote => escape = true,
-            '\'' => quote = !quote,
-            '/' if !quote => {
-                out.push(&path[start..idx]);
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    if quote || escape {
-        return Err(());
-    }
-    if start < path.len() {
-        out.push(&path[start..]);
-    }
-    Ok(out)
-}
-
-fn find_predicate_end(rest: &str) -> Result<usize, ()> {
-    let mut quote = false;
-    let mut escape = false;
-    for (idx, ch) in rest.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' if quote => escape = true,
-            '\'' => quote = !quote,
-            ']' if !quote => return Ok(idx),
-            _ => {}
-        }
-    }
-    Err(())
-}
-
-fn parse_predicate(predicate: &str) -> Result<(&str, String), ()> {
-    let (key, raw_value) = predicate.split_once('=').ok_or(())?;
-    let quoted = raw_value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .ok_or(())?;
-    Ok((key, unescape_predicate_value(quoted)?))
-}
-
-fn unescape_predicate_value(value: &str) -> Result<String, ()> {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            out.push(chars.next().ok_or(())?);
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
-}
-
 /// One JSON/RFC 7951 gNMI update produced by a CNF/generated renderer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GnmiJsonUpdate {
     path: YangPath,
     value_json: String,
+}
+
+impl std::fmt::Debug for GnmiJsonUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiJsonUpdate").finish_non_exhaustive()
+    }
 }
 
 impl GnmiJsonUpdate {
@@ -292,7 +209,7 @@ impl GnmiJsonUpdate {
     ) -> Result<Self, GnmiJsonProjectionError> {
         let value_json = value_json.into();
         serde_json::from_str::<serde_json::Value>(&value_json)
-            .map_err(|_| GnmiJsonProjectionError::invalid_json(path.as_str()))?;
+            .map_err(|_| GnmiJsonProjectionError::invalid_json())?;
         Ok(Self { path, value_json })
     }
 
@@ -308,10 +225,17 @@ impl GnmiJsonUpdate {
 }
 
 /// CNF/generated-code gNMI projection failure.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[error("gNMI JSON projection failed")]
 pub struct GnmiJsonProjectionError {
     detail: String,
+}
+
+impl std::fmt::Debug for GnmiJsonProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GnmiJsonProjectionError")
+            .finish_non_exhaustive()
+    }
 }
 
 impl GnmiJsonProjectionError {
@@ -322,8 +246,8 @@ impl GnmiJsonProjectionError {
         }
     }
 
-    fn invalid_json(path: &str) -> Self {
-        Self::projection(format!("invalid JSON at {path}"))
+    fn invalid_json() -> Self {
+        Self::projection("invalid gNMI projection JSON")
     }
 
     /// Server-local detail. Never send this directly to a client.

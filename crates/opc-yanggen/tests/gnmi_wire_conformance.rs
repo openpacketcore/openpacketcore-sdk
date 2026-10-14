@@ -349,6 +349,11 @@ impl PolicySource for FixedPolicy {
     fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
         Ok(Arc::new(self.0.clone()))
     }
+    fn watch_authorization(&self, principal: &opc_config_model::TrustedPrincipal, gate: opc_mgmt_authz::AuthorizationGate)
+        -> Result<opc_mgmt_authz::AuthorizationWatch, AuthzError> {
+        opc_mgmt_authz::AuthorizationWatch::immutable(self.active_policy_context_for_principal(principal)?, gate)
+    }
+
 }
 
 #[derive(Clone, Default)]

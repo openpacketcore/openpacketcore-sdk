@@ -58,6 +58,33 @@ key is rejected instead of replacing the earlier row in the generated
 `BTreeMap`. Both failures use stable diagnostics that never include key
 values.
 
+Keyed lists under `config false` retain `Option<T>` key leaves and the same
+scalar or composite map-key types as configuration lists. Generated key
+extraction and edit helpers use that optional representation, including
+sensitive key wrappers. Read-only rows and nested containers with no
+configuration differences emit warning-free no-op diff helpers. State leaf
+fields, including leaves with a schema default, start as `None`; an observed
+value equal to that default remains `Some(value)`.
+Generated patch application, including direct `apply_patch_segments` calls,
+gNMI Set, and the NETCONF XML edit applicator reject writes to state paths.
+They also reject state members in JSON or XML bodies addressed to configuration
+ancestors, including empty or null state members and hand-built NETCONF edit
+nodes. Ancestor replacement or removal that would erase existing state is
+refused. Rejections use fixed diagnostics with no input values and leave the
+original model unchanged; configuration edits that retain state still succeed.
+Patch errors use stable messages without instance paths, input field names, or
+values, including their `Display` and `Debug` output. This covers invalid and
+read-only paths, numeric parsing, JSON decoding, and unsupported fields.
+Configuration diffs exclude every read-only node kind, including removed rows, containers,
+keyless lists and leaf-lists; writable siblings still emit their own deltas.
+NETCONF edit generation omits helpers beneath keyless lists, including nested
+container, leaf-list and list helpers, while retaining the reachable list's
+unsupported-shape rejection. Read-only admission takes precedence for state lists.
+Generated modules for these schemas are checked with Clippy warnings denied.
+Their block boundaries preserve literal contents and punctuation. Pinned output
+changes are confined to patch, NETCONF edit and leafref validation generation;
+unrelated generated artifacts retain their bytes.
+
 Key leaves with a non-public `opc:data-class` remain available to serde,
 ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`
 implementations redact them. A sensitive single key uses the generated
@@ -132,6 +159,23 @@ the additional integer widths and restricted strings, so exhaustive matches
 must handle them. Runtime registries add `integer_ranges()`/`integer_range()`
 with `i128` bounds while preserving the legacy `i64` numeric-range API.
 
+### Bounded NETCONF content projection
+
+Generated NETCONF renderers implement `supports_subtree_content` and
+`project_subtree_content`. They use `SubtreeProjection` to gate each structural
+node, list row and scalar before inspecting typed fields. Only the authorized
+dependencies are captured; the shared evaluator compares those captured
+values and preserves list order, identity keys, defaults and payload masking.
+No whole-model serialization precedes matching.
+
+Regenerate `netconf_xml.rs` to opt an existing generated binding into this
+contract. Existing renderer implementations retain their key-only read
+support and refuse other content predicates until they supply the typed
+projection. Stored models and the ordinary
+schema-only rendering hooks retain their existing representations. See
+[subtree content reads](../../docs/design/netconf-subtree-content-reads.md)
+for codec restrictions and integration requirements.
+
 ## Relationships
 
 - Emits implementations consumed by `opc-config-model`,
@@ -148,8 +192,8 @@ Current scope:
   the supported OpenPacketCore YANG subset.
 - Absolute `leafref` validation for both scalar leaves and leaf-lists. Generated
   leaf-list checks validate every element against the referenced target set and
-  identify the unresolved element and its index without changing scalar-leaf
-  behavior. Empty leaf-lists require no matching target value.
+  identify the unresolved element's index and target schema path without
+  including its value. Empty leaf-lists require no matching target value.
 - Fail-closed diagnostics for unsupported or unsafe constructs.
 
 Known constraints:

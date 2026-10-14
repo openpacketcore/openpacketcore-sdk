@@ -739,6 +739,7 @@ impl Traversal<'_> {
         }
         let endpoint = SocketAddr::new(address.peer().endpoint.ip(), port);
         let provenance = SnaptrPath {
+            rank: Box::default(),
             records: records.into(),
             hops: path.hops.clone().into_boxed_slice(),
             terminal_host: host.clone(),
@@ -1467,7 +1468,8 @@ impl Traversal<'_> {
         for (index, mut endpoint) in std::mem::take(&mut self.endpoints).into_iter().enumerate() {
             let mut paths = Vec::new();
             for ranked in endpoint.paths {
-                let path = ranked.value;
+                let mut path = ranked.value;
+                path.rank = ranked.rank.into_boxed_slice();
                 let port = endpoint.peer.endpoint.port();
                 if !paths.is_empty() {
                     if hosts.len() == DnsAnswer::MAX_CANDIDATES

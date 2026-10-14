@@ -1,0 +1,45 @@
+module combined-state {
+  yang-version 1.1;
+  namespace "urn:example:combined-state";
+  prefix cs;
+  revision 2026-10-13;
+  container root {
+    leaf limit { type uint8 { range "1..10"; } }
+    leaf label { type string { length "1..4"; pattern "[a-z]+"; } }
+    leaf-list aliases { type string { length "1..4"; pattern "[a-z]+"; } }
+    list route {
+      key "id";
+      leaf id { type uint64 { range "1..max"; } }
+      leaf metric { type uint8 { range "1..10"; } }
+      container stats {
+        config false;
+        leaf packets { type uint64; default 0; }
+      }
+    }
+    container left {
+      config false;
+      list sample {
+        key "id";
+        leaf id { type uint64; }
+        leaf count { type uint64; default 0; }
+      }
+    }
+    container right {
+      config false;
+      list sample {
+        key "token-id region";
+        leaf token-id { type uint64; }
+        leaf region { type uint8; }
+        leaf count { type uint64; }
+      }
+    }
+    container authorizations {
+      config false;
+      list grant {
+        key "token-id";
+        leaf token-id { type uint64; }
+        leaf count { type uint64; }
+      }
+    }
+  }
+}

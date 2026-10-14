@@ -6,6 +6,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
     let mut impls = TokenStream::new();
     let nodes_by_path = NodeIndex::new(&input.nodes);
 
@@ -169,15 +170,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
+            let empty_redaction = has_state_lists && redactions.is_empty();
+            let depth_parameter = if empty_redaction {
+                format_ident!("_depth")
+            } else {
+                format_ident!("depth")
+            };
+            let depth_guard = if empty_redaction {
+                quote! {}
+            } else {
+                quote! {
+                    if depth > 64 {
+                        return;
+                    }
+                }
+            };
             impls.extend(quote! {
                 impl Redactable for #struct_name {
                     fn redact_sensitive(&mut self) {
                         self.redact_sensitive_depth(0);
                     }
-                    fn redact_sensitive_depth(&mut self, depth: usize) {
-                        if depth > 64 {
-                            return;
-                        }
+                    fn redact_sensitive_depth(&mut self, #depth_parameter: usize) {
+                        #depth_guard
                         #redactions
                     }
                 }

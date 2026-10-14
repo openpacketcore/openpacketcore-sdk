@@ -1,0 +1,17 @@
+module nested-keyless {
+  yang-version 1.1;
+  namespace "urn:example:nested-keyless";
+  prefix nk;
+  revision 2026-10-13;
+  container state {
+    config false;
+    list keyed {
+      key "name";
+      leaf name { type string; }
+      list observation {
+        container detail { leaf count { type uint32; } }
+        leaf-list label { type string; }
+      }
+    }
+  }
+}

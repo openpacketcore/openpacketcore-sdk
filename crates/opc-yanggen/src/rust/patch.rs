@@ -14,6 +14,8 @@ fn is_sensitive_node(node: &SchemaNode) -> bool {
 }
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
+    let has_state_lists = super::has_state_keyed_lists(input);
+    let has_state = input.nodes.iter().any(|node| !node.config);
     let root = input
         .nodes
         .iter()
@@ -41,14 +43,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         )
     } else {
         (
-            quote! { |e| config_error("invalid-value", e.to_string()) },
+            quote! { |_| config_error("invalid-value", "invalid JSON value") },
             quote! {},
         )
     };
     let integer_error = if normalize_errors {
         quote! { |_| config_error("invalid-value", "invalid integer value") }
     } else {
-        quote! { |e| config_error("invalid-value", e.to_string()) }
+        quote! { |_| config_error("invalid-value", "invalid numeric value") }
     };
     let validate_merge = if normalize_errors {
         quote! { let _: Self = serde_json::from_str(v).map_err(#json_error)?; }
@@ -81,6 +83,20 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         quote! {}
     } else {
         quote! { pub }
+    };
+    let inner_apply = if has_state && has_scalar_constraints && !has_ordered_lists {
+        // The scalar wrapper already uses `apply_patch_segments_inner` for its
+        // checked entry point. State recursion needs a distinct private method.
+        format_ident!("apply_patch_segments_state_inner")
+    } else if has_state {
+        format_ident!("apply_patch_segments_inner")
+    } else {
+        apply_segments.clone()
+    };
+    let inner_visibility = if has_state {
+        quote! {}
+    } else {
+        apply_visibility.clone()
     };
     let ordered_parameter = if has_ordered_lists {
         quote! { , ordered_list: Option<&OrderedListReplacement> }
@@ -148,6 +164,22 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             let struct_name = format_ident!("{}", nodes_by_path.type_name(node));
             let mut field_arms = TokenStream::new();
             let mut diff_fields = TokenStream::new();
+            let all_fields_read_only = has_state
+                && node
+                    .child_paths
+                    .iter()
+                    .filter_map(|path| nodes_by_path.get(path))
+                    .all(|child| !child.config);
+            let dispatch_return = if all_fields_read_only {
+                quote! {}
+            } else {
+                quote! { return }
+            };
+            let dispatch_semicolon = if all_fields_read_only {
+                quote! {}
+            } else {
+                quote! { ; }
+            };
 
             for child_path in &node.child_paths {
                 if let Some(child) = nodes_by_path.get(child_path) {
@@ -194,7 +226,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             let parsed = YangInt64(_v.parse::<i64>().map_err(#integer_error)?);
                         },
                         Some(TypeRef::Decimal64) => quote! {
-                            let parsed = YangDecimal64(_v.parse::<f64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                            let parsed = YangDecimal64(_v.parse::<f64>().map_err(|_| config_error("invalid-value", "invalid numeric value"))?);
                         },
                         Some(TypeRef::Empty) => quote! {
                             let parsed = YangEmpty;
@@ -244,7 +276,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 #child_name_str => {
                                     #reject_ordered_target
                                     if segments.len() > 1 {
-                                        return Err(config_error("invalid-path", format!("path goes deeper than leaf: {}", cleaned_name)));
+                                        return Err(config_error("invalid-path", "path goes deeper than leaf"));
                                     }
                                     match op {
                                         ConfigOp::Delete | ConfigOp::Remove => {
@@ -280,11 +312,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     } else {
                                         if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                             if let Some(ref mut container) = self.#field_ident {
-                                                container.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                container.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         } else {
                                             let container = #get_mut_container;
-                                            container.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                            container.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                         }
                                     }
                                 }
@@ -362,6 +394,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             .map_err(|_| config_error("invalid-value", #list_error))?;
                                     }
                                 } else {
+                                    // A single map key has the scalar's Copy semantics,
+                                    // including SensitiveKey<T> when T is Copy. Composite
+                                    // keys and owned scalar keys still need their clone.
+                                    let cloned_map_key = match child.key_leaves.as_slice() {
+                                        [key_leaf] => child
+                                            .child_paths
+                                            .iter()
+                                            .filter_map(|path| nodes_by_path.get(path))
+                                            .find(|node| {
+                                                clean_segment(last_segment(&node.path)) == key_leaf
+                                            })
+                                            .map(|node| {
+                                                super::types::cloned_key_value(
+                                                    node,
+                                                    &nodes_by_path,
+                                                    quote! { key },
+                                                    has_state_lists,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| quote! { key.clone() }),
+                                        _ => quote! { key.clone() },
+                                    };
                                     quote! {
                                         let parsed_rows: Vec<#ty_name> = serde_json::from_str(value)
                                             .map_err(|_| config_error("invalid-value", #list_error))?;
@@ -370,7 +424,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         for row in parsed_rows {
                                             let key: #key_type = super::serde::ExtractKey::extract_key(&row)
                                                 .ok_or_else(|| config_error("invalid-value", #list_error))?;
-                                            if !keys.insert(key.clone()) {
+                                            if !keys.insert(#cloned_map_key) {
                                                 return Err(config_error("invalid-value", #list_error));
                                             }
                                             rows.push((key, row));
@@ -394,7 +448,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                         .map_err(|_| config_error("invalid-value", #list_error))?;
                                                     for ((key, _), raw_row) in rows.into_iter().zip(raw_rows) {
                                                         let value = raw_row.to_string();
-                                                        list.entry(key).or_default().#apply_segments(op, &[], Some(&value) #ordered_argument)?;
+                                                        list.entry(key).or_default().#inner_apply(op, &[], Some(&value) #ordered_argument)?;
                                                     }
                                                 }
                                             }
@@ -479,25 +533,29 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                 let key_field_ident = format_ident!("{}", to_snake_case(key_leaf));
                                 let key_is_sensitive = is_sensitive_node(key_leaf_node);
-                                let key_assign = if key_is_sensitive {
-                                    quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
-                                } else {
-                                    quote! { parsed_item.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
-                                };
-                                let entry_key_assign = if key_is_sensitive {
-                                    quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
-                                } else {
-                                    quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
-                                };
+                                let cloned_key = super::types::cloned_key_value(
+                                    key_leaf_node,
+                                    &nodes_by_path,
+                                    quote! { parsed_key },
+                                    has_state_lists,
+                                );
+                                let key_value = super::types::explicit_leaf_value(
+                                    key_leaf_node,
+                                    cloned_key.clone(),
+                                );
+                                let key_assign =
+                                    quote! { parsed_item.#key_field_ident = #key_value; };
+                                let entry_key_assign =
+                                    quote! { entry.#key_field_ident = #key_value; };
                                 let valueless_key_assign = if has_scalar_constraints {
                                     quote! { else { #entry_key_assign } }
                                 } else {
                                     quote! {}
                                 };
                                 let map_key = if key_is_sensitive {
-                                    quote! { SensitiveKey::from(parsed_key.clone()) }
+                                    quote! { SensitiveKey::from(#cloned_key) }
                                 } else {
-                                    quote! { parsed_key.clone() }
+                                    cloned_key
                                 };
 
                                 quote! {
@@ -524,12 +582,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         } else {
                                             if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                                 if let Some(entry) = self.#field_ident.get_mut(&parsed_key) {
-                                                    entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                    entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(#map_key).or_default();
                                                 #entry_key_assign
-                                                entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         }
                                     }
@@ -603,17 +661,24 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
                                     let key_field_ident =
                                         format_ident!("{}", to_snake_case(key_leaf));
+                                    let cloned_key = super::types::cloned_key_value(
+                                        key_leaf_node,
+                                        &nodes_by_path,
+                                        quote! { #key_ident },
+                                        has_state_lists,
+                                    );
                                     key_fields.extend(quote! {
-                                        #key_field_ident: #key_ident.clone(),
+                                        #key_field_ident: #cloned_key,
                                     });
-                                    let is_sensitive = is_sensitive_node(key_leaf_node);
-                                    if is_sensitive {
-                                        key_assigns.push(quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
-                                        entry_key_assigns.push(quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
-                                    } else {
-                                        key_assigns.push(quote! { parsed_item.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
-                                        entry_key_assigns.push(quote! { entry.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
-                                    }
+                                    let key_value = super::types::explicit_leaf_value(
+                                        key_leaf_node,
+                                        cloned_key,
+                                    );
+                                    key_assigns.push(
+                                        quote! { parsed_item.#key_field_ident = #key_value; },
+                                    );
+                                    entry_key_assigns
+                                        .push(quote! { entry.#key_field_ident = #key_value; });
                                 }
                                 let valueless_key_assign = if has_scalar_constraints {
                                     quote! { else { #(#entry_key_assigns)* } }
@@ -647,12 +712,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         } else {
                                             if op == &ConfigOp::Delete || op == &ConfigOp::Remove {
                                                 if let Some(entry) = self.#field_ident.get_mut(&parsed_key) {
-                                                    entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                    entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
                                                 #(#entry_key_assigns)*
-                                                entry.#apply_segments(op, &segments[1..], value #ordered_argument)?;
+                                                entry.#inner_apply(op, &segments[1..], value #ordered_argument)?;
                                             }
                                         }
                                     }
@@ -718,7 +783,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     let parsed_elem = YangInt64(v.parse::<i64>().map_err(#integer_error)?);
                                 },
                                 Some(TypeRef::Decimal64) => quote! {
-                                    let parsed_elem = YangDecimal64(v.parse::<f64>().map_err(|e| config_error("invalid-value", e.to_string()))?);
+                                    let parsed_elem = YangDecimal64(v.parse::<f64>().map_err(|_| config_error("invalid-value", "invalid numeric value"))?);
                                 },
                                 Some(TypeRef::Empty) => quote! {
                                     let parsed_elem = YangEmpty;
@@ -772,7 +837,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         _ => quote! {},
                     };
 
-                    field_arms.extend(arm);
+                    if child.config {
+                        field_arms.extend(arm);
+                    } else {
+                        field_arms.extend(quote! {
+                            #child_name_str => {
+                                #dispatch_return Err(config_error("read-only", "cannot modify read-only path")) #dispatch_semicolon
+                            }
+                        });
+                    }
+
+                    // State data never belongs to a configuration diff, even
+                    // when a collection or an optional container disappears.
+                    if !child.config {
+                        continue;
+                    }
 
                     // Diff logic
                     let child_segment_str = last_segment(&child.path);
@@ -870,6 +949,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 };
                                 let key_bracket_construction_prev =
                                     key_bracket_construction.clone();
+                                let previous_keys =
+                                    if has_state_lists || nodes_by_path.expanded_profile {
+                                        quote! { k in previous.#field_ident.keys() }
+                                    } else {
+                                        quote! { (k, _) in &previous.#field_ident }
+                                    };
 
                                 let keyed_diff = quote! {
                                     let list_path = format!("{}/{}", _path_prefix, #child_segment_str);
@@ -882,7 +967,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                             cur_val.diff_segments(&Default::default(), &entry_path, deltas)?;
                                         }
                                     }
-                                    for (k, _) in &previous.#field_ident {
+                                    for #previous_keys {
                                         if !self.#field_ident.contains_key(k) {
                                             #key_bracket_construction_prev
                                             let entry_path = format!("{}{}", list_path, key_bracket_str);
@@ -935,9 +1020,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 }
             }
 
+            // No-op configuration diffs need no inputs in any schema profile.
+            let empty_state_diff = diff_fields.is_empty();
             let previous_param = format_ident!(
                 "{}",
-                if nodes_by_path.expanded_profile && diff_fields.is_empty() {
+                if empty_state_diff {
                     "_previous"
                 } else {
                     "previous"
@@ -945,7 +1032,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             );
             let deltas_param = format_ident!(
                 "{}",
-                if nodes_by_path.expanded_profile && diff_fields.is_empty() {
+                if empty_state_diff {
                     "_deltas"
                 } else {
                     "deltas"
@@ -986,15 +1073,56 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             } else {
                 quote! {}
             };
-            impls.extend(quote! {
-                impl #struct_name {
-                    #public_apply_wrapper
+            let state_matcher = if has_state {
+                state_matcher(node, &nodes_by_path)
+            } else {
+                quote! {}
+            };
+            let checked_apply = if has_state {
+                let path = &node.path;
+                quote! {
                     #apply_visibility fn #apply_segments(
                         &mut self,
                         op: &ConfigOp,
                         segments: &[PathSegment],
                         value: Option<&str> #ordered_parameter,
                     ) -> Result<(), ConfigError> {
+                        validate_patch_input(#path, segments, value)?;
+                        let mut candidate = self.clone();
+                        candidate.#inner_apply(op, segments, value #ordered_argument)?;
+                        if !candidate.state_matches(self) {
+                            return Err(config_error("read-only", "cannot modify read-only path"));
+                        }
+                        *self = candidate;
+                        Ok(())
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let validate_inner = if has_state {
+                let path = &node.path;
+                quote! { validate_patch_input(#path, segments, value)?; }
+            } else {
+                quote! {}
+            };
+            let dispatch_success = if all_fields_read_only {
+                quote! {}
+            } else {
+                quote! { Ok(()) }
+            };
+            impls.extend(quote! {
+                impl #struct_name {
+                    #public_apply_wrapper
+                    #state_matcher
+                    #checked_apply
+                    #inner_visibility fn #inner_apply(
+                        &mut self,
+                        op: &ConfigOp,
+                        segments: &[PathSegment],
+                        value: Option<&str> #ordered_parameter,
+                    ) -> Result<(), ConfigError> {
+                        #validate_inner
                         if segments.is_empty() {
                             #reject_ordered_target
                             match op {
@@ -1020,8 +1148,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 } else {
                                                     val.to_string()
                                                 };
-                                                let segs = parse_path(&k).map_err(|e| config_error("invalid-path", e))?;
-                                                self.#apply_segments(op, &segs, Some(&val_str) #ordered_argument)?;
+                                                let segs = parse_path(&k).map_err(|_| config_error("invalid-path", "invalid path"))?;
+                                                self.#inner_apply(op, &segs, Some(&val_str) #ordered_argument)?;
                                             }
                                             return Ok(());
                                         } else {
@@ -1040,10 +1168,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         match cleaned_name {
                             #field_arms
                             _ => {
-                                return Err(config_error("unsupported-path", format!("unsupported field: {}", cleaned_name)));
+                                #dispatch_return Err(config_error("unsupported-path", "unsupported field")) #dispatch_semicolon
                             }
                         }
-                        Ok(())
+                        #dispatch_success
                     }
 
                     pub fn diff_segments(
@@ -1060,25 +1188,109 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
     }
 
-    let escape_key_value_fn = if input
-        .nodes
-        .iter()
-        .any(|node| node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty())
-    {
-        quote! {
-            fn escape_key_value(value: &str) -> String {
-                value.replace('\\', "\\\\").replace('\'', "\\'")
+    let escape_key_value_fn =
+        if input.nodes.iter().any(|node| {
+            node.config && node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()
+        }) {
+            quote! {
+                fn escape_key_value(value: &str) -> String {
+                    value.replace('\\', "\\\\").replace('\'', "\\'")
+                }
             }
-        }
-    } else {
-        quote! {}
-    };
+        } else {
+            quote! {}
+        };
 
     let scalar_validation = if has_scalar_constraints {
         quote! { super::validate::validate_syntax(&temp).map_err(|error| config_error("invalid-value", error.message))?; }
     } else {
         quote! {}
     };
+    let scalar_constraint_error_helper = if input
+        .nodes
+        .iter()
+        .any(|node| super::types::has_scalar_constraints(node, &nodes_by_path))
+    {
+        quote! {
+            fn scalar_constraint_error(reason: &'static str) -> ConfigError {
+                config_error("invalid-value", reason)
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let write_validation = if has_state {
+        quote! {
+            // Resolve relative helper paths and JSON member paths using the same
+            // bare names as dispatch. Reject state before parsing its payload.
+            fn write_target(
+                mut node: &'static opc_mgmt_schema::NodeMeta,
+                segments: &[PathSegment],
+            ) -> Result<Option<&'static opc_mgmt_schema::NodeMeta>, ConfigError> {
+                let registry = super::schema_registry::registry();
+                for segment in segments {
+                    if !node.config {
+                        return Err(config_error("read-only", "cannot modify read-only path"));
+                    }
+                    let Some(child) = node.child_paths.iter().filter_map(|path| registry.node(path))
+                        .find(|child| clean_segment(child.path.rsplit('/').next().unwrap_or("")) == clean_segment(&segment.name)) else {
+                            // Existing dispatch/deserialization owns unknown fields.
+                            return Ok(None);
+                        };
+                    node = child;
+                }
+                if !node.config {
+                    return Err(config_error("read-only", "cannot modify read-only path"));
+                }
+                Ok(Some(node))
+            }
+
+            fn validate_state_members(
+                node: &'static opc_mgmt_schema::NodeMeta,
+                value: &serde_json::Value,
+            ) -> Result<(), ConfigError> {
+                use opc_mgmt_schema::NodeKind;
+                if !matches!(node.kind, NodeKind::Container | NodeKind::List) {
+                    return Ok(());
+                }
+                match value {
+                    serde_json::Value::Object(members) => {
+                        for (name, value) in members {
+                            let segments = parse_path(name).map_err(|_| config_error("invalid-path", "invalid path"))?;
+                            if let Some(child) = write_target(node, &segments)? {
+                                validate_state_members(child, value)?;
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(rows) if node.kind == NodeKind::List => {
+                        for row in rows {
+                            validate_state_members(node, row)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+
+            fn validate_patch_input(
+                path: &'static str,
+                segments: &[PathSegment],
+                value: Option<&str>,
+            ) -> Result<(), ConfigError> {
+                let node = super::schema_registry::registry().node(path)
+                    .ok_or_else(|| config_error("invalid-path", "invalid path"))?;
+                if let Some(target) = write_target(node, segments)? {
+                    if let Some(value) = value.and_then(|text| serde_json::from_str(text).ok()) {
+                        validate_state_members(target, &value)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let tokens = quote! {
         use opc_config_model::{ConfigError, YangPath};
         use super::types::*;
@@ -1103,6 +1315,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #ordered_definitions
+
+        #write_validation
 
         fn config_error(kind: &'static str, message: impl Into<String>) -> ConfigError {
             ConfigError::new(kind, message)
@@ -1275,10 +1489,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     #ordered_path_arm
                 };
                 if !super::paths::is_valid_path(path.as_str()) {
-                    return Err(config_error("invalid-path", format!("invalid path: {}", path)));
+                    return Err(config_error("invalid-path", "invalid path"));
                 }
                 if !super::paths::is_config_path(path.as_str()) {
-                    return Err(config_error("read-only", format!("cannot modify read-only path: {}", path)));
+                    return Err(config_error("read-only", "cannot modify read-only path"));
                 }
             }
 
@@ -1293,7 +1507,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     ConfigDelta::Remove(p) => (p, ConfigOp::Remove, None #ordered_none),
                     #ordered_apply_arm
                 };
-                let segments = parse_path(path.as_str()).map_err(|e| config_error("invalid-path", e))?;
+                let segments = parse_path(path.as_str()).map_err(|_| config_error("invalid-path", "invalid path"))?;
                 if segments.is_empty() {
                     return Err(config_error("invalid-path", "Path is empty"));
                 }
@@ -1309,6 +1523,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         }
 
         #json_error_helper
+        #scalar_constraint_error_helper
         #impls
     };
 
@@ -1328,7 +1543,7 @@ fn subtree_constraint_checks(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenS
             child,
             nodes,
             quote! { self.#field },
-            quote! { (|reason| config_error("invalid-value", reason)) },
+            quote! { scalar_constraint_error },
         ));
         let access = if is_sensitive_node(child) {
             quote! { self.#field.get() }
@@ -1354,6 +1569,113 @@ fn subtree_constraint_checks(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenS
         });
     }
     checks
+}
+
+// Compare only operational fields so replacing/removing a configuration ancestor
+// cannot erase retained observations. Configuration list order is independent of
+// the state associated with each key.
+fn state_matcher(node: &SchemaNode, nodes: &NodeIndex<'_>) -> TokenStream {
+    if !node.config {
+        return quote! {
+            pub(crate) fn state_matches(&self, previous: &Self) -> bool {
+                self == previous
+            }
+        };
+    }
+    let mut checks = Vec::new();
+    for child in node.child_paths.iter().filter_map(|path| nodes.get(path)) {
+        let field = format_ident!(
+            "{}",
+            to_snake_case(clean_segment(last_segment(&child.path)))
+        );
+        if !child.config {
+            checks.push(quote! { self.#field == previous.#field });
+            continue;
+        }
+        if !nodes.nodes.values().any(|descendant| {
+            !descendant.config
+                && descendant
+                    .path
+                    .strip_prefix(&child.path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            continue;
+        }
+        let current = if is_sensitive_node(child) {
+            quote! { self.#field.get() }
+        } else {
+            quote! { self.#field }
+        };
+        let previous = if is_sensitive_node(child) {
+            quote! { previous.#field.get() }
+        } else {
+            quote! { previous.#field }
+        };
+        let (current_iter, previous_iter) = if super::is_user_ordered(child) {
+            if is_sensitive_node(child) {
+                (
+                    quote! { (#current).into_iter() },
+                    quote! { (#previous).into_iter() },
+                )
+            } else {
+                (
+                    quote! { (&self.#field).into_iter() },
+                    quote! { (&previous.#field).into_iter() },
+                )
+            }
+        } else {
+            (quote! { (#current).iter() }, quote! { (#previous).iter() })
+        };
+        let check = match child.kind {
+            SchemaNodeKind::Container => quote! {
+                match ((#current).as_ref(), (#previous).as_ref()) {
+                    (Some(current), Some(previous)) => current.state_matches(previous),
+                    (Some(current), None) => current.state_matches(&Default::default()),
+                    (None, Some(previous)) => previous.state_matches(&Default::default()),
+                    (None, None) => true,
+                }
+            },
+            SchemaNodeKind::List if child.key_leaves.is_empty() => quote! {
+                (#current).iter().enumerate().all(|(index, row)| {
+                    (#previous).get(index).map_or_else(
+                        || row.state_matches(&Default::default()),
+                        |old| row.state_matches(old),
+                    )
+                }) && (#previous).iter().skip((#current).len())
+                    .all(|row| row.state_matches(&Default::default()))
+            },
+            SchemaNodeKind::List => quote! {
+                #current_iter.all(|(key, row)| {
+                    (#previous).get(key).map_or_else(
+                        || row.state_matches(&Default::default()),
+                        |old| row.state_matches(old),
+                    )
+                }) && #previous_iter.all(|(key, row)| {
+                    (#current).contains_key(key) || row.state_matches(&Default::default())
+                })
+            },
+            _ => continue,
+        };
+        checks.push(check);
+    }
+    if checks.is_empty() {
+        quote! {
+            pub(crate) fn state_matches(&self, _previous: &Self) -> bool { true }
+        }
+    } else if checks.len() == 1 {
+        let check = &checks[0];
+        quote! {
+            pub(crate) fn state_matches(&self, previous: &Self) -> bool {
+                #check
+            }
+        }
+    } else {
+        quote! {
+            pub(crate) fn state_matches(&self, previous: &Self) -> bool {
+                #((#checks))&&*
+            }
+        }
+    }
 }
 
 #[cfg(test)]

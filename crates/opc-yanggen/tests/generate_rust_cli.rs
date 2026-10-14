@@ -314,12 +314,16 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 
-    // Captured from the generator before user ordering support (1d880a21c).
-    // Changing unaffected generated output requires an explicit baseline update.
+    // All generated files are pinned, including the NETCONF projector's
+    // operation admission observations. Output changes require a baseline update.
+    // The patch.rs pin retains #1268 safe diagnostics. Read renderer pins include
+    // #1269 authorized projection and #1270 canonical gNMI key literals. Every
+    // generated file remains covered by its complete-file assertion.
     let expected = [
         (
             "gnmi_json.rs",
-            "15ae5aabae1c48947fd78110cab9253da759172c3585dc9ccbcf83d67dce44df",
+            // #1269 permits authorized sensitive keys; #1270 builds XPath literals.
+            "537d5deb527ae2d47434f6538ddf0c9768694ce9fc0e3d24388d97fbfa7b6b87",
         ),
         (
             "gnmi_set.rs",
@@ -335,7 +339,8 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "netconf_xml.rs",
-            "4b8b4259e265d7a2d4ec1f86ba0c97bec684d400a43040fd869c33f055f9c09e",
+            // #1270 native instance trees plus #1272 bounded content projection.
+            "1f9f22c7a9c4f169eb1787754fdd0f6a79e35c0608d94692c58fad4cf1825b7b",
         ),
         (
             "netconf_xml_edit.rs",
@@ -343,7 +348,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "patch.rs",
-            "5f5d286da75e8b7648bb2d1ade4de6f69b295a8c6d0e796ac3defa1862621a48",
+            "2d08d6ffe3b0b30eb090009a39afeafe96e0ae75976b7f86880050f123a448ee",
         ),
         (
             "paths.rs",

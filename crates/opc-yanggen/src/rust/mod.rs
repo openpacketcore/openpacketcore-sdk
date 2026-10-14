@@ -316,6 +316,45 @@ fn has_user_ordered_collections(input: &CanonicalInput) -> bool {
     })
 }
 
+fn has_state_keyed_lists(input: &CanonicalInput) -> bool {
+    input.nodes.iter().any(|node| {
+        !node.config && node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()
+    })
+}
+
+// TokenStream's single-line display makes adjacent independent `if` statements
+// look like a missing `else` to Clippy. Preserve each token, including literals
+// and joint punctuation, while putting closing braces on separate lines.
+fn write_rust_tokens(tokens: proc_macro2::TokenStream, out: &mut String) {
+    use proc_macro2::{Delimiter, Spacing, TokenTree};
+
+    for token in tokens {
+        match token {
+            TokenTree::Group(group) => {
+                let (open, close) = match group.delimiter() {
+                    Delimiter::Parenthesis => ("(", ") "),
+                    Delimiter::Brace => ("{", "}\n"),
+                    Delimiter::Bracket => ("[", "] "),
+                    Delimiter::None => ("", ""),
+                };
+                out.push_str(open);
+                write_rust_tokens(group.stream(), out);
+                out.push_str(close);
+            }
+            TokenTree::Punct(punct) => {
+                out.push(punct.as_char());
+                if punct.spacing() == Spacing::Alone {
+                    out.push(' ');
+                }
+            }
+            other => {
+                out.push_str(&other.to_string());
+                out.push(' ');
+            }
+        }
+    }
+}
+
 pub fn generate_rust(
     input: &CanonicalInput,
 ) -> Result<HashMap<String, String>, RustGenerationError> {
@@ -453,7 +492,50 @@ __ORDERED_REPLACEMENT_CHANGED_PATH__            }
         schema_registry::generate(&input)?,
     );
 
+    // These models previously emitted uncompilable Rust. Keep the established
+    // bytes of other supported models while giving state-list output proper
+    // statement boundaries without modifying string or character literals.
+    if has_state_keyed_lists(&input) {
+        for content in files.values_mut() {
+            let tokens = content.parse().map_err(|error| {
+                RustGenerationError::new(format!("invalid generated Rust tokens: {error}"))
+            })?;
+            let mut formatted = String::with_capacity(content.len());
+            write_rust_tokens(tokens, &mut formatted);
+            *content = formatted;
+        }
+    }
+
     Ok(files)
+}
+
+#[test]
+fn state_list_token_layout_preserves_literals_and_joint_punctuation() {
+    let source = r###"
+        #[doc = "Keep } if inside the literal"]
+        fn sample<'a>(value: &'a str) -> &'a str {
+            let _raw = r#"} if "#;
+            let _bytes = b"} if ";
+            let _character = '}';
+            let _range = 0..=3;
+            let _path = std::string::String::new();
+            if value.is_empty() { return value; }
+            if value == "} if " { return value; }
+            value
+        }
+    "###;
+    let tokens = source.parse::<proc_macro2::TokenStream>().unwrap();
+    let mut formatted = String::new();
+    write_rust_tokens(tokens.clone(), &mut formatted);
+    assert!(formatted.contains("}\n"));
+    assert!(formatted.contains("r#\"} if \"#"));
+    assert_eq!(
+        formatted
+            .parse::<proc_macro2::TokenStream>()
+            .unwrap()
+            .to_string(),
+        tokens.to_string()
+    );
 }
 
 /// Returns the canonical input shape used by Rust artifacts.

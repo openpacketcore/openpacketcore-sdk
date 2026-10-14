@@ -25,6 +25,7 @@ use opc_mgmt_audit::{
 };
 use opc_mgmt_authz::{
     AuthzError, ConfigWriteAuthorizer, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer,
+    ReadNode,
 };
 use opc_mgmt_errors::{
     commit_error_to_netconf, commit_error_to_netconf_app_tag, NetconfError, NetconfErrorTag,
@@ -363,7 +364,8 @@ impl ConfirmedCommitState {
 
 #[derive(Debug, Clone)]
 struct CandidateSnapshot<C> {
-    config: C,
+    // Reads share the immutable model; only write paths may materialize a copy.
+    config: Arc<C>,
     base_version: ConfigVersion,
     generation: Arc<()>,
 }
@@ -427,9 +429,13 @@ impl<C: Clone> CandidateDatastore<C> {
         self.snapshot.clone()
     }
 
-    fn snapshot_or(&mut self, running: &C, running_version: ConfigVersion) -> CandidateSnapshot<C> {
+    fn snapshot_or(
+        &mut self,
+        running: &Arc<C>,
+        running_version: ConfigVersion,
+    ) -> CandidateSnapshot<C> {
         self.snapshot().unwrap_or_else(|| CandidateSnapshot {
-            config: running.clone(),
+            config: Arc::clone(running),
             base_version: running_version,
             generation: Arc::new(()),
         })
@@ -438,7 +444,7 @@ impl<C: Clone> CandidateDatastore<C> {
     fn replace(&mut self, candidate: C, base_version: ConfigVersion) {
         self.prune_released();
         self.snapshot = Some(CandidateSnapshot {
-            config: candidate,
+            config: Arc::new(candidate),
             base_version,
             generation: Arc::new(()),
         });
@@ -771,6 +777,35 @@ where
         self.config_authority.is_some()
     }
 
+    fn read_filter_preflight(
+        &self,
+        operation: &RpcOperation,
+        limits: &MgmtLimits,
+    ) -> Option<(NetconfOperation, crate::filter::FilterError)> {
+        if crate::operations::content::ContentRequest::from_operation(operation)
+            .is_some_and(|request| request.use_content_handler(&self.binding))
+        {
+            return None;
+        }
+        let (metric, filter) = match operation {
+            RpcOperation::Get(request) => (NetconfOperation::Get, request.filter.as_ref()),
+            RpcOperation::GetData(request)
+                if request.datastore == crate::xml::NmdaDatastore::Operational =>
+            {
+                (NetconfOperation::GetData, request.filter.as_ref())
+            }
+            _ => return None,
+        };
+        crate::filter::prepare_instance_read_filter(
+            self.binding.schema_registry(),
+            filter,
+            limits,
+            self.binding.key_predicates_supported(),
+        )
+        .err()
+        .map(|error| (metric, error))
+    }
+
     async fn ensure_config_authority(
         &self,
         operation: ConfigAuthorityOperation,
@@ -1095,6 +1130,81 @@ where
             }
         };
 
+        if let Some((metric, error)) = self.read_filter_preflight(&parsed.operation, limits) {
+            let event = AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Read,
+                audit_failed(error.audit_reason()),
+            );
+            let error = if self.audit.record(&event).is_err() {
+                RpcError::operation_failed()
+            } else {
+                error.rpc_error()
+            };
+            record_rpc_error(metric, error.classification.tag, started.elapsed());
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(&parsed.message_id),
+                &parsed.reply_attrs,
+                error,
+            ));
+        }
+
+        if let Some(request) =
+            crate::operations::content::ContentRequest::from_operation(&parsed.operation)
+                .filter(|request| request.use_content_handler(&self.binding))
+        {
+            return RpcHandlingResult::keep_open(crate::operations::poll_ready(
+                crate::operations::content::handle_with_gate(
+                    &self.binding,
+                    GetContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                    |source| {
+                        self.load_content_config(source)
+                            .map(crate::operations::content::ContentConfig::Shared)
+                    },
+                    AuditMode::Synchronous,
+                    || async {
+                        let gate = config_authority_gate(&parsed.operation)?;
+                        if self.config_authority.is_some()
+                            || self
+                                .binding
+                                .config_bus()
+                                .authority_mode()
+                                .requires_external_authority()
+                        {
+                            return Some(
+                                self.authority_rejection_reply_sync(
+                                    RpcExecContext {
+                                        request_id,
+                                        principal,
+                                        message_id: &parsed.message_id,
+                                        reply_attrs: &parsed.reply_attrs,
+                                        started,
+                                    },
+                                    gate,
+                                    ConfigAuthorityOutcome::Unavailable,
+                                )
+                                .reply_xml,
+                            );
+                        }
+                        None
+                    },
+                ),
+            ));
+        }
+
         if let Some(gate) = config_authority_gate(&parsed.operation) {
             if self.config_authority.is_some()
                 || self
@@ -1398,6 +1508,28 @@ where
             }
         };
 
+        if let Some((metric, error)) = self.read_filter_preflight(&parsed.operation, limits) {
+            let event = AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Read,
+                audit_failed(error.audit_reason()),
+            );
+            let error = if self.audit.record_async(&event).await.is_err() {
+                RpcError::operation_failed()
+            } else {
+                error.rpc_error()
+            };
+            record_rpc_error(metric, error.classification.tag, started.elapsed());
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(&parsed.message_id),
+                &parsed.reply_attrs,
+                error,
+            ))
+            .into();
+        }
+
         if self.required_config_audit.is_some() && !self.required_audit_profile_supported() {
             // A mutable application binding must not enable a local effect
             // owner after required-audit construction checked the composition.
@@ -1418,6 +1550,55 @@ where
                 &parsed.reply_attrs,
                 RpcError::operation_failed(),
             ))
+            .into();
+        }
+
+        if let Some(request) =
+            crate::operations::content::ContentRequest::from_operation(&parsed.operation)
+                .filter(|request| request.use_content_handler(&self.binding))
+        {
+            return RpcHandlingResult::keep_open(
+                crate::operations::content::handle_with_gate(
+                    &self.binding,
+                    GetContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                    |source| {
+                        self.load_content_config(source)
+                            .map(crate::operations::content::ContentConfig::Shared)
+                    },
+                    AuditMode::Asynchronous,
+                    || async {
+                        let gate = config_authority_gate(&parsed.operation)?;
+                        let outcome = self.ensure_config_authority(gate.operation).await.err()?;
+                        Some(
+                            self.authority_rejection_reply_async(
+                                RpcExecContext {
+                                    request_id,
+                                    principal,
+                                    message_id: &parsed.message_id,
+                                    reply_attrs: &parsed.reply_attrs,
+                                    started,
+                                },
+                                gate,
+                                outcome,
+                            )
+                            .await
+                            .reply_xml,
+                        )
+                    },
+                )
+                .await,
+            )
             .into();
         }
 
@@ -2073,6 +2254,39 @@ where
             .collect()
     }
 
+    fn load_content_config(
+        &self,
+        source: crate::operations::content::ContentSource,
+    ) -> Result<Arc<C>, RpcError> {
+        use crate::operations::content::ContentSource;
+        match source {
+            ContentSource::Running => {
+                Ok(self.binding.config_bus().current_snapshot().config.clone())
+            }
+            ContentSource::Candidate => {
+                let running = self.binding.config_bus().current_snapshot();
+                let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
+                let candidate = candidate.snapshot_or(&running.config, running.version);
+                if candidate.base_version != running.version {
+                    return Err(RpcError::operation_failed());
+                }
+                Ok(candidate.config)
+            }
+            ContentSource::Startup => self
+                .binding
+                .startup_datastore()
+                .ok_or_else(RpcError::operation_not_supported)?
+                .load_startup_config()
+                .map_err(|error| match error {
+                    StartupDatastoreError::NotFound => RpcError::data_missing(),
+                    StartupDatastoreError::Unsupported => RpcError::operation_not_supported(),
+                    StartupDatastoreError::Failed { .. } => RpcError::operation_failed(),
+                })?
+                .map(Arc::new)
+                .ok_or_else(RpcError::data_missing),
+        }
+    }
+
     fn candidate_config_for_get_config(&self, request: &crate::xml::GetConfigRequest) -> Option<C> {
         if request.source != XmlDatastore::Candidate
             || !self.binding.candidate_datastore_capability()
@@ -2081,8 +2295,8 @@ where
         }
         let running = self.binding.config_bus().current_snapshot();
         let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-        let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
-        (candidate.base_version == running.version).then_some(candidate.config)
+        let candidate = candidate.snapshot_or(&running.config, running.version);
+        (candidate.base_version == running.version).then(|| candidate.config.as_ref().clone())
     }
 
     fn candidate_config_for_get_data(&self, request: &crate::xml::GetDataRequest) -> Option<C> {
@@ -2093,8 +2307,8 @@ where
         }
         let running = self.binding.config_bus().current_snapshot();
         let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-        let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
-        (candidate.base_version == running.version).then_some(candidate.config)
+        let candidate = candidate.snapshot_or(&running.config, running.version);
+        (candidate.base_version == running.version).then(|| candidate.config.as_ref().clone())
     }
 
     fn startup_config_for_get_config(
@@ -4500,7 +4714,7 @@ where
         let candidate_generation = candidate
             .as_ref()
             .map(|candidate| Arc::clone(&candidate.generation));
-        let candidate_config = candidate.map(|candidate| candidate.config);
+        let candidate_config = candidate.map(|candidate| Arc::unwrap_or_clone(candidate.config));
         let commit_request = CommitRequest::new(
             context.request_id,
             context.principal.clone(),
@@ -5250,11 +5464,11 @@ where
                     .candidate
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .snapshot_or(running.config.as_ref(), running.version);
+                    .snapshot_or(&running.config, running.version);
                 if candidate.base_version != running.version {
                     return Err(DatastoreFailure::Failed);
                 }
-                Ok(candidate.config)
+                Ok(Arc::unwrap_or_clone(candidate.config))
             }
             XmlDatastore::Startup => {
                 if !self.binding.startup_datastore_capability() {
@@ -6235,7 +6449,7 @@ where
         let running = self.binding.config_bus().current_snapshot();
         let base = {
             let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
-            candidate.snapshot_or(running.config.as_ref(), running.version)
+            candidate.snapshot_or(&running.config, running.version)
         };
         if base.base_version != running.version {
             return self
@@ -6605,23 +6819,27 @@ where
             return None;
         }
 
-        let decisions =
-            match self
-                .authz
-                .authorize(principal, ReadAction::Subscribe, &candidate_paths)
-            {
-                Ok(decisions) => decisions,
-                Err(_) => {
-                    record_notification(
-                        NETCONF_NOTIFICATION_STREAM,
-                        NetconfNotificationOutcome::Failure,
-                    );
-                    return None;
-                }
-            };
+        let selection = match self.authz.authorize_selection(
+            principal,
+            ReadAction::Subscribe,
+            &candidate_paths
+                .iter()
+                .map(|path| ReadNode::projected(path))
+                .collect::<Vec<_>>(),
+            &Default::default(),
+        ) {
+            Ok(selection) => selection,
+            Err(_) => {
+                record_notification(
+                    NETCONF_NOTIFICATION_STREAM,
+                    NetconfNotificationOutcome::Failure,
+                );
+                return None;
+            }
+        };
         let allowed_paths = candidate_paths
             .iter()
-            .zip(decisions.iter())
+            .zip(selection.decisions.iter())
             .filter_map(|(path, decision)| decision.allowed.then_some(*path))
             .collect::<Vec<_>>();
         if allowed_paths.is_empty() {
@@ -6799,7 +7017,7 @@ where
                     .candidate
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .snapshot_or(snapshot.config.as_ref(), snapshot.version);
+                    .snapshot_or(&snapshot.config, snapshot.version);
                 if candidate.base_version != snapshot.version {
                     return self
                         .validate_failed_reply(
@@ -6810,7 +7028,7 @@ where
                         )
                         .await;
                 }
-                Arc::new(candidate.config)
+                candidate.config
             }
             XmlDatastore::Startup => {
                 let Some(startup) = self.binding.startup_datastore() else {
@@ -8387,6 +8605,44 @@ mod tests {
     struct DemoRenderer;
 
     impl NetconfXmlRenderer<DemoConfig> for DemoRenderer {
+        fn render_selected_nodes(
+            &self,
+            config: &DemoConfig,
+            selection: &[&str],
+            predicates: &[opc_mgmt_schema::NetconfKeyPredicate],
+            branches: &[opc_mgmt_schema::NetconfInstanceBranch],
+            report: DefaultReport,
+        ) -> Result<Vec<opc_mgmt_schema::NetconfDataNode>, NetconfProjectionError> {
+            if !matches!(report, DefaultReport::Trim | DefaultReport::ReportAll) {
+                return Err(NetconfProjectionError::UnsupportedDefaultReport { report });
+            }
+            let branches = branches.iter().collect::<Vec<_>>();
+            let ctx = NetconfXmlRenderContext::new(&REGISTRY, selection, report)
+                .with_predicates(predicates)
+                .with_instances(&branches);
+            let mut children = Vec::new();
+            for (path, value) in [
+                ("/sys:system/sys:hostname", &config.hostname),
+                ("/sys:system/sys:secret", &config.secret),
+            ] {
+                if ctx.is_selected(path) {
+                    children.push(opc_mgmt_schema::NetconfDataNode::leaf(
+                        path,
+                        value.clone(),
+                        false,
+                    ));
+                }
+            }
+            Ok(if children.is_empty() {
+                Vec::new()
+            } else {
+                vec![opc_mgmt_schema::NetconfDataNode::branch(
+                    "/sys:system",
+                    children,
+                )]
+            })
+        }
+
         fn render_running_config(
             &self,
             config: &DemoConfig,
@@ -11442,6 +11698,120 @@ mod tests {
 
         let result = task.await.expect("join").expect("session result");
         assert_eq!(result.rpc_count, 2);
+    }
+
+    #[tokio::test]
+    async fn notification_stream_does_not_emit_changes_with_denied_list_keys() {
+        struct KeyRegistry;
+        impl SchemaRegistry for KeyRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "fnv1a64:notification-key"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                ORIGINS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                static KEY_NODES: std::sync::OnceLock<Vec<NodeMeta>> = std::sync::OnceLock::new();
+                KEY_NODES.get_or_init(|| {
+                    vec![
+                        NodeMeta {
+                            child_paths: &["/sys:system/sys:rows"],
+                            ..NODES[0]
+                        },
+                        NodeMeta {
+                            path: "/sys:system/sys:rows",
+                            kind: NodeKind::List,
+                            key_leaves: &["id"],
+                            child_paths: &[
+                                "/sys:system/sys:rows/sys:id",
+                                "/sys:system/sys:rows/sys:value",
+                            ],
+                            ..NODES[0]
+                        },
+                        NodeMeta {
+                            path: "/sys:system/sys:rows/sys:id",
+                            data_class: DataClass::SubscriberId,
+                            ..NODES[1]
+                        },
+                        NodeMeta {
+                            path: "/sys:system/sys:rows/sys:value",
+                            ..NODES[1]
+                        },
+                    ]
+                })
+            }
+        }
+        struct KeyBinding(Arc<ConfigBus<DemoConfig>>);
+        impl NetconfConfigBinding<DemoConfig> for KeyBinding {
+            fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+                self.0.clone()
+            }
+            fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+                &KeyRegistry
+            }
+        }
+
+        let previous = DemoConfig {
+            hostname: "old-value-marker".into(),
+            secret: "key-value-marker".into(),
+        };
+        let current = DemoConfig {
+            hostname: "new-value-marker".into(),
+            ..previous.clone()
+        };
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(current.clone(), MockManagedDatastore::new())
+                .await
+                .unwrap(),
+        );
+        let change = ConfigChange {
+            tx_id: opc_types::TxId::new(),
+            version: ConfigVersion::new(1),
+            previous: Arc::new(previous),
+            current: Arc::new(current),
+            deltas: Arc::from([]),
+            changed_paths: Arc::from([YangPath::new("/sys:system/sys:rows/sys:value").unwrap()]),
+        };
+        let mut modules = ModuleRegistry::new();
+        modules.register_module("demo-system", "sys").unwrap();
+        for allow_key in [true, false] {
+            let key = YangPathPattern::parse("/sys:system/sys:rows/sys:id", &modules).unwrap();
+            let policy = NacmPolicy::builder(PolicyVersion::new(1))
+                .add_rule(if allow_key {
+                    NacmRule::allow(NacmAction::Subscribe, key)
+                } else {
+                    NacmRule::deny(NacmAction::Subscribe, key)
+                })
+                .add_rule(NacmRule::allow(
+                    NacmAction::Subscribe,
+                    YangPathPattern::parse("/sys:system/sys:rows/sys:value", &modules).unwrap(),
+                ))
+                .build();
+            let server = ReadOnlyNetconfServer::new(
+                KeyBinding(bus.clone()),
+                FixedPolicy(policy),
+                CapturingAudit::default(),
+                TransportType::NetconfTls,
+            )
+            .unwrap();
+            let notification = server
+                .notification_xml_for_event(&principal(), ConfigEvent::Change(change.clone()));
+            if allow_key {
+                let xml = notification.expect("allowed value and key notify");
+                assert!(xml.contains("netconf-config-change"));
+                assert!(xml.contains("/sys:system/sys:rows/sys:value"));
+                assert!(!xml.contains("/sys:system/sys:rows/sys:id"));
+                assert!(!xml.contains("value-marker"));
+            } else {
+                assert!(
+                    notification.is_none(),
+                    "a denied list key must suppress the value change"
+                );
+            }
+        }
     }
 
     #[tokio::test]
