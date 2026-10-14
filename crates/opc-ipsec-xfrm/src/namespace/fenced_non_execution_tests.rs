@@ -17,6 +17,22 @@ mod fenced_non_execution {
             .await
     }
 
+    // Baseline release seam. Finalization already surrenders effect ownership,
+    // but does not implement SDK settlement release or remember late prepares.
+    // Implementation replaces this call with the explicit bound release API.
+    async fn release_settled(
+        backend: &NamespaceBoundLinuxXfrmBackend,
+        store: &XfrmObjectRosterRecoveryStore,
+        group: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        roster: &XfrmObjectRosterRequest,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        backend
+            .finalize_durable_object_roster(store, group, generation, roster)
+            .await
+            .map(|_| ())
+    }
+
     #[derive(Debug, Default)]
     struct EffectGate {
         entered: tokio::sync::Notify,
@@ -685,6 +701,59 @@ mod fenced_non_execution {
         );
         assert!(!transport.operations().contains(&"remove_sa"));
     }
+    #[tokio::test]
+    async fn fenced_non_execution_release_reuses_slots_beyond_thirty_without_reviving_prepares() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xF3);
+        let generation = roster_generation(37);
+        let roster = sa_roster(1);
+        let mut late_prepares = 0;
+        let mut release_publications = 0;
+        // More than two complete turns of the existing thirty live slots.
+        for identity in 1..=64 {
+            let group = roster_group(identity);
+            drop(
+                backend
+                    .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                    .await
+                    .expect("settled admissions must free their live slots"),
+            );
+            assert!(closed_without_effect(
+                &close_generation(&backend, &store, group, generation, &roster).await
+            ));
+            let before = store.publication_ledger().unwrap().len();
+            release_settled(&backend, &store, group, generation, &roster)
+                .await
+                .unwrap();
+            let after = store.publication_ledger().unwrap().len();
+            release_publications += after - before;
+            // Lost release acknowledgements are retried with the same binding.
+            release_settled(&backend, &store, group, generation, &roster)
+                .await
+                .unwrap();
+            assert_eq!(store.publication_ledger().unwrap().len(), after);
+            let late = backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                .await;
+            late_prepares += usize::from(late.is_ok());
+            drop(late);
+            // Drain the baseline's incorrectly admitted preparation.
+            let _ = backend
+                .recover_durable_object_roster(&store, group, generation, &roster)
+                .await;
+        }
+        assert_eq!(
+            late_prepares, 0,
+            "released settlement reopened a delayed prepare"
+        );
+        assert_eq!(
+            release_publications, 64,
+            "one provider-local durable release publication per settled roster"
+        );
+        assert!(transport.operations().is_empty());
+    }
+
     #[tokio::test]
     async fn fenced_non_execution_rejects_substituted_roster_and_store_before_any_io() {
         let root = DurableTestRoot::new();

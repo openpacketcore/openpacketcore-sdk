@@ -106,7 +106,7 @@ rustix = { version = "1.1.5", features = ["process", "fs"] }
 
 [dev-dependencies]
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
-opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0" }
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["test-control"] }
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }

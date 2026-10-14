@@ -103,6 +103,65 @@ async fn fenced_non_execution_reconcile_revokes_stale_sdk_execution_for_all_memb
 }
 
 #[tokio::test]
+async fn fenced_non_execution_terminal_readback_reinstallation_never_revives_old_permits() {
+    let request = request_with_members(2);
+    let provider = Arc::new(ClosureProbeProvider {
+        prepares: AtomicUsize::new(0),
+        executions: AtomicUsize::new(0),
+        close_unknown: false,
+    });
+    let backend = Arc::new(CutBackend::default());
+    let executor = closure_executor(Arc::clone(&provider), Arc::clone(&backend));
+    let stale = executor.register(request.clone()).await.unwrap();
+    for ordinal in 0..2 {
+        assert!(matches!(
+            executor.prepare(&stale, ordinal).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+    }
+    let current = recovered(executor.admission_status(request.clone()).await.unwrap());
+    let proofs = vec![
+        conclusive(executor.reconcile_member(&current, 0).await.unwrap()),
+        conclusive(executor.reconcile_member(&current, 1).await.unwrap()),
+    ];
+    let terminal = executor.prepare_terminal(&current, proofs).await.unwrap();
+    assert_eq!(
+        executor
+            .terminalize(&current, &terminal)
+            .await
+            .unwrap()
+            .phase(),
+        Phase::Aborted
+    );
+    assert!(
+        executor.local_authority.check(&stale.authority_permit)
+            == LocalAuthorityCheck::RevokedOrExpired
+    );
+
+    // This is the actual installation step in admission_status, stopped in
+    // the error window before a terminal readback can release the new entry.
+    let recreated = executor
+        .local_authority
+        .install_admission(
+            stale.backend_registration(),
+            stale.admission(),
+            stale.authority(),
+        )
+        .unwrap();
+    assert!(executor.local_authority.check(&recreated) == LocalAuthorityCheck::Current);
+    let late = executor.execute(&stale, 0).await;
+    assert_eq!(
+        provider.executions.load(Ordering::SeqCst),
+        0,
+        "terminal readback recreated a current stale permit; refused={}",
+        late.is_err()
+    );
+    assert_ne!(recreated.generation, stale.authority_permit.generation);
+    assert_eq!(backend.admission_calls().len(), 1);
+    assert_eq!(backend.terminal_calls().len(), 1);
+}
+
+#[tokio::test]
 async fn fenced_non_execution_successor_rebuilds_identical_terminal_after_lost_closure_reply() {
     let request = request_with_members(2);
     let provider = Arc::new(ClosureProbeProvider {

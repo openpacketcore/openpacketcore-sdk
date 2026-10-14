@@ -1,17 +1,21 @@
 //! Non-execution settlement through real V2 ingress, signed provider receipts,
 //! and the namespace actor's authenticated durable roster store.
 //!
-//! No test in this module submits a kernel mutation. Physical submission races
-//! belong to the namespace actor tests with an instrumented transport.
+//! Tests submit no kernel mutations: the accepted-work case uses an
+//! instrumented transport inside the real namespace actor.
+
+#[path = "fenced_non_execution/accepted.rs"]
+mod accepted;
 
 use super::*;
 use opc_ipsec_xfrm::{
     InstallPolicyRequest, IpAddress, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
     PolicyParameters, XfrmAction, XfrmDirection, XfrmObjectInstallRequest,
-    XfrmObjectRosterDurableError, XfrmObjectRosterGroupId, XfrmObjectRosterMemberPhase,
-    XfrmObjectRosterMemberRequest, XfrmObjectRosterOperationGeneration,
-    XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore, XfrmObjectRosterRequest,
-    XfrmObjectRosterRestartOutcome, XfrmSelector,
+    XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterDurableError, XfrmObjectRosterGroupId,
+    XfrmObjectRosterMemberPhase, XfrmObjectRosterMemberRequest,
+    XfrmObjectRosterOperationGeneration, XfrmObjectRosterRecoveryProofKey,
+    XfrmObjectRosterRecoveryStore, XfrmObjectRosterRequest, XfrmObjectRosterRestartOutcome,
+    XfrmSelector,
 };
 use opc_session_net::{
     FencedMutationRosterAdmissionInput as AdmissionInput, FencedMutationRosterClient,
@@ -36,20 +40,28 @@ struct XfrmSettlementProvider {
     prepares: AtomicUsize,
     executions: AtomicUsize,
     reconciliations: AtomicUsize,
+    compensations: AtomicUsize,
+    run_member: Option<u8>,
+    ready: Mutex<std::collections::HashMap<u8, XfrmObjectRosterAdmissionAuthority>>,
     observations: Mutex<Vec<(u8, &'static str)>>,
     _root: tempfile::TempDir,
 }
 
 impl XfrmSettlementProvider {
-    fn new(issuer: Arc<ProductionRosterAttestationIssuer>) -> Arc<Self> {
+    fn new(
+        issuer: Arc<ProductionRosterAttestationIssuer>,
+        width: u8,
+        backend: LinuxXfrmBackend,
+        run_member: Option<u8>,
+    ) -> Arc<Self> {
         let root = tempfile::tempdir().expect("private durable provider directory");
-        let (actor, store) = LinuxXfrmBackend::new()
+        let (actor, store) = backend
             .bind_current_network_namespace_with_object_roster_recovery(
                 root.path().join("rosters"),
                 XfrmObjectRosterRecoveryProofKey::new([0x81; 32]).expect("synthetic proof key"),
             )
             .expect("bind the production namespace actor and authenticated store");
-        let members = (0..WIDTH)
+        let members = (0..width)
             .map(|ordinal| {
                 let member = Member::new(
                     ordinal,
@@ -88,6 +100,9 @@ impl XfrmSettlementProvider {
             prepares: AtomicUsize::new(0),
             executions: AtomicUsize::new(0),
             reconciliations: AtomicUsize::new(0),
+            compensations: AtomicUsize::new(0),
+            run_member,
+            ready: Mutex::new(std::collections::HashMap::new()),
             observations: Mutex::new(Vec::new()),
             _root: root,
         })
@@ -182,13 +197,32 @@ impl MemberProvider for XfrmSettlementProvider {
             .map_err(|_| ())?;
         // The positive control models losing a prepared, never-run owner.
         // Dropping the affine authority permits ordinary zero-effect recovery.
-        drop(authority);
+        if self.run_member == Some(call.ordinal()) {
+            self.ready
+                .lock()
+                .map_err(|_| ())?
+                .insert(call.ordinal(), authority);
+        } else {
+            drop(authority);
+        }
         Ok(ProviderCallOutcome::prepared_not_run())
     }
 
-    async fn execute(&self, _call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+    async fn execute(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
         self.executions.fetch_add(1, Ordering::SeqCst);
-        Err(())
+        self.binding(call)?;
+        let authority = self
+            .ready
+            .lock()
+            .map_err(|_| ())?
+            .remove(&call.ordinal())
+            .ok_or(())?;
+        self.actor
+            .run_durable_object_roster(authority)
+            .await
+            .map_err(|_| ())?;
+        // The effect is durable, but its SDK acknowledgement is deliberately lost.
+        Ok(ProviderCallOutcome::outcome_unknown())
     }
 
     async fn status(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
@@ -203,6 +237,32 @@ impl MemberProvider for XfrmSettlementProvider {
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
         self.observe(call, RosterProviderOperationV1::Reconcile)
             .await
+    }
+
+    async fn compensate_member(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        let (group, retained) = self.binding(call)?;
+        self.compensations.fetch_add(1, Ordering::SeqCst);
+        let observed = self
+            .actor
+            .recover_durable_object_roster(&self.store, group, Self::generation(), &retained.roster)
+            .await
+            .map_err(|_| ())?;
+        if !matches!(
+            observed,
+            XfrmObjectRosterRestartOutcome::OwnedResidueRetired { .. }
+                | XfrmObjectRosterRestartOutcome::RolledBack { .. }
+                | XfrmObjectRosterRestartOutcome::Retired { .. }
+        ) {
+            return Ok(ProviderCallOutcome::outcome_unknown());
+        }
+        let mut evidence = vec![0xB2];
+        evidence.extend_from_slice(&call.fence_binding_commitment());
+        self.issuer.provider_receipt(
+            call,
+            RosterProviderOperationV1::Compensate,
+            RosterProviderOutcomeV1::CompensatedReconciled,
+            evidence,
+        )
     }
 }
 
@@ -221,6 +281,15 @@ struct SettlementFixture {
 
 impl SettlementFixture {
     async fn start(lose_admission: bool) -> Self {
+        Self::start_with_backend(lose_admission, WIDTH, LinuxXfrmBackend::new(), None).await
+    }
+
+    async fn start_with_backend(
+        lose_admission: bool,
+        width: u8,
+        backend: LinuxXfrmBackend,
+        run_member: Option<u8>,
+    ) -> Self {
         let pki = Arc::new(TestPki::new());
         let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
             Arc::clone(&pki),
@@ -281,13 +350,15 @@ impl SettlementFixture {
             voter_authority,
         );
         let shutdown_client = persistent.clone();
-        let provider = XfrmSettlementProvider::new(issuer);
+        let provider = XfrmSettlementProvider::new(issuer, width, backend, run_member);
         let adapter = persistent
             .into_fenced_mutation_roster_v2_provider_adapter(
                 Arc::clone(&provider),
                 Arc::new(EstablishedPublicationEvidenceProvider::default()),
                 attestor,
-                NonZeroUsize::new(usize::from(WIDTH)).unwrap(),
+                // The per-scope gate reserves ceil(global / 2) slots; keep
+                // two available for the held execute and concurrent closure.
+                NonZeroUsize::new(usize::from(width.max(3))).unwrap(),
             )
             .expect("production signed provider adapter");
         let client = adapter.client().clone();
@@ -354,9 +425,9 @@ impl SettlementFixture {
     }
 
     async fn reconcile_all(&self, recovered: &mut RecoveredRoster) -> Vec<MemberProof> {
-        assert_eq!(recovered.members().len(), usize::from(WIDTH));
+        assert_eq!(recovered.members().len(), self.provider.members.len());
         let mut proofs = Vec::new();
-        for ordinal in 0..WIDTH {
+        for ordinal in 0..u8::try_from(self.provider.members.len()).unwrap() {
             let retained = &self.provider.members[usize::from(ordinal)].member;
             assert_eq!(recovered.members()[usize::from(ordinal)], *retained);
             let mut member = recovered

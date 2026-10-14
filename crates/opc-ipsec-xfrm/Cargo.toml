@@ -18,6 +18,7 @@ default = []
 ikev2 = ["dep:opc-proto-ikev2"]
 scope-store = ["opc-local-kernel-lifecycle/store"]
 native-scope = ["scope-store", "opc-local-kernel-lifecycle/native-scope"]
+test-control = []
 
 [dependencies]
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }
