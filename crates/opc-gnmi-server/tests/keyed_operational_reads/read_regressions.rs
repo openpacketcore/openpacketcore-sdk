@@ -605,6 +605,7 @@ struct ClassificationRegistry {
     inner: &'static AggregateRegistry,
     path: &'static str,
     class: Option<DataClass>,
+    hidden_class: DataClass,
 }
 
 impl SchemaRegistry for ClassificationRegistry {
@@ -623,6 +624,8 @@ impl SchemaRegistry for ClassificationRegistry {
     fn data_class(&self, path: &str) -> Option<DataClass> {
         if path == self.path {
             self.class
+        } else if path == HIDDEN_PATH {
+            Some(self.hidden_class)
         } else {
             self.inner.data_class(path)
         }
@@ -632,24 +635,39 @@ impl SchemaRegistry for ClassificationRegistry {
 fn classification_registry(
     path: &'static str,
     class: Option<DataClass>,
+    hidden_class: DataClass,
 ) -> &'static ClassificationRegistry {
     let registry = Box::leak(Box::new(ClassificationRegistry {
         inner: aggregate_registry(DataClass::Public, DataClass::Public),
         path,
         class,
+        hidden_class,
     }));
     assert_eq!(registry.node(path).unwrap().data_class, DataClass::Public);
+    assert_eq!(
+        registry.node(HIDDEN_PATH).unwrap().data_class,
+        DataClass::Public
+    );
     assert_eq!(registry.data_class(path), class);
+    assert_eq!(
+        registry.data_class(HIDDEN_PATH),
+        if path == HIDDEN_PATH {
+            class
+        } else {
+            Some(hidden_class)
+        }
+    );
     registry
 }
 
 const OPAQUE_PATH: &str = "/ex:system/ex:opaque";
 const HIDDEN_PATH: &str = "/ex:system/ex:opaque/ex:hidden";
+const PUBLIC_PATH: &str = "/ex:system/ex:opaque/ex:public";
 const VISIBLE_PATH: &str = "/ex:system/ex:visible";
 const OPAQUE_JSON: &str = r#"{"hidden":"protected-marker","public":"public"}"#;
 
 async fn registry_classification_masks_leaf(class: Option<DataClass>) {
-    let registry = classification_registry(HIDDEN_PATH, class);
+    let registry = classification_registry(HIDDEN_PATH, class, DataClass::SecuritySecret);
     let (service, binding, _) = fixture_with_registry(
         vec![value(HIDDEN_PATH, r#""protected-marker""#)],
         vec![policy(&["/ex:system", "/ex:system/**"])],
@@ -682,10 +700,19 @@ async fn registry_classification_masks_unclassified_leaf() {
     registry_classification_masks_leaf(None).await;
 }
 
-async fn registry_classification_prunes_get(path: &'static str, class: Option<DataClass>) {
-    let registry = classification_registry(path, class);
+async fn registry_classification_prunes_get(
+    path: &'static str,
+    class: Option<DataClass>,
+    hidden_class: DataClass,
+) {
+    let registry = classification_registry(path, class, hidden_class);
     let (service, binding, _) = fixture_with_registry(
-        vec![value(OPAQUE_PATH, OPAQUE_JSON), value(VISIBLE_PATH, "true")],
+        vec![
+            value(OPAQUE_PATH, OPAQUE_JSON),
+            value(HIDDEN_PATH, r#""protected-marker""#),
+            value(PUBLIC_PATH, r#""public""#),
+            value(VISIBLE_PATH, "true"),
+        ],
         vec![policy(&["/ex:system", "/ex:system/**"])],
         MgmtLimits::default(),
         registry,
@@ -699,39 +726,77 @@ async fn registry_classification_prunes_get(path: &'static str, class: Option<Da
         .await
         .unwrap()
         .into_inner();
+    let hidden_json = if hidden_class == DataClass::Public {
+        br#""protected-marker""#.to_vec()
+    } else {
+        br#""<redacted>""#.to_vec()
+    };
     assert_eq!(
         decoded(response),
-        vec![(wire_path(VISIBLE_PATH).elem, b"true".to_vec())]
+        vec![
+            (wire_path(HIDDEN_PATH).elem, hidden_json),
+            (wire_path(PUBLIC_PATH).elem, br#""public""#.to_vec()),
+            (wire_path(VISIBLE_PATH).elem, b"true".to_vec()),
+        ]
     );
     let requests = binding.provider.requests.lock().unwrap();
     assert!(!requests.is_empty());
     for request in requests.iter() {
-        assert_eq!(request.paths, vec![YangPath::new(VISIBLE_PATH).unwrap()]);
+        assert_eq!(
+            request.paths,
+            vec![
+                YangPath::new(HIDDEN_PATH).unwrap(),
+                YangPath::new(PUBLIC_PATH).unwrap(),
+                YangPath::new(VISIBLE_PATH).unwrap(),
+            ]
+        );
     }
 }
 
 #[tokio::test]
 async fn registry_classification_get_prunes_overridden_descendant() {
-    registry_classification_prunes_get(HIDDEN_PATH, Some(DataClass::SecuritySecret)).await;
+    registry_classification_prunes_get(
+        HIDDEN_PATH,
+        Some(DataClass::SecuritySecret),
+        DataClass::SecuritySecret,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn registry_classification_get_prunes_unclassified_descendant() {
-    registry_classification_prunes_get(HIDDEN_PATH, None).await;
+    registry_classification_prunes_get(HIDDEN_PATH, None, DataClass::SecuritySecret).await;
 }
 
 #[tokio::test]
 async fn registry_classification_get_prunes_overridden_aggregate() {
-    registry_classification_prunes_get(OPAQUE_PATH, Some(DataClass::SecuritySecret)).await;
+    registry_classification_prunes_get(
+        OPAQUE_PATH,
+        Some(DataClass::SecuritySecret),
+        DataClass::SecuritySecret,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn registry_classification_get_prunes_unclassified_aggregate() {
-    registry_classification_prunes_get(OPAQUE_PATH, None).await;
+    registry_classification_prunes_get(OPAQUE_PATH, None, DataClass::SecuritySecret).await;
 }
 
-async fn registry_classification_prunes_event(path: &'static str, class: Option<DataClass>) {
-    let registry = classification_registry(path, class);
+#[tokio::test]
+async fn registry_classification_get_refuses_aggregate_with_public_descendants() {
+    // Isolate the aggregate's own check: no descendant classification can refuse it.
+    for class in [Some(DataClass::SecuritySecret), None] {
+        registry_classification_prunes_get(OPAQUE_PATH, class, DataClass::Public).await;
+    }
+}
+
+async fn registry_classification_prunes_event(
+    path: &'static str,
+    class: Option<DataClass>,
+    hidden_class: DataClass,
+) {
+    let registry = classification_registry(path, class, hidden_class);
     let (service, binding, sender) = subscription_fixture_with_registry(
         vec![],
         policy(&["/ex:system", "/ex:system/**"]),
@@ -756,50 +821,100 @@ async fn registry_classification_prunes_event(path: &'static str, class: Option<
         .await
         .unwrap();
     sender
+        .send(OperationalEvent::Update(value(
+            HIDDEN_PATH,
+            r#""protected-marker""#,
+        )))
+        .await
+        .unwrap();
+    sender
+        .send(OperationalEvent::Update(value(PUBLIC_PATH, r#""public""#)))
+        .await
+        .unwrap();
+    sender
         .send(OperationalEvent::Update(value(VISIBLE_PATH, "true")))
         .await
         .unwrap();
-    let data = notification(
-        tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap(),
+    let hidden_json = if hidden_class == DataClass::Public {
+        br#""protected-marker""#.to_vec()
+    } else {
+        br#""<redacted>""#.to_vec()
+    };
+    for (path, json) in [
+        (HIDDEN_PATH, hidden_json),
+        (PUBLIC_PATH, br#""public""#.to_vec()),
+        (VISIBLE_PATH, b"true".to_vec()),
+    ] {
+        let data = notification(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(data.update.len(), 1);
+        assert_eq!(
+            data.update[0].path.as_ref().unwrap().elem,
+            wire_path(path).elem
+        );
+        assert_eq!(
+            data.update[0].val.as_ref().unwrap().value,
+            Some(gnmi::typed_value::Value::JsonIetfVal(json))
+        );
+        assert!(data.delete.is_empty());
+    }
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            stream.as_mut().poll_next(cx).is_pending()
+        ))
+        .await
     );
-    assert_eq!(data.update.len(), 1);
-    assert_eq!(
-        data.update[0].path.as_ref().unwrap().elem,
-        wire_path(VISIBLE_PATH).elem
-    );
-    assert_eq!(
-        data.update[0].val.as_ref().unwrap().value,
-        Some(gnmi::typed_value::Value::JsonIetfVal(b"true".to_vec()))
-    );
-    assert!(data.delete.is_empty());
     let requests = binding.events.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].paths,
-        vec![YangPath::new(VISIBLE_PATH).unwrap()]
+        vec![
+            YangPath::new(HIDDEN_PATH).unwrap(),
+            YangPath::new(PUBLIC_PATH).unwrap(),
+            YangPath::new(VISIBLE_PATH).unwrap(),
+        ]
     );
 }
 
 #[tokio::test]
 async fn registry_classification_event_prunes_overridden_descendant() {
-    registry_classification_prunes_event(HIDDEN_PATH, Some(DataClass::SecuritySecret)).await;
+    registry_classification_prunes_event(
+        HIDDEN_PATH,
+        Some(DataClass::SecuritySecret),
+        DataClass::SecuritySecret,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn registry_classification_event_prunes_unclassified_descendant() {
-    registry_classification_prunes_event(HIDDEN_PATH, None).await;
+    registry_classification_prunes_event(HIDDEN_PATH, None, DataClass::SecuritySecret).await;
 }
 
 #[tokio::test]
 async fn registry_classification_event_prunes_overridden_aggregate() {
-    registry_classification_prunes_event(OPAQUE_PATH, Some(DataClass::SecuritySecret)).await;
+    registry_classification_prunes_event(
+        OPAQUE_PATH,
+        Some(DataClass::SecuritySecret),
+        DataClass::SecuritySecret,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn registry_classification_event_prunes_unclassified_aggregate() {
-    registry_classification_prunes_event(OPAQUE_PATH, None).await;
+    registry_classification_prunes_event(OPAQUE_PATH, None, DataClass::SecuritySecret).await;
+}
+
+#[tokio::test]
+async fn registry_classification_event_refuses_aggregate_with_public_descendants() {
+    // Isolate the aggregate's own check: no descendant classification can refuse it.
+    for class in [Some(DataClass::SecuritySecret), None] {
+        registry_classification_prunes_event(OPAQUE_PATH, class, DataClass::Public).await;
+    }
 }
