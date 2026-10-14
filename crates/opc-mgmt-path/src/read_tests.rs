@@ -99,6 +99,33 @@ fn public() -> Registry {
     }
 }
 
+#[test]
+fn exact_target_list_may_omit_keys_but_ancestors_and_partial_tuples_stay_strict() {
+    for path in [
+        "/ex:system/ex:list",
+        "/ex:system/ex:list[ex:id='a'][ex:zone='east']/ex:child",
+    ] {
+        let path = YangPath::new(path).unwrap();
+        let resolved = resolve_instance(&public(), &path).unwrap();
+        assert_eq!(resolved.canonical, path);
+        assert_eq!(resolved.node.kind, NodeKind::List);
+    }
+    for path in [
+        "/ex:system/ex:list[ex:id='a']",
+        "/ex:system/ex:list[ex:zone='east'][ex:id='a']",
+        "/ex:system/ex:list[ex:id=\"a\"][ex:zone='east']",
+        "/ex:system/ex:list/ex:value",
+        "/ex:system/ex:list/ex:child",
+        "/ex:system/ex:list[ex:id='a']/ex:child",
+        "/ex:system/ex:list[ex:id='a'][ex:zone='east']/ex:child/ex:value",
+    ] {
+        assert!(
+            resolve_instance(&public(), &YangPath::new(path).unwrap()).is_err(),
+            "{path}"
+        );
+    }
+}
+
 fn request(id: &str) -> RequestPath {
     RequestPath::from_elems([
         PathSegment::new("ex:system"),

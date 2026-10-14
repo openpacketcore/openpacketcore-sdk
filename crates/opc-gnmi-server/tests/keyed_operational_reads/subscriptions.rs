@@ -12,6 +12,9 @@ use prost::Message;
 use tonic::codec::Codec;
 use tonic::codegen::tokio_stream::StreamExt;
 
+#[path = "read_regressions.rs"]
+mod read_regressions;
+
 struct SubscriptionPolicy {
     current: Mutex<Arc<NacmPolicy>>,
     calls: AtomicUsize,
@@ -72,6 +75,7 @@ impl OperationalEventSource for Events {
 #[derive(Clone)]
 struct SubscriptionBinding {
     inner: Binding,
+    audit: Arc<Audit>,
     policy: Arc<SubscriptionPolicy>,
     events: Arc<Events>,
     rendered: Arc<tokio::sync::Notify>,
@@ -159,6 +163,7 @@ async fn subscription_fixture_with_registry(
     let (sender, receiver) = operational_event_channel(8);
     let binding = SubscriptionBinding {
         inner,
+        audit: audit.clone(),
         policy: Arc::new(SubscriptionPolicy {
             current: Mutex::new(Arc::new(permissions)),
             calls: AtomicUsize::new(0),

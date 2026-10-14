@@ -2840,6 +2840,7 @@ dependencies = [
 name = "opc-gnmi-server"
 version = "0.2.0"
 dependencies = [
+ "allocation-counter",
  "async-trait",
  "bytes",
  "http-body-util",
@@ -3200,6 +3201,7 @@ dependencies = [
 name = "opc-mgmt-opstate"
 version = "0.2.0"
 dependencies = [
+ "allocation-counter",
  "opc-config-model",
  "opc-mgmt-errors",
  "opc-mgmt-path",

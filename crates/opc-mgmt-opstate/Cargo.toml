@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]
