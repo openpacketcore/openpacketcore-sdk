@@ -53,16 +53,18 @@ OPTIMIZED_LIB = (
     "sqlite::consensus::tests::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression",
 )
 SPECIAL = (*ISOLATED_LIB, *ISOLATED_INTEGRATION, *OPTIMIZED_LIB)
-SERIAL_LIB_TEST = (
+SERIAL_LIB_TESTS = (
     "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
-    "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history"
+    "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history",
+    "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
+    "scope_child_read_three_large_children_refuse_the_whole_observation",
 )
-ISOLATED_TESTS = (*SPECIAL, SERIAL_LIB_TEST)
+ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS)
 
 
 def owner(name: str) -> int:
     """The same name in two harnesses must have the same owner: skips are global."""
-    if name == SERIAL_LIB_TEST:
+    if name in SERIAL_LIB_TESTS:
         return 1
     if name in SPECIAL:
         return PROOF_SHARD
@@ -148,11 +150,11 @@ def verify(rows: list[dict]) -> None:
             raise ValueError("empty ordinary shard")
 
 
-def serial_lib_command() -> dict:
+def serial_lib_command(name: str) -> dict:
     # Preserve the ordinary six-package feature unification and test profile.
-    return {"name": SERIAL_LIB_TEST, "env": {}, "argv": [
+    return {"name": name, "env": {}, "argv": [
         "cargo", "test", *SELECTION, "--quiet", "--lib", "--",
-        "--test-threads=1", "--nocapture", "--exact", SERIAL_LIB_TEST,
+        "--test-threads=1", "--nocapture", "--exact", name,
     ]}
 
 
@@ -162,7 +164,7 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
     verify(rows)
     commands = []
     if shard == 1:
-        commands.append(serial_lib_command())
+        commands.extend(serial_lib_command(name) for name in SERIAL_LIB_TESTS)
     if shard in ORDINARY_SHARDS:
         skipped = sorted({r["name"] for r in rows if r["name"] in ISOLATED_TESTS or r["shard"] != shard})
         commands.append({"name": "ordinary", "env": {}, "argv": [
@@ -204,33 +206,35 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
     if set(planned) != set(SHARDS):
         raise ValueError("missing or unexpected test shard")
     isolated = [(shard, index, command) for shard, commands in planned.items()
-                for index, command in enumerate(commands) if command["name"] == SERIAL_LIB_TEST]
-    if isolated != [(1, 0, serial_lib_command())]:
-        raise ValueError("serial library test must run exactly once, first on shard 1")
-    selections = []
-    for shard, commands in planned.items():
-        for index, command in enumerate(commands):
-            argv = command["argv"]
-            if not ({"--lib", "--tests"} & set(argv)):
-                continue
-            harness = argv[argv.index("--") + 1:]
-            skips = [harness[i + 1] for i, arg in enumerate(harness[:-1]) if arg == "--skip"]
-            filters = [arg for i, arg in enumerate(harness)
-                       if not arg.startswith("--") and (i == 0 or harness[i - 1] != "--skip")]
-            def matches(value: str) -> bool:
-                return value == SERIAL_LIB_TEST if "--exact" in harness else value in SERIAL_LIB_TEST
-            if (not filters or any(matches(value) for value in filters)) and not any(matches(value) for value in skips):
-                selections.append((shard, index))
-    if selections != [(1, 0)]:
-        raise ValueError("serial library test selections are missing or overlapping")
+                for index, command in enumerate(commands) if command["name"] in SERIAL_LIB_TESTS]
+    expected = [(1, index, serial_lib_command(name)) for index, name in enumerate(SERIAL_LIB_TESTS)]
+    if isolated != expected:
+        raise ValueError("serial library tests must each run exactly once, first on shard 1")
+    for serial_index, name in enumerate(SERIAL_LIB_TESTS):
+        selections = []
+        for shard, commands in planned.items():
+            for index, command in enumerate(commands):
+                argv = command["argv"]
+                if not ({"--lib", "--tests"} & set(argv)):
+                    continue
+                harness = argv[argv.index("--") + 1:]
+                skips = [harness[i + 1] for i, arg in enumerate(harness[:-1]) if arg == "--skip"]
+                filters = [arg for i, arg in enumerate(harness)
+                           if not arg.startswith("--") and (i == 0 or harness[i - 1] != "--skip")]
+                def matches(value: str) -> bool:
+                    return value == name if "--exact" in harness else value in name
+                if (not filters or any(matches(value) for value in filters)) and not any(matches(value) for value in skips):
+                    selections.append((shard, index))
+        if selections != [(1, serial_index)]:
+            raise ValueError("serial library test selections are missing or overlapping: " + name)
     for shard in ORDINARY_SHARDS:
         ordinary = [c for c in planned[shard] if c["name"] == "ordinary"]
         if len(ordinary) != 1:
             raise ValueError("ordinary test command must run exactly once per shard")
         argv = ordinary[0]["argv"]
         skips = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--skip"]
-        if "--exact" not in argv or skips.count(SERIAL_LIB_TEST) != 1:
-            raise ValueError("ordinary tests must exclude exactly the serial library test")
+        if "--exact" not in argv or any(skips.count(name) != 1 for name in SERIAL_LIB_TESTS):
+            raise ValueError("ordinary tests must exclude exactly the serial library tests")
 
 
 def require_jobs(needs: dict) -> None:

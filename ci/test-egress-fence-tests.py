@@ -48,72 +48,80 @@ def skips(command):
 
 
 class ScopePayloadSerialPhaseTests(unittest.TestCase):
-    NAME = (
+    NAMES = (
         "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
-        "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history"
+        "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history",
+        "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
+        "scope_child_read_three_large_children_refuse_the_whole_observation",
     )
 
     def rows(self):
-        return [row for row in fixture() if row["name"] != self.NAME] + [
+        return [row for row in fixture() if row["name"] not in self.NAMES] + [
             {"package": "opc-session-store", "target": "opc_session_store",
-             "kind": ["lib"], "name": self.NAME, "ignored": False, "shard": 1},
+             "kind": ["lib"], "name": name, "ignored": False, "shard": 1}
+            for name in self.NAMES
         ]
 
     def test_serial_phase_runs_first_once_and_preserves_original_selection(self):
         plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
-        self.assertEqual(plans[1][0], {"name": self.NAME, "env": {}, "argv": [
+        self.assertEqual(plans[1][:len(self.NAMES)], [{"name": name, "env": {}, "argv": [
             "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
-            "--test-threads=1", "--nocapture", "--exact", self.NAME,
-        ]})
+            "--test-threads=1", "--nocapture", "--exact", name,
+        ]} for name in self.NAMES])
         exact = [(shard, command) for shard, plan in plans.items()
-                 for command in plan if command["name"] == self.NAME]
-        self.assertEqual(exact, [(1, plans[1][0])])
-        self.assertEqual(plans[1][1]["name"], "ordinary")
+                 for command in plan if command["name"] in self.NAMES]
+        self.assertEqual(exact, [(1, command) for command in plans[1][:len(self.NAMES)]])
+        self.assertEqual(plans[1][len(self.NAMES)]["name"], "ordinary")
         for shard in FENCE.ORDINARY_SHARDS:
             ordinary = next(c for c in plans[shard] if c["name"] == "ordinary")
             self.assertIn("--exact", ordinary["argv"])
-            self.assertEqual(ordinary["argv"].count(self.NAME), 1)
-            self.assertIn(self.NAME, skips(ordinary))
+            for name in self.NAMES:
+                self.assertEqual(ordinary["argv"].count(name), 1)
+                self.assertIn(name, skips(ordinary))
         FENCE.verify_plans(plans)
 
     def test_missing_ignored_duplicate_or_wrong_harness_fails(self):
-        for mutation in ("missing", "ignored", "duplicate", "target", "package", "kind"):
-            rows = self.rows()
-            if mutation == "missing":
-                rows.pop()
-            elif mutation == "duplicate":
-                rows.append(dict(rows[-1], package="another-package"))
-            elif mutation == "ignored":
-                rows[-1]["ignored"] = True
-            else:
-                rows[-1][mutation] = ["test"] if mutation == "kind" else "other"
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                FENCE.verify(rows)
+        for name in self.NAMES:
+            for mutation in ("missing", "ignored", "duplicate", "target", "package", "kind"):
+                rows = self.rows()
+                row = next(row for row in rows if row["name"] == name)
+                if mutation == "missing":
+                    rows.remove(row)
+                elif mutation == "duplicate":
+                    rows.append(dict(row, package="another-package"))
+                elif mutation == "ignored":
+                    row["ignored"] = True
+                else:
+                    row[mutation] = ["test"] if mutation == "kind" else "other"
+                with self.subTest(test=name, mutation=mutation), self.assertRaises(ValueError):
+                    FENCE.verify(rows)
 
     def test_missing_duplicate_late_or_overlapping_serial_commands_fail(self):
-        for mutation in ("missing", "duplicate", "renamed-duplicate", "late", "overlap", "threads", "profile"):
-            plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
-            if mutation == "missing":
-                plans[1].pop(0)
-            elif mutation == "duplicate":
-                plans[1].insert(0, copy.deepcopy(plans[1][0]))
-            elif mutation == "renamed-duplicate":
-                duplicate = copy.deepcopy(plans[1][0])
-                duplicate["name"] = "another-command"
-                plans[0].append(duplicate)
-            elif mutation == "late":
-                plans[1][0], plans[1][1] = plans[1][1], plans[1][0]
-            elif mutation == "overlap":
-                argv = plans[1][1]["argv"]
-                index = argv.index(self.NAME)
-                del argv[index - 1:index + 1]
-            elif mutation == "threads":
-                argv = plans[1][0]["argv"]
-                argv[argv.index("--test-threads=1")] = "--test-threads=4"
-            else:
-                plans[1][0]["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] = "1"
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                FENCE.verify_plans(plans)
+        for serial_index, name in enumerate(self.NAMES):
+            for mutation in ("missing", "duplicate", "renamed-duplicate", "late", "overlap", "threads", "profile"):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                ordinary_index = len(self.NAMES)
+                if mutation == "missing":
+                    plans[1].pop(serial_index)
+                elif mutation == "duplicate":
+                    plans[1].insert(serial_index, copy.deepcopy(plans[1][serial_index]))
+                elif mutation == "renamed-duplicate":
+                    duplicate = copy.deepcopy(plans[1][serial_index])
+                    duplicate["name"] = "another-command"
+                    plans[0].append(duplicate)
+                elif mutation == "late":
+                    plans[1][serial_index], plans[1][ordinary_index] = plans[1][ordinary_index], plans[1][serial_index]
+                elif mutation == "overlap":
+                    argv = plans[1][ordinary_index]["argv"]
+                    index = argv.index(name)
+                    del argv[index - 1:index + 1]
+                elif mutation == "threads":
+                    argv = plans[1][serial_index]["argv"]
+                    argv[argv.index("--test-threads=1")] = "--test-threads=4"
+                else:
+                    plans[1][serial_index]["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] = "1"
+                with self.subTest(test=name, mutation=mutation), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
 
 
 class PartitionTests(unittest.TestCase):
@@ -129,7 +137,7 @@ class PartitionTests(unittest.TestCase):
 
     def test_new_tests_and_same_prefix_siblings_are_included(self):
         rows = fixture()
-        for prefix in [FENCE.OPTIMIZED_LIB[0], FENCE.SERIAL_LIB_TEST, "new_module"]:
+        for prefix in [FENCE.OPTIMIZED_LIB[0], *FENCE.SERIAL_LIB_TESTS, "new_module"]:
             name = prefix + "::new_test"
             row = dict(rows[-1], name=name, shard=FENCE.owner(name))
             rows.append(row)

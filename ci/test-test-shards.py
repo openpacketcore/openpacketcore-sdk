@@ -173,9 +173,11 @@ class I686TargetAuditTests(unittest.TestCase):
 
 
 class ScopePayloadSerialPhaseTests(unittest.TestCase):
-    NAME = (
+    NAMES = (
         "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
-        "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history"
+        "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history",
+        "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
+        "scope_child_read_three_large_children_refuse_the_whole_observation",
     )
 
     def setUp(self) -> None:
@@ -184,45 +186,50 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
 
     def test_exact_serial_phase_precedes_parallel_tests_with_original_selection(self) -> None:
         commands = TEST_SHARDS.commands(self.plan, "misc", self.targets)
-        self.assertEqual(commands[0], TEST_SHARDS.SELECTION + [
-            "--lib", "--", "--test-threads=1", "--nocapture", "--exact", self.NAME,
-        ])
-        self.assertIn("--test-threads=4", commands[1])
-        self.assertIn("--exact", commands[1])
-        self.assertEqual(commands[1].count(self.NAME), 1)
-        self.assertEqual(commands[1][commands[1].index(self.NAME) - 1], "--skip")
-        for name in (self.NAME, self.NAME + "_future"):
-            selected = [
-                shard for shard in TEST_SHARDS.shard_ids(self.plan)
-                for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
-                if "--lib" in command and LibraryGroupPlanTests.selected(command, name)
-            ]
-            self.assertEqual(selected, ["misc"])
+        self.assertEqual(commands[:len(self.NAMES)], [TEST_SHARDS.SELECTION + [
+            "--lib", "--", "--test-threads=1", "--nocapture", "--exact", name,
+        ] for name in self.NAMES])
+        ordinary = commands[len(self.NAMES)]
+        self.assertIn("--test-threads=4", ordinary)
+        self.assertIn("--exact", ordinary)
+        for serial in self.NAMES:
+            self.assertEqual(ordinary.count(serial), 1)
+            self.assertEqual(ordinary[ordinary.index(serial) - 1], "--skip")
+            for name in (serial, serial + "_future"):
+                selected = [
+                    shard for shard in TEST_SHARDS.shard_ids(self.plan)
+                    for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
+                    if "--lib" in command and LibraryGroupPlanTests.selected(command, name)
+                ]
+                self.assertEqual(selected, ["misc"])
 
     def test_missing_ignored_or_duplicate_live_test_fails(self) -> None:
-        for names, ignored in (([], []), ([self.NAME] * 2, []), ([self.NAME], [self.NAME])):
-            outputs = [subprocess.CompletedProcess(
-                [], 0, stdout="\n".join(f"{name}: test" for name in selected)
-            ) for selected in (names, ignored)]
-            with self.subTest(names=names, ignored=ignored), \
-                    patch.object(TEST_SHARDS.subprocess, "run", side_effect=outputs), \
-                    self.assertRaisesRegex(SystemExit, "serial.*exactly once|serial.*ignored"):
-                TEST_SHARDS.verify_serial_lib_tests()
+        for broken in self.NAMES:
+            for names, ignored in (([], []), ([broken] * 2, []), ([broken], [broken])):
+                outputs = [subprocess.CompletedProcess(
+                    [], 0, stdout="\n".join(f"{name}: test" for name in selected)
+                ) for name in self.NAMES
+                    for selected in ((names, ignored) if name == broken else ([name], []))]
+                with self.subTest(test=broken, names=names, ignored=ignored), \
+                        patch.object(TEST_SHARDS.subprocess, "run", side_effect=outputs), \
+                        self.assertRaisesRegex(SystemExit, "serial.*exactly once|serial.*ignored"):
+                    TEST_SHARDS.verify_serial_lib_tests()
 
     def test_enabled_live_test_is_checked_with_full_selection_and_ignored_inventory(self) -> None:
         outputs = [subprocess.CompletedProcess([], 0, stdout=text) for text in (
-            self.NAME + ": test\n", "0 tests, 0 benchmarks\n",
+            value for name in self.NAMES
+            for value in (name + ": test\n", "0 tests, 0 benchmarks\n")
         )]
         with patch.object(TEST_SHARDS.subprocess, "run", side_effect=outputs) as run:
             TEST_SHARDS.verify_serial_lib_tests()
-        for call in run.call_args_list:
+        self.assertEqual(run.call_count, 2 * len(self.NAMES))
+        for index, call in enumerate(run.call_args_list):
             argv = call.args[0]
             self.assertEqual(argv[:len(TEST_SHARDS.SELECTION)], TEST_SHARDS.SELECTION)
             self.assertIn("--list", argv)
             self.assertIn("--exact", argv)
-            self.assertIn(self.NAME, argv)
-        self.assertNotIn("--ignored", run.call_args_list[0].args[0])
-        self.assertIn("--ignored", run.call_args_list[1].args[0])
+            self.assertIn(self.NAMES[index // 2], argv)
+            self.assertEqual("--ignored" in argv, bool(index % 2))
 
     def test_misc_precheck_requires_the_live_serial_inventory(self) -> None:
         with patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets), \
@@ -235,30 +242,32 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
 
     def test_missing_duplicate_late_or_overlapping_serial_commands_fail(self) -> None:
         original = TEST_SHARDS.commands
-        for mutation in ("missing", "duplicate", "late", "overlap", "threads", "profile"):
-            def changed(plan, shard, targets):
-                commands = copy.deepcopy(original(plan, shard, targets))
-                if shard == "misc":
-                    if mutation == "missing":
-                        commands.pop(0)
-                    elif mutation == "duplicate":
-                        commands.insert(0, commands[0].copy())
-                    elif mutation == "late":
-                        commands[0], commands[1] = commands[1], commands[0]
-                    elif mutation == "overlap":
-                        index = commands[1].index(self.NAME)
-                        del commands[1][index - 1:index + 1]
-                    elif mutation == "threads":
-                        index = commands[0].index("--test-threads=1")
-                        commands[0][index] = "--test-threads=4"
-                    else:
-                        commands[0] = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *commands[0]]
-                return commands
+        for serial_index, name in enumerate(self.NAMES):
+            for mutation in ("missing", "duplicate", "late", "overlap", "threads", "profile"):
+                def changed(plan, shard, targets):
+                    commands = copy.deepcopy(original(plan, shard, targets))
+                    if shard == "misc":
+                        ordinary_index = len(self.NAMES)
+                        if mutation == "missing":
+                            commands.pop(serial_index)
+                        elif mutation == "duplicate":
+                            commands.insert(serial_index, commands[serial_index].copy())
+                        elif mutation == "late":
+                            commands[serial_index], commands[ordinary_index] = commands[ordinary_index], commands[serial_index]
+                        elif mutation == "overlap":
+                            index = commands[ordinary_index].index(name)
+                            del commands[ordinary_index][index - 1:index + 1]
+                        elif mutation == "threads":
+                            index = commands[serial_index].index("--test-threads=1")
+                            commands[serial_index][index] = "--test-threads=4"
+                        else:
+                            commands[serial_index] = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *commands[serial_index]]
+                    return commands
 
-            with self.subTest(mutation=mutation), \
-                    patch.object(TEST_SHARDS, "commands", side_effect=changed), \
-                    self.assertRaises(SystemExit):
-                TEST_SHARDS.verify_commands(self.plan, self.targets)
+                with self.subTest(test=name, mutation=mutation), \
+                        patch.object(TEST_SHARDS, "commands", side_effect=changed), \
+                        self.assertRaises(SystemExit):
+                    TEST_SHARDS.verify_commands(self.plan, self.targets)
 
 
 class QuiescentShardPlanTests(unittest.TestCase):
@@ -293,7 +302,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
         # The broad process excludes exactly this test; the following command
         # executes it once, with the same packages, features and test profile.
         self.assertEqual(len(mentions), 2)
-        self.assertEqual(mentions[0], commands[1])
+        self.assertEqual(mentions[0], commands[len(TEST_SHARDS.SERIAL_LIB_TESTS)])
         self.assertEqual(mentions[0].count(name), 1)
         self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
         self.assertIn("--exact", mentions[0])
@@ -325,7 +334,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 name = f"{module}::{suffix}"
                 mentions = [command for command in commands if name in command]
                 self.assertEqual(len(mentions), 2)
-                self.assertEqual(mentions[0], commands[1])
+                self.assertEqual(mentions[0], commands[len(TEST_SHARDS.SERIAL_LIB_TESTS)])
                 self.assertEqual(mentions[0].count(name), 1)
                 self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
                 self.assertIn("--exact", mentions[0])

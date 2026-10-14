@@ -6,13 +6,14 @@ shards in [ci.yml](../.github/workflows/ci.yml). Use
 to reproduce the shards with the profile and disk setup in
 [CONTRIBUTING](../CONTRIBUTING.md#validation-gates).
 
-The scope-payload decode regression runs first in a fresh serial process on
-`misc` and egress shard `1`, followed by each runner's parallel suite. Exact
-exclusions prevent duplicate execution. Live inventories reject a missing,
-ignored or ambiguous test, and command-plan checks preserve its serial position,
-package selection, features and profile. Its four Tokio workers, decode/history
-assertions and both ten-second timeouts are unchanged. Successful runs print each
-write's elapsed time and decode/audit counts for hosted validation.
+The scope-payload decode regression and the three-large-child observation refusal
+test each run in a fresh serial process first on `misc` and egress shard `1`,
+followed by each runner's parallel suite. Exact exclusions prevent duplicate
+execution. Live inventories reject a missing, ignored or ambiguous test, and
+command-plan checks preserve each serial position, package selection, features
+and profile. The tests retain their four Tokio workers, all assertions and the
+existing ten-second bounds. Successful runs print each measured write's elapsed
+time and decode/audit counts for hosted validation.
 
 The required i686 matrix separates session-net library tests from executable
 unit tests, integration tests and doctests. The integration runner exercises the

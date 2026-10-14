@@ -64,6 +64,8 @@ HARNESS = ["--test-threads=4"]
 SERIAL_LIB_TESTS = (
     "consensus::store::sequential_wal_sdk_tests::scope_payload_cost::"
     "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history",
+    "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
+    "scope_child_read_three_large_children_refuse_the_whole_observation",
 )
 
 # These tests intentionally prove literal authority or operation budgets.
