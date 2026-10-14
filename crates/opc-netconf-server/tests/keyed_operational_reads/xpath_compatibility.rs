@@ -21,7 +21,7 @@ async fn assert_masked_configuration_xpath_is_refused(nmda: bool) {
             };
             let reply = rpc(&server, &operation, &MgmtLimits::default());
             assert!(
-                reply.contains("<error-tag>invalid-value</error-tag>"),
+                reply.contains("<error-tag>operation-not-supported</error-tag>"),
                 "{reply}"
             );
             assert_eq!(source.calls.load(Ordering::SeqCst), 0);

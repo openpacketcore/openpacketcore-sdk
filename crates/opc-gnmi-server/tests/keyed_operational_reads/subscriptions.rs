@@ -1542,7 +1542,13 @@ async fn expanded_revocation_discards_buffered_output_without_waiting_for_capaci
             .await
             .unwrap();
     }
-    wait_policy_calls(&binding.policy, 3).await;
+    // Wait until both events have completed authorization before activating
+    // revocation. A policy lookup starts before its revision is recorded and
+    // may legitimately retry if activation races that record.
+    tokio::time::timeout(Duration::from_secs(5), wait_for_render(&binding, 3))
+        .await
+        .unwrap();
+    assert_eq!(binding.policy.calls.load(Ordering::SeqCst), 3);
     let pending = binding
         .policy
         .changes
