@@ -832,6 +832,8 @@ jobs:
         include:
           - slice: ordinary
             cache_key: opc-session-net-i686
+          - slice: ordinary-integration
+            cache_key: opc-session-net-i686-integration
           - slice: contracts
             cache_key: opc-session-net-i686-contracts
     env:
@@ -893,6 +895,8 @@ jobs:
           timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_timing_contracts[@]}")
           case "${I686_SLICE}" in
             ordinary)
+              # Keep the library binary separate from the integration binaries
+              # so neither ordinary shard approaches the 30-minute job limit.
               skips=()
               for timing_contract in "${timing_contracts[@]}"; do
                 skips+=(--skip "stateless_quorum_consumer::$timing_contract")
@@ -902,10 +906,32 @@ jobs:
                 --all-features \
                 --target i686-unknown-linux-gnu \
                 --quiet \
+                --lib \
                 -- \
                 --test-threads=1 \
                 --exact \
                 "${skips[@]}"
+              ;;
+            ordinary-integration)
+              # The wildcard includes every registered integration binary,
+              # including future additions. Target selection omits doctests,
+              # so retain them explicitly in the same shard.
+              cargo test --locked \
+                -p opc-session-net \
+                --all-features \
+                --target i686-unknown-linux-gnu \
+                --quiet \
+                --test '*' \
+                -- \
+                --test-threads=1
+              cargo test --locked \
+                -p opc-session-net \
+                --all-features \
+                --target i686-unknown-linux-gnu \
+                --quiet \
+                --doc \
+                -- \
+                --test-threads=1
               ;;
             contracts)
               for timing_contract in "${ordinary_timing_contracts[@]}"; do
@@ -944,11 +970,11 @@ jobs:
       # carries the caller-supplied absolute usize base offsets whose checked
       # arithmetic is width-sensitive.
       - name: Run 32-bit portability tests
-        if: matrix.slice == 'ordinary'
+        if: matrix.slice == 'ordinary-integration'
         run: cargo test --locked -p opc-protocol -p opc-proto-gtpv2c --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
 
   # Keep the existing required-check job key and display name stable while
-  # requiring every i686 matrix slice to finish successfully.
+  # requiring both ordinary shards and the contracts slice to succeed.
   session-net-i686:
     name: opc-session-net i686
     if: always()
