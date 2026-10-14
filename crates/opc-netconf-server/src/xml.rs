@@ -2685,7 +2685,8 @@ impl ParserState {
         if frame.child_count > 0 && !frame.text.trim().is_empty() {
             return Err(XmlError::SubtreeFilterContentMatchNotSupported);
         }
-        let text = (frame.has_text && frame.child_count == 0).then_some(frame.text);
+        let text = (frame.has_text && frame.child_count == 0 && !frame.text.trim().is_empty())
+            .then_some(frame.text);
         if text.is_some() {
             self.filter_content_match_count = self.filter_content_match_count.saturating_add(1);
             self.limits
