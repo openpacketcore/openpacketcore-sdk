@@ -1511,16 +1511,62 @@ async fn expanded_revoke_then_restore_terminates_the_old_stream() {
     terminal_at_ack(&mut stream).await;
 }
 
+#[derive(Default)]
+struct OperationalProjectionProbe {
+    values: AtomicUsize,
+    projected: tokio::sync::Notify,
+}
+
+impl SchemaRegistry for OperationalProjectionProbe {
+    fn schema_digest(&self) -> &'static str {
+        Registry.schema_digest()
+    }
+    fn served_models(&self) -> &'static [ModelData] {
+        Registry.served_models()
+    }
+    fn nodes(&self) -> &'static [NodeMeta] {
+        Registry.nodes()
+    }
+    fn origins(&self) -> &'static [OriginEntry] {
+        Registry.origins()
+    }
+    fn data_class(&self, path: &str) -> Option<DataClass> {
+        let class = Registry.data_class(path);
+        if path == "/ex:system/ex:peer/ex:up" {
+            // The scalar's class is read by value projection, after the
+            // snapshot or event has recorded its authorization decision.
+            self.values.fetch_add(1, Ordering::SeqCst);
+            self.projected.notify_one();
+        }
+        class
+    }
+}
+
+impl OperationalProjectionProbe {
+    async fn wait_for_values(&self, count: usize) {
+        loop {
+            let projected = self.projected.notified();
+            if self.values.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            projected.await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn expanded_revocation_discards_buffered_output_without_waiting_for_capacity() {
+    let registry: &'static OperationalProjectionProbe =
+        Box::leak(Box::new(OperationalProjectionProbe::default()));
     let limits = MgmtLimits {
         max_subscriber_queue_bytes: 4096,
         ..MgmtLimits::default()
     };
-    let (service, binding, sender) = subscription_fixture(
+    let (service, binding, sender) = subscription_fixture_with_registry(
         vec![peer("permitted-marker", "up", "true")],
         group_key_policy(),
         limits,
+        registry,
     )
     .await;
     let mut list = subscription(selection(&[], "up"));
@@ -1532,6 +1578,7 @@ async fn expanded_revocation_discards_buffered_output_without_waiting_for_capaci
         .into_inner();
     notification(stream.next().await.unwrap().unwrap());
     sync(stream.next().await.unwrap().unwrap());
+    assert_eq!(registry.values.load(Ordering::SeqCst), 1);
     for _ in 0..2 {
         sender
             .send(OperationalEvent::Update(peer(
@@ -1545,9 +1592,10 @@ async fn expanded_revocation_discards_buffered_output_without_waiting_for_capaci
     // Wait until both events have completed authorization before activating
     // revocation. A policy lookup starts before its revision is recorded and
     // may legitimately retry if activation races that record.
-    tokio::time::timeout(Duration::from_secs(5), wait_for_render(&binding, 3))
+    tokio::time::timeout(Duration::from_secs(5), registry.wait_for_values(3))
         .await
         .unwrap();
+    assert_eq!(registry.values.load(Ordering::SeqCst), 3);
     assert_eq!(binding.policy.calls.load(Ordering::SeqCst), 3);
     let pending = binding
         .policy
