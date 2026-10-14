@@ -20,7 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operational `<get-data>` binding hooks must implement `render_selected_nodes`.
   Regenerate model bindings or project authorized configuration into
   `NetconfDataNode` values so configuration and state merge by complete list
-  identity before masking. Renderers without this contract fail closed. (#1270)
+  identity before masking. Renderers without this contract fail closed.
+  Regenerate gNMI JSON bindings as well. Key predicates are literal XPath strings:
+  double-quoted when the value contains an apostrophe, with backslashes kept
+  literal. Predicates written by earlier generated renderers are no longer
+  unescaped. `OperationalRequest` adds public `max_values` and `max_value_bytes`
+  fields; construct it with `OperationalRequest::new`. `OperationalResponseError`,
+  `PathError` and `FilterError` add variants. (#1270)
 
 - `opc-proto-nas`: `MmMessageBody::ConfigurationUpdateCommand` and
   `MmMessageBody::ConfigurationUpdateComplete` now carry the typed
