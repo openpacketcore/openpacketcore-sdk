@@ -585,6 +585,23 @@ class RequiredCITests(unittest.TestCase):
         new = {**old, 'ci/plan.py': 'SKIP_TESTS = ["checks::works"]\n'}
         self.assertFalse(report(old, new).success)
 
+    def test_python_skip_annotation_without_value_is_not_a_selector(self):
+        for declaration in ('SKIP_TESTS: list[str]\n',
+                            'from dataclasses import dataclass\n@dataclass\nclass Selection:\n    skips: tuple[str, ...]\n'):
+            with self.subTest(declaration=declaration):
+                result = report(rust(), {**rust(), 'ci/plan.py': declaration})
+                self.assertTrue(result.success)
+                self.assertEqual(result.findings, [])
+
+    def test_python_annotated_skip_values_still_disable_tests(self):
+        for declaration in ('SKIP_TESTS: list[str] = ["checks::works"]\n',
+                            'class Selection:\n    skips: tuple[str, ...] = ("checks::works",)\n',
+                            'SKIP_TESTS: list[str]\nSKIP_TESTS = ["checks::works"]\n'):
+            with self.subTest(declaration=declaration):
+                result = report(rust(), {**rust(), 'ci/plan.py': declaration})
+                self.assertFalse(result.success)
+                self.assertEqual([(f.subject, f.kind) for f in result.findings], [(TEST, 'disabled')])
+
     def test_duplicate_yaml_keys_fail_closed(self):
         with self.assertRaisesRegex(GuardError, 'duplicate YAML key'):
             report({}, {'.github/workflows/ci.yml': 'jobs:\n  rust: {}\n  rust: {}\n'})

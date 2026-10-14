@@ -288,7 +288,7 @@ def skips(files):
                     for first, second in zip(values, values[1:]):
                         if first == '--skip' and second:
                             found.add((path, second))
-                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                     if any(re.search(r'skip|exclud|ignor', ast.unparse(target), re.I) for target in targets):
                         for literal in ast.walk(node.value):
