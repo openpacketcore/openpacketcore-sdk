@@ -1171,8 +1171,9 @@ where
         if path.elems.is_empty() {
             let origin_modules = root_origin_modules(registry, prefix.as_ref(), Some(&path))?;
             if let Some(prefix) = prefix.as_ref().filter(|prefix| !prefix.elems.is_empty()) {
-                let resolved = crate::path::resolve_read_path(registry, None, prefix)?;
-                classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
+                if let Some(resolved) = crate::path::resolve_read_path(registry, None, prefix)? {
+                    classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
+                }
             } else {
                 classify_all_matching(
                     registry,
@@ -1183,8 +1184,9 @@ where
             }
             continue;
         }
-        let resolved = crate::path::resolve_read_path(registry, prefix.as_ref(), &path)?;
-        classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
+        if let Some(resolved) = crate::path::resolve_read_path(registry, prefix.as_ref(), &path)? {
+            classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
+        }
     }
     classes
         .operational_paths
