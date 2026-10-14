@@ -311,10 +311,17 @@ fn render_list_entry_fn(
         }
         let field = format_ident!("{}", to_snake_case(local));
         let inner = leaf_inner_expr(child, nodes_by_path);
+        // Configuration leaves use a match expression, which needs grouping in
+        // let-else. State leaves use Option::map and need no extra parentheses.
+        let inner = if child.config {
+            quote! { (#inner) }
+        } else {
+            inner
+        };
         predicate_stmts.push(quote! {
             if ctx.has_key_predicate(#child_path) {
                 let value = &value.#field;
-                let Some((raw, _)) = (#inner) else {
+                let Some((raw, _)) = #inner else {
                     return Err(NetconfProjectionError::UnsupportedShape {
                         path, kind: opc_mgmt_schema::NodeKind::List,
                     });
