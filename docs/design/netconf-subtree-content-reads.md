@@ -217,7 +217,8 @@ merge-sort level. Reservations multiply original node totals by the logarithmic
 row-width bound and the largest compared tuple/value lengths, then add linear
 visit, predicate, copy and conflict-check terms. They do not square pooled list
 sizes or charge vector-removal shifts. Metadata normalization, provider duplicate
-checks and provider ordering also use bounded index sorts. Provider ordering
+checks and provider ordering also use bounded index sorts. Metadata normalization
+charges each merge level by the batch's summed metadata. Provider ordering
 still uses validated canonical paths; its prepaid byte bound uses captured path
 identities, including fixed-width masked components.
 

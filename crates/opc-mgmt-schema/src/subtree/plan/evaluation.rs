@@ -56,16 +56,14 @@ impl Shape {
 
 fn normalize_shapes(shapes: &mut [Shape], budget: &SubtreeBudget) -> Result<(), SubtreeError> {
     budget.charge(shapes.len())?;
-    let mut comparison = 0;
+    let mut per_level = 0;
     for shape in shapes.iter() {
-        comparison = comparison.max(shape.metadata_work);
+        add_work(&mut per_level, multiply_work(shape.metadata_work, 2)?)?;
+        add_work(&mut per_level, 2)?;
     }
-    let per_compare = multiply_work(comparison, 2)?
-        .checked_add(2)
-        .ok_or(SubtreeError::TooBig)?;
-    let mut per_node = multiply_work(sort_levels(shapes.len()), per_compare)?;
-    add_work(&mut per_node, 8)?;
-    budget.charge(multiply_work(shapes.len(), per_node)?)?;
+    let mut units = multiply_work(sort_levels(shapes.len()), per_level)?;
+    add_work(&mut units, multiply_work(shapes.len(), 8)?)?;
+    budget.charge(units)?;
     // Metadata alone is sorted; all comparison/move work is prepaid. The
     // capture order and every identity/payload remain outside this operation.
     let order = identity::sorted_indices(
