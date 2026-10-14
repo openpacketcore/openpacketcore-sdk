@@ -38,6 +38,7 @@ from collections import Counter
 from pathlib import Path
 
 import realtime_qualification
+import cargo_test_selection
 
 ROOT = Path(__file__).resolve().parent.parent
 PLAN_PATH = ROOT / "ci" / "test-shards.json"
@@ -642,12 +643,17 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             "the optimized private-lib shard must run its timing contracts "
             "once each, in their declared module-qualified name order"
         )
+    metadata = cargo_test_selection.workspace_metadata(ROOT)
     for shard in shard_ids(plan):
         actual = commands(plan, shard, targets)
-        library_commands = [
-            command for command in actual
-            if "--lib" in command and command != ordinary
-        ]
+        try:
+            library_commands = [
+                command for index, command in enumerate(actual)
+                if cargo_test_selection.resolve(command, metadata).has_library()
+                and (shard, index) != ("misc", ordinary_index)
+            ]
+        except ValueError as error:
+            sys.exit(f"{shard} has an unsupported test selection: {error}")
         expected = (serial if shard == "misc" else []) + extra_lib_commands(plan, shard)
         if library_commands != expected:
             sys.exit(f"{shard} must run every assigned library group exactly once")

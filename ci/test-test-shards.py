@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import io
+import os
 import shlex
 import subprocess
 import sys
@@ -20,6 +21,146 @@ SPEC = importlib.util.spec_from_file_location("test_shards", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 TEST_SHARDS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TEST_SHARDS)
+
+
+class CargoTestSelectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        (cls.root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["store", "other", "disabled"]\n'
+            'default-members = ["other"]\nresolver = "2"\n'
+        )
+        for directory, package in (("store", "opc-session-store"),
+                                   ("other", "another-package"),
+                                   ("disabled", "disabled-library")):
+            root = cls.root / directory
+            (root / "src").mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                f'[package]\nname = "{package}"\nversion = "0.1.0"\nedition = "2021"\n'
+                f'[lib]\nname = "{directory}_library"\n'
+                + ('test = false\n' if directory == "disabled" else '')
+            )
+            (root / "src/lib.rs").write_text(
+                'mod consensus { mod store { mod sequential_wal_sdk_tests {\n'
+                + ''.join(
+                    f'mod {module} {{ #[test] fn {name}() {{ println!("{directory} library ran"); }} }}\n'
+                    for module, name in (
+                        ("scope_payload_cost", "scope_large_child_write_decodes_one_payload_per_voter_independent_of_history"),
+                        ("scope_child_read", "scope_child_read_three_large_children_refuse_the_whole_observation"),
+                    )
+                ) + '} } }\n'
+            )
+        # A same-name test in a different target must not count as a library run.
+        (cls.root / "store/tests").mkdir()
+        (cls.root / "store/tests/another_harness.rs").write_text(
+            (cls.root / "store/src/lib.rs").read_text().replace("store library ran", "integration ran")
+        )
+        for kind in ("bin", "example"):
+            with (cls.root / "store/Cargo.toml").open("a") as manifest:
+                manifest.write(f'[[{kind}]]\nname = "disabled_{kind}"\npath = "src/{kind}.rs"\ntest = false\n')
+            (cls.root / f"store/src/{kind}.rs").write_text(
+                'fn main() {}\n' + (cls.root / "store/src/lib.rs").read_text().replace(
+                    "store library ran", kind + " ran")
+            )
+        cls.environment = dict(os.environ, CARGO_TARGET_DIR=str(TEST_SHARDS.ROOT / "target/cargo-test-selection"))
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=cls.root,
+                       env=cls.environment, check=True, capture_output=True)
+        cls.metadata = TEST_SHARDS.cargo_test_selection.workspace_metadata(cls.root)
+
+    def resolve(self, *args):
+        return TEST_SHARDS.cargo_test_selection.resolve(["cargo", "test", *args], self.metadata)
+
+    def test_real_cargo_runs_both_serial_names_under_each_equivalent_selector(self) -> None:
+        for name in ScopePayloadSerialPhaseTests.NAMES:
+            for selector in ([], ["--lib"], ["--tests"], ["--all-targets"]):
+                argv = ["cargo", "test", "--locked", "--offline", "-p", "opc-session-store",
+                        "--quiet", *selector, "--", "--exact", name, "--nocapture"]
+                with self.subTest(name=name, selector=selector):
+                    result = subprocess.run(argv, cwd=self.root, env=self.environment,
+                                            check=True, capture_output=True, text=True)
+                    self.assertEqual(result.stdout.count("store library ran"), 1)
+                    resolved = TEST_SHARDS.cargo_test_selection.resolve(argv, self.metadata)
+                    self.assertTrue(resolved.selects("opc-session-store", "store_library", ("lib",), name))
+
+    def test_manifest_test_false_is_respected_unless_library_is_explicit(self) -> None:
+        name = ScopePayloadSerialPhaseTests.NAMES[0]
+        for selector, expected in (([], False), (["--tests"], False),
+                                   (["--lib"], True), (["--all-targets"], True)):
+            argv = ["cargo", "test", "--locked", "--offline", "-p", "disabled-library",
+                    "--quiet", *selector, "--", "--exact", name, "--nocapture"]
+            with self.subTest(selector=selector):
+                result = subprocess.run(argv, cwd=self.root, env=self.environment,
+                                        check=True, capture_output=True, text=True)
+                self.assertEqual(result.stdout.count("disabled library ran"), int(expected))
+                resolved = TEST_SHARDS.cargo_test_selection.resolve(argv, self.metadata)
+                self.assertEqual(resolved.selects("disabled-library", "disabled_library", ("lib",), name), expected)
+
+    def test_named_integration_target_does_not_run_the_same_named_library_test(self) -> None:
+        name = ScopePayloadSerialPhaseTests.NAMES[0]
+        argv = ["cargo", "test", "--locked", "--offline", "--package=opc-session-store",
+                "--test=another_*", "--quiet", "--", "--exact", name, "--nocapture"]
+        result = subprocess.run(argv, cwd=self.root, env=self.environment,
+                                check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.count("integration ran"), 1)
+        self.assertNotIn("store library ran", result.stdout)
+        resolved = TEST_SHARDS.cargo_test_selection.resolve(argv, self.metadata)
+        self.assertFalse(resolved.has_library())
+        self.assertEqual(resolved.targets, frozenset())
+
+    def test_non_library_target_flags_match_cargos_library_selection(self) -> None:
+        name = ScopePayloadSerialPhaseTests.NAMES[0]
+        for kind in ("bin", "example"):
+            for selector in ([], ["--tests"], ["--all-targets"], ["--" + kind + "s"],
+                             ["--" + kind + "=disabled_" + kind]):
+                argv = ["cargo", "test", "--locked", "--offline", "-p", "opc-session-store",
+                        "--quiet", *selector, "--", "--exact", name, "--nocapture"]
+                with self.subTest(kind=kind, selector=selector):
+                    result = subprocess.run(argv, cwd=self.root, env=self.environment,
+                                            check=True, capture_output=True, text=True)
+                    actual = result.stdout.count(kind + " ran")
+                    self.assertIn(actual, (0, 1))
+                    library_runs = result.stdout.count("store library ran")
+                    self.assertIn(library_runs, (0, 1))
+                    resolved = TEST_SHARDS.cargo_test_selection.resolve(argv, self.metadata)
+                    self.assertEqual(resolved.selects("opc-session-store", "store_library", ("lib",), name), bool(library_runs))
+
+    def test_metadata_controls_default_members_package_aliases_and_exclusions(self) -> None:
+        self.assertEqual(self.resolve().targets, frozenset({("another-package", "other_library", ("lib",))}))
+        for package in (["-p", "opc-session-store"], ["-popc-session-store"],
+                        ["--package", "opc-session-store"], ["--package=opc-session-store"],
+                        ["--package=opc-session-*"]):
+            with self.subTest(package=package):
+                self.assertEqual(self.resolve(*package, "--lib").targets,
+                                 frozenset({("opc-session-store", "store_library", ("lib",))}))
+        for workspace in ("--workspace", "--all"):
+            selection = self.resolve(workspace, "--exclude=opc-session-*", "--lib")
+            self.assertNotIn(("opc-session-store", "store_library", ("lib",)), selection.targets)
+            self.assertIn(("another-package", "other_library", ("lib",)), selection.targets)
+
+    def test_libtest_values_are_not_filters_and_cargo_filter_is_forwarded(self) -> None:
+        name = ScopePayloadSerialPhaseTests.NAMES[0]
+        for harness in (["--test-threads", "4", "--exact", name],
+                        ["--test-threads=4", "--exact", name],
+                        ["--skip=unrelated", "--exact", name]):
+            selection = self.resolve("-popc-session-store", "--tests", "--", *harness)
+            self.assertTrue(selection.selects("opc-session-store", "store_library", ("lib",), name))
+        selection = self.resolve("-popc-session-store", name, "--", "--exact", "--test-threads", "4")
+        self.assertTrue(selection.selects("opc-session-store", "store_library", ("lib",), name))
+        for args in (["--", "--skip", name], ["--", "--skip=" + name],
+                     ["--", "--ignored"], ["--", "--list"], ["--no-run"], ["--doc"]):
+            selection = self.resolve("-popc-session-store", *args)
+            self.assertFalse(selection.selects("opc-session-store", "store_library", ("lib",), name))
+
+    def test_unmodeled_or_malformed_command_forms_fail_closed(self) -> None:
+        for args in (["--future-selector"], ["--benches"], ["--config", "build.target='other'"],
+                     ["--manifest-path", "other/Cargo.toml"], ["--package"],
+                     ["--package=missing"], ["--exclude=opc-session-store"],
+                     ["--", "--skip"], ["--", "--future-harness-option"]):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                self.resolve(*args)
 
 
 class ManifestTestSourceAuditTests(unittest.TestCase):
@@ -268,6 +409,52 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
                         patch.object(TEST_SHARDS, "commands", side_effect=changed), \
                         self.assertRaises(SystemExit):
                     TEST_SHARDS.verify_commands(self.plan, self.targets)
+
+    def test_equivalent_cargo_selectors_cannot_duplicate_a_serial_test(self) -> None:
+        targets = TEST_SHARDS.integration_targets()
+        original = TEST_SHARDS.commands
+        for name in self.NAMES:
+            for selector in ([], ["--lib"], ["--tests"], ["--all-targets"]):
+                extra = TEST_SHARDS.SELECTION + selector + [
+                    "--", "--test-threads=4", "--exact", name,
+                ]
+
+                def changed(plan, shard, targets):
+                    commands = copy.deepcopy(original(plan, shard, targets))
+                    if shard == "misc":
+                        commands.insert(-1, extra)
+                    return commands
+
+                with self.subTest(test=name, selector=selector), \
+                        patch.object(TEST_SHARDS, "commands", side_effect=changed), \
+                        self.assertRaises(SystemExit):
+                    TEST_SHARDS.verify(self.plan, targets)
+
+    def test_repeated_ordinary_library_command_is_not_exempt_from_overlap_checks(self) -> None:
+        original = TEST_SHARDS.commands
+        ordinary = original(self.plan, "misc", self.targets)[len(self.NAMES)]
+
+        def changed(plan, shard, targets):
+            commands = copy.deepcopy(original(plan, shard, targets))
+            if shard == "it-2":
+                commands.append(ordinary.copy())
+            return commands
+
+        with patch.object(TEST_SHARDS, "commands", side_effect=changed), self.assertRaises(SystemExit):
+            TEST_SHARDS.verify_commands(self.plan, self.targets)
+
+    def test_unmodeled_target_selector_cannot_hide_a_library_command(self) -> None:
+        original = TEST_SHARDS.commands
+
+        def changed(plan, shard, targets):
+            commands = copy.deepcopy(original(plan, shard, targets))
+            if shard == "it-1":
+                commands.append(TEST_SHARDS.SELECTION + ["--future-selector"])
+            return commands
+
+        with patch.object(TEST_SHARDS, "commands", side_effect=changed), \
+                self.assertRaisesRegex(SystemExit, "unsupported.*selection"):
+            TEST_SHARDS.verify_commands(self.plan, self.targets)
 
 
 class QuiescentShardPlanTests(unittest.TestCase):

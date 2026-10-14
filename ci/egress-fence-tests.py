@@ -20,6 +20,8 @@ import shlex
 import subprocess
 import sys
 
+import cargo_test_selection
+
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGES = (
@@ -210,21 +212,16 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
     expected = [(1, index, serial_lib_command(name)) for index, name in enumerate(SERIAL_LIB_TESTS)]
     if isolated != expected:
         raise ValueError("serial library tests must each run exactly once, first on shard 1")
+    metadata = cargo_test_selection.workspace_metadata(ROOT)
+    resolved = {
+        (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
+        for shard, commands in planned.items() for index, command in enumerate(commands)
+    }
     for serial_index, name in enumerate(SERIAL_LIB_TESTS):
-        selections = []
-        for shard, commands in planned.items():
-            for index, command in enumerate(commands):
-                argv = command["argv"]
-                if not ({"--lib", "--tests"} & set(argv)):
-                    continue
-                harness = argv[argv.index("--") + 1:]
-                skips = [harness[i + 1] for i, arg in enumerate(harness[:-1]) if arg == "--skip"]
-                filters = [arg for i, arg in enumerate(harness)
-                           if not arg.startswith("--") and (i == 0 or harness[i - 1] != "--skip")]
-                def matches(value: str) -> bool:
-                    return value == name if "--exact" in harness else value in name
-                if (not filters or any(matches(value) for value in filters)) and not any(matches(value) for value in skips):
-                    selections.append((shard, index))
+        selections = [
+            location for location, selection in resolved.items()
+            if selection.selects("opc-session-store", "opc_session_store", ("lib",), name)
+        ]
         if selections != [(1, serial_index)]:
             raise ValueError("serial library test selections are missing or overlapping: " + name)
     for shard in ORDINARY_SHARDS:

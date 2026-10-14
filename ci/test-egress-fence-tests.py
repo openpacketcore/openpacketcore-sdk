@@ -5,9 +5,13 @@ import copy
 import importlib.util
 from pathlib import Path
 import re
+import sys
 import unittest
+from unittest.mock import patch
 
 
+# The workflow runs this test with -I; import only the explicit CI module path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 SPEC = importlib.util.spec_from_file_location(
     "egress_fence_tests", Path(__file__).with_name("egress-fence-tests.py"))
 assert SPEC is not None and SPEC.loader is not None
@@ -54,6 +58,23 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
         "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
         "scope_child_read_three_large_children_refuse_the_whole_observation",
     )
+
+    def setUp(self):
+        packages = [{
+            "id": name, "name": name, "version": "0.1.0", "targets": [
+                {"name": name.replace("-", "_"), "kind": ["lib"], "test": True},
+            ],
+        } for name in (*FENCE.PACKAGES, "opc-session-testkit")]
+        for package, target in (("opc-session-store", "consensus_openraft"),
+                                ("opc-session-testkit", "qualification_profile")):
+            next(p for p in packages if p["name"] == package)["targets"].append(
+                {"name": target, "kind": ["test"], "test": True})
+        metadata = {"workspace_root": str(FENCE.ROOT), "packages": packages,
+                    "workspace_members": [p["id"] for p in packages],
+                    "workspace_default_members": [p["id"] for p in packages]}
+        patcher = patch.object(FENCE.cargo_test_selection, "workspace_metadata", return_value=metadata)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def rows(self):
         return [row for row in fixture() if row["name"] not in self.NAMES] + [
@@ -122,6 +143,60 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
                     plans[1][serial_index]["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] = "1"
                 with self.subTest(test=name, mutation=mutation), self.assertRaises(ValueError):
                     FENCE.verify_plans(plans)
+
+    def test_equivalent_cargo_selectors_cannot_duplicate_a_serial_test(self):
+        for name in self.NAMES:
+            for selector in ([], ["--lib"], ["--tests"], ["--all-targets"]):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                plans[0].append({"name": "second-scope-execution", "env": {}, "argv": [
+                    "cargo", "test", *FENCE.SELECTION, "--quiet", *selector,
+                    "--", "--test-threads=4", "--exact", name,
+                ]})
+                with self.subTest(test=name, selector=selector), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
+
+    def test_same_filter_in_another_package_does_not_duplicate_the_library_test(self):
+        for name in self.NAMES:
+            plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+            plans[0].append({"name": "another-package", "env": {}, "argv": [
+                "cargo", "test", "--locked", "--package=opc-runtime", "--all-features",
+                "--lib", "--", "--test-threads=4", "--exact", name,
+            ]})
+            with self.subTest(test=name):
+                FENCE.verify_plans(plans)
+
+    def test_cargo_filters_and_libtest_value_spellings_cannot_hide_overlap(self):
+        for name in self.NAMES:
+            for suffix in (["--", "--test-threads", "4", "--exact", name],
+                           [name, "--", "--exact", "--test-threads=4"],
+                           ["--", "--skip=unrelated", "--exact", name]):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                plans[0].append({"name": "second-scope-execution", "env": {}, "argv": [
+                    "cargo", "test", *FENCE.SELECTION, "--tests", *suffix,
+                ]})
+                with self.subTest(test=name, suffix=suffix), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
+
+    def test_non_library_targets_and_skipped_names_do_not_overlap(self):
+        for name in self.NAMES:
+            for suffix in (["--test=consensus_*", "--", "--exact", name],
+                           ["--all-targets", "--", "--exact", "--skip=" + name, name],
+                           ["--doc", "--", "--exact", name],
+                           ["--lib", "--no-run", "--", "--exact", name]):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                plans[0].append({"name": "another-command", "env": {}, "argv": [
+                    "cargo", "test", *FENCE.SELECTION, *suffix,
+                ]})
+                with self.subTest(test=name, suffix=suffix):
+                    FENCE.verify_plans(plans)
+
+    def test_unmodeled_target_selector_is_rejected(self):
+        plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+        plans[0].append({"name": "unknown-selection", "env": {}, "argv": [
+            "cargo", "test", *FENCE.SELECTION, "--future-selector",
+        ]})
+        with self.assertRaisesRegex(ValueError, "unsupported Cargo test option"):
+            FENCE.verify_plans(plans)
 
 
 class PartitionTests(unittest.TestCase):
