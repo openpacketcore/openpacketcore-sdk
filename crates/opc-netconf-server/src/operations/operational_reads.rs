@@ -96,6 +96,8 @@ pub(crate) fn read_operational<C: OpcConfig, B: NetconfConfigBinding<C>>(
         if resolved.node.config || !state_paths.contains(&resolved.node.path) {
             return Err(RpcError::operation_failed());
         }
+        crate::binding::validate_key_payload(registry, &resolved, value.value_json())
+            .map_err(|_| RpcError::operation_failed())?;
         available.push(resolved.node.path);
     }
     available.sort_unstable();

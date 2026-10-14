@@ -15,6 +15,7 @@ use crate::discovery;
 use crate::xml::{EditConfigRequest, WithDefaultsMode};
 
 mod operational_xml;
+pub(crate) use operational_xml::validate_key_payload;
 
 /// RFC 8525 YANG Library advertisement data supplied by the embedding CNF.
 ///

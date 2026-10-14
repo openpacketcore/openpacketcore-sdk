@@ -23,6 +23,9 @@ use opc_netconf_server::{NetconfConfigBinding, ReadOnlyNetconfServer};
 use opc_types::TenantId;
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 
+#[path = "keyed_operational_reads/key_payloads.rs"]
+mod key_payloads;
+
 struct Registry;
 const fn leaf(path: &'static str, config: bool, class: DataClass) -> NodeMeta {
     NodeMeta {

@@ -1,13 +1,57 @@
 //! Scalar operational projection retaining qualified ancestry and raw identities.
 
 use opc_mgmt_opstate::OperationalResponse;
-use opc_mgmt_path::CanonicalPath;
+use opc_mgmt_path::{CanonicalPath, ResolvedPath};
 use opc_mgmt_schema::{merge_netconf_data, NetconfDataNode, NodeKind, SchemaRegistry};
 
 use super::BindingError;
 
 fn invalid() -> BindingError {
     BindingError::projection("invalid NETCONF operational projection")
+}
+
+/// Checks a reported key against its complete, validated identity before masking.
+pub(crate) fn validate_key_payload(
+    registry: &dyn SchemaRegistry,
+    resolved: &ResolvedPath,
+    value_json: &str,
+) -> Result<(), BindingError> {
+    let Some((parent_path, name)) = resolved.node.path.rsplit_once('/') else {
+        return Ok(());
+    };
+    let Some(parent) = registry.node(parent_path) else {
+        return Ok(());
+    };
+    if !opc_mgmt_path::declared_key(registry, parent, name)
+        .is_some_and(|key| key.path == resolved.node.path)
+    {
+        return Ok(());
+    }
+    let parsed = CanonicalPath::parse(resolved.canonical.as_str()).map_err(|_| invalid())?;
+    let list = parsed.segments().iter().rev().nth(1).ok_or_else(invalid)?;
+    let identity = list
+        .keys
+        .iter()
+        .find_map(|(name, identity)| {
+            opc_mgmt_path::declared_key(registry, parent, name)
+                .filter(|key| key.path == resolved.node.path)
+                .map(|_| *identity)
+        })
+        .ok_or_else(invalid)?;
+    if scalar_value(value_json)?.ok_or_else(invalid)? != identity {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn scalar_value(value_json: &str) -> Result<Option<String>, BindingError> {
+    match serde_json::from_str(value_json).map_err(|_| invalid())? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(raw) => Ok(Some(raw)),
+        serde_json::Value::Bool(raw) => Ok(Some(raw.to_string())),
+        serde_json::Value::Number(raw) => Ok(Some(raw.to_string())),
+        _ => Err(invalid()),
+    }
 }
 
 pub(super) fn operational_nodes(
@@ -25,13 +69,10 @@ pub(super) fn operational_nodes(
         if resolved.node.config || resolved.node.kind != NodeKind::Leaf {
             return Err(invalid());
         }
+        validate_key_payload(registry, &resolved, value.value_json())?;
         let parsed = CanonicalPath::parse(value.path().as_str()).map_err(|_| invalid())?;
-        let raw = match serde_json::from_str(value.value_json()).map_err(|_| invalid())? {
-            serde_json::Value::Null => continue,
-            serde_json::Value::String(raw) => raw,
-            serde_json::Value::Bool(raw) => raw.to_string(),
-            serde_json::Value::Number(raw) => raw.to_string(),
-            _ => return Err(invalid()),
+        let Some(raw) = scalar_value(value.value_json())? else {
+            continue;
         };
         let mut ancestors = Vec::new();
         let mut schema = String::new();
@@ -52,9 +93,6 @@ pub(super) fn operational_nodes(
             for (name, identity) in &segment.keys {
                 let key =
                     opc_mgmt_path::declared_key(registry, ancestor, name).ok_or_else(invalid)?;
-                if key.path == resolved.node.path && raw != *identity {
-                    return Err(invalid());
-                }
                 keys.push(NetconfDataNode::leaf(
                     key.path,
                     (*identity).to_string(),
