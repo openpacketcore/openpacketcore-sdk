@@ -89,6 +89,14 @@ pub(crate) fn prepare_read_filter(
             {
                 return Err(FilterError::UnsupportedXPath);
             }
+            // Matching compares the stored value. A key whose data class forbids
+            // cleartext is rendered masked; an equality test would disclose it.
+            if !registry
+                .data_class(key_path)
+                .is_some_and(|class| class.allows_cleartext())
+            {
+                return Err(FilterError::UnsupportedXPath);
+            }
             predicates.push(NetconfKeyPredicate {
                 list_path,
                 key_path,

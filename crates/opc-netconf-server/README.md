@@ -66,6 +66,7 @@ Composite and ancestor predicates restrict instances after authorization.
 Expressions, non-key predicates, unions with predicates, wildcard predicates
 and opaque operational instance filtering remain unsupported. Existing schema
 selection and structural subtree filters retain their behavior.
+Predicates on keys whose data class forbids cleartext (security-secret, lawful-intercept or a secret-like name) are refused with `operation-not-supported` before authorization or data access.
 
 Custom bindings must honor both `ReadSelection::schema_paths()` and
 `ReadSelection::predicates()`. They must explicitly implement

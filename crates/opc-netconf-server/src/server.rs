@@ -25,6 +25,7 @@ use opc_mgmt_audit::{
 };
 use opc_mgmt_authz::{
     AuthzError, ConfigWriteAuthorizer, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer,
+    ReadNode,
 };
 use opc_mgmt_errors::{
     commit_error_to_netconf, commit_error_to_netconf_app_tag, NetconfError, NetconfErrorTag,
@@ -6605,23 +6606,27 @@ where
             return None;
         }
 
-        let decisions =
-            match self
-                .authz
-                .authorize(principal, ReadAction::Subscribe, &candidate_paths)
-            {
-                Ok(decisions) => decisions,
-                Err(_) => {
-                    record_notification(
-                        NETCONF_NOTIFICATION_STREAM,
-                        NetconfNotificationOutcome::Failure,
-                    );
-                    return None;
-                }
-            };
+        let selection = match self.authz.authorize_selection(
+            principal,
+            ReadAction::Subscribe,
+            &candidate_paths
+                .iter()
+                .map(|path| ReadNode::projected(path))
+                .collect::<Vec<_>>(),
+            &Default::default(),
+        ) {
+            Ok(selection) => selection,
+            Err(_) => {
+                record_notification(
+                    NETCONF_NOTIFICATION_STREAM,
+                    NetconfNotificationOutcome::Failure,
+                );
+                return None;
+            }
+        };
         let allowed_paths = candidate_paths
             .iter()
-            .zip(decisions.iter())
+            .zip(selection.decisions.iter())
             .filter_map(|(path, decision)| decision.allowed.then_some(*path))
             .collect::<Vec<_>>();
         if allowed_paths.is_empty() {
