@@ -30,7 +30,8 @@ pub(super) fn explicit_leaf_value(node: &SchemaNode, value: TokenStream) -> Toke
     }
 }
 
-/// Copies scalar keys in state-list models and clones keys that own data.
+/// Copies scalar keys in expanded and state-list models, including Copy
+/// sensitive wrappers, and clones keys that own data.
 /// Other models retain their established emitted bytes.
 pub(super) fn cloned_key_value(
     node: &SchemaNode,
@@ -38,7 +39,7 @@ pub(super) fn cloned_key_value(
     value: TokenStream,
     has_state_lists: bool,
 ) -> TokenStream {
-    if has_state_lists && is_copy_type(node, nodes_by_path) {
+    if (has_state_lists || nodes_by_path.expanded_profile) && is_copy_type(node, nodes_by_path) {
         value
     } else {
         quote! { #value.clone() }

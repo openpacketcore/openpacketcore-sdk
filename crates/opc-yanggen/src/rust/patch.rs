@@ -949,11 +949,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 };
                                 let key_bracket_construction_prev =
                                     key_bracket_construction.clone();
-                                let previous_keys = if has_state_lists {
-                                    quote! { k in previous.#field_ident.keys() }
-                                } else {
-                                    quote! { (k, _) in &previous.#field_ident }
-                                };
+                                let previous_keys =
+                                    if has_state_lists || nodes_by_path.expanded_profile {
+                                        quote! { k in previous.#field_ident.keys() }
+                                    } else {
+                                        quote! { (k, _) in &previous.#field_ident }
+                                    };
 
                                 let keyed_diff = quote! {
                                     let list_path = format!("{}/{}", _path_prefix, #child_segment_str);
