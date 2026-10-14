@@ -177,6 +177,9 @@ impl<P: PolicySource> ReadAuthorizer<'_, P> {
                 requirement.paths.insert(node.path);
                 requirement.add_keys(registry, node.path, request.opaque);
                 if request.opaque {
+                    if !node.data_class.allows_cleartext() {
+                        requirement.valid = false;
+                    }
                     for descendant in registry
                         .nodes()
                         .iter()
@@ -184,6 +187,9 @@ impl<P: PolicySource> ReadAuthorizer<'_, P> {
                     {
                         requirement.paths.insert(descendant.path);
                         requirement.add_keys(registry, descendant.path, true);
+                        if !descendant.data_class.allows_cleartext() {
+                            requirement.valid = false;
+                        }
                     }
                 }
                 requirement
