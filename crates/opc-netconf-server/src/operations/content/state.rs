@@ -357,17 +357,27 @@ fn requested_instance(
     identity: &[InstanceKey],
     budget: &SubtreeBudget,
 ) -> Result<bool, SubtreeError> {
-    budget.charge(selectors.len())?;
+    let sizing = Reservation::measure(budget, "provider selector sizing", || {
+        budget.charge(selectors.len())
+    })?;
     let mut work = selectors.len();
     for selector in selectors {
+        sizing.visit();
         add_work(&mut work, selector.schema_path.len())?;
         add_work(&mut work, path.len())?;
-        budget.charge(selector.keys.len())?;
+        let keys = Reservation::measure(budget, "provider selector key sizing", || {
+            budget.charge(selector.keys.len())
+        })?;
         add_work(&mut work, selector.keys.len())?;
         for (key, expected) in &selector.keys {
-            budget.charge(identity.len())?;
+            keys.visit();
+            let identities =
+                Reservation::measure(budget, "provider selector identity sizing", || {
+                    budget.charge(identity.len())
+                })?;
             add_work(&mut work, identity.len())?;
             for actual in identity {
+                identities.visit();
                 add_work(&mut work, key.len())?;
                 add_work(&mut work, actual.path.len())?;
                 add_work(&mut work, expected.len())?;
@@ -378,13 +388,19 @@ fn requested_instance(
     // Selector constraints themselves are schema-approved cleartext. Captured
     // tuples can also contain masked components; reserve the whole product
     // before any path, component or selector comparison can stop the search.
-    budget.charge(work)?;
+    let matching = Reservation::measure(budget, "provider selector correlation", || {
+        budget.charge(work)
+    })?;
     Ok(selectors.iter().any(|selector| {
-        selector.schema_path == path
+        matching.visit();
+        matching.text_cmp(selector.schema_path, path).is_eq()
             && selector.keys.iter().all(|(key, expected)| {
-                identity
-                    .iter()
-                    .any(|actual| *key == actual.path && *expected == actual.captured)
+                matching.visit();
+                identity.iter().any(|actual| {
+                    matching.visit();
+                    matching.text_cmp(key, actual.path).is_eq()
+                        && matching.text_cmp(expected, &actual.captured).is_eq()
+                })
             })
     }))
 }
@@ -654,6 +670,47 @@ fn instance(
 mod index_tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn selector_correlation_observes_cleartext_work_and_its_admission() {
+        // Removing any selector sizing or matching charge must fail an audit.
+        // Two 17-byte paths and one 512-byte value make three full comparisons.
+        let path = "/m:peer/m:enabled";
+        let key = "/m:peer/m:keyname";
+        assert_eq!((path.len(), key.len()), (17, 17));
+        let value = "v".repeat(512);
+        let selectors = [NetconfInstanceSelector {
+            schema_path: path,
+            keys: vec![(key, value.clone())],
+        }];
+        let identity = [InstanceKey {
+            path: key,
+            raw: value.clone(),
+            captured: value,
+            masked: false,
+        }];
+        let budget = SubtreeBudget::new(4096, 0).unwrap();
+        audit::take_audits();
+        assert!(requested_instance(&selectors, path, &identity, &budget).unwrap());
+        let audits = audit::take_audits();
+        for phase in [
+            "provider selector sizing",
+            "provider selector key sizing",
+            "provider selector identity sizing",
+            "provider selector correlation",
+        ] {
+            let observed = audits.iter().find(|audit| audit.phase == phase).unwrap();
+            assert!(observed.actual() > 0, "{observed:?}");
+            assert!(observed.actual() <= observed.admitted, "{observed:?}");
+        }
+        let matching = audits
+            .iter()
+            .find(|audit| audit.phase == "provider selector correlation")
+            .unwrap();
+        assert_eq!(matching.bytes, 546);
+        assert_eq!(matching.visits, 3);
+        assert_eq!(4096 - budget.remaining(), 1098);
+    }
 
     #[test]
     fn provider_phases_count_work_at_capacity_and_preserve_order() {

@@ -57,12 +57,22 @@ impl Reservation {
         units: usize,
         _phase: &'static str,
     ) -> Result<Self, SubtreeError> {
-        budget.charge(units)?;
+        Self::measure(budget, _phase, || budget.charge(units))
+    }
+
+    pub(super) fn measure(
+        _budget: &SubtreeBudget,
+        _phase: &'static str,
+        charge: impl FnOnce() -> Result<(), SubtreeError>,
+    ) -> Result<Self, SubtreeError> {
+        #[cfg(test)]
+        let remaining = _budget.remaining();
+        charge()?;
         Ok(Self {
             #[cfg(test)]
             audit: std::cell::Cell::new(Audit {
                 phase: _phase,
-                admitted: units,
+                admitted: remaining - _budget.remaining(),
                 ..Audit::default()
             }),
         })
