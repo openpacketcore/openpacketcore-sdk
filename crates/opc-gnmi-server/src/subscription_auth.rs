@@ -27,6 +27,12 @@ struct State {
     initial: Option<(u64, ResolvedPolicy)>,
 }
 
+enum RecordOutcome {
+    Recorded,
+    RevisionMoved,
+    Revoked,
+}
+
 impl std::fmt::Debug for StreamAuthorization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamAuthorization")
@@ -88,65 +94,89 @@ impl StreamAuthorization {
         &self,
         requested: &[ReadNode<'_>],
     ) -> Result<AuthorizedReadSelection, GnmiError> {
-        let revision = self.gate.revision().map_err(|_| authorization_failure())?;
-        let (previous, initial) = {
-            let mut state = self.state.lock().map_err(|_| authorization_failure())?;
-            (state.previously_permitted.clone(), state.initial.take())
-        };
-        let resolved = match initial {
-            Some((initial_revision, initial)) if revision == initial_revision => initial,
-            _ => self
-                .source
-                .active_policy_context_for_principal(&self.principal)
-                .map_err(|_| authorization_failure())?,
-        };
-        let selection = self.evaluate(&resolved, requested, &previous)?;
-        self.record(revision, &selection)?;
-        Ok(selection)
+        loop {
+            let revision = self.gate.revision().map_err(|_| authorization_failure())?;
+            let (previous, initial) = {
+                let mut state = self.state.lock().map_err(|_| authorization_failure())?;
+                (state.previously_permitted.clone(), state.initial.take())
+            };
+            let resolved = match initial {
+                Some((initial_revision, initial)) if revision == initial_revision => initial,
+                _ => self
+                    .source
+                    .active_policy_context_for_principal(&self.principal)
+                    .map_err(|_| authorization_failure())?,
+            };
+            let selection = self.evaluate(&resolved, requested, &previous)?;
+            match self.record(revision, &selection)? {
+                RecordOutcome::Recorded => return Ok(selection),
+                RecordOutcome::RevisionMoved => continue,
+                RecordOutcome::Revoked if self.gate.reevaluation_pending() == Ok(true) => {
+                    // The control notification owns revocation. Config events
+                    // cannot accelerate termination while delivery is pending.
+                    return Ok(AuthorizedReadSelection::default());
+                }
+                RecordOutcome::Revoked => {
+                    self.gate.terminate();
+                    return Err(authorization_failure());
+                }
+            }
+        }
     }
 
     /// Hidden events make one authorization decision, then stop. In particular,
     /// a denied event does not examine revocation state or perform audit work.
     pub(crate) fn event(&self, node: &'static str) -> Result<bool, GnmiError> {
-        let revision = self.gate.revision().map_err(|_| authorization_failure())?;
-        let previous = self
-            .state
-            .lock()
-            .map_err(|_| authorization_failure())?
-            .previously_permitted
-            .clone();
         let mut requested = self.requested.clone();
         requested.push(ReadNode::operational(node));
-        let resolved = match self
-            .source
-            .active_policy_context_for_principal(&self.principal)
-        {
-            Ok(resolved) => resolved,
-            Err(_) if self.gate.reevaluation_pending().unwrap_or(false) => {
-                // Output is already gated by the activated revision. Its
-                // independent control notification owns refresh failure and
-                // termination; an unprovably authorized event is only dropped.
+        loop {
+            let revision = self.gate.revision().map_err(|_| authorization_failure())?;
+            let previous = self
+                .state
+                .lock()
+                .map_err(|_| authorization_failure())?
+                .previously_permitted
+                .clone();
+            let resolved = match self
+                .source
+                .active_policy_context_for_principal(&self.principal)
+            {
+                Ok(resolved) => resolved,
+                Err(_) if self.gate.reevaluation_pending().unwrap_or(false) => {
+                    // Output is already gated by the activated revision. Its
+                    // independent control notification owns refresh failure and
+                    // termination; an unprovably authorized event is only dropped.
+                    return Ok(false);
+                }
+                Err(_) => return Err(authorization_failure()),
+            };
+            let authz = ReadAuthorizer::new(self.registry, self.source.as_ref())
+                .map_err(|_| authorization_failure())?;
+            let selection = authz.authorize_selection_resolved(
+                &resolved,
+                ReadAction::Subscribe,
+                &requested,
+                &previous,
+            );
+            if selection
+                .decisions
+                .last()
+                .is_none_or(|decision| !decision.allowed)
+            {
                 return Ok(false);
             }
-            Err(_) => return Err(authorization_failure()),
-        };
-        let authz = ReadAuthorizer::new(self.registry, self.source.as_ref())
-            .map_err(|_| authorization_failure())?;
-        let selection = authz.authorize_selection_resolved(
-            &resolved,
-            ReadAction::Subscribe,
-            &requested,
-            &previous,
-        );
-        if selection
-            .decisions
-            .last()
-            .is_none_or(|decision| !decision.allowed)
-        {
-            return Ok(false);
+            match self.record(revision, &selection)? {
+                RecordOutcome::Recorded => return Ok(true),
+                RecordOutcome::RevisionMoved => continue,
+                RecordOutcome::Revoked if self.gate.reevaluation_pending() == Ok(true) => {
+                    return Ok(false);
+                }
+                RecordOutcome::Revoked => {
+                    self.gate.terminate();
+                    return Err(authorization_failure());
+                }
+            }
         }
-        self.record(revision, &selection)?;
-        Ok(true)
     }
 
     /// One fresh context covers requested nodes, aggregate descendants, keys,
@@ -163,7 +193,10 @@ impl StreamAuthorization {
             .active_policy_context_for_principal(&self.principal)
             .map_err(|_| authorization_failure())?;
         let selection = self.evaluate(&resolved, &self.requested, &previous)?;
-        self.record(revision, &selection)
+        match self.record(revision, &selection)? {
+            RecordOutcome::Recorded => Ok(()),
+            RecordOutcome::RevisionMoved | RecordOutcome::Revoked => Err(authorization_failure()),
+        }
     }
 
     /// Prunes a provider subscription from the most recent complete batch. This
@@ -192,28 +225,32 @@ impl StreamAuthorization {
         )
     }
 
-    fn record(&self, revision: u64, selection: &AuthorizedReadSelection) -> Result<(), GnmiError> {
-        let result = self
-            .gate
-            .at_revision(revision, || {
-                let mut state = self.state.lock().map_err(|_| authorization_failure())?;
-                if !state
-                    .previously_permitted
-                    .is_subset(&selection.permitted_paths)
-                {
-                    return Err(authorization_failure());
-                }
-                state
-                    .previously_permitted
-                    .extend(selection.permitted_paths.iter().cloned());
-                state.allowed_requested = allowed_nodes(selection);
-                Ok(())
-            })
-            .map_err(|_| authorization_failure())?;
-        if result.is_err() {
-            self.gate.terminate();
+    fn record(
+        &self,
+        revision: u64,
+        selection: &AuthorizedReadSelection,
+    ) -> Result<RecordOutcome, GnmiError> {
+        match self.gate.at_revision(revision, || {
+            let mut state = self.state.lock().map_err(|_| authorization_failure())?;
+            if !state
+                .previously_permitted
+                .is_subset(&selection.permitted_paths)
+            {
+                return Ok(RecordOutcome::Revoked);
+            }
+            state
+                .previously_permitted
+                .extend(selection.permitted_paths.iter().cloned());
+            state.allowed_requested = allowed_nodes(selection);
+            Ok(RecordOutcome::Recorded)
+        }) {
+            Ok(result) => result,
+            Err(_) => {
+                // Distinguish a healthy activation race from a failed gate.
+                self.gate.revision().map_err(|_| authorization_failure())?;
+                Ok(RecordOutcome::RevisionMoved)
+            }
         }
-        result
     }
 }
 
