@@ -7,7 +7,11 @@ use crate::consensus::snapshot::{
 use crate::sqlite::consensus::tests::sequential_wal::IncomingSnapshot;
 use crate::sqlite::consensus::wal::{native::Opening, snapshot::InstallSource, Binding, Point};
 use crate::{SessionPersistenceMode, SnapshotIntegrityPolicy};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Mutex,
+};
+use std::time::Instant;
 
 const CHILD: &str = "OPC_NATIVE_PURGE_CRASH_CASE";
 const REPORT: &str = "OPC_NATIVE_PURGE_CRASH_REPORT";
@@ -25,6 +29,7 @@ struct Case {
     mode: SessionPersistenceMode,
     phase: Phase,
     point: Point,
+    hold_prior_capture: bool,
 }
 
 fn cases() -> Vec<Case> {
@@ -38,6 +43,7 @@ fn cases() -> Vec<Case> {
             mode: SessionPersistenceMode::Durable,
             phase: Phase::PurgeCut,
             point,
+            hold_prior_capture: false,
         });
     }
     for mode in [
@@ -74,10 +80,21 @@ fn cases() -> Vec<Case> {
                     // inline in its single writer, before the append hook.
                     continue;
                 }
-                cases.push(Case { mode, phase, point });
+                cases.push(Case {
+                    mode,
+                    phase,
+                    point,
+                    hold_prior_capture: false,
+                });
             }
         }
     }
+    cases.push(Case {
+        mode: SessionPersistenceMode::Async,
+        phase: Phase::Snapshot,
+        point: Point::BeforeBasisPublicationSync,
+        hold_prior_capture: true,
+    });
     cases
 }
 
@@ -140,11 +157,53 @@ fn snapshot(wal: &Wal) -> IncomingSnapshot {
     incoming
 }
 
+fn drain_async_fixture(wal: &Wal) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut publication = wal.async_persistence_progress();
+        let cut = wal.request_async_persistence().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                drop(publication.borrow_and_update());
+                let (state, failure, progress) = wal.storage_health();
+                assert_eq!(state, crate::consensus::SessionStorageState::Running);
+                assert!(failure.is_none());
+                let progress = progress.unwrap();
+                assert!(progress.background_failure.is_none());
+                if progress.completed_generation >= cut.0 && progress.completed_sequence >= cut.1 {
+                    break;
+                }
+                publication.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("fixture persistence cut completes before the crash hook is armed");
+    });
+}
+
 fn crash(case: Case) -> ! {
     let armed = Arc::new(AtomicBool::new(false));
     let hook_armed = Arc::clone(&armed);
+    let hold_prior_capture = Arc::new(AtomicBool::new(false));
+    let hook_hold_prior_capture = Arc::clone(&hold_prior_capture);
+    let (captured_tx, captured_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
     let control = IoControl {
         hook: Arc::new(move |point| {
+            if point == Point::BeforeNativeGenerationAppend
+                && hook_hold_prior_capture.swap(false, Ordering::SeqCst)
+            {
+                captured_tx.send(()).map_err(io::Error::other)?;
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+            }
             if point == case.point && hook_armed.load(Ordering::SeqCst) {
                 // Exit from the actual writer at the declared boundary. No
                 // WAL shutdown, destructor, or test-only checkpoint can run.
@@ -179,6 +238,10 @@ fn crash(case: Case) -> ! {
         fixture.wal.checkpoint().unwrap();
         let newer = snapshot(&fixture.wal);
         snapshots.push(SnapshotFile::capture(&newer));
+        if case.hold_prior_capture {
+            drain_async_fixture(&fixture.wal);
+            hold_prior_capture.store(true, Ordering::SeqCst);
+        }
         // A snapshot at the same applied cut still changes its selected
         // descriptor. This barrier gives Durable cleanup a covered WAL cut.
         fixture
@@ -187,6 +250,12 @@ fn crash(case: Case) -> ! {
             .unwrap()
             .wait()
             .unwrap();
+        if case.hold_prior_capture {
+            captured_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the primer barrier generation is captured before arming");
+            assert!(!fixture.wal.checkpoint_pending_for_test().unwrap());
+        }
         Some(newer)
     } else {
         None
@@ -205,22 +274,43 @@ fn crash(case: Case) -> ! {
         serde_json::to_vec(&report).unwrap(),
     )
     .unwrap();
-    armed.store(true, Ordering::SeqCst);
-    match case.phase {
-        Phase::PurgeCut | Phase::PurgeCheckpoint => {
-            fixture
-                .wal
-                .submit(Operation::Purge(log_id(4)))
-                .unwrap()
-                .wait()
-                .unwrap();
-            fixture.wal.checkpoint().unwrap();
+    std::thread::scope(|scope| {
+        if case.hold_prior_capture {
+            // Hold an earlier generation until the fixture either requests a
+            // drain or arms the hook while that generation is still in flight.
+            scope.spawn(|| {
+                let started = Instant::now();
+                while !armed.load(Ordering::SeqCst)
+                    && !fixture.wal.checkpoint_pending_for_test().unwrap()
+                {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                release_tx.send(()).unwrap();
+            });
         }
-        Phase::Snapshot => fixture
-            .wal
-            .native_publish_snapshot(newer.as_ref().unwrap().candidate.clone())
-            .unwrap(),
-    }
+        if case.mode == SessionPersistenceMode::Async {
+            // An admitted barrier can still have an earlier generation in
+            // flight. Drain it before attributing a hook to this operation.
+            drain_async_fixture(&fixture.wal);
+        }
+        armed.store(true, Ordering::SeqCst);
+        match case.phase {
+            Phase::PurgeCut | Phase::PurgeCheckpoint => {
+                fixture
+                    .wal
+                    .submit(Operation::Purge(log_id(4)))
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                fixture.wal.checkpoint().unwrap();
+            }
+            Phase::Snapshot => fixture
+                .wal
+                .native_publish_snapshot(newer.as_ref().unwrap().candidate.clone())
+                .unwrap(),
+        }
+    });
     panic!("crash hook did not run: {case:?}");
 }
 
