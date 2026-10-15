@@ -293,7 +293,7 @@
     },
     {
       "module": "consensus::store::sequential_wal_sdk_tests::native_log_bound",
-      "shard": "heavy-1",
+      "shard": "native-log-0",
       "tests": [
         "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens"
       ]
@@ -307,9 +307,15 @@
     },
     {
       "module": "consensus::storage::tests::native_log_retained_bound",
-      "shard": "heavy-1",
+      "shard": "native-log-1",
       "tests": [
-        "native_log_retained_bound_survives_snapshot_purge_and_restart",
+        "native_log_retained_bound_survives_snapshot_purge_and_restart"
+      ]
+    },
+    {
+      "module": "consensus::storage::tests::native_log_retained_bound",
+      "shard": "native-log-2",
+      "tests": [
         "native_log_retained_bound_survives_snapshot_purge_and_restart_async"
       ]
     }

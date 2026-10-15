@@ -12,3 +12,8 @@ TESTS = (
     "consensus::storage::tests::native_log_retained_bound::"
     "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
 )
+
+# One expensive proof per hosted runner. Keep these separate from the ordinary
+# matrices: their O1 compilation alone exceeded the old heavy/egress headroom.
+CORE_SHARDS = tuple(f"native-log-{index}" for index in range(len(TESTS)))
+EGRESS_SHARDS = tuple(range(4, 4 + len(TESTS)))

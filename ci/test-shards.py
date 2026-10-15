@@ -39,6 +39,7 @@ from pathlib import Path
 
 import realtime_qualification
 import cargo_test_selection
+import library_partition
 import native_log_bound
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -332,6 +333,7 @@ def shard_ids(plan: dict) -> list[str]:
     ids = ["misc", OPTIMIZED_QUIESCENT_SHARD]
     ids += [f"it-{i}" for i in range(int(plan["integration_shards"]))]
     ids += [f"heavy-{i}" for i in range(len(plan["heavy"]["shards"]))]
+    ids += list(native_log_bound.CORE_SHARDS)
     return ids
 
 
@@ -479,7 +481,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
             + ["--test", heavy["target"], "--", *HARNESS, "--exact", *skips],
         ]
 
-    if shard == OPTIMIZED_QUIESCENT_SHARD:
+    if shard == OPTIMIZED_QUIESCENT_SHARD or shard in native_log_bound.CORE_SHARDS:
         # The O1 snapshot/restart proofs retain their exact serial commands,
         # but compile once on their own runner. Keeping them behind misc's
         # broad lib/bin run exceeded that job's hard 60-minute budget before
@@ -533,6 +535,39 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     return [ordinary, *isolated, *extra]
 
 
+def hosted_commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
+    """Transfer misc's whole library phase to the required library runners.
+
+    `commands` remains the logical coverage plan. Both this support phase and
+    run_libraries derive from it, so an added lib command cannot be stranded.
+    """
+    return [command for command in commands(plan, shard, targets)
+            if shard != "misc" or "--lib" not in command]
+
+
+def run_libraries(plan: dict, shard: int, output: Path) -> None:
+    targets = integration_targets()
+    verify(plan, targets)
+    phase = [command for command in commands(plan, "misc", targets) if "--lib" in command]
+    print("Compile and inventory the complete workspace library selection", flush=True)
+    rows, metadata = library_partition.inventory(SELECTION, ROOT)
+    library_partition.validate_rows(rows, tuple(moved_lib_names(plan)))
+    planned = {index: library_partition.commands(phase, len(SERIAL_LIB_TESTS), rows, index)
+               for index in library_partition.SHARDS}
+    library_partition.verify(phase, len(SERIAL_LIB_TESTS), rows, planned, metadata)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({
+        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "tests": rows, "logical_library_phase": phase, "plans": planned,
+    }, indent=2) + "\n")
+    print(f"Exact library partition verified: {len(rows)} test identities; mapping: {output}", flush=True)
+    for index, command in enumerate(planned[shard]):
+        print(f"library shard {shard}: invocation {index + 1}/{len(planned[shard])}", flush=True)
+        result = subprocess.run(command, cwd=ROOT)
+        if result.returncode:
+            sys.exit(f"library shard {shard} invocation {index + 1}: exit {result.returncode}; see {output} for argv")
+
+
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
@@ -553,12 +588,33 @@ def verify_workflow(plan: dict) -> None:
     if not match:
         sys.exit(f"no `shard: [...]` matrix in the rust-tests job of {WORKFLOW}")
     declared = [item.strip() for item in match.group(1).split(",") if item.strip()]
-    expected = shard_ids(plan)
+    expected = [shard for shard in shard_ids(plan) if shard not in native_log_bound.CORE_SHARDS]
     if declared != expected:
         sys.exit(
             f"{WORKFLOW.name} runs shards {declared} but the plan defines "
             f"{expected}"
         )
+
+    native_job = text.split("\n  rust-native-log-proofs:", 1)
+    native_matrix = re.search(r"^\s*shard:\s*\[([^\]]*)\]", native_job[1], re.M) if len(native_job) == 2 else None
+    if native_matrix is None or [item.strip() for item in native_matrix.group(1).split(",")] != list(native_log_bound.CORE_SHARDS):
+        sys.exit("the dedicated native log proof matrix must run each full-bound shard")
+
+    # Bind the logical library transfer to actual required hosted invocations.
+    job_parts = re.split(r"^  ([a-z][a-z0-9-]+):\n", text.split("\njobs:\n", 1)[1], flags=re.M)
+    jobs = dict(zip(job_parts[1::2], job_parts[2::2]))
+    for operation in ("precheck", "plan"):
+        if f"test-shards.py {operation} --shard '${{{{ matrix.shard }}}}'" not in jobs.get("rust-native-log-proofs", ""):
+            sys.exit("native log proof runners must precheck and execute their exact shard")
+    library_job = jobs.get("rust-libraries", "")
+    library_matrix = re.search(r"^\s*shard:\s*\[([^\]]*)\]", library_job, re.M)
+    if library_matrix is None or [int(item.strip()) for item in library_matrix.group(1).split(",")] != list(library_partition.SHARDS):
+        sys.exit("the dedicated library matrix must cover every library shard")
+    if "test-shards.py run-libraries --shard '${{ matrix.shard }}'" not in library_job:
+        sys.exit("the dedicated library runners must execute their exact partition")
+    for operation in ("precheck", "plan"):
+        if f"test-shards.py {operation} --shard '${{{{ matrix.shard }}}}' --split-libraries" not in jobs["rust-tests"]:
+            sys.exit("ordinary hosted shards must transfer misc's library phase")
 
     lanes = set(re.findall(r"^  (rust-[a-z0-9-]+):$", text, re.M))
     aggregator = text.split("\n  rust:\n", 1)
@@ -731,7 +787,8 @@ def verify_lib_plan(plan: dict) -> None:
     """Keep exact library filters disjoint and timing profiles unchanged."""
     if len(SERIAL_LIB_TESTS) != len(set(SERIAL_LIB_TESTS)):
         sys.exit("serial library tests are duplicated")
-    ordinary_shards = set(shard_ids(plan)) - {"misc", OPTIMIZED_QUIESCENT_SHARD}
+    group_shards = set(shard_ids(plan)) - {"misc", OPTIMIZED_QUIESCENT_SHARD}
+    ordinary_shards = group_shards - set(native_log_bound.CORE_SHARDS)
     overrides = plan.get("quiescent_lib_shards", {})
     for name, shard in overrides.items():
         if name not in QUIESCENT_LIB_TESTS or name in OPTIMIZED_QUIESCENT_LIB_TESTS:
@@ -744,7 +801,7 @@ def verify_lib_plan(plan: dict) -> None:
     claimed.update(SERIAL_LIB_TESTS)
     rust_path = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*")
     for group in plan.get("lib_groups", []):
-        if group["shard"] not in ordinary_shards:
+        if group["shard"] not in group_shards:
             sys.exit(f"invalid library-group shard: {group['shard']!r}")
         if not group["tests"]:
             sys.exit("library groups must name at least one test")
@@ -754,8 +811,10 @@ def verify_lib_plan(plan: dict) -> None:
             sys.exit("library groups require module-qualified Rust test names")
         names = lib_group_names(group)
         if any(name in native_log_bound.TESTS for name in names):
-            if group["shard"] != "heavy-1" or not set(names).issubset(native_log_bound.TESTS):
-                sys.exit("full native log proofs must remain separate heavy-1 groups")
+            if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.TESTS.index(names[0])]:
+                sys.exit("full native log proofs must each own one dedicated parallel shard")
+        elif group["shard"] in native_log_bound.CORE_SHARDS:
+            sys.exit("dedicated native log proof shards cannot carry ordinary tests")
         for name in lib_group_names(group):
             if name in claimed:
                 sys.exit(f"library test is claimed more than once: {name!r}")
@@ -877,7 +936,7 @@ def verify_serial_lib_tests() -> None:
     print(f"serial library tests resolve exactly once and remain enabled: {len(SERIAL_LIB_TESTS)}")
 
 
-def precheck(plan: dict, shard: str) -> None:
+def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
     """Fail a heavy shard whose named tests no longer resolve.
 
     libtest exits 0 when a filter matches nothing, so a renamed test would
@@ -895,7 +954,8 @@ def precheck(plan: dict, shard: str) -> None:
         # Run before the suite: a stale exclusion must fail even if another
         # required test would stop the shard before its final partition audit.
         verify_heavy(plan)
-        verify_serial_lib_tests()
+        if not split_libraries:
+            verify_serial_lib_tests()
     groups = [group for group in plan.get("lib_groups", []) if group["shard"] == shard]
     if groups:
         # Resolve each profile independently. Keep multisets: a duplicate
@@ -907,6 +967,7 @@ def precheck(plan: dict, shard: str) -> None:
             by_profile.setdefault(prefix, []).extend(lib_group_names(group))
         for prefix, names in by_profile.items():
             command = [*prefix, "--", "--list", "--exact", *names]
+            print(f"{shard}: compile/list {len(names)} library test(s) with {'O1' if 'CARGO_PROFILE_TEST_OPT_LEVEL=1' in prefix else 'ordinary'} profile", flush=True)
             output = subprocess.run(
                 command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
             ).stdout
@@ -929,7 +990,7 @@ def precheck(plan: dict, shard: str) -> None:
                 if any(line.endswith(": test") for line in output.splitlines()):
                     sys.exit("full native log proofs must remain enabled in their execution profile")
         print(f"{shard} library groups resolve exactly once: {sum(map(len, by_profile.values()))} tests")
-    isolated_lib_tests = quiescent_lib_tests_for_shard(shard, plan)
+    isolated_lib_tests = () if shard == "misc" and split_libraries else quiescent_lib_tests_for_shard(shard, plan)
     if isolated_lib_tests:
         for name in isolated_lib_tests:
             qualified = qualified_quiescent_lib_test(name)
@@ -1036,10 +1097,15 @@ def main() -> None:
     sub.add_parser("ids")
     plan_cmd = sub.add_parser("plan")
     plan_cmd.add_argument("--shard", required=True)
+    plan_cmd.add_argument("--split-libraries", action="store_true")
     sub.add_parser("verify")
     sub.add_parser("verify-heavy")
     precheck_cmd = sub.add_parser("precheck")
     precheck_cmd.add_argument("--shard", required=True)
+    precheck_cmd.add_argument("--split-libraries", action="store_true")
+    libraries = sub.add_parser("run-libraries")
+    libraries.add_argument("--shard", type=int, choices=library_partition.SHARDS, required=True)
+    libraries.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     plan = load_plan()
@@ -1053,7 +1119,11 @@ def main() -> None:
         return
 
     if args.command == "precheck":
-        precheck(plan, args.shard)
+        precheck(plan, args.shard, split_libraries=args.split_libraries)
+        return
+
+    if args.command == "run-libraries":
+        run_libraries(plan, args.shard, args.output)
         return
 
     targets = integration_targets()
@@ -1062,7 +1132,8 @@ def main() -> None:
         verify(plan, targets)
         return
 
-    for command in commands(plan, args.shard, targets):
+    selected_commands = hosted_commands if args.split_libraries else commands
+    for command in selected_commands(plan, args.shard, targets):
         print(shlex.join(command))
 
 

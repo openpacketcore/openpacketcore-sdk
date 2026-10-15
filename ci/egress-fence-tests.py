@@ -16,7 +16,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 import sys
 
@@ -33,8 +32,8 @@ SELECTION = ["--locked", *[arg for name in PACKAGES for arg in ("-p", name)],
              "--all-features"]
 ORDINARY_SHARDS = (0, 1, 2)
 PROOF_SHARD = 3
-SHARDS = (*ORDINARY_SHARDS, PROOF_SHARD)
-REQUIRED_JOBS = ("sources", "oracles", "installer", "host-tests", "host-proofs")
+SHARDS = (*ORDINARY_SHARDS, PROOF_SHARD, *native_log_bound.EGRESS_SHARDS)
+REQUIRED_JOBS = ("sources", "oracles", "installer", "host-tests", "host-proofs", "host-native-log-proofs")
 ISOLATED_LIB = (
     "consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement",
     "consensus::raft_adapter::tests::raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family",
@@ -71,6 +70,8 @@ def owner(name: str) -> int:
         return 1
     if name in SPECIAL:
         return PROOF_SHARD
+    if name in native_log_bound.TESTS:
+        return native_log_bound.EGRESS_SHARDS[native_log_bound.TESTS.index(name)]
     return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % len(ORDINARY_SHARDS)
 
 
@@ -194,8 +195,8 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
             "cargo", "test", *SELECTION, "--quiet", "--tests", "--", "--test-threads=4",
             "--exact", *[arg for name in skipped for arg in ("--skip", name)],
         ]})
-        commands.extend(native_log_bound_command(name) for name in native_log_bound.TESTS
-                        if owner(name) == shard)
+    if shard in native_log_bound.EGRESS_SHARDS:
+        commands.append(native_log_bound_command(native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(shard)]))
     if shard == PROOF_SHARD:
         for name in (*ISOLATED_INTEGRATION, *ISOLATED_LIB):
             target = ["--test", "consensus_openraft"] if name in ISOLATED_INTEGRATION else ["--lib"]
@@ -236,12 +237,10 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
     if isolated != expected:
         raise ValueError("serial library tests must each run exactly once, first on shard 1")
     native_locations = {}
-    for shard in ORDINARY_SHARDS:
-        names = [name for name in native_log_bound.TESTS if owner(name) == shard]
-        start = (len(SERIAL_LIB_TESTS) if shard == 1 else 0) + 1
-        if planned[shard][start:start + len(names)] != [native_log_bound_command(name) for name in names]:
-            raise ValueError("full native log proofs must run separately at O1 on their original shards")
-        native_locations.update({name: (shard, start + index) for index, name in enumerate(names)})
+    for shard, name in zip(native_log_bound.EGRESS_SHARDS, native_log_bound.TESTS):
+        if planned[shard] != [native_log_bound_command(name)]:
+            raise ValueError("each full native log proof must run alone at O1 on its dedicated shard")
+        native_locations[name] = (shard, 0)
     metadata = cargo_test_selection.workspace_metadata(ROOT)
     resolved = {
         (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
@@ -295,6 +294,21 @@ def main() -> int:
         return 0
     if args.output is None or (not args.inventory_only and args.shard is None):
         parser.error("--output and either --shard or --inventory-only are required")
+    if not args.inventory_only and args.shard in native_log_bound.EGRESS_SHARDS:
+        # These runners need only O1. The ordinary runners still inventory all
+        # names and verify their ownership, while this live O1 precheck rejects
+        # a missing, ignored or ambiguous proof before it can pass as a no-op.
+        name = native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(args.shard)]
+        commands = [native_log_bound_command(name)]
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({
+            "head": capture(["git", "rev-parse", "HEAD"]).strip(),
+            "plans": {str(args.shard): commands},
+        }, indent=2) + "\n")
+        print("Precheck O1 full native log proof:", name, flush=True)
+        precheck_native_log_bound(commands)
+        run_commands(commands)
+        return 0
     rows = inventory()
     plan = {str(shard): plans(rows, shard) for shard in SHARDS}
     verify_plans({int(shard): commands for shard, commands in plan.items()})
@@ -307,10 +321,18 @@ def main() -> int:
     print("Exact test-name partition:", dict(sorted(Counter(r["shard"] for r in rows).items())), flush=True)
     if not args.inventory_only:
         precheck_native_log_bound(plan[str(args.shard)])
-        for command in plan[str(args.shard)]:
-            print("egress-fence:", command["name"], shlex.join(command["argv"]), flush=True)
-            subprocess.run(command["argv"], cwd=ROOT, env=dict(os.environ, **command["env"]), check=True)
+        run_commands(plan[str(args.shard)])
     return 0
+
+
+def run_commands(commands: list[dict]) -> None:
+    for command in commands:
+        # Exact argv is retained in the mapping artifact. Printing hundreds of
+        # kilobytes of exclusions as one line truncated `gh run view --log`.
+        print("egress-fence:", command["name"], flush=True)
+        result = subprocess.run(command["argv"], cwd=ROOT, env=dict(os.environ, **command["env"]))
+        if result.returncode:
+            raise ValueError(f"{command['name']}: exit {result.returncode}; see the test mapping for exact argv")
 
 
 if __name__ == "__main__":

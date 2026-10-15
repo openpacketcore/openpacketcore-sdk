@@ -124,12 +124,15 @@ retains its ordinary test profile.
 
 The three full-bound native log reclamation proofs also use
 `CARGO_PROFILE_TEST_OPT_LEVEL=1`, with debug assertions and overflow checks
-enabled. The core plan keeps them on `heavy-1`; the egress plan keeps their
-original test-name shards and runs them separately from the ordinary tests.
+enabled. Each proof has a dedicated parallel core shard (`native-log-0` through
+`native-log-2`) and egress shard (`4` through `6`).
 Both plans preserve their package and feature selection and precheck the exact
 enabled names in the execution profile. The default three-cycle regressions
 retain the ordinary test profile. All entry counts, persistence operations,
-assertions, and job limits remain unchanged.
+assertions, test deadlines and existing job limits remain unchanged. The new
+core proof jobs have 90-minute budgets and the new egress proof jobs have
+75-minute budgets, including compilation. See the [CI layout](ci/README.md) for
+the hosted sizing evidence and the ordinary library partition.
 
 The separate **Rust GTP-U unsupported-platform cfg** job in
 [ci.yml](.github/workflows/ci.yml) runs on Linux with

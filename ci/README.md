@@ -6,25 +6,50 @@ shards in [ci.yml](../.github/workflows/ci.yml). Use
 to reproduce the shards with the profile and disk setup in
 [CONTRIBUTING](../CONTRIBUTING.md#validation-gates).
 
+The hosted `misc` runner uses `plan --shard misc --split-libraries` for binary
+unit tests, example compilation, doctests and the heavy-target remainder. Its
+library phase runs on two required `Rust library tests` runners, with the same
+workspace package selection, features, ordinary profile and four test threads.
+Each runner compiles/lists every library and verifies that its compiled targets
+match Cargo metadata. Exact-name exclusions partition the live inventory using
+the first eight SHA-256 bytes modulo two. Duplicate names in different libraries
+share an owner; new tests are assigned automatically. The uploaded mapping
+records the revision, identities, ignored status and exact commands. The logical
+`plan --shard misc` remains available to reproduce the complete unsplit phase.
+
 The scope-payload decode regression and the three-large-child observation refusal
-test each run in a fresh serial process first on `misc` and egress shard `1`,
-followed by each runner's parallel suite. Exact exclusions prevent duplicate
-execution. Live inventories reject a missing, ignored or ambiguous test, and
-command-plan checks preserve each serial position, package selection, features
-and profile. The tests retain their four Tokio workers, all assertions and the
-existing ten-second bounds. Successful runs print each measured write's elapsed
-time and decode/audit counts for hosted validation.
+test each run in a fresh serial process first on library shard `0` and egress
+shard `1`, followed by that runner's parallel suite. Exact exclusions prevent
+duplicate execution. Live inventories reject missing, ignored or ambiguous names.
+The tests retain their four Tokio workers, all assertions and ten-second bounds.
+Successful runs print elapsed time and decode/audit counts for hosted validation.
 
 The full-bound native log reclamation proofs listed in
-[`native_log_bound.py`](native_log_bound.py) retain their million-entry inputs
-and run at test O1 with debug assertions and overflow checks enabled. They stay
-on core `heavy-1` and their original egress shards. Each egress proof runs in its
-own serial process after the ordinary suite; core runs the two follower modes
-serially in one group and the leader in another. This keeps their CPU and disk
-work out of unrelated test runtimes. Live prechecks resolve the exact enabled
-names using the execution profile. Package selection, feature unification,
-default three-cycle coverage and job limits are preserved. The leader emits
-proposal progress and reopen phase timings under `--nocapture`.
+[`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
+
+| Proof | Core shard | Egress shard |
+| --- | --- | --- |
+| Leader idempotent request and reopen | `native-log-0` | `4` |
+| Durable snapshot, purge and restart | `native-log-1` | `5` |
+| Async snapshot, purge and restart | `native-log-2` | `6` |
+
+Each runs in its own serial test process at test O1, with debug assertions and
+overflow checks enabled, preserving the original package/feature selection.
+Live prechecks resolve the exact enabled name in that profile. All million-entry
+inputs, persistence operations and assertions remain intact; the default
+three-cycle regressions stay in the ordinary library partition.
+
+Core proof runners have a new 90-minute job budget; egress proof runners have
+75 minutes. These account for the hosted observations in
+[CI run 38771278536](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38771278536)
+and [egress run 38771278326](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38771278326):
+heavy-1 spent 38.3 minutes in its mixed ordinary/O1 precheck before testing, and
+the leader's measured proposal progress projects about 27 minutes for all inputs,
+before reopen. Egress's additional O1 precheck cost about 15 minutes per runner.
+These are sizing inputs, not completed timing qualifications. Existing job limits
+and every test deadline remain unchanged. The new required matrices compile only
+their proof profile; neither ordinary heavy-1 nor ordinary egress shards pay for
+that compilation. A hosted run must confirm the resulting margin.
 
 The required i686 matrix separates session-net library tests from executable
 unit tests, integration tests and doctests. The integration runner exercises the

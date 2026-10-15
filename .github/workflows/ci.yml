@@ -221,6 +221,7 @@ jobs:
       - name: Test test-shard manifest audit
         run: |
           python3 ci/test-test-shards.py
+          python3 ci/test-library-partition.py
           python3 ci/test-performance-tests.py
           python3 ci/test-realtime-qualification.py
           python3 -I ci/test-egress-fence-tests.py
@@ -280,7 +281,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep in step with `python3 ci/test-shards.py ids`; the rust-gates
+        # The planner also lists the separate native-log proof shards. Its
         # plan check fails the run if the plan itself stops covering
         # everything, and the aggregator below fails if a shard is dropped.
         shard: [misc, quiescent-o1, it-0, it-1, it-2, heavy-0, heavy-1]
@@ -324,12 +325,12 @@ jobs:
       # exits 0 when a filter matches nothing, so a rename would otherwise
       # leave a heavy shard green having run nothing.
       - name: Precheck shard selection
-        run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}'
+        run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}' --split-libraries
 
       - name: Run test shard
         run: |
           set -euo pipefail
-          python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
+          python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' --split-libraries > shard-commands.txt
           test -s shard-commands.txt
           # The command list is read on fd 3, and each command gets its own
           # stdin from /dev/null. Reading the list on stdin instead would let
@@ -349,6 +350,105 @@ jobs:
       - name: Verify heavy-target test partition
         if: matrix.shard == 'misc'
         run: python3 ci/test-shards.py verify-heavy
+
+  # Mixed O0/O1 precheck took 38 minutes on hosted heavy-1; leader progress
+  # projects another 27 minutes. One proof per runner, with a 90-minute job
+  # budget for compilation, reopen and host variance. Test deadlines are intact.
+  rust-native-log-proofs:
+    name: Rust full native log proof (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [native-log-0, native-log-1, native-log-2]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-native-log-${{ matrix.shard }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Precheck shard selection
+        run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}'
+
+      - name: Run test shard
+        run: |
+          set -euo pipefail
+          python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
+          test -s shard-commands.txt
+          while IFS= read -r command <&3; do
+            echo "::group::${command}"
+            if ! eval "${command}" < /dev/null; then
+              echo "::endgroup::"
+              echo "::error::shard '${{ matrix.shard }}' failed: ${command}"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done 3< shard-commands.txt
+
+
+  # Keep the 36-minute hosted store library off misc's serial critical path.
+  # Both runners preserve workspace feature unification and the O0 profile;
+  # exact names, including future tests, are distributed by a live inventory.
+  rust-libraries:
+    name: Rust library tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-libraries-${{ matrix.shard }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run exact library partition
+        run: |
+          python3 ci/test-shards.py run-libraries --shard '${{ matrix.shard }}' \
+            --output "${RUNNER_TEMP}/library-test-map.json"
+
+      - name: Archive the complete library mapping
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: library-test-map-${{ matrix.shard }}
+          overwrite: true
+          path: ${{ runner.temp }}/library-test-map.json
+          if-no-files-found: error
 
   rust-persist:
     name: Rust opc-persist contract
@@ -720,6 +820,8 @@ jobs:
       - rust-gates
       - rust-clippy
       - rust-tests
+      - rust-native-log-proofs
+      - rust-libraries
       - rust-persist
       - rust-gtpu-cfg
       - rust-sctp-privileged

@@ -4,6 +4,7 @@
 import copy
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import re
 import sys
@@ -216,21 +217,22 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
         return [row for row in fixture() if row["name"] not in self.NAMES] + [
             {"package": "opc-session-store", "target": "opc_session_store",
              "kind": ["lib"], "name": name, "ignored": False,
-             "shard": int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % 3}
+             "shard": FENCE.owner(name)}
             for name in self.NAMES
         ]
 
-    def test_full_native_bounds_run_once_after_ordinary_tests_on_their_original_shards(self):
+    def test_full_native_bounds_run_once_on_dedicated_parallel_shards(self):
         plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
         for name in self.NAMES:
-            owner = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % 3
+            owner = 4 + self.NAMES.index(name)
             selected = [(shard, index, command) for shard, commands in plans.items()
                         for index, command in enumerate(commands) if command["name"] == name]
             with self.subTest(name=name):
                 self.assertEqual(len(selected), 1)
                 shard, index, command = selected[0]
                 self.assertEqual(shard, owner)
-                self.assertGreater(index, plans[owner].index(ordinary(plans[owner])))
+                self.assertEqual(index, 0)
+                self.assertEqual(len(plans[owner]), 1)
                 self.assertEqual(command["env"], {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"})
                 self.assertEqual(command["argv"], [
                     "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
@@ -285,7 +287,7 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "test-map.json"
             with (
-                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "2", "--output", str(output)]),
+                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "4", "--output", str(output)]),
                 patch.object(FENCE, "inventory", return_value=self.rows()),
                 patch.object(FENCE, "capture", side_effect=lambda argv, **kwargs:
                              "f" * 40 if argv[0] == "git" else ""),
@@ -296,10 +298,41 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
             execute.assert_not_called()
             self.assertTrue(output.is_file())
 
+    def test_dedicated_native_entrypoint_builds_only_its_optimized_profile(self):
+        name = self.NAMES[0]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "mapping.json"
+            with (
+                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "4", "--output", str(output)]),
+                patch.object(FENCE, "inventory", side_effect=AssertionError("ordinary profile must not compile")),
+                patch.object(FENCE, "capture", side_effect=["f" * 40, f"{name}: test\n", ""]) as capture,
+                patch.object(FENCE, "run_commands") as execute,
+            ):
+                self.assertEqual(FENCE.main(), 0)
+            execute.assert_called_once_with([FENCE.native_log_bound_command(name)])
+            self.assertEqual(capture.call_count, 3)
+            self.assertTrue(all(call.kwargs["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] == "1"
+                                for call in capture.call_args_list[1:]))
+            self.assertTrue(output.is_file())
+
+    def test_ordinary_entrypoint_does_not_precompile_any_full_bound_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "mapping.json"
+            with (
+                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "2", "--output", str(output)]),
+                patch.object(FENCE, "inventory", return_value=self.rows()),
+                patch.object(FENCE, "capture", return_value="f" * 40) as capture,
+                patch.object(FENCE, "run_commands") as execute,
+            ):
+                self.assertEqual(FENCE.main(), 0)
+            capture.assert_called_once_with(["git", "rev-parse", "HEAD"])
+            self.assertTrue(all(command["env"] == {} for command in execute.call_args.args[0]))
+            self.assertFalse(any(command["name"] in self.NAMES for command in execute.call_args.args[0]))
+
     def test_full_native_plan_rejects_lost_duplicate_early_and_overlapping_execution(self):
         for name in self.NAMES:
             owner = FENCE.owner(name)
-            for mutation in ("missing", "duplicate", "early", "overlap", "threads", "profile"):
+            for mutation in ("missing", "duplicate", "ordinary-owner", "overlap", "threads", "profile"):
                 plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
                 command = next((command for command in plans[owner] if command["name"] == name), None)
                 self.assertIsNotNone(command)
@@ -307,9 +340,9 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
                     plans[owner].remove(command)
                 elif mutation == "duplicate":
                     plans[owner].append(copy.deepcopy(command))
-                elif mutation == "early":
+                elif mutation == "ordinary-owner":
                     plans[owner].remove(command)
-                    plans[owner].insert(0, command)
+                    plans[1].append(command)
                 elif mutation == "overlap":
                     duplicate = copy.deepcopy(command)
                     duplicate["name"] = "concealed-overlap"
@@ -414,7 +447,7 @@ class PartitionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 FENCE.verify(broken)
         with self.assertRaises(ValueError):
-            FENCE.plans(rows, 4)
+            FENCE.plans(rows, max(FENCE.SHARDS) + 1)
 
     def test_libtest_inventory_rejects_unrecognized_and_duplicate_output(self):
         self.assertEqual(FENCE.listing("alpha: test\nbeta: test\n\n2 tests, 0 benchmarks\n"), ["alpha", "beta"])
@@ -486,7 +519,9 @@ class WorkflowTests(unittest.TestCase):
                 for mapping in re.findall(r"workspaces: ([^\n]+)", jobs[name]):
                     workspace, target = mapping.split(" -> ")
                     self.assertFalse(Path(target).is_absolute())
-                    caches.add((FENCE.ROOT / workspace / target).resolve())
+                    # Compare configured paths, not this developer's physical
+                    # cache symlinks (which may point at a memory filesystem).
+                    caches.add(Path(os.path.abspath(FENCE.ROOT / workspace / target)))
                 builds = {FENCE.ROOT / relative for relative in re.findall(
                     r'export CARGO_TARGET_DIR="\$\{GITHUB_WORKSPACE\}/([^"\n]+)"', jobs[name])}
                 self.assertTrue(builds)
@@ -497,11 +532,24 @@ class WorkflowTests(unittest.TestCase):
         for name in ["host-tests", "host-proofs"]:
             self.assertNotIn("shared-key: egress-fence-host\n", jobs[name])
 
+    def test_cache_mapping_check_is_independent_of_local_cache_symlinks(self):
+        workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/egress-fence.yml").write_text(workflow)
+            (root / "target").mkdir()
+            cache = Path(directory) / "memory-cache"
+            cache.mkdir()
+            (root / "target/egress-fence-host").symlink_to(cache, target_is_directory=True)
+            with patch.object(FENCE, "ROOT", root):
+                self.test_cache_targets_match_each_jobs_actual_compilation_directories()
+
     def test_both_artifact_uploads_allow_reruns_to_replace_existing_artifacts(self):
         workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
         uploads = [step for step in workflow.split("      - name: ")
                    if "uses: actions/upload-artifact@" in step]
-        self.assertEqual(len(uploads), 2)
+        self.assertEqual(len(uploads), 3)
         for step in uploads:
             self.assertIn("          overwrite: true\n", step)
 
@@ -517,7 +565,7 @@ class WorkflowTests(unittest.TestCase):
         for name in FENCE.REQUIRED_JOBS:
             with self.subTest(job=name):
                 self.assertIn(condition, jobs[name])
-                self.assertIn("timeout-minutes: 45\n", jobs[name])
+                self.assertIn(f"timeout-minutes: {75 if name == 'host-native-log-proofs' else 45}\n", jobs[name])
                 self.assertRegex(jobs[name], r"needs: (changes|\[changes, sources\])\n")
                 self.assertIn("if: always()\n        run: bash ci/egress-fence-cleanup.sh", jobs[name])
         aggregate = jobs["root-cgroup-egress"]
@@ -533,6 +581,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("shard: [0, 1, 2]\n", host)
         self.assertIn("run: ci/setup-fsverity-tmp.sh\n", host)
         self.assertIn("--shard '${{ matrix.shard }}'", host)
+        native = jobs["host-native-log-proofs"]
+        self.assertIn("shard: [4, 5, 6]\n", native)
+        self.assertIn("fail-fast: false\n", native)
+        self.assertIn("run: ci/setup-fsverity-tmp.sh\n", native)
+        self.assertIn("--shard '${{ matrix.shard }}'", native)
         proofs = jobs["host-proofs"]
         self.assertIn("run: ci/setup-fsverity-tmp.sh\n", proofs)
         self.assertIn(f"--shard {FENCE.PROOF_SHARD} \\\n", proofs)
