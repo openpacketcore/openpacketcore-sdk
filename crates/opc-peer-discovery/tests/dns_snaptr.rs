@@ -2409,3 +2409,257 @@ async fn relay_only_realm_is_a_match_and_never_a_no_match_fallback_decision() {
         assert_eq!(response.result.unwrap().candidates().len(), 1);
     }
 }
+
+fn compatibility_query(transport: PeerTransport, protocol: &str) -> DnsQuery {
+    DnsQuery::new(ServiceDiscoveryInput::new(
+        PeerLabel::new("diameter-test").unwrap(),
+        DiscoveryTarget::new("realm.example."),
+        ServiceDiscoveryMode::Snaptr,
+        transport,
+        Some(3868),
+    ))
+    .unwrap()
+    .with_address_family(AddressFamilyPolicy::Ipv4Only)
+    .with_snaptr_filter(SnaptrFilter::new("aaa", protocol, SnaptrOrdering::Rfc3958).unwrap())
+    .unwrap()
+}
+
+#[tokio::test]
+async fn bare_aaa_follows_replacement_without_advertising_a_protocol() {
+    for (transport, protocol) in [
+        (PeerTransport::Sctp, "diameter.sctp"),
+        (PeerTransport::Tcp, "diameter.tcp"),
+    ] {
+        for flag in ["a", "s", ""] {
+            let dns = FakeDns::new(move |q| {
+                let (owner, kind, _) = question(q);
+                let (answers, additional) = match (owner.as_str(), kind) {
+                    ("realm.example.", 35) => (
+                        vec![naptr("realm.example.", 1, 0, flag, "AAA", "", CHILD, 7)],
+                        vec![],
+                    ),
+                    (CHILD, 35) => (vec![naptr(CHILD, 1, 0, "a", "aaa", "", HOST, 90)], vec![]),
+                    (CHILD, 33) => (
+                        vec![srv(CHILD, 10, 5, 7777, HOST, 90)],
+                        vec![address(HOST, "192.0.2.1", 90)],
+                    ),
+                    (CHILD | HOST, 1) => (vec![address(&owner, "192.0.2.1", 90)], vec![]),
+                    _ => panic!("unexpected question"),
+                };
+                Some(reply(q, 0, &answers, &[], &additional))
+            })
+            .await;
+            let q = compatibility_query(transport, protocol);
+            let response = DnsClient::new(config(dns.address))
+                .unwrap()
+                .resolve_with_seed(&q, now, 0)
+                .await;
+            assert_eq!(response.snaptr_root().unwrap().kind, SnaptrRootKind::Match);
+            let answer = response.result.unwrap();
+            assert_eq!(answer.candidates().len(), 1);
+            assert_eq!(answer.expires_at(), Some(time(8_000)));
+            let candidate = &answer.candidates()[0];
+            assert_eq!(candidate.peer().transport, transport);
+            assert_eq!(
+                candidate.peer().endpoint.port(),
+                if flag == "s" { 7777 } else { 3868 }
+            );
+            let path = &candidate.snaptr().unwrap().paths()[0];
+            assert_eq!(path.hops().len(), if flag.is_empty() { 2 } else { 1 });
+            for hop in path.hops() {
+                assert!(!hop.protocol_advertised());
+                assert!(hop.services().eq_ignore_ascii_case("aaa"));
+            }
+            assert_eq!(
+                answer.filter_snaptr_paths(|_| true).unwrap(),
+                Some(answer.clone())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn compatibility_refuses_extended_data_even_when_legacy_records_are_present() {
+    for extended in ["aaa+ap6:diameter.tcp", "aaa+ap5:diameter.sctp", "aaa+ap6"] {
+        for legacy in ["aaa", "aaa:diameter.sctp"] {
+            let dns = FakeDns::new(move |q| {
+                assert_eq!(question(q).1, 35);
+                Some(reply(
+                    q,
+                    0,
+                    &[
+                        naptr("realm.example.", 1, 0, "a", extended, "", HOST, 90),
+                        naptr("realm.example.", 2, 0, "a", legacy, "", OTHER, 90),
+                    ],
+                    &[],
+                    &[],
+                ))
+            })
+            .await;
+            let response = DnsClient::new(config(dns.address))
+                .unwrap()
+                .resolve_with_seed(
+                    &compatibility_query(PeerTransport::Sctp, "diameter.sctp"),
+                    now,
+                    0,
+                )
+                .await;
+            assert_eq!(
+                response.snaptr_root().unwrap().kind,
+                SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::ExtendedPresentNoMatch)
+            );
+            assert_eq!(
+                response.result,
+                Err(DnsError::Snaptr {
+                    reason: SnaptrFailure::NoMatchingService(SnaptrNoMatch::ExtendedPresentNoMatch),
+                    expires_at: Some(time(91_000)),
+                })
+            );
+            assert_eq!(dns.seen().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn compatibility_keeps_explicit_transport_matching_and_ignores_unrelated_grammar() {
+    let dns = FakeDns::new(|q| {
+        let (owner, kind, _) = question(q);
+        let answers = match (owner.as_str(), kind) {
+            ("realm.example.", 35) => vec![
+                naptr(
+                    "realm.example.",
+                    1,
+                    0,
+                    "a",
+                    "aaa:diameter.tcp",
+                    "",
+                    OTHER,
+                    90,
+                ),
+                naptr(
+                    "realm.example.",
+                    1,
+                    0,
+                    "u",
+                    "E2U+sip:!bad",
+                    "!regexp!",
+                    OTHER,
+                    90,
+                ),
+                naptr(
+                    "realm.example.",
+                    2,
+                    0,
+                    "a",
+                    "aaa:diameter.sctp",
+                    "",
+                    HOST,
+                    90,
+                ),
+            ],
+            (HOST, 1) => vec![address(HOST, "192.0.2.1", 90)],
+            _ => panic!("unexpected question"),
+        };
+        Some(reply(q, 0, &answers, &[], &[]))
+    })
+    .await;
+    let response = DnsClient::new(config(dns.address))
+        .unwrap()
+        .resolve_with_seed(
+            &compatibility_query(PeerTransport::Sctp, "diameter.sctp"),
+            now,
+            0,
+        )
+        .await;
+    let answer = response.result.unwrap();
+    assert_eq!(answer.candidates().len(), 1);
+    let hop = &answer.candidates()[0].snaptr().unwrap().paths()[0].hops()[0];
+    assert!(hop.protocol_advertised());
+    assert_eq!(hop.services(), "aaa:diameter.sctp");
+    assert_eq!(dns.seen().len(), 2);
+}
+
+#[tokio::test]
+async fn bare_aaa_retains_semantic_refusals_and_traversal_bounds() {
+    for (flag, service, regexp, replacement, reason) in [
+        ("u", "aaa", "", HOST, SnaptrFailure::UnsupportedFlag),
+        ("a", "aaa", "!regexp!", HOST, SnaptrFailure::RegexpNotEmpty),
+        ("a", "aaa:", "", HOST, SnaptrFailure::MalformedService),
+        ("a", "aaa", "", ".", SnaptrFailure::InvalidReplacement),
+        ("", "aaa", "", "realm.example.", SnaptrFailure::Loop),
+    ] {
+        let dns = FakeDns::new(move |q| {
+            Some(reply(
+                q,
+                0,
+                &[naptr(
+                    "realm.example.",
+                    1,
+                    0,
+                    flag,
+                    service,
+                    regexp,
+                    replacement,
+                    90,
+                )],
+                &[],
+                &[],
+            ))
+        })
+        .await;
+        let response = DnsClient::new(config(dns.address))
+            .unwrap()
+            .resolve_with_seed(
+                &compatibility_query(PeerTransport::Sctp, "diameter.sctp"),
+                now,
+                0,
+            )
+            .await;
+        assert_eq!(
+            response.result,
+            Err(DnsError::Snaptr {
+                reason,
+                expires_at: None
+            })
+        );
+        assert_eq!(dns.seen().len(), 1);
+    }
+    for depth in [true, false] {
+        let dns = FakeDns::new(|q| {
+            Some(reply(
+                q,
+                0,
+                &[naptr("realm.example.", 1, 0, "", "aaa", "", CHILD, 90)],
+                &[],
+                &[],
+            ))
+        })
+        .await;
+        let mut cfg = config(dns.address);
+        if depth {
+            cfg.max_snaptr_depth = 1;
+        } else {
+            cfg.max_snaptr_lookups = 1;
+        }
+        let response = DnsClient::new(cfg)
+            .unwrap()
+            .resolve_with_seed(
+                &compatibility_query(PeerTransport::Sctp, "diameter.sctp"),
+                now,
+                0,
+            )
+            .await;
+        assert_eq!(
+            response.result,
+            Err(if depth {
+                DnsError::Snaptr {
+                    reason: SnaptrFailure::DepthLimit,
+                    expires_at: None,
+                }
+            } else {
+                DnsError::LimitExceeded
+            })
+        );
+        assert_eq!(dns.seen().len(), 1);
+    }
+}

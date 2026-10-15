@@ -91,6 +91,7 @@ impl DnsAnswer {
                 DnsCandidate {
                     peer: candidate.peer.clone(),
                     records: Some(first.records.clone()),
+                    srv: None,
                     snaptr: Some(SnaptrProvenance {
                         origin: provenance.origin.clone(),
                         filter: provenance.filter.clone(),

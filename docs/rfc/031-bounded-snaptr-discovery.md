@@ -104,6 +104,17 @@ match that protocol. Legacy `aaa` records do not satisfy an application-ID
 filter; the root classification below exposes legacy presence to the caller.
 Preserve security-bearing protocol tags for the consumer's handshake.
 
+For explicit section 5(d)/(e) compatibility, a filter with service `aaa`
+accepts `aaa:protocol` by whole-tag matching and bare `aaa` without inventing
+a protocol tag. Bare records use the query's configured supported transport
+and retain `protocol_advertised() == false`; the consumer owns the supported
+transport sequence. All replacement, flag, loop, depth and work limits still
+apply. A compatibility query that observes any `aaa+ap` family record refuses
+`ExtendedPresentNoMatch`, even beside legacy matches. This also prevents a
+changed RRset between the caller's application query and compatibility query
+from turning extended data into a downgrade. Retry the application-specific
+query when reconsidering extended discovery.
+
 Defaults come from the requested service definition: GTP-C uses 2123
 ([TS 29.274 V8.0.0, clause 4.3.1.1](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/08.00.00_60/ts_129274v080000p.pdf));
 Diameter TCP/SCTP uses 3868, and its TLS/DTLS profiles use 5658
@@ -427,7 +438,7 @@ above; it never freshens stale endpoints.
 
 ## Retained size
 
-The endpoint/host/path limits apply to cached payloads as well as responses.
+The S-NAPTR endpoint/host/path limits apply to cached payloads as well as responses.
 At most 64 paths contain 16 timed records and 14 NAPTR hops each. On 64-bit
 platforms, a conservative bound for retained DNS-derived metadata is 2 MiB
 per answer (512 MiB for 256 maximally populated cache entries), excluding

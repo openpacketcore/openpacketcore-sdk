@@ -40,7 +40,7 @@ fn matches_service(
     if protocols.iter().any(|tag| !crate::snaptr::valid_tag(tag)) {
         return Err(SnaptrFailure::MalformedService);
     }
-    if protocols.is_empty() && filter.diameter() {
+    if protocols.is_empty() && (filter.diameter() || filter.service() == "aaa") {
         return Ok(Some(false));
     }
     Ok(protocols
@@ -120,7 +120,13 @@ fn prepare_naptr(
         };
         records.push(MatchedNaptr { record, advertised });
     }
-    let classification = if matched {
+    let classification = if filter.service() == "aaa" && extended {
+        // A compatibility lookup can observe a changed RRset after the caller's
+        // application-specific lookup. RFC 6408 section 5(b)/(c) does not permit
+        // treating extended data as legacy support, even beside matching aaa.
+        records.clear();
+        SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::ExtendedPresentNoMatch)
+    } else if matched {
         SnaptrRootKind::Match
     } else {
         SnaptrRootKind::PresentNoMatch(if malformed {

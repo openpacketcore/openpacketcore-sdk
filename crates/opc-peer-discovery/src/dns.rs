@@ -1,7 +1,9 @@
 //! Additive DNS contracts. The legacy resolver and selection structs retain
 //! their original shape; these types carry DNS identity, TTLs and provenance.
 
-use crate::{SnaptrCoverage, SnaptrFailure, SnaptrFilter, SnaptrHost, SnaptrProvenance};
+use crate::{
+    SnaptrCoverage, SnaptrFailure, SnaptrFilter, SnaptrHost, SnaptrProvenance, SrvProvenance,
+};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -11,6 +13,9 @@ use crate::{DiscoveryTarget, PeerCandidate, PeerDiscoveryTime, ServiceDiscoveryI
 
 #[path = "dns_snaptr_filter.rs"]
 mod path_filter;
+
+#[path = "dns_srv_filter.rs"]
+mod srv_path_filter;
 
 /// Canonical absolute ASCII DNS name, redacted in diagnostics.
 ///
@@ -346,10 +351,11 @@ pub struct DnsCandidate {
     pub(crate) peer: PeerCandidate,
     pub(crate) records: Option<Arc<[DnsRecord]>>,
     pub(crate) snaptr: Option<SnaptrProvenance>,
+    pub(crate) srv: Option<SrvProvenance>,
 }
 
 impl DnsCandidate {
-    /// Maximum retained record count per candidate, including the terminal
+    /// Maximum retained record count per path, including the terminal
     /// address record. Oversized chains are rejected, never truncated.
     pub const MAX_RECORDS: usize = 16;
 
@@ -371,6 +377,7 @@ impl DnsCandidate {
             peer,
             records: Some(records.into()),
             snaptr: None,
+            srv: None,
         })
     }
 
@@ -380,6 +387,7 @@ impl DnsCandidate {
             peer,
             records: None,
             snaptr: None,
+            srv: None,
         }
     }
 
@@ -393,12 +401,23 @@ impl DnsCandidate {
         self.snaptr.as_ref()
     }
 
+    /// Bounded direct SRV derivations, including alternate targets and ports.
+    pub fn srv(&self) -> Option<&SrvProvenance> {
+        self.srv.as_ref()
+    }
+
     pub(crate) fn all_records(&self) -> impl Iterator<Item = &DnsRecord> {
         self.records
             .iter()
             .flat_map(|records| records.iter())
             .chain(
                 self.snaptr
+                    .iter()
+                    .flat_map(|provenance| provenance.paths())
+                    .flat_map(|path| path.records()),
+            )
+            .chain(
+                self.srv
                     .iter()
                     .flat_map(|provenance| provenance.paths())
                     .flat_map(|path| path.records()),

@@ -2312,3 +2312,559 @@ async fn cancelling_concurrent_targets_releases_the_single_refresh_permit() {
     ));
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn shared_endpoint_retains_the_alternate_target_chain_expiry() {
+    let (socket, task) = server(1, |_, q| {
+        reply(
+            q,
+            0,
+            &[
+                srv(SERVICE, 10, 1, 3868, FIRST, 90),
+                srv(SERVICE, 20, 1, 3868, SECOND, 90),
+                srv(SERVICE, 30, 1, 3868, THIRD, 90),
+            ],
+            &[],
+            &[
+                address(FIRST, "192.0.2.1", 90),
+                address(SECOND, "192.0.2.2", 90),
+                address(THIRD, "192.0.2.1", 3),
+            ],
+        )
+    })
+    .await;
+    let answer = DnsClient::new(config(socket.local_addr().unwrap()))
+        .unwrap()
+        .resolve_with_seed(&query(), now, 7)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(answer.candidates().len(), 2);
+    assert_eq!(
+        answer.candidates()[0].peer().endpoint.to_string(),
+        "192.0.2.1:3868"
+    );
+    assert_eq!(
+        answer.candidates()[1].peer().endpoint.to_string(),
+        "192.0.2.2:3868"
+    );
+    assert_eq!(
+        answer.expires_at(),
+        Some(PeerDiscoveryTime::from_millis(4_000))
+    );
+    task.await.unwrap();
+}
+
+async fn srv_path_answer(
+    seed: u64,
+    reverse: bool,
+    tied: bool,
+    shared: bool,
+    partial: bool,
+) -> opc_peer_discovery::DnsAnswer {
+    let (socket, task) = server(1, move |_, q| {
+        let mut records = vec![
+            srv(SERVICE, 10, 0, 3868, FIRST, 90),
+            srv(SERVICE, if tied { 10 } else { 20 }, 5, 3868, SECOND, 90),
+            srv(SERVICE, if tied { 10 } else { 30 }, 25, 3868, THIRD, 90),
+        ];
+        if partial {
+            records.push(srv(SERVICE, 40, 1, 3868, "missing.example.invalid.", 90));
+        }
+        if reverse {
+            records.reverse();
+        }
+        reply(
+            q,
+            0,
+            &records,
+            &[],
+            &[
+                address(FIRST, "192.0.2.1", 90),
+                address(SECOND, "192.0.2.2", 50),
+                address(THIRD, if shared { "192.0.2.1" } else { "192.0.2.3" }, 3),
+            ],
+        )
+    })
+    .await;
+    let mut cfg = config(socket.local_addr().unwrap());
+    cfg.max_srv_address_lookups = 0;
+    cfg.partial_failure_ttl = Duration::from_secs(2);
+    let response = DnsClient::new(cfg)
+        .unwrap()
+        .resolve_with_seed(&query(), now, seed)
+        .await;
+    assert_eq!(response.skipped_srv_targets, usize::from(partial));
+    assert_eq!(response.skipped_srv_records, usize::from(partial));
+    task.await.unwrap();
+    response.result.unwrap()
+}
+
+#[tokio::test]
+async fn srv_path_policy_reranks_shared_endpoints_without_changing_the_cache() {
+    let original = srv_path_answer(7, false, false, true, false).await;
+    assert_eq!(
+        original.filter_srv_paths(|_| true).unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(original.filter_srv_paths(|_| false).unwrap(), None);
+    assert_eq!(
+        original.filter_snaptr_paths(|_| true),
+        Err(DnsError::InvalidQuery)
+    );
+    let mut visits = Vec::new();
+    let view = original
+        .filter_srv_paths(|path| {
+            visits.push(path.target().as_str().to_owned());
+            path.target().as_str() != FIRST
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(visits, [FIRST, SECOND, THIRD]);
+    assert_eq!(
+        view.candidates()
+            .iter()
+            .map(|c| c.peer().endpoint.to_string())
+            .collect::<Vec<_>>(),
+        ["192.0.2.2:3868", "192.0.2.1:3868"]
+    );
+    for (index, (candidate, target, priority)) in view
+        .candidates()
+        .iter()
+        .zip([SECOND, THIRD])
+        .zip([20, 30])
+        .map(|((c, t), p)| (c, t, p))
+        .enumerate()
+    {
+        assert_eq!(candidate.peer().priority, priority);
+        assert_eq!(
+            candidate.peer().weight,
+            u16::MAX - u16::try_from(index).unwrap()
+        );
+        let provenance = candidate.srv().unwrap();
+        assert_eq!(provenance.origin().as_str(), SERVICE);
+        assert_eq!(provenance.paths().len(), 1);
+        let path = &provenance.paths()[0];
+        assert_eq!(path.owner().as_str(), SERVICE);
+        assert_eq!(path.target().as_str(), target);
+        assert_eq!(path.port(), 3868);
+        assert_eq!(path.priority(), priority);
+        assert_eq!(path.weight(), if target == SECOND { 5 } else { 25 });
+        assert_eq!(candidate.records(), Some(path.records()));
+        assert_eq!(path.records().last().unwrap().owner.as_str(), target);
+        assert_eq!(path.records().last().unwrap().observed_at, now());
+        assert!(!format!("{path:?}").contains(target));
+    }
+    assert_eq!(original.candidates()[0].srv().unwrap().paths().len(), 2);
+    assert_eq!(
+        original.candidates()[0]
+            .records()
+            .unwrap()
+            .last()
+            .unwrap()
+            .owner
+            .as_str(),
+        FIRST
+    );
+    let narrower = view
+        .filter_srv_paths(|p| p.target().as_str() == THIRD)
+        .unwrap();
+    assert_eq!(
+        narrower,
+        original
+            .filter_srv_paths(|p| p.target().as_str() == THIRD)
+            .unwrap()
+    );
+
+    let mut cache = DnsCache::default();
+    let token = match cache
+        .begin_refresh(&query(), now(), Duration::from_secs(3))
+        .unwrap()
+    {
+        DnsRefresh::Start(token) => token,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    assert!(cache.finish_refresh(token, Ok(original.clone()), now()));
+    let before = cache.lookup(&query().cache_key(), now());
+    assert_eq!(
+        before.fresh_until,
+        Some(PeerDiscoveryTime::from_millis(4_000))
+    );
+    let cached = match &before.result {
+        DnsCachedResult::Fresh(answer) => answer,
+        other => panic!("unexpected cache state: {other:?}"),
+    };
+    let longer_view = cached
+        .filter_srv_paths(|p| p.target().as_str() == SECOND)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        longer_view.expires_at(),
+        Some(PeerDiscoveryTime::from_millis(51_000))
+    );
+    assert_eq!(
+        cached
+            .filter_srv_paths(|p| p.target().as_str() != FIRST)
+            .unwrap(),
+        Some(view)
+    );
+    assert_eq!(cache.lookup(&query().cache_key(), now()), before);
+    assert_eq!(cached, &original);
+}
+
+#[tokio::test]
+async fn srv_path_filter_keeps_seeded_ties_across_wire_permutations() {
+    for seed in 0..16 {
+        let reference = srv_path_answer(seed, false, true, false, false).await;
+        let expected_visits = reference
+            .candidates()
+            .iter()
+            .map(|c| {
+                c.records()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .owner
+                    .as_str()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let mut previous = None;
+        for reverse in [false, true] {
+            let original = srv_path_answer(seed, reverse, true, true, false).await;
+            let mut visits = Vec::new();
+            let view = original
+                .filter_srv_paths(|p| {
+                    visits.push(p.target().as_str().to_owned());
+                    p.target().as_str() != FIRST
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(visits, expected_visits);
+            let expected = expected_visits
+                .iter()
+                .filter(|target| target.as_str() != FIRST)
+                .map(|target| {
+                    (
+                        target.as_str(),
+                        if target == SECOND {
+                            "192.0.2.2:3868"
+                        } else {
+                            "192.0.2.1:3868"
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let actual = view
+                .candidates()
+                .iter()
+                .map(|c| {
+                    (
+                        c.srv().unwrap().paths()[0].target().as_str(),
+                        c.peer().endpoint.to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|(target, endpoint)| (*target, endpoint.as_str()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                original.filter_srv_paths(|_| true).unwrap(),
+                Some(original.clone())
+            );
+            if let Some(previous) = previous {
+                assert_eq!(original, previous);
+            }
+            previous = Some(original);
+        }
+    }
+}
+
+#[tokio::test]
+async fn srv_path_filter_keeps_partial_and_negative_freshness_bounds() {
+    let partial = srv_path_answer(0, false, false, true, true).await;
+    assert_eq!(
+        partial.expires_at(),
+        Some(PeerDiscoveryTime::from_millis(3_000))
+    );
+    let view = partial
+        .filter_srv_paths(|p| p.target().as_str() == SECOND)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.expires_at(), partial.expires_at());
+    let bounded = partial.with_negative_freshness_bound(PeerDiscoveryTime::from_millis(2_500));
+    let view = bounded
+        .filter_srv_paths(|p| p.target().as_str() == SECOND)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.expires_at(),
+        Some(PeerDiscoveryTime::from_millis(2_500))
+    );
+    assert_eq!(
+        bounded.filter_srv_paths(|_| true).unwrap(),
+        Some(bounded.clone())
+    );
+}
+
+#[tokio::test]
+async fn srv_paths_keep_ports_separate_and_all_bounded_record_paths() {
+    let (socket, task) = server(3, |i, q| match i {
+        0 => reply(
+            q,
+            0,
+            &[
+                srv(SERVICE, 10, 1, 443, FIRST, 90),
+                srv(SERVICE, 20, 1, 8443, FIRST, 90),
+                srv(SERVICE, 30, 1, 443, SECOND, 90),
+            ],
+            &[],
+            &[
+                address(FIRST, "192.0.2.1", 90),
+                address(SECOND, "192.0.2.1", 90),
+            ],
+        ),
+        1 => {
+            assert_eq!((question(q).0.as_str(), question(q).1), (SERVICE, 33));
+            // RFC 1035 owner compression keeps all 128 SRV records within the
+            // advertised UDP size. SRV targets remain uncompressed. Addresses
+            // use a separate response so the message's 128-record cap holds.
+            let records = (0..128)
+                .map(|priority| {
+                    let encoded = srv(SERVICE, priority, 1, 443, "a.invalid.", 90);
+                    let mut compressed = vec![0xc0, 0x0c];
+                    compressed.extend_from_slice(&encoded[name(SERVICE).len()..]);
+                    compressed
+                })
+                .collect::<Vec<_>>();
+            let response = reply(q, 0, &records, &[], &[]);
+            assert!(response.len() <= 4096);
+            response
+        }
+        2 => {
+            assert_eq!((question(q).0.as_str(), question(q).1), ("a.invalid.", 1));
+            reply(q, 0, &[address("a.invalid.", "192.0.2.1", 90)], &[], &[])
+        }
+        _ => unreachable!(),
+    })
+    .await;
+    let mut cfg = config(socket.local_addr().unwrap());
+    cfg.max_srv_records = 128;
+    cfg.edns_payload_size = 4096;
+    let client = DnsClient::new(cfg).unwrap();
+    let original = client
+        .resolve_with_seed(&query(), now, 0)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(original.candidates().len(), 2);
+    let view = original
+        .filter_srv_paths(|p| p.target().as_str() == SECOND)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.candidates().len(), 1);
+    assert_eq!(view.candidates()[0].peer().endpoint.port(), 443);
+    assert_eq!(view.candidates()[0].peer().priority, 30);
+    assert_eq!(original.candidates()[0].srv().unwrap().paths().len(), 2);
+    assert_eq!(original.candidates()[1].srv().unwrap().paths().len(), 1);
+
+    let bounded = client
+        .resolve_with_seed(&query(), now, 0)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(bounded.candidates().len(), 1);
+    assert_eq!(bounded.candidates()[0].srv().unwrap().paths().len(), 128);
+    let last = bounded
+        .filter_srv_paths(|p| p.priority() == 127)
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.candidates()[0].peer().priority, 127);
+    assert_eq!(last.candidates()[0].srv().unwrap().paths().len(), 1);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn srv_path_filter_validates_the_whole_answer_before_calling_policy() {
+    let original = srv_path_answer(0, false, false, true, false).await;
+    let first = &original.candidates()[0];
+    let legacy = opc_peer_discovery::DnsCandidate::without_ttl(first.peer().clone());
+    let manually_built = opc_peer_discovery::DnsCandidate::new(
+        first.peer().clone(),
+        first.records().unwrap().to_vec(),
+    )
+    .unwrap();
+    for invalid in [legacy, manually_built] {
+        let mut candidates = original.candidates().to_vec();
+        candidates.push(invalid);
+        let mixed = opc_peer_discovery::DnsAnswer::new(candidates).unwrap();
+        let mut calls = 0;
+        assert_eq!(
+            mixed.filter_srv_paths(|_| {
+                calls += 1;
+                true
+            }),
+            Err(DnsError::InvalidQuery)
+        );
+        assert_eq!(calls, 0);
+    }
+}
+
+#[tokio::test]
+async fn srv_cache_refuses_mismatched_query_origin_mode_and_transport() {
+    let original = srv_path_answer(0, false, false, true, false).await;
+    for (name, mode, transport) in [
+        (
+            "_svc._tcp.other.invalid.",
+            ServiceDiscoveryMode::Service,
+            PeerTransport::Tcp,
+        ),
+        (SERVICE, ServiceDiscoveryMode::Address, PeerTransport::Tcp),
+        (SERVICE, ServiceDiscoveryMode::Service, PeerTransport::Udp),
+    ] {
+        let wrong = DnsQuery::new(ServiceDiscoveryInput::new(
+            PeerLabel::new("test").unwrap(),
+            DiscoveryTarget::new(name),
+            mode,
+            transport,
+            Some(3868),
+        ))
+        .unwrap();
+        let mut cache = DnsCache::default();
+        let token = match cache
+            .begin_refresh(&wrong, now(), Duration::from_secs(3))
+            .unwrap()
+        {
+            DnsRefresh::Start(token) => token,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        assert!(cache.finish_refresh(token, Ok(original.clone()), now()));
+        let status = cache.lookup(&wrong.cache_key(), now());
+        assert_eq!(status.result, DnsCachedResult::Miss);
+        assert_eq!(status.last_error, Some(DnsError::MalformedAnswer));
+    }
+}
+
+#[tokio::test]
+async fn srv_paths_retain_completed_alternates_after_the_endpoint_cap() {
+    let (socket, task) = server(2, |_, q| {
+        let (owner, kind, _) = question(q);
+        match (owner.as_str(), kind) {
+            (SERVICE, 33) => reply(
+                q,
+                0,
+                &[
+                    srv(SERVICE, 10, 1, 3868, FIRST, 90),
+                    srv(SERVICE, 20, 1, 3868, SECOND, 90),
+                ],
+                &[],
+                &[address(SECOND, "192.0.2.1", 3)],
+            ),
+            (FIRST, 1) => reply(
+                q,
+                0,
+                &(1..=16)
+                    .map(|i| address(FIRST, &format!("192.0.2.{i}"), 90))
+                    .collect::<Vec<_>>(),
+                &[],
+                &[],
+            ),
+            _ => panic!("unexpected question"),
+        }
+    })
+    .await;
+    let response = DnsClient::new(config(socket.local_addr().unwrap()))
+        .unwrap()
+        .resolve_with_seed(&query(), now, 0)
+        .await;
+    assert_eq!(response.skipped_srv_records, 1);
+    let original = response.result.unwrap();
+    assert_eq!(original.candidates().len(), 16);
+    assert_eq!(
+        original.filter_srv_paths(|_| true).unwrap(),
+        Some(original.clone())
+    );
+    let view = original
+        .filter_srv_paths(|p| p.target().as_str() == SECOND)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.candidates().len(), 1);
+    assert_eq!(
+        view.candidates()[0].peer().endpoint.to_string(),
+        "192.0.2.1:3868"
+    );
+    assert_eq!(view.candidates()[0].peer().priority, 20);
+    assert_eq!(
+        view.expires_at(),
+        Some(PeerDiscoveryTime::from_millis(4_000))
+    );
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn srv_cache_checks_future_observations_on_alternate_paths() {
+    let (socket, task) = server(2, |_, q| {
+        let (owner, kind, _) = question(q);
+        match (owner.as_str(), kind) {
+            (SERVICE, 33) => reply(
+                q,
+                0,
+                &[
+                    srv(SERVICE, 10, 1, 3868, FIRST, 90),
+                    srv(SERVICE, 20, 1, 3868, SECOND, 90),
+                ],
+                &[],
+                &[address(FIRST, "192.0.2.1", 90)],
+            ),
+            (SECOND, 1) => reply(q, 0, &[address(SECOND, "192.0.2.1", 90)], &[], &[]),
+            _ => panic!("unexpected question"),
+        }
+    })
+    .await;
+    let ticks = Cell::new(1_000);
+    let original = DnsClient::new(config(socket.local_addr().unwrap()))
+        .unwrap()
+        .resolve_with_seed(
+            &query(),
+            || {
+                let value = ticks.get();
+                ticks.set(value + 1);
+                PeerDiscoveryTime::from_millis(value)
+            },
+            0,
+        )
+        .await
+        .result
+        .unwrap();
+    let first = &original.candidates()[0];
+    let primary_observation = first
+        .records()
+        .unwrap()
+        .iter()
+        .map(|r| r.observed_at)
+        .max()
+        .unwrap();
+    let future_observation = first.srv().unwrap().paths()[1]
+        .records()
+        .last()
+        .unwrap()
+        .observed_at;
+    assert!(future_observation > primary_observation);
+    let mut cache = DnsCache::default();
+    let token = match cache
+        .begin_refresh(&query(), now(), Duration::from_secs(3))
+        .unwrap()
+    {
+        DnsRefresh::Start(token) => token,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    assert!(cache.finish_refresh(token, Ok(original), primary_observation));
+    let status = cache.lookup(&query().cache_key(), primary_observation);
+    assert_eq!(status.result, DnsCachedResult::Miss);
+    assert_eq!(status.last_error, Some(DnsError::MalformedAnswer));
+    task.await.unwrap();
+}

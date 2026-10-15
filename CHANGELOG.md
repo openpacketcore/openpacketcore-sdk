@@ -719,6 +719,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserve runtime assertions, and regenerate output digest pins for shared
   statement formatting and lint repairs. (#1274)
 
+- `opc-peer-discovery`: retain direct SRV target-and-port paths when endpoints
+  overlap, including their original rank and TTLs. `filter_srv_paths` provides
+  a pure policy view that re-ranks endpoints by surviving target identity;
+  the cache retains the original answer. (#1286)
+  Retained alternate paths also bound the answer's expiry, so an unfiltered
+  answer whose endpoint is shared with a shorter-lived target can expire and
+  refresh earlier than before.
+- `opc-peer-discovery`: follow bare `aaa` NAPTR records under an explicit
+  compatibility filter using caller-selected transport, without inventing a
+  protocol tag. Refuse compatibility when extended Diameter records appear,
+  preserving the prohibition on downgrade after an extended mismatch. (#1287)
+
 - `opc-session-net` tests: reserve scope listener sockets across endpoint
   replacement and full fleet reopen so restarted ephemeral consensus listeners
   cannot take their saved ports. Keep bind-error diagnostics and exercise
