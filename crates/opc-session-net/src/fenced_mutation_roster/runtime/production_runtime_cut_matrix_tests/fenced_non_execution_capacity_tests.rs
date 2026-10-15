@@ -16,6 +16,7 @@ struct CapacityProvider {
     members: Vec<CapacityMember>,
     ready: Mutex<HashMap<u8, xfrm::XfrmObjectRosterAdmissionAuthority>>,
     bindings: Mutex<HashMap<u8, [u8; 32]>>,
+    reconciliations: AtomicUsize,
 }
 
 impl CapacityProvider {
@@ -116,6 +117,7 @@ impl MemberProvider for CapacityProvider {
     }
 
     async fn reconcile_member(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        self.reconciliations.fetch_add(1, Ordering::SeqCst);
         let retained = self.bind(call);
         let outcome = self
             .actor
@@ -223,6 +225,7 @@ async fn capacity_case(
             members,
             ready: Mutex::new(HashMap::new()),
             bindings: Mutex::new(HashMap::new()),
+            reconciliations: AtomicUsize::new(0),
         }),
     )
 }
@@ -400,4 +403,173 @@ async fn fenced_non_execution_not_transmitted_retry_registers_executes_and_relea
     assert_eq!(effects.load(Ordering::SeqCst), 2);
     assert_eq!(executor.backend.admission_calls().len(), 2);
     assert_eq!(executor.backend.terminal_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn fenced_non_execution_unknown_uncommitted_admissions_discard_every_registration() {
+    let root = tempfile::tempdir().unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let (actor, store) = capacity_store(&root, Arc::clone(&effects));
+    for index in 0..32 {
+        let (request, provider) = capacity_case(&actor, &store, index).await;
+        let backend = Arc::new(CutBackend::default());
+        backend.state.lock().unwrap().next_admission_outcome_unknown = true;
+        let executor = RosterExecutor::new(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            CutAttestor::new(request.admission().scope()),
+            NonZeroUsize::new(4).unwrap(),
+        );
+        assert!(matches!(
+            executor.register(request.clone()).await,
+            Err(ExecutorError::AdmissionOutcomeUnknown)
+        ));
+        // Only a returned Admitted supplies execution authority. The consumer
+        // discards these unbegun bindings even though commit remains unknown.
+        for retained in &provider.members {
+            actor
+                .discard_unadmitted_durable_object_roster_settlement(
+                    &store,
+                    retained.group,
+                    CapacityProvider::generation(),
+                    &retained.roster,
+                )
+                .await
+                .unwrap();
+            assert!(actor
+                .prepare_durable_object_roster(
+                    &store,
+                    retained.group,
+                    CapacityProvider::generation(),
+                    retained.roster.clone(),
+                )
+                .await
+                .is_err());
+        }
+        assert!(matches!(
+            executor.admission_status(request).await,
+            Err(ExecutorError::AuthorityRejected)
+        ));
+        assert_eq!(backend.admission_calls().len(), 1);
+        assert!(backend.terminal_calls().is_empty());
+        assert_eq!(provider.reconciliations.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+async fn compacted_terminal_releases_full_store(status_readback: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let (actor, store) = capacity_store(&root, Arc::clone(&effects));
+    for index in 0..29 {
+        let (_, provider) = capacity_case(&actor, &store, index).await;
+        let retained = &provider.members[0];
+        drop(
+            actor
+                .prepare_durable_object_roster(
+                    &store,
+                    retained.group,
+                    CapacityProvider::generation(),
+                    retained.roster.clone(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let (request, provider) = capacity_case(&actor, &store, 29).await;
+    let backend = Arc::new(CutBackend::default());
+    let executor = RosterExecutor::new(
+        Arc::clone(&provider),
+        Arc::clone(&backend),
+        CutAttestor::new(request.admission().scope()),
+        NonZeroUsize::new(4).unwrap(),
+    );
+    let active = executor.register(request.clone()).await.unwrap();
+    assert!(matches!(
+        executor.prepare(&active, 0).await.unwrap(),
+        CallResult::PreparedNotRun
+    ));
+    let second = recovered(executor.admission_status(request).await.unwrap());
+    let (next_request, next_provider) = capacity_case(&actor, &store, 30).await;
+    let next = &next_provider.members[0];
+    assert_eq!(
+        actor
+            .prepare_durable_object_roster(
+                &store,
+                next.group,
+                CapacityProvider::generation(),
+                next.roster.clone(),
+            )
+            .await
+            .unwrap_err(),
+        xfrm::XfrmObjectRosterDurableError::CapacityExceeded
+    );
+    let mut proofs = Vec::new();
+    for ordinal in 0..2 {
+        proofs.push(conclusive(
+            executor.reconcile_member(&active, ordinal).await.unwrap(),
+        ));
+    }
+    let prepared = executor.prepare_terminal(&active, proofs).await.unwrap();
+    backend.compact_next_terminal();
+    if status_readback {
+        backend.lose_next_terminal_reply();
+        assert!(matches!(
+            executor.terminalize(&active, &prepared).await,
+            Err(ExecutorError::TerminalizeOutcomeUnknown)
+        ));
+        assert!(matches!(
+            executor.terminal_status(&active, &prepared).await,
+            Ok(TerminalStatusResult::Compacted)
+        ));
+    } else {
+        assert!(matches!(
+            executor.terminalize(&active, &prepared).await,
+            Err(ExecutorError::TerminalPayloadCompacted)
+        ));
+    }
+    // The SDK validated the exact retained terminal body against the durable
+    // tombstone. That result authorizes the trusted consumer's release even
+    // when the payload receipt has aged out.
+    for retained in &provider.members {
+        actor
+            .release_durable_object_roster_settlement(
+                &store,
+                retained.group,
+                CapacityProvider::generation(),
+                &retained.roster,
+            )
+            .await
+            .unwrap();
+    }
+    let next_executor = RosterExecutor::new(
+        next_provider,
+        Arc::new(CutBackend::default()),
+        CutAttestor::new(next_request.admission().scope()),
+        NonZeroUsize::new(4).unwrap(),
+    );
+    let next = next_executor.register(next_request).await.unwrap();
+    assert!(matches!(
+        next_executor.prepare(&next, 0).await.unwrap(),
+        CallResult::PreparedNotRun
+    ));
+    let before = provider.reconciliations.load(Ordering::SeqCst);
+    let observation = executor.reconcile_member(&second, 0).await;
+    assert_eq!(provider.reconciliations.load(Ordering::SeqCst), before,
+        "validated compaction must refuse readback provider dispatch before released history is observed");
+    assert!(observation.is_err());
+    assert!(second.local.lock().unwrap().first_conclusive[0].is_none());
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.admission_calls().len(), 1);
+    assert_eq!(backend.terminal_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn fenced_non_execution_compacted_terminalize_releases_full_store_and_revokes_readback() {
+    compacted_terminal_releases_full_store(false).await;
+}
+
+#[tokio::test]
+async fn fenced_non_execution_compacted_terminal_status_releases_full_store_and_revokes_readback() {
+    compacted_terminal_releases_full_store(true).await;
 }

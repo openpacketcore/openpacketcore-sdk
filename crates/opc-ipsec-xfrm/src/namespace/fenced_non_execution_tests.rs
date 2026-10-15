@@ -274,6 +274,17 @@ mod fenced_non_execution {
                 .await
                 .unwrap(),
         );
+        for index in 1..=29 {
+            let unrelated = XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(
+                roster_policy_request(index),
+            )]).unwrap();
+            drop(backend.prepare_durable_object_roster(
+                &store, roster_group(index as u8), generation, unrelated,
+            ).await.unwrap());
+        }
+        assert_eq!(backend.prepare_durable_object_roster(
+            &store, roster_group(0xFA), generation, sa_roster(1),
+        ).await.unwrap_err(), XfrmObjectRosterDurableError::CapacityExceeded);
         for releasing in [false, true] {
             let held = Arc::new(EffectGate::default());
             let contended = Arc::new(EffectGate::default());
@@ -292,11 +303,10 @@ mod fenced_non_execution {
                 let contended = Arc::clone(&contended);
                 Arc::new(move || contended.hold())
             });
-            let mut task = tokio::spawn({
-                let backend = backend.clone();
-                let store = store.clone();
-                let roster = roster.clone();
-                async move {
+            let publications_before = store.publication_ledger().unwrap().len();
+            let expired = {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                let call = async {
                     if releasing {
                         release_settled(&backend, &store, group, generation, &roster).await
                     } else {
@@ -305,22 +315,38 @@ mod fenced_non_execution {
                         assert!(observed.closed_without_effect());
                         Ok(())
                     }
+                };
+                let mut caller = Box::pin(tokio::time::timeout_at(deadline, call));
+                tokio::select! {
+                    () = contended.wait_entered() => {},
+                    _ = &mut caller => panic!("the caller must reach the held store lock"),
                 }
-            });
-            contended.wait_entered().await;
-            tokio::time::pause();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-            tokio::time::advance(Duration::from_secs(2)).await;
-            assert!(tokio::time::timeout_at(deadline, &mut task).await.is_err());
-            assert!(
-                !task.is_finished(),
-                "caller expiry must leave the accepted task owned"
-            );
-            tokio::time::resume();
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(2)).await;
+                let expired = caller.await.is_err();
+                tokio::time::resume();
+                expired
+            };
+            assert!(expired, "the caller future is dropped at its original deadline");
+            assert_eq!(store.publication_ledger().unwrap().len(), publications_before);
             held.release();
             holder.join().unwrap();
             contended.release();
-            task.await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let ledger = store.publication_ledger().unwrap();
+                    if ledger.iter().skip(publications_before).any(|publication| {
+                        if releasing {
+                            publication.class == crate::durable_roster::XfrmObjectRosterPublicationClass::Release
+                        } else {
+                            publication.phase == XfrmObjectRosterDurablePhase::Closed
+                        }
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("accepted work publishes without another caller or retry");
         }
         assert!(backend
             .prepare_durable_object_roster(&store, group, generation, roster)
@@ -333,7 +359,7 @@ mod fenced_non_execution {
                 .unwrap(),
         );
         assert!(transport.operations().is_empty());
-        assert_eq!(store.publication_ledger().unwrap().len(), 4);
+        assert_eq!(store.publication_ledger().unwrap().len(), 33);
     }
 
     #[tokio::test]

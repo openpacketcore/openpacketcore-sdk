@@ -3,6 +3,77 @@
 
 use super::*;
 
+#[test]
+fn fenced_non_execution_successor_resolution_rejects_substituted_original_owner() {
+    let request = request_with_members(1);
+    let mut recovery = successor(&request, 2);
+    recovery.original_owner = OwnerId::new("different-original-owner").unwrap();
+    assert!(matches!(
+        recovery.resolve_for_admission(request.admission()),
+        Err(ExecutorError::InvalidRegistration)
+    ));
+}
+
+#[test]
+fn fenced_non_execution_successor_resolution_rejects_substituted_admission_fence() {
+    let request = request_with_members(1);
+    let mut recovery = successor(&request, 3);
+    recovery.original_admission_fence = FenceToken::new(2);
+    assert!(matches!(
+        recovery.resolve_for_admission(request.admission()),
+        Err(ExecutorError::InvalidRegistration)
+    ));
+}
+
+#[test]
+fn fenced_non_execution_reclaims_authority_across_repeated_removal_and_recreation() {
+    let registry = LocalAuthorityRegistry::new(Arc::new(SystemClock));
+    let request = request_with_members(1);
+    let backend_registration = BackendRegistration::issue(
+        [0xB9; 32],
+        RequestId::bind(1, request.admission()).unwrap(),
+        request.admission(),
+    )
+    .unwrap();
+    let stale = registry
+        .install_admission(
+            backend_registration,
+            request.admission(),
+            request.authority(),
+        )
+        .unwrap();
+    registry.release_terminal_permit(&stale);
+    for cycle in 0..10_000 {
+        let current_registry = if cycle % 2 == 0 {
+            registry.clone()
+        } else {
+            LocalAuthorityRegistry::new(Arc::new(SystemClock))
+        };
+        let reserved = current_registry.reserve_admission(&request).unwrap();
+        assert_eq!(
+            current_registry.inner.entry_count.load(Ordering::Acquire),
+            1
+        );
+        let current = current_registry
+            .finalize_admission(reserved, backend_registration, request.admission())
+            .unwrap();
+        assert!(current_registry.check(&current) == LocalAuthorityCheck::Current);
+        assert!(current_registry.check(&stale) == LocalAuthorityCheck::RevokedOrExpired);
+        current_registry.release_terminal_permit(&stale);
+        assert_eq!(
+            current_registry.inner.entry_count.load(Ordering::Acquire),
+            1
+        );
+        current_registry.release_terminal_permit(&current);
+        assert_eq!(
+            current_registry.inner.entry_count.load(Ordering::Acquire),
+            0
+        );
+        assert!(current_registry.check(&current) == LocalAuthorityCheck::RevokedOrExpired);
+    }
+    assert_eq!(registry.inner.entry_count.load(Ordering::Acquire), 0);
+}
+
 struct TerminalBoundaryProvider {
     calls: AtomicUsize,
     hold_execute: bool,

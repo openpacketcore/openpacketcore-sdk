@@ -43,6 +43,12 @@ struct RetainedMember {
     roster: XfrmObjectRosterRequest,
 }
 
+#[derive(Default)]
+struct SettlementObserveGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 struct XfrmSettlementProvider {
     actor: NamespaceBoundLinuxXfrmBackend,
     store: XfrmObjectRosterRecoveryStore,
@@ -56,6 +62,7 @@ struct XfrmSettlementProvider {
     ready: Mutex<std::collections::HashMap<u8, XfrmObjectRosterAdmissionAuthority>>,
     bindings: Mutex<std::collections::HashMap<u8, [u8; 32]>>,
     observations: Mutex<Vec<(u8, &'static str)>>,
+    reconcile_gate: Mutex<Option<Arc<SettlementObserveGate>>>,
     _root: tempfile::TempDir,
 }
 
@@ -136,6 +143,7 @@ impl XfrmSettlementProvider {
             ready: Mutex::new(std::collections::HashMap::new()),
             bindings: Mutex::new(std::collections::HashMap::new()),
             observations: Mutex::new(Vec::new()),
+            reconcile_gate: Mutex::new(None),
             _root: root,
         })
     }
@@ -172,6 +180,11 @@ impl XfrmSettlementProvider {
         operation: RosterProviderOperationV1,
     ) -> Result<ProviderCallOutcome, ()> {
         let (group, retained) = self.binding(call)?;
+        let gate = self.reconcile_gate.lock().map_err(|_| ())?.take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         // Closing an unstarted binding does not join accepted actor work or
         // grant compensation. Missing storage is never a negative receipt.
         let observed = self
@@ -620,6 +633,33 @@ async fn fenced_non_execution_lost_admission_settles_every_unstarted_member() {
         fixture.client.admit(&mut fixture.input).await.unwrap(),
         AdmissionOutcome::OutcomeUnknown(_)
     ));
+    for retained in &fixture.provider.members {
+        fixture
+            .provider
+            .actor
+            .discard_unadmitted_durable_object_roster_settlement(
+                &fixture.provider.store,
+                retained.group,
+                XfrmSettlementProvider::generation(),
+                &retained.roster,
+            )
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .provider
+                .actor
+                .prepare_durable_object_roster(
+                    &fixture.provider.store,
+                    retained.group,
+                    XfrmSettlementProvider::generation(),
+                    retained.roster.clone(),
+                )
+                .await
+                .is_err(),
+            "an unknown admission issues no prepare authority"
+        );
+    }
     fixture
         .fleet
         .wait_all_application_sequences(fixture.sequence_before + 1)

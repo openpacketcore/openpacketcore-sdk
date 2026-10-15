@@ -7040,7 +7040,9 @@ mod production_runtime_cut_matrix_tests {
         current_authority: Option<AuthorityBinding>,
         committed: Option<CommittedTerminal>,
         compacted_recovery: Option<(u64, ProfiledTerminalConflictTombstone)>,
+        compacted_terminal: Option<(u64, ProfiledTerminalConflictTombstone)>,
         compact_next_terminal: bool,
+        next_admission_outcome_unknown: bool,
         lose_next_terminal_reply: bool,
         next_admission_not_transmitted: bool,
         next_terminal_not_transmitted: bool,
@@ -7176,6 +7178,10 @@ mod production_runtime_cut_matrix_tests {
                 state.next_admission_not_transmitted = false;
                 return Ok(RegistrationDecision::NotTransmitted);
             }
+            if state.next_admission_outcome_unknown {
+                state.next_admission_outcome_unknown = false;
+                return Err(());
+            }
             if state.admission.is_some() {
                 return Ok(RegistrationDecision::AdmissionReplayed);
             }
@@ -7298,6 +7304,12 @@ mod production_runtime_cut_matrix_tests {
             ) {
                 return Ok(TerminalStatusDecision::Reject(BackendRejection::Authority));
             }
+            if let Some((history_epoch, tombstone)) = state.compacted_terminal.clone() {
+                return Ok(TerminalStatusDecision::Compacted {
+                    history_epoch,
+                    tombstone,
+                });
+            }
             Ok(match state.committed.clone() {
                 Some(committed) => TerminalStatusDecision::Recorded(Box::new(committed)),
                 None => TerminalStatusDecision::Admitted,
@@ -7346,6 +7358,14 @@ mod production_runtime_cut_matrix_tests {
                 let tombstone =
                     TerminalConflictTombstone::new(request.admission(), committed.record())
                         .expect("validated compact terminal binding");
+                state.compacted_terminal = Some((
+                    committed.record().request_id().history_epoch(),
+                    ProfiledTerminalConflictTombstone::V1(tombstone.clone()),
+                ));
+                if state.lose_next_terminal_reply {
+                    state.lose_next_terminal_reply = false;
+                    return Err(());
+                }
                 return Ok(TerminalizeDecision::Compacted {
                     history_epoch: committed.record().request_id().history_epoch(),
                     tombstone: ProfiledTerminalConflictTombstone::V1(tombstone),
