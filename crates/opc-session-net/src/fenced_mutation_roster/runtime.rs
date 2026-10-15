@@ -6247,6 +6247,7 @@ mod local_authority_registry_tests {
                     authority: exemplar.authority().clone(),
                     generation: 1,
                     execution_closed: false,
+                    terminal_committed: false,
                 },
             );
         }
@@ -6270,6 +6271,7 @@ mod local_authority_registry_tests {
 #[cfg(test)]
 mod production_runtime_cut_matrix_tests {
     mod async_provider_authority_tests;
+    mod fenced_non_execution_capacity_tests;
     mod fenced_non_execution_registry_tests;
 
     use super::*;

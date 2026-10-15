@@ -707,3 +707,162 @@ async fn fenced_non_execution_incomplete_and_substituted_proofs_cannot_commit_te
     assert_eq!(provider.prepares.load(Ordering::SeqCst), 0);
     assert_eq!(provider.executions.load(Ordering::SeqCst), 0);
 }
+
+#[derive(Default)]
+struct DelayedReadbackBackend {
+    inner: CutBackend,
+    hold_readback: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl DelayedReadbackBackend {
+    async fn hold(&self, decision: RegistrationDecision) -> RegistrationDecision {
+        if self.hold_readback.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        decision
+    }
+}
+
+#[async_trait]
+impl RosterExecutorBackend for DelayedReadbackBackend {
+    type Error = ();
+
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        self.inner.expected_roster_attestation_trust_root_identity()
+    }
+
+    fn current_roster_configuration_identity(&self) -> Option<SessionConsensusIdentity> {
+        self.inner.current_roster_configuration_identity()
+    }
+
+    async fn register(&self, request: &RegistrationRequest) -> Result<RegistrationDecision, ()> {
+        self.inner.register(request).await
+    }
+
+    async fn admission_status(
+        &self,
+        request: AdmissionStatusRequest<'_>,
+    ) -> Result<RegistrationDecision, ()> {
+        Ok(self.hold(self.inner.admission_status(request).await?).await)
+    }
+
+    async fn recover(&self, request: &RecoveryRequest) -> Result<RegistrationDecision, ()> {
+        Ok(self.hold(self.inner.recover(request).await?).await)
+    }
+
+    async fn terminal_status(
+        &self,
+        request: TerminalStatusRequest<'_>,
+    ) -> Result<TerminalStatusDecision, ()> {
+        self.inner.terminal_status(request).await
+    }
+
+    async fn terminalize(
+        &self,
+        request: TerminalizeRequest<'_>,
+    ) -> Result<TerminalizeDecision, ()> {
+        self.inner.terminalize(request).await
+    }
+}
+
+async fn delayed_readback_cannot_reinstall_after_terminal(successor_read: bool, established: bool) {
+    let request = request_with_members(1);
+    let provider = TerminalBoundaryProvider::new(false, false);
+    let backend = Arc::new(DelayedReadbackBackend::default());
+    let executor = Arc::new(RosterExecutor::new(
+        Arc::clone(&provider),
+        Arc::clone(&backend),
+        CutAttestor::new(request.admission().scope()),
+        NonZeroUsize::new(4).unwrap(),
+    ));
+    let mut current = executor.register(request.clone()).await.unwrap();
+    let recovery = successor(&request, 2);
+    if successor_read {
+        backend
+            .inner
+            .install_successor_authority(recovery.authority().clone());
+        current = recovered(executor.recover(recovery.clone()).await.unwrap());
+    }
+    let proof = if established {
+        if successor_read {
+            conclusive(executor.status(&current, 0).await.unwrap())
+        } else {
+            assert!(matches!(
+                executor.prepare(&current, 0).await.unwrap(),
+                CallResult::PreparedNotRun
+            ));
+            conclusive(executor.execute(&current, 0).await.unwrap())
+        }
+    } else {
+        conclusive(executor.reconcile_member(&current, 0).await.unwrap())
+    };
+    backend.hold_readback.store(true, Ordering::SeqCst);
+    let pending = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            if successor_read {
+                executor.recover(recovery).await
+            } else {
+                executor.admission_status(request).await
+            }
+        }
+    });
+    backend.entered.notified().await;
+    let terminal = executor
+        .prepare_terminal(&current, vec![proof])
+        .await
+        .unwrap();
+    let receipt = executor.terminalize(&current, &terminal).await.unwrap();
+    assert_eq!(
+        receipt.phase(),
+        if established {
+            Phase::Established
+        } else {
+            Phase::Aborted
+        }
+    );
+    if established {
+        // Complete the actual publication acknowledgement transition, which
+        // releases the same authority entry retained by Established.
+        let call = EstablishedPublicationCall::from_executor(
+            receipt.publication_authority().unwrap(),
+            receipt.protected_checkpoint(),
+            receipt.protected_result(),
+        )
+        .unwrap();
+        executor
+            .local_authority
+            .linearize_publication(&call, || Ok(()))
+            .unwrap();
+    }
+    assert!(
+        executor.local_authority.check(&current.authority_permit)
+            == LocalAuthorityCheck::RevokedOrExpired
+    );
+    let before = provider.calls.load(Ordering::SeqCst);
+    backend.release.notify_one();
+    if let Ok(RecoveryResult::PollAdmitted(stale)) = pending.await.unwrap() {
+        let _ = executor.reconcile_member(&stale.registration, 0).await;
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), before,
+        "a delayed PollAdmitted readback must not recreate provider authority after terminal release");
+}
+
+#[tokio::test]
+async fn fenced_non_execution_delayed_admission_readback_cannot_reinstall_after_terminal() {
+    for established in [false, true] {
+        delayed_readback_cannot_reinstall_after_terminal(false, established).await;
+    }
+}
+
+#[tokio::test]
+async fn fenced_non_execution_delayed_successor_readback_cannot_reinstall_after_terminal() {
+    for established in [false, true] {
+        delayed_readback_cannot_reinstall_after_terminal(true, established).await;
+    }
+}

@@ -58,7 +58,7 @@ opc-route-steering = { path = "../opc-route-steering", version = "0.2.0" }
 aes-gcm = { workspace = true }
 hmac = { workspace = true }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { workspace = true, features = ["sched"] }
