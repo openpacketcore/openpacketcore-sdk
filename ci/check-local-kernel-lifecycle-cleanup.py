@@ -14,13 +14,18 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import subprocess
 import sys
+import time
 import uuid
 
 
 KINDS = ("net", "mnt")
 SCRIPT = Path(__file__).resolve()
+TERM_GRACE_SECONDS = 2
+KILL_GRACE_SECONDS = 3
 
 
 def lines(command: list[str]) -> list[str]:
@@ -241,6 +246,8 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
         result["errors"].extend(errors)
         survivors = []
         if current_record:
+            if command_exit_code < 0:
+                result["errors"].append(f"qualification command interrupted by signal {-command_exit_code}")
             root = identity(current_record["root"])
             verification_chain = list(ancestors(os.getpid(), processes))
             if root not in {identity(process) for process in verification_chain}:
@@ -312,6 +319,159 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
     return 0
 
 
+def current_ancestry(process: dict):
+    """Read ancestry afresh; a reused parent cannot establish ownership."""
+    seen = set()
+    while process["pid"] not in seen:
+        seen.add(process["pid"])
+        yield process
+        if process["ppid"] == 0:
+            return
+        parent = read_stat(Path(f"/proc/{process['ppid']}/stat"))
+        if parent["start_time"] > process["start_time"]:
+            raise ValueError("parent identity changed during descendant cleanup")
+        process = parent
+
+
+def pin_owned_process(process: dict, root: tuple[int, int]):
+    """Pin the selected identity before checking its current owner ancestry."""
+    descriptor = os.pidfd_open(process["pid"])
+    retained = False
+    try:
+        current = read_stat(Path(f"/proc/{process['pid']}/stat"))
+        if identity(current) != identity(process) \
+                or root not in {identity(parent) for parent in current_ancestry(current)}:
+            return None
+        retained = True
+        return descriptor
+    finally:
+        # A successful caller owns the descriptor until disposal finishes.
+        if not retained:
+            os.close(descriptor)
+
+
+def owned_descendants(root: tuple[int, int], excluded: set) -> list[dict]:
+    if identity(read_stat(Path(f"/proc/{root[0]}/stat"))) != root:
+        raise ValueError("registered namespace owner changed identity")
+    pending, seen, descendants = [root[0]], set(), []
+    while pending:
+        parent = pending.pop()
+        if parent in seen:
+            continue
+        seen.add(parent)
+        try:
+            tasks = list(Path(f"/proc/{parent}/task").iterdir())
+        except FileNotFoundError:
+            continue
+        for task in tasks:
+            try:
+                children = (task / "children").read_text().split()
+            except FileNotFoundError:
+                continue
+            for child in children:
+                try:
+                    process = read_stat(Path(f"/proc/{child}/stat"))
+                    if identity(process) in excluded:
+                        continue
+                    if root not in {identity(ancestor) for ancestor in current_ancestry(process)}:
+                        continue
+                except (FileNotFoundError, ValueError):
+                    # Reparenting or PID reuse can invalidate this observation.
+                    # Rescan; never signal a process whose owner is uncertain.
+                    continue
+                if process["pid"] not in {child["pid"] for child in descendants}:
+                    descendants.append(process)
+                    pending.append(process["pid"])
+    return descendants
+
+
+def dispose_descendants(evidence: Path, run_id: str) -> int:
+    """Bounded disposal runs as root while the owner stays alive and reaps."""
+    result = {"passed": False, "targets": [], "remaining": [], "errors": [],
+              "had_live_descendants": False,
+              "term_grace_seconds": TERM_GRACE_SECONDS, "kill_grace_seconds": KILL_GRACE_SECONDS}
+    pinned = {}
+    record = None
+    started = time.monotonic()
+    try:
+        _context, records = ownership(evidence)
+        record = records["run-" + run_id + ".json"]
+        root = identity(record["root"])
+        chain = list(current_ancestry(read_stat(Path("/proc/self/stat"))))
+        if root not in {identity(process) for process in chain}:
+            raise ValueError("descendant disposer is not a child of the registered owner")
+        excluded = {identity(process) for process in chain}
+        while True:
+            remaining = owned_descendants(root, excluded)
+            for process in remaining:
+                key = identity(process)
+                if key in pinned:
+                    continue
+                try:
+                    descriptor = pin_owned_process(process, root)
+                except ProcessLookupError:
+                    continue
+                except FileNotFoundError:
+                    continue
+                if descriptor is None:
+                    continue
+                target = {"pid": key[0], "start_time": key[1], "signals": []}
+                result["targets"].append(target)
+                pinned[key] = descriptor, target
+            elapsed = time.monotonic() - started
+            signum = signal.SIGTERM if elapsed < TERM_GRACE_SECONDS else signal.SIGKILL
+            live = False
+            for descriptor, target in pinned.values():
+                if select.select([descriptor], [], [], 0)[0]:
+                    continue
+                live = True
+                result["had_live_descendants"] = True
+                if signum not in target["signals"]:
+                    try:
+                        signal.pidfd_send_signal(descriptor, signum)
+                        target["signals"].append(signum)
+                    except ProcessLookupError:
+                        pass
+            if not remaining and not live:
+                # A parent may exit during the scan and leave a newly adopted
+                # child outside that snapshot. The owner cannot finish until
+                # its kernel child list contains only this verifier's chain.
+                if not direct_children(root[0]) - {process["pid"] for process in chain}:
+                    result["passed"] = True
+                    break
+            if elapsed >= TERM_GRACE_SECONDS + KILL_GRACE_SECONDS:
+                result["remaining"] = remaining
+                result["unreaped_child_pids"] = sorted(
+                    direct_children(root[0]) - {process["pid"] for process in chain})
+                result["errors"].append("owned descendants did not exit within the disposal deadline")
+                break
+            time.sleep(0.02)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        result["errors"].append(str(error))
+    finally:
+        for descriptor, _target in pinned.values():
+            os.close(descriptor)
+        result["elapsed_seconds"] = time.monotonic() - started
+        path = evidence / ("disposal-" + run_id + ".json")
+        write_json(path, result)
+        if record is not None:
+            record["disposal"] = path.name
+            # Disposal must never forgive a leak, even if it appeared after
+            # the attribution inventory or the disposer itself failed.
+            if result["had_live_descendants"] or not result["passed"]:
+                record["cleanup_passed"] = False
+            write_json(evidence / ("run-" + run_id + ".json"), record)
+    return 0 if result["passed"] and not result["had_live_descendants"] else 1
+
+
+def reap_finished_children(excluded: set[int]) -> None:
+    for pid in direct_children(os.getpid()) - excluded:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
 def run_owned_command(evidence: Path, command: list[str]) -> int:
     context, _records = ownership(evidence)
     # An orphan stays in our process tree until verification. PID start times
@@ -326,22 +486,54 @@ def run_owned_command(evidence: Path, command: list[str]) -> int:
     with (evidence / ("run-" + run_id + ".json")).open("x") as output:
         json.dump(record, output, indent=2)
         output.write("\n")
+    interrupted = None
+
+    def interrupt(signum, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = signum
+
+    handlers = {signum: signal.signal(signum, interrupt) for signum in [signal.SIGTERM, signal.SIGINT]}
+    primary = None
     try:
-        code = subprocess.run(command, check=False).returncode
-    except OSError:
-        code = 127
-    # Reap exited orphans; live descendants remain visible to the verifier.
-    while True:
         try:
-            if os.waitpid(-1, os.WNOHANG)[0] == 0:
-                break
-        except ChildProcessError:
-            break
-    privileged = [] if os.geteuid() == 0 else ["sudo", "-n"]
-    check = privileged + [sys.executable, str(SCRIPT), "verify", str(evidence),
-                          "--run-id", run_id, "--command-exit-code", str(code)]
-    cleanup = subprocess.run(check, check=False).returncode
-    return (code if code > 0 else 128 - code) if code else cleanup
+            primary = subprocess.Popen(command)
+            while primary.poll() is None and interrupted is None:
+                reap_finished_children({primary.pid})
+                time.sleep(0.02)
+            code = -interrupted if interrupted is not None else primary.returncode
+        except OSError:
+            code = 127
+        # Capture the original leak before disposal, including an interrupted
+        # primary command. The verifier has permission to signal sudo children.
+        reap_finished_children({primary.pid} if primary else set())
+        privileged = [] if os.geteuid() == 0 else ["sudo", "-n"]
+        check = privileged + [sys.executable, str(SCRIPT), "verify", str(evidence),
+                              "--run-id", run_id, "--command-exit-code", str(code),
+                              "--dispose-descendants"]
+        # A process-group interruption must not interrupt the cleanup helper.
+        verifier = subprocess.Popen(check, start_new_session=True)
+        while verifier.poll() is None:
+            if primary:
+                primary.poll()
+            reap_finished_children({verifier.pid} | ({primary.pid} if primary else set()))
+            time.sleep(0.02)
+        if primary:
+            primary.poll()
+        reap_finished_children(set())
+        cleanup = verifier.returncode or bool(direct_children(os.getpid()))
+        if interrupted is not None:
+            # A signal can arrive during verification/disposal. Keep that
+            # interruption sticky without replacing the original attribution.
+            path = evidence / ("run-" + run_id + ".json")
+            record = json.loads(path.read_text())
+            record.update(interrupted_signal=interrupted, cleanup_passed=False)
+            write_json(path, record)
+            return 128 + interrupted
+        return (code if code > 0 else 128 - code) if code else int(cleanup)
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
 
 
 def main() -> int:
@@ -353,6 +545,7 @@ def main() -> int:
         if name == "verify":
             mode.add_argument("--run-id")
             mode.add_argument("--command-exit-code", type=int)
+            mode.add_argument("--dispose-descendants", action="store_true")
         if name == "run":
             mode.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -380,7 +573,15 @@ def main() -> int:
             return 0
         if args.run_id is not None and not re.fullmatch(r"[0-9a-f]{32}", args.run_id):
             raise ValueError("invalid ownership run identifier")
-        return verify(args.evidence_dir, args.run_id, args.command_exit_code)
+        if args.dispose_descendants and args.run_id is None:
+            raise ValueError("descendant disposal requires an ownership run identifier")
+        disposal = 0
+        try:
+            result = verify(args.evidence_dir, args.run_id, args.command_exit_code)
+        finally:
+            if args.dispose_descendants:
+                disposal = dispose_descendants(args.evidence_dir, args.run_id)
+        return result or disposal
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1

@@ -193,6 +193,12 @@ snapshot. Its process ownership evidence rejects leaked qualification namespaces
 and unfinished descendants while allowing unrelated host services to come and
 go. Host-visible pins, mounts, named namespaces and interfaces must still match
 the baseline. Missing ownership or incomplete inventories fail cleanup.
+After recording attribution, the owner terminates and reaps its remaining
+descendants, including privileged children. Disposal uses verified process
+identities and pidfds, with a two-second SIGTERM grace followed by up to three
+seconds for SIGKILL. SIGTERM and SIGINT keep the owner alive through disposal.
+Original leaks and interruptions remain failures after disposal; the evidence
+retains both the original attribution and the disposal result.
 `--toolchain` chooses an installed Rust toolchain. Repeated `--case` arguments
 select exact cases for development and explicitly produce a partial result.
 

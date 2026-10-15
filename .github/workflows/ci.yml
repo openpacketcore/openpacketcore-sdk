@@ -653,6 +653,11 @@ jobs:
           sudo -n python3 ci/test-local-kernel-lifecycle-cleanup-integration.py \
             --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup-regressions"
 
+      - name: Regress cleanup owner supervision
+        run: |
+          python3 ci/test-local-kernel-lifecycle-supervision.py \
+            --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle-supervision-regressions"
+
       - name: Check local kernel lifecycle support
         run: |
           set -euo pipefail
@@ -723,6 +728,7 @@ jobs:
             ${{ runner.temp }}/local-kernel-lifecycle
             ${{ runner.temp }}/local-kernel-lifecycle-cleanup
             ${{ runner.temp }}/local-kernel-lifecycle-cleanup-regressions
+            ${{ runner.temp }}/local-kernel-lifecycle-supervision-regressions
           if-no-files-found: error
 
   rust:

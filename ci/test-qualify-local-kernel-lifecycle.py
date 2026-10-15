@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -60,6 +61,80 @@ class CleanupTests(unittest.TestCase):
             "command": ["qualification-fixture"], "exit_code": 0,
             "survivors": [], "cleanup_passed": True,
         }))
+
+    def test_descendant_signaling_pins_identity_and_rejects_unrelated_ancestry(self):
+        selected = {"pid": 30, "ppid": 10, "start_time": 300}
+        root = {"pid": 10, "ppid": 1, "start_time": 100}
+        for current, ancestry, owned in [
+            (selected, [selected, root, self.init], True),
+            ({**selected, "start_time": 301}, [selected, root, self.init], False),
+            (selected, [selected, self.init], False),
+        ]:
+            with self.subTest(current=current, owned=owned), \
+                    patch.object(CLEANUP.os, "pidfd_open", return_value=55) as opened, \
+                    patch.object(CLEANUP, "read_stat", return_value=current), \
+                    patch.object(CLEANUP, "current_ancestry", return_value=iter(ancestry)), \
+                    patch.object(CLEANUP.os, "close") as closed:
+                self.assertEqual(CLEANUP.pin_owned_process(selected, (10, 100)), 55 if owned else None)
+                opened.assert_called_once_with(30)
+                if owned:
+                    closed.assert_not_called()
+                else:
+                    closed.assert_called_once_with(55)
+
+    def test_descendant_ancestry_rejects_reused_parent_identity(self):
+        child = {"pid": 30, "ppid": 10, "start_time": 300}
+        with patch.object(CLEANUP, "read_stat", return_value={"pid": 10, "ppid": 1, "start_time": 301}):
+            with self.assertRaisesRegex(ValueError, "parent identity changed"):
+                list(CLEANUP.current_ancestry(child))
+
+    def test_descendant_disposal_escalates_with_a_bound_and_keeps_failure_sticky(self):
+        root = {"pid": 10, "ppid": 1, "start_time": 100}
+        child = {"pid": 30, "ppid": 10, "start_time": 300, "state": "S"}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            with patch.object(CLEANUP, "read_stat", return_value=root), \
+                    patch.object(CLEANUP, "current_ancestry", return_value=iter([root, self.init])), \
+                    patch.object(CLEANUP, "owned_descendants", return_value=[child]), \
+                    patch.object(CLEANUP, "direct_children", return_value={30}), \
+                    patch.object(CLEANUP, "pin_owned_process", return_value=55), \
+                    patch.object(CLEANUP.select, "select", return_value=([], [], [])), \
+                    patch.object(CLEANUP.signal, "pidfd_send_signal") as sent, \
+                    patch.object(CLEANUP.os, "close") as closed, \
+                    patch.object(CLEANUP.time, "monotonic", side_effect=[0, 0, 2.1, 5.1, 5.1]), \
+                    patch.object(CLEANUP.time, "sleep"):
+                self.assertEqual(CLEANUP.dispose_descendants(Path(directory), "fixture"), 1)
+            self.assertEqual([call.args for call in sent.call_args_list], [(55, signal.SIGTERM), (55, signal.SIGKILL)])
+            closed.assert_called_once_with(55)
+            result = json.loads((Path(directory) / "disposal-fixture.json").read_text())
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["remaining"], [child])
+            self.assertIn("owned descendants did not exit within the disposal deadline", result["errors"])
+            self.assertFalse(json.loads((Path(directory) / "run-fixture.json").read_text())["cleanup_passed"])
+
+    def test_descendant_disposal_rescans_an_orphan_adopted_after_inventory(self):
+        root = {"pid": 10, "ppid": 1, "start_time": 100}
+        child = {"pid": 30, "ppid": 10, "start_time": 300, "state": "S"}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            with patch.object(CLEANUP, "read_stat", return_value=root), \
+                    patch.object(CLEANUP, "current_ancestry", return_value=iter([root, self.init])), \
+                    patch.object(CLEANUP, "owned_descendants", side_effect=[[], [child], []]) as scanned, \
+                    patch.object(CLEANUP, "direct_children", side_effect=[{30}, set()]), \
+                    patch.object(CLEANUP, "pin_owned_process", return_value=55), \
+                    patch.object(CLEANUP.select, "select", side_effect=[([], [], []), ([55], [], [])]), \
+                    patch.object(CLEANUP.signal, "pidfd_send_signal") as sent, \
+                    patch.object(CLEANUP.os, "close") as closed, \
+                    patch.object(CLEANUP.time, "monotonic", side_effect=[0, 0, 0.1, 0.2, 0.2]), \
+                    patch.object(CLEANUP.time, "sleep"):
+                self.assertEqual(CLEANUP.dispose_descendants(Path(directory), "fixture"), 1)
+            self.assertEqual(scanned.call_count, 3)
+            sent.assert_called_once_with(55, signal.SIGTERM)
+            closed.assert_called_once_with(55)
+            result = json.loads((Path(directory) / "disposal-fixture.json").read_text())
+            self.assertTrue(result["passed"])
+            self.assertTrue(result["had_live_descendants"])
+            self.assertFalse(json.loads((Path(directory) / "run-fixture.json").read_text())["cleanup_passed"])
 
     def test_unrelated_service_arrival_is_attributed_without_failing_cleanup(self):
         after = copy.deepcopy(self.before)

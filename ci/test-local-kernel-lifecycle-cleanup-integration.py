@@ -102,9 +102,17 @@ def run_case(evidence, orphan, descriptors):
             (evidence / "holder.json").write_text(json.dumps(holder, indent=2) + "\n")
             if orphan:
                 assert launcher.wait(timeout=45) == 1, "leaked qualification child was accepted"
+                try:
+                    current = CLEANUP.read_stat(Path(f"/proc/{holder['pid']}/stat"))
+                except FileNotFoundError:
+                    current = None
+                assert current is None or CLEANUP.identity(current) != (
+                    holder["pid"], holder["start_time"]), "owner returned before reaping its leaked child"
             else:
                 check(command + ["run", str(cleanup), "--", sys.executable, "-c", "pass"],
                       evidence / "unrelated-run.log")
+                assert CLEANUP.identity(CLEANUP.read_stat(Path(f"/proc/{holder['pid']}/stat"))) == (
+                    holder["pid"], holder["start_time"]), "cleanup disposed of an unrelated process"
             records = list(cleanup.glob("attribution-*.json"))
             assert len(records) == 1
             result = json.loads(records[0].read_text())

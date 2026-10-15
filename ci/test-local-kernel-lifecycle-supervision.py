@@ -111,7 +111,8 @@ def run_case(directory, mode, root_child):
     cleanup.mkdir()  # The unprivileged owner must be able to save its record.
     privileged = ["sudo", "-n", sys.executable, str(CHECKER)]
     check(privileged + ["snapshot", str(cleanup)], directory / "snapshot.log")
-    child = [sys.executable, str(SCRIPT), "--fixture", str(directory), "--mode", mode]
+    fixture_mode = "return" if mode.endswith("-cleanup") else mode
+    child = [sys.executable, str(SCRIPT), "--fixture", str(directory), "--mode", fixture_mode]
     if root_child:
         child = ["sudo", "-n"] + child
     command = [sys.executable, str(CHECKER), "run", str(cleanup), "--"] + child
@@ -123,19 +124,28 @@ def run_case(directory, mode, root_child):
             wait_file(directory / "holder.json")
             identities = json.loads((directory / "holder.json").read_text())
             pidfd = os.pidfd_open(identities["holder"]["pid"])
+            if mode.endswith("-cleanup"):
+                deadline = time.monotonic() + 15
+                while not any(json.loads(path.read_text())["status"] == "complete"
+                              for path in cleanup.glob("run-*.json")):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("owner did not reach disposal")
+                    time.sleep(0.01)
             if mode != "return":
-                owner.send_signal(getattr(signal, mode))
+                owner.send_signal(getattr(signal, mode.split("-")[0]))
             result["wrapper_exit"] = owner.wait(timeout=30)
         result["after_wrapper_exit"] = {name: same_process(value) for name, value in identities.items()}
         result["holder_exited"] = bool(select.select([pidfd], [], [], 0)[0])
         result["records"] = [json.loads(path.read_text()) for path in cleanup.glob("run-*.json")]
         result["attributions"] = [json.loads(path.read_text()) for path in cleanup.glob("attribution-*.json")]
+        result["children_after_wrapper_exit"] = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
         # These observations precede every release, signal and fallback reap.
         assert not any(result["after_wrapper_exit"].values()), (
             "wrapper exited before disposing and reaping owned descendants: "
             + json.dumps(result["after_wrapper_exit"]))
         assert result["holder_exited"]
-        assert result["wrapper_exit"] == (1 if mode == "return" else 128 + getattr(signal, mode))
+        assert not result["children_after_wrapper_exit"], "wrapper left additional adopted descendants"
+        assert result["wrapper_exit"] == (1 if mode == "return" else 128 + getattr(signal, mode.split("-")[0]))
         assert len(result["records"]) == len(result["attributions"]) == 1
         assert not result["records"][0]["cleanup_passed"]
         attribution = result["attributions"][0]
@@ -144,6 +154,14 @@ def run_case(directory, mode, root_child):
         assert any(child["pid"] == identities["holder"]["pid"]
                    and child["start_time"] == identities["holder"]["start_time"]
                    for child in attribution["surviving_processes"])
+        disposal = json.loads((cleanup / result["records"][0]["disposal"]).read_text())
+        assert disposal["passed"] and not disposal["remaining"] and not disposal["errors"]
+        target = next(target for target in disposal["targets"]
+                      if target["pid"] == identities["holder"]["pid"])
+        assert target["start_time"] == identities["holder"]["start_time"]
+        assert target["signals"] == [signal.SIGTERM, signal.SIGKILL]
+        if mode != "return":
+            assert result["records"][0]["interrupted_signal"] == getattr(signal, mode.split("-")[0])
         check(privileged + ["verify", str(cleanup)], directory / "verify.log", 1)
         assert not json.loads((cleanup / "result.json").read_text())["passed"]
         result["passed"] = True
@@ -152,7 +170,9 @@ def run_case(directory, mode, root_child):
         if owner is not None and owner.poll() is None:
             owner.terminate()
             owner.wait(timeout=30)
-        for expected in identities.values():
+        adopted = [process(int(pid)) for pid in
+                   Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()]
+        for expected in [*identities.values(), *adopted]:
             if same_process(expected):
                 subprocess.run(["sudo", "-n", sys.executable, str(SCRIPT), "--dispose",
                                 str(expected["pid"]), str(expected["start_time"])], check=True, timeout=10)
@@ -172,7 +192,8 @@ def main():
     parser.add_argument("--mode", choices=["return", "SIGTERM", "SIGINT"], default="return")
     parser.add_argument("--dispose", type=int, nargs=2)
     parser.add_argument("--case", choices=["return-user", "SIGTERM-user", "SIGINT-user",
-                                           "return-root", "SIGTERM-root", "SIGINT-root"])
+                                           "SIGTERM-cleanup-user", "return-root", "SIGTERM-root",
+                                           "SIGINT-root", "SIGTERM-cleanup-root"])
     args = parser.parse_args()
     if args.fixture:
         return fixture(args.fixture, args.mode)
@@ -185,7 +206,7 @@ def main():
     if libc.prctl(36, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "cannot adopt fixture orphans")
     for root_child in [False, True]:
-        for mode in ["return", "SIGTERM", "SIGINT"]:
+        for mode in ["return", "SIGTERM", "SIGINT", "SIGTERM-cleanup"]:
             name = mode + ("-root" if root_child else "-user")
             if args.case is None or args.case == name:
                 run_case(args.evidence_dir / name, mode, root_child)
