@@ -489,7 +489,7 @@ fn retry_outcome(
             Ok(None)
         };
     }
-    if !notify.has_empty_protocol_spi() || !notify.spi.is_empty() {
+    if notify.spi_size != 0 || !notify.spi.is_empty() {
         return Err(Ikev2SaInitInitiatorError::InvalidRetry);
     }
     match notify.notify_message_type {

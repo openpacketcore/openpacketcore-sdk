@@ -378,6 +378,61 @@ fn typed_retries_accept_both_spi_forms_and_cookie_retry_preserves_payloads() {
 }
 
 #[test]
+fn retries_ignore_protocol_id_when_spi_is_empty() {
+    let request = request(&offer());
+    for (kind, data) in [
+        (IKEV2_NOTIFY_COOKIE, b"cookie".to_vec()),
+        (IKEV2_NOTIFY_INVALID_KE_PAYLOAD, vec![0, 20]),
+        (IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, vec![]),
+    ] {
+        let notify = Ikev2NotifyPayloadBuild {
+            protocol_id: 0,
+            spi: vec![],
+            notify_message_type: kind,
+            notification_data: data.clone(),
+        };
+        let template = if kind == IKEV2_NOTIFY_COOKIE {
+            build_ike_sa_init_cookie_response(&request.message().header, &data).unwrap()
+        } else {
+            build_ike_sa_init_notify_response(&request.message().header, &[notify]).unwrap()
+        };
+        for responder_spi in [0, SPI_R] {
+            for protocol_id in 0..=u8::MAX {
+                let mut reply = template.clone();
+                reply.header.responder_spi = responder_spi;
+                let mut raw = reply.raw_payloads.to_vec();
+                // RFC 7296 section 3.10: ignore Protocol ID when SPI is empty.
+                raw[4] = protocol_id;
+                reply.raw_payloads = Bytes::from(raw);
+                let outcome = admit_ike_sa_init_response(
+                    &request,
+                    &reply.as_borrowed(),
+                    DecodeContext::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("retry kind {kind}, Protocol ID {protocol_id}: {error:?}")
+                });
+                match (kind, outcome) {
+                    (IKEV2_NOTIFY_COOKIE, Ikev2SaInitResponse::Cookie(cookie)) => {
+                        assert_eq!(cookie.cookie(), data);
+                        let retry = request.with_cookie(cookie.cookie()).unwrap();
+                        assert_eq!(retry.message().raw_payloads[4], 0);
+                    }
+                    (
+                        IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
+                        Ikev2SaInitResponse::InvalidKePayload {
+                            requested_group: 20,
+                        },
+                    )
+                    | (IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, Ikev2SaInitResponse::NoProposalChosen) => {}
+                    _ => panic!("wrong typed retry outcome"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn retries_reject_malformed_duplicate_and_conflicting_notifications() {
     let request = request(&offer());
     for cookie in [vec![], vec![1; 65]] {
@@ -389,7 +444,7 @@ fn retries_reject_malformed_duplicate_and_conflicting_notifications() {
     let mut challenge =
         build_ike_sa_init_cookie_response(&request.message().header, b"cookie").unwrap();
     let mut raw = challenge.raw_payloads.to_vec();
-    raw[4] = 1; // COOKIE cannot carry a protocol ID.
+    raw[5] = 1; // COOKIE must not carry an SPI; its first data byte becomes SPI.
     challenge.raw_payloads = Bytes::from(raw);
     assert_rejected(&request, &challenge);
     for kind in [IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN] {
