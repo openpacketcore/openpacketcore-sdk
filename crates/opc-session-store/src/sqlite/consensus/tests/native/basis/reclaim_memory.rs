@@ -558,6 +558,18 @@ fn native_reclaim_memory_shutdown_interrupts_committed_wait() {
     if isolated("native_reclaim_memory_shutdown_interrupts_committed_wait") {
         return;
     }
+    assert_shutdown_interrupts_committed_wait(false);
+}
+
+#[test]
+fn native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked() {
+    if isolated("native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked") {
+        return;
+    }
+    assert_shutdown_interrupts_committed_wait(true);
+}
+
+fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
     let armed = Arc::new(AtomicBool::new(false));
     let gate = Gate::new(Point::BeforeGroup, 1);
     let (fixture, entry) = waiting_fixture_with(IoControl {
@@ -580,12 +592,14 @@ fn native_reclaim_memory_shutdown_interrupts_committed_wait() {
         let apply = scope.spawn(|| fixture.wal.native_apply_committed(&[entry]));
         until(|| fixture.wal.retirement_wait_state_for_test().unwrap().0 > 0);
         armed.store(true, Ordering::Release);
-        fixture
-            .wal
-            .submit(Operation::Barrier)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let primer = block_writer_first.then(|| {
+            let pending = fixture.wal.submit(Operation::Barrier).unwrap();
+            gate.entered();
+            pending
+        });
+        // The writer can reach the armed gate before this barrier completes.
+        // Keep its ticket until the gate is released below.
+        let first = fixture.wal.submit(Operation::Barrier).unwrap();
         gate.entered();
         let queued = fixture.wal.submit(Operation::Barrier).unwrap();
         let started = Instant::now();
@@ -594,6 +608,14 @@ fn native_reclaim_memory_shutdown_interrupts_committed_wait() {
         gate.release();
         assert_eq!(error.to_string(), "native retirement admission stopped");
         assert!(started.elapsed() < Duration::from_secs(1));
+        if let Some(primer) = primer {
+            primer
+                .wait()
+                .expect("shutdown cancellation preserves the gate-triggering barrier");
+        }
+        first
+            .wait()
+            .expect("shutdown cancellation preserves the first accepted barrier");
         queued
             .wait()
             .expect("shutdown cancellation preserves accepted WAL work");
