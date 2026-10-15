@@ -59,7 +59,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -78,27 +78,9 @@ const MAX_LOCAL_AUTHORITY_ENTRIES: usize = super::canonical::MAX_RESERVED_AND_RE
 /// provider effects behind one process-wide lock. Keep this aligned with the
 /// fixed provider-work scheduler shard count.
 const LOCAL_AUTHORITY_SHARDS: usize = 16;
-// A removed entry must never lend its generation to a later readback, even
-// through a different registry in the same process. Exhaustion fails closed.
-static NEXT_LOCAL_AUTHORITY_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn next_local_authority_generation() -> Result<u64, ExecutorError> {
-    let mut generation = NEXT_LOCAL_AUTHORITY_GENERATION.load(Ordering::Relaxed);
-    loop {
-        let next = generation
-            .checked_add(1)
-            .ok_or(ExecutorError::AuthorityRejected)?;
-        match NEXT_LOCAL_AUTHORITY_GENERATION.compare_exchange_weak(
-            generation,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return Ok(generation),
-            Err(current) => generation = current,
-        }
-    }
-}
+/// A stale capability retains its allocation, so replacement cannot reuse its
+/// identity. Completed incarnations leave no process-lifetime allocation count.
+struct LocalAuthorityIncarnation;
 
 fn store_roster_profile(profile: super::canonical::Profile) -> StoreRosterProfile {
     if profile == super::canonical::Profile::v1() {
@@ -666,9 +648,9 @@ struct LocalAuthorityEntry {
     /// success can always be recovered without a second remote mutation.
     registration: Option<BackendRegistration>,
     authority: AuthorityBinding,
-    /// Unique process-local revocation generation, never caller supplied or
-    /// reissued after removal of an entry.
-    generation: u64,
+    /// Shared process-local identity, retained by every capability for this
+    /// incarnation and replaced whenever the entry is recreated or superseded.
+    incarnation: Arc<LocalAuthorityIncarnation>,
     /// Reconciliation closes every prepare/execute registration for this
     /// admission, without revoking observation or compensation authority.
     execution_closed: bool,
@@ -769,20 +751,20 @@ impl Drop for LocalTerminalRead {
 struct LocalAdmissionReservation {
     key: LocalAuthorityKey,
     authority: AuthorityBinding,
-    generation: u64,
+    incarnation: Arc<LocalAuthorityIncarnation>,
 }
 
 /// Non-forgeable process-local capability attached only to a [`Registration`]
 /// or reconstructed from an SDK-issued established publication capsule.
 ///
-/// The fields stay private so callers cannot attach a current generation to an
+/// The fields stay private so callers cannot attach a current incarnation to an
 /// arbitrary body, owner, fence, or provider result.
 #[derive(Clone)]
 pub(crate) struct LocalAuthorityPermit {
     key: LocalAuthorityKey,
     registration: BackendRegistration,
     authority: AuthorityBinding,
-    generation: u64,
+    incarnation: Arc<LocalAuthorityIncarnation>,
 }
 
 impl fmt::Debug for LocalAuthorityPermit {
@@ -831,16 +813,16 @@ impl LocalAuthorityRegistry {
                 Err(ExecutorError::AuthorityRejected)
             };
         }
-        let generation = next_local_authority_generation()?;
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
+        let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: None,
                 authority: request.authority().clone(),
-                generation,
+                incarnation: Arc::clone(&incarnation),
                 execution_closed: false,
                 terminal_committed: false,
             },
@@ -848,7 +830,7 @@ impl LocalAuthorityRegistry {
         Ok(LocalAdmissionReservation {
             key,
             authority: request.authority().clone(),
-            generation,
+            incarnation,
         })
     }
 
@@ -873,7 +855,7 @@ impl LocalAuthorityRegistry {
             .get_mut(&key)
             .ok_or(ExecutorError::AdmissionOutcomeUnknown)?;
         if entry.authority != reservation.authority
-            || entry.generation != reservation.generation
+            || !Arc::ptr_eq(&entry.incarnation, &reservation.incarnation)
             || !self.current_at(&entry.authority)
             || entry
                 .registration
@@ -886,7 +868,7 @@ impl LocalAuthorityRegistry {
             key,
             registration,
             authority: reservation.authority,
-            generation: reservation.generation,
+            incarnation: reservation.incarnation,
         })
     }
 
@@ -917,19 +899,19 @@ impl LocalAuthorityRegistry {
                 key,
                 registration,
                 authority: authority.clone(),
-                generation: entry.generation,
+                incarnation: Arc::clone(&entry.incarnation),
             });
         }
-        let generation = next_local_authority_generation()?;
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
+        let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: Some(registration),
                 authority: authority.clone(),
-                generation,
+                incarnation: Arc::clone(&incarnation),
                 execution_closed: false,
                 terminal_committed: false,
             },
@@ -938,7 +920,7 @@ impl LocalAuthorityRegistry {
             key,
             registration,
             authority: authority.clone(),
-            generation,
+            incarnation,
         })
     }
 
@@ -948,7 +930,7 @@ impl LocalAuthorityRegistry {
         let removable = entries.get(&reservation.key).is_some_and(|entry| {
             entry.registration.is_none()
                 && entry.authority == reservation.authority
-                && entry.generation == reservation.generation
+                && Arc::ptr_eq(&entry.incarnation, &reservation.incarnation)
         });
         if removable {
             entries.remove(&reservation.key);
@@ -981,32 +963,32 @@ impl LocalAuthorityRegistry {
                         key,
                         registration,
                         authority: authority.clone(),
-                        generation: entry.generation,
+                        incarnation: Arc::clone(&entry.incarnation),
                     });
                 }
                 std::cmp::Ordering::Greater => {
-                    entry.generation = next_local_authority_generation()?;
+                    entry.incarnation = Arc::new(LocalAuthorityIncarnation);
                     entry.registration = Some(registration);
                     entry.authority = authority.clone();
                     return Ok(LocalAuthorityPermit {
                         key,
                         registration,
                         authority: authority.clone(),
-                        generation: entry.generation,
+                        incarnation: Arc::clone(&entry.incarnation),
                     });
                 }
             }
         }
-        let generation = next_local_authority_generation()?;
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
+        let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: Some(registration),
                 authority: authority.clone(),
-                generation,
+                incarnation: Arc::clone(&incarnation),
                 execution_closed: false,
                 terminal_committed: false,
             },
@@ -1015,7 +997,7 @@ impl LocalAuthorityRegistry {
             key,
             registration,
             authority: authority.clone(),
-            generation,
+            incarnation,
         })
     }
 
@@ -1183,7 +1165,7 @@ impl LocalAuthorityRegistry {
         };
         entry.registration == Some(permit.registration)
             && entry.authority == permit.authority
-            && entry.generation == permit.generation
+            && Arc::ptr_eq(&entry.incarnation, &permit.incarnation)
             && self.current_at(&entry.authority)
     }
 
@@ -1239,7 +1221,7 @@ impl LocalAuthorityRegistry {
             key,
             registration: publication.current_registration(),
             authority: entry.authority.clone(),
-            generation: entry.generation,
+            incarnation: Arc::clone(&entry.incarnation),
         })
     }
 
@@ -6416,7 +6398,7 @@ mod local_authority_registry_tests {
                 LocalAuthorityEntry {
                     registration: None,
                     authority: exemplar.authority().clone(),
-                    generation: 1,
+                    incarnation: Arc::new(LocalAuthorityIncarnation),
                     execution_closed: false,
                     terminal_committed: false,
                 },

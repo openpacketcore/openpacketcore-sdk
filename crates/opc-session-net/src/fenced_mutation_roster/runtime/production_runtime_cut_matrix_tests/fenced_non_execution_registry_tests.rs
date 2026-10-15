@@ -407,7 +407,10 @@ async fn fenced_non_execution_terminal_readback_reinstallation_never_revives_old
         "terminal readback recreated a current stale permit; refused={}",
         late.is_err()
     );
-    assert_ne!(recreated.generation, stale.authority_permit.generation);
+    assert!(!Arc::ptr_eq(
+        &recreated.incarnation,
+        &stale.authority_permit.incarnation,
+    ));
     assert_eq!(backend.admission_calls().len(), 1);
     assert_eq!(backend.terminal_calls().len(), 1);
 }
