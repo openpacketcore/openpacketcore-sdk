@@ -13,6 +13,7 @@ use opc_consensus::engine::raft::{InstallSnapshotRequest, InstallSnapshotRespons
 use opc_consensus::engine::StoredMembership;
 
 mod timing;
+mod timing_remaining;
 
 struct Story {
     leader: usize,
@@ -100,6 +101,34 @@ pub(super) fn decode_snapshot(
     .map_err(Box::new)
 }
 
+async fn certify_snapshot(
+    cold: &ConsensusSessionStore,
+    leader: SessionConsensusNodeId,
+) -> ColdQuorumCut {
+    let cold = cold.clone();
+    clock::complete(cold.inner.operation_timeout, async move {
+        let request = cold
+            .inner
+            .persistence_protocol
+            .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
+            .await
+            .unwrap();
+        let cut = cold
+            .call_peer::<_, ColdQuorumCut>(
+                leader,
+                SessionConsensusRpcFamily::ReadBarrier,
+                &request,
+                tokio::time::Instant::now() + OPERATION_BOUND,
+            )
+            .await
+            .unwrap();
+        assert!(cut.request == request);
+        assert_eq!(cut.requester, cold.inner.local_node_id);
+        cut
+    })
+    .await
+}
+
 async fn prepare(fleet: &mut Fleet) -> Story {
     fleet.start().await;
     let leader = fleet.leader();
@@ -114,7 +143,7 @@ async fn prepare(fleet: &mut Fleet) -> Story {
         .unwrap();
     for store in fleet.stores.iter().flatten() {
         assert_recorded(store, &first, &first_outcome).await;
-        clock::drain(store).await.unwrap();
+        drain_snapshot(store).await.unwrap();
     }
     let old_applied = fleet
         .store(follower)
@@ -141,23 +170,7 @@ async fn prepare(fleet: &mut Fleet) -> Story {
         .await
         .unwrap();
     let cold = fleet.store(follower);
-    let request = cold
-        .inner
-        .persistence_protocol
-        .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
-        .await
-        .unwrap();
-    let cut = cold
-        .call_peer::<_, ColdQuorumCut>(
-            fleet.peers[leader].node,
-            SessionConsensusRpcFamily::ReadBarrier,
-            &request,
-            tokio::time::Instant::now() + OPERATION_BOUND,
-        )
-        .await
-        .unwrap();
-    assert!(cut.request == request);
-    assert_eq!(cut.requester, cold.inner.local_node_id);
+    let cut = certify_snapshot(cold, fleet.peers[leader].node).await;
     assert!(cut.barrier.index > base.meta.last_log_id.unwrap().index);
     let covering = snapshot(fleet.store(leader)).await;
     assert!(persistence_protocol::covers(
@@ -437,6 +450,49 @@ async fn initialize_snapshot(
     .await
 }
 
+async fn drain_snapshot(
+    store: &ConsensusSessionStore,
+) -> Result<SessionPersistenceHealth, SessionPersistenceDrainError> {
+    let store = store.clone();
+    clock::complete(store.inner.operation_timeout, async move {
+        store.drain_async_persistence().await
+    })
+    .await
+}
+
+async fn quarantine_snapshot(
+    cold: &ConsensusSessionStore,
+) -> Result<ColdBarrierRequest, SessionConsensusPeerError> {
+    let cold = cold.clone();
+    clock::complete(cold.inner.operation_timeout, async move {
+        cold.inner
+            .persistence_protocol
+            .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
+            .await
+    })
+    .await
+}
+
+async fn install_corrupted_snapshot(
+    cold: &ConsensusSessionStore,
+    sender: SessionConsensusNodeId,
+    corrupted: &InstallSnapshotRequest<SessionRaftTypeConfig>,
+) -> Box<RaftError<SessionConsensusNodeId, InstallSnapshotError>> {
+    let cold = cold.clone();
+    let corrupted = corrupted.clone();
+    clock::complete(cold.inner.operation_timeout, async move {
+        let started = tokio::time::Instant::now();
+        let error = decode_snapshot(
+            send_snapshot(&cold, sender, &corrupted).await,
+            "corrupted final install",
+        )
+        .expect_err("the real completed snapshot stream must reject its corrupted database");
+        assert!(started.elapsed() < OPERATION_BOUND);
+        error
+    })
+    .await
+}
+
 async fn install_base(cold: &ConsensusSessionStore, sender: SessionConsensusNodeId, story: &Story) {
     assert_eq!(
         decode_snapshot(
@@ -469,7 +525,7 @@ async fn install_base(cold: &ConsensusSessionStore, sender: SessionConsensusNode
     );
     // The real install dispatches a separate log purge. Let that legitimate
     // background generation finish before byte-exact rejection assertions.
-    clock::drain(cold).await.unwrap();
+    drain_snapshot(cold).await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
         races::wait_for(
@@ -570,11 +626,27 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
         // The first replacement must expire under the unchanged operation
         // deadline while accepted installation still owns the pre-publication
         // hold. Expiry must neither retire that work nor allocate an attempt.
+        let expired_replacement = {
+            let cold = cold.clone();
+            clock::run(async move {
+                let started = tokio::time::Instant::now();
+                let replacement = cold
+                    .inner
+                    .persistence_protocol
+                    .quarantine_before(started + OPERATION_BOUND);
+                tokio::pin!(replacement);
+                assert!(futures_util::poll!(replacement.as_mut()).is_pending());
+                tokio::time::advance(OPERATION_BOUND - Duration::from_millis(1)).await;
+                assert!(futures_util::poll!(replacement.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(1)).await;
+                let result = replacement.await;
+                assert_eq!(started.elapsed(), OPERATION_BOUND);
+                result
+            })
+            .await
+        };
         assert!(matches!(
-            cold.inner
-                .persistence_protocol
-                .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
-                .await,
+            expired_replacement,
             Err(SessionConsensusPeerError::Timeout)
         ));
         assert_eq!(fleet.selector(story.follower), selected_base);
@@ -584,29 +656,35 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             .await
             .expect("cancelled caller leaves actual installation owned through publication");
         let new_request = {
-            let replacement = cold
-                .inner
-                .persistence_protocol
-                .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND);
-            tokio::pin!(replacement);
-            assert!(futures_util::poll!(replacement.as_mut()).is_pending());
+            let cold = cold.clone();
+            let after = Arc::clone(&after);
+            let expected_applied = story.covering.meta.last_log_id;
+            clock::complete(cold.inner.operation_timeout, async move {
+                let replacement = cold
+                    .inner
+                    .persistence_protocol
+                    .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND);
+                tokio::pin!(replacement);
+                assert!(futures_util::poll!(replacement.as_mut()).is_pending());
 
-            assert_eq!(
-                cold.inner
-                    .private_wal
-                    .as_ref()
-                    .unwrap()
-                    .with_native_read(|native| Ok(native.applied()))
-                    .unwrap(),
-                story.covering.meta.last_log_id
-            );
-            assert!(
-                futures_util::poll!(replacement.as_mut()).is_pending(),
-                "replacement must also drain post-publication engine completion"
-            );
-            assert!(!cold.inner.persistence_protocol.is_active());
-            after.release();
-            replacement.await.unwrap()
+                assert_eq!(
+                    cold.inner
+                        .private_wal
+                        .as_ref()
+                        .unwrap()
+                        .with_native_read(|native| Ok(native.applied()))
+                        .unwrap(),
+                    expected_applied
+                );
+                assert!(
+                    futures_util::poll!(replacement.as_mut()).is_pending(),
+                    "replacement must also drain post-publication engine completion"
+                );
+                assert!(!cold.inner.persistence_protocol.is_active());
+                after.release();
+                replacement.await.unwrap()
+            })
+            .await
         };
         assert_ne!(new_request.nonce, story.cut.request.nonce);
         assert_eq!(new_request.incarnation, story.cut.request.incarnation);
@@ -655,7 +733,7 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
         assert!(
             local.meta.last_log_id.unwrap().index > story.covering.meta.last_log_id.unwrap().index
         );
-        clock::drain(&cold).await.unwrap();
+        drain_snapshot(&cold).await.unwrap();
         fleet.close(story.follower).await;
         drop(cold);
         fleet
@@ -735,13 +813,7 @@ async fn async_persistence_failed_final_snapshot_keeps_cold_admission_and_select
         let mut corrupted = story.covering.clone();
         let middle = corrupted.data.len() / 2;
         corrupted.data[middle] ^= 0x40;
-        let started = tokio::time::Instant::now();
-        let error = decode_snapshot(
-            send_snapshot(&cold, sender, &corrupted).await,
-            "corrupted final install",
-        )
-        .expect_err("the real completed snapshot stream must reject its corrupted database");
-        assert!(started.elapsed() < OPERATION_BOUND);
+        let error = install_corrupted_snapshot(&cold, sender, &corrupted).await;
         let RaftError::Fatal(fatal @ Fatal::StorageError(_)) = *error else {
             panic!("corrupted install must retain its actual storage error: {error:?}");
         };

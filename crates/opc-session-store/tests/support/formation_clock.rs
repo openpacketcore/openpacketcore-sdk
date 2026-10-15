@@ -10,6 +10,8 @@ pub(crate) mod controlled_clock;
 /// remain on the original runtime. The helper calls the ordinary initializer
 /// once, with its original operation timeout and authority checks. It must not
 /// wrap tests of initialization deadlines or cold recovery.
+/// Functional cold recovery may use `controlled_clock::run` directly only
+/// alongside a direct deadline control on that same recovery path.
 pub(crate) async fn run<F>(formation: F) -> F::Output
 where
     F: Future + Send + 'static,

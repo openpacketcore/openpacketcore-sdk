@@ -387,7 +387,7 @@ impl Fleet {
             stores
                 .iter()
                 .all(|store| store.inner.persistence_protocol.is_active()),
-            "cold recovery must use the ordinary initialization deadline"
+            "formation requires active stores; cold recovery needs its own deadline control"
         );
         let results = crate::formation_clock::run(async move {
             join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster)).await

@@ -17,12 +17,7 @@ async fn reopen_installed_snapshot(
     .unwrap();
     // Match the replacement in the cancellation scenario: the completed
     // old install cannot supply authority for this fresh catch-up attempt.
-    let replacement = cold
-        .inner
-        .persistence_protocol
-        .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
-        .await
-        .unwrap();
+    let replacement = quarantine_snapshot(&cold).await.unwrap();
     assert_ne!(replacement.nonce, story.cut.request.nonce);
     assert_eq!(replacement.attempt, story.cut.request.attempt + 1);
     for sender in 0..3 {
@@ -33,7 +28,7 @@ async fn reopen_installed_snapshot(
     initialize_snapshot(&cold).await.unwrap();
     let local = snapshot(&cold).await;
     assert!(local.meta.last_log_id.unwrap().index > story.covering.meta.last_log_id.unwrap().index);
-    clock::drain(&cold).await.unwrap();
+    drain_snapshot(&cold).await.unwrap();
     fleet.close(story.follower).await;
     drop(cold);
     fleet
@@ -58,14 +53,15 @@ async fn functional_base_install_waits_for_real_publication() {
             .join(format!("snapshots-{}", story.follower));
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
-        let held = FixedInstallSourceCopyGateGuard::for_live_directory(&directory, Arc::clone(&gate));
+        let held =
+            FixedInstallSourceCopyGateGuard::for_live_directory(&directory, Arc::clone(&gate));
         let (installed, early) = clock::run(async move {
             let _held = held;
             let install = AssertUnwindSafe(install_base(&cold, sender, &story)).catch_unwind();
             tokio::pin!(install);
             tokio::select! {
                 () = gate.wait_started() => {},
-                _ = install.as_mut() => panic!("base install returned before real source-copy hold"),
+                _ = install.as_mut() => panic!("base install escaped copy hold"),
             }
             assert!(!cold.inner.persistence_protocol.is_active());
             tokio::time::advance(OPERATION_BOUND + Duration::from_millis(1)).await;
@@ -77,8 +73,14 @@ async fn functional_base_install_waits_for_real_publication() {
             }
         })
         .await;
-        assert!(installed.is_ok(), "functional base install expired before real publication");
-        assert!(!early, "functional base install completed while publication was held");
+        assert!(
+            installed.is_ok(),
+            "functional base install expired before real publication"
+        );
+        assert!(
+            !early,
+            "functional base install completed while publication was held"
+        );
     })
     .catch_unwind()
     .await;
@@ -94,16 +96,14 @@ async fn functional_snapshot_reopen_waits_for_real_quorum_cut() {
         let (story, local) = reopen_installed_snapshot(&mut fleet).await;
         let cold = fleet.store(story.follower).clone();
         assert!(!cold.status().admitted);
-        let hold = races::ReplyRelease::cold_cut(
-            &fleet.peers[story.leader],
-            cold.inner.local_node_id,
-        );
+        let hold =
+            races::ReplyRelease::cold_cut(&fleet.peers[story.leader], cold.inner.local_node_id);
         let (initialized, early, cut) = clock::run(async move {
             let initialize = initialize_snapshot(&cold);
             tokio::pin!(initialize);
             tokio::select! {
                 () = hold.wait_started() => {},
-                result = initialize.as_mut() => panic!("rejoin returned before actual quorum cut: {result:?}"),
+                result = initialize.as_mut() => panic!("rejoin escaped cut hold: {result:?}"),
             }
             let cut = hold.cut();
             assert!(!cold.inner.persistence_protocol.is_active());
@@ -117,15 +117,26 @@ async fn functional_snapshot_reopen_waits_for_real_quorum_cut() {
             }
         })
         .await;
-        assert_eq!(initialized, Ok(()), "functional snapshot rejoin expired before actual quorum cut");
-        assert!(!early, "functional rejoin completed while certification was held");
+        assert_eq!(
+            initialized,
+            Ok(()),
+            "functional snapshot rejoin expired before actual quorum cut"
+        );
+        assert!(
+            !early,
+            "functional rejoin completed while certification was held"
+        );
         assert!(cut.barrier.index > local.meta.last_log_id.unwrap().index);
         assert_ne!(cut.request.nonce, story.cut.request.nonce);
         let repaired = fleet.store(story.follower);
         assert_recorded(repaired, &story.first, &story.first_outcome).await;
         assert_recorded(repaired, &story.second, &story.second_outcome).await;
         assert!(repaired.status().admitted);
-        assert!(repaired.probe_fixed_quorum_readiness().await.traffic_authority().is_granted());
+        assert!(repaired
+            .probe_fixed_quorum_readiness()
+            .await
+            .traffic_authority()
+            .is_granted());
     })
     .catch_unwind()
     .await;
@@ -215,20 +226,24 @@ async fn snapshot_reopen_deadline_cannot_admit_a_held_quorum_cut() {
     let result = AssertUnwindSafe(async {
         let (story, local) = reopen_installed_snapshot(&mut fleet).await;
         let cold = fleet.store(story.follower).clone();
-        let hold = races::ReplyRelease::cold_cut(&fleet.peers[story.leader], cold.inner.local_node_id);
+        let hold =
+            races::ReplyRelease::cold_cut(&fleet.peers[story.leader], cold.inner.local_node_id);
         let cut = clock::run(async move {
             let started = tokio::time::Instant::now();
             let initialize = cold.initialize_cluster();
             tokio::pin!(initialize);
             tokio::select! {
                 () = hold.wait_started() => {},
-                result = initialize.as_mut() => panic!("rejoin returned before actual quorum cut: {result:?}"),
+                result = initialize.as_mut() => panic!("rejoin escaped cut hold: {result:?}"),
             }
             let cut = hold.cut();
             tokio::time::advance(OPERATION_BOUND - Duration::from_millis(1)).await;
             assert!(futures_util::poll!(initialize.as_mut()).is_pending());
             tokio::time::advance(Duration::from_millis(1)).await;
-            assert_eq!(initialize.await, Err(ConsensusSessionStoreOpenError::RecoveryRequired));
+            assert_eq!(
+                initialize.await,
+                Err(ConsensusSessionStoreOpenError::RecoveryRequired)
+            );
             assert_eq!(started.elapsed(), OPERATION_BOUND);
             assert!(!cold.inner.persistence_protocol.is_active());
             assert!(!cold.status().admitted);
@@ -241,7 +256,12 @@ async fn snapshot_reopen_deadline_cannot_admit_a_held_quorum_cut() {
         let cold = fleet.store(story.follower);
         assert!(!cold.inner.persistence_protocol.is_active());
         assert!(!cold.status().admitted);
-        assert_eq!(cold.probe_fixed_quorum_readiness().await.traffic_authority(), FixedQuorumTrafficAuthority::RecoveryRequired);
+        assert_eq!(
+            cold.probe_fixed_quorum_readiness()
+                .await
+                .traffic_authority(),
+            FixedQuorumTrafficAuthority::RecoveryRequired
+        );
     })
     .catch_unwind()
     .await;
