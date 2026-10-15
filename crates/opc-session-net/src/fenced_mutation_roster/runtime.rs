@@ -625,6 +625,11 @@ struct LocalAuthorityRegistryInner {
     /// Each immutable roster binding has exactly one shard. There is no global
     /// registry mutex: a lock collision can affect only one fixed shard.
     entries: [Mutex<HashMap<LocalAuthorityKey, LocalAuthorityEntry>>; LOCAL_AUTHORITY_SHARDS],
+    /// Only in-flight admission/recovery reads appear here. A terminal receipt
+    /// invalidates an older read before it can reinstall a removed entry.
+    terminal_reads:
+        [Mutex<HashMap<TerminalReadIdentity, TerminalReadEntry>>; LOCAL_AUTHORITY_SHARDS],
+    terminal_read_count: AtomicUsize,
     /// Reservations are made while holding an individual shard lock, but this
     /// atomic total closes the inter-shard race at the durable live-roster
     /// limit. It owns no waiters and never evicts current authority.
@@ -672,6 +677,90 @@ struct LocalAuthorityEntry {
     terminal_committed: bool,
 }
 
+/// The immutable lookup identity available before successor recovery resolves
+/// the historical admission scope. The backend still authenticates the full
+/// canonical admission; this identity only rejects stale local read results.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TerminalReadIdentity {
+    key_digest: [u8; 32],
+    roster_id: RosterId,
+    original_owner: OwnerId,
+    admission_fence: FenceToken,
+}
+
+impl TerminalReadIdentity {
+    fn for_admission(admission: &Admission) -> Self {
+        Self {
+            key_digest: admission.key().digest(),
+            roster_id: admission.roster_id(),
+            original_owner: admission.logical_owner().clone(),
+            admission_fence: admission.admission_fence(),
+        }
+    }
+
+    fn for_recovery(request: &RecoveryRequest) -> Self {
+        Self {
+            key_digest: request.authority().key().digest(),
+            roster_id: request.lookup().roster_id(),
+            original_owner: request.original_owner().clone(),
+            admission_fence: request.original_admission_fence(),
+        }
+    }
+
+    fn shard_index(&self) -> usize {
+        usize::from(self.key_digest[0] ^ self.roster_id.as_bytes()[0])
+            & (LOCAL_AUTHORITY_SHARDS - 1)
+    }
+}
+
+struct TerminalReadEntry {
+    readers: usize,
+    terminal_committed: bool,
+}
+
+/// Dropping a read, including cancellation, releases its share of the temporary
+/// guard. Completed admissions leave no read guard or terminal tombstone.
+struct LocalTerminalRead {
+    registry: LocalAuthorityRegistry,
+    identity: TerminalReadIdentity,
+}
+
+impl LocalTerminalRead {
+    fn install<T>(
+        &self,
+        terminal: bool,
+        install: impl FnOnce() -> Result<T, ExecutorError>,
+    ) -> Result<T, ExecutorError> {
+        // The same short lock orders terminal invalidation and installation.
+        // The callback only installs local state; it never awaits or does I/O.
+        let reads = self.registry.lock_terminal_reads(&self.identity);
+        let entry = reads
+            .get(&self.identity)
+            .ok_or(ExecutorError::AuthorityRejected)?;
+        if entry.terminal_committed && !terminal {
+            return Err(ExecutorError::AuthorityRejected);
+        }
+        install()
+    }
+}
+
+impl Drop for LocalTerminalRead {
+    fn drop(&mut self) {
+        let mut reads = self.registry.lock_terminal_reads(&self.identity);
+        if let Some(entry) = reads.get_mut(&self.identity) {
+            if entry.readers > 1 {
+                entry.readers -= 1;
+            } else {
+                reads.remove(&self.identity);
+                self.registry
+                    .inner
+                    .terminal_read_count
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
 /// Exact process-local admission capacity reserved before PollAdmit.
 ///
 /// Dropping this token never releases its ledger row: cancellation is an
@@ -715,6 +804,8 @@ impl LocalAuthorityRegistry {
             inner: Arc::new(LocalAuthorityRegistryInner {
                 clock,
                 entries: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+                terminal_reads: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+                terminal_read_count: AtomicUsize::new(0),
                 entry_count: AtomicUsize::new(0),
                 expiry_sweep_cursor: AtomicUsize::new(0),
             }),
@@ -987,12 +1078,59 @@ impl LocalAuthorityRegistry {
     /// currently owns its entry, including a successor installed during readback.
     /// This mark shares the entry's bounded lifetime and never allocates history.
     fn mark_terminal(&self, admission: &Admission) {
+        let identity = TerminalReadIdentity::for_admission(admission);
+        // Always take the read shard before an authority shard. Pending
+        // readback installation uses the same order, with no await between.
+        let mut reads = self.lock_terminal_reads(&identity);
+        if let Some(entry) = reads.get_mut(&identity) {
+            entry.terminal_committed = true;
+        }
         let key = LocalAuthorityKey::for_admission(admission);
         let mut entries = self.lock_entries_after_durable_read(&key);
         self.prune_expired_locked(&mut entries);
         if let Some(entry) = entries.get_mut(&key) {
             entry.terminal_committed = true;
         }
+    }
+
+    fn begin_terminal_read(
+        &self,
+        identity: TerminalReadIdentity,
+    ) -> Result<LocalTerminalRead, ExecutorError> {
+        let mut reads = self.lock_terminal_reads(&identity);
+        if let Some(entry) = reads.get_mut(&identity) {
+            entry.readers = entry
+                .readers
+                .checked_add(1)
+                .ok_or(ExecutorError::ExecutorBusy)?;
+        } else {
+            self.inner
+                .terminal_read_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < MAX_PROVIDER_IN_FLIGHT).then_some(count + 1)
+                })
+                .map_err(|_| ExecutorError::ExecutorBusy)?;
+            reads.insert(
+                identity.clone(),
+                TerminalReadEntry {
+                    readers: 1,
+                    terminal_committed: false,
+                },
+            );
+        }
+        Ok(LocalTerminalRead {
+            registry: self.clone(),
+            identity,
+        })
+    }
+
+    fn lock_terminal_reads(
+        &self,
+        identity: &TerminalReadIdentity,
+    ) -> MutexGuard<'_, HashMap<TerminalReadIdentity, TerminalReadEntry>> {
+        self.inner.terminal_reads[identity.shard_index()]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Hold the exact authority shard while committing the local post-provider
@@ -4001,6 +4139,9 @@ where
     ) -> Result<RecoveryResult, ExecutorError> {
         self.diagnostics
             .increment(DiagnosticsCounter::RecoveryCalls);
+        let terminal_read = self
+            .local_authority
+            .begin_terminal_read(TerminalReadIdentity::for_recovery(&request))?;
         let decision = self
             .backend
             .recover(&request)
@@ -4053,13 +4194,15 @@ where
                 RegistrationDecision::Reject(rejection) => return Err(rejection.into()),
             };
         let request = request.resolve_for_admission(&admission)?;
-        let registration = Registration::recover(
-            request,
-            admission,
-            backend_registration,
-            admission_provenance,
-            &self.local_authority,
-        )?;
+        let registration = terminal_read.install(committed_terminal.is_some(), || {
+            Registration::recover(
+                request,
+                admission,
+                backend_registration,
+                admission_provenance,
+                &self.local_authority,
+            )
+        })?;
         if let Some(committed) = committed_terminal {
             let body =
                 TerminalBody::from_record(committed.record().clone(), registration.admission())?;
@@ -4092,6 +4235,9 @@ where
     ) -> Result<RecoveryResult, ExecutorError> {
         self.diagnostics
             .increment(DiagnosticsCounter::AdmissionStatusCalls);
+        let terminal_read = self
+            .local_authority
+            .begin_terminal_read(TerminalReadIdentity::for_admission(request.admission()))?;
         let decision = self
             .backend
             .admission_status(AdmissionStatusRequest {
@@ -4131,12 +4277,14 @@ where
         {
             return Err(ExecutorError::AuthorityRejected);
         }
-        let registration = Registration::readback(
-            request,
-            backend_registration,
-            admission_provenance,
-            &self.local_authority,
-        )?;
+        let registration = terminal_read.install(committed_terminal.is_some(), || {
+            Registration::readback(
+                request,
+                backend_registration,
+                admission_provenance,
+                &self.local_authority,
+            )
+        })?;
         if let Some(committed) = committed_terminal {
             let body =
                 TerminalBody::from_record(committed.record().clone(), registration.admission())?;

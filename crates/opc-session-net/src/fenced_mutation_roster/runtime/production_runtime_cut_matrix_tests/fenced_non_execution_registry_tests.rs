@@ -787,6 +787,8 @@ async fn delayed_readback_cannot_reinstall_after_terminal(successor_read: bool, 
             .inner
             .install_successor_authority(recovery.authority().clone());
         current = recovered(executor.recover(recovery.clone()).await.unwrap());
+    } else if !established {
+        current = recovered(executor.admission_status(request.clone()).await.unwrap());
     }
     let proof = if established {
         if successor_read {
@@ -865,4 +867,124 @@ async fn fenced_non_execution_delayed_successor_readback_cannot_reinstall_after_
     for established in [false, true] {
         delayed_readback_cannot_reinstall_after_terminal(true, established).await;
     }
+}
+
+#[test]
+fn fenced_non_execution_readback_guards_retain_only_bounded_inflight_reads() {
+    let registry = LocalAuthorityRegistry::new(Arc::new(SystemClock));
+    let request = request_with_members(1);
+    let identity = TerminalReadIdentity::for_admission(request.admission());
+    for _ in 0..10_000 {
+        let first = registry.begin_terminal_read(identity.clone()).unwrap();
+        let second = registry.begin_terminal_read(identity.clone()).unwrap();
+        let mut unrelated_identity = identity.clone();
+        unrelated_identity.roster_id = RosterId::from_bytes([0xFA; 16]).unwrap();
+        let unrelated = registry.begin_terminal_read(unrelated_identity).unwrap();
+        assert_eq!(
+            registry.inner.terminal_read_count.load(Ordering::Acquire),
+            2
+        );
+        registry.mark_terminal(request.admission());
+        assert!(matches!(
+            first.install(false, || Ok(())),
+            Err(ExecutorError::AuthorityRejected)
+        ));
+        assert!(matches!(
+            second.install(false, || Ok(())),
+            Err(ExecutorError::AuthorityRejected)
+        ));
+        assert!(first.install(true, || Ok(())).is_ok());
+        assert!(unrelated.install(false, || Ok(())).is_ok());
+        drop(first);
+        assert_eq!(
+            registry.inner.terminal_read_count.load(Ordering::Acquire),
+            2
+        );
+        drop(second);
+        drop(unrelated);
+        assert_eq!(
+            registry.inner.terminal_read_count.load(Ordering::Acquire),
+            0
+        );
+    }
+    let mut guards = Vec::new();
+    for index in 1..=MAX_PROVIDER_IN_FLIGHT {
+        let mut next = identity.clone();
+        next.roster_id = RosterId::from_bytes((index as u128).to_be_bytes()).unwrap();
+        guards.push(registry.begin_terminal_read(next).unwrap());
+    }
+    assert_eq!(
+        registry.inner.terminal_read_count.load(Ordering::Acquire),
+        MAX_PROVIDER_IN_FLIGHT
+    );
+    assert!(matches!(
+        registry.begin_terminal_read(identity.clone()),
+        Err(ExecutorError::ExecutorBusy)
+    ));
+    drop(guards);
+    assert_eq!(
+        registry.inner.terminal_read_count.load(Ordering::Acquire),
+        0
+    );
+    assert!(registry
+        .inner
+        .terminal_reads
+        .iter()
+        .all(|shard| shard.lock().unwrap().is_empty()));
+    let next = registry.begin_terminal_read(identity).unwrap();
+    assert!(next.install(false, || Ok(())).is_ok());
+}
+
+#[tokio::test]
+async fn fenced_non_execution_cancelled_readback_releases_its_inflight_guard() {
+    let request = request_with_members(1);
+    let provider = TerminalBoundaryProvider::new(false, false);
+    let backend = Arc::new(DelayedReadbackBackend::default());
+    let executor = Arc::new(RosterExecutor::new(
+        provider,
+        Arc::clone(&backend),
+        CutAttestor::new(request.admission().scope()),
+        NonZeroUsize::new(4).unwrap(),
+    ));
+    let active = executor.register(request.clone()).await.unwrap();
+    backend.hold_readback.store(true, Ordering::SeqCst);
+    let pending = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        let request = request.clone();
+        async move { executor.admission_status(request).await }
+    });
+    backend.entered.notified().await;
+    assert_eq!(
+        executor
+            .local_authority
+            .inner
+            .terminal_read_count
+            .load(Ordering::Acquire),
+        1
+    );
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        executor
+            .local_authority
+            .inner
+            .terminal_read_count
+            .load(Ordering::Acquire),
+        0
+    );
+    assert!(
+        executor.local_authority.check(&active.authority_permit) == LocalAuthorityCheck::Current
+    );
+    assert!(matches!(
+        executor.admission_status(request).await.unwrap(),
+        RecoveryResult::PollAdmitted(_)
+    ));
+    assert_eq!(
+        executor
+            .local_authority
+            .inner
+            .terminal_read_count
+            .load(Ordering::Acquire),
+        0
+    );
 }
