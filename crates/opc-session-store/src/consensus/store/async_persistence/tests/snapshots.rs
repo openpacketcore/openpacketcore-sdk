@@ -1,6 +1,7 @@
 //! Actual compacted-prefix installation and cancellation through ordinary
-//! Async stores. Each public operation keeps its 800 ms bound; snapshot
-//! construction and controlled recovery stages have separate fixture bounds.
+//! Async stores. Functional install/rejoin callers use controlled time while
+//! real engine and disk work retain their ordinary runtime. Every operation
+//! keeps its 800 ms bound; deadline controls advance that clock explicitly.
 
 use super::*;
 use crate::consensus::snapshot::SnapshotArtifactGate;
@@ -10,6 +11,8 @@ use crate::consensus::storage::{
 use opc_consensus::engine::error::{Fatal, InstallSnapshotError};
 use opc_consensus::engine::raft::{InstallSnapshotRequest, InstallSnapshotResponse};
 use opc_consensus::engine::StoredMembership;
+
+mod timing;
 
 struct Story {
     leader: usize,
@@ -411,10 +414,33 @@ async fn async_persistence_cold_repair_rejects_wrong_authority_and_requires_real
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
+async fn install_fixture_snapshot(
+    cold: &ConsensusSessionStore,
+    sender: SessionConsensusNodeId,
+    request: &InstallSnapshotRequest<SessionRaftTypeConfig>,
+) -> SessionConsensusWireResponse {
+    let cold = cold.clone();
+    let request = request.clone();
+    clock::complete(cold.inner.operation_timeout, async move {
+        send_snapshot(&cold, sender, &request).await
+    })
+    .await
+}
+
+async fn initialize_snapshot(
+    cold: &ConsensusSessionStore,
+) -> Result<(), ConsensusSessionStoreOpenError> {
+    let cold = cold.clone();
+    clock::complete(cold.inner.operation_timeout, async move {
+        cold.initialize_cluster().await
+    })
+    .await
+}
+
 async fn install_base(cold: &ConsensusSessionStore, sender: SessionConsensusNodeId, story: &Story) {
     assert_eq!(
         decode_snapshot(
-            send_snapshot(cold, sender, &story.base).await,
+            install_fixture_snapshot(cold, sender, &story.base).await,
             "pre-barrier base install"
         )
         .unwrap()
@@ -615,7 +641,7 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
                 fleet.set_link(sender, story.follower, true);
             }
         }
-        clock::initialize(&cold).await.unwrap();
+        initialize_snapshot(&cold).await.unwrap();
         let fresh = fleet.peers[story.leader].last_cut.lock().unwrap().unwrap();
         assert!(fresh.barrier.index > story.cut.barrier.index);
         assert_ne!(fresh.request.nonce, story.cut.request.nonce);
@@ -637,7 +663,7 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             .await
             .unwrap();
         assert!(!fleet.store(story.follower).status().admitted);
-        clock::initialize(fleet.store(story.follower))
+        initialize_snapshot(fleet.store(story.follower))
             .await
             .unwrap();
         assert_recorded(
