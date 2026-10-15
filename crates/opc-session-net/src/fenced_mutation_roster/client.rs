@@ -1586,6 +1586,18 @@ impl FencedMutationRosterClient {
 
     /// Read the exact durable absent-predecessor roster under the current
     /// higher-fence guard.
+    ///
+    /// The backend verifies the committed successor lease for the exact scope
+    /// and business key before returning [`ClientError::AdmissionRecordMissing`].
+    /// Once that strictly higher fence is current, an admission using the
+    /// original authority cannot commit later, including a delayed request
+    /// submitted before the successor lease committed. Admission validates the
+    /// live authority again at consensus application; the exclusion survives
+    /// restart. Thus this verified successor-fenced missing result can conclude
+    /// an ambiguous original admission. It is neither an Aborted receipt nor
+    /// evidence of member non-execution, and grants no member or publication
+    /// authority. Unavailable, timeout and authority-refusal results do not
+    /// establish this missing result.
     pub async fn recover_absent(
         &self,
         input: &AbsentRecoveryInput,
@@ -1610,6 +1622,9 @@ impl FencedMutationRosterClient {
     /// The supplied input retains the canonical original admission plus its
     /// original authority provenance; a successor `RecoveryInput` cannot be
     /// substituted at this ambiguity boundary.
+    /// A missing result under this original authority remains inconclusive:
+    /// the original admission may still commit. Successor-fenced exclusion is
+    /// the separate [`Self::recover_absent`] contract.
     pub async fn admission_status(
         &self,
         input: &AdmissionInput,

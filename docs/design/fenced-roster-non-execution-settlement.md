@@ -63,6 +63,21 @@ so no settlement call can reach released history. Fence and release
 rustdoc must state these preconditions. No recovery path requires a person to
 clear state.
 
+## Successor-fenced missing admission
+
+After a strictly higher successor lease has committed for the same scope and
+business key, the original authority can no longer commit an admission. This
+includes an original command submitted before the successor lease committed but
+applied afterward: admission checks the current live authority at consensus
+application, and the durable fence preserves that exclusion across restart.
+`recover_absent` validates that current successor authority before returning
+`AdmissionRecordMissing`, so this exact missing result can conclude the pending
+original admission. A missing `admission_status` result under the original
+authority remains inconclusive; the original command may still commit. An
+unavailable read, timeout or rejected authority is not verified successor-fenced
+absence. This contract issues neither an Aborted receipt nor member
+non-execution evidence, and grants no prepare, execute or publication authority.
+
 ## Existing pieces and the gap
 
 Paths below are under `crates/`; links pin the inspected baseline.

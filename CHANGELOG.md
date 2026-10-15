@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all provider calls across every registration, including delayed replies.
   Verified compacted terminal results also authorize exact retained-roster
   release, so terminal payload expiry cannot strand settlement capacity.
+  The successor-recovery contract now explicitly states that a committed higher
+  fence excludes a delayed original admission; original-authority missing
+  readback remains inconclusive.
   `opc-ipsec-xfrm` adds exact pre-admission registration, store-bound closure,
   discard after any admission result other than Admitted and explicit retention
   release. Absence
