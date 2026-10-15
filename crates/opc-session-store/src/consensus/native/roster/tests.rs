@@ -491,6 +491,7 @@ fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
         RecoveryRequestInput,
     };
     use crate::sqlite::consensus::{roster_reads, ProtectedRosterV2ReadResult};
+    use crate::{FenceToken, OwnerId};
 
     let signed = crate::consensus::types::roster_v2_aborted_persistence_fixture();
     let state = predecessor(&signed, None);

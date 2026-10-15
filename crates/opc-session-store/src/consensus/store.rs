@@ -24574,10 +24574,11 @@ mod membership_tests {
         .unwrap();
         store.initialize_cluster().await.unwrap();
         let scope = store.consumer_scope().unwrap();
+        let service = store.consumer_service();
         let missing =
-            store.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, true);
+            service.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, true);
         let original =
-            store.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, false);
+            service.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, false);
         assert!(matches!(
             original,
             SessionConsumerResponse::FencedMutationRosterAdmissionStatus(
