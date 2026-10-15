@@ -1,8 +1,8 @@
 # Fenced non-execution settlement after admission reply loss
 
-Design proposal v3 for [SDK #1280](https://github.com/openpacketcore/openpacketcore-sdk/issues/1280).
+Design proposal v4 for [SDK #1280](https://github.com/openpacketcore/openpacketcore-sdk/issues/1280).
 Source baseline: `4b49fe5b39618af6f523e62f46fb62709212098b`.
-Status: v3 amendment awaiting review; v2 implemented.
+Status: v4 amendment awaiting review; v2 implemented.
 
 An admission that committed before its reply was lost must be settled using that
 exact admission. Non-execution becomes conclusive only after its execution
@@ -10,16 +10,17 @@ generation is irrevocably closed at every member's physical effect boundary and
 accepted work is quiescent or conclusively reconciled. Missing intent alone
 remains nonconclusive.
 
-## v3 amendment: bounded settlement state
+## v4 amendment: bounded settlement state
 
 Before submitting a new admission, the trusted adapter registers each exact
 `(group, generation, request fingerprint)` in the store's process-local settlement
 registry. That same operation returns the store identity committed in the member
-descriptor. SDK-bound preparation requires a matching open registration. Fence
-closes it under the same lock as preparation; a closed or missing registration
-refuses preparation. Registration never grants execution authority. Readback,
+descriptor. SDK-bound preparation checks for a matching open registration and
+publishes Prepared within one hold of the store lock. Fence closes the
+registration under that lock, so a closed or missing registration refuses
+preparation. Registration never grants execution authority. Readback,
 recovery and release must not register or reopen an old binding, and the adapter
-never reuses a group and generation.
+never reuses a group and generation for another admission.
 
 An absence closure consumes no durable live slot and publishes no row. After
 checking the original store identity and its complete authenticated history,
@@ -31,8 +32,11 @@ absent members, terminal settlement or automatic release of those held rows.
 
 The registry contains at most one entry per binding awaiting a definitive
 admission outcome or terminal settlement. The adapter owns that lifecycle across
-caller cancellation. A definitive non-admission removes the registration; an
-ambiguous admission retains it. After verifying either durable terminal receipt,
+caller cancellation. A definitive non-admission removes the registration. The
+identical retry that `NotTransmitted` permits registers the same binding again
+before resubmission; no provider call can exist for an admission that was never
+transmitted. An ambiguous admission retains its registration.
+After verifying either durable terminal receipt,
 release removes the registration and any retained row's settlement hold.
 Idempotent release allocates no entry. Delete the process-lifetime released map:
 no released binding or tombstone remains in the registry, so its size depends
@@ -42,11 +46,15 @@ fails because its registration is gone.
 After restart, an absent binding may have no registration. Fence may still
 report Closed: no execution authority survives restart, preparation requires a
 live registration, and every begun binding remains durably retained until
-release. This recovery path creates no registration or execution authority. In
-the live process the SDK refuses provider calls once the terminal is locked, so
-released history cannot be reinterpreted by a later settlement call. Fence and
-release rustdoc must state these preconditions. No recovery path requires a
-person to clear state.
+release. This recovery path creates no registration or execution authority.
+Before the SDK returns any terminal receipt, it marks the admission's local
+authority entry, whichever authority holds it. Every registration of that
+admission, including those built by exact readback, then refuses every provider
+call before dispatch and at the post-provider check. Readback of a committed
+terminal returns only the receipt, before and after restart. Release requires
+that receipt, so no settlement call can reach released history. Fence and release
+rustdoc must state these preconditions. No recovery path requires a person to
+clear state.
 
 ## Existing pieces and the gap
 
@@ -105,7 +113,7 @@ a consensus receipt nor a new consumer-managed fence request/status protocol.
    every immutable member, descriptor and expected version before I/O. The SDK
    lease fence, local revocation counter and XFRM operation generation are
    distinct; do not substitute one for another or manufacture a higher lease.
-   The admitted member descriptor commits to the exact group, the generation and an opaque identity of the open roster store (store incarnation, actor incarnation and namespace seal), returned by the registration operation above. The fence treats absence as never-started only when the open store matches that commitment; otherwise the result is unknown. The adapter never reuses a group and generation.
+   The admitted member descriptor commits to the exact group, the generation and an opaque identity of the open roster store (store incarnation, actor incarnation and namespace seal), returned by the registration operation above. The fence treats absence as never-started only when the open store matches that commitment; otherwise the result is unknown. The adapter never reuses a group and generation for another admission.
 3. The XFRM effect boundary is the run's durable `Prepared -> Issuing` publication. After the existing store-binding check, the fence acts outside the actor queue under the same process lock: it closes the registration, returns an absence observation without publication, or moves an existing Prepared record to durable Closed. A retained Closed row is neither prunable nor unresolved writer authority. A run that is queued, paused before that publication or held by a delayed adapter then fails its registration check, Prepared-handle check or `Prepared -> Issuing` transition. No effect follows, and the fence does not wait for it. A record already Issuing, Applied or Compensating is accepted work. For such a record the fence reports the existing disposition, and the normal status, adopt and recover calls run on the actor after that work. Existing recover and adopt read a durable Closed record before the live-seal check. Do not burn the store-wide writer epoch, because unresolved work still needs its existing adjacent proofs.
 4. Retain every begun binding and immutable canonical member outcome through terminal pruning and namespace reset until the consumer releases it.
    Persist Prepared-to-Closed transitions; an absent binding follows the
@@ -152,11 +160,15 @@ ready to retry effects. Until release, repeat existing reconcile/status/adopt
 with the same retained requests; reopen the same authenticated store after
 restart. Return the same evidence commitment under successor authority.
 The caller stops waiting at its original deadline, and the detached provider call keeps the existing fixed provider deadline. Neither extends the lease or authorizes a renewed admission, and expiry preserves ambiguity.
-Waiting for the in-process store lock is bounded by the caller's existing
-absolute deadline; no new wait budget is created. Contention must not return
-`StoreBusy` or revoke an unrelated run's affine authority.
-Expiry grants no new effect authority, and accepted work retains its recovery
-ownership. `StoreBusy` remains reserved for the cross-process open lock.
+Every in-process store call waits for the store lock instead of failing on
+contention. A critical section holds no await, provider call or second store
+lease. A caller stops waiting at its existing absolute deadline; the actor
+command, or the blocking fence or release task, keeps ownership and completes as
+it does after cancellation. No store call therefore gets a deadline or wait
+budget of its own. Contention never returns `StoreBusy`, fails a run, consumes
+its affine authority or leaves a post-install publication unwritten. Expiry
+grants no new effect authority. `StoreBusy` remains reserved for the
+cross-process open lock.
 Accepted cleanup can finish under existing cancellation-resilient ownership without
 extending the call.
 
@@ -179,32 +191,47 @@ retained durable row and zero closure or release writes for an absent binding;
 removal of released rows is batched with the next publication. These are not
 consensus mutations. Complete and release more than the store's 30
 live-record slots over successive admissions without a lifetime capacity failure.
-Before release, verify retention across pruning/reset; after release, keep stale
-prepare/run holders, recreate a local entry through readback, and assert zero
-late provider effects. Also repeat after real store reopen, preserving the
-descriptor's original store identity and the rejection of substituted identity.
+Before release, verify retention across pruning/reset and retain a second
+registration from exact readback. After release, keep stale prepare/run holders
+and assert zero late provider effects; exact readback returns only the terminal
+receipt. Also repeat after real store reopen, preserving the descriptor's
+original store identity and the rejection of substituted identity.
 
-Add these tests before changing the implementation. Retain failing evidence on
-`42429afa3` for capacity, registry growth, lock contention and reset finalization;
-record already-correct terminal-binding and acknowledgement behavior as positive
-controls.
+Add these tests before changing the implementation. On the v2 implementation,
+the capacity, registry-growth, lock-contention, reset-finalization and
+released-history tests must fail; the terminal-binding and acknowledgement tests
+are positive controls.
 
 - Fill all 30 slots with width-two admissions, each with one Prepared member and
   one absent member. Every admission must settle Aborted and release within its
   existing deadline, without manual cleanup; the next prepare must succeed.
-- Settle and release 10,000 bindings while retaining unrelated unsettled bindings.
-  After each release the registry must contain only unsettled bindings, and every
-  late prepare must be refused. Definitive non-admission must also remove its entry.
-- Fence and release binding A on a blocking thread while the actor prepares,
-  runs and finalizes unrelated roster B 100 times. Every B run must be Applied,
-  with no `StoreBusy`; separately hold the lock through the original deadline
-  and verify bounded waiting without late effects or lost recovery ownership.
+- Settle and release 10,000 bindings, both Established and Aborted, while retaining
+  unrelated unsettled bindings. After each release, every in-memory settlement
+  entry must belong to an unsettled binding; on the v2 implementation, count the
+  released map. Every late prepare must be refused. Definitive non-admission must
+  remove its entry, and the identical retry after `NotTransmitted` must register
+  again, execute and release.
+- Hold the store lock from a test thread when unrelated roster B starts its run,
+  and again after B's first install, freeing it each time. B must finish Applied
+  with no `StoreBusy`; the v2 implementation fails at the first hold. Then fence
+  and release settled binding A on a blocking thread while the actor prepares,
+  runs and finalizes B 100 times; every B run must be Applied. Finally hold the
+  lock past the deadline of a fence caller and of a release caller. Each caller
+  stops waiting at its deadline, both tasks complete once the lock is freed, the
+  released row stops counting against capacity, and no effect follows.
 - Reset an Applied Held roster and assert that finalization reports Retired.
 - Reach Established through the real actor, finalize each roster, compare every
   terminal `settled_member_binding` with its recorded call commitment, release,
   and reject late preparation. Also hold a conclusive `AppliedExecuted` reply
   until reconciliation closes the admission: execute must return OutcomeUnknown
   and the member must never become Applied locally.
+- Hold a second registration from exact readback while the ActiveRoster reaches
+  Established. Release every roster, then prepare an unrelated roster so the
+  released rows are removed. Reconcile each member through the second
+  registration: the SDK must refuse before provider dispatch, and the provider
+  must record no fence call. Also hold one such reconcile after its precheck
+  until release and removal finish; the post-provider check must discard its
+  result.
 
 ## Risks and review decisions
 
