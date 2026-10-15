@@ -70,13 +70,32 @@ business key, the original authority can no longer commit an admission. This
 includes an original command submitted before the successor lease committed but
 applied afterward: admission checks the current live authority at consensus
 application, and the durable fence preserves that exclusion across restart.
-`recover_absent` validates that current successor authority before returning
-`AdmissionRecordMissing`, so this exact missing result can conclude the pending
-original admission. A missing `admission_status` result under the original
-authority remains inconclusive; the original command may still commit. An
-unavailable read, timeout or rejected authority is not verified successor-fenced
-absence. This contract issues neither an Aborted receipt nor member
-non-execution evidence, and grants no prepare, execute or publication authority.
+`recover_absent` carries the retained original business key in its public input
+and authenticated V2 request. Both reject a successor lease for a different key.
+After the linearizable barrier, the backend validates that exact live successor
+lease before returning `AdmissionRecordMissing`. This result concludes the
+pending original admission only when the slot is absent and the durable global
+retirement witness records no retired terminal history.
+
+Terminal retirement deletes stable slots and can release the last partition
+floor. The global witness survives both deletion and restart, but cannot identify
+which absent roster retired. After any terminal history has retired in that
+ledger, every absent V2 recovery slot returns `RecoveryHistoryUnavailable`, even
+for an unrelated roster that never committed. This is an inconclusive history
+classification, not proof that this particular roster retired. Exact retained
+and compacted results remain readable. A more selective negative result requires
+additional durable provenance; this change does not provide it.
+
+A missing `admission_status` result under the original authority remains
+`RecoveryRequired`; the original command may still commit. Barrier
+`RecoveryRequired`, `RecoveryHistoryUnavailable`, unavailable, timeout and
+authority-refusal results never establish verified absence. Verified missing
+issues neither an Aborted receipt nor member non-execution evidence, and grants
+no prepare, execute or publication authority.
+
+The V2 recovery carrier now requires the original key and refuses the former
+unbound recovery encoding. The V2 activation compatibility digest changes;
+crossing this change requires a fresh install. Frozen V1 carriers are unchanged.
 
 ## Existing pieces and the gap
 

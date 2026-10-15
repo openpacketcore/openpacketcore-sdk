@@ -486,6 +486,7 @@ fn native_roster_indexes_preserve_alias_rejection_and_bounded_mixed_history_pref
 
 #[test]
 fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
+    use crate::fenced_mutation_roster::RosterId;
     use crate::fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, RecoveryLookup, RecoveryRequest,
         RecoveryRequestInput,
@@ -564,8 +565,9 @@ fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
         RecoveryLookup::new(signed.admission.scope(), signed.admission.roster_id()),
         signed.authority.owner().clone(),
         signed.authority.fence(),
-        authority,
+        authority.clone(),
     ))
+    .and_then(|request| request.bind_original_key(signed.authority.key().clone()))
     .unwrap();
     let empty = Store::new(&successor_delta, &Ledger::empty(), &signed.root).unwrap();
     assert!(matches!(
@@ -579,18 +581,54 @@ fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
         ProtectedRosterV2ReadResult::Missing
     ));
     let retired_store = Store::new(&successor_delta, &retired, &signed.root).unwrap();
+    let retired_read = roster_reads::read_protected_roster_v2_recovery_sync(
+        &retired_store,
+        signed.identity,
+        &recovery,
+        due,
+    )
+    .unwrap();
     assert!(
-        !matches!(
+        !matches!(retired_read, ProtectedRosterV2ReadResult::Missing),
+        "a retired committed native admission must never become verified missing"
+    );
+    assert!(matches!(
+        retired_read,
+        ProtectedRosterV2ReadResult::HistoryUnavailable
+    ));
+    let unrelated = RecoveryRequest::new(RecoveryRequestInput::new(
+        RecoveryLookup::new(
+            signed.admission.scope(),
+            RosterId::from_bytes([0xF3; 16]).unwrap(),
+        ),
+        signed.authority.owner().clone(),
+        signed.authority.fence(),
+        authority,
+    ))
+    .and_then(|request| request.bind_original_key(signed.authority.key().clone()))
+    .unwrap();
+    assert!(
+        matches!(
             roster_reads::read_protected_roster_v2_recovery_sync(
                 &retired_store,
                 signed.identity,
-                &recovery,
-                due
+                &unrelated,
+                due,
             )
             .unwrap(),
-            ProtectedRosterV2ReadResult::Missing
+            ProtectedRosterV2ReadResult::HistoryUnavailable
         ),
-        "a retired committed native admission must never become verified missing"
+        "the global witness cannot distinguish an unrelated absent roster from retired history"
+    );
+    assert!(
+        roster_reads::read_protected_roster_v2_recovery_sync(
+            &retired_store,
+            signed.identity,
+            &recovery,
+            due.add_seconds(61).unwrap(),
+        )
+        .is_err(),
+        "expired authority is refused before history classification"
     );
 }
 

@@ -715,6 +715,7 @@ impl From<SessionConsumerRosterRejection> for BackendRejection {
             SessionConsumerRosterRejection::Authority => Self::Authority,
             SessionConsumerRosterRejection::RecoveryRequired => Self::RecoveryRequired,
             SessionConsumerRosterRejection::RecordMissing => Self::RecordMissing,
+            SessionConsumerRosterRejection::HistoryUnavailable => Self::HistoryUnavailable,
             SessionConsumerRosterRejection::GenerationConflict => Self::GenerationConflict,
             SessionConsumerRosterRejection::GenerationExhausted => Self::GenerationExhausted,
             SessionConsumerRosterRejection::BusinessKeyReserved => Self::BusinessKeyReserved,
@@ -839,6 +840,33 @@ enum AdmissionRequestWire {
     Recover {
         scope: [u8; 32],
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
+        authority: AuthorityWire,
+    },
+}
+
+/// V2 keeps registration at ordinal zero and refuses the old unbound
+/// recovery ordinal. Bound recovery carries the immutable original key inside
+/// the authenticated capsule; it cannot be decoded as a frozen V1 request.
+#[derive(Serialize, Deserialize)]
+enum AdmissionRequestWireV2 {
+    Register {
+        scope: [u8; 32],
+        admission: Vec<u8>,
+        authority: AuthorityWire,
+    },
+    LegacyUnboundRecover {
+        scope: [u8; 32],
+        roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
+        authority: AuthorityWire,
+    },
+    Recover {
+        scope: [u8; 32],
+        roster_id: RosterId,
+        original_key: SessionKey,
         original_owner: OwnerId,
         original_admission_fence: FenceToken,
         authority: AuthorityWire,
@@ -995,15 +1023,21 @@ fn admission_capsule_for_registration(
     request: &RegistrationRequest,
     profile: Profile,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ()> {
-    let wire = AdmissionRequestWire::Register {
-        scope: request.authority().ingress_scope().digest(),
-        admission: request.admission().to_canonical_bytes().map_err(|_| ())?,
-        authority: request.authority().into(),
-    };
+    let scope = request.authority().ingress_scope().digest();
+    let admission = request.admission().to_canonical_bytes().map_err(|_| ())?;
+    let authority = request.authority().into();
     let canonical = if profile == Profile::v1() {
-        encode_admission_request(&wire)?
+        encode_admission_request(&AdmissionRequestWire::Register {
+            scope,
+            admission,
+            authority,
+        })?
     } else if profile == Profile::v2() {
-        encode_admission_request_v2(&wire)?
+        encode_admission_request_v2(&AdmissionRequestWireV2::Register {
+            scope,
+            admission,
+            authority,
+        })?
     } else {
         return Err(());
     };
@@ -1014,17 +1048,28 @@ fn admission_capsule_for_recovery(
     request: &RecoveryRequest,
     profile: Profile,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ()> {
-    let wire = AdmissionRequestWire::Recover {
-        scope: request.lookup().scope().digest(),
-        roster_id: request.lookup().roster_id(),
-        original_owner: request.original_owner().clone(),
-        original_admission_fence: request.original_admission_fence(),
-        authority: request.authority().into(),
-    };
+    let scope = request.lookup().scope().digest();
+    let roster_id = request.lookup().roster_id();
+    let original_owner = request.original_owner().clone();
+    let original_admission_fence = request.original_admission_fence();
+    let authority = request.authority().into();
     let canonical = if profile == Profile::v1() {
-        encode_admission_request(&wire)?
+        encode_admission_request(&AdmissionRequestWire::Recover {
+            scope,
+            roster_id,
+            original_owner,
+            original_admission_fence,
+            authority,
+        })?
     } else if profile == Profile::v2() {
-        encode_admission_request_v2(&wire)?
+        encode_admission_request_v2(&AdmissionRequestWireV2::Recover {
+            scope,
+            roster_id,
+            original_key: request.original_key().ok_or(())?.clone(),
+            original_owner,
+            original_admission_fence,
+            authority,
+        })?
     } else {
         return Err(());
     };
@@ -1246,7 +1291,7 @@ fn encode_terminal_request(wire: &TerminalRequestWire) -> Result<Vec<u8>, ()> {
     .map_err(|_| ())
 }
 
-fn encode_admission_request_v2(wire: &AdmissionRequestWire) -> Result<Vec<u8>, ()> {
+fn encode_admission_request_v2(wire: &AdmissionRequestWireV2) -> Result<Vec<u8>, ()> {
     encode_frame(
         ADMISSION_REQUEST_V2_MAGIC,
         ADMISSION_REQUEST_V2_DOMAIN,
@@ -2068,11 +2113,11 @@ mod tests {
     }
 
     const PROFILE_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR: &[u8] = concat!(
-        "admission-request-v2=postcard-frame,magic:OPCRPA2\\0,domain:admission-port/profile-v2/request/v1,wire:AdmissionRequestWire(register:scope,admission,authority|recover:scope,roster-id,original-owner,original-admission-fence,authority)\n",
+        "admission-request-v2=postcard-frame,magic:OPCRPA2\\0,domain:admission-port/profile-v2/request/v1,wire:AdmissionRequestWireV2(register@0:scope,admission,authority|legacy-unbound-recover@1:refused|recover@2:scope,roster-id,original-key,original-owner,original-admission-fence,authority)\n",
         "admission-response-v2=postcard-frame,magic:OPCRPS2\\0,domain:admission-port/profile-v2/response/v1,wire:AdmissionResponseWireV2(fresh:scope,registration,profile-v2-admission-provenance|replayed:scope|poll-admitted:scope,registration,admission,profile-v2-admission-provenance|terminal:scope,registration,admission,committed,profile-v2-admission-provenance|compacted:scope,history-epoch,profile-v2-terminal-conflict-tombstone|reject:scope,rejection)\n",
         "terminal-request-v2=postcard-frame,magic:OPCRPT2\\0,domain:terminal-port/profile-v2/request/v1,wire:TerminalRequestWireV2(scope,binding,registration,authority,record,profile-v2-admission-provenance,generic-compact-terminal-evidence),no-v1-bundle-or-voter-ingress\n",
         "terminal-response-v2=postcard-frame,magic:OPCRPU2\\0,domain:terminal-port/profile-v2/response/v1,wire:TerminalResponseWireV2(terminalized:scope,committed|replayed:scope,committed|admitted:scope|compacted:scope,history-epoch,profile-v2-terminal-conflict-tombstone|reject:scope,rejection),no-v1-tombstone\n",
-        "bounds=admission-capsule,terminal-v2-capsule,terminal-v2-hello-frame,port-envelope-overhead;response=profile-v2-frames-only,no-v1-frame-probe\n"
+        "bounds=admission-capsule,terminal-v2-capsule,terminal-v2-hello-frame,port-envelope-overhead;response=profile-v2-frames-only,no-v1-frame-probe;rejection=history-unavailable@15\n"
     )
     .as_bytes();
 
@@ -2209,6 +2254,12 @@ mod tests {
                 ClientError::AdmissionRecordMissing,
             ),
             (
+                SessionConsumerRosterRejection::HistoryUnavailable,
+                BackendRejection::HistoryUnavailable,
+                ExecutorError::RecoveryHistoryUnavailable,
+                ClientError::RecoveryHistoryUnavailable,
+            ),
+            (
                 SessionConsumerRosterRejection::GenerationConflict,
                 BackendRejection::GenerationConflict,
                 ExecutorError::AdmissionGenerationConflict,
@@ -2285,6 +2336,24 @@ mod tests {
                     assert_eq!(ClientError::from(executor), client);
                 }
                 _ => panic!("rejection response must not decode as an admission"),
+            }
+            let response_v2 = encode_frame(
+                ADMISSION_RESPONSE_V2_MAGIC,
+                ADMISSION_RESPONSE_V2_DOMAIN,
+                &AdmissionResponseWireV2::Reject {
+                    scope: scope.digest(),
+                    rejection,
+                },
+                MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .unwrap();
+            match decode_admission_response_v2(&response_v2, scope, None).unwrap() {
+                RegistrationDecision::Reject(actual) => {
+                    assert_eq!(actual, backend);
+                    assert_eq!(ExecutorError::from(actual), executor);
+                    assert_eq!(ClientError::from(executor), client);
+                }
+                _ => panic!("V2 rejection must remain a rejection through the public mapping"),
             }
         }
     }

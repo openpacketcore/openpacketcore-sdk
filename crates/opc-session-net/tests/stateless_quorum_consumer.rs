@@ -10098,6 +10098,7 @@ async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absenc
     let sequences_before_recovery = fleet.application_sequences().await;
     let recovery = AbsentRecoveryInput::new(
         roster_id,
+        key.clone(),
         owner.clone(),
         original_lease.fence(),
         successor.clone(),
@@ -10185,8 +10186,14 @@ async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absenc
         "the successor lease converges before the read-only stale-recovery probe",
     );
     let sequences_before_stale_recovery = fleet.application_sequences().await;
-    let stale = AbsentRecoveryInput::new(roster_id, owner, original_lease.fence(), expired)
-        .expect("expired V2 Aborted recovery input is syntactically valid");
+    let stale = AbsentRecoveryInput::new(
+        roster_id,
+        key.clone(),
+        owner,
+        original_lease.fence(),
+        expired,
+    )
+    .expect("expired V2 Aborted recovery input is syntactically valid");
     assert!(matches!(
         client.recover_absent(&stale).await,
         Err(RosterClientError::AuthorityRejected)
@@ -10485,9 +10492,24 @@ async fn persistent_three_voter_v2_absent_roster_tenant_scope_isolation_preserve
             }
         }
     }
-    let cross_tenant_recovery =
-        AbsentRecoveryInput::new(roster_id, owner_a.clone(), lease_a.fence(), lease_b.clone())
-            .expect("syntactically valid cross-tenant recovery input");
+    assert!(matches!(
+        AbsentRecoveryInput::new(
+            roster_id,
+            lease_a.key().clone(),
+            owner_a.clone(),
+            lease_a.fence(),
+            lease_b.clone(),
+        ),
+        Err(RosterClientError::AuthorityRejected)
+    ));
+    let cross_tenant_recovery = AbsentRecoveryInput::new(
+        roster_id,
+        lease_b.key().clone(),
+        owner_a.clone(),
+        lease_a.fence(),
+        lease_b.clone(),
+    )
+    .expect("syntactically valid cross-tenant recovery input");
     assert!(matches!(
         client_b.recover_absent(&cross_tenant_recovery).await,
         Err(RosterClientError::AuthorityRejected)

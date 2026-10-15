@@ -580,6 +580,8 @@ pub enum SessionConsumerRosterRejection {
     Unavailable,
     /// Admission required exact row absence but an authoritative row exists.
     RecordAlreadyExists,
+    /// A missing V2 recovery slot may belong to retired terminal history.
+    HistoryUnavailable,
 }
 
 /// Exact safe outcome of the sole admission mutation.

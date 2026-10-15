@@ -14134,6 +14134,7 @@ pub(crate) struct ProtectedRosterTerminalRead {
 #[derive(Clone)]
 pub(crate) enum ProtectedRosterV2ReadResult {
     Missing,
+    HistoryUnavailable,
     Admitted(Box<ProtectedRosterV2LiveRead>),
     Terminalized(Box<ProtectedRosterV2TerminalRead>),
     Compacted {
@@ -54998,12 +54999,27 @@ mod tests {
                 successor,
             ),
         )
+        .and_then(|request| request.bind_original_key(fixture.authority.key().clone()))
         .unwrap();
         let read = read_protected_roster_v2_recovery_sync(&conn, identity, &recovery, due)
             .expect("verified successor can read the retired namespace");
         assert!(
             !matches!(read, ProtectedRosterV2ReadResult::Missing),
             "a retired committed admission must never be reported as verified missing"
+        );
+        assert!(matches!(
+            read,
+            ProtectedRosterV2ReadResult::HistoryUnavailable
+        ));
+        assert!(
+            read_protected_roster_v2_recovery_sync(
+                &conn,
+                identity,
+                &recovery,
+                due.add_seconds(61).unwrap(),
+            )
+            .is_err(),
+            "expired authority is refused before history classification"
         );
     }
 
@@ -55737,6 +55753,7 @@ mod tests {
                 successor.clone(),
             ),
         )
+        .and_then(|request| request.bind_original_key(fixture.authority.key().clone()))
         .expect("construct compact V2 successor recovery");
         assert!(matches!(
             read_protected_roster_v2_recovery_sync(
@@ -55884,6 +55901,7 @@ mod tests {
                 denied.clone(),
             ),
         )
+        .and_then(|request| request.bind_original_key(fixture.authority.key().clone()))
         .expect("construct V2 recovery request");
         let present_recovery = read_protected_roster_v2_recovery_sync(
             &conn,

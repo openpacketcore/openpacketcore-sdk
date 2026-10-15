@@ -23,7 +23,7 @@ use super::{
     },
 };
 use async_trait::async_trait;
-use opc_session_store::{FenceToken, Generation, LeaseGuard, OwnerId};
+use opc_session_store::{FenceToken, Generation, LeaseGuard, OwnerId, SessionKey};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, sync::Arc};
 
@@ -35,8 +35,11 @@ pub enum ClientError {
     InvalidInput,
     /// The current lease or scope did not authorize the requested operation.
     AuthorityRejected,
-    /// Admission found no authoritative session record at the expected key.
+    /// Admission found no authoritative session record, or successor recovery
+    /// verified a missing V2 admission before any terminal history retirement.
     AdmissionRecordMissing,
+    /// The V2 slot is absent, but retired history prevents proving non-admission.
+    RecoveryHistoryUnavailable,
     /// Admission required exact row absence but an authoritative row exists.
     AdmissionRecordAlreadyExists,
     /// Admission's expected generation did not match the authoritative record.
@@ -69,6 +72,7 @@ impl fmt::Display for ClientError {
             Self::InvalidInput => "invalid protected roster input",
             Self::AuthorityRejected => "protected roster authority rejected",
             Self::AdmissionRecordMissing => "protected roster admission record missing",
+            Self::RecoveryHistoryUnavailable => "protected roster recovery history unavailable",
             Self::AdmissionRecordAlreadyExists => {
                 "protected roster admission record already exists"
             }
@@ -114,6 +118,7 @@ impl From<ExecutorError> for ClientError {
             | ExecutorError::AttestationUnavailable
             | ExecutorError::BackendUnavailable => Self::Unavailable,
             ExecutorError::AdmissionRecordMissing => Self::AdmissionRecordMissing,
+            ExecutorError::RecoveryHistoryUnavailable => Self::RecoveryHistoryUnavailable,
             ExecutorError::AdmissionRecordAlreadyExists => Self::AdmissionRecordAlreadyExists,
             ExecutorError::AdmissionGenerationConflict => Self::AdmissionGenerationConflict,
             ExecutorError::AdmissionGenerationExhausted => Self::AdmissionGenerationExhausted,
@@ -297,6 +302,7 @@ impl AdmissionInput {
         }
         AbsentRecoveryInput::new(
             self.roster_id(),
+            self.lease.key().clone(),
             self.lease.owner().clone(),
             self.lease.fence(),
             lease,
@@ -439,6 +445,7 @@ impl<'de> Deserialize<'de> for RecoveryInput {
 pub struct AbsentRecoveryInput {
     profile: Profile,
     roster_id: RosterId,
+    original_key: SessionKey,
     original_owner: OwnerId,
     original_admission_fence: FenceToken,
     lease: LeaseGuard,
@@ -446,17 +453,23 @@ pub struct AbsentRecoveryInput {
 
 impl AbsentRecoveryInput {
     /// Construct recovery for an absent-predecessor admission under a current,
-    /// higher lease guard.
+    /// higher lease guard for the original business key. The original key is
+    /// retained provenance; it must not be replaced with the successor's key.
     pub fn new(
         roster_id: RosterId,
+        original_key: SessionKey,
         original_owner: OwnerId,
         original_admission_fence: FenceToken,
         lease: LeaseGuard,
     ) -> Result<Self, ClientError> {
         validate_recovery_authority(original_admission_fence, &lease)?;
+        if lease.key() != &original_key {
+            return Err(ClientError::AuthorityRejected);
+        }
         Ok(Self {
             profile: Profile::v2(),
             roster_id,
+            original_key,
             original_owner,
             original_admission_fence,
             lease,
@@ -482,6 +495,7 @@ impl AbsentRecoveryInput {
                 LeaseMetadata::new(self.lease.acquired_at(), self.lease.expires_at()),
             ),
         )
+        .and_then(|request| request.bind_original_key(self.original_key.clone()))
         .map_err(Into::into)
     }
 }
@@ -497,6 +511,7 @@ impl fmt::Debug for AbsentRecoveryInput {
 struct AbsentRecoveryInputWire {
     profile: Profile,
     roster_id: RosterId,
+    original_key: SessionKey,
     original_owner: OwnerId,
     original_admission_fence: FenceToken,
     lease: LeaseGuard,
@@ -510,6 +525,7 @@ impl<'de> Deserialize<'de> for AbsentRecoveryInput {
         }
         Self::new(
             wire.roster_id,
+            wire.original_key,
             wire.original_owner,
             wire.original_admission_fence,
             wire.lease,
@@ -552,6 +568,7 @@ impl fmt::Debug for AdmissionOutcome {
 pub struct AdmissionUnknown {
     profile: Profile,
     roster_id: RosterId,
+    original_key: SessionKey,
     original_owner: OwnerId,
     original_admission_fence: FenceToken,
 }
@@ -588,6 +605,7 @@ impl AdmissionUnknown {
         }
         AbsentRecoveryInput::new(
             self.roster_id,
+            self.original_key,
             self.original_owner,
             self.original_admission_fence,
             lease,
@@ -1559,6 +1577,7 @@ impl FencedMutationRosterClient {
                 Ok(AdmissionOutcome::OutcomeUnknown(AdmissionUnknown {
                     profile: input.proposal.profile(),
                     roster_id: input.roster_id(),
+                    original_key: input.lease.key().clone(),
                     original_owner: input.lease.owner().clone(),
                     original_admission_fence: input.lease.fence(),
                 }))
@@ -1588,16 +1607,28 @@ impl FencedMutationRosterClient {
     /// higher-fence guard.
     ///
     /// The backend verifies the committed successor lease for the exact scope
-    /// and business key before returning [`ClientError::AdmissionRecordMissing`].
+    /// and retained original business key before returning
+    /// [`ClientError::AdmissionRecordMissing`]. Both the recovery input and the
+    /// authenticated V2 request carry that key and reject a different lease key.
     /// Once that strictly higher fence is current, an admission using the
     /// original authority cannot commit later, including a delayed request
     /// submitted before the successor lease committed. Admission validates the
     /// live authority again at consensus application; the exclusion survives
     /// restart. Thus this verified successor-fenced missing result can conclude
-    /// an ambiguous original admission. It is neither an Aborted receipt nor
-    /// evidence of member non-execution, and grants no member or publication
-    /// authority. Unavailable, timeout and authority-refusal results do not
-    /// establish this missing result.
+    /// an ambiguous original admission.
+    ///
+    /// Retirement deletes stable slots. If the durable global witness records
+    /// any retired terminal history, an absent slot instead returns
+    /// [`ClientError::RecoveryHistoryUnavailable`], including an unrelated roster
+    /// that never committed. The witness cannot identify which absent roster
+    /// retired. This restriction survives restart; exact retained and compacted
+    /// results remain readable. No absence result bypasses this restriction.
+    ///
+    /// Verified missing is neither an Aborted receipt nor evidence of member
+    /// non-execution, and grants no member or publication authority. History
+    /// unavailable, [`ClientError::RecoveryRequired`], unavailable, timeout and
+    /// authority-refusal results do not establish missing. Original-authority
+    /// [`Self::admission_status`] missing remains `RecoveryRequired`.
     pub async fn recover_absent(
         &self,
         input: &AbsentRecoveryInput,
@@ -2165,6 +2196,7 @@ mod tests {
         let unknown = AdmissionUnknown {
             profile: Profile::v2(),
             roster_id: v2_proposal().roster_id(),
+            original_key: original.key().clone(),
             original_owner: original.owner().clone(),
             original_admission_fence: original.fence(),
         };
@@ -2175,6 +2207,36 @@ mod tests {
             ),
             "the ambiguity handle must retain the original business key"
         );
+    }
+
+    #[test]
+    fn absent_recovery_wire_preserves_and_requires_the_original_business_key() {
+        let input = AbsentRecoveryInput::new(
+            v2_proposal().roster_id(),
+            lease().key().clone(),
+            lease().owner().clone(),
+            FenceToken::new(1),
+            lease(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&input).unwrap();
+        let decoded: AbsentRecoveryInput = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.original_key, *lease().key());
+        assert_eq!(
+            decoded
+                .request(Scope::from_digest([0x51; 32]))
+                .unwrap()
+                .original_key(),
+            Some(lease().key())
+        );
+
+        let mut wrong_key = wire.clone();
+        wrong_key["original_key"]["stable_id"] = serde_json::json!([2]);
+        assert!(serde_json::from_value::<AbsentRecoveryInput>(wrong_key).is_err());
+        let mut unbound = wire;
+        unbound.as_object_mut().unwrap().remove("original_key");
+        assert!(serde_json::from_value::<AbsentRecoveryInput>(unbound).is_err());
+        assert_eq!(format!("{input:?}"), "AbsentRecoveryInput(<redacted>)");
     }
 
     #[tokio::test]
@@ -2216,6 +2278,7 @@ mod tests {
         ));
         let recovery = AbsentRecoveryInput::new(
             admission.roster_id(),
+            lease().key().clone(),
             lease().owner().clone(),
             FenceToken::new(1),
             lease(),
@@ -2228,6 +2291,7 @@ mod tests {
         let unknown = AdmissionUnknown {
             profile: Profile::v2(),
             roster_id: admission.roster_id(),
+            original_key: lease().key().clone(),
             original_owner: lease().owner().clone(),
             original_admission_fence: FenceToken::new(1),
         };
@@ -2300,6 +2364,7 @@ mod tests {
     fn absent_recovery_wire_round_trips_v2_and_rejects_cross_profile_decode() {
         let absent = AbsentRecoveryInput::new(
             RosterId::from_bytes([0x71; 16]).expect("nonzero absent roster ID"),
+            lease().key().clone(),
             lease().owner().clone(),
             FenceToken::new(1),
             lease(),

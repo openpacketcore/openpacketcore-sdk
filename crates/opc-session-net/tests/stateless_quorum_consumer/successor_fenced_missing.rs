@@ -116,6 +116,7 @@ async fn public_v2_verified_missing_excludes_delayed_original_admission_after_fu
             assert!(successor.fence() > original.fence());
             let current = AbsentRecoveryInput::new(
                 roster_id,
+                key.clone(),
                 original.owner().clone(),
                 original.fence(),
                 successor,

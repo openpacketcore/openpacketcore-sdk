@@ -13627,7 +13627,17 @@ impl ConsensusSessionConsumerService {
             ProtectedRosterV2ReadResult::Missing => {
                 return roster_admission_read_rejected(
                     recovery,
-                    SessionConsumerRosterRejection::RecoveryRequired,
+                    if recovery {
+                        SessionConsumerRosterRejection::RecordMissing
+                    } else {
+                        SessionConsumerRosterRejection::RecoveryRequired
+                    },
+                );
+            }
+            ProtectedRosterV2ReadResult::HistoryUnavailable => {
+                return roster_admission_read_rejected(
+                    recovery,
+                    SessionConsumerRosterRejection::HistoryUnavailable,
                 );
             }
             ProtectedRosterV2ReadResult::Admitted(live) => {
@@ -15999,7 +16009,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 // V2's status response has the same externally retained terminal bytes,
                 // but its backend selection and evidence are profile-isolated.
                 match read {
-                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Missing => reject(SessionConsumerRosterRejection::RecoveryRequired),
+                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Missing | crate::sqlite::consensus::ProtectedRosterV2ReadResult::HistoryUnavailable => reject(SessionConsumerRosterRejection::RecoveryRequired),
                     crate::sqlite::consensus::ProtectedRosterV2ReadResult::Admitted(live) => match decoded.into_terminal_request(&live.admission).and_then(|_| encode_terminal_admitted_response_v2(request.scope()).map_err(|_| crate::fenced_mutation_roster_transport::ProtectedRosterTransportError)) {
                         Ok(capsule) => SessionConsumerResponse::FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse::Recorded(capsule)),
                         Err(_) => reject(SessionConsumerRosterRejection::Malformed),
@@ -24579,6 +24589,18 @@ mod membership_tests {
             service.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, true);
         let original =
             service.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, false);
+        assert!(matches!(
+            service.roster_read_response_v2(
+                scope,
+                ProtectedRosterV2ReadResult::HistoryUnavailable,
+                true,
+            ),
+            SessionConsumerResponse::FencedMutationRosterRecover(
+                SessionConsumerRosterAdmissionReadResponse::Rejected(
+                    SessionConsumerRosterRejection::HistoryUnavailable
+                )
+            )
+        ));
         assert!(matches!(
             original,
             SessionConsumerResponse::FencedMutationRosterAdmissionStatus(
