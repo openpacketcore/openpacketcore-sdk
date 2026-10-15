@@ -7,6 +7,9 @@
 #[path = "fenced_non_execution/accepted.rs"]
 mod accepted;
 
+#[path = "fenced_non_execution/established.rs"]
+mod established;
+
 use super::*;
 use opc_ipsec_xfrm::{
     InstallPolicyRequest, IpAddress, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
@@ -27,6 +30,13 @@ use opc_session_store::fenced_mutation_roster::{
 
 const WIDTH: u8 = 3;
 
+#[derive(Clone, Copy)]
+enum SettlementExecution {
+    None,
+    LoseAcknowledgement(u8),
+    Conclusive,
+}
+
 struct RetainedMember {
     member: Member,
     group: XfrmObjectRosterGroupId,
@@ -42,7 +52,7 @@ struct XfrmSettlementProvider {
     executions: AtomicUsize,
     reconciliations: AtomicUsize,
     compensations: AtomicUsize,
-    run_member: Option<u8>,
+    execution: SettlementExecution,
     ready: Mutex<std::collections::HashMap<u8, XfrmObjectRosterAdmissionAuthority>>,
     bindings: Mutex<std::collections::HashMap<u8, [u8; 32]>>,
     observations: Mutex<Vec<(u8, &'static str)>>,
@@ -54,7 +64,7 @@ impl XfrmSettlementProvider {
         issuer: Arc<ProductionRosterAttestationIssuer>,
         width: u8,
         backend: LinuxXfrmBackend,
-        run_member: Option<u8>,
+        execution: SettlementExecution,
     ) -> Arc<Self> {
         let root = tempfile::tempdir().expect("private durable provider directory");
         let (actor, store) = backend
@@ -115,7 +125,7 @@ impl XfrmSettlementProvider {
             executions: AtomicUsize::new(0),
             reconciliations: AtomicUsize::new(0),
             compensations: AtomicUsize::new(0),
-            run_member,
+            execution,
             ready: Mutex::new(std::collections::HashMap::new()),
             bindings: Mutex::new(std::collections::HashMap::new()),
             observations: Mutex::new(Vec::new()),
@@ -276,7 +286,9 @@ impl MemberProvider for XfrmSettlementProvider {
             .map_err(|_| ())?;
         // The positive control models losing a prepared, never-run owner.
         // Dropping the affine authority permits ordinary zero-effect recovery.
-        if self.run_member == Some(call.ordinal()) {
+        if matches!(self.execution, SettlementExecution::Conclusive)
+            || matches!(self.execution, SettlementExecution::LoseAcknowledgement(ordinal) if ordinal == call.ordinal())
+        {
             self.ready
                 .lock()
                 .map_err(|_| ())?
@@ -300,6 +312,14 @@ impl MemberProvider for XfrmSettlementProvider {
             .run_durable_object_roster(authority)
             .await
             .map_err(|_| ())?;
+        if matches!(self.execution, SettlementExecution::Conclusive) {
+            return self.issuer.provider_receipt(
+                call,
+                RosterProviderOperationV1::Execute,
+                RosterProviderOutcomeV1::AppliedExecuted,
+                vec![0xB4, call.ordinal()],
+            );
+        }
         // The effect is durable, but its SDK acknowledgement is deliberately lost.
         Ok(ProviderCallOutcome::outcome_unknown())
     }
@@ -369,6 +389,24 @@ impl SettlementFixture {
         backend: LinuxXfrmBackend,
         run_member: Option<u8>,
     ) -> Self {
+        Self::start_with_execution(
+            lose_admission,
+            width,
+            backend,
+            run_member.map_or(
+                SettlementExecution::None,
+                SettlementExecution::LoseAcknowledgement,
+            ),
+        )
+        .await
+    }
+
+    async fn start_with_execution(
+        lose_admission: bool,
+        width: u8,
+        backend: LinuxXfrmBackend,
+        execution: SettlementExecution,
+    ) -> Self {
         let pki = Arc::new(TestPki::new());
         let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
             Arc::clone(&pki),
@@ -429,7 +467,7 @@ impl SettlementFixture {
             voter_authority,
         );
         let shutdown_client = persistent.clone();
-        let provider = XfrmSettlementProvider::new(issuer, width, backend, run_member);
+        let provider = XfrmSettlementProvider::new(issuer, width, backend, execution);
         let adapter = persistent
             .into_fenced_mutation_roster_v2_provider_adapter(
                 Arc::clone(&provider),

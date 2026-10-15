@@ -130,6 +130,232 @@ mod fenced_non_execution {
             .is_ok_and(XfrmObjectRosterFenceObservation::closed_without_effect)
     }
 
+    #[derive(Debug, Clone)]
+    struct InstalledGateTransport {
+        inner: RecordingSuccessTransport,
+        installed: Arc<EffectGate>,
+    }
+
+    impl LinuxXfrmTransport for InstalledGateTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            class: crate::linux::NetlinkOperationClass,
+            request: &[u8],
+            sequence: u32,
+            config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            let result = self
+                .inner
+                .transact(operation, class, request, sequence, config);
+            if operation == "install_sa" {
+                self.installed.hold();
+            }
+            result
+        }
+
+        fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    async fn run_across_forced_store_contention(after_install: bool) {
+        let root = DurableTestRoot::new();
+        let installed = Arc::new(EffectGate::default());
+        let _installed_release = ReleaseOnDrop(Arc::clone(&installed));
+        if !after_install {
+            installed.release();
+        }
+        let transport = InstalledGateTransport {
+            inner: RecordingSuccessTransport::default(),
+            installed: Arc::clone(&installed),
+        };
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xB7);
+        let group = roster_group(0xB8);
+        let generation = roster_generation(37);
+        let roster = sa_roster(1);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        let mut authority = Some(authority);
+        let held = Arc::new(EffectGate::default());
+        let contended = Arc::new(EffectGate::default());
+        let _held_release = ReleaseOnDrop(Arc::clone(&held));
+        let _contention_release = ReleaseOnDrop(Arc::clone(&contended));
+        let run = if after_install {
+            let actor = backend.clone();
+            let authority = authority.take().unwrap();
+            let run = tokio::spawn(async move { actor.run_durable_object_roster(authority).await });
+            installed.wait_entered().await;
+            Some(run)
+        } else {
+            None
+        };
+        let holder = std::thread::spawn({
+            let store = store.clone();
+            let held = Arc::clone(&held);
+            move || {
+                let _lock = store.hold_process_lock_for_test();
+                held.hold();
+            }
+        });
+        held.wait_entered().await;
+        store.on_next_lease_contention_for_test({
+            let contended = Arc::clone(&contended);
+            Arc::new(move || contended.hold())
+        });
+        let run = match run {
+            Some(run) => {
+                installed.release();
+                run
+            }
+            None => {
+                let actor = backend.clone();
+                let authority = authority.take().unwrap();
+                tokio::spawn(async move { actor.run_durable_object_roster(authority).await })
+            }
+        };
+        contended.wait_entered().await;
+        held.release();
+        holder.join().unwrap();
+        contended.release();
+        let outcome = run.await.unwrap();
+        assert!(
+            outcome
+                .as_ref()
+                .is_ok_and(|outcome| outcome.as_str() == "applied"),
+            "store contention must preserve the run and its affine authority: {outcome:?}"
+        );
+        assert_eq!(
+            backend
+                .finalize_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
+        assert_eq!(
+            transport
+                .inner
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_lock_contention_before_run_preserves_authority() {
+        run_across_forced_store_contention(false).await;
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_lock_contention_after_install_completes_publication() {
+        run_across_forced_store_contention(true).await;
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_full_store_closes_absent_members_without_a_live_slot() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xBA);
+        let generation = roster_generation(37);
+        let mut admissions = Vec::new();
+        for index in 0..30 {
+            let prepared_group = roster_group(u8::try_from(index + 1).unwrap());
+            let absent_group = roster_group(u8::try_from(index + 101).unwrap());
+            let prepared = settlement_roster(
+                &store,
+                XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(
+                    roster_sa_request(index),
+                )])
+                .unwrap(),
+            );
+            let absent = settlement_roster(
+                &store,
+                XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(
+                    roster_policy_request(index),
+                )])
+                .unwrap(),
+            );
+            drop(
+                backend
+                    .prepare_durable_object_roster(
+                        &store,
+                        prepared_group,
+                        generation,
+                        prepared.clone(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            admissions.push((prepared_group, absent_group, prepared, absent));
+        }
+        let publications = store.publication_ledger().unwrap().len();
+        for (prepared_group, absent_group, prepared, absent) in admissions {
+            let before = store.publication_ledger().unwrap().len();
+            let closed =
+                close_generation(&backend, &store, absent_group, generation, &absent).await;
+            assert!(
+                closed_without_effect(&closed),
+                "a full store must close absence without a slot: {closed:?}"
+            );
+            assert_eq!(store.publication_ledger().unwrap().len(), before);
+            assert!(closed_without_effect(
+                &close_generation(&backend, &store, prepared_group, generation, &prepared).await
+            ));
+            release_settled(&backend, &store, prepared_group, generation, &prepared)
+                .await
+                .unwrap();
+            release_settled(&backend, &store, absent_group, generation, &absent)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.publication_ledger().unwrap().len(), publications + 60);
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, roster_group(0xFE), generation, sa_roster(1))
+                .await
+                .unwrap(),
+        );
+        assert!(transport.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_reset_applied_held_finalizes_as_retired() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xBB);
+        let group = roster_group(0xBC);
+        let generation = roster_generation(37);
+        let roster = settlement_roster(&store, sa_roster(1));
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .run_durable_object_roster(authority)
+                .await
+                .unwrap()
+                .as_str(),
+            "applied"
+        );
+        store.reset_after_namespace_empty().unwrap();
+        assert_eq!(
+            backend
+                .finalize_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap(),
+            XfrmObjectRosterDurablePhase::Retired
+        );
+        release_settled(&backend, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(!transport.operations().contains(&"remove_sa"));
+    }
+
     #[tokio::test]
     async fn fenced_non_execution_preserves_ordinary_unstarted_recovery() {
         let root = DurableTestRoot::new();

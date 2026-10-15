@@ -1594,6 +1594,8 @@ struct StoreInner {
     // delayed prepare cannot reuse a row removed by the next publication.
     released: Mutex<ReleasedBindings>,
     #[cfg(test)]
+    lease_contention_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     ledger: Mutex<Vec<XfrmObjectRosterPublication>>,
     #[cfg(test)]
     physical_barriers: Mutex<usize>,
@@ -1877,6 +1879,8 @@ impl XfrmObjectRosterRecoveryStore {
             journal_enabled: false,
             process_lock: Mutex::new(()),
             released: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            lease_contention_hook: Mutex::new(None),
             #[cfg(test)]
             ledger: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2687,19 +2691,44 @@ impl XfrmObjectRosterRecoveryStore {
         if self.inner.owner_process_id == 0 || self.inner.owner_process_id != std::process::id() {
             return Err(XfrmObjectRosterDurableError::WrongIncarnation);
         }
-        let process_guard = self
-            .inner
-            .process_lock
-            .try_lock()
-            .map_err(|error| match error {
-                TryLockError::WouldBlock => XfrmObjectRosterDurableError::StoreBusy,
-                TryLockError::Poisoned(_) => XfrmObjectRosterDurableError::Storage,
-            })?;
+        let attempted = self.inner.process_lock.try_lock();
+        #[cfg(test)]
+        if matches!(&attempted, Err(TryLockError::WouldBlock)) {
+            let hook = self.inner.lease_contention_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let process_guard = attempted.map_err(|error| match error {
+            TryLockError::WouldBlock => XfrmObjectRosterDurableError::StoreBusy,
+            TryLockError::Poisoned(_) => XfrmObjectRosterDurableError::Storage,
+        })?;
         verify_visible_identity(&self.inner)?;
         Ok(StoreLease {
             store: &self.inner,
             _process_guard: process_guard,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_process_lock_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner.process_lock.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_next_lease_contention_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.lease_contention_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn settlement_bindings_for_test(&self) -> Vec<([u8; 16], u64)> {
+        self.inner
+            .released
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect()
     }
 }
 
@@ -7569,6 +7598,55 @@ mod tests {
             XfrmObjectRosterRecoveryStore::open_bound(root.path(), key(9), [7; 40]).unwrap_err(),
             XfrmObjectRosterDurableError::Malformed
         );
+    }
+
+    #[test]
+    fn settlement_memory_is_bounded_by_unsettled_bindings_over_ten_thousand_releases() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let unsettled = [(group(0x71), generation(1)), (group(0x72), generation(1))];
+        for (index, (group, generation)) in unsettled.iter().enumerate() {
+            opened
+                .prepare_with_retention(
+                    *group,
+                    *generation,
+                    &[distinct_material(100 + index)],
+                    true,
+                )
+                .unwrap();
+        }
+        let material = [distinct_material(0)];
+        let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+        for index in 1..=10_000 {
+            let generation = generation(index);
+            let prepared = opened
+                .prepare_with_retention(group(0x73), generation, &material, true)
+                .unwrap();
+            if index % 2 == 0 {
+                let applied = run_to_applied(&opened, &prepared, 1);
+                advance(
+                    &opened,
+                    &applied,
+                    XfrmObjectRosterDurablePhase::Applied,
+                    XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Committed, 1),
+                );
+            } else {
+                opened.fence(group(0x73), generation, &material).unwrap();
+            }
+            opened
+                .release_settlement(group(0x73), generation, fingerprint)
+                .unwrap();
+            opened
+                .release_settlement(group(0x73), generation, fingerprint)
+                .unwrap();
+            let entries = opened.settlement_bindings_for_test();
+            assert!(entries.iter().all(|entry| unsettled.iter().any(|(group, generation)| *entry == (group.0, generation.get()))),
+                "every in-memory settlement entry must belong to unsettled work after release {index}; retained entries={entries:?}");
+            assert!(opened
+                .prepare_with_retention(group(0x73), generation, &material, true)
+                .is_err());
+        }
+        assert_eq!(opened.settlement_bindings_for_test().len(), unsettled.len());
     }
 
     #[test]

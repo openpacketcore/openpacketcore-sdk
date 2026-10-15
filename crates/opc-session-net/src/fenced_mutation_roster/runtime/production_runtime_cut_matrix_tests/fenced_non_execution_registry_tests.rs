@@ -3,6 +3,186 @@
 
 use super::*;
 
+struct TerminalBoundaryProvider {
+    calls: AtomicUsize,
+    hold_execute: bool,
+    hold_reconcile: bool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl TerminalBoundaryProvider {
+    fn new(hold_execute: bool, hold_reconcile: bool) -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            hold_execute,
+            hold_reconcile,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl MemberProvider for TerminalBoundaryProvider {
+    type Error = ();
+
+    async fn prepare(&self, _: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderCallOutcome::prepared_not_run())
+    }
+
+    async fn execute(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.hold_execute {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        signed_provider_receipt(call, RosterProviderOutcomeV1::AppliedExecuted, vec![0xE1])
+    }
+
+    async fn status(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        signed_provider_receipt(call, RosterProviderOutcomeV1::AppliedAdopted, vec![0xE1])
+    }
+
+    async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        self.status(call).await
+    }
+
+    async fn reconcile_member(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.hold_reconcile {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        signed_provider_receipt(
+            call,
+            RosterProviderOutcomeV1::NotAppliedReconciled,
+            vec![0xE2],
+        )
+    }
+}
+
+fn terminal_boundary_executor(
+    provider: Arc<TerminalBoundaryProvider>,
+) -> RosterExecutor<TerminalBoundaryProvider, CutBackend> {
+    RosterExecutor::new(
+        provider,
+        Arc::new(CutBackend::default()),
+        CutAttestor::new(request().admission().scope()),
+        NonZeroUsize::new(4).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn fenced_non_execution_established_receipt_revokes_every_readback_provider_call() {
+    let provider = TerminalBoundaryProvider::new(false, false);
+    let executor = terminal_boundary_executor(Arc::clone(&provider));
+    let request = request_with_members(1);
+    let active = executor.register(request.clone()).await.unwrap();
+    let second = recovered(executor.admission_status(request.clone()).await.unwrap());
+    assert!(matches!(
+        executor.prepare(&active, 0).await.unwrap(),
+        CallResult::PreparedNotRun
+    ));
+    let applied = conclusive(executor.execute(&active, 0).await.unwrap());
+    let prepared = executor
+        .prepare_terminal(&active, vec![applied])
+        .await
+        .unwrap();
+    assert_eq!(
+        executor
+            .terminalize(&active, &prepared)
+            .await
+            .unwrap()
+            .phase(),
+        Phase::Established
+    );
+    assert!(matches!(
+        executor.admission_status(request).await.unwrap(),
+        RecoveryResult::Established(_)
+    ));
+    let before = provider.calls.load(Ordering::SeqCst);
+    let status = executor.status(&second, 0).await;
+    let adopt = executor.adopt(&second, 0).await;
+    let reconcile = executor.reconcile_member(&second, 0).await;
+    assert_eq!(provider.calls.load(Ordering::SeqCst), before,
+        "a terminal receipt must revoke provider dispatch through every earlier exact readback registration");
+    assert!(status.is_err() && adopt.is_err() && reconcile.is_err());
+}
+
+#[tokio::test]
+async fn fenced_non_execution_established_receipt_discards_reconcile_held_after_precheck() {
+    let provider = TerminalBoundaryProvider::new(false, true);
+    let executor = Arc::new(terminal_boundary_executor(Arc::clone(&provider)));
+    let request = request_with_members(1);
+    let active = executor.register(request.clone()).await.unwrap();
+    let second = Arc::new(recovered(executor.admission_status(request).await.unwrap()));
+    assert!(matches!(
+        executor.prepare(&active, 0).await.unwrap(),
+        CallResult::PreparedNotRun
+    ));
+    let applied = conclusive(executor.execute(&active, 0).await.unwrap());
+    let pending = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        let second = Arc::clone(&second);
+        async move { executor.reconcile_member(&second, 0).await }
+    });
+    provider.entered.notified().await;
+    let prepared = executor
+        .prepare_terminal(&active, vec![applied])
+        .await
+        .unwrap();
+    assert_eq!(
+        executor
+            .terminalize(&active, &prepared)
+            .await
+            .unwrap()
+            .phase(),
+        Phase::Established
+    );
+    provider.release.notify_one();
+    let result = pending.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Ok(CallResult::OutcomeUnknown) | Err(ExecutorError::OutcomeUnknown)
+        ),
+        "a signed result from a provider call held through terminal release must be discarded"
+    );
+    assert!(second.local.lock().unwrap().first_conclusive[0].is_none());
+}
+
+#[tokio::test]
+async fn fenced_non_execution_applied_acknowledgement_after_closure_stays_unknown() {
+    let provider = TerminalBoundaryProvider::new(true, false);
+    let executor = Arc::new(terminal_boundary_executor(Arc::clone(&provider)));
+    let request = request_with_members(1);
+    let active = Arc::new(executor.register(request.clone()).await.unwrap());
+    assert!(matches!(
+        executor.prepare(&active, 0).await.unwrap(),
+        CallResult::PreparedNotRun
+    ));
+    let second = recovered(executor.admission_status(request).await.unwrap());
+    let pending = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        let active = Arc::clone(&active);
+        async move { executor.execute(&active, 0).await }
+    });
+    provider.entered.notified().await;
+    assert!(matches!(
+        executor.reconcile_member(&second, 0).await.unwrap(),
+        CallResult::Conclusive(_)
+    ));
+    provider.release.notify_one();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Ok(CallResult::OutcomeUnknown) | Err(ExecutorError::OutcomeUnknown)
+    ));
+    assert!(active.local.lock().unwrap().first_conclusive[0].is_none());
+}
+
 struct ClosureProbeProvider {
     prepares: AtomicUsize,
     executions: AtomicUsize,
