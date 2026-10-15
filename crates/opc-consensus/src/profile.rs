@@ -284,7 +284,12 @@ pub fn durable_openraft_config(
 }
 
 /// The only asynchronous runtime used by durable SDK Openraft adapters.
+#[cfg(not(feature = "dangerous-test-hooks"))]
 pub type DurableOpenraftRuntime = openraft::TokioRuntime;
+
+/// Tokio with scoped election samples for deterministic test fixtures.
+#[cfg(feature = "dangerous-test-hooks")]
+pub type DurableOpenraftRuntime = crate::test_runtime::ScriptedElectionRuntime;
 
 #[cfg(test)]
 mod tests {

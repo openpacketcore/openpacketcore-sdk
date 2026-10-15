@@ -2689,6 +2689,7 @@ dependencies = [
  "p256 0.14.0",
  "postcard",
  "rand 0.10.3",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.11.0",
