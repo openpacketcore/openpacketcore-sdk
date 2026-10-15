@@ -277,10 +277,19 @@ mod fenced_non_execution {
         for index in 1..=29 {
             let unrelated = XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(
                 roster_policy_request(index),
-            )]).unwrap();
-            drop(backend.prepare_durable_object_roster(
-                &store, roster_group(index as u8), generation, unrelated,
-            ).await.unwrap());
+            )])
+            .unwrap();
+            drop(
+                backend
+                    .prepare_durable_object_roster(
+                        &store,
+                        roster_group(index as u8),
+                        generation,
+                        unrelated,
+                    )
+                    .await
+                    .unwrap(),
+            );
         }
         assert_eq!(backend.prepare_durable_object_roster(
             &store, roster_group(0xFA), generation, sa_roster(1),
@@ -327,8 +336,14 @@ mod fenced_non_execution {
                 tokio::time::resume();
                 expired
             };
-            assert!(expired, "the caller future is dropped at its original deadline");
-            assert_eq!(store.publication_ledger().unwrap().len(), publications_before);
+            assert!(
+                expired,
+                "the caller future is dropped at its original deadline"
+            );
+            assert_eq!(
+                store.publication_ledger().unwrap().len(),
+                publications_before
+            );
             held.release();
             holder.join().unwrap();
             contended.release();
@@ -337,7 +352,8 @@ mod fenced_non_execution {
                     let ledger = store.publication_ledger().unwrap();
                     if ledger.iter().skip(publications_before).any(|publication| {
                         if releasing {
-                            publication.class == crate::durable_roster::XfrmObjectRosterPublicationClass::Release
+                            publication.class
+                                == crate::durable_roster::XfrmObjectRosterPublicationClass::Release
                         } else {
                             publication.phase == XfrmObjectRosterDurablePhase::Closed
                         }
@@ -346,7 +362,9 @@ mod fenced_non_execution {
                     }
                     tokio::task::yield_now().await;
                 }
-            }).await.expect("accepted work publishes without another caller or retry");
+            })
+            .await
+            .expect("accepted work publishes without another caller or retry");
         }
         assert!(backend
             .prepare_durable_object_roster(&store, group, generation, roster)
