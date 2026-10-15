@@ -28,11 +28,13 @@ impl Drop for CompletionHold {
 enum ReplyFilter {
     AppendAtOrAfter(u64),
     GrantedVote,
+    ColdCut,
 }
 
 enum CapturedRequest {
     Append(AppendEntriesRequest<SessionRaftTypeConfig>),
     Vote(VoteRequest<SessionConsensusNodeId>),
+    ColdCut(ColdQuorumCut),
 }
 
 /// Exactly one actual successful response, retaining its original request.
@@ -46,7 +48,7 @@ pub(super) struct ReplyHold {
     delivered: tokio::sync::watch::Sender<bool>,
 }
 
-struct ReplyRelease(Arc<ReplyHold>);
+pub(super) struct ReplyRelease(Arc<ReplyHold>);
 
 impl ReplyRelease {
     fn new(peer: &Peer, sender: SessionConsensusNodeId, minimum_index: u64) -> Self {
@@ -55,6 +57,21 @@ impl ReplyRelease {
 
     fn vote(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
         Self::install(peer, sender, ReplyFilter::GrantedVote)
+    }
+
+    pub(super) fn cold_cut(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
+        Self::install(peer, sender, ReplyFilter::ColdCut)
+    }
+
+    pub(super) async fn wait_started(&self) {
+        self.0.entered.notified().await;
+    }
+
+    pub(super) fn cut(&self) -> ColdQuorumCut {
+        match self.0.captured.lock().unwrap().as_ref().unwrap() {
+            CapturedRequest::ColdCut(cut) => *cut,
+            _ => panic!("expected actual cold quorum cut"),
+        }
     }
 
     fn install(peer: &Peer, sender: SessionConsensusNodeId, filter: ReplyFilter) -> Self {
@@ -76,7 +93,7 @@ impl ReplyRelease {
         Self(hold)
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.0.release.send_replace(true);
     }
 }
@@ -91,14 +108,14 @@ impl ReplyHold {
     fn append(&self) -> AppendEntriesRequest<SessionRaftTypeConfig> {
         match self.captured.lock().unwrap().as_ref().unwrap() {
             CapturedRequest::Append(request) => request.clone(),
-            CapturedRequest::Vote(_) => panic!("expected actual append request"),
+            _ => panic!("expected actual append request"),
         }
     }
 
     fn vote(&self) -> VoteRequest<SessionConsensusNodeId> {
         match self.captured.lock().unwrap().as_ref().unwrap() {
             CapturedRequest::Vote(request) => request.clone(),
-            CapturedRequest::Append(_) => panic!("expected actual vote request"),
+            _ => panic!("expected actual vote request"),
         }
     }
 
@@ -154,6 +171,24 @@ impl ReplyHold {
                     return;
                 }
                 CapturedRequest::Vote(vote)
+            }
+            ReplyFilter::ColdCut => {
+                if request.family != SessionConsensusRpcFamily::ReadBarrier {
+                    return;
+                }
+                let Ok(cut) = decode_bounded::<ColdQuorumCut>(payload) else {
+                    return;
+                };
+                let wire = persistence_protocol::unwrap_payload(
+                    SessionPersistenceMode::Async,
+                    &request.payload,
+                )
+                .unwrap();
+                let barrier: persistence_protocol::ColdBarrierRequest =
+                    decode_bounded(wire).unwrap();
+                assert_eq!(cut.requester, request.sender);
+                assert!(cut.request == barrier);
+                CapturedRequest::ColdCut(cut)
             }
         };
         {

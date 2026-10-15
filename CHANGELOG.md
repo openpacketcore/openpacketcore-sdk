@@ -730,6 +730,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store` tests: isolate functional asynchronous snapshot install,
+  rejoin, persistence drain, replacement quarantine, and certification calls
+  from host scheduling delays. Real publication and quorum-reply holds verify
+  completion and corrupted-install storage errors, while direct deadline
+  controls retain exact 800 ms expiry and closed recovery admission. (#1291)
+
 - `opc-yanggen`: apply generated-code lint fixes to models without expanded
   scalars or keyed state lists. Check all warnings across 294 generated cases,
   preserve runtime assertions, and regenerate output digest pins for shared
