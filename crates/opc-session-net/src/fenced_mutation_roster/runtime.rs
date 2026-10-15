@@ -1804,7 +1804,12 @@ impl RegistrationAdmissionProvenance {
 }
 
 impl Registration {
-    #[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+    #[cfg(all(
+        test,
+        feature = "test-control",
+        target_os = "linux",
+        target_pointer_width = "64"
+    ))]
     pub(crate) fn retained_member_proof_count_for_test(&self) -> Result<usize, ExecutorError> {
         self.local
             .lock()
@@ -6426,6 +6431,7 @@ mod local_authority_registry_tests {
 #[cfg(test)]
 mod production_runtime_cut_matrix_tests {
     mod async_provider_authority_tests;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     mod fenced_non_execution_capacity_tests;
     mod fenced_non_execution_registry_tests;
 

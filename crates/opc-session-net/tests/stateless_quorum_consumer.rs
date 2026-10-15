@@ -2,7 +2,7 @@
 
 #![cfg(feature = "test-control")]
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[path = "stateless_quorum_consumer/fenced_non_execution.rs"]
 mod fenced_non_execution;
 #[path = "stateless_quorum_consumer/normal_forward_hold.rs"]

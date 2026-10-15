@@ -669,7 +669,12 @@ pub struct RecoveredRoster {
 }
 
 impl RecoveredRoster {
-    #[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+    #[cfg(all(
+        test,
+        feature = "test-control",
+        target_os = "linux",
+        target_pointer_width = "64"
+    ))]
     pub(crate) fn retained_member_proof_count_for_test(&self) -> Result<usize, ExecutorError> {
         self.registration.retained_member_proof_count_for_test()
     }
