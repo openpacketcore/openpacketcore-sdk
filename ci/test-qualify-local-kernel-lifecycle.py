@@ -3,6 +3,7 @@
 
 import copy
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
@@ -36,11 +37,250 @@ class CleanupTests(unittest.TestCase):
             "named_netns": [], "bpffs_entries": ["existing d 12"],
             "bpffs_mounts": [], "interfaces": ["lo", "eth0"],
         }
+        self.init = {"pid": 1, "ppid": 0, "start_time": 1, "state": "S", "comm": "init",
+                     "cgroup": ["0::/"], "namespaces": {"net": {}, "mnt": {}}}
 
     def run_cleanup(self):
         # Expected negative fixtures must not emit GitHub error annotations.
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                patch.object(os, "geteuid", return_value=0):
             return CLEANUP.main()
+
+    def owner_fixture(self, directory):
+        evidence = Path(directory)
+        baseline = json.dumps(self.before, indent=2) + "\n"
+        (evidence / "before.json").write_text(baseline)
+        (evidence / "ownership.json").write_text(json.dumps({
+            "version": 1, "id": "fixture-owner",
+            "baseline_sha256": hashlib.sha256(baseline.encode()).hexdigest(),
+        }))
+        (evidence / "run-fixture.json").write_text(json.dumps({
+            "version": 1, "owner_id": "fixture-owner", "status": "complete",
+            "root": {"pid": 10, "start_time": 100},
+            "command": ["qualification-fixture"], "exit_code": 0,
+            "survivors": [], "cleanup_passed": True,
+        }))
+
+    def test_unrelated_service_arrival_is_attributed_without_failing_cleanup(self):
+        after = copy.deepcopy(self.before)
+        after["net"].append("102")
+        after["mnt"].append("202")
+        service = {
+            "pid": 20, "ppid": 1, "start_time": 200, "state": "S",
+            "comm": "systemd-hostnamed",
+            "cgroup": ["0::/system.slice/systemd-hostnamed.service"],
+            "namespaces": {"net": {"102": ["task:20"]}, "mnt": {"202": ["task:20"]}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            with patch.object(CLEANUP, "snapshot", return_value=after), \
+                    patch.object(CLEANUP, "process_inventory", return_value=({1: self.init, 20: service}, []), create=True), \
+                    patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory]):
+                self.assertEqual(self.run_cleanup(), 0,
+                                 "an unrelated host service's namespaces are not qualification leaks")
+            result = json.loads((Path(directory) / "result.json").read_text())
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["differences"], {})
+            for kind, identity in [("net", "102"), ("mnt", "202")]:
+                attribution = result["namespace_owners"][kind][identity]
+                self.assertEqual(attribution["status"], "unrelated")
+                self.assertEqual(attribution["owners"][0]["pid"], 20)
+                self.assertEqual(attribution["owners"][0]["comm"], "systemd-hostnamed")
+
+    def test_qualification_child_namespace_still_fails_cleanup(self):
+        after = copy.deepcopy(self.before)
+        after["net"].append("102")
+        root = {"pid": 10, "ppid": 1, "start_time": 100, "state": "S",
+                "comm": "qualification-fixture", "cgroup": ["0::/qualification"],
+                "namespaces": {"net": {"100": ["task:10"]}, "mnt": {"200": ["task:10"]}}}
+        child = {"pid": 30, "ppid": 10, "start_time": 300, "state": "S",
+                 "comm": "leaked-child", "cgroup": ["0::/qualification"],
+                 "namespaces": {"net": {"102": ["task:30"]}, "mnt": {"200": ["task:30"]}}}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            with patch.object(CLEANUP, "snapshot", return_value=after), \
+                    patch.object(CLEANUP, "process_inventory", return_value=({10: root, 30: child}, []), create=True), \
+                    patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory]):
+                self.assertEqual(self.run_cleanup(), 1)
+            result = json.loads((Path(directory) / "result.json").read_text())
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["differences"]["net"]["added"], ["102"])
+            owner = result["namespace_owners"]["net"]["102"]["owners"][0]
+            self.assertEqual(owner["pid"], 30)
+            self.assertTrue(owner["qualification_owned"])
+
+    def verify_fixture(self, directory, after, processes=None, errors=None):
+        with patch.object(CLEANUP, "snapshot", return_value=after), \
+                patch.object(CLEANUP, "process_inventory", return_value=(processes or {}, errors or [])), \
+                patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory]):
+            code = self.run_cleanup()
+        return code, json.loads((Path(directory) / "result.json").read_text())
+
+    def test_reused_owner_pid_and_shared_cgroup_do_not_own_a_service(self):
+        after = copy.deepcopy(self.before)
+        after["net"].append("102")
+        service = {**self.init, "pid": 10, "ppid": 1, "start_time": 900,
+                   "comm": "other-process", "cgroup": ["0::/qualification"],
+                   "namespaces": {"net": {"102": ["task:10"]}, "mnt": {}}}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            code, result = self.verify_fixture(directory, after, {1: self.init, 10: service})
+            self.assertEqual(code, 0)
+            self.assertFalse(result["namespace_owners"]["net"]["102"]["owners"][0]["qualification_owned"])
+            # The same service can subsequently exit without invalidating cleanup.
+            self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+
+    def test_reparented_survivor_is_still_owned_and_failed_run_stays_failed(self):
+        after = copy.deepcopy(self.before)
+        after["net"].append("102")
+        child = {**self.init, "pid": 30, "ppid": 1, "start_time": 300,
+                 "namespaces": {"net": {"102": ["fd:30:7"]}, "mnt": {}}}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            path = Path(directory) / "run-fixture.json"
+            record = json.loads(path.read_text())
+            record.update(cleanup_passed=False, survivors=[{"pid": 30, "start_time": 300}])
+            path.write_text(json.dumps(record))
+            code, result = self.verify_fixture(directory, after, {1: self.init, 30: child})
+            self.assertEqual(code, 1)
+            self.assertEqual(result["namespace_owners"]["net"]["102"]["status"], "qualification")
+            self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
+
+    def test_missing_or_racing_ownership_cannot_exempt_a_namespace(self):
+        after = copy.deepcopy(self.before)
+        after["net"].append("102")
+        holder = {**self.init, "pid": 20, "ppid": 99, "start_time": 200,
+                  "namespaces": {"net": {"102": ["task:20"]}, "mnt": {}}}
+        for processes, errors in [({}, []), ({20: holder}, []),
+                                  ({20: {**holder, "ppid": 1}, 1: self.init}, ["unreadable pid 30"]),
+                                  ({20: holder, 99: {**self.init, "pid": 99, "start_time": 500}}, [])]:
+            with self.subTest(processes=processes, errors=errors), tempfile.TemporaryDirectory() as directory:
+                self.owner_fixture(directory)
+                with patch.object(CLEANUP, "namespace_inventory", return_value=after):
+                    code, result = self.verify_fixture(directory, after, processes, errors)
+                self.assertEqual(code, 1)
+                self.assertEqual(result["namespace_owners"]["net"]["102"]["status"], "unknown")
+
+    def test_namespace_that_vanishes_during_inventory_is_reported(self):
+        after = copy.deepcopy(self.before)
+        after["net"].append("102")
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            with patch.object(CLEANUP, "namespace_inventory", return_value=self.before):
+                code, result = self.verify_fixture(directory, after)
+            self.assertEqual(code, 0)
+            self.assertEqual(result["namespace_owners"]["net"]["102"], {"status": "gone", "owners": []})
+
+    def test_incomplete_corrupt_and_mismatched_ownership_fail_closed(self):
+        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline"]:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                self.owner_fixture(directory)
+                evidence = Path(directory)
+                record = evidence / "run-fixture.json"
+                if fault == "interrupted":
+                    value = json.loads(record.read_text())
+                    value["status"] = "running"
+                    record.write_text(json.dumps(value))
+                elif fault == "missing":
+                    (evidence / "ownership.json").unlink()
+                elif fault in {"bad-json", "wrong-type"}:
+                    record.write_text("{" if fault == "bad-json" else "[]")
+                else:
+                    (evidence / "before.json").write_text(json.dumps(self.before) + " ")
+                self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
+
+    def test_failure_to_save_completed_owner_cannot_report_pass(self):
+        run_id = "a" * 32
+        root = {**self.init, "pid": 10, "ppid": 1, "start_time": 100}
+        verifier = {**self.init, "pid": os.getpid(), "ppid": 10, "start_time": 200}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            path = Path(directory) / ("run-" + run_id + ".json")
+            original = Path(directory) / "run-fixture.json"
+            record = json.loads(original.read_text())
+            record["status"] = "running"
+            original.unlink()
+            path.write_text(json.dumps(record))
+            save = CLEANUP.write_json
+
+            def fail_record(path, value):
+                if path.name.startswith("run-"):
+                    raise OSError("cannot save completed owner")
+                save(path, value)
+
+            with patch.object(CLEANUP, "snapshot", return_value=self.before), \
+                    patch.object(CLEANUP, "process_inventory", return_value=({1: self.init, 10: root,
+                                                                             os.getpid(): verifier}, [])), \
+                    patch.object(CLEANUP, "direct_children", return_value={os.getpid()}), \
+                    patch.object(CLEANUP, "write_json", side_effect=fail_record), \
+                    patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory, "--run-id", run_id,
+                                                       "--command-exit-code", "0"]):
+                self.assertEqual(self.run_cleanup(), 1)
+            result = json.loads((Path(directory) / ("attribution-" + run_id + ".json")).read_text())
+            self.assertFalse(result["passed"])
+            self.assertIn("cannot save completed owner", result["errors"])
+
+    def test_reparenting_during_inventory_cannot_hide_a_live_child(self):
+        run_id = "a" * 32
+        root = {**self.init, "pid": 10, "ppid": 1, "start_time": 100}
+        verifier = {**self.init, "pid": os.getpid(), "ppid": 10, "start_time": 200}
+        # This PPID became stale during collection: the kernel's children list
+        # now puts the child directly under the still-live subreaper.
+        child = {**self.init, "pid": 30, "ppid": 99, "start_time": 300}
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            original = Path(directory) / "run-fixture.json"
+            record = json.loads(original.read_text())
+            record["status"] = "running"
+            original.unlink()
+            (Path(directory) / ("run-" + run_id + ".json")).write_text(json.dumps(record))
+            with patch.object(CLEANUP, "snapshot", return_value=self.before), \
+                    patch.object(CLEANUP, "process_inventory", return_value=({1: self.init, 10: root,
+                                                                             30: child, os.getpid(): verifier}, [])), \
+                    patch.object(CLEANUP, "direct_children", return_value={os.getpid(), 30}), \
+                    patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory, "--run-id", run_id,
+                                                       "--command-exit-code", "0"]):
+                self.assertEqual(self.run_cleanup(), 1)
+            result = json.loads((Path(directory) / ("attribution-" + run_id + ".json")).read_text())
+            self.assertEqual([process["pid"] for process in result["surviving_processes"]], [30])
+
+    def test_missing_metadata_for_a_surviving_process_fails_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            process = proc / "30"
+            process.mkdir()
+            (process / "stat").write_text("30 (fixture) S 1 " + "0 " * 17 + "300")
+            processes, errors = CLEANUP.process_inventory(proc_root=proc)
+            self.assertEqual(processes, {})
+            self.assertEqual(len(errors), 1)
+            self.assertIn("pid 30", errors[0])
+            (process / "stat").unlink()
+            self.assertEqual(CLEANUP.process_inventory(proc_root=proc), ({}, []))
+
+    def test_inventory_finds_nonleader_threads_and_namespace_descriptors(self):
+        def stat(pid, ppid, start, state="S"):
+            return f"{pid} (name with ) parentheses) {state} {ppid} " + "0 " * 17 + str(start)
+
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            process = proc / "30"
+            process.mkdir()
+            (process / "stat").write_text(stat(30, 10, 300))
+            (process / "cgroup").write_text("0::/fixture\n")
+            for tid in [30, 31]:
+                task = process / "task" / str(tid)
+                (task / "ns").mkdir(parents=True)
+                (task / "fd").mkdir()
+                (task / "stat").write_text(stat(tid, 10, 300))
+                (task / "ns/net").symlink_to("net:[102]" if tid == 31 else "net:[100]")
+                (task / "ns/mnt").symlink_to("mnt:[200]")
+            (process / "task/30/fd/7").symlink_to("mnt:[202]")
+            processes, errors = CLEANUP.process_inventory({"net": {"102"}, "mnt": {"202"}}, proc)
+            self.assertEqual(errors, [])
+            self.assertEqual(processes[30]["start_time"], 300)
+            self.assertEqual(processes[30]["namespaces"], {
+                "net": {"102": ["task:31"]}, "mnt": {"202": ["fd:30:7"]},
+            })
 
     def test_surviving_namespaces_and_host_residue_fail_cleanup(self):
         for kind, value in [
@@ -118,7 +358,9 @@ class WorkflowTests(unittest.TestCase):
         qualify = next(step for step in steps if step.startswith("Qualify exact local kernel lifecycle\n"))
         self.assertEqual(sum("ci/qualify-local-kernel-lifecycle.py" in step for step in steps), 1)
         self.assertEqual(qualify.split("        run: |\n", 1)[1].strip(),
-                         'python3 ci/qualify-local-kernel-lifecycle.py \\\n'
+                         'python3 ci/check-local-kernel-lifecycle-cleanup.py run \\\n'
+                         '            "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup" -- \\\n'
+                         '            python3 ci/qualify-local-kernel-lifecycle.py \\\n'
                          '            --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle"')
         cleanup = next(step for step in steps if step.startswith("Require local kernel lifecycle cleanup\n"))
         self.assertIn("if: always()\n", cleanup)
@@ -131,6 +373,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(host.index("cleanup.py snapshot"), host.index("sudo unshare"))
         self.assertLess(host.index("Check local kernel lifecycle support"), host.index("Qualify exact"))
         self.assertIn("unshare -n -m --propagation private", host)
+        self.assertEqual(host.count("check-local-kernel-lifecycle-cleanup.py run"), 4)
+        self.assertLess(host.index('mkdir -p "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup"'),
+                        host.index("cleanup.py snapshot"))
 
     def test_both_workflows_keep_the_same_unfiltered_triggers(self):
         workflows = [(RUNNER.ROOT / ".github/workflows" / name).read_text()

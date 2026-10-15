@@ -719,6 +719,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserve runtime assertions, and regenerate output digest pins for shared
   statement formatting and lint repairs. (#1274)
 
+- CI: attribute new kernel lifecycle namespaces to their owning processes so
+  unrelated host services do not cause false cleanup failures. Keep leaked
+  qualification namespaces, orphaned descendants and host-visible residue
+  fatal, with process ownership evidence retained for review. (#1279)
+
 - `opc-session-net` tests: reserve scope listener sockets across endpoint
   replacement and full fleet reopen so restarted ephemeral consensus listeners
   cannot take their saved ports. Keep bind-error diagnostics and exercise

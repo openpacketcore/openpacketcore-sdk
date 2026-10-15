@@ -648,6 +648,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ethtool iproute2 kmod libseccomp2 nftables wireguard-tools
 
+      - name: Regress cleanup namespace ownership
+        run: |
+          sudo -n python3 ci/test-local-kernel-lifecycle-cleanup-integration.py \
+            --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup-regressions"
+
       - name: Check local kernel lifecycle support
         run: |
           set -euo pipefail
@@ -662,16 +667,23 @@ jobs:
           # Loading GRE creates fallback interfaces in the host namespace.
           # Include module setup in the baseline, before any private probes.
           sudo modprobe ip_gre
+          mkdir -p "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup"
           sudo -n python3 ci/check-local-kernel-lifecycle-cleanup.py snapshot \
             "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup"
-          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
+          if ! python3 ci/check-local-kernel-lifecycle-cleanup.py run \
+            "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup" -- \
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
             sudo modprobe vrf
-            sudo unshare -n -- ip link add vrf-probe type vrf table 10
+            python3 ci/check-local-kernel-lifecycle-cleanup.py run \
+              "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup" -- \
+              sudo unshare -n -- ip link add vrf-probe type vrf table 10
           fi
           # Probe in private namespaces, including the bpffs mount. The
           # qualification creates the same isolation for every exact case.
-          sudo unshare -n -m --propagation private -- sh -euc '
+          python3 ci/check-local-kernel-lifecycle-cleanup.py run \
+            "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup" -- \
+            sudo unshare -n -m --propagation private -- sh -euc '
             mount -t bpf -o mode=0700 bpf /sys/fs/bpf
             ip link set lo up
             ip link add bridge-probe type bridge
@@ -690,7 +702,9 @@ jobs:
 
       - name: Qualify exact local kernel lifecycle
         run: |
-          python3 ci/qualify-local-kernel-lifecycle.py \
+          python3 ci/check-local-kernel-lifecycle-cleanup.py run \
+            "${RUNNER_TEMP}/local-kernel-lifecycle-cleanup" -- \
+            python3 ci/qualify-local-kernel-lifecycle.py \
             --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle"
 
       - name: Require local kernel lifecycle cleanup
@@ -708,6 +722,7 @@ jobs:
           path: |
             ${{ runner.temp }}/local-kernel-lifecycle
             ${{ runner.temp }}/local-kernel-lifecycle-cleanup
+            ${{ runner.temp }}/local-kernel-lifecycle-cleanup-regressions
           if-no-files-found: error
 
   rust:
