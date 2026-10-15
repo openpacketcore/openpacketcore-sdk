@@ -196,7 +196,7 @@ the baseline. Missing ownership or incomplete inventories fail cleanup.
 After recording attribution, the owner terminates and reaps its remaining
 descendants, including privileged children. Disposal uses verified process
 identities and pidfds, with a two-second SIGTERM grace followed by up to three
-seconds for SIGKILL. SIGTERM and SIGINT keep the owner alive through disposal.
+seconds for SIGKILL. SIGTERM, SIGINT and SIGHUP keep the owner alive through disposal.
 Original leaks and interruptions remain failures after disposal; the evidence
 retains both the original attribution and the disposal result.
 `--toolchain` chooses an installed Rust toolchain. Repeated `--case` arguments

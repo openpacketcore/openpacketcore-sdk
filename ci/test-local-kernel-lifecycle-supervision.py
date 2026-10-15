@@ -189,11 +189,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--fixture", type=Path)
-    parser.add_argument("--mode", choices=["return", "SIGTERM", "SIGINT"], default="return")
+    parser.add_argument("--mode", choices=["return", "SIGTERM", "SIGINT", "SIGHUP"], default="return")
     parser.add_argument("--dispose", type=int, nargs=2)
-    parser.add_argument("--case", choices=["return-user", "SIGTERM-user", "SIGINT-user",
+    parser.add_argument("--case", choices=["return-user", "SIGTERM-user", "SIGINT-user", "SIGHUP-user",
                                            "SIGTERM-cleanup-user", "return-root", "SIGTERM-root",
-                                           "SIGINT-root", "SIGTERM-cleanup-root"])
+                                           "SIGINT-root", "SIGHUP-root", "SIGTERM-cleanup-root"])
     args = parser.parse_args()
     if args.fixture:
         return fixture(args.fixture, args.mode)
@@ -206,7 +206,7 @@ def main():
     if libc.prctl(36, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "cannot adopt fixture orphans")
     for root_child in [False, True]:
-        for mode in ["return", "SIGTERM", "SIGINT", "SIGTERM-cleanup"]:
+        for mode in ["return", "SIGTERM", "SIGINT", "SIGTERM-cleanup", "SIGHUP"]:
             name = mode + ("-root" if root_child else "-user")
             if args.case is None or args.case == name:
                 run_case(args.evidence_dir / name, mode, root_child)

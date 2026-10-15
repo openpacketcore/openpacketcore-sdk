@@ -724,8 +724,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   qualification namespaces, orphaned descendants and host-visible residue
   fatal, with process ownership evidence retained for review. Keep the owner
   alive through bounded termination and reaping on command completion,
-  SIGTERM and SIGINT, including privileged descendants; successful disposal
-  does not erase the original failure. (#1279)
+  SIGTERM, SIGINT and SIGHUP, including privileged descendants; successful
+  disposal does not erase the original failure. Retry disappearing processes
+  during disposal and ignore inventory errors from exited tasks. (#1279)
 
 - `opc-session-net` tests: reserve scope listener sockets across endpoint
   replacement and full fleet reopen so restarted ephemeral consensus listeners

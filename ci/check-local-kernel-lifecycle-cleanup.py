@@ -128,7 +128,8 @@ def process_inventory(wanted=None, proc_root=Path("/proc")) -> tuple[dict, list[
                         except FileNotFoundError:
                             continue  # A task or fd closed during collection.
                         except OSError as error:
-                            local_errors.append(f"pid {before['pid']} {source}: {error}")
+                            if (task / "stat").exists():
+                                local_errors.append(f"pid {before['pid']} {source}: {error}")
                             continue
                         match = re.fullmatch(r"(net|mnt):\[([0-9]+)\]", value)
                         if match and (wanted is None or match[2] in wanted.get(match[1], set())):
@@ -138,7 +139,8 @@ def process_inventory(wanted=None, proc_root=Path("/proc")) -> tuple[dict, list[
                 except FileNotFoundError:
                     continue
                 except OSError as error:
-                    local_errors.append(f"pid {before['pid']} task {task.name}: {error}")
+                    if (task / "stat").exists():
+                        local_errors.append(f"pid {before['pid']} task {task.name}: {error}")
             after = read_stat(directory / "stat")
             if identity(before) != identity(after):
                 errors.append(f"pid {before['pid']} changed identity during collection")
@@ -375,7 +377,7 @@ def owned_descendants(root: tuple[int, int], excluded: set) -> list[dict]:
                         continue
                     if root not in {identity(ancestor) for ancestor in current_ancestry(process)}:
                         continue
-                except (FileNotFoundError, ValueError):
+                except (FileNotFoundError, ProcessLookupError, ValueError):
                     # Reparenting or PID reuse can invalidate this observation.
                     # Rescan; never signal a process whose owner is uncertain.
                     continue
@@ -409,9 +411,7 @@ def dispose_descendants(evidence: Path, run_id: str) -> int:
                     continue
                 try:
                     descriptor = pin_owned_process(process, root)
-                except ProcessLookupError:
-                    continue
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError, ValueError):
                     continue
                 if descriptor is None:
                     continue
@@ -493,7 +493,8 @@ def run_owned_command(evidence: Path, command: list[str]) -> int:
         if interrupted is None:
             interrupted = signum
 
-    handlers = {signum: signal.signal(signum, interrupt) for signum in [signal.SIGTERM, signal.SIGINT]}
+    handlers = {signum: signal.signal(signum, interrupt)
+                for signum in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]}
     primary = None
     try:
         try:

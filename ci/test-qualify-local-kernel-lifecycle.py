@@ -136,6 +136,92 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue(result["had_live_descendants"])
             self.assertFalse(json.loads((Path(directory) / "run-fixture.json").read_text())["cleanup_passed"])
 
+    def test_descendant_disposal_retries_a_stat_read_race_before_escalating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            self.owner_fixture(directory)
+            proc = evidence / "proc"
+            for pid, ppid, start in [(1, 0, 1), (10, 1, 100), (30, 10, 300), (31, 10, 310), (40, 10, 400)]:
+                task = proc / str(pid) / "task" / str(pid)
+                task.mkdir(parents=True)
+                (task / "children").write_text("30" if pid == 10 else "")
+                (proc / str(pid) / "stat").write_text(f"{pid} (fixture) S {ppid} " + "0 " * 17 + str(start))
+            (proc / "self").symlink_to("40")
+            children = proc / "10/task/10/children"
+            state = {"alive": True, "races": 0, "time": 0}
+            read_stat = CLEANUP.read_stat
+
+            def proc_path(value):
+                path = Path(value)
+                return proc / path.relative_to("/proc") if path.is_relative_to("/proc") else path
+
+            def read_with_exit(path):
+                if path == proc / "31/stat":
+                    state["races"] += 1
+                    path.unlink()
+                    children.write_text("30")
+                    raise ProcessLookupError("fixture child reaped between stat open and read")
+                return read_stat(path)
+
+            def send(_descriptor, signum):
+                if signum == signal.SIGTERM:
+                    # The resistant child is already pinned when another child
+                    # disappears during the next inventory scan.
+                    children.write_text("30 31")
+                elif signum == signal.SIGKILL:
+                    state["alive"] = False
+                    (proc / "30/stat").unlink()
+                    children.write_text("")
+
+            def sleep(_seconds):
+                state["time"] += 1
+
+            with patch.object(CLEANUP, "Path", side_effect=proc_path), \
+                    patch.object(CLEANUP, "read_stat", side_effect=read_with_exit), \
+                    patch.object(CLEANUP.os, "pidfd_open", return_value=55), \
+                    patch.object(CLEANUP.select, "select", side_effect=lambda *_: ([], [], []) if state["alive"] else ([55], [], [])), \
+                    patch.object(CLEANUP.signal, "pidfd_send_signal", side_effect=send) as sent, \
+                    patch.object(CLEANUP.os, "close") as closed, \
+                    patch.object(CLEANUP.time, "monotonic", side_effect=lambda: state["time"]), \
+                    patch.object(CLEANUP.time, "sleep", side_effect=sleep):
+                self.assertEqual(CLEANUP.dispose_descendants(evidence, "fixture"), 1)
+            result = json.loads((evidence / "disposal-fixture.json").read_text())
+            self.assertFalse(state["alive"], "TERM-resistant descendant outlived disposal: " + json.dumps(result))
+            self.assertEqual(state["races"], 1)
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["remaining"], [])
+            self.assertEqual([call.args for call in sent.call_args_list], [(55, signal.SIGTERM), (55, signal.SIGKILL)])
+            closed.assert_called_once_with(55)
+            self.assertFalse(json.loads((evidence / "run-fixture.json").read_text())["cleanup_passed"])
+
+    def test_descendant_disposal_retries_uncertain_pinning_before_escalating(self):
+        root = {"pid": 10, "ppid": 1, "start_time": 100}
+        child = {"pid": 30, "ppid": 10, "start_time": 300, "state": "S"}
+        racing = {"pid": 31, "ppid": 10, "start_time": 310, "state": "S"}
+        for error in [FileNotFoundError, ProcessLookupError, ValueError]:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                self.owner_fixture(directory)
+                with patch.object(CLEANUP, "read_stat", return_value=root), \
+                        patch.object(CLEANUP, "current_ancestry", return_value=iter([root, self.init])), \
+                        patch.object(CLEANUP, "owned_descendants", side_effect=[[child], [child, racing], [child], []]), \
+                        patch.object(CLEANUP, "direct_children", return_value=set()), \
+                        patch.object(CLEANUP, "pin_owned_process", side_effect=[55, error("ancestry changed while pinning")]), \
+                        patch.object(CLEANUP.select, "select", side_effect=[([], [], [])] * 3 + [([55], [], [])]), \
+                        patch.object(CLEANUP.signal, "pidfd_send_signal") as sent, \
+                        patch.object(CLEANUP.os, "close") as closed, \
+                        patch.object(CLEANUP.time, "monotonic", side_effect=[0, 0, 1, 2.1, 2.2, 2.2]), \
+                        patch.object(CLEANUP.time, "sleep"):
+                    self.assertEqual(CLEANUP.dispose_descendants(Path(directory), "fixture"), 1)
+                result = json.loads((Path(directory) / "disposal-fixture.json").read_text())
+                self.assertTrue(result["passed"], result)
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["remaining"], [])
+                self.assertEqual([call.args for call in sent.call_args_list], [(55, signal.SIGTERM), (55, signal.SIGKILL)])
+                self.assertEqual(result["targets"], [{"pid": 30, "start_time": 300, "signals": [15, 9]}])
+                closed.assert_called_once_with(55)
+                self.assertFalse(json.loads((Path(directory) / "run-fixture.json").read_text())["cleanup_passed"])
+
     def test_unrelated_service_arrival_is_attributed_without_failing_cleanup(self):
         after = copy.deepcopy(self.before)
         after["net"].append("102")
@@ -356,6 +442,56 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(processes[30]["namespaces"], {
                 "net": {"102": ["task:31"]}, "mnt": {"202": ["fd:30:7"]},
             })
+
+    def test_task_inventory_errors_are_retained_only_for_surviving_tasks(self):
+        for operation in ["stat", "ns", "fd"]:
+            for exited in [False, True]:
+                with self.subTest(operation=operation, exited=exited), tempfile.TemporaryDirectory() as directory:
+                    proc = Path(directory)
+                    process = proc / "30"
+                    process.mkdir()
+                    (process / "stat").write_text("30 (fixture) S 10 " + "0 " * 17 + "300")
+                    (process / "cgroup").write_text("0::/fixture\n")
+                    for tid in [30, 31]:
+                        task = process / "task" / str(tid)
+                        (task / "ns").mkdir(parents=True)
+                        (task / "fd").mkdir()
+                        (task / "stat").write_text(f"{tid} (fixture) S 10 " + "0 " * 17 + "300")
+                        (task / "ns/net").symlink_to("net:[100]")
+                        (task / "ns/mnt").symlink_to("mnt:[200]")
+                    task = process / "task/31"
+                    (task / "fd/7").symlink_to("mnt:[202]")
+                    failed_path = task / {"stat": "stat", "ns": "ns/net", "fd": "fd/7"}[operation]
+                    read_stat, readlink = CLEANUP.read_stat, os.readlink
+
+                    def fail():
+                        if exited:
+                            for path in [task / name for name in ["stat", "ns/net", "ns/mnt", "fd/7"]]:
+                                path.unlink()
+                        if operation == "stat":
+                            raise ProcessLookupError("fixture task stat became unavailable")
+                        raise PermissionError("fixture task link became inaccessible")
+
+                    def stat_read(path):
+                        if operation == "stat" and path == failed_path:
+                            fail()
+                        return read_stat(path)
+
+                    def link_read(path):
+                        if operation != "stat" and path == failed_path:
+                            fail()
+                        return readlink(path)
+
+                    with patch.object(CLEANUP, "read_stat", side_effect=stat_read), \
+                            patch.object(CLEANUP.os, "readlink", side_effect=link_read):
+                        processes, errors = CLEANUP.process_inventory(proc_root=proc)
+                    self.assertTrue(processes[30]["live"])
+                    self.assertEqual(processes[30]["start_time"], 300)
+                    self.assertIn("task:30", processes[30]["namespaces"]["net"]["100"])
+                    self.assertEqual(len(errors), 0 if exited else 1, errors)
+                    if not exited:
+                        self.assertIn("pid 30", errors[0])
+                        self.assertIn("fixture task", errors[0])
 
     def test_surviving_namespaces_and_host_residue_fail_cleanup(self):
         for kind, value in [
