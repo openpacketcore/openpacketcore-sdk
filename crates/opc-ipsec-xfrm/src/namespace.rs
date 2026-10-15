@@ -3368,7 +3368,8 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// The caller may sign a non-execution receipt only when the observation
     /// reports `closed_without_effect()`. The SDK must refuse all member provider
     /// calls before dispatch and after completion once it returns any terminal
-    /// receipt, across every readback registration. Released outcomes must never
+    /// receipt or verified compacted terminal-status or terminalize result,
+    /// across every readback registration. Released outcomes must never
     /// reach this operation. After restart, no execution authority survives and
     /// every begun binding stays durably held until receipt-verified release.
     /// Caller expiry or cancellation leaves completion owned by the blocking
@@ -3397,14 +3398,19 @@ impl NamespaceBoundLinuxXfrmBackend {
 
     /// Release retained settlement history after the trusted adapter verifies
     /// the exact durable SDK terminal receipt, for Established or Aborted.
+    /// A verified `Compacted` terminal-status or terminalize result for the exact
+    /// retained roster also authorizes release, as does a verified `Compacted`
+    /// successor recovery after restart. Compaction follows a durable terminal;
+    /// readback or recovery of a compacted admission installs no registration.
     ///
     /// An ambiguous terminal outcome cannot authorize this call. Finalize
     /// Applied ownership normally before releasing; this operation removes
     /// neither established objects nor cleanup responsibility. It is
     /// idempotent and remains owned across cancellation. On restart, reopen
-    /// the original store and retry from the durable terminal receipt.
-    /// The SDK must mark the admission's shared authority entry terminal before
-    /// returning that receipt, so every registration refuses subsequent member
+    /// the original store and retry from the durable terminal receipt or verified
+    /// compacted successor-recovery result. The SDK must mark the admission's
+    /// shared authority entry terminal before returning the receipt or verified
+    /// compacted terminal-status or terminalize result, so every registration refuses subsequent member
     /// provider calls and discards results held across release. Removing the live
     /// registration retains no released-binding tombstone. Caller expiry stops
     /// waiting while this blocking task completes; the store has no wait deadline.

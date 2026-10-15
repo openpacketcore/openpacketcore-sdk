@@ -4762,6 +4762,7 @@ where
                         prepared.body.commitment(),
                     )
                     .map_err(|_| ExecutorError::TerminalConflict)?;
+                self.local_authority.mark_terminal(registration.admission());
                 Ok(TerminalStatusResult::Compacted)
             }
             TerminalStatusDecision::Admitted => Ok(TerminalStatusResult::Admitted),
@@ -4872,6 +4873,7 @@ where
                             .increment(DiagnosticsCounter::TerminalizeConflict);
                         ExecutorError::TerminalConflict
                     })?;
+                self.local_authority.mark_terminal(registration.admission());
                 self.diagnostics
                     .increment(DiagnosticsCounter::TerminalPayloadCompacted);
                 Err(ExecutorError::TerminalPayloadCompacted)

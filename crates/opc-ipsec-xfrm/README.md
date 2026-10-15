@@ -657,14 +657,20 @@ or cleanup authority; `namespace_was_cleared()` identifies that observation.
 An unissued Prepared record instead becomes Closed. Finalize Applied normally
 so retention does not hold the writer gate. After either durable SDK terminal
 receipt, compare each `settled_member_binding` with the original call commitment, then invoke
-`release_durable_object_roster_settlement`. An ambiguous terminal result cannot
-release history. Before returning either terminal receipt, the SDK closes all
-member provider calls across every registration, checking again after each
-provider reply. Exact terminal readback returns only that receipt, so released
-history cannot become new non-execution evidence. Release publishes one durable
+`release_durable_object_roster_settlement`. A verified `Compacted` terminal-status
+or terminalize result for the exact retained roster also authorizes release, as
+does a verified `Compacted` successor recovery after restart: compaction follows
+a durable terminal, and readback or recovery of a compacted admission installs
+no registration. An ambiguous terminal result cannot release history. Before
+returning either terminal receipt or a verified compacted terminal-status or
+terminalize result, the SDK closes all member provider calls across every
+registration, checking again after each provider reply. Exact terminal readback
+returns only the receipt or compacted result, so released history cannot become
+new non-execution evidence. Release publishes one durable
 retention change for a retained row, survives caller
 cancellation and is idempotent. The consumer retries it automatically after
-restart from the exact terminal receipt. Removal of released history is batched
+restart from the exact terminal receipt or verified compacted successor-recovery
+result. Removal of released history is batched
 with the next roster publication, before live-record capacity is charged; the
 30 live slots are reusable. Release removes the registration; absence needs no
 publication. In-memory settlement state contains only unsettled bindings, and

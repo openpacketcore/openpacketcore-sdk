@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NotApplied + Reconciled`; missing intent alone is insufficient. Terminal
   receipts expose member commitments for verified settlement release and close
   all provider calls across every registration, including delayed replies.
+  Verified compacted terminal results also authorize exact retained-roster
+  release, so terminal payload expiry cannot strand settlement capacity.
   `opc-ipsec-xfrm` adds exact pre-admission registration, store-bound closure,
   definitive non-admission discard and explicit retention release. Absence
   closure consumes no durable slot, released bindings retain no registry entry,

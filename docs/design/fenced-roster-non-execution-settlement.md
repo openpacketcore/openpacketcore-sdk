@@ -47,12 +47,14 @@ After restart, an absent binding may have no registration. Fence may still
 report Closed: no execution authority survives restart, preparation requires a
 live registration, and every begun binding remains durably retained until
 release. This recovery path creates no registration or execution authority.
-Before the SDK returns any terminal receipt, it marks the admission's local
+Before the SDK returns any terminal receipt or a verified compacted terminal-status
+or terminalize result, it marks the admission's local
 authority entry, whichever authority holds it. Every registration of that
 admission, including those built by exact readback, then refuses every provider
 call before dispatch and at the post-provider check. Readback of a committed
-terminal returns only the receipt, before and after restart. Release requires
-that receipt, so no settlement call can reach released history. Fence and release
+terminal returns only the receipt or a compacted result, before and after restart.
+Release requires that receipt or a verified compacted result as specified in step 6,
+so no settlement call can reach released history. Fence and release
 rustdoc must state these preconditions. No recovery path requires a person to
 clear state.
 
@@ -136,11 +138,16 @@ a consensus receipt nor a new consumer-managed fence request/status protocol.
    The adapter verifies the receipt's exact admission/member binding before
    releasing the registration and any retained row; an ambiguous terminal result
    cannot release either.
+   A verified `Compacted` terminal-status or terminalize result for the exact
+   retained roster also authorizes release, as does a verified `Compacted`
+   successor recovery after restart: compaction follows a durable terminal, and
+   readback or recovery of a compacted admission installs no registration.
    Release removes only settlement retention, never the established objects or
    existing cleanup responsibility. Normal finalization is not delayed to retain
    history: an Applied record must leave unresolved writer authority so unrelated
    rosters can prepare. Release is idempotent, remains owned across cancellation,
-   and is retried automatically after restart from the durable terminal receipt.
+   and is retried automatically after restart from the durable terminal receipt
+   or the verified compacted successor-recovery result.
    Batch its durable removal with the next store publication, before checking
    live-record capacity. Completed admissions therefore free their slots for
    later admissions rather than consuming a cumulative attach allowance.
@@ -245,7 +252,8 @@ otherwise it creates a false negative.
 
 Retention is per unsettled admission and is never cumulative. Begun SDK-bound
 records, including Prepared-to-Closed rows, survive pruning and namespace reset
-until the consumer releases them with the durable terminal receipt. Only those
+until the consumer releases them with the durable terminal receipt or a verified
+compacted result for the exact retained roster. Only those
 durable rows count against the live-record limit; an absence closure needs no
 slot. The live-registration rule prevents delayed preparation after release
 without remembering completed bindings. A delayed run still fails because its
@@ -263,7 +271,8 @@ reset using an authenticated reset marker. Its original member outcomes remain
 unchanged, but observation, including finalization, reports retirement and it
 holds no writer or cleanup authority. This marker never establishes never-started
 execution. Prepared becomes Closed, while already-terminal outcomes stay immutable. Release can
-then surrender this retained history after the exact SDK terminal receipt.
+then surrender this retained history after the exact SDK terminal receipt or
+verified compacted result.
 
 Every physical submission path must participate, including backend work surviving
 timeouts. Review this boundary and authority revocation before implementation;
