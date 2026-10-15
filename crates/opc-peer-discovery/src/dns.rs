@@ -2,7 +2,8 @@
 //! their original shape; these types carry DNS identity, TTLs and provenance.
 
 use crate::{
-    SnaptrCoverage, SnaptrFailure, SnaptrFilter, SnaptrHost, SnaptrProvenance, SrvProvenance,
+    SnaptrCoverage, SnaptrFailure, SnaptrFilter, SnaptrHost, SnaptrProvenance, SrvCoverage,
+    SrvProvenance,
 };
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -449,6 +450,7 @@ pub struct DnsAnswer {
     negative_freshness_bound: Option<PeerDiscoveryTime>,
     pub(crate) snaptr_hosts: Option<Box<[SnaptrHost]>>,
     pub(crate) snaptr_coverage: Option<SnaptrCoverage>,
+    pub(crate) srv_coverage: Option<SrvCoverage>,
 }
 
 impl DnsAnswer {
@@ -473,6 +475,7 @@ impl DnsAnswer {
             negative_freshness_bound: None,
             snaptr_hosts: None,
             snaptr_coverage: None,
+            srv_coverage: None,
         })
     }
 
@@ -490,6 +493,13 @@ impl DnsAnswer {
     /// Coverage and omission/failure counts that survive cache publication.
     pub fn snaptr_coverage(&self) -> Option<&SnaptrCoverage> {
         self.snaptr_coverage.as_ref()
+    }
+
+    /// Original direct-SRV completion evidence, retained through cache and
+    /// pure path filtering. `None` means unknown coverage, not completeness.
+    /// A policy-empty view cannot establish DNS absence from candidate count.
+    pub fn srv_coverage(&self) -> Option<&SrvCoverage> {
+        self.srv_coverage.as_ref()
     }
 
     /// Shorten freshness to an absolute deadline without rewriting provenance.

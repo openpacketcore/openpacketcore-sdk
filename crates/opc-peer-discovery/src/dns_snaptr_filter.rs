@@ -136,6 +136,7 @@ impl DnsAnswer {
             freshness_bound: self.freshness_bound,
             negative_freshness_bound: self.negative_freshness_bound,
             snaptr_coverage: self.snaptr_coverage,
+            srv_coverage: self.srv_coverage,
             snaptr_hosts: Some(
                 hosts
                     .into_iter()

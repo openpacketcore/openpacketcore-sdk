@@ -719,6 +719,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserve runtime assertions, and regenerate output digest pins for shared
   statement formatting and lint repairs. (#1274)
 
+- `opc-peer-discovery`: retain direct-SRV completion evidence across target
+  address and final endpoint limits, cache publication and pure filtering.
+  Failed S-NAPTR traversals now expose coverage even without a positive answer,
+  distinguishing exhaustive branch outcomes from omitted trace details.
+
 - `opc-peer-discovery`: retain direct SRV target-and-port paths when endpoints
   overlap, including their original rank and TTLs. `filter_srv_paths` provides
   a pure policy view that re-ranks endpoints by surviving target identity;

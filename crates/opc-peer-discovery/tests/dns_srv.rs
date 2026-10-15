@@ -2868,3 +2868,177 @@ async fn srv_cache_checks_future_observations_on_alternate_paths() {
     assert_eq!(status.last_error, Some(DnsError::MalformedAnswer));
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn completion_evidence_distinguishes_a_complete_prefix_from_target_address_truncation() {
+    let mut answers = Vec::new();
+    for truncated in [false, true] {
+        let (socket, task) = server(1, move |_, q| {
+            assert_eq!(question(q).1, 33);
+            let mut addresses = (1..=16)
+                .map(|last| address(FIRST, &format!("224.0.0.{last}"), 30))
+                .collect::<Vec<_>>();
+            if truncated {
+                addresses.push(address(FIRST, "192.0.2.1", 30));
+            }
+            reply(q, 0, &[srv(SERVICE, 0, 0, 443, FIRST, 30)], &[], &addresses)
+        })
+        .await;
+        let mut cfg = config(socket.local_addr().unwrap());
+        cfg.edns_payload_size = 4096;
+        let q = query();
+        let response = DnsClient::new(cfg)
+            .unwrap()
+            .resolve_with_seed(&q, now, 0)
+            .await;
+        assert_eq!(response.skipped_srv_records, 0);
+        assert_eq!(response.skipped_srv_targets, 0);
+        assert_eq!(response.outcomes.len(), 2);
+        assert!(response
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.result.is_ok()));
+        let coverage = *response.srv_coverage().unwrap();
+        assert_eq!(coverage.incomplete, truncated);
+        assert_eq!(coverage.omitted_addresses, usize::from(truncated));
+        assert_eq!(coverage.omitted_endpoints, 0);
+        assert_eq!(coverage.unexpanded_records, 0);
+        assert_eq!(coverage.unexpanded_targets, 0);
+        assert_eq!(coverage.failed_questions, 0);
+        assert!(response.snaptr_coverage().is_none());
+        let answer = response.result.unwrap();
+        assert_eq!(answer.srv_coverage(), Some(&coverage));
+        assert_eq!(answer.candidates().len(), 16);
+        assert!(answer.candidates().iter().all(|candidate| candidate
+            .peer()
+            .endpoint
+            .ip()
+            .is_multicast()));
+        assert_eq!(answer.filter_srv_paths(|_| false).unwrap(), None);
+        assert_eq!(
+            answer.filter_srv_paths(|_| true).unwrap(),
+            Some(answer.clone())
+        );
+
+        let mut cache = DnsCache::default();
+        let DnsRefresh::Start(token) = cache
+            .begin_refresh(&q, now(), Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!("initial refresh admission")
+        };
+        assert!(cache.finish_refresh(token, Ok(answer.clone()), now()));
+        let status = cache.lookup(&q.cache_key(), now());
+        assert_eq!(status.result, DnsCachedResult::Fresh(answer.clone()));
+        assert_eq!(
+            status.fresh_until,
+            Some(PeerDiscoveryTime::from_millis(31_000))
+        );
+        answers.push(answer);
+        task.await.unwrap();
+        assert!(socket.try_recv_from(&mut [0; 512]).is_err());
+    }
+    assert_eq!(answers[0].candidates(), answers[1].candidates());
+    assert_ne!(
+        answers[0], answers[1],
+        "cached answers must retain resolver evidence distinguishing complete data from truncation"
+    );
+}
+
+#[tokio::test]
+async fn completion_evidence_counts_final_endpoint_omissions_without_target_truncation() {
+    let (socket, task) = server(1, |_, q| {
+        let addresses = (1..=8)
+            .map(|last| address(FIRST, &format!("192.0.2.{last}"), 30))
+            .chain((1..=9).map(|last| address(SECOND, &format!("198.51.100.{last}"), 30)))
+            .collect::<Vec<_>>();
+        reply(
+            q,
+            0,
+            &[
+                srv(SERVICE, 0, 0, 443, FIRST, 30),
+                srv(SERVICE, 1, 0, 443, SECOND, 30),
+            ],
+            &[],
+            &addresses,
+        )
+    })
+    .await;
+    let mut cfg = config(socket.local_addr().unwrap());
+    cfg.edns_payload_size = 4096;
+    let response = DnsClient::new(cfg)
+        .unwrap()
+        .resolve_with_seed(&query(), now, 0)
+        .await;
+    assert_eq!(response.skipped_srv_records, 0);
+    assert_eq!(response.skipped_srv_targets, 0);
+    let coverage = *response.srv_coverage().unwrap();
+    assert!(coverage.incomplete);
+    assert_eq!(coverage.omitted_addresses, 0);
+    assert_eq!(coverage.omitted_endpoints, 1);
+    assert_eq!(coverage.unexpanded_records, 0);
+    assert_eq!(coverage.unexpanded_targets, 0);
+    assert_eq!(coverage.failed_questions, 0);
+    let answer = response.result.unwrap();
+    assert_eq!(answer.candidates().len(), 16);
+    assert_eq!(answer.srv_coverage(), Some(&coverage));
+    let filtered = answer
+        .filter_srv_paths(|path| path.target().as_str() == FIRST)
+        .unwrap()
+        .unwrap();
+    assert_eq!(filtered.candidates().len(), 8);
+    assert_eq!(filtered.srv_coverage(), Some(&coverage));
+    assert_eq!(filtered.expires_at(), answer.expires_at());
+    task.await.unwrap();
+    assert!(socket.try_recv_from(&mut [0; 512]).is_err());
+}
+
+#[tokio::test]
+async fn completion_evidence_keeps_srv_work_limits_and_failed_questions_incomplete() {
+    for bound in 0..4 {
+        let (socket, task) = server(if bound == 0 { 2 } else { 1 }, |_, q| {
+            if question(q).1 == 33 {
+                reply(
+                    q,
+                    0,
+                    &[
+                        srv(SERVICE, 0, 0, 443, FIRST, 30),
+                        srv(SERVICE, 1, 0, 443, SECOND, 30),
+                    ],
+                    &[],
+                    &[address(FIRST, "192.0.2.1", 30)],
+                )
+            } else {
+                assert_eq!(question(q).0, SECOND);
+                reply(q, 0, &[], &[soa()], &[])
+            }
+        })
+        .await;
+        let mut cfg = config(socket.local_addr().unwrap());
+        match bound {
+            1 => cfg.max_srv_records = 1,
+            2 => cfg.max_srv_targets = 1,
+            3 => cfg.max_srv_address_lookups = 0,
+            _ => {}
+        }
+        let response = DnsClient::new(cfg)
+            .unwrap()
+            .resolve_with_seed(&query(), now, 0)
+            .await;
+        let coverage = *response.srv_coverage().unwrap();
+        assert!(coverage.incomplete);
+        assert_eq!(coverage.unexpanded_records, usize::from(bound != 0));
+        assert_eq!(coverage.unexpanded_targets, usize::from(bound != 0));
+        assert_eq!(
+            coverage.failed_questions,
+            usize::from(bound == 0 || bound == 3)
+        );
+        assert_eq!(coverage.omitted_addresses, 0);
+        assert_eq!(coverage.omitted_endpoints, 0);
+        let answer = response.result.unwrap();
+        assert_eq!(answer.candidates().len(), 1);
+        assert_eq!(answer.srv_coverage(), Some(&coverage));
+        task.await.unwrap();
+        assert!(socket.try_recv_from(&mut [0; 512]).is_err());
+    }
+}

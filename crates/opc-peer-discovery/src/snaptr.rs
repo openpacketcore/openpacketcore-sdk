@@ -409,8 +409,9 @@ impl SnaptrHost {
     }
 }
 
-/// Bounded counters retained with a cached S-NAPTR answer. Counts cover observed
-/// work only; an unvisited subtree has unknown cardinality.
+/// Bounded counters retained with a cached S-NAPTR answer and exposed by
+/// [`crate::DnsClientResponse::snaptr_coverage`] even when traversal fails.
+/// Counts cover observed work only; an unvisited subtree has unknown cardinality.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SnaptrCoverage {

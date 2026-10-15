@@ -43,7 +43,7 @@ pub use snaptr::{
     SnaptrHost, SnaptrHostAddress, SnaptrNoMatch, SnaptrOrdering, SnaptrPath, SnaptrProvenance,
     SnaptrRootKind, SnaptrRootObservation, SnaptrSrv,
 };
-pub use srv::{SrvPath, SrvProvenance};
+pub use srv::{SrvCoverage, SrvPath, SrvProvenance};
 
 /// Stable SDK profile label for this discovery contract.
 pub const TELCO_PEER_DISCOVERY_PROFILE: &str = "opc-peer-discovery+transport-neutral-v1";

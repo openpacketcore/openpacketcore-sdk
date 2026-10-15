@@ -2963,3 +2963,185 @@ async fn compatibility_changed_rfc3588_root_with_extended_data_never_authorizes_
         ]
     );
 }
+
+#[tokio::test]
+async fn completion_evidence_survives_failed_traversal_with_omitted_branch_details() {
+    let mut responses = Vec::new();
+    for count in [3, 5] {
+        let dns = FakeDns::new(move |q| {
+            let (answers, additional) = match question(q).1 {
+                35 => (vec![naptr(ROOT, 1, 0, "s", SERVICE, "", CHILD, 90)], vec![]),
+                33 => (
+                    (0..count)
+                        .map(|i| srv(CHILD, i, 0, 2123, &format!("alias{i}.example.invalid."), 90))
+                        .collect(),
+                    (0..count)
+                        .map(|i| rr(&format!("alias{i}.example.invalid."), 5, 90, &name(OTHER)))
+                        .collect(),
+                ),
+                kind => panic!("unexpected record type: {kind}"),
+            };
+            Some(reply(q, 0, &answers, &[], &additional))
+        })
+        .await;
+        let mut cfg = config(dns.address);
+        cfg.edns_payload_size = 4096;
+        cfg.max_snaptr_records = 1;
+        cfg.max_snaptr_lookups = 3;
+        let response = DnsClient::new(cfg)
+            .unwrap()
+            .resolve_with_seed(&query(), now, 0)
+            .await;
+        assert_eq!(
+            response.result,
+            Err(DnsError::Snaptr {
+                reason: SnaptrFailure::NoUsablePath,
+                expires_at: None,
+            })
+        );
+        assert_eq!(response.snaptr_branches.len(), 3);
+        assert!(response
+            .snaptr_branches
+            .iter()
+            .all(|branch| branch.error == DnsError::MalformedAnswer));
+        assert_eq!(response.skipped_srv_records, 0);
+        assert_eq!(response.skipped_srv_targets, 0);
+        let coverage = response.snaptr_coverage().unwrap();
+        assert!(coverage.incomplete);
+        assert_eq!(coverage.failed_branches, usize::from(count));
+        assert_eq!(coverage.refused_branches, 0);
+        assert_eq!(coverage.omitted_branch_outcomes, usize::from(count - 3));
+        assert_eq!(coverage.unfinished_lookups, 0);
+        assert_eq!(coverage.unvisited_branches, 0);
+        assert_eq!(coverage.unexpanded_records, 0);
+        assert_eq!(coverage.unexpanded_srv_records, 0);
+        assert_eq!(coverage.unexpanded_srv_targets, 0);
+        assert!(response.srv_coverage().is_none());
+        assert_eq!(dns.seen(), [(ROOT.to_owned(), 35), (CHILD.to_owned(), 33)]);
+        responses.push(response);
+    }
+    assert_eq!(responses[0].result, responses[1].result);
+    assert_eq!(responses[0].outcomes, responses[1].outcomes);
+    assert_eq!(responses[0].snaptr_branches, responses[1].snaptr_branches);
+    assert_ne!(
+        format!("{:?}", responses[0]),
+        format!("{:?}", responses[1]),
+        "failed responses must expose completion counters beyond their bounded branch trace"
+    );
+}
+
+#[tokio::test]
+async fn completion_evidence_exposes_exhaustive_denials_refusals_and_unfinished_lookups() {
+    for scenario in 0..3 {
+        let dns = FakeDns::new(move |q| {
+            let (owner, kind, _) = question(q);
+            let response = if kind == 35 {
+                let flag = if scenario == 1 { "u" } else { "a" };
+                reply(
+                    q,
+                    0,
+                    &[naptr(ROOT, 1, 0, flag, SERVICE, "", HOST, 90)],
+                    &[],
+                    &[],
+                )
+            } else {
+                assert_eq!((owner.as_str(), kind), (HOST, 1));
+                reply(q, 3, &[], &[soa("example.invalid.", 30, 7)], &[])
+            };
+            Some(response)
+        })
+        .await;
+        let mut cfg = config(dns.address);
+        if scenario == 2 {
+            cfg.max_snaptr_lookups = 1;
+        }
+        let response = DnsClient::new(cfg)
+            .unwrap()
+            .resolve_with_seed(&query(), now, 0)
+            .await;
+        assert!(response.result.is_err());
+        assert_eq!(response.snaptr_root().unwrap().kind, SnaptrRootKind::Match);
+        let coverage = response.snaptr_coverage().unwrap();
+        assert!(coverage.incomplete);
+        assert_eq!(coverage.omitted_branch_outcomes, 0);
+        assert_eq!(coverage.unexpanded_records, 0);
+        assert_eq!(coverage.unexpanded_srv_records, 0);
+        assert_eq!(coverage.unexpanded_srv_targets, 0);
+        assert_eq!(coverage.omitted_addresses, 0);
+        assert_eq!(coverage.omitted_paths, 0);
+        assert_eq!(coverage.omitted_hosts, 0);
+        assert_eq!(coverage.unfinished_lookups, usize::from(scenario == 2));
+        assert_eq!(coverage.refused_branches, usize::from(scenario == 1));
+        assert_eq!(coverage.failed_branches, usize::from(scenario != 1));
+        assert_eq!(response.snaptr_branches.len(), 1);
+        match scenario {
+            0 => {
+                assert!(matches!(
+                    response.snaptr_branches[0].error,
+                    DnsError::NxDomain { .. }
+                ));
+                assert_eq!(dns.seen(), [(ROOT.to_owned(), 35), (HOST.to_owned(), 1)]);
+            }
+            1 => {
+                assert!(matches!(
+                    response.snaptr_branches[0].error,
+                    DnsError::Snaptr {
+                        reason: SnaptrFailure::UnsupportedFlag,
+                        ..
+                    }
+                ));
+                assert_eq!(dns.seen(), [(ROOT.to_owned(), 35)]);
+            }
+            _ => {
+                assert_eq!(response.result, Err(DnsError::LimitExceeded));
+                assert_eq!(response.snaptr_branches[0].error, DnsError::LimitExceeded);
+                assert_eq!(dns.seen(), [(ROOT.to_owned(), 35)]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn completion_evidence_matches_cached_snaptr_coverage_and_excludes_root_only_results() {
+    for positive in [false, true] {
+        let dns = FakeDns::new(move |q| {
+            if !positive {
+                return Some(reply(q, 0, &[], &[soa(ROOT, 30, 7)], &[]));
+            }
+            let answers = if question(q).1 == 35 {
+                vec![naptr(ROOT, 1, 0, "a", SERVICE, "", HOST, 30)]
+            } else {
+                vec![address(HOST, "192.0.2.1", 30)]
+            };
+            Some(reply(q, 0, &answers, &[], &[]))
+        })
+        .await;
+        let q = query();
+        let response = DnsClient::new(config(dns.address))
+            .unwrap()
+            .resolve_with_seed(&q, now, 0)
+            .await;
+        if !positive {
+            assert!(response.snaptr_coverage().is_none());
+            assert_eq!(
+                response.snaptr_root().unwrap().kind,
+                SnaptrRootKind::NoNaptr
+            );
+            assert!(matches!(response.result, Err(DnsError::NoData { .. })));
+            assert_eq!(dns.seen(), [(ROOT.to_owned(), 35)]);
+            continue;
+        }
+        let coverage = *response.snaptr_coverage().unwrap();
+        assert!(!coverage.incomplete);
+        let answer = response.result.unwrap();
+        assert_eq!(answer.snaptr_coverage(), Some(&coverage));
+        let mut cache = DnsCache::default();
+        let token = start(&mut cache, &q, now());
+        assert!(cache.finish_refresh(token, Ok(answer.clone()), now()));
+        assert_eq!(
+            cache.lookup(&q.cache_key(), now()).result,
+            DnsCachedResult::Fresh(answer)
+        );
+        assert_eq!(dns.seen(), [(ROOT.to_owned(), 35), (HOST.to_owned(), 1)]);
+    }
+}

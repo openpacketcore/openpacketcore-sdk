@@ -24,6 +24,7 @@ DnsQuery::with_snaptr_filter(filter) -> Result<DnsQuery, DnsError>
 DnsCandidate::snaptr() -> Option<&SnaptrProvenance>
 DnsAnswer::snaptr_hosts() -> Option<&[SnaptrHost]>
 DnsClientResponse::snaptr_root() -> Option<&SnaptrRootObservation>
+DnsClientResponse::snaptr_coverage() -> Option<&SnaptrCoverage>
 ```
 
 One query requests one application service/protocol pair. Its existing
@@ -63,6 +64,18 @@ survive cache publication, including excluded higher-ranked paths. Neither this
 view nor its prefix promises exhaustive topology/collocation search; the
 consumer owns that selection and decides whether the reported coverage is
 sufficient. No topology ranking is performed in the SDK.
+
+Expose the same coverage in the response after a matched-root traversal,
+including failures with no retained endpoint. Root-only decisions and failures
+before traversal return no coverage; their typed root/error contracts remain
+the authority. The response's bounded branch trace cannot prove that every
+branch outcome is present. An exhaustive-denial classification requires zero
+unexpanded/unvisited/unfinished/omitted counters, accounting for every failed
+or refused branch, and an explicit check of each retained typed outcome.
+Timeouts and local failures do not become denials just because their trace
+fits. `incomplete` also includes fully observed semantic refusals and failures;
+neither that flag nor the retained trace length is a denial predicate.
+Consumers must not reconstruct omitted DNS data or traversal.
 
 Use the same legacy weight encoding as address and SRV mode:
 `weight = u16::MAX - index` in the final deduplicated endpoint order, through
@@ -474,6 +487,7 @@ All names/answers are synthetic; tests never contact public or system DNS.
 | Ordering and seed | Retain higher-order candidates after a successful lower group; test two ancestral levels, order/preference conflicts, 3GPP weights at 0/65535, SRV priority/weight and ports. Check fixed seed-derivation vectors, owner/type separation, wire-order permutations, and a shared child drawn once. Force later siblings to release an earlier one; verify slot refilling, late replacement of full endpoint/path pools and rebuilt host references. Arrival-dependent order, flattened order/preference and a different S-NAPTR legacy weight encoding must fail. |
 | Concurrency and backtracking | Use the default attempts and automatic budget with silent first-ranked delegations, address hosts, SRV owners and SRV targets; also use the full unmodified default limits. Retain healthy siblings, child Timeout outcomes and partial freshness. Bound concurrent questions, reserve backtracking time for each non-root kind while an alternative remains, progress nested siblings and share in-flight data without consuming the record budget prematurely. Use an in-process datagram fixture and paused time for deadline ordering: a lone path must retry a lost first packet and complete a healthy chain. A healthy retry or delayed answer must also survive a dead sibling already in flight. Release the cap when siblings finish; shared waiters, cached NAPTR/SRV paths to the same question, and exhausted allowances must not create alternatives. A cached path to a different admissible child still needs backtracking time. Pin logical allowance consumed by queued duplicates and keep two healthy queued branches within a short virtual-time budget. Assert outcomes, question counts and ordering; no correctness assertion depends on host-clock margins. |
 | Completed prefix | Retain outcomes and coverage from admitted failures after the pool fills. Test transient, timeout and SOA failures above and below a full prefix, and below a partial prefix; only failures below all 16 endpoints avoid a freshness bound. With one slot, assert the exact wire questions and that a lower-ranked host is never queried after 16 better endpoints complete. Disabling the prefix stop or applying a lower failure's bound must fail. |
+| Completion evidence at retention limits | Direct SRV must distinguish a complete sixteen-address RRset from the same prefix followed by an omitted usable address, retaining coverage and original data through cache publication and pure filtering. Count final endpoint omissions, skipped work and failed questions separately. Failed S-NAPTR traversal must expose exhaustive denial/refusal counts, unfinished lookups and omitted bounded-trace details through the public response. Missing coverage is unknown; bounded trace length alone cannot certify completeness. |
 | Unrelated service syntax | Filter malformed first SERVICES tokens beside a valid match and in an unrelated-only Diameter realm. The latter must remain `NotAdvertised` through ordinary cache publication, allowing caller-owned section 5(f) fallback. |
 | Bounds and cancellation | Self/two-node/case/alias loops and a shared-child diamond; exact depth/provenance boundaries; each record/lookup/target/retention limit with and without an already healthy path. A slow delegation after a healthy host must yield a timed-out partial answer. Budget-blocked higher-ranked paths must expose outcomes/freshness bounds. Resetting budgets per branch, dropping completed results, missing coverage or leaking work after cancellation must fail. |
 | Root classification and RFC 6408 | No root NAPTR (NXDOMAIN and NODATA); unrelated-only NAPTR; extended application/transport mismatch under 5(b)/(c); legacy-only 5(d)/(e); matching explicit/application-only records; malformed requested fields; mixed extended/legacy records. Assert each typed classification and allowed caller action, including explicit 5(f) SRV names. Check classification TTL/negative cap, zero/high-bit/unknown timing, filter/profile cache isolation, `finish_refresh` publication fencing and refresh pacing. Include relay-only answers and an SCTP mismatch beside an independent TCP match. Conflating absence with mismatch, allowing downgrade, or caching a decision indefinitely must fail. |

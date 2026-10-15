@@ -5,6 +5,31 @@ use std::sync::Arc;
 
 use crate::{DnsName, DnsRecord, SnaptrSrv};
 
+/// Resolver-produced coverage before consumer policy filters direct SRV data.
+/// Counts describe observed work; skipped targets have unknown address counts.
+/// Positive answers retain this evidence through cache publication and pure
+/// path filtering. No field asserts endpoint usability or authentication.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SrvCoverage {
+    /// Some work, address/endpoint data, or successful completion is missing.
+    /// False requires a successful answer, no omissions and no failed question.
+    pub incomplete: bool,
+    /// Valid SRV records not expanded because a work or candidate bound stopped them.
+    pub unexpanded_records: usize,
+    /// Distinct valid targets whose address expansion was entirely skipped.
+    pub unexpanded_targets: usize,
+    /// Observed addresses discarded by per-target retention after family ordering.
+    /// This counts each visited target once, independently of its SRV ports.
+    pub omitted_addresses: usize,
+    /// Distinct observed endpoints from retained target addresses that did not
+    /// fit the final candidate set. Addresses counted above are not counted again.
+    pub omitted_endpoints: usize,
+    /// Failed root or target-family outcomes, including denials and local limits.
+    /// Typed root denials retain their own meaning even when this count is nonzero.
+    pub failed_questions: usize,
+}
+
 /// One complete direct SRV derivation of an endpoint, including timed records.
 /// Selection rank is retained privately so consumer policy never redraws weights.
 #[derive(Clone)]

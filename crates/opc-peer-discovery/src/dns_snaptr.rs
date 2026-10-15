@@ -1664,6 +1664,10 @@ impl DnsClient {
             root_finished: false,
         };
         traversal.run(now).await;
+        if !traversal.root_finished {
+            traversal.coverage.incomplete |= traversal.response.result.is_err();
+            traversal.response.snaptr_coverage = Some(traversal.coverage);
+        }
         traversal.response
     }
 }

@@ -31,6 +31,7 @@ an async DNS client for A/AAAA, RFC 2782 SRV and bounded S-NAPTR discovery.
   `DnsRetryPolicy`, `DnsRefresh`, and `DnsRefreshToken`.
 - S-NAPTR policy/results: `SnaptrFilter`, `SnaptrOrdering`, `SnaptrProvenance`,
   `SnaptrPath`, `SnaptrHost`, `SnaptrCoverage`, and `SnaptrRootObservation`.
+- Direct-SRV policy/results: `SrvPath`, `SrvProvenance`, and `SrvCoverage`.
 - DNS failures: `DnsError`, `SnaptrFailure`, `SnaptrNoMatch`, and `DnsCacheError`
   expose typed, redacted failures.
 - Identity and transport: `PeerLabel`, `PeerTransport`, and
@@ -566,6 +567,25 @@ view's expiry does not replace the cache's `fresh_until` or retry state. Apply
 changed policy to the original answer to recover paths a previous policy
 excluded. Filtering does not issue queries or backfill omitted discovery work.
 
+`DnsClientResponse::srv_coverage()` reports resolver completion before policy
+filtering. The same `SrvCoverage` is retained in a positive
+`DnsAnswer::srv_coverage()` through cache publication and path filtering. It
+counts skipped record/target work, per-target address truncation, distinct
+observed endpoints omitted from final assembly, and failed questions. Address
+omissions count each visited target once; endpoint omissions count only
+combinations of its retained addresses and advertised ports, without counting
+discarded addresses again. Unvisited targets have unknown address cardinality.
+`incomplete == false` requires a successful resolution with no omission or
+failed question. Absent coverage means unknown, never complete. Existing typed
+root denials keep their authority independently of this positive-answer test.
+
+Sixteen retained addresses and zero skipped records/targets do not prove
+completeness: a seventeenth address can have been discarded within one target.
+A consumer whose policy excludes every retained endpoint must consult the
+original coverage before treating that view as an exhaustive result. Coverage
+does not decide usability, authentication, fallback, or last-good policy, and
+it does not change the original answer, its deadlines or the cache state machine.
+
 | SRV resource | Default | Accepted bound |
 |---|---:|---:|
 | Distinct valid SRV records expanded after ordering | 32 | 1–128 |
@@ -667,6 +687,18 @@ precedence over alternate metadata. `snaptr_coverage()` exposes omitted work,
 refused/failed branches and incomplete hosts through cache publication. The
 consumer owns topology/collocation selection and authentication against the
 original name. The view does not promise an exhaustive topology search.
+
+`DnsClientResponse::snaptr_coverage()` also exposes these counters after a
+matched-root traversal fails with no positive answer. The response and positive
+answer expose equal coverage when an answer exists. Root-only decisions and
+pre-admission failures carry no traversal coverage; use their typed result and
+root classification. A bounded branch trace alone never proves exhaustiveness.
+Before classifying an all-branch failure as an exhaustive denial, require no
+unexpanded, unvisited, unfinished or omitted work/evidence, account for every
+refused/failed branch, and inspect each retained typed outcome. A timeout is
+not a denial merely because its trace fits. `incomplete` includes fully observed
+refusals and failures, so that flag alone cannot classify a failed traversal.
+No omitted records or paths should be reconstructed by the consumer.
 
 One admission permit and absolute `snaptr_refresh_timeout` cover the traversal.
 NAPTR depth defaults to 8 (maximum 14), eligible record expansions to 128
