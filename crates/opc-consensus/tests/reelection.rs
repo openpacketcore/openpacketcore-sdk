@@ -14,8 +14,7 @@ use opc_consensus::engine::{
     EmptyNode, Raft, ServerState, Vote,
 };
 use opc_consensus::{
-    durable_openraft_config, DurableOpenraftDomain, DurableOpenraftRuntime,
-    DURABLE_CONSENSUS_TIMING_PROFILE,
+    durable_openraft_config, DurableOpenraftDomain, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use tokio::sync::{watch, Barrier};
 
@@ -23,13 +22,20 @@ use tokio::sync::{watch, Barrier};
 mod memory_store;
 use memory_store::{MemoryLog, MemoryStateMachine};
 
+#[path = "reelection/schedule.rs"]
+mod schedule;
+#[path = "reelection/scripted_split.rs"]
+mod scripted_split;
+#[path = "../src/test_runtime.rs"]
+mod test_runtime;
+
 engine::declare_raft_types!(
     ElectionConfig:
         D = u64,
         R = u64,
         NodeId = u64,
         Node = EmptyNode,
-        AsyncRuntime = DurableOpenraftRuntime,
+        AsyncRuntime = test_runtime::ScriptedElectionRuntime,
 );
 
 #[derive(Clone, Debug)]
@@ -38,11 +44,14 @@ struct VoteExchange {
     target: u64,
     request: VoteRequest<u64>,
     response: VoteResponse<u64>,
+    sent_at: tokio::time::Instant,
+    replied_at: tokio::time::Instant,
 }
 
 struct SplitGate {
-    arrivals: Mutex<BTreeMap<u64, VoteRequest<u64>>>,
+    arrivals: watch::Sender<BTreeMap<u64, VoteRequest<u64>>>,
     both_candidates: Barrier,
+    term: Option<u64>,
 }
 
 struct NetworkState {
@@ -105,18 +114,22 @@ impl RaftNetwork<ElectionConfig> for Connection {
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, EmptyNode, RaftError<u64>>> {
         let target = self.target().map_err(RPCError::Unreachable)?;
-        let split = self.network.state.split.lock().unwrap().clone();
+        let sent_at = tokio::time::Instant::now();
+        let split = self
+            .network
+            .state
+            .split
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|gate| gate.term.is_none_or(|term| rpc.vote.leader_id.term == term));
         if let Some(split) = split {
-            let first = split
-                .arrivals
-                .lock()
-                .unwrap()
-                .insert(self.network.source, rpc.clone())
-                .is_none();
-            assert!(
-                first,
-                "each survivor sends exactly one initial vote request"
-            );
+            split.arrivals.send_modify(|arrivals| {
+                assert!(
+                    arrivals.insert(self.network.source, rpc.clone()).is_none(),
+                    "each survivor sends exactly one initial vote request"
+                );
+            });
             // Each request exists only after its source has saved its self-vote.
             // Deliver neither request until both real candidates are present.
             split.both_candidates.wait().await;
@@ -131,6 +144,8 @@ impl RaftNetwork<ElectionConfig> for Connection {
                 target: self.target,
                 request: rpc,
                 response: response.clone(),
+                sent_at,
+                replied_at: tokio::time::Instant::now(),
             });
         });
         Ok(response)
@@ -216,8 +231,9 @@ async fn automatic_re_election_after_forced_split_vote() {
     nodes[0].shutdown().await.unwrap();
     state.votes.send_replace(Vec::new());
     *state.split.lock().unwrap() = Some(Arc::new(SplitGate {
-        arrivals: Mutex::new(BTreeMap::new()),
+        arrivals: watch::channel(BTreeMap::new()).0,
         both_candidates: Barrier::new(2),
+        term: None,
     }));
 
     // These are the only forced campaigns: they construct the failed round.
