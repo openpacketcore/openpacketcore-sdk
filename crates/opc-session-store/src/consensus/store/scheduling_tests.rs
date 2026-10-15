@@ -2,6 +2,71 @@
 use super::*;
 
 #[tokio::test]
+async fn log_admission_preflight_resident_deadline_preserves_diagnostic() {
+    let directory = tempfile::tempdir().expect("preflight admission directory");
+    let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+        .expect("preflight admission backend");
+    let store = ConsensusSessionStore::open_with_clock(
+        membership_tests::singleton_topology(),
+        backend,
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+        Arc::new(SystemClock),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("preflight admission store");
+    let mut reservations = Vec::new();
+    for _ in 0..crate::scope_scheduler::ScopeSchedulerBudgets::default()
+        .maintenance
+        .queued
+    {
+        reservations.push(
+            store
+                .inner
+                .proposal_admission
+                .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Maintenance)
+                .await
+                .expect("reserve maintenance resident capacity"),
+        );
+    }
+    let before = store
+        .inner
+        .diagnostics
+        .proposal_permit_deadline
+        .load(Ordering::Relaxed);
+    let reply = store
+        .preflight_record_expiry_on_local_leader(
+            Vec::new(),
+            ForwardConsumerScope::Internal,
+            store.inner.local_node_id,
+            tokio::time::Instant::now() + Duration::from_millis(40),
+        )
+        .await;
+    assert_eq!(reply, ForwardMutationReply::Unavailable);
+    assert_eq!(
+        store.inner.proposal_admission.available_permits(),
+        SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
+        "resident exhaustion does not consume an execution credit"
+    );
+    let after = store
+        .inner
+        .diagnostics
+        .proposal_permit_deadline
+        .load(Ordering::Relaxed);
+    drop(reservations);
+    store
+        .shutdown()
+        .await
+        .expect("preflight admission shutdown");
+    assert_eq!(
+        after,
+        before + 1,
+        "preflight admission timeouts remain observable"
+    );
+}
+
+#[tokio::test]
 async fn log_admission_leader_waits_without_running_credit() {
     let directory = tempfile::tempdir().expect("log admission directory");
     let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))

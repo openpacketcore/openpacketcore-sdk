@@ -9721,7 +9721,13 @@ impl ConsensusSessionStore {
         .await
         {
             Ok(Ok(reservation)) => reservation,
-            _ => return ForwardMutationReply::Unavailable,
+            _ => {
+                self.inner
+                    .diagnostics
+                    .proposal_permit_deadline
+                    .fetch_add(1, Ordering::Relaxed);
+                return ForwardMutationReply::Unavailable;
+            }
         };
         let proposal_permit = match self
             .start_proposal_before(

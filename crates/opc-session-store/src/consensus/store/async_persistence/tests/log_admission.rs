@@ -572,10 +572,20 @@ async fn blocked_transfer(mode: SessionPersistenceMode, window: u64, cycles: usi
             // Resume the same transfer. No further snapshot or purge is triggered
             // by the test, and the leader must clear backpressure on its own.
             let resumed = std::time::Instant::now();
+            eprintln!("log_admission_transfer releasing mode={mode:?} window={window} held_cut={held_cut} target={target} before={before:?}; current={:?}", store.inner.raft.metrics().borrow());
             drop(hold);
             let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
             assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()),
-                "transfer recovery: {reply:?}; pressure: {:?}", store.log_pressure_snapshot());
+                "transfer recovery: {reply:?}; unavailable={}; outcome_unknown={}; voters={:?}",
+                reply == ForwardMutationReply::Unavailable,
+                reply == ForwardMutationReply::OutcomeUnknown,
+                fleet.stores.iter().flatten().map(|store| (
+                    store.inner.local_node_id,
+                    store.log_pressure_snapshot(),
+                    store.inner.raft.metrics().borrow().clone(),
+                    store.inner.persistence_protocol.is_active(),
+                    store.inner.backend.snapshot_observation().phase_for_test(),
+                )).collect::<Vec<_>>());
             assert!(store.log_pressure_snapshot().retained_rows < window);
             assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
             eprintln!("log_admission_transfer mode={mode:?} window={window} resumed_millis={}", resumed.elapsed().as_millis());
