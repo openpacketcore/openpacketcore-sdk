@@ -3222,7 +3222,7 @@ a trailing partial or complete frame is valid buffered input.
 
 def xfrm_roster_lifecycle(subset_dir: Path) -> list[dict]:
     source = "crates/opc-n3iwf-fixtures/oracles/roster-lifecycle.json"
-    digest = "4aa403e1afd7f4449f35a2d3cbafb90b75eab84917f34ec74c0242e0b95f09f2"
+    digest = "b42f56fffe05534c50a768e6002062a709c83ec56a3322d82561c5f519af9b98"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_roster_reference_digest")

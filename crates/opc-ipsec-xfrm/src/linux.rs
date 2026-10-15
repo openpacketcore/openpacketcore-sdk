@@ -341,7 +341,22 @@ impl LinuxXfrmBackend {
         })
     }
 
-    #[cfg(test)]
+    /// Build a namespace-test backend whose exact encoded requests are handled
+    /// by an instrumented transport instead of a kernel socket.
+    ///
+    /// The callback returns the decoded netlink reply body or an ACK. This
+    /// opt-in test seam retains the ordinary actor, durable store, encoding,
+    /// receipt and readback paths; it grants no kernel mutation capability.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn with_instrumented_transport<F>(transport: F) -> Self
+    where
+        F: Fn(&'static str, &[u8]) -> Result<Option<Vec<u8>>, XfrmError> + Send + Sync + 'static,
+    {
+        Self::with_transport(InstrumentedTransport(transport))
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn with_transport<T>(transport: T) -> Self
     where
         T: LinuxXfrmTransport + 'static,
@@ -1765,6 +1780,37 @@ pub(crate) enum NetlinkDumpCompletion {
     /// The kernel marked the dump inconsistent. Everything the visitor saw
     /// belongs to a discarded dump.
     Interrupted,
+}
+
+#[cfg(feature = "test-control")]
+struct InstrumentedTransport<F>(F);
+
+#[cfg(feature = "test-control")]
+impl<F> fmt::Debug for InstrumentedTransport<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InstrumentedTransport(<redacted>)")
+    }
+}
+
+#[cfg(feature = "test-control")]
+impl<F> LinuxXfrmTransport for InstrumentedTransport<F>
+where
+    F: Fn(&'static str, &[u8]) -> Result<Option<Vec<u8>>, XfrmError> + Send + Sync,
+{
+    fn transact(
+        &self,
+        operation: &'static str,
+        _: NetlinkOperationClass,
+        request: &[u8],
+        _: u32,
+        _: LinuxXfrmBackendConfig,
+    ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+        (self.0)(operation, request).map(|body| body.map(Zeroizing::new))
+    }
+
+    fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe {
+        XfrmProbe::unsupported()
+    }
 }
 
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {

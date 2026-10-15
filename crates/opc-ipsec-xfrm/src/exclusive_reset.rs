@@ -8,6 +8,8 @@ use crate::XfrmError;
 /// rely on any SA or policy there. It must retain no predecessor object or
 /// recovery record for adoption, recovery, or finalization in this process.
 /// The SDK cannot verify these obligations.
+/// SDK-bound settlement history is retained only as authenticated historical
+/// evidence after reset, with no execution, writer or cleanup authority.
 ///
 /// Bind every recovery-store family ever used in the namespace. Unbound stores
 /// are untouched. Stop plaintext sources before resetting: even protective

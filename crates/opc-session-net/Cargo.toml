@@ -104,6 +104,9 @@ ring = "0.17.14"
 socket2 = { version = "0.6", features = ["all"] }
 rustix = { version = "1.1.5", features = ["process", "fs"] }
 
+[target.'cfg(all(target_os = "linux", target_pointer_width = "64"))'.dev-dependencies]
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["test-control"] }
+
 [dev-dependencies]
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }

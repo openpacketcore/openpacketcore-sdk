@@ -36,8 +36,8 @@ use crate::durable_roster::{
     XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase, XfrmObjectRosterGroupId,
     XfrmObjectRosterMemberId, XfrmObjectRosterMemberMaterial, XfrmObjectRosterMemberPhase,
     XfrmObjectRosterMemberTransition, XfrmObjectRosterOperationGeneration,
-    XfrmObjectRosterRecoveryHandle, XfrmObjectRosterRecoveryStore, XfrmObjectRosterSweepProof,
-    XfrmObjectRosterTransition, XFRM_OBJECT_ROSTER_MAX_MEMBERS,
+    XfrmObjectRosterRecoveryHandle, XfrmObjectRosterRecoveryStore, XfrmObjectRosterStoreIdentity,
+    XfrmObjectRosterSweepProof, XfrmObjectRosterTransition, XFRM_OBJECT_ROSTER_MAX_MEMBERS,
 };
 use crate::model::validate_exact_lookup_mark;
 use crate::{
@@ -206,6 +206,7 @@ fn kernel_selection_key(request: &XfrmObjectInstallRequest) -> KernelSelectionKe
 #[derive(Clone)]
 pub struct XfrmObjectRosterRequest {
     members: Vec<XfrmObjectRosterMemberRequest>,
+    settlement_identity: Option<XfrmObjectRosterStoreIdentity>,
 }
 
 impl XfrmObjectRosterRequest {
@@ -283,7 +284,28 @@ impl XfrmObjectRosterRequest {
                 return Err(XfrmObjectRosterRequestError::AmbiguousKernelSelection);
             }
         }
-        Ok(Self { members })
+        Ok(Self {
+            members,
+            settlement_identity: None,
+        })
+    }
+
+    /// Retain settlement history until an explicit terminal-receipt release.
+    ///
+    /// The trusted adapter commits this original store identity, the exact
+    /// group and generation, and the ordered request in the admitted member
+    /// descriptor. Never replace it with a freshly opened store's identity
+    /// during recovery. Ordinary rosters need no settlement retention.
+    #[must_use]
+    pub fn with_settlement_identity(mut self, identity: XfrmObjectRosterStoreIdentity) -> Self {
+        self.settlement_identity = Some(identity);
+        self
+    }
+
+    /// Original store identity committed before admission, if retained.
+    #[must_use]
+    pub const fn settlement_identity(&self) -> Option<XfrmObjectRosterStoreIdentity> {
+        self.settlement_identity
     }
 
     /// Number of declared members.
@@ -583,6 +605,75 @@ impl fmt::Debug for XfrmObjectRosterDurableOutcome {
     }
 }
 
+/// Authenticated observation at the roster's physical execution boundary.
+///
+/// Only [`Self::closed_without_effect`] establishes permanent exclusion with
+/// no effect. Existing accepted work requires normal observation, adoption or
+/// guarded recovery. This value grants no execution or deletion authority.
+pub struct XfrmObjectRosterFenceObservation {
+    phase: XfrmObjectRosterDurablePhase,
+    members: XfrmObjectRosterMemberDispositions,
+    namespace_cleared: bool,
+}
+
+impl XfrmObjectRosterFenceObservation {
+    /// A verified exclusive namespace reset surrendered the retained work's
+    /// authority. Member dispositions remain its original history; this is
+    /// never evidence that accepted work was never started.
+    #[must_use]
+    pub const fn namespace_was_cleared(&self) -> bool {
+        self.namespace_cleared
+    }
+
+    /// True only for a durably closed, never-issued ordered roster, including
+    /// an untouched Prepared record that ordinary recovery already retired.
+    #[must_use]
+    pub fn closed_without_effect(&self) -> bool {
+        self.phase == XfrmObjectRosterDurablePhase::Closed
+            || (self.phase == XfrmObjectRosterDurablePhase::Retired
+                && !self.namespace_cleared
+                && self.members.iter().all(|member| {
+                    member.member_phase() == XfrmObjectRosterMemberPhase::Pending
+                        && member.sweep_proof_kind().is_none()
+                        && member.adjacent_proof_kind().is_none()
+                }))
+    }
+
+    /// Retained durable phase; accepted work is not a negative observation.
+    #[must_use]
+    pub const fn phase(&self) -> XfrmObjectRosterDurablePhase {
+        self.phase
+    }
+
+    /// Complete ordered dispositions from the authenticated store.
+    #[must_use]
+    pub const fn members(&self) -> &XfrmObjectRosterMemberDispositions {
+        &self.members
+    }
+
+    /// Stable, value-free diagnostic label.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self.phase {
+            XfrmObjectRosterDurablePhase::Closed => "no_mutation",
+            XfrmObjectRosterDurablePhase::Issuing | XfrmObjectRosterDurablePhase::Compensating => {
+                "indeterminate"
+            }
+            XfrmObjectRosterDurablePhase::NoMutation => "foreign_untouched",
+            phase => phase.as_str(),
+        }
+    }
+}
+
+impl fmt::Debug for XfrmObjectRosterFenceObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("XfrmObjectRosterFenceObservation")
+            .field("phase", &self.phase.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Deterministic disposition of a durable roster record after process loss.
 ///
 /// Every variant carries the per-member disposition of the record that
@@ -821,6 +912,12 @@ fn roster_member_material(
     generation: XfrmObjectRosterOperationGeneration,
     roster: &XfrmObjectRosterRequest,
 ) -> Result<Vec<XfrmObjectRosterMemberMaterial>, XfrmObjectRosterDurableError> {
+    if roster
+        .settlement_identity
+        .is_some_and(|identity| identity != store.settlement_identity())
+    {
+        return Err(XfrmObjectRosterDurableError::WrongBinding);
+    }
     let mut material = Vec::with_capacity(roster.arity());
     for (ordinal, member) in roster.members().iter().enumerate() {
         let fingerprints = store.fingerprints_for_request(member.request())?;
@@ -903,7 +1000,65 @@ pub(crate) fn prepare_object_roster(
     roster: &XfrmObjectRosterRequest,
 ) -> Result<XfrmObjectRosterRecoveryHandle, XfrmObjectRosterDurableError> {
     let material = roster_member_material(store, group_id, generation, roster)?;
-    store.prepare(group_id, generation, &material)
+    if roster.settlement_identity.is_some() {
+        store.prepare_with_retention(group_id, generation, &material, true)
+    } else {
+        store.prepare(group_id, generation, &material)
+    }
+}
+
+pub(crate) fn register_object_roster_settlement(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<XfrmObjectRosterStoreIdentity, XfrmObjectRosterDurableError> {
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    store.register_settlement(group_id, generation, fingerprint)
+}
+
+pub(crate) fn discard_unadmitted_object_roster_settlement(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<(), XfrmObjectRosterDurableError> {
+    if roster.settlement_identity != Some(store.settlement_identity()) {
+        return Err(XfrmObjectRosterDurableError::WrongBinding);
+    }
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    store.discard_unadmitted_settlement(group_id, generation, fingerprint)
+}
+
+pub(crate) fn fence_object_roster(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<XfrmObjectRosterFenceObservation, XfrmObjectRosterDurableError> {
+    if roster.settlement_identity != Some(store.settlement_identity()) {
+        return Err(XfrmObjectRosterDurableError::WrongBinding);
+    }
+    let material = roster_member_material(store, group_id, generation, roster)?;
+    let record = store.fence(group_id, generation, &material)?;
+    Ok(XfrmObjectRosterFenceObservation {
+        phase: record.observation_phase(),
+        members: dispositions_for(&record),
+        namespace_cleared: record.namespace_was_cleared(),
+    })
+}
+
+pub(crate) fn release_object_roster_settlement(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<(), XfrmObjectRosterDurableError> {
+    if roster.settlement_identity != Some(store.settlement_identity()) {
+        return Err(XfrmObjectRosterDurableError::WrongBinding);
+    }
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    store.release_settlement(group_id, generation, fingerprint)
 }
 
 /// Read the authenticated current group phase for one retained roster.
@@ -920,7 +1075,7 @@ pub(crate) fn durable_object_roster_phase(
     let fingerprint = roster_digest(store, group_id, generation, roster)?;
     store
         .restore(group_id, generation, fingerprint)
-        .map(|record| record.phase)
+        .map(|record| record.observation_phase())
 }
 
 pub(crate) fn validate_object_roster_admission(
@@ -1771,7 +1926,7 @@ pub(crate) fn finalize_durable_object_roster(
 ) -> Result<XfrmObjectRosterDurablePhase, XfrmObjectRosterDurableError> {
     let fingerprint = roster_digest(store, group_id, generation, roster)?;
     let record = store.restore(group_id, generation, fingerprint)?;
-    match record.phase {
+    match record.observation_phase() {
         XfrmObjectRosterDurablePhase::Applied => publish(
             store,
             &record,
@@ -1787,7 +1942,7 @@ pub(crate) fn finalize_durable_object_roster(
             .map(|record| record.phase)
         }
         XfrmObjectRosterDurablePhase::Committed | XfrmObjectRosterDurablePhase::Retired => {
-            Ok(record.phase)
+            Ok(record.observation_phase())
         }
         _ => Err(XfrmObjectRosterDurableError::InvalidTransition),
     }
@@ -1835,7 +1990,10 @@ where
     let fingerprint = roster_digest(store, group_id, generation, roster)?;
     let record = store.restore(group_id, generation, fingerprint)?;
     let members = dispositions_for(&record);
-    match record.phase {
+    match record.observation_phase() {
+        XfrmObjectRosterDurablePhase::Closed => {
+            return Ok(XfrmObjectRosterRestartOutcome::NoMutation { members })
+        }
         XfrmObjectRosterDurablePhase::Committed => {
             return Ok(XfrmObjectRosterRestartOutcome::Committed { members })
         }
@@ -1907,7 +2065,10 @@ where
     let fingerprint = roster_digest(store, group_id, generation, roster)?;
     let record = store.restore(group_id, generation, fingerprint)?;
     let members = dispositions_for(&record);
-    match record.phase {
+    match record.observation_phase() {
+        XfrmObjectRosterDurablePhase::Closed => {
+            Ok(XfrmObjectRosterRestartOutcome::NoMutation { members })
+        }
         XfrmObjectRosterDurablePhase::Prepared => {
             let record = publish(
                 store,

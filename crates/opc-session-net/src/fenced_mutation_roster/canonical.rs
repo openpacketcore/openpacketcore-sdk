@@ -1644,16 +1644,24 @@ impl<'a> MemberCall<'a> {
     /// bound by the authenticated admission commitment, preventing aliases in
     /// another roster or tenant from sharing authority.
     pub fn fence_binding_commitment(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(PROVIDER_FENCE_BINDING_DOMAIN);
-        h.update(self.roster_id.as_bytes());
-        h.update(self.admission_commitment);
-        h.update([self.member.ordinal]);
-        h.update(self.member.operation_id.as_bytes());
-        h.update(self.member.descriptor_commitment());
-        h.update(self.member.expected_version.to_be_bytes());
-        h.finalize().into()
+        member_fence_binding_commitment(self.roster_id, self.admission_commitment, self.member)
     }
+}
+
+pub(crate) fn member_fence_binding_commitment(
+    roster_id: RosterId,
+    admission_commitment: [u8; 32],
+    member: &Member,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PROVIDER_FENCE_BINDING_DOMAIN);
+    h.update(roster_id.as_bytes());
+    h.update(admission_commitment);
+    h.update([member.ordinal]);
+    h.update(member.operation_id.as_bytes());
+    h.update(member.descriptor_commitment());
+    h.update(member.expected_version.to_be_bytes());
+    h.finalize().into()
 }
 impl fmt::Debug for MemberCall<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2434,6 +2442,27 @@ fn validate_status_bytes(bytes: &[u8]) -> Result<(), Error> {
 /// Terminal member commitments deliberately exclude the execution fence so
 /// that reconstruction remains byte-identical.
 ///
+/// Reconciliation also supports exact admission readback at the equal fence.
+/// Before reporting `NotApplied + Reconciled`, permanently close this exact
+/// [`MemberCall::fence_binding_commitment`] at every physical effect boundary,
+/// including delayed prepare/execute and accepted work surviving cancellation.
+/// Absence is conclusive only with authenticated complete history coverage and
+/// exclusion; forgotten intent, an unknown store incarnation or unfinished
+/// accepted work stays unknown. An override that reports NotApplied without
+/// durable closure is unsound. Never substitute a higher lease fence or write
+/// a new SDK admission to obtain closure.
+///
+/// The first reconcile irrevocably closes local prepare/execute for the whole
+/// admission, even on NotTransmitted or unknown. This is defense in depth, not
+/// physical exclusion. Observe already-applied members through status/adopt;
+/// compensation still requires the complete SDK-validated aborting proof set.
+/// Retain every begun binding and immutable outcome until the consumer holds
+/// the exact durable terminal receipt. The trusted adapter verifies its member
+/// binding before idempotently releasing provider-local history, for either
+/// Established or Aborted, and retries release after restart. An ambiguous
+/// terminal reply cannot authorize release. Finalization must still surrender
+/// unresolved writer authority normally; retaining history must not retain it.
+///
 /// This floor protects successors of the same immutable admission. It is not
 /// a configuration-wide retirement primitive: a higher fence for a different
 /// admission has a different [`MemberCall::fence_binding_commitment`]. Local
@@ -2503,6 +2532,9 @@ pub trait MemberProvider: Send + Sync + 'static {
     /// A conclusive response must be an opaque Provider receipt establishing
     /// only `NotApplied + Reconciled` or `Compensated + Reconciled`.  `NotFound`
     /// remains non-exclusionary and never restores execute authority.
+    /// Close the exact execution binding durably before signing NotApplied,
+    /// at the equal fence as well as under a successor. Unsupported providers
+    /// keep the default unknown result.
     async fn reconcile_member(
         &self,
         _call: &MemberCall<'_>,

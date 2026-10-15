@@ -135,11 +135,11 @@ const ROLE_CONFLICT_TERMINAL: &str = "roster-conflict-terminal-677";
 /// detector rewrites exactly the actor-incarnation field and nothing else.
 const RECORD_BODY_BYTES: usize = 912;
 const ACTOR_INCARNATION_RANGE: std::ops::Range<usize> = 64..80;
-const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-record-v1\0";
+const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-record-v2\0";
 const JOURNAL_NAME: &str = "journal";
 const JOURNAL_HEADER_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = JOURNAL_HEADER_BYTES - 32;
-const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-epoch-v1\0";
+const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-epoch-v2\0";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1056,8 +1056,8 @@ fn authenticate_record_frame(
 
 fn authenticate_journal_header(encoded: &[u8], key: &[u8; 32]) -> TestResult {
     if encoded.len() != JOURNAL_HEADER_BYTES
-        || encoded[..8] != *b"OPCXRSE1"
-        || encoded[8..10] != 1_u16.to_be_bytes()
+        || encoded[..8] != *b"OPCXRSE2"
+        || encoded[8..10] != 2_u16.to_be_bytes()
         || encoded[10..16].iter().any(|byte| *byte != 0)
         || encoded[40..EPOCH_BODY_BYTES].iter().any(|byte| *byte != 0)
         || encoded[16..32].iter().all(|byte| *byte == 0)

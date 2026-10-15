@@ -78,6 +78,9 @@ const MAX_LOCAL_AUTHORITY_ENTRIES: usize = super::canonical::MAX_RESERVED_AND_RE
 /// provider effects behind one process-wide lock. Keep this aligned with the
 /// fixed provider-work scheduler shard count.
 const LOCAL_AUTHORITY_SHARDS: usize = 16;
+/// A stale capability retains its allocation, so replacement cannot reuse its
+/// identity. Completed incarnations leave no process-lifetime allocation count.
+struct LocalAuthorityIncarnation;
 
 fn store_roster_profile(profile: super::canonical::Profile) -> StoreRosterProfile {
     if profile == super::canonical::Profile::v1() {
@@ -604,6 +607,11 @@ struct LocalAuthorityRegistryInner {
     /// Each immutable roster binding has exactly one shard. There is no global
     /// registry mutex: a lock collision can affect only one fixed shard.
     entries: [Mutex<HashMap<LocalAuthorityKey, LocalAuthorityEntry>>; LOCAL_AUTHORITY_SHARDS],
+    /// Only in-flight admission/recovery reads appear here. A terminal receipt
+    /// invalidates an older read before it can reinstall a removed entry.
+    terminal_reads:
+        [Mutex<HashMap<TerminalReadIdentity, TerminalReadEntry>>; LOCAL_AUTHORITY_SHARDS],
+    terminal_read_count: AtomicUsize,
     /// Reservations are made while holding an individual shard lock, but this
     /// atomic total closes the inter-shard race at the durable live-roster
     /// limit. It owns no waiters and never evicts current authority.
@@ -640,9 +648,99 @@ struct LocalAuthorityEntry {
     /// success can always be recovered without a second remote mutation.
     registration: Option<BackendRegistration>,
     authority: AuthorityBinding,
-    /// This is incremented before replacing a lower-fence permit. It is a
-    /// process-local revocation generation and is never caller supplied.
-    generation: u64,
+    /// Shared process-local identity, retained by every capability for this
+    /// incarnation and replaced whenever the entry is recreated or superseded.
+    incarnation: Arc<LocalAuthorityIncarnation>,
+    /// Reconciliation closes every prepare/execute registration for this
+    /// admission, without revoking observation or compensation authority.
+    execution_closed: bool,
+    /// A durable terminal receipt closes member I/O across all registrations.
+    /// Established publication authority remains live until its acknowledgement.
+    terminal_committed: bool,
+}
+
+/// The immutable lookup identity available before successor recovery resolves
+/// the historical admission scope. The backend still authenticates the full
+/// canonical admission; this identity only rejects stale local read results.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TerminalReadIdentity {
+    key_digest: [u8; 32],
+    roster_id: RosterId,
+    original_owner: OwnerId,
+    admission_fence: FenceToken,
+}
+
+impl TerminalReadIdentity {
+    fn for_admission(admission: &Admission) -> Self {
+        Self {
+            key_digest: admission.key().digest(),
+            roster_id: admission.roster_id(),
+            original_owner: admission.logical_owner().clone(),
+            admission_fence: admission.admission_fence(),
+        }
+    }
+
+    fn for_recovery(request: &RecoveryRequest) -> Self {
+        Self {
+            key_digest: request.authority().key().digest(),
+            roster_id: request.lookup().roster_id(),
+            original_owner: request.original_owner().clone(),
+            admission_fence: request.original_admission_fence(),
+        }
+    }
+
+    fn shard_index(&self) -> usize {
+        usize::from(self.key_digest[0] ^ self.roster_id.as_bytes()[0])
+            & (LOCAL_AUTHORITY_SHARDS - 1)
+    }
+}
+
+struct TerminalReadEntry {
+    readers: usize,
+    terminal_committed: bool,
+}
+
+/// Dropping a read, including cancellation, releases its share of the temporary
+/// guard. Completed admissions leave no read guard or terminal tombstone.
+struct LocalTerminalRead {
+    registry: LocalAuthorityRegistry,
+    identity: TerminalReadIdentity,
+}
+
+impl LocalTerminalRead {
+    fn install<T>(
+        &self,
+        terminal: bool,
+        install: impl FnOnce() -> Result<T, ExecutorError>,
+    ) -> Result<T, ExecutorError> {
+        // The same short lock orders terminal invalidation and installation.
+        // The callback only installs local state; it never awaits or does I/O.
+        let reads = self.registry.lock_terminal_reads(&self.identity);
+        let entry = reads
+            .get(&self.identity)
+            .ok_or(ExecutorError::AuthorityRejected)?;
+        if entry.terminal_committed && !terminal {
+            return Err(ExecutorError::AuthorityRejected);
+        }
+        install()
+    }
+}
+
+impl Drop for LocalTerminalRead {
+    fn drop(&mut self) {
+        let mut reads = self.registry.lock_terminal_reads(&self.identity);
+        if let Some(entry) = reads.get_mut(&self.identity) {
+            if entry.readers > 1 {
+                entry.readers -= 1;
+            } else {
+                reads.remove(&self.identity);
+                self.registry
+                    .inner
+                    .terminal_read_count
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
 }
 
 /// Exact process-local admission capacity reserved before PollAdmit.
@@ -653,20 +751,20 @@ struct LocalAuthorityEntry {
 struct LocalAdmissionReservation {
     key: LocalAuthorityKey,
     authority: AuthorityBinding,
-    generation: u64,
+    incarnation: Arc<LocalAuthorityIncarnation>,
 }
 
 /// Non-forgeable process-local capability attached only to a [`Registration`]
 /// or reconstructed from an SDK-issued established publication capsule.
 ///
-/// The fields stay private so callers cannot attach a current generation to an
+/// The fields stay private so callers cannot attach a current incarnation to an
 /// arbitrary body, owner, fence, or provider result.
 #[derive(Clone)]
 pub(crate) struct LocalAuthorityPermit {
     key: LocalAuthorityKey,
     registration: BackendRegistration,
     authority: AuthorityBinding,
-    generation: u64,
+    incarnation: Arc<LocalAuthorityIncarnation>,
 }
 
 impl fmt::Debug for LocalAuthorityPermit {
@@ -678,6 +776,7 @@ impl fmt::Debug for LocalAuthorityPermit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalAuthorityCheck {
     Current,
+    ExecutionClosed,
     RevokedOrExpired,
 }
 
@@ -687,6 +786,8 @@ impl LocalAuthorityRegistry {
             inner: Arc::new(LocalAuthorityRegistryInner {
                 clock,
                 entries: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+                terminal_reads: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+                terminal_read_count: AtomicUsize::new(0),
                 entry_count: AtomicUsize::new(0),
                 expiry_sweep_cursor: AtomicUsize::new(0),
             }),
@@ -715,19 +816,21 @@ impl LocalAuthorityRegistry {
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
-        let generation = 1;
+        let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: None,
                 authority: request.authority().clone(),
-                generation,
+                incarnation: Arc::clone(&incarnation),
+                execution_closed: false,
+                terminal_committed: false,
             },
         );
         Ok(LocalAdmissionReservation {
             key,
             authority: request.authority().clone(),
-            generation,
+            incarnation,
         })
     }
 
@@ -752,7 +855,7 @@ impl LocalAuthorityRegistry {
             .get_mut(&key)
             .ok_or(ExecutorError::AdmissionOutcomeUnknown)?;
         if entry.authority != reservation.authority
-            || entry.generation != reservation.generation
+            || !Arc::ptr_eq(&entry.incarnation, &reservation.incarnation)
             || !self.current_at(&entry.authority)
             || entry
                 .registration
@@ -765,7 +868,7 @@ impl LocalAuthorityRegistry {
             key,
             registration,
             authority: reservation.authority,
-            generation: reservation.generation,
+            incarnation: reservation.incarnation,
         })
     }
 
@@ -796,26 +899,28 @@ impl LocalAuthorityRegistry {
                 key,
                 registration,
                 authority: authority.clone(),
-                generation: entry.generation,
+                incarnation: Arc::clone(&entry.incarnation),
             });
         }
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
-        let generation = 1;
+        let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: Some(registration),
                 authority: authority.clone(),
-                generation,
+                incarnation: Arc::clone(&incarnation),
+                execution_closed: false,
+                terminal_committed: false,
             },
         );
         Ok(LocalAuthorityPermit {
             key,
             registration,
             authority: authority.clone(),
-            generation,
+            incarnation,
         })
     }
 
@@ -825,7 +930,7 @@ impl LocalAuthorityRegistry {
         let removable = entries.get(&reservation.key).is_some_and(|entry| {
             entry.registration.is_none()
                 && entry.authority == reservation.authority
-                && entry.generation == reservation.generation
+                && Arc::ptr_eq(&entry.incarnation, &reservation.incarnation)
         });
         if removable {
             entries.remove(&reservation.key);
@@ -858,21 +963,18 @@ impl LocalAuthorityRegistry {
                         key,
                         registration,
                         authority: authority.clone(),
-                        generation: entry.generation,
+                        incarnation: Arc::clone(&entry.incarnation),
                     });
                 }
                 std::cmp::Ordering::Greater => {
-                    entry.generation = entry
-                        .generation
-                        .checked_add(1)
-                        .ok_or(ExecutorError::AuthorityRejected)?;
+                    entry.incarnation = Arc::new(LocalAuthorityIncarnation);
                     entry.registration = Some(registration);
                     entry.authority = authority.clone();
                     return Ok(LocalAuthorityPermit {
                         key,
                         registration,
                         authority: authority.clone(),
-                        generation: entry.generation,
+                        incarnation: Arc::clone(&entry.incarnation),
                     });
                 }
             }
@@ -880,34 +982,146 @@ impl LocalAuthorityRegistry {
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
-        let generation = 1;
+        let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: Some(registration),
                 authority: authority.clone(),
-                generation,
+                incarnation: Arc::clone(&incarnation),
+                execution_closed: false,
+                terminal_committed: false,
             },
         );
         Ok(LocalAuthorityPermit {
             key,
             registration,
             authority: authority.clone(),
-            generation,
+            incarnation,
         })
     }
 
     fn check(&self, permit: &LocalAuthorityPermit) -> LocalAuthorityCheck {
+        self.check_operation(permit, None)
+    }
+
+    fn check_operation(
+        &self,
+        permit: &LocalAuthorityPermit,
+        operation: Option<ProviderOperation>,
+    ) -> LocalAuthorityCheck {
         let mut entries = match self.lock_entries(&permit.key) {
             Ok(entries) => entries,
             Err(_) => return LocalAuthorityCheck::RevokedOrExpired,
         };
         self.prune_expired_locked(&mut entries);
-        if self.is_current_locked(&entries, permit) {
-            LocalAuthorityCheck::Current
-        } else {
+        if !self.is_current_locked(&entries, permit) {
             LocalAuthorityCheck::RevokedOrExpired
+        } else if !Self::permits_operation_locked(&entries, permit, operation) {
+            LocalAuthorityCheck::ExecutionClosed
+        } else {
+            LocalAuthorityCheck::Current
         }
+    }
+
+    fn close_execution(&self, permit: &LocalAuthorityPermit) -> Result<(), ExecutorError> {
+        let mut entries = self
+            .lock_entries(&permit.key)
+            .map_err(|_| ExecutorError::AuthorityRejected)?;
+        self.prune_expired_locked(&mut entries);
+        if !self.is_current_locked(&entries, permit) {
+            return Err(ExecutorError::AuthorityRejected);
+        }
+        entries
+            .get_mut(&permit.key)
+            .ok_or(ExecutorError::AuthorityRejected)?
+            .execution_closed = true;
+        Ok(())
+    }
+
+    fn permits_operation_locked(
+        entries: &HashMap<LocalAuthorityKey, LocalAuthorityEntry>,
+        permit: &LocalAuthorityPermit,
+        operation: Option<ProviderOperation>,
+    ) -> bool {
+        let Some(operation) = operation else {
+            return true;
+        };
+        entries.get(&permit.key).is_some_and(|entry| {
+            !entry.terminal_committed
+                && (!matches!(
+                    operation,
+                    ProviderOperation::Prepare | ProviderOperation::Execute
+                ) || !entry.execution_closed)
+        })
+    }
+
+    /// A verified terminal settles the admission under whichever authority
+    /// currently owns its entry, including a successor installed during readback.
+    /// This mark shares the entry's bounded lifetime and never allocates history.
+    fn mark_terminal(&self, admission: &Admission) {
+        let identity = TerminalReadIdentity::for_admission(admission);
+        // Always take the read shard before an authority shard. Pending
+        // readback installation uses the same order, with no await between.
+        let mut reads = self.lock_terminal_reads(&identity);
+        if let Some(entry) = reads.get_mut(&identity) {
+            entry.terminal_committed = true;
+        }
+        let key = LocalAuthorityKey::for_admission(admission);
+        let mut entries = self.lock_entries_after_durable_read(&key);
+        self.prune_expired_locked(&mut entries);
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.terminal_committed = true;
+        }
+    }
+
+    fn begin_terminal_read(
+        &self,
+        identity: TerminalReadIdentity,
+    ) -> Result<LocalTerminalRead, ExecutorError> {
+        let mut reads = self.lock_terminal_reads(&identity);
+        if let Some(entry) = reads.get_mut(&identity) {
+            entry.readers = entry
+                .readers
+                .checked_add(1)
+                .ok_or(ExecutorError::ExecutorBusy)?;
+        } else {
+            let mut count = self.inner.terminal_read_count.load(Ordering::Acquire);
+            loop {
+                if count >= MAX_PROVIDER_IN_FLIGHT {
+                    return Err(ExecutorError::ExecutorBusy);
+                }
+                match self.inner.terminal_read_count.compare_exchange_weak(
+                    count,
+                    count + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => count = current,
+                }
+            }
+            reads.insert(
+                identity.clone(),
+                TerminalReadEntry {
+                    readers: 1,
+                    terminal_committed: false,
+                },
+            );
+        }
+        Ok(LocalTerminalRead {
+            registry: self.clone(),
+            identity,
+        })
+    }
+
+    fn lock_terminal_reads(
+        &self,
+        identity: &TerminalReadIdentity,
+    ) -> MutexGuard<'_, HashMap<TerminalReadIdentity, TerminalReadEntry>> {
+        self.inner.terminal_reads[identity.shard_index()]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Hold the exact authority shard while committing the local post-provider
@@ -920,11 +1134,22 @@ impl LocalAuthorityRegistry {
         permit: &LocalAuthorityPermit,
         complete: impl FnOnce() -> Result<T, ExecutorError>,
     ) -> Result<T, ExecutorError> {
+        self.linearize_operation(permit, None, complete)
+    }
+
+    fn linearize_operation<T>(
+        &self,
+        permit: &LocalAuthorityPermit,
+        operation: Option<ProviderOperation>,
+        complete: impl FnOnce() -> Result<T, ExecutorError>,
+    ) -> Result<T, ExecutorError> {
         let mut entries = self
             .lock_entries(&permit.key)
             .map_err(|_| ExecutorError::OutcomeUnknown)?;
         self.prune_expired_locked(&mut entries);
-        if !self.is_current_locked(&entries, permit) {
+        if !self.is_current_locked(&entries, permit)
+            || !Self::permits_operation_locked(&entries, permit, operation)
+        {
             return Err(ExecutorError::OutcomeUnknown);
         }
         complete()
@@ -940,7 +1165,7 @@ impl LocalAuthorityRegistry {
         };
         entry.registration == Some(permit.registration)
             && entry.authority == permit.authority
-            && entry.generation == permit.generation
+            && Arc::ptr_eq(&entry.incarnation, &permit.incarnation)
             && self.current_at(&entry.authority)
     }
 
@@ -996,7 +1221,7 @@ impl LocalAuthorityRegistry {
             key,
             registration: publication.current_registration(),
             authority: entry.authority.clone(),
-            generation: entry.generation,
+            incarnation: Arc::clone(&entry.incarnation),
         })
     }
 
@@ -1430,6 +1655,8 @@ impl RecoveryRequest {
     fn resolve_for_admission(mut self, admission: &Admission) -> Result<Self, ExecutorError> {
         if self.lookup.roster_id() != admission.roster_id()
             || self.authority.ingress_scope() != self.lookup.ingress_scope()
+            || self.original_owner != *admission.logical_owner()
+            || self.original_admission_fence != admission.admission_fence()
         {
             return Err(ExecutorError::InvalidRegistration);
         }
@@ -1577,6 +1804,25 @@ impl RegistrationAdmissionProvenance {
 }
 
 impl Registration {
+    #[cfg(all(
+        test,
+        feature = "test-control",
+        target_os = "linux",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn retained_member_proof_count_for_test(&self) -> Result<usize, ExecutorError> {
+        self.local
+            .lock()
+            .map(|local| {
+                local
+                    .first_conclusive
+                    .iter()
+                    .filter(|proof| proof.is_some())
+                    .count()
+            })
+            .map_err(|_| ExecutorError::OutcomeUnknown)
+    }
+
     fn issue(
         request: RegistrationRequest,
         backend_registration: BackendRegistration,
@@ -2936,6 +3182,17 @@ impl CommittedTerminal {
             commit_metadata: self.commit_metadata,
         });
         let receipt = TerminalCommitReceipt {
+            settled_member_bindings: admission
+                .members()
+                .iter()
+                .map(|member| {
+                    super::canonical::member_fence_binding_commitment(
+                        admission.roster_id(),
+                        admission.body_commitment(),
+                        member,
+                    )
+                })
+                .collect(),
             phase: match self.materialization {
                 TerminalMaterialization::Established(_) => Phase::Established,
                 TerminalMaterialization::Aborted => Phase::Aborted,
@@ -2977,6 +3234,7 @@ impl fmt::Debug for CommittedTerminal {
 /// can never authorize publication.
 #[derive(PartialEq, Eq)]
 pub(crate) struct TerminalCommitReceipt {
+    settled_member_bindings: Vec<[u8; 32]>,
     phase: Phase,
     protected_checkpoint: Vec<u8>,
     protected_result: Vec<u8>,
@@ -2986,6 +3244,11 @@ pub(crate) struct TerminalCommitReceipt {
 }
 
 impl TerminalCommitReceipt {
+    pub(crate) fn settled_member_binding(&self, ordinal: u8) -> Option<[u8; 32]> {
+        self.settled_member_bindings
+            .get(usize::from(ordinal))
+            .copied()
+    }
     /// Irreversible terminal phase.
     pub(crate) const fn phase(&self) -> Phase {
         self.phase
@@ -3888,6 +4151,9 @@ where
     ) -> Result<RecoveryResult, ExecutorError> {
         self.diagnostics
             .increment(DiagnosticsCounter::RecoveryCalls);
+        let terminal_read = self
+            .local_authority
+            .begin_terminal_read(TerminalReadIdentity::for_recovery(&request))?;
         let decision = self
             .backend
             .recover(&request)
@@ -3940,13 +4206,15 @@ where
                 RegistrationDecision::Reject(rejection) => return Err(rejection.into()),
             };
         let request = request.resolve_for_admission(&admission)?;
-        let registration = Registration::recover(
-            request,
-            admission,
-            backend_registration,
-            admission_provenance,
-            &self.local_authority,
-        )?;
+        let registration = terminal_read.install(committed_terminal.is_some(), || {
+            Registration::recover(
+                request,
+                admission,
+                backend_registration,
+                admission_provenance,
+                &self.local_authority,
+            )
+        })?;
         if let Some(committed) = committed_terminal {
             let body =
                 TerminalBody::from_record(committed.record().clone(), registration.admission())?;
@@ -3979,6 +4247,9 @@ where
     ) -> Result<RecoveryResult, ExecutorError> {
         self.diagnostics
             .increment(DiagnosticsCounter::AdmissionStatusCalls);
+        let terminal_read = self
+            .local_authority
+            .begin_terminal_read(TerminalReadIdentity::for_admission(request.admission()))?;
         let decision = self
             .backend
             .admission_status(AdmissionStatusRequest {
@@ -4018,12 +4289,14 @@ where
         {
             return Err(ExecutorError::AuthorityRejected);
         }
-        let registration = Registration::readback(
-            request,
-            backend_registration,
-            admission_provenance,
-            &self.local_authority,
-        )?;
+        let registration = terminal_read.install(committed_terminal.is_some(), || {
+            Registration::readback(
+                request,
+                backend_registration,
+                admission_provenance,
+                &self.local_authority,
+            )
+        })?;
         if let Some(committed) = committed_terminal {
             let body =
                 TerminalBody::from_record(committed.record().clone(), registration.admission())?;
@@ -4059,6 +4332,7 @@ where
             registration.backend_registration(),
             registration.authority(),
         )?;
+        self.local_authority.mark_terminal(registration.admission());
         if receipt.phase() == Phase::Aborted {
             self.local_authority
                 .release_terminal_permit(&registration.authority_permit);
@@ -4488,6 +4762,7 @@ where
                         prepared.body.commitment(),
                     )
                     .map_err(|_| ExecutorError::TerminalConflict)?;
+                self.local_authority.mark_terminal(registration.admission());
                 Ok(TerminalStatusResult::Compacted)
             }
             TerminalStatusDecision::Admitted => Ok(TerminalStatusResult::Admitted),
@@ -4598,6 +4873,7 @@ where
                             .increment(DiagnosticsCounter::TerminalizeConflict);
                         ExecutorError::TerminalConflict
                     })?;
+                self.local_authority.mark_terminal(registration.admission());
                 self.diagnostics
                     .increment(DiagnosticsCounter::TerminalPayloadCompacted);
                 Err(ExecutorError::TerminalPayloadCompacted)
@@ -4643,6 +4919,26 @@ where
         if member.ordinal() != ordinal {
             return Err(ExecutorError::InvalidMember);
         }
+        // Close before dispatch (including a busy or NotTransmitted result).
+        // Registrations reconstructed by readback share this admission entry.
+        if operation == ProviderOperation::Reconcile {
+            self.local_authority
+                .close_execution(&registration.authority_permit)?;
+        }
+        match self
+            .local_authority
+            .check_operation(&registration.authority_permit, Some(operation))
+        {
+            LocalAuthorityCheck::Current => {}
+            LocalAuthorityCheck::ExecutionClosed => return Err(ExecutorError::RecoveryRequired),
+            LocalAuthorityCheck::RevokedOrExpired => return Err(ExecutorError::AuthorityRejected),
+        }
+        let remaining = Duration::try_from(
+            *registration.authority().expires_at().as_offset_datetime()
+                - *self.local_authority.now().as_offset_datetime(),
+        )
+        .map_err(|_| ExecutorError::AuthorityRejected)?;
+        let caller_deadline = tokio::time::Instant::now() + remaining;
         // Both guards are acquired synchronously before spawn. The detached
         // child owns them through both local permit checks and the provider
         // operation, so dropping the caller future cannot cancel the
@@ -4753,7 +5049,13 @@ where
             })
             .await
         });
-        task.await.map_err(|_| ExecutorError::OutcomeUnknown)?
+        // Dropping the join handle at expiry detaches accepted provider work.
+        // Its fixed provider deadline and cancellation-resilient ownership are
+        // unchanged; the caller receives no proof after its original lease.
+        tokio::time::timeout_at(caller_deadline, task)
+            .await
+            .map_err(|_| ExecutorError::OutcomeUnknown)?
+            .map_err(|_| ExecutorError::OutcomeUnknown)?
     }
 }
 
@@ -4864,8 +5166,13 @@ where
         }
     };
 
-    if task.local_authority.check(&task.authority_permit) != LocalAuthorityCheck::Current {
-        return Err(ExecutorError::AuthorityRejected);
+    match task
+        .local_authority
+        .check_operation(&task.authority_permit, Some(task.operation))
+    {
+        LocalAuthorityCheck::Current => {}
+        LocalAuthorityCheck::ExecutionClosed => return Err(ExecutorError::RecoveryRequired),
+        LocalAuthorityCheck::RevokedOrExpired => return Err(ExecutorError::AuthorityRejected),
     }
     let provider_call = MemberCall::from_executor(
         &task.admission,
@@ -4920,9 +5227,10 @@ where
     // happen while the provider future is in flight. Linearize the exact
     // post-effect authority check with the local transition and proof
     // construction, so a successor cannot revoke the permit in between.
-    let proof = task
-        .local_authority
-        .linearize_current(&task.authority_permit, || {
+    let proof = task.local_authority.linearize_operation(
+        &task.authority_permit,
+        Some(task.operation),
+        || {
             let mut local = task
                 .local
                 .lock()
@@ -5203,7 +5511,8 @@ where
                 }),
                 _ => None,
             })
-        })?;
+        },
+    )?;
     if let Some(error) = response_error {
         return Err(error);
     }
@@ -6098,7 +6407,9 @@ mod local_authority_registry_tests {
                 LocalAuthorityEntry {
                     registration: None,
                     authority: exemplar.authority().clone(),
-                    generation: 1,
+                    incarnation: Arc::new(LocalAuthorityIncarnation),
+                    execution_closed: false,
+                    terminal_committed: false,
                 },
             );
         }
@@ -6122,6 +6433,9 @@ mod local_authority_registry_tests {
 #[cfg(test)]
 mod production_runtime_cut_matrix_tests {
     mod async_provider_authority_tests;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    mod fenced_non_execution_capacity_tests;
+    mod fenced_non_execution_registry_tests;
 
     use super::*;
     use crate::fenced_mutation_roster::canonical::{
@@ -6732,7 +7046,9 @@ mod production_runtime_cut_matrix_tests {
         current_authority: Option<AuthorityBinding>,
         committed: Option<CommittedTerminal>,
         compacted_recovery: Option<(u64, ProfiledTerminalConflictTombstone)>,
+        compacted_terminal: Option<(u64, ProfiledTerminalConflictTombstone)>,
         compact_next_terminal: bool,
+        next_admission_outcome_unknown: bool,
         lose_next_terminal_reply: bool,
         next_admission_not_transmitted: bool,
         next_terminal_not_transmitted: bool,
@@ -6868,6 +7184,10 @@ mod production_runtime_cut_matrix_tests {
                 state.next_admission_not_transmitted = false;
                 return Ok(RegistrationDecision::NotTransmitted);
             }
+            if state.next_admission_outcome_unknown {
+                state.next_admission_outcome_unknown = false;
+                return Err(());
+            }
             if state.admission.is_some() {
                 return Ok(RegistrationDecision::AdmissionReplayed);
             }
@@ -6990,6 +7310,12 @@ mod production_runtime_cut_matrix_tests {
             ) {
                 return Ok(TerminalStatusDecision::Reject(BackendRejection::Authority));
             }
+            if let Some((history_epoch, tombstone)) = state.compacted_terminal.clone() {
+                return Ok(TerminalStatusDecision::Compacted {
+                    history_epoch,
+                    tombstone: Box::new(tombstone),
+                });
+            }
             Ok(match state.committed.clone() {
                 Some(committed) => TerminalStatusDecision::Recorded(Box::new(committed)),
                 None => TerminalStatusDecision::Admitted,
@@ -7038,6 +7364,14 @@ mod production_runtime_cut_matrix_tests {
                 let tombstone =
                     TerminalConflictTombstone::new(request.admission(), committed.record())
                         .expect("validated compact terminal binding");
+                state.compacted_terminal = Some((
+                    committed.record().request_id().history_epoch(),
+                    ProfiledTerminalConflictTombstone::V1(tombstone.clone()),
+                ));
+                if state.lose_next_terminal_reply {
+                    state.lose_next_terminal_reply = false;
+                    return Err(());
+                }
                 return Ok(TerminalizeDecision::Compacted {
                     history_epoch: committed.record().request_id().history_epoch(),
                     tombstone: ProfiledTerminalConflictTombstone::V1(tombstone),
@@ -8260,6 +8594,16 @@ mod production_runtime_cut_matrix_tests {
         );
         let registration = executor.register(request).await.expect("registered");
 
+        // All effects precede reconciliation, which closes the entire admission.
+        assert!(matches!(
+            executor.prepare(&registration, 3).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 3).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+
         for ordinal in 0_u8..3 {
             assert!(matches!(
                 executor.prepare(&registration, ordinal).await,
@@ -8295,14 +8639,6 @@ mod production_runtime_cut_matrix_tests {
             Ok(CallResult::Conclusive(_))
         ));
 
-        assert!(matches!(
-            executor.prepare(&registration, 3).await,
-            Ok(CallResult::PreparedNotRun)
-        ));
-        assert!(matches!(
-            executor.execute(&registration, 3).await,
-            Ok(CallResult::Conclusive(_))
-        ));
         assert!(matches!(
             executor.compensate_member(&registration, 3).await,
             Ok(CallResult::NotTransmitted)
