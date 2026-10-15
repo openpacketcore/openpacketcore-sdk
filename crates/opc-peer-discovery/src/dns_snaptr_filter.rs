@@ -91,6 +91,7 @@ impl DnsAnswer {
                 DnsCandidate {
                     peer: candidate.peer.clone(),
                     records: Some(first.records.clone()),
+                    srv: None,
                     snaptr: Some(SnaptrProvenance {
                         origin: provenance.origin.clone(),
                         filter: provenance.filter.clone(),
@@ -135,6 +136,7 @@ impl DnsAnswer {
             freshness_bound: self.freshness_bound,
             negative_freshness_bound: self.negative_freshness_bound,
             snaptr_coverage: self.snaptr_coverage,
+            srv_coverage: self.srv_coverage,
             snaptr_hosts: Some(
                 hosts
                     .into_iter()

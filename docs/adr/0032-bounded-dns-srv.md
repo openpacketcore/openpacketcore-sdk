@@ -149,6 +149,26 @@ owner for programmatic correlation. Terminal outcomes retain the SRV question
 plus each requested family once per visited target, at most `1 + 2 * max_srv_targets`.
 Repeated target names reuse those outcomes across ports. Diagnostics remain redacted.
 
+### Completion evidence
+
+Expose `SrvCoverage` through `DnsClientResponse::srv_coverage()` and retain the
+same value in a positive `DnsAnswer::srv_coverage()`. It describes the original
+resolver response before consumer policy: skipped record/target work,
+addresses omitted by each target's sixteen-address cap, distinct endpoints
+omitted from the final sixteen-candidate set, and failed questions. Count each
+visited target's discarded addresses once, independently of its SRV ports;
+count omitted endpoints only from retained target addresses. Skipped work has
+unknown descendant cardinality. These counters require no additional queries,
+and neither the work nor retention bounds change.
+
+The incomplete flag is false only for a successful result with all those
+counts zero. Unknown coverage is not evidence of completeness. A complete
+sixteen-address RRset and its identical retained prefix with a discarded
+seventeenth address must remain distinguishable after cache publication.
+Pure path filtering retains the original metadata and deadlines; a filtered
+empty view does not establish DNS absence. Existing typed root denials,
+negative authority, and the cache's last-good policy are unchanged.
+
 ## Consequences
 
 The change adds no dependency, background task, second cache or unsafe code.

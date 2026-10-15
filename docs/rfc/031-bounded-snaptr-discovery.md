@@ -24,6 +24,7 @@ DnsQuery::with_snaptr_filter(filter) -> Result<DnsQuery, DnsError>
 DnsCandidate::snaptr() -> Option<&SnaptrProvenance>
 DnsAnswer::snaptr_hosts() -> Option<&[SnaptrHost]>
 DnsClientResponse::snaptr_root() -> Option<&SnaptrRootObservation>
+DnsClientResponse::snaptr_coverage() -> Option<&SnaptrCoverage>
 ```
 
 One query requests one application service/protocol pair. Its existing
@@ -64,6 +65,18 @@ view nor its prefix promises exhaustive topology/collocation search; the
 consumer owns that selection and decides whether the reported coverage is
 sufficient. No topology ranking is performed in the SDK.
 
+Expose the same coverage in the response after a matched-root traversal,
+including failures with no retained endpoint. Root-only decisions and failures
+before traversal return no coverage; their typed root/error contracts remain
+the authority. The response's bounded branch trace cannot prove that every
+branch outcome is present. An exhaustive-denial classification requires zero
+unexpanded/unvisited/unfinished/omitted counters, accounting for every failed
+or refused branch, and an explicit check of each retained typed outcome.
+Timeouts and local failures do not become denials just because their trace
+fits. `incomplete` also includes fully observed semantic refusals and failures;
+neither that flag nor the retained trace length is a denial predicate.
+Consumers must not reconstruct omitted DNS data or traversal.
+
 Use the same legacy weight encoding as address and SRV mode:
 `weight = u16::MAX - index` in the final deduplicated endpoint order, through
 one shared helper. S-NAPTR uses priority zero, as address mode does; direct
@@ -103,6 +116,24 @@ the protocol was not advertised. A protocol-specific descendant must still
 match that protocol. Legacy `aaa` records do not satisfy an application-ID
 filter; the root classification below exposes legacy presence to the caller.
 Preserve security-bearing protocol tags for the consumer's handshake.
+
+For explicit section 5(d)/(e) compatibility, a filter with service `aaa`
+accepts `aaa:protocol` by whole-tag matching and bare `aaa` without inventing
+a protocol tag. Bare records use the query's configured supported transport
+and retain `protocol_advertised() == false`; the consumer owns the supported
+transport sequence. All replacement, flag, loop, depth and work limits still
+apply. A compatibility query that observes any `aaa+ap` family record refuses
+`ExtendedPresentNoMatch`, even beside legacy matches. This also prevents a
+changed RRset between the caller's application query and compatibility query
+from turning extended data into a downgrade. Retry the application-specific
+query when reconsidering extended discovery.
+If neither extended data nor an `aaa` service entry exists, the compatibility
+result is `PresentNoMatch(NotAdvertised)` and permits caller-owned section 5(f)
+SRV fallback. RFC 3588 `AAA+D2T`/`AAA+D2S` records count as unrelated during
+this compatibility query; they still produce `LegacyOnly` for an application-ID
+query. An `aaa:protocol` entry with no supported protocol remains
+`PresentNoMatch(ServiceNotOffered)`. Malformed requested service syntax remains
+a refusal, never an absence signal.
 
 Defaults come from the requested service definition: GTP-C uses 2123
 ([TS 29.274 V8.0.0, clause 4.3.1.1](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/08.00.00_60/ts_129274v080000p.pdf));
@@ -145,7 +176,8 @@ A valid match takes precedence over non-matches. Without one, requested-field
 malformation takes precedence over extended presence, then legacy presence,
 then unrelated-only data. Conservatively treat an `aaa+ap` family marker as
 extended presence even if its ID is noncanonical; do not infer absence from
-it. Non-Diameter queries use `PresentNoMatch(ServiceNotOffered)` as needed.
+it. The explicit `aaa` compatibility query uses the rules above; other
+non-Diameter queries use `PresentNoMatch(ServiceNotOffered)` as needed.
 Root SERVFAIL, REFUSED, timeout, invalid query or unparseable response has
 **no classification**, preserving its typed error. None means unobserved,
 never `NoNaptr` or `NotAdvertised`.
@@ -427,7 +459,7 @@ above; it never freshens stale endpoints.
 
 ## Retained size
 
-The endpoint/host/path limits apply to cached payloads as well as responses.
+The S-NAPTR endpoint/host/path limits apply to cached payloads as well as responses.
 At most 64 paths contain 16 timed records and 14 NAPTR hops each. On 64-bit
 platforms, a conservative bound for retained DNS-derived metadata is 2 MiB
 per answer (512 MiB for 256 maximally populated cache entries), excluding
@@ -455,6 +487,7 @@ All names/answers are synthetic; tests never contact public or system DNS.
 | Ordering and seed | Retain higher-order candidates after a successful lower group; test two ancestral levels, order/preference conflicts, 3GPP weights at 0/65535, SRV priority/weight and ports. Check fixed seed-derivation vectors, owner/type separation, wire-order permutations, and a shared child drawn once. Force later siblings to release an earlier one; verify slot refilling, late replacement of full endpoint/path pools and rebuilt host references. Arrival-dependent order, flattened order/preference and a different S-NAPTR legacy weight encoding must fail. |
 | Concurrency and backtracking | Use the default attempts and automatic budget with silent first-ranked delegations, address hosts, SRV owners and SRV targets; also use the full unmodified default limits. Retain healthy siblings, child Timeout outcomes and partial freshness. Bound concurrent questions, reserve backtracking time for each non-root kind while an alternative remains, progress nested siblings and share in-flight data without consuming the record budget prematurely. Use an in-process datagram fixture and paused time for deadline ordering: a lone path must retry a lost first packet and complete a healthy chain. A healthy retry or delayed answer must also survive a dead sibling already in flight. Release the cap when siblings finish; shared waiters, cached NAPTR/SRV paths to the same question, and exhausted allowances must not create alternatives. A cached path to a different admissible child still needs backtracking time. Pin logical allowance consumed by queued duplicates and keep two healthy queued branches within a short virtual-time budget. Assert outcomes, question counts and ordering; no correctness assertion depends on host-clock margins. |
 | Completed prefix | Retain outcomes and coverage from admitted failures after the pool fills. Test transient, timeout and SOA failures above and below a full prefix, and below a partial prefix; only failures below all 16 endpoints avoid a freshness bound. With one slot, assert the exact wire questions and that a lower-ranked host is never queried after 16 better endpoints complete. Disabling the prefix stop or applying a lower failure's bound must fail. |
+| Completion evidence at retention limits | Direct SRV must distinguish a complete sixteen-address RRset from the same prefix followed by an omitted usable address, retaining coverage and original data through cache publication and pure filtering. Count final endpoint omissions, skipped work and failed questions separately. Failed S-NAPTR traversal must expose exhaustive denial/refusal counts, unfinished lookups and omitted bounded-trace details through the public response. Missing coverage is unknown; bounded trace length alone cannot certify completeness. |
 | Unrelated service syntax | Filter malformed first SERVICES tokens beside a valid match and in an unrelated-only Diameter realm. The latter must remain `NotAdvertised` through ordinary cache publication, allowing caller-owned section 5(f) fallback. |
 | Bounds and cancellation | Self/two-node/case/alias loops and a shared-child diamond; exact depth/provenance boundaries; each record/lookup/target/retention limit with and without an already healthy path. A slow delegation after a healthy host must yield a timed-out partial answer. Budget-blocked higher-ranked paths must expose outcomes/freshness bounds. Resetting budgets per branch, dropping completed results, missing coverage or leaking work after cancellation must fail. |
 | Root classification and RFC 6408 | No root NAPTR (NXDOMAIN and NODATA); unrelated-only NAPTR; extended application/transport mismatch under 5(b)/(c); legacy-only 5(d)/(e); matching explicit/application-only records; malformed requested fields; mixed extended/legacy records. Assert each typed classification and allowed caller action, including explicit 5(f) SRV names. Check classification TTL/negative cap, zero/high-bit/unknown timing, filter/profile cache isolation, `finish_refresh` publication fencing and refresh pacing. Include relay-only answers and an SCTP mismatch beside an independent TCP match. Conflating absence with mismatch, allowing downgrade, or caching a decision indefinitely must fail. |

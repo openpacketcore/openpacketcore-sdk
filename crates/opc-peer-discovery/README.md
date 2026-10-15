@@ -31,6 +31,7 @@ an async DNS client for A/AAAA, RFC 2782 SRV and bounded S-NAPTR discovery.
   `DnsRetryPolicy`, `DnsRefresh`, and `DnsRefreshToken`.
 - S-NAPTR policy/results: `SnaptrFilter`, `SnaptrOrdering`, `SnaptrProvenance`,
   `SnaptrPath`, `SnaptrHost`, `SnaptrCoverage`, and `SnaptrRootObservation`.
+- Direct-SRV policy/results: `SrvPath`, `SrvProvenance`, and `SrvCoverage`.
 - DNS failures: `DnsError`, `SnaptrFailure`, `SnaptrNoMatch`, and `DnsCacheError`
   expose typed, redacted failures.
 - Identity and transport: `PeerLabel`, `PeerTransport`, and
@@ -537,11 +538,53 @@ RFC 2308 handling. If no target is usable, return a typed failure and let the
 cache retain last-good data with paced retries.
 
 Each candidate retains the complete service-alias, SRV and address chain.
+`DnsCandidate::srv()` also retains every completed target-and-port path to
+that selected endpoint, with raw SRV priority/weight and its original seeded
+traversal rank. Alternate targets sharing an endpoint keep distinct identity
+and record chains. Each endpoint retains at most 128 paths, bounded further
+by the configured record/target work limits, with at most 16 records per path.
+This includes completed alternate paths from already-started work after the
+endpoint prefix fills; endpoint selection and query limits stay the same.
+The existing skipped counters still describe omissions from endpoint assembly.
 The full SRV RRset supplies its minimum TTL before deduplication, and address
 RRsets retain their own minima before truncation (RFC 2181 section 5.2).
 Additional data shares the initial response observation; fresh address replies
 retain their later observations. Neither step restarts the SRV lifetime.
 `fresh_until` includes the earliest chain deadline and the configured cache cap.
+Alternate paths participate in expiry and future-observation validation too.
+
+`DnsAnswer::filter_srv_paths` applies consumer policy to these original paths
+in their retained traversal order. For example, excluding one target never
+authorizes or discards another target merely because their addresses overlap.
+The best surviving path supplies each endpoint's primary records and priority;
+weights encode the resulting endpoint order without another random draw.
+Raw SRV fields, record times and both failure freshness bounds survive.
+Address, S-NAPTR, legacy and mixed answers are rejected before calling policy.
+An empty policy result is local exclusion, not DNS absence or fallback authority.
+
+Publish the original answer to `DnsCache`, then filter lookup snapshots. A
+view's expiry does not replace the cache's `fresh_until` or retry state. Apply
+changed policy to the original answer to recover paths a previous policy
+excluded. Filtering does not issue queries or backfill omitted discovery work.
+
+`DnsClientResponse::srv_coverage()` reports resolver completion before policy
+filtering. The same `SrvCoverage` is retained in a positive
+`DnsAnswer::srv_coverage()` through cache publication and path filtering. It
+counts skipped record/target work, per-target address truncation, distinct
+observed endpoints omitted from final assembly, and failed questions. Address
+omissions count each visited target once; endpoint omissions count only
+combinations of its retained addresses and advertised ports, without counting
+discarded addresses again. Unvisited targets have unknown address cardinality.
+`incomplete == false` requires a successful resolution with no omission or
+failed question. Absent coverage means unknown, never complete. Existing typed
+root denials keep their authority independently of this positive-answer test.
+
+Sixteen retained addresses and zero skipped records/targets do not prove
+completeness: a seventeenth address can have been discarded within one target.
+A consumer whose policy excludes every retained endpoint must consult the
+original coverage before treating that view as an exhaustive result. Coverage
+does not decide usability, authentication, fallback, or last-good policy, and
+it does not change the original answer, its deadlines or the cache state machine.
 
 | SRV resource | Default | Accepted bound |
 |---|---:|---:|
@@ -551,7 +594,8 @@ retain their later observations. Neither step restarts the SRV lifetime.
 | Concurrent target exchanges per refresh | 4 | 1–32 |
 | Overall SRV I/O budget | Automatic: timeout × (servers + 1), capped at 300 s | 0 (automatic) or 1 ms–300 s |
 | Memoized addresses per target | 16 | 16 |
-| Final candidates / records per candidate | 16 / 16 | 16 / 16 |
+| Final candidates / records per path | 16 / 16 | 16 / 16 |
+| Retained paths per endpoint | At most the record budget | 128 |
 | Retained terminal response sources | — | 1 + address lookup budget |
 | Retained terminal resolution outcomes | — | 1 + 2 × distinct-target limit |
 
@@ -644,6 +688,18 @@ refused/failed branches and incomplete hosts through cache publication. The
 consumer owns topology/collocation selection and authentication against the
 original name. The view does not promise an exhaustive topology search.
 
+`DnsClientResponse::snaptr_coverage()` also exposes these counters after a
+matched-root traversal fails with no positive answer. The response and positive
+answer expose equal coverage when an answer exists. Root-only decisions and
+pre-admission failures carry no traversal coverage; use their typed result and
+root classification. A bounded branch trace alone never proves exhaustiveness.
+Before classifying an all-branch failure as an exhaustive denial, require no
+unexpanded, unvisited, unfinished or omitted work/evidence, account for every
+refused/failed branch, and inspect each retained typed outcome. A timeout is
+not a denial merely because its trace fits. `incomplete` includes fully observed
+refusals and failures, so that flag alone cannot classify a failed traversal.
+No omitted records or paths should be reconstructed by the consumer.
+
 One admission permit and absolute `snaptr_refresh_timeout` cover the traversal.
 NAPTR depth defaults to 8 (maximum 14), eligible record expansions to 128
 (maximum 1024), and logical lookups including memoized visits to 64 (maximum
@@ -690,7 +746,21 @@ and root RRset/alias deadlines survive ordinary `finish_refresh`, using the
 existing negative TTL cap, last-good retention and retry/token fencing.
 `snaptr_root()` is diagnostic context, with no separate cache lifecycle.
 
-The DNS-derived retained payload is bounded conservatively by 2 MiB per
+An explicit `SnaptrFilter` for service `aaa` implements RFC 6408 section 5(d)/(e):
+`aaa:protocol` matches that whole protocol tag, while bare `aaa` follows its
+replacement using this query's configured supported transport. Its hop records
+`protocol_advertised() == false`; no protocol tag or application ID is invented.
+The consumer tries its supported transports in the required order. The same
+flags, loop, depth, work and malformed-service rules apply. A compatibility
+lookup that observes any extended `aaa+ap` data returns `ExtendedPresentNoMatch`,
+including when the root changes after an application-specific query. Reconsider
+extended discovery; legacy records in that reply cannot enable a downgrade.
+Without extended data or an `aaa` service entry, the compatibility result is
+`NotAdvertised`, allowing caller-owned SRV fallback. RFC 3588 `AAA+D2T` and
+`AAA+D2S` count as unrelated for this filter. An explicit `aaa:protocol` entry
+for an unsupported protocol remains `ServiceNotOffered`, not absence.
+
+The S-NAPTR DNS-derived retained payload is bounded conservatively by 2 MiB per
 answer, plus up to 16 copies of the caller-owned label; allocator bookkeeping
 and cache query keys are separate. [RFC 031](../../docs/rfc/031-bounded-snaptr-discovery.md)
 specifies the matching grammar, fallback table, exact seed derivation,

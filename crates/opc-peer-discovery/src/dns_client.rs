@@ -397,6 +397,8 @@ pub struct DnsClientResponse {
     /// Bounded branch refusals/failures in traversal order; not retained by the cache.
     pub snaptr_branches: Vec<crate::SnaptrBranchOutcome>,
     pub(crate) snaptr_root: Option<crate::SnaptrRootObservation>,
+    pub(crate) snaptr_coverage: Option<crate::SnaptrCoverage>,
+    pub(crate) srv_coverage: Option<crate::SrvCoverage>,
 }
 
 impl DnsClientResponse {
@@ -404,6 +406,25 @@ impl DnsClientResponse {
     /// `result`, so existing `finish_refresh` drivers preserve them.
     pub fn snaptr_root(&self) -> Option<&crate::SnaptrRootObservation> {
         self.snaptr_root.as_ref()
+    }
+
+    /// S-NAPTR traversal coverage, including failures with no positive answer.
+    /// A bounded branch trace alone is
+    /// not exhaustive: inspect omission/work counters before classifying its
+    /// typed outcomes. `incomplete` also includes fully observed refusals and
+    /// failures, so it is not itself a denial or fallback predicate.
+    /// Root-only decisions use [`Self::snaptr_root`] and `result` instead;
+    /// they and pre-admission failures return `None`, never implied completeness.
+    pub fn snaptr_coverage(&self) -> Option<&crate::SnaptrCoverage> {
+        self.snaptr_coverage.as_ref()
+    }
+
+    /// Completion evidence from a direct SRV resolution, before policy filtering.
+    /// A positive `result` retains the same evidence in [`DnsAnswer::srv_coverage`].
+    /// Other modes and failures before SRV resolution return `None` (unknown).
+    /// Typed root denials keep their authority independently of coverage.
+    pub fn srv_coverage(&self) -> Option<&crate::SrvCoverage> {
+        self.srv_coverage.as_ref()
     }
 
     fn error(error: DnsError) -> Self {
@@ -415,6 +436,8 @@ impl DnsClientResponse {
             skipped_srv_targets: 0,
             snaptr_branches: Vec::new(),
             snaptr_root: None,
+            snaptr_coverage: None,
+            srv_coverage: None,
         }
     }
 }
@@ -810,6 +833,8 @@ impl DnsClient {
                 skipped_srv_targets: 0,
                 snaptr_branches: Vec::new(),
                 snaptr_root: None,
+                snaptr_coverage: None,
+                srv_coverage: None,
             };
         }
         candidates
@@ -835,6 +860,8 @@ impl DnsClient {
             skipped_srv_targets: 0,
             snaptr_branches: Vec::new(),
             snaptr_root: None,
+            snaptr_coverage: None,
+            srv_coverage: None,
         }
     }
 

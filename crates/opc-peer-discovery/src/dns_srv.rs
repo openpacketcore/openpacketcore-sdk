@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 use super::*;
 use crate::dns_wire::{SrvAnswer, SrvRecord};
-use crate::{DiscoveryTarget, PeerCandidate};
+use crate::{DiscoveryTarget, PeerCandidate, SnaptrSrv, SrvCoverage, SrvPath, SrvProvenance};
 
 #[derive(Clone)]
 pub(super) struct RefreshSession {
@@ -49,12 +49,16 @@ struct SrvRefresh {
     negative_freshness_bound: Option<PeerDiscoveryTime>,
     skipped_records: usize,
     skipped_targets: usize,
+    omitted_addresses: usize,
+    omitted_endpoints: usize,
 }
 
 impl SrvRefresh {
     fn merge(&mut self, mut other: Self) {
         self.sources.append(&mut other.sources);
         self.outcomes.append(&mut other.outcomes);
+        self.omitted_addresses += other.omitted_addresses;
+        self.omitted_endpoints += other.omitted_endpoints;
         for (bound, added) in [
             (&mut self.freshness_bound, other.freshness_bound),
             (
@@ -165,6 +169,106 @@ struct SrvExpansion {
 }
 
 impl SrvExpansion {
+    fn omitted_endpoints(&self, targets: &[DnsQuery]) -> usize {
+        let mut omitted = Vec::new();
+        for record in &self.records[..self.record_limit] {
+            let Some(index) = targets
+                .iter()
+                .position(|target| *target.name() == record.target)
+            else {
+                continue;
+            };
+            let Some(TargetResponse {
+                result: Ok(addresses),
+                ..
+            }) = &self.results[index]
+            else {
+                continue;
+            };
+            for address in addresses {
+                let endpoint = SocketAddr::new(address.peer().endpoint.ip(), record.port);
+                if !self
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.peer().endpoint == endpoint)
+                    && !omitted.contains(&endpoint)
+                {
+                    omitted.push(endpoint);
+                }
+            }
+        }
+        omitted.len()
+    }
+
+    fn retain_paths(
+        &mut self,
+        query: &DnsQuery,
+        answer: &SrvAnswer,
+        targets: &[DnsQuery],
+    ) -> Result<(), DnsError> {
+        let owner = answer
+            .chain
+            .last()
+            .ok_or(DnsError::MalformedAnswer)?
+            .owner
+            .clone();
+        let mut paths = vec![Vec::new(); self.candidates.len()];
+        // Reuse completed target work, including alternate paths after the
+        // endpoint cap. No new endpoint or lookup is admitted by retention.
+        for (rank, record) in self.records[..self.record_limit].iter().enumerate() {
+            let Some(target_index) = targets.iter().position(|q| *q.name() == record.target) else {
+                continue;
+            };
+            let Some(TargetResponse {
+                result: Ok(addresses),
+                ..
+            }) = &self.results[target_index]
+            else {
+                continue;
+            };
+            for (address_rank, address) in addresses.iter().enumerate() {
+                let endpoint = SocketAddr::new(address.peer().endpoint.ip(), record.port);
+                let Some(index) = self
+                    .candidates
+                    .iter()
+                    .position(|c| c.peer().endpoint == endpoint)
+                else {
+                    continue;
+                };
+                let mut chain = answer.chain.clone();
+                chain.extend_from_slice(address.records().ok_or(DnsError::MalformedAnswer)?);
+                if chain.len() > DnsCandidate::MAX_RECORDS {
+                    return Err(DnsError::MalformedAnswer);
+                }
+                paths[index].push(SrvPath {
+                    rank: (rank, address_rank),
+                    records: chain.into(),
+                    record: SnaptrSrv {
+                        owner: owner.clone(),
+                        priority: record.priority,
+                        weight: record.weight,
+                        port: record.port,
+                        target: record.target.clone(),
+                    },
+                });
+            }
+        }
+        for (candidate, paths) in self.candidates.iter_mut().zip(paths) {
+            candidate.records = Some(
+                paths
+                    .first()
+                    .ok_or(DnsError::MalformedAnswer)?
+                    .records
+                    .clone(),
+            );
+            candidate.srv = Some(SrvProvenance {
+                origin: query.name().clone(),
+                paths: paths.into_boxed_slice(),
+            });
+        }
+        Ok(())
+    }
+
     fn has_candidate_capacity(&self, targets: &[DnsQuery], started: usize) -> bool {
         let mut endpoints = Vec::new();
         for record in &self.records[..self.record_limit] {
@@ -318,8 +422,27 @@ impl DnsClient {
             }
             Err(error) => Err(error),
         };
+        let failed_questions = refresh
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.result.is_err())
+            .count();
+        let coverage = SrvCoverage {
+            incomplete: result.is_err()
+                || refresh.skipped_records != 0
+                || refresh.skipped_targets != 0
+                || refresh.omitted_addresses != 0
+                || refresh.omitted_endpoints != 0
+                || failed_questions != 0,
+            unexpanded_records: refresh.skipped_records,
+            unexpanded_targets: refresh.skipped_targets,
+            omitted_addresses: refresh.omitted_addresses,
+            omitted_endpoints: refresh.omitted_endpoints,
+            failed_questions,
+        };
         DnsClientResponse {
             result: result.map(|mut answer| {
+                answer.srv_coverage = Some(coverage);
                 if let Some(bound) = refresh.freshness_bound {
                     answer = answer.with_freshness_bound(bound);
                 }
@@ -334,6 +457,8 @@ impl DnsClient {
             skipped_srv_targets: refresh.skipped_targets,
             snaptr_branches: Vec::new(),
             snaptr_root: None,
+            snaptr_coverage: None,
+            srv_coverage: Some(coverage),
         }
     }
 
@@ -433,6 +558,8 @@ impl DnsClient {
         refresh.skipped_targets = skipped_targets.len();
         refresh.skipped_records =
             expansion.skipped_records + expansion.records.len() - expansion.next_record;
+        refresh.omitted_endpoints = expansion.omitted_endpoints(&targets);
+        expansion.retain_paths(query, &answer, &targets)?;
         // Diagnostics use target selection order, including speculative work
         // already started within the concurrency bound before the cap filled.
         for response in expansion.results.into_iter().flatten() {
@@ -543,6 +670,7 @@ impl DnsClient {
         // destination precedence, including server-side address rotation.
         candidates
             .sort_by_key(|candidate| crate::dns::destination_rank(candidate.peer().endpoint.ip()));
+        refresh.omitted_addresses = candidates.len().saturating_sub(DnsAnswer::MAX_CANDIDATES);
         candidates.truncate(DnsAnswer::MAX_CANDIDATES);
         Ok(candidates)
     }

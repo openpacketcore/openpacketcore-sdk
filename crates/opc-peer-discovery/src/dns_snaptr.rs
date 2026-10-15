@@ -40,7 +40,7 @@ fn matches_service(
     if protocols.iter().any(|tag| !crate::snaptr::valid_tag(tag)) {
         return Err(SnaptrFailure::MalformedService);
     }
-    if protocols.is_empty() && filter.diameter() {
+    if protocols.is_empty() && (filter.diameter() || filter.service() == "aaa") {
         return Ok(Some(false));
     }
     Ok(protocols
@@ -93,6 +93,7 @@ fn prepare_naptr(
     let mut filtered = 0;
     let mut extended = false;
     let mut legacy = false;
+    let mut compatibility_present = false;
     let mut malformed = false;
     let mut matched = false;
     for record in answer.records {
@@ -104,6 +105,7 @@ fn prepare_naptr(
             .to_ascii_lowercase();
         extended |= first.starts_with(b"aaa+ap");
         legacy |= matches!(first.as_slice(), b"aaa" | b"aaa+d2t" | b"aaa+d2s");
+        compatibility_present |= first == b"aaa";
         let advertised = match matches_service(&record, filter) {
             Ok(Some(value)) => {
                 matched = true;
@@ -120,11 +122,19 @@ fn prepare_naptr(
         };
         records.push(MatchedNaptr { record, advertised });
     }
-    let classification = if matched {
+    let classification = if filter.service() == "aaa" && extended {
+        // A compatibility lookup can observe a changed RRset after the caller's
+        // application-specific lookup. RFC 6408 section 5(b)/(c) does not permit
+        // treating extended data as legacy support, even beside matching aaa.
+        records.clear();
+        SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::ExtendedPresentNoMatch)
+    } else if matched {
         SnaptrRootKind::Match
     } else {
         SnaptrRootKind::PresentNoMatch(if malformed {
             SnaptrNoMatch::MalformedRequestedService
+        } else if filter.service() == "aaa" && !compatibility_present {
+            SnaptrNoMatch::NotAdvertised
         } else if !filter.diameter() {
             SnaptrNoMatch::ServiceNotOffered
         } else if extended {
@@ -1654,6 +1664,10 @@ impl DnsClient {
             root_finished: false,
         };
         traversal.run(now).await;
+        if !traversal.root_finished {
+            traversal.coverage.incomplete |= traversal.response.result.is_err();
+            traversal.response.snaptr_coverage = Some(traversal.coverage);
+        }
         traversal.response
     }
 }
