@@ -2443,6 +2443,14 @@ by issue #143.
   audit/readiness latching, terminal idempotency, and exact legacy
   confirmation.
 - Run with: `cargo test -p opc-session-store`.
+- The native void-receipt fixtures script election samples and delivery of
+  crossing votes through the real three-voter engine. They verify a forced
+  campaign denied by the leader lease, an automatic split vote, and the
+  designated successor's retry at a bound computed from the configured timers.
+  With the current profile, the split occurs at six seconds and the successor
+  wins at twelve; the former ten-second wait is retained as a negative control.
+  A separate wall-clock watchdog bounds real I/O. Normal time resumes for the
+  original receipt, business-state, snapshot, and restart assertions.
 - Fixed-quorum fault, snapshot, and election qualification requires the existing
   test controls: `cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority`.
   On Linux, live authority faults execute against both the selected native WAL

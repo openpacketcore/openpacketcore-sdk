@@ -730,6 +730,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store` tests: make native void-receipt successor elections
+  deterministic with real lease denials and split votes. Require the designated
+  successor at the retry computed from the configured election timers, retain
+  the former ten-second wait as a negative control, and preserve all receipt,
+  business-state, snapshot, and restart assertions. (#1301)
+
 - `opc-persist`: preserve the remaining standard-clock deadline budget when
   waiting for retained configuration admission and consumer-checkpoint I/O or
   encryption. An advanced Tokio clock no longer makes an unexpired operation

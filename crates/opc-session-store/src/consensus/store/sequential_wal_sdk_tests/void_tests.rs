@@ -373,27 +373,11 @@ async fn void_readiness_before_first_activation_needs_every_voters_proof() {
 
 impl Fleet {
     async fn change_void_leader(&self) {
-        let old = self
-            .stores
-            .iter()
-            .position(|store| store.status().leader_id == Some(store.status().node_id))
-            .unwrap();
-        let successor = &self.stores[(old + 1) % self.stores.len()];
-        successor.inner.raft.trigger().elect().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if self
-                    .stores
-                    .iter()
-                    .all(|store| store.status().leader_id == Some(successor.status().node_id))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("successor leader on every voter");
+        self.void_election
+            .as_ref()
+            .expect("scripted successor election")
+            .change_leader(self)
+            .await;
     }
 
     async fn snapshot_void_receipts(&self) {
@@ -452,7 +436,7 @@ impl Fleet {
             } else {
                 SnapshotIntegrityPolicy::PortableVerified
             };
-            let result =
+            let open = Box::pin(
                 ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                     self.topologies[index].clone(),
                     backend,
@@ -463,8 +447,13 @@ impl Fleet {
                         .unwrap_or_else(|| Arc::new(crate::SystemClock)),
                     crate::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                     snapshot_integrity,
-                )
-                .await;
+                ),
+            );
+            let result = if let Some(election) = &self.void_election {
+                election.scripts[index].scope(open).await
+            } else {
+                open.await
+            };
             match result {
                 Ok(store) => self.stores.push(store),
                 Err(error) => {
@@ -515,7 +504,11 @@ impl Fleet {
                 }) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                if self.void_election.is_some() {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
         })
         .await;
@@ -576,36 +569,47 @@ async fn recovery_inspection_accepts_real_void_profile_replicas() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn native_three_voter_void_decides_before_original_and_survives_restart() {
     let mut fleet = Fleet::new_native("void-before-original");
     let profiles = [FencedTransitionV2Profile::V2WithVoid; 3];
-    fleet.open_void_profiles(profiles).await;
     let result = AssertUnwindSafe(async {
-        let request = v2_create_request(
-            301,
-            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
-            FenceToken::new(0),
-            &provider(),
-        )
-        .await;
-        let expected =
-            FencedTransitionV2Status::Recorded(Box::new(Err(StoreError::FencedTransitionVoided)));
-        assert_eq!(
-            fleet.stores[0]
-                .fenced_transition_v2_capability()
-                .await
-                .unwrap(),
-            Some(FencedTransitionV2Capability::V2)
-        );
-        assert_eq!(
-            fleet.stores[0]
-                .fenced_transition_v2_void(&request)
-                .await
-                .unwrap(),
-            expected
-        );
-        fleet.change_void_leader().await;
+        let (request, expected) = void_election::schedule::with_frozen_time(Box::pin(
+            AssertUnwindSafe(async {
+                fleet.void_election = Some(void_election::VoidElection::new(&fleet).await);
+                fleet.open_void_profiles(profiles).await;
+                let request = v2_create_request(
+                    301,
+                    FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+                    FenceToken::new(0),
+                    &provider(),
+                )
+                .await;
+                let expected = FencedTransitionV2Status::Recorded(Box::new(Err(
+                    StoreError::FencedTransitionVoided,
+                )));
+                assert_eq!(
+                    fleet.stores[0]
+                        .fenced_transition_v2_capability()
+                        .await
+                        .unwrap(),
+                    Some(FencedTransitionV2Capability::V2)
+                );
+                assert_eq!(
+                    fleet.stores[0]
+                        .fenced_transition_v2_void(&request)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                fleet.change_void_leader().await;
+                (request, expected)
+            })
+            .catch_unwind(),
+        ))
+        .await
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        fleet.void_election = None;
         for store in &fleet.stores {
             assert_eq!(
                 store.fenced_transition_v2_status(&request).await.unwrap(),
@@ -638,26 +642,36 @@ async fn native_three_voter_void_decides_before_original_and_survives_restart() 
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn native_three_voter_original_receipt_wins_over_later_void() {
     let mut fleet = Fleet::new_native("original-before-void");
-    fleet
-        .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
-        .await;
     let result = AssertUnwindSafe(async {
-        let request = v2_create_request(
-            302,
-            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
-            FenceToken::new(0),
-            &provider(),
-        )
-        .await;
-        let outcome = fleet.stores[0]
-            .fenced_transition_v2(request.clone())
-            .await
-            .unwrap();
-        let expected = FencedTransitionV2Status::Recorded(Box::new(Ok(outcome)));
-        fleet.change_void_leader().await;
+        let (request, expected) = void_election::schedule::with_frozen_time(Box::pin(
+            AssertUnwindSafe(async {
+                fleet.void_election = Some(void_election::VoidElection::new(&fleet).await);
+                fleet
+                    .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
+                    .await;
+                let request = v2_create_request(
+                    302,
+                    FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+                    FenceToken::new(0),
+                    &provider(),
+                )
+                .await;
+                let outcome = fleet.stores[0]
+                    .fenced_transition_v2(request.clone())
+                    .await
+                    .unwrap();
+                let expected = FencedTransitionV2Status::Recorded(Box::new(Ok(outcome)));
+                fleet.change_void_leader().await;
+                (request, expected)
+            })
+            .catch_unwind(),
+        ))
+        .await
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        fleet.void_election = None;
         for store in &fleet.stores {
             assert_eq!(
                 store.fenced_transition_v2_void(&request).await.unwrap(),
