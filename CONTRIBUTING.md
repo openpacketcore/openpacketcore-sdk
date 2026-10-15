@@ -189,10 +189,11 @@ Run the protected prepared-transition functional test alone with
 assertions and overflow checks remain enabled. The selector functional test
 retains its ordinary test profile.
 
-The full-bound native log and receipt-history reclamation proofs also use
+The full-bound native log and receipt-history reclamation proofs and four
+full-window log-admission proofs also use
 `CARGO_PROFILE_TEST_OPT_LEVEL=1`, with debug assertions and overflow checks
 enabled. Each proof has a dedicated parallel core shard (`native-log-0` through
-`native-log-13`) and egress shard (`4` through `17`).
+`native-log-17`) and egress shard (`4` through `21`).
 Both plans preserve their package and feature selection and precheck the exact
 enabled names in the execution profile. The default three-cycle regressions
 retain the ordinary test profile. All entry counts, persistence operations,
