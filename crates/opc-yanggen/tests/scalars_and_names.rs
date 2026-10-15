@@ -126,6 +126,7 @@ fn legacy_constructs_keep_every_generated_file_byte_identical() {
     // #1269 authorized keys and hidden-ancestor omission plus #1270 canonical key
     // literals and native instance trees, plus #1272 bounded content projection.
     // Every complete generated file stays pinned.
+    // All pins also include #1274 generated-lint repairs and shared statement formatting.
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/legacy_constructs_digests.json")).unwrap();
     let parsed = generation_input_from_yang_sources(

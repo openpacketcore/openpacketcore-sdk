@@ -120,8 +120,8 @@ fn generate_module(directory: &Path, name: &str, source: &str) {
             // Count comparisons in the actual generated composite key. Only
             // its equality implementation changes; the generated collections,
             // diff and apply code are exercised without instrumentation edits.
-            let derived = "# [derive (Debug , Clone , PartialEq , Eq , PartialOrd , Ord , Serialize , Deserialize , Default)] pub struct EndpointKey";
-            let counted = "# [derive (Debug , Clone , Eq , PartialOrd , Ord , Serialize , Deserialize , Default)] pub struct EndpointKey";
+            let derived = "# [derive (Debug , Clone , PartialEq , Eq , PartialOrd , Ord , Serialize , Deserialize , Default ) ] pub struct EndpointKey";
+            let counted = "# [derive (Debug , Clone , Eq , PartialOrd , Ord , Serialize , Deserialize , Default ) ] pub struct EndpointKey";
             assert_eq!(content.matches(derived).count(), 1);
             content = content.replace(derived, counted);
             content.push_str(

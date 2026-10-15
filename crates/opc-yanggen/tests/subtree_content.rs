@@ -35,11 +35,11 @@ fn generated_subtree_content_service() {
         // Count real model clones outside the projector without changing what
         // Clone copies. The nested tests run serially and reset after setup.
         let contents = if name == "types.rs" {
-            let declaration = "# [derive (Clone , PartialEq , Default)] pub struct SecretLeaf";
+            let declaration = "# [derive (Clone , PartialEq , Default ) ] pub struct SecretLeaf";
             assert_eq!(contents.matches(declaration).count(), 1);
             let mut contents = contents.replacen(
                 declaration,
-                "# [derive (PartialEq , Default)] pub struct SecretLeaf",
+                "# [derive (PartialEq , Default ) ] pub struct SecretLeaf",
                 1,
             );
             contents.push_str(

@@ -19,7 +19,6 @@ use quote::{format_ident, quote};
 
 /// Emits the `netconf_xml_edit` module for the generated crate.
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
-    let has_state_lists = super::has_state_keyed_lists(input);
     let nodes_by_path = NodeIndex::new(&input.nodes);
 
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
@@ -63,7 +62,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // apply_children_<list> helper is in scope.
     for node in &sorted_nodes {
         if node.kind == SchemaNodeKind::List && !has_keyless_list_ancestor(node, &nodes_by_path) {
-            apply_fns.push(apply_list_fn(node, &nodes_by_path, has_state_lists)?);
+            apply_fns.push(apply_list_fn(node, &nodes_by_path)?);
         }
     }
 
@@ -198,7 +197,6 @@ fn apply_children_fn(
     nodes_by_path: &NodeIndex<'_>,
     input: &CanonicalInput,
 ) -> Result<TokenStream, RustGenerationError> {
-    let has_state_lists = super::has_state_keyed_lists(input);
     let fn_ident = format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
     let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
@@ -319,7 +317,7 @@ fn apply_children_fn(
                 } else {
                     quote! { #child_type_ident::default() }
                 };
-                let default_constructor = if has_state_lists && !is_boxed {
+                let default_constructor = if !is_boxed {
                     quote! { #child_type_ident::default }
                 } else {
                     quote! { || #new_expr }
@@ -441,21 +439,6 @@ fn apply_children_fn(
     let check_singletons = if singleton_paths.is_empty() {
         TokenStream::new()
     } else {
-        let singleton_arm = if has_state_lists {
-            quote! {
-                #(#singleton_paths)|* if !singletons.insert(child.schema_path) => {
-                    return Err(NetconfEditError::InvalidValue { path: child.schema_path });
-                }
-            }
-        } else {
-            quote! {
-                #(#singleton_paths)|* => {
-                    if !singletons.insert(child.schema_path) {
-                        return Err(NetconfEditError::InvalidValue { path: child.schema_path });
-                    }
-                }
-            }
-        };
         quote! {
             // RFC 6241 section 7.2 leaves repeated operations on one
             // conceptual node undefined. Reject them before applying children;
@@ -463,19 +446,20 @@ fn apply_children_fn(
             let mut singletons = std::collections::BTreeSet::new();
             for child in children {
                 match child.schema_path {
-                    #singleton_arm
+                    #(#singleton_paths)|* if !singletons.insert(child.schema_path) => {
+                        return Err(NetconfEditError::InvalidValue { path: child.schema_path });
+                    }
                     _ => {}
                 }
             }
         }
     };
 
-    let rejects_every_child = has_state_lists
-        && node.child_paths.iter().all(|path| {
-            nodes_by_path
-                .get(path)
-                .is_some_and(|child| child.kind == SchemaNodeKind::Leaf && !child.config)
-        });
+    let rejects_every_child = node.child_paths.iter().all(|path| {
+        nodes_by_path
+            .get(path)
+            .is_some_and(|child| child.kind == SchemaNodeKind::Leaf && !child.config)
+    });
     let value_param = format_ident!(
         "{}",
         if !rejects_every_child
@@ -731,7 +715,6 @@ fn leaf_list_value_key_expr(
 fn apply_list_fn(
     node: &SchemaNode,
     nodes_by_path: &NodeIndex<'_>,
-    has_state_lists: bool,
 ) -> Result<TokenStream, RustGenerationError> {
     let fn_ident = format_ident!("apply_{}", nodes_by_path.helper_name(&node.path));
     let children_fn_ident =
@@ -784,18 +767,10 @@ fn apply_list_fn(
         });
         let is_sensitive = is_sensitive_node(key_leaf_node);
         single_key_is_sensitive = is_sensitive;
-        cloned_parsed = super::types::cloned_key_value(
-            key_leaf_node,
-            nodes_by_path,
-            quote! { parsed },
-            has_state_lists,
-        );
-        cloned_map_key = super::types::cloned_key_value(
-            key_leaf_node,
-            nodes_by_path,
-            quote! { parsed_key },
-            has_state_lists,
-        );
+        cloned_parsed =
+            super::types::cloned_key_value(key_leaf_node, nodes_by_path, quote! { parsed });
+        cloned_map_key =
+            super::types::cloned_key_value(key_leaf_node, nodes_by_path, quote! { parsed_key });
         let raw_key = if is_sensitive {
             cloned_parsed.clone()
         } else {
@@ -829,7 +804,6 @@ fn apply_list_fn(
                 key_leaf_node,
                 nodes_by_path,
                 quote! { #key_field_ident },
-                has_state_lists,
             );
             key_struct_fields.push(if key_field_ident == cloned_key.to_string() {
                 quote! { #key_field_ident }
@@ -873,23 +847,16 @@ fn apply_list_fn(
     } else {
         quote! { map.insert(parsed_key, entry); }
     };
-    let new_entry = if has_state_lists {
-        let remaining_fields = if node.child_paths.len() == node.key_leaves.len() {
-            quote! {}
-        } else {
-            quote! { ..Default::default() }
-        };
-        quote! {
-            let mut entry = #entry_type_ident {
-                #(#key_initializers)*
-                #remaining_fields
-            };
-        }
+    let remaining_fields = if node.child_paths.len() == node.key_leaves.len() {
+        quote! {}
     } else {
-        quote! {
-            let mut entry = #entry_type_ident::default();
-            #(#key_assigns)*
-        }
+        quote! { ..Default::default() }
+    };
+    let new_entry = quote! {
+        let mut entry = #entry_type_ident {
+            #(#key_initializers)*
+            #remaining_fields
+        };
     };
 
     Ok(quote! {
@@ -1101,11 +1068,7 @@ fn numeric_range_check_expr(
             let (min, max) = (interval.min as i64, interval.max as i64);
             (quote! { #min }, quote! { #max })
         };
-        if extended {
-            quote! { (#min..=#max).contains(&numeric_value) }
-        } else {
-            quote! { (#min <= numeric_value && numeric_value <= #max) }
-        }
+        quote! { (#min..=#max).contains(&numeric_value) }
     });
 
     let integer_type = if extended {

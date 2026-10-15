@@ -21,6 +21,6 @@ fn generated_key_list_matrix_has_no_copy_clone_or_partial_map_iteration() {
             }
         }
     }
-    assert_eq!(total, 192 + 4, "every matrix cell must be checked");
+    assert_eq!(total, 288 + 6, "every matrix cell must be checked");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

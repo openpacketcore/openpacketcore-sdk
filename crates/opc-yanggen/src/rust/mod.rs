@@ -156,14 +156,10 @@ impl<'a> NodeIndex<'a> {
                     .map(clean_segment)
                     .map(|s| {
                         let name = to_snake_case(s);
-                        if expanded_profile {
-                            name.split('_')
-                                .filter(|s| !s.is_empty())
-                                .collect::<Vec<_>>()
-                                .join("_")
-                        } else {
-                            name
-                        }
+                        name.split('_')
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("_")
                     })
                     .collect::<Vec<_>>()
                     .join("_")
@@ -313,12 +309,6 @@ fn has_user_ordered_collections(input: &CanonicalInput) -> bool {
         is_user_ordered(node)
             && (node.kind == SchemaNodeKind::LeafList
                 || (node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()))
-    })
-}
-
-fn has_state_keyed_lists(input: &CanonicalInput) -> bool {
-    input.nodes.iter().any(|node| {
-        !node.config && node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()
     })
 }
 
@@ -492,18 +482,15 @@ __ORDERED_REPLACEMENT_CHANGED_PATH__            }
         schema_registry::generate(&input)?,
     );
 
-    // These models previously emitted uncompilable Rust. Keep the established
-    // bytes of other supported models while giving state-list output proper
-    // statement boundaries without modifying string or character literals.
-    if has_state_keyed_lists(&input) {
-        for content in files.values_mut() {
-            let tokens = content.parse().map_err(|error| {
-                RustGenerationError::new(format!("invalid generated Rust tokens: {error}"))
-            })?;
-            let mut formatted = String::with_capacity(content.len());
-            write_rust_tokens(tokens, &mut formatted);
-            *content = formatted;
-        }
+    // Give every model proper statement boundaries without modifying string
+    // or character literals, including models without optional profiles.
+    for content in files.values_mut() {
+        let tokens = content.parse().map_err(|error| {
+            RustGenerationError::new(format!("invalid generated Rust tokens: {error}"))
+        })?;
+        let mut formatted = String::with_capacity(content.len());
+        write_rust_tokens(tokens, &mut formatted);
+        *content = formatted;
     }
 
     Ok(files)

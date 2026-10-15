@@ -6,15 +6,17 @@ use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
+    Legacy,
     Expanded,
     State,
 }
 
 impl Profile {
-    pub const ALL: [Self; 2] = [Self::Expanded, Self::State];
+    pub const ALL: [Self; 3] = [Self::Legacy, Self::Expanded, Self::State];
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Legacy => "legacy",
             Self::Expanded => "expanded",
             Self::State => "state",
         }
@@ -200,6 +202,9 @@ impl Case {
         // A config-only expanded case deliberately has no state anchor. A state
         // row necessarily also enables the state profile; uint64 enables both.
         let anchor = match self.profile {
+            Profile::Legacy => {
+                "container settings { leaf enabled { type boolean; } } container status { config false; leaf uptime { type uint32; } }"
+            }
             Profile::Expanded => "leaf marker { type uint8; }",
             Profile::State => {
                 "container telemetry { config false; list sample { key name; leaf name { type string; } } }"

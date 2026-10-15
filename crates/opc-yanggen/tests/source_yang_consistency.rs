@@ -7,110 +7,9 @@ use opc_yanggen::{
 };
 use tempfile::tempdir;
 
-const BASE_YANG: &str = r#"
-module opc-test {
-  yang-version 1.1;
-  namespace "urn:opc:test";
-  prefix test;
+const BASE_YANG: &str = include_str!("fixtures/system_ordered_base.yang");
 
-  import opc-annotations {
-    prefix opc;
-    revision-date 2026-01-01;
-  }
-
-  revision 2026-06-28 {
-    description "Initial test model.";
-  }
-
-  container system {
-    description "Config root.";
-
-    leaf enabled {
-      type boolean;
-      default "true";
-    }
-
-    leaf secret {
-      type string;
-      opc:data-class "security-secret";
-    }
-
-    list peer {
-      key "name";
-      unique "port";
-
-      leaf name {
-        type string;
-      }
-
-      leaf port {
-        type uint16;
-      }
-    }
-
-    container state {
-      config false;
-
-      leaf uptime {
-        type uint32;
-      }
-    }
-  }
-}
-"#;
-
-const COMMENT_ONLY_YANG: &str = r#"
-module opc-test {
-  yang-version 1.1;
-  namespace "urn:opc:test";
-  prefix test;
-
-  import opc-annotations {
-    prefix opc;
-    revision-date 2026-01-01;
-  }
-
-  revision 2026-06-28 {
-    description "Only this documentation changed.";
-  }
-
-  container system {
-    description "A different description should not affect schema digest.";
-
-    leaf enabled {
-      type boolean;
-      default "true";
-      description "Documentation-only change.";
-    }
-
-    leaf secret {
-      type string;
-      opc:data-class "security-secret";
-    }
-
-    list peer {
-      key "name";
-      unique "port";
-
-      leaf name {
-        type string;
-      }
-
-      leaf port {
-        type uint16;
-      }
-    }
-
-    container state {
-      config false;
-
-      leaf uptime {
-        type uint32;
-      }
-    }
-  }
-}
-"#;
+const COMMENT_ONLY_YANG: &str = include_str!("fixtures/system_ordered_comments.yang");
 
 const ENUM_YANG: &str = r#"
 module opc-test {
@@ -175,6 +74,7 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     // read projection, #1270 canonical gNMI key literals and native instance trees,
     // and #1272 bounded NETCONF content projection. Every generated
     // file stays pinned across the four source models.
+    // All pins also include #1274 generated-lint repairs and shared statement formatting.
     // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // enum/gnmi_json.rs: #1270 shared literal predicate construction.
