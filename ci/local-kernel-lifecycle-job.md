@@ -37,11 +37,24 @@ mount. The new job records network/mount namespace IDs, named namespaces,
 host-visible bpffs entries/mounts and interfaces after module setup and before
 the private namespace probes. GRE is loaded before that snapshot because its
 module setup creates kernel-owned fallback interfaces in the host namespace.
-Its final check rejects surviving new namespaces and any change to the
-host-visible state. Existing unrelated namespaces may disappear. The check
-does not enumerate or reopen BPF program/map IDs. A missing baseline or failed
-inventory command is a failure; snapshots and differences are uploaded even
-after qualification or preflight failure.
+Every private preflight and the qualification run use the cleanup checker's
+`run` mode. It acts as a child subreaper, keeping orphaned descendants in its
+process tree until verification. Each new network/mount namespace is attributed
+to its live processes, including nonleader threads and open namespace
+descriptors. Evidence includes PID, process start time, name, cgroup and ownership.
+PID start times distinguish reused PIDs; sharing a cgroup alone does not make a
+process part of qualification.
+
+The check rejects qualification-owned namespaces, live descendants after a
+command returns, interrupted ownership records and any change to host-visible
+state. Unrelated host services may create or release namespaces; their attributed
+namespaces are informational. A namespace with no provable owner fails unless a
+second inventory confirms it has already disappeared. Failed cleanup remains a
+failure in the final verification even if its processes later exit. A missing or
+changed baseline, incomplete process ancestry, unreadable surviving process or
+failed inventory command also fails. The check does not enumerate or reopen BPF
+program/map IDs. Snapshots and ownership results are uploaded even after
+qualification or preflight failure.
 
 ## Hosted time estimate
 

@@ -162,11 +162,21 @@ The **Privileged local kernel lifecycle** job in
 `ci/local-kernel-lifecycle-cases.json` on its own runner. It blocks the existing
 **Rust workspace** aggregate and has its own kernel preflight and cleanup
 verification. See the [job mapping and time estimate](ci/local-kernel-lifecycle-job.md).
-Run that same manifest locally with the worktree's existing Cargo cache:
+After the workflow's kernel module setup, run that same manifest and cleanup
+check locally with the worktree's existing Cargo cache. Create the evidence
+directory as the build user; only inventory and native tests require root:
 
 ```bash
-python3 ci/qualify-local-kernel-lifecycle.py \
-  --evidence-dir target/lifecycle-evidence/run-01
+mkdir -p target/lifecycle-evidence/run-01/cleanup
+sudo -n python3 ci/check-local-kernel-lifecycle-cleanup.py snapshot \
+  target/lifecycle-evidence/run-01/cleanup
+python3 ci/check-local-kernel-lifecycle-cleanup.py run \
+  target/lifecycle-evidence/run-01/cleanup -- \
+  python3 ci/qualify-local-kernel-lifecycle.py \
+    --evidence-dir target/lifecycle-evidence/run-01/qualification
+# Run this final verification even when qualification fails.
+sudo -n python3 ci/check-local-kernel-lifecycle-cleanup.py verify \
+  target/lifecycle-evidence/run-01/cleanup
 ```
 
 This needs Linux BPF/XFRM support, iproute2, Python 3, `libseccomp.so.2`, `unshare`, `timeout`,
@@ -178,6 +188,17 @@ Missing tests, skips, unsupported capabilities,
 timeouts and changed source/binaries fail qualification. The evidence records
 the compiler, source digest, emitted binaries, kernel and exact case results;
 use a new evidence directory on a repeat run, while reusing the build cache.
+Wrap any namespace-creating preflight in the same cleanup `run` mode after the
+snapshot. Its process ownership evidence rejects leaked qualification namespaces
+and unfinished descendants while allowing unrelated host services to come and
+go. Host-visible pins, mounts, named namespaces and interfaces must still match
+the baseline. Missing ownership or incomplete inventories fail cleanup.
+After recording attribution, the owner terminates and reaps its remaining
+descendants, including privileged children. Disposal uses verified process
+identities and pidfds, with a two-second SIGTERM grace followed by up to three
+seconds for SIGKILL. SIGTERM, SIGINT and SIGHUP keep the owner alive through disposal.
+Original leaks and interruptions remain failures after disposal; the evidence
+retains both the original attribution and the disposal result.
 `--toolchain` chooses an installed Rust toolchain. Repeated `--case` arguments
 select exact cases for development and explicitly produce a partial result.
 
