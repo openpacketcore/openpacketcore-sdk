@@ -78,6 +78,34 @@ fn assert_rejected(request: &Ikev2SaInitRequest, response: &OwnedMessage) {
     );
 }
 
+fn replace_payloads(message: &mut OwnedMessage, entries: &[(PayloadType, Vec<u8>)]) {
+    let mut raw = Vec::new();
+    for (index, (_, body)) in entries.iter().enumerate() {
+        raw.push(entries.get(index + 1).map_or(0, |(kind, _)| kind.as_u8()));
+        raw.push(0);
+        raw.extend_from_slice(&u16::try_from(body.len() + 4).unwrap().to_be_bytes());
+        raw.extend_from_slice(body);
+    }
+    message.header.next_payload = entries.first().map_or(0, |(kind, _)| kind.as_u8());
+    message.header.length = 28 + u32::try_from(raw.len()).unwrap();
+    message.raw_payloads = Bytes::from(raw);
+}
+
+fn entries(message: &OwnedMessage) -> Vec<(PayloadType, Vec<u8>)> {
+    message
+        .payloads()
+        .map(|raw| {
+            let raw = raw.unwrap();
+            (raw.payload_type, raw.body.to_vec())
+        })
+        .collect()
+}
+
+fn rejection(request: &Ikev2SaInitRequest, response: &OwnedMessage) -> Ikev2SaInitInitiatorError {
+    admit_ike_sa_init_response(request, &response.as_borrowed(), DecodeContext::default())
+        .unwrap_err()
+}
+
 #[test]
 fn request_preserves_caller_preference_and_public_key_custody() {
     let key = key();
@@ -370,7 +398,11 @@ fn retries_reject_malformed_duplicate_and_conflicting_notifications() {
             protocol_id: 0,
             spi: vec![],
             notify_message_type: kind,
-            notification_data: b"cookie".to_vec(),
+            notification_data: if kind == IKEV2_NOTIFY_COOKIE {
+                b"cookie".to_vec()
+            } else {
+                vec![]
+            },
         });
         assert_rejected(&request, &response(&request, &payloads));
     }
@@ -383,6 +415,217 @@ fn retries_reject_malformed_duplicate_and_conflicting_notifications() {
     challenge.raw_payloads = Bytes::from(raw);
     challenge.header.length = 28 + u32::try_from(challenge.raw_payloads.len()).unwrap();
     assert_rejected(&request, &challenge);
+}
+
+#[test]
+fn admission_rejects_duplicate_missing_and_trailing_payloads() {
+    let request = request(&offer());
+    let valid = response(&request, &response_payloads());
+    for index in 0..3 {
+        let mut response = valid.clone();
+        let mut payloads = entries(&valid);
+        payloads.push(payloads[index].clone());
+        replace_payloads(&mut response, &payloads);
+        assert_eq!(
+            rejection(&request, &response),
+            Ikev2SaInitInitiatorError::DuplicatePayload
+        );
+        let mut payloads = entries(&valid);
+        payloads.remove(index);
+        replace_payloads(&mut response, &payloads);
+        assert_eq!(
+            rejection(&request, &response),
+            Ikev2SaInitInitiatorError::MissingPayload
+        );
+    }
+    let mut response = valid.clone();
+    let mut payloads = entries(&valid);
+    payloads[2].1.resize(257, 0x72);
+    replace_payloads(&mut response, &payloads);
+    assert_eq!(
+        rejection(&request, &response),
+        Ikev2SaInitInitiatorError::InvalidResponderNonce
+    );
+    let mut raw = valid.raw_payloads.to_vec();
+    raw.extend_from_slice(b"unframed tail");
+    response.raw_payloads = Bytes::from(raw);
+    response.header.length = 28 + u32::try_from(response.raw_payloads.len()).unwrap();
+    assert_eq!(
+        rejection(&request, &response),
+        Ikev2SaInitInitiatorError::InvalidResponsePayload
+    );
+    let mut response = valid;
+    let mut payloads = entries(&response);
+    payloads.push((PayloadType::Unknown(250), b"ignored extension".to_vec()));
+    replace_payloads(&mut response, &payloads);
+    assert!(admit_ike_sa_init_response(
+        &request,
+        &response.as_borrowed(),
+        DecodeContext::default()
+    )
+    .is_ok());
+    let last = response.raw_payloads.len() - 4 - b"ignored extension".len();
+    let mut raw = response.raw_payloads.to_vec();
+    raw[last + 1] = 0x80;
+    response.raw_payloads = Bytes::from(raw);
+    assert_eq!(
+        rejection(&request, &response),
+        Ikev2SaInitInitiatorError::InvalidResponsePayload
+    );
+}
+
+#[test]
+fn retry_shape_and_correlation_checks_apply_to_every_typed_outcome() {
+    let request = request(&offer());
+    let template = build_ike_sa_init_cookie_response(&request.message().header, b"cookie").unwrap();
+    for (kind, data) in [
+        (IKEV2_NOTIFY_INVALID_KE_PAYLOAD, vec![]),
+        (IKEV2_NOTIFY_INVALID_KE_PAYLOAD, vec![19]),
+        (IKEV2_NOTIFY_INVALID_KE_PAYLOAD, vec![0, 0]),
+        (IKEV2_NOTIFY_INVALID_KE_PAYLOAD, vec![0, 19, 0]),
+        (IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, vec![1]),
+    ] {
+        let mut reply = template.clone();
+        let mut body = vec![0, 0];
+        body.extend_from_slice(&kind.to_be_bytes());
+        body.extend_from_slice(&data);
+        replace_payloads(&mut reply, &[(PayloadType::Notify, body)]);
+        assert_eq!(
+            rejection(&request, &reply),
+            Ikev2SaInitInitiatorError::InvalidRetry
+        );
+    }
+    for (kind, data) in [
+        (IKEV2_NOTIFY_COOKIE, b"cookie".to_vec()),
+        (IKEV2_NOTIFY_INVALID_KE_PAYLOAD, vec![0, 19]),
+        (IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, vec![]),
+    ] {
+        let mut body = vec![0, 0];
+        body.extend_from_slice(&kind.to_be_bytes());
+        body.extend_from_slice(&data);
+        let mut reply = template.clone();
+        replace_payloads(&mut reply, &[(PayloadType::Notify, body.clone())]);
+        for mutation in 0..4 {
+            let mut reply = reply.clone();
+            match mutation {
+                0 => reply.header.initiator_spi ^= 1,
+                1 => reply.header.message_id = 1,
+                2 => reply.header.flags = HeaderFlags::from_bits(true, true, false),
+                _ => reply.header.flags = HeaderFlags::from_bits(false, false, false),
+            }
+            assert_eq!(
+                rejection(&request, &reply),
+                Ikev2SaInitInitiatorError::InvalidResponseHeader
+            );
+        }
+        replace_payloads(
+            &mut reply,
+            &[
+                (PayloadType::Notify, body.clone()),
+                (PayloadType::Notify, body),
+            ],
+        );
+        assert_eq!(
+            rejection(&request, &reply),
+            Ikev2SaInitInitiatorError::InvalidRetry
+        );
+    }
+}
+
+#[test]
+fn caller_cookie_is_first_and_status_notifications_keep_their_order() {
+    let key = key();
+    let status = |kind| Ikev2NotifyPayloadBuild {
+        protocol_id: 0,
+        spi: vec![],
+        notify_message_type: kind,
+        notification_data: vec![],
+    };
+    let cookie = Ikev2NotifyPayloadBuild {
+        notification_data: b"caller-cookie".to_vec(),
+        ..status(IKEV2_NOTIFY_COOKIE)
+    };
+    let request = build_ike_sa_init_request(
+        SPI_I,
+        &offer(),
+        &key,
+        &[0x61; 32],
+        &[status(65000), cookie.clone(), status(65001)],
+    )
+    .unwrap();
+    let payloads = request
+        .message()
+        .payloads()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(payloads[0].payload_type, PayloadType::Notify);
+    assert_eq!(payloads[1].payload_type, PayloadType::SecurityAssociation);
+    let decoded = decode_ike_sa_init_request_payloads(
+        &request.message().as_borrowed(),
+        DecodeContext::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decoded
+            .notifies
+            .iter()
+            .map(|n| n.notify_message_type)
+            .collect::<Vec<_>>(),
+        vec![IKEV2_NOTIFY_COOKIE, 65000, 65001]
+    );
+    assert_eq!(
+        build_ike_sa_init_request(
+            SPI_I,
+            &offer(),
+            &key,
+            &[0x61; 32],
+            &[cookie.clone(), cookie]
+        )
+        .unwrap_err(),
+        Ikev2SaInitInitiatorError::InvalidNotify
+    );
+}
+
+#[test]
+fn separate_integrity_offer_and_alternative_dh_are_checked_as_complete_suites() {
+    let mut offered = offer();
+    offered.proposals[0].transforms[0].transform_id = 12; // AES-CBC
+    offered.proposals[0].transforms.push(transform(3, 12)); // HMAC-SHA2-256-128
+    let request = request(&offered);
+    let mut payloads = response_payloads();
+    payloads.security_association = offered.clone();
+    let reply = response(&request, &payloads);
+    assert!(
+        admit_ike_sa_init_response(&request, &reply.as_borrowed(), DecodeContext::default())
+            .is_ok()
+    );
+    payloads.security_association.proposals[0].transforms.pop();
+    assert_eq!(
+        rejection(&request, &response(&request, &payloads)),
+        Ikev2SaInitInitiatorError::InvalidSelection
+    );
+    // A proposal may not mix combined-mode and separate-integrity algorithms.
+    offered.proposals[0]
+        .transforms
+        .push(offer().proposals[0].transforms[0].clone());
+    assert_eq!(
+        build_ike_sa_init_request(SPI_I, &offered, &key(), &[0x61; 32], &[]).unwrap_err(),
+        Ikev2SaInitInitiatorError::InvalidOffer
+    );
+    let mut offered = offer();
+    offered.proposals[0].transforms.push(transform(4, 20));
+    let request = self::request(&offered);
+    payloads = response_payloads();
+    payloads.security_association.proposals[0].transforms[2].transform_id = 20;
+    payloads.key_exchange.dh_group = 20;
+    payloads.key_exchange.key_exchange_data = Ikev2EphemeralDhKey::generate(Ikev2DhGroup::Ecp384)
+        .unwrap()
+        .public_value()
+        .to_vec();
+    assert_eq!(
+        rejection(&request, &response(&request, &payloads)),
+        Ikev2SaInitInitiatorError::KeyExchangeMismatch
+    );
 }
 
 #[test]

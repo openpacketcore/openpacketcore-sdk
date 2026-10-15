@@ -34,7 +34,9 @@ fn fixture(name: &str) -> Vec<u8> {
         .next()
         .unwrap();
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -153,7 +155,7 @@ pub fn run() {
     let mut requirements = Ikev2CryptoRequirements::all_software_supported();
     requirements.require_dh_checkpoint(Ikev2DhGroup::Ecp256);
     let policy = ProviderPolicy::new().require_all(requirements.required_capabilities());
-    install_ikev2_software_crypto_module(policy, requirements).unwrap();
+    let _report = install_ikev2_software_crypto_module(policy, requirements).unwrap();
     let mut checkpoint = vec![1, 0, 19];
     checkpoint.extend_from_slice(&fixture("scalar_i"));
     let key = Ikev2EphemeralDhKey::import_private_checkpoint(

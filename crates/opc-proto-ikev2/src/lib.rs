@@ -112,6 +112,7 @@ pub mod protocol_key;
 pub mod recovery;
 pub mod sa_init;
 pub mod sa_init_crypto;
+pub mod sa_init_initiator;
 pub mod sa_init_negotiation;
 pub mod signature_hash;
 pub mod software_crypto;
@@ -358,6 +359,10 @@ pub use sa_init_crypto::{
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2InitialExchangeNoncePolicy,
     Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+};
+pub use sa_init_initiator::{
+    admit_ike_sa_init_response, build_ike_sa_init_request, Ikev2SaInitAccepted,
+    Ikev2SaInitInitiatorError, Ikev2SaInitRequest, Ikev2SaInitResponse,
 };
 pub use sa_init_negotiation::{
     negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
