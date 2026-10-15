@@ -5,9 +5,14 @@ mod fenced_non_execution {
     // Commit the original store identity before admission or any preparation.
     fn settlement_roster(
         store: &XfrmObjectRosterRecoveryStore,
+        group: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
         roster: XfrmObjectRosterRequest,
     ) -> XfrmObjectRosterRequest {
-        roster.with_settlement_identity(store.settlement_identity())
+        let roster = roster.with_settlement_identity(store.settlement_identity());
+        let identity =
+            register_object_roster_settlement(store, group, generation, &roster).unwrap();
+        roster.with_settlement_identity(identity)
     }
 
     // Exercise the production publication outside the namespace actor queue.
@@ -256,6 +261,213 @@ mod fenced_non_execution {
     }
 
     #[tokio::test]
+    async fn fenced_non_execution_caller_deadlines_leave_fence_and_release_owned() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xB9);
+        let group = roster_group(0xB9);
+        let generation = roster_generation(37);
+        let roster = settlement_roster(&store, group, generation, sa_roster(1));
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                .await
+                .unwrap(),
+        );
+        for releasing in [false, true] {
+            let held = Arc::new(EffectGate::default());
+            let contended = Arc::new(EffectGate::default());
+            let _held_release = ReleaseOnDrop(Arc::clone(&held));
+            let _contention_release = ReleaseOnDrop(Arc::clone(&contended));
+            let holder = std::thread::spawn({
+                let store = store.clone();
+                let held = Arc::clone(&held);
+                move || {
+                    let _lock = store.hold_process_lock_for_test();
+                    held.hold();
+                }
+            });
+            held.wait_entered().await;
+            store.on_next_lease_contention_for_test({
+                let contended = Arc::clone(&contended);
+                Arc::new(move || contended.hold())
+            });
+            let mut task = tokio::spawn({
+                let backend = backend.clone();
+                let store = store.clone();
+                let roster = roster.clone();
+                async move {
+                    if releasing {
+                        release_settled(&backend, &store, group, generation, &roster).await
+                    } else {
+                        let observed =
+                            close_generation(&backend, &store, group, generation, &roster).await?;
+                        assert!(observed.closed_without_effect());
+                        Ok(())
+                    }
+                }
+            });
+            contended.wait_entered().await;
+            tokio::time::pause();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(tokio::time::timeout_at(deadline, &mut task).await.is_err());
+            assert!(
+                !task.is_finished(),
+                "caller expiry must leave the accepted task owned"
+            );
+            tokio::time::resume();
+            held.release();
+            holder.join().unwrap();
+            contended.release();
+            task.await.unwrap().unwrap();
+        }
+        assert!(backend
+            .prepare_durable_object_roster(&store, group, generation, roster)
+            .await
+            .is_err());
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, roster_group(0xFA), generation, sa_roster(1))
+                .await
+                .unwrap(),
+        );
+        assert!(transport.operations().is_empty());
+        assert_eq!(store.publication_ledger().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_concurrent_settlement_preserves_one_hundred_unrelated_runs() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xB6);
+        for index in 1..=100 {
+            let generation = roster_generation(index);
+            let settled_group = roster_group(0xB5);
+            let settled = settlement_roster(&store, settled_group, generation, policy_roster(1));
+            drop(
+                backend
+                    .prepare_durable_object_roster(
+                        &store,
+                        settled_group,
+                        generation,
+                        settled.clone(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let settlement = async {
+                assert!(
+                    close_generation(&backend, &store, settled_group, generation, &settled)
+                        .await
+                        .unwrap()
+                        .closed_without_effect()
+                );
+                release_settled(&backend, &store, settled_group, generation, &settled)
+                    .await
+                    .unwrap();
+            };
+            let independent = async {
+                let group = roster_group(0xB4);
+                let roster = sa_roster(1);
+                let authority = backend
+                    .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    backend
+                        .run_durable_object_roster(authority)
+                        .await
+                        .unwrap()
+                        .as_str(),
+                    "applied"
+                );
+                assert_eq!(
+                    backend
+                        .finalize_durable_object_roster(&store, group, generation, &roster)
+                        .await
+                        .unwrap(),
+                    XfrmObjectRosterDurablePhase::Committed
+                );
+            };
+            tokio::join!(settlement, independent);
+        }
+        assert_eq!(
+            transport
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            100
+        );
+        assert!(!transport.operations().contains(&"remove_sa"));
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_identical_untransmitted_retry_registers_before_execution() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xB3);
+        let group = roster_group(0xB2);
+        let generation = roster_generation(37);
+        let roster = sa_roster(1);
+        let identity = backend
+            .register_durable_object_roster_settlement(&store, group, generation, &roster)
+            .await
+            .unwrap();
+        let roster = roster.with_settlement_identity(identity);
+        backend
+            .discard_unadmitted_durable_object_roster_settlement(&store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            backend
+                .register_durable_object_roster_settlement(&store, group, generation, &roster)
+                .await
+                .unwrap(),
+            identity
+        );
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .run_durable_object_roster(authority)
+                .await
+                .unwrap()
+                .as_str(),
+            "applied"
+        );
+        assert_eq!(
+            backend
+                .finalize_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
+        release_settled(&backend, &store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(backend
+            .prepare_durable_object_roster(&store, group, generation, roster)
+            .await
+            .is_err());
+        assert_eq!(
+            transport
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn fenced_non_execution_full_store_closes_absent_members_without_a_live_slot() {
         let root = DurableTestRoot::new();
         let transport = RecordingSuccessTransport::default();
@@ -267,6 +479,8 @@ mod fenced_non_execution {
             let absent_group = roster_group(u8::try_from(index + 101).unwrap());
             let prepared = settlement_roster(
                 &store,
+                prepared_group,
+                generation,
                 XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(
                     roster_sa_request(index),
                 )])
@@ -274,6 +488,8 @@ mod fenced_non_execution {
             );
             let absent = settlement_roster(
                 &store,
+                absent_group,
+                generation,
                 XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(
                     roster_policy_request(index),
                 )])
@@ -329,7 +545,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xBB);
         let group = roster_group(0xBC);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(1));
+        let roster = settlement_roster(&store, group, generation, sa_roster(1));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -363,7 +579,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xA1);
         let group = roster_group(0xA2);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         drop(
             backend
                 .prepare_durable_object_roster(&store, group, generation, roster.clone())
@@ -401,7 +617,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xB1);
         let group = roster_group(0xB2);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -419,7 +635,7 @@ mod fenced_non_execution {
             .iter()
             .filter(|operation| **operation == "install_sa")
             .count();
-        // Drain/retire the baseline's unsafe late run before the RED assertion.
+        // Retire any late run so the assertion reports effects, not leftovers.
         let _ = backend
             .recover_durable_object_roster(&store, group, generation, &roster)
             .await;
@@ -437,7 +653,7 @@ mod fenced_non_execution {
         let _release = ReleaseOnDrop(Arc::clone(&transport.gate));
         let group = roster_group(0xB4);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -460,7 +676,7 @@ mod fenced_non_execution {
         );
         transport.gate.release();
         let delayed = run.await.unwrap();
-        // The baseline's queued recover must finish before inspecting counters.
+        // Let queued actor work finish before reading counters.
         let _ = backend.query_sa(query_request()).await;
         let effects = transport.effects.load(Ordering::SeqCst);
         assert!(fenced_while_held && delayed.is_err() && effects == 0,
@@ -486,7 +702,7 @@ mod fenced_non_execution {
         let _release = ReleaseOnDrop(Arc::clone(&transport.gate));
         let group = roster_group(0xB6);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -575,7 +791,7 @@ mod fenced_non_execution {
         let _release = ReleaseOnDrop(Arc::clone(&transport.gate));
         let group = roster_group(0xC2);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(1));
+        let roster = settlement_roster(&store, group, generation, sa_roster(1));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -635,7 +851,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD1);
         let group = roster_group(0xD2);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -691,7 +907,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD3);
         let group = roster_group(0xD4);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(3));
+        let roster = settlement_roster(&store, group, generation, sa_roster(3));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -729,7 +945,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD5);
         let group = roster_group(0xD6);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(1));
+        let roster = settlement_roster(&store, group, generation, sa_roster(1));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -784,7 +1000,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xD7);
         let group = roster_group(0xD8);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(1));
+        let roster = settlement_roster(&store, group, generation, sa_roster(1));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -812,7 +1028,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xE1);
         let group = roster_group(0xE2);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         drop(
             backend
                 .prepare_durable_object_roster(&store, group, generation, roster.clone())
@@ -863,7 +1079,7 @@ mod fenced_non_execution {
         let binding = backend.network_namespace_binding().durable_bytes().unwrap();
         let group = roster_group(0xE5);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         drop(
             backend
                 .prepare_durable_object_roster(&store, group, generation, roster.clone())
@@ -916,7 +1132,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xE6);
         let group = roster_group(0xE7);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         let authority = backend
             .prepare_durable_object_roster(&store, group, generation, roster.clone())
             .await
@@ -973,12 +1189,12 @@ mod fenced_non_execution {
         let transport = RecordingSuccessTransport::default();
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xF3);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(1));
         let mut late_prepares = 0;
         let mut release_publications = 0;
         // More than two complete turns of the existing thirty live slots.
         for identity in 1..=64 {
             let group = roster_group(identity);
+            let roster = settlement_roster(&store, group, generation, sa_roster(1));
             drop(
                 backend
                     .prepare_durable_object_roster(&store, group, generation, roster.clone())
@@ -1004,7 +1220,7 @@ mod fenced_non_execution {
                 .await;
             late_prepares += usize::from(late.is_ok());
             drop(late);
-            // Drain the baseline's incorrectly admitted preparation.
+            // Retire any late preparation before the next iteration.
             let _ = backend
                 .recover_durable_object_roster(&store, group, generation, &roster)
                 .await;
@@ -1032,7 +1248,7 @@ mod fenced_non_execution {
         let generation = roster_generation(37);
         // This exact retained request is bound before SDK admission, without
         // making an XFRM intent record. Reusing the proof key is insufficient.
-        let roster = settlement_roster(&original_store, sa_roster(1));
+        let roster = settlement_roster(&original_store, group, generation, sa_roster(1));
         let closed = close_generation(&original, &original_store, group, generation, &roster).await;
         assert!(
             closed_without_effect(&closed),
@@ -1055,7 +1271,7 @@ mod fenced_non_execution {
         let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xF1);
         let group = roster_group(0xF2);
         let generation = roster_generation(37);
-        let roster = settlement_roster(&store, sa_roster(2));
+        let roster = settlement_roster(&store, group, generation, sa_roster(2));
         drop(
             backend
                 .prepare_durable_object_roster(&store, group, generation, roster.clone())
@@ -1068,7 +1284,7 @@ mod fenced_non_execution {
                 &store,
                 group,
                 generation,
-                &settlement_roster(&store, policy_roster(2))
+                &policy_roster(2).with_settlement_identity(store.settlement_identity())
             )
             .await
             .unwrap_err(),
@@ -1093,7 +1309,7 @@ mod fenced_non_execution {
                 &other_store,
                 group,
                 generation,
-                settlement_roster(&other_store, roster.clone()),
+                settlement_roster(&other_store, group, generation, roster.clone()),
             )
             .await
             .unwrap();

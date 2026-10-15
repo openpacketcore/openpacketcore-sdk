@@ -1007,6 +1007,29 @@ pub(crate) fn prepare_object_roster(
     }
 }
 
+pub(crate) fn register_object_roster_settlement(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<XfrmObjectRosterStoreIdentity, XfrmObjectRosterDurableError> {
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    store.register_settlement(group_id, generation, fingerprint)
+}
+
+pub(crate) fn discard_unadmitted_object_roster_settlement(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<(), XfrmObjectRosterDurableError> {
+    if roster.settlement_identity != Some(store.settlement_identity()) {
+        return Err(XfrmObjectRosterDurableError::WrongBinding);
+    }
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    store.discard_unadmitted_settlement(group_id, generation, fingerprint)
+}
+
 pub(crate) fn fence_object_roster(
     store: &XfrmObjectRosterRecoveryStore,
     group_id: XfrmObjectRosterGroupId,
@@ -1919,7 +1942,7 @@ pub(crate) fn finalize_durable_object_roster(
             .map(|record| record.phase)
         }
         XfrmObjectRosterDurablePhase::Committed | XfrmObjectRosterDurablePhase::Retired => {
-            Ok(record.phase)
+            Ok(record.observation_phase())
         }
         _ => Err(XfrmObjectRosterDurableError::InvalidTransition),
     }

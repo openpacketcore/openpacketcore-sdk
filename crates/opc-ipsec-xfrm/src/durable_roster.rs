@@ -1519,6 +1519,17 @@ fn fingerprints_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
     bool::from(left.ct_eq(right))
 }
 
+fn fingerprint_for_material(
+    key: &XfrmObjectRosterRecoveryProofKey,
+    members: &[XfrmObjectRosterMemberMaterial],
+) -> Result<[u8; 32], XfrmObjectRosterDurableError> {
+    let slots = members
+        .iter()
+        .map(|material| DurableRosterMemberSlot::from_material(*material))
+        .collect::<Vec<_>>();
+    roster_fingerprint(key.canonical_mac_key(), &slots.iter().collect::<Vec<_>>())
+}
+
 fn array_at<const N: usize>(bytes: &[u8], start: usize) -> [u8; N] {
     let mut result = [0_u8; N];
     result.copy_from_slice(&bytes[start..start + N]);
@@ -1577,7 +1588,12 @@ impl fmt::Debug for XfrmObjectRosterStoreIdentity {
     }
 }
 
-type ReleasedBindings = BTreeMap<([u8; 16], u64), [u8; 32]>;
+struct SettlementRegistration {
+    fingerprint: [u8; 32],
+    open: bool,
+}
+
+type SettlementRegistrations = BTreeMap<([u8; 16], u64), SettlementRegistration>;
 
 struct StoreInner {
     visible_path: PathBuf,
@@ -1590,9 +1606,9 @@ struct StoreInner {
     control: ControlRecord,
     journal_enabled: bool,
     process_lock: Mutex<()>,
-    // Execution authority is process-local. Keep released bindings here so a
-    // delayed prepare cannot reuse a row removed by the next publication.
-    released: Mutex<ReleasedBindings>,
+    // Entries exist only while admission or terminal settlement is unresolved.
+    // Preparation and closure inspect this registry under the process lock.
+    settlements: Mutex<SettlementRegistrations>,
     #[cfg(test)]
     lease_contention_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -1878,7 +1894,7 @@ impl XfrmObjectRosterRecoveryStore {
             },
             journal_enabled: false,
             process_lock: Mutex::new(()),
-            released: Mutex::new(BTreeMap::new()),
+            settlements: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             lease_contention_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1895,7 +1911,9 @@ impl XfrmObjectRosterRecoveryStore {
         Ok(store)
     }
 
-    /// Commitment the trusted adapter includes in the admission descriptor.
+    /// Original commitment for readback and recovery. Before a fresh admission,
+    /// use the namespace actor's settlement registration operation, which
+    /// returns this identity while registering the exact execution binding.
     #[must_use]
     pub fn settlement_identity(&self) -> XfrmObjectRosterStoreIdentity {
         let control = self.inner.control;
@@ -1908,6 +1926,75 @@ impl XfrmObjectRosterRecoveryStore {
             STORE_IDENTITY_AUTH_DOMAIN,
             &bytes,
         ))
+    }
+
+    pub(crate) fn register_settlement(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        fingerprint: [u8; 32],
+    ) -> Result<XfrmObjectRosterStoreIdentity, XfrmObjectRosterDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        let mut entries = lease
+            .store
+            .settlements
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        let key = (group_id.0, generation.get());
+        if let Some(entry) = entries.get(&key) {
+            if !fingerprints_equal(&entry.fingerprint, &fingerprint) {
+                return Err(XfrmObjectRosterDurableError::WrongBinding);
+            }
+            if !entry.open {
+                return Err(XfrmObjectRosterDurableError::InvalidTransition);
+            }
+        } else {
+            match inventory.current_for(group_id, generation) {
+                Ok(_) => return Err(XfrmObjectRosterDurableError::InvalidTransition),
+                Err(XfrmObjectRosterDurableError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+            entries.insert(
+                key,
+                SettlementRegistration {
+                    fingerprint,
+                    open: true,
+                },
+            );
+        }
+        Ok(self.settlement_identity())
+    }
+
+    pub(crate) fn discard_unadmitted_settlement(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        fingerprint: [u8; 32],
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        match inventory.current_for(group_id, generation) {
+            Ok(_) => return Err(XfrmObjectRosterDurableError::InvalidTransition),
+            Err(XfrmObjectRosterDurableError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let mut entries = lease
+            .store
+            .settlements
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        let key = (group_id.0, generation.get());
+        if let Some(entry) = entries.get(&key) {
+            if !fingerprints_equal(&entry.fingerprint, &fingerprint) {
+                return Err(XfrmObjectRosterDurableError::WrongBinding);
+            }
+            if !entry.open {
+                return Err(XfrmObjectRosterDurableError::InvalidTransition);
+            }
+        }
+        entries.remove(&key);
+        Ok(())
     }
 
     /// Persist a prepared roster before any backend mutation is admitted.
@@ -1949,8 +2036,9 @@ impl XfrmObjectRosterRecoveryStore {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
         let lease = self.lease()?;
-        if lease.was_released(group_id, generation)?.is_some() {
-            return Err(XfrmObjectRosterDurableError::InvalidTransition);
+        let fingerprint = fingerprint_for_material(&lease.store.proof_key, members)?;
+        if retain {
+            lease.require_open_settlement(group_id, generation, &fingerprint)?;
         }
         let mut inventory = lease.inventory()?;
         if inventory.records.iter().any(|(_, record)| {
@@ -2028,14 +2116,18 @@ impl XfrmObjectRosterRecoveryStore {
             roster_fingerprint: [0; 32],
             members: slots,
         };
-        record.roster_fingerprint =
-            roster_fingerprint(lease.store.proof_key.canonical_mac_key(), &record.active())?;
+        record.roster_fingerprint = fingerprint;
         lease.publish_record_releasing(&record, PublicationClass::Prepare, &inventory)?;
         record.handle(&lease.store.proof_key)
     }
 
-    /// Close absence or Prepared under the same lock as Prepared -> Issuing.
-    /// Accepted work is observed without modifying its epoch or authority.
+    /// Close the live registration under the preparation/publication lock.
+    /// Absence consumes no durable slot; Prepared becomes durable Closed.
+    /// The trusted SDK caller must refuse all provider calls after a terminal
+    /// receipt, including readback registrations and post-provider results.
+    /// After restart no execution authority survives, and begun bindings stay
+    /// durably held until receipt-verified release, so authenticated absence
+    /// still proves non-execution without allocating a registration.
     pub(crate) fn fence(
         &self,
         group_id: XfrmObjectRosterGroupId,
@@ -2046,10 +2138,7 @@ impl XfrmObjectRosterRecoveryStore {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
         let lease = self.lease()?;
-        if lease.was_released(group_id, generation)?.is_some() {
-            return Err(XfrmObjectRosterDurableError::Stale);
-        }
-        let mut inventory = lease.inventory()?;
+        let inventory = lease.inventory()?;
         let mut slots = [None; XFRM_OBJECT_ROSTER_MAX_MEMBERS];
         for (slot, material) in slots.iter_mut().zip(members) {
             *slot = Some(DurableRosterMemberSlot::from_material(*material));
@@ -2079,6 +2168,7 @@ impl XfrmObjectRosterRecoveryStore {
                 {
                     return Err(XfrmObjectRosterDurableError::WrongBinding);
                 }
+                lease.close_settlement(group_id, generation, &closed.roster_fingerprint)?;
                 if current.phase != XfrmObjectRosterDurablePhase::Prepared {
                     return Ok(current.clone());
                 }
@@ -2101,19 +2191,7 @@ impl XfrmObjectRosterRecoveryStore {
                 }
             }
             Err(XfrmObjectRosterDurableError::NotFound) => {
-                if lease.prune_terminal_records(&inventory)? {
-                    inventory = lease.inventory()?;
-                }
-                if inventory
-                    .records
-                    .iter()
-                    .filter(|(_, record)| record.retention != SettlementRetention::Released)
-                    .count()
-                    >= MAX_ACTIVE_RECORDS
-                {
-                    return Err(XfrmObjectRosterDurableError::CapacityExceeded);
-                }
-                lease.publish_record_releasing(&closed, PublicationClass::Prepare, &inventory)?;
+                lease.close_settlement(group_id, generation, &closed.roster_fingerprint)?;
             }
             Err(error) => return Err(error),
         }
@@ -2124,6 +2202,9 @@ impl XfrmObjectRosterRecoveryStore {
     /// terminal receipt and retries this exact release after cancellation or
     /// restart. A missing row is already released; it is never non-execution
     /// evidence. Applied writer authority must first be finalized normally.
+    /// The SDK marks every registration terminal before returning that receipt,
+    /// so no later settlement call may reinterpret released history. Release
+    /// removes the live registration and creates no process-lifetime tombstone.
     pub(crate) fn release_settlement(
         &self,
         group_id: XfrmObjectRosterGroupId,
@@ -2131,13 +2212,7 @@ impl XfrmObjectRosterRecoveryStore {
         fingerprint: [u8; 32],
     ) -> Result<(), XfrmObjectRosterDurableError> {
         let lease = self.lease()?;
-        if let Some(released) = lease.was_released(group_id, generation)? {
-            return if fingerprints_equal(&released, &fingerprint) {
-                Ok(())
-            } else {
-                Err(XfrmObjectRosterDurableError::WrongBinding)
-            };
-        }
+        lease.check_settlement_fingerprint(group_id, generation, &fingerprint)?;
         let inventory = lease.inventory()?;
         match inventory.current_for(group_id, generation) {
             Ok((old_name, current)) => {
@@ -2177,10 +2252,10 @@ impl XfrmObjectRosterRecoveryStore {
         }
         lease
             .store
-            .released
+            .settlements
             .lock()
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?
-            .insert((group_id.0, generation.get()), fingerprint);
+            .remove(&(group_id.0, generation.get()));
         Ok(())
     }
 
@@ -2437,20 +2512,14 @@ impl XfrmObjectRosterRecoveryStore {
         let inventory = lease.inventory()?;
         let mut updates = Vec::new();
         for (name, record) in &inventory.records {
-            if record.retention == SettlementRetention::Released {
-                lease
-                    .store
-                    .released
-                    .lock()
-                    .map_err(|_| XfrmObjectRosterDurableError::Storage)?
-                    .insert(
-                        (record.group_id.0, record.group_generation.get()),
-                        record.roster_fingerprint,
-                    );
-            }
             if record.retention != SettlementRetention::Held || record.is_terminal() {
                 continue;
             }
+            lease.close_settlement(
+                record.group_id,
+                record.group_generation,
+                &record.roster_fingerprint,
+            )?;
             let mut next = record.clone();
             next.publication_sequence = next
                 .publication_sequence
@@ -2621,14 +2690,7 @@ impl XfrmObjectRosterRecoveryStore {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
         let lease = self.lease()?;
-        let slots = members
-            .iter()
-            .map(|material| DurableRosterMemberSlot::from_material(*material))
-            .collect::<Vec<_>>();
-        roster_fingerprint(
-            lease.store.proof_key.canonical_mac_key(),
-            &slots.iter().collect::<Vec<_>>(),
-        )
+        fingerprint_for_material(&lease.store.proof_key, members)
     }
 
     /// Return the test-only publication ledger for this store lease.
@@ -2699,10 +2761,15 @@ impl XfrmObjectRosterRecoveryStore {
                 hook();
             }
         }
-        let process_guard = attempted.map_err(|error| match error {
-            TryLockError::WouldBlock => XfrmObjectRosterDurableError::StoreBusy,
-            TryLockError::Poisoned(_) => XfrmObjectRosterDurableError::Storage,
-        })?;
+        let process_guard = match attempted {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => self
+                .inner
+                .process_lock
+                .lock()
+                .map_err(|_| XfrmObjectRosterDurableError::Storage)?,
+            Err(TryLockError::Poisoned(_)) => return Err(XfrmObjectRosterDurableError::Storage),
+        };
         verify_visible_identity(&self.inner)?;
         Ok(StoreLease {
             store: &self.inner,
@@ -2723,7 +2790,7 @@ impl XfrmObjectRosterRecoveryStore {
     #[cfg(test)]
     fn settlement_bindings_for_test(&self) -> Vec<([u8; 16], u64)> {
         self.inner
-            .released
+            .settlements
             .lock()
             .unwrap()
             .keys()
@@ -2747,18 +2814,66 @@ enum PublicationClass {
 }
 
 impl StoreLease<'_> {
-    fn was_released(
+    fn require_open_settlement(
         &self,
         group_id: XfrmObjectRosterGroupId,
         generation: XfrmObjectRosterOperationGeneration,
-    ) -> Result<Option<[u8; 32]>, XfrmObjectRosterDurableError> {
-        Ok(self
+        fingerprint: &[u8; 32],
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        let entries = self
             .store
-            .released
+            .settlements
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        let entry = entries
+            .get(&(group_id.0, generation.get()))
+            .ok_or(XfrmObjectRosterDurableError::InvalidTransition)?;
+        if !fingerprints_equal(&entry.fingerprint, fingerprint) {
+            return Err(XfrmObjectRosterDurableError::WrongBinding);
+        }
+        if !entry.open {
+            return Err(XfrmObjectRosterDurableError::InvalidTransition);
+        }
+        Ok(())
+    }
+
+    fn check_settlement_fingerprint(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        fingerprint: &[u8; 32],
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        if self
+            .store
+            .settlements
             .lock()
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?
             .get(&(group_id.0, generation.get()))
-            .copied())
+            .is_some_and(|entry| !fingerprints_equal(&entry.fingerprint, fingerprint))
+        {
+            return Err(XfrmObjectRosterDurableError::WrongBinding);
+        }
+        Ok(())
+    }
+
+    fn close_settlement(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        fingerprint: &[u8; 32],
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        let mut entries = self
+            .store
+            .settlements
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        if let Some(entry) = entries.get_mut(&(group_id.0, generation.get())) {
+            if !fingerprints_equal(&entry.fingerprint, fingerprint) {
+                return Err(XfrmObjectRosterDurableError::WrongBinding);
+            }
+            entry.open = false;
+        }
+        Ok(())
     }
 
     fn inventory(&self) -> Result<Inventory, XfrmObjectRosterDurableError> {
@@ -2997,19 +3112,6 @@ impl StoreLease<'_> {
         }
         self.validate_record_binding(record)?;
         validate_roster_record(record)?;
-        {
-            let mut remembered = self
-                .store
-                .released
-                .lock()
-                .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
-            for (_, old) in &released {
-                remembered.insert(
-                    (old.group_id.0, old.group_generation.get()),
-                    old.roster_fingerprint,
-                );
-            }
-        }
         if inventory.journal {
             #[cfg(target_os = "linux")]
             {
@@ -7324,6 +7426,9 @@ mod tests {
         let identity = opened.settlement_identity();
         let material = members(2);
         let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+        opened
+            .register_settlement(group(0x51), generation(1), fingerprint)
+            .unwrap();
         let prepared = opened
             .prepare_with_retention(group(0x51), generation(1), &material, true)
             .unwrap();
@@ -7357,6 +7462,10 @@ mod tests {
             .release_settlement(group(0x51), generation(1), fingerprint)
             .unwrap();
         assert!(reopened.publication_ledger().unwrap().is_empty());
+        assert_eq!(
+            reopened.release_settlement(group(0x51), generation(1), [0xFF; 32]),
+            Err(XfrmObjectRosterDurableError::WrongBinding)
+        );
         reopened
             .prepare(group(0x52), generation(1), &members(1))
             .unwrap();
@@ -7367,10 +7476,6 @@ mod tests {
         assert!(reopened
             .prepare_with_retention(group(0x51), generation(1), &material, true)
             .is_err());
-        assert_eq!(
-            reopened.release_settlement(group(0x51), generation(1), [0xFF; 32]),
-            Err(XfrmObjectRosterDurableError::WrongBinding)
-        );
         drop(reopened);
 
         // The terminal receipt remains the retry owner even after a prior
@@ -7391,6 +7496,9 @@ mod tests {
         let opened = store(&root);
         let material = members(2);
         let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+        opened
+            .register_settlement(group(0x53), generation(1), fingerprint)
+            .unwrap();
         let prepared = opened
             .prepare_with_retention(group(0x53), generation(1), &material, true)
             .unwrap();
@@ -7443,18 +7551,32 @@ mod tests {
         let root = TestRoot::new();
         let opened = store(&root);
         for index in 0..MAX_ACTIVE_RECORDS {
+            let group = group(u8::try_from(index + 1).unwrap());
+            let material = [distinct_material(index)];
+            let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
             opened
-                .fence(
-                    group(u8::try_from(index + 1).unwrap()),
-                    generation(1),
-                    &[distinct_material(index)],
-                )
+                .register_settlement(group, generation(1), fingerprint)
                 .unwrap();
+            opened
+                .prepare_with_retention(group, generation(1), &material, true)
+                .unwrap();
+            opened.fence(group, generation(1), &material).unwrap();
         }
+        let next = [distinct_material(50)];
+        let next_fingerprint = opened.roster_fingerprint_for(&next).unwrap();
+        opened
+            .register_settlement(group(0x60), generation(1), next_fingerprint)
+            .unwrap();
         assert_eq!(
-            opened.fence(group(0x60), generation(1), &[distinct_material(50)]),
+            opened.prepare_with_retention(group(0x60), generation(1), &next, true),
             Err(XfrmObjectRosterDurableError::CapacityExceeded)
         );
+        let before = opened.publication_ledger().unwrap();
+        let absent = opened
+            .fence(group(0x63), generation(1), &[distinct_material(51)])
+            .unwrap();
+        assert_eq!(absent.phase, XfrmObjectRosterDurablePhase::Closed);
+        assert_eq!(opened.publication_ledger().unwrap(), before);
         let fingerprint = opened
             .roster_fingerprint_for(&[distinct_material(0)])
             .unwrap();
@@ -7485,6 +7607,9 @@ mod tests {
             let opened = store(&root);
             let material = members(2);
             let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+            opened
+                .register_settlement(group(0x61), generation(1), fingerprint)
+                .unwrap();
             let prepared = opened
                 .prepare_with_retention(group(0x61), generation(1), &material, true)
                 .unwrap();
@@ -7601,11 +7726,73 @@ mod tests {
     }
 
     #[test]
+    fn settlement_definitive_non_admission_discards_and_identical_retry_registers_again() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let group = group(0x74);
+        let generation = generation(1);
+        let material = members(1);
+        let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+        let identity = opened
+            .register_settlement(group, generation, fingerprint)
+            .unwrap();
+        assert_eq!(opened.settlement_bindings_for_test().len(), 1);
+        assert_eq!(
+            opened.discard_unadmitted_settlement(group, generation, [0xFF; 32]),
+            Err(XfrmObjectRosterDurableError::WrongBinding)
+        );
+        opened
+            .discard_unadmitted_settlement(group, generation, fingerprint)
+            .unwrap();
+        opened
+            .discard_unadmitted_settlement(group, generation, fingerprint)
+            .unwrap();
+        assert!(opened.settlement_bindings_for_test().is_empty());
+        assert!(opened.publication_ledger().unwrap().is_empty());
+        assert!(opened
+            .prepare_with_retention(group, generation, &material, true)
+            .is_err());
+        assert_eq!(
+            opened
+                .register_settlement(group, generation, fingerprint)
+                .unwrap(),
+            identity
+        );
+        let prepared = opened
+            .prepare_with_retention(group, generation, &material, true)
+            .unwrap();
+        assert_eq!(
+            opened.discard_unadmitted_settlement(group, generation, fingerprint),
+            Err(XfrmObjectRosterDurableError::InvalidTransition)
+        );
+        let applied = run_to_applied(&opened, &prepared, 1);
+        advance(
+            &opened,
+            &applied,
+            XfrmObjectRosterDurablePhase::Applied,
+            XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Committed, 1),
+        );
+        opened
+            .release_settlement(group, generation, fingerprint)
+            .unwrap();
+        assert!(opened.settlement_bindings_for_test().is_empty());
+        assert!(opened
+            .prepare_with_retention(group, generation, &material, true)
+            .is_err());
+    }
+
+    #[test]
     fn settlement_memory_is_bounded_by_unsettled_bindings_over_ten_thousand_releases() {
         let root = TestRoot::new();
         let opened = store(&root);
         let unsettled = [(group(0x71), generation(1)), (group(0x72), generation(1))];
         for (index, (group, generation)) in unsettled.iter().enumerate() {
+            let fingerprint = opened
+                .roster_fingerprint_for(&[distinct_material(100 + index)])
+                .unwrap();
+            opened
+                .register_settlement(*group, *generation, fingerprint)
+                .unwrap();
             opened
                 .prepare_with_retention(
                     *group,
@@ -7619,6 +7806,9 @@ mod tests {
         let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
         for index in 1..=10_000 {
             let generation = generation(index);
+            opened
+                .register_settlement(group(0x73), generation, fingerprint)
+                .unwrap();
             let prepared = opened
                 .prepare_with_retention(group(0x73), generation, &material, true)
                 .unwrap();

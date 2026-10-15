@@ -86,22 +86,23 @@ use crate::{
         XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase, XfrmObjectRosterGroupId,
         XfrmObjectRosterOperationGeneration, XfrmObjectRosterRecoveryHandle,
         XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore,
+        XfrmObjectRosterStoreIdentity,
     },
     durable_roster_flow::{
         adopt_durable_object_roster as adopt_object_roster,
         cut_durable_object_roster_at_applied as cut_object_roster_at_applied,
         cut_durable_object_roster_at_compensating_member as cut_object_roster_at_compensating_member,
         cut_durable_object_roster_at_issuing_member as cut_object_roster_at_issuing_member,
-        durable_object_roster_phase, fence_object_roster,
-        finalize_durable_object_roster as finalize_object_roster,
+        discard_unadmitted_object_roster_settlement, durable_object_roster_phase,
+        fence_object_roster, finalize_durable_object_roster as finalize_object_roster,
         finish_durable_object_roster_effect_quiesced as finish_object_roster_effect_quiesced,
         issue_durable_object_roster as run_object_roster,
         issue_durable_object_roster_effect_quiesced as run_object_roster_effect_quiesced,
         prepare_object_roster as prepare_object_roster_record,
-        recover_durable_object_roster as recover_object_roster, release_object_roster_settlement,
-        validate_object_roster_admission, XfrmObjectRosterDurableOutcome,
-        XfrmObjectRosterFenceObservation, XfrmObjectRosterIssueError, XfrmObjectRosterRequest,
-        XfrmObjectRosterRestartOutcome,
+        recover_durable_object_roster as recover_object_roster, register_object_roster_settlement,
+        release_object_roster_settlement, validate_object_roster_admission,
+        XfrmObjectRosterDurableOutcome, XfrmObjectRosterFenceObservation,
+        XfrmObjectRosterIssueError, XfrmObjectRosterRequest, XfrmObjectRosterRestartOutcome,
     },
     XfrmObjectInstallRequest,
 };
@@ -3295,16 +3296,83 @@ impl NamespaceBoundLinuxXfrmBackend {
         .await
     }
 
+    /// Register one exact binding before submitting its SDK admission, returning
+    /// the store identity to commit in the immutable member descriptor.
+    ///
+    /// The trusted adapter owns this registration across caller cancellation.
+    /// It must retain it while admission is ambiguous, discard it only after
+    /// definitive non-admission, or release it after a verified terminal receipt.
+    /// An identical retry after `NotTransmitted` registers again before submission.
+    /// Registration grants no execution authority. Never register during readback,
+    /// recovery or release, or reuse a group and generation for another admission.
+    ///
+    /// # Errors
+    /// Returns WrongBinding for a substituted store or request, InvalidTransition
+    /// for an already closed or retained binding, and storage failures otherwise.
+    #[cfg(unix)]
+    pub async fn register_durable_object_roster_settlement(
+        &self,
+        store: &XfrmObjectRosterRecoveryStore,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        roster: &XfrmObjectRosterRequest,
+    ) -> Result<XfrmObjectRosterStoreIdentity, XfrmObjectRosterDurableError> {
+        self.require_bound_roster_store(store)?;
+        let store = store.clone();
+        let roster = roster.clone();
+        tokio::task::spawn_blocking(move || {
+            register_object_roster_settlement(&store, group_id, generation, &roster)
+        })
+        .await
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+    }
+
+    /// Discard an exact registration after definitive SDK non-admission.
+    ///
+    /// The trusted adapter must prove the admission was never transmitted or
+    /// was definitively rejected; an ambiguous reply or cancellation cannot
+    /// authorize discard. No member provider call may exist. An identical
+    /// `NotTransmitted` retry registers the same binding again before resubmission.
+    /// This operation publishes nothing, is idempotent, and stays owned across
+    /// cancellation. Any begun or closed binding must use terminal release instead.
+    ///
+    /// # Errors
+    /// Returns WrongBinding for a substituted store or request, InvalidTransition
+    /// for a begun or closed binding, and storage failures otherwise.
+    #[cfg(unix)]
+    pub async fn discard_unadmitted_durable_object_roster_settlement(
+        &self,
+        store: &XfrmObjectRosterRecoveryStore,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        roster: &XfrmObjectRosterRequest,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        self.require_bound_roster_store(store)?;
+        let store = store.clone();
+        let roster = roster.clone();
+        tokio::task::spawn_blocking(move || {
+            discard_unadmitted_object_roster_settlement(&store, group_id, generation, &roster)
+        })
+        .await
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+    }
+
     /// Permanently close one exact retained execution binding without waiting
     /// for the namespace actor. The request must carry the store identity
     /// committed by the trusted adapter before admission.
     ///
-    /// Absence or Prepared becomes durable Closed under the same store lock
-    /// used by Prepared -> Issuing. Accepted work is only observed: this call
+    /// Absence closes its live registration without a durable row or live slot.
+    /// Prepared becomes durable Closed under the same store lock used by both
+    /// preparation and Prepared -> Issuing. Accepted work is only observed: this call
     /// never compensates, adopts, burns an epoch or submits a backend effect.
     /// The caller may sign a non-execution receipt only when the observation
-    /// reports `closed_without_effect()`. Cancellation leaves the publication
-    /// owned by its blocking task; retry the identical retained binding.
+    /// reports `closed_without_effect()`. The SDK must refuse all member provider
+    /// calls before dispatch and after completion once it returns any terminal
+    /// receipt, across every readback registration. Released outcomes must never
+    /// reach this operation. After restart, no execution authority survives and
+    /// every begun binding stays durably held until receipt-verified release.
+    /// Caller expiry or cancellation leaves completion owned by the blocking
+    /// task; retry the identical retained binding without registering it again.
     ///
     /// # Errors
     /// Returns WrongBinding for another open store or descriptor identity, and
@@ -3335,6 +3403,11 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// neither established objects nor cleanup responsibility. It is
     /// idempotent and remains owned across cancellation. On restart, reopen
     /// the original store and retry from the durable terminal receipt.
+    /// The SDK must mark the admission's shared authority entry terminal before
+    /// returning that receipt, so every registration refuses subsequent member
+    /// provider calls and discards results held across release. Removing the live
+    /// registration retains no released-binding tombstone. Caller expiry stops
+    /// waiting while this blocking task completes; the store has no wait deadline.
     ///
     /// # Errors
     /// Returns WrongBinding for a substituted store or request, refuses

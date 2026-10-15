@@ -667,6 +667,9 @@ struct LocalAuthorityEntry {
     /// Reconciliation closes every prepare/execute registration for this
     /// admission, without revoking observation or compensation authority.
     execution_closed: bool,
+    /// A durable terminal receipt closes member I/O across all registrations.
+    /// Established publication authority remains live until its acknowledgement.
+    terminal_committed: bool,
 }
 
 /// Exact process-local admission capacity reserved before PollAdmit.
@@ -748,6 +751,7 @@ impl LocalAuthorityRegistry {
                 authority: request.authority().clone(),
                 generation,
                 execution_closed: false,
+                terminal_committed: false,
             },
         );
         Ok(LocalAdmissionReservation {
@@ -836,6 +840,7 @@ impl LocalAuthorityRegistry {
                 authority: authority.clone(),
                 generation,
                 execution_closed: false,
+                terminal_committed: false,
             },
         );
         Ok(LocalAuthorityPermit {
@@ -912,6 +917,7 @@ impl LocalAuthorityRegistry {
                 authority: authority.clone(),
                 generation,
                 execution_closed: false,
+                terminal_committed: false,
             },
         );
         Ok(LocalAuthorityPermit {
@@ -965,12 +971,28 @@ impl LocalAuthorityRegistry {
         permit: &LocalAuthorityPermit,
         operation: Option<ProviderOperation>,
     ) -> bool {
-        !matches!(
-            operation,
-            Some(ProviderOperation::Prepare | ProviderOperation::Execute)
-        ) || entries
-            .get(&permit.key)
-            .is_some_and(|entry| !entry.execution_closed)
+        let Some(operation) = operation else {
+            return true;
+        };
+        entries.get(&permit.key).is_some_and(|entry| {
+            !entry.terminal_committed
+                && (!matches!(
+                    operation,
+                    ProviderOperation::Prepare | ProviderOperation::Execute
+                ) || !entry.execution_closed)
+        })
+    }
+
+    /// A verified terminal settles the admission under whichever authority
+    /// currently owns its entry, including a successor installed during readback.
+    /// This mark shares the entry's bounded lifetime and never allocates history.
+    fn mark_terminal(&self, admission: &Admission) {
+        let key = LocalAuthorityKey::for_admission(admission);
+        let mut entries = self.lock_entries_after_durable_read(&key);
+        self.prune_expired_locked(&mut entries);
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.terminal_committed = true;
+        }
     }
 
     /// Hold the exact authority shard while committing the local post-provider
@@ -4150,6 +4172,7 @@ where
             registration.backend_registration(),
             registration.authority(),
         )?;
+        self.local_authority.mark_terminal(registration.admission());
         if receipt.phase() == Phase::Aborted {
             self.local_authority
                 .release_terminal_permit(&registration.authority_permit);

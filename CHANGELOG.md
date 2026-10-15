@@ -13,8 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execute for the entire admission, including older handles and equal-fence
   readback. Providers must durably exclude the exact binding before signing
   `NotApplied + Reconciled`; missing intent alone is insufficient. Terminal
-  receipts expose member commitments for verified settlement release.
-  `opc-ipsec-xfrm` adds store-bound closure and explicit retention release.
+  receipts expose member commitments for verified settlement release and close
+  all provider calls across every registration, including delayed replies.
+  `opc-ipsec-xfrm` adds exact pre-admission registration, store-bound closure,
+  definitive non-admission discard and explicit retention release. Absence
+  closure consumes no durable slot, released bindings retain no registry entry,
+  and in-process store contention waits without abandoning accepted work.
   Its roster store format is now v2; crossing this change requires a fresh
   install, and other formats are refused as malformed. (#1280)
 

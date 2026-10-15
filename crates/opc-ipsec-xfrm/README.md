@@ -626,15 +626,24 @@ publishes nothing and authorizes no deletion.
 
 ### Fenced settlement after a lost admission reply
 
-For an SDK-bound roster, retain `store.settlement_identity()` in the admitted
-member descriptor along with the exact group, generation and ordered request,
-and attach it with `roster.with_settlement_identity(identity)`. Keep that
-original identity on restart. Ordinary rosters require no settlement retention.
+Before submitting an SDK admission, call
+`register_durable_object_roster_settlement` for each exact group, generation and
+ordered request. That operation returns the store identity for the admitted
+member descriptor; attach it with `roster.with_settlement_identity(identity)`.
+Preparation requires the matching open registration. Retain the registration
+across ambiguous admission and cancellation. After definitive non-admission,
+`discard_unadmitted_durable_object_roster_settlement` removes it; an identical
+`NotTransmitted` retry registers again before resubmission. Never reuse the
+group and generation for another admission. Keep the original store identity
+on restart; readback, recovery and release never register again. Ordinary
+rosters require no settlement retention.
 
 After exact SDK admission readback, the trusted provider calls
 `fence_durable_object_roster`. This publishes outside the actor queue under the
-store's compare-and-publish lock. Absent or Prepared becomes Closed; a delayed
-run then fails its Prepared handle or its Prepared-to-Issuing transition.
+store's compare-and-publish lock. Absence closes the registration without a
+durable row or live slot; Prepared becomes durable Closed. A delayed prepare
+requires an open registration, and a delayed run fails its Prepared handle or
+its Prepared-to-Issuing transition.
 `closed_without_effect()` is the only conclusive never-started observation.
 Issuing, Applied and Compensating retain their original dispositions and writer
 epoch. Observe or adopt accepted work normally; closure grants no compensation
@@ -649,13 +658,21 @@ An unissued Prepared record instead becomes Closed. Finalize Applied normally
 so retention does not hold the writer gate. After either durable SDK terminal
 receipt, compare each `settled_member_binding` with the original call commitment, then invoke
 `release_durable_object_roster_settlement`. An ambiguous terminal result cannot
-release history. Release publishes one durable retention change, survives caller
+release history. Before returning either terminal receipt, the SDK closes all
+member provider calls across every registration, checking again after each
+provider reply. Exact terminal readback returns only that receipt, so released
+history cannot become new non-execution evidence. Release publishes one durable
+retention change for a retained row, survives caller
 cancellation and is idempotent. The consumer retries it automatically after
 restart from the exact terminal receipt. Removal of released history is batched
 with the next roster publication, before live-record capacity is charged; the
-30 live slots are reusable. The open store remembers released bindings for its
-process lifetime to reject delayed prepares. Release removes no kernel object
-and grants no execution or deletion authority.
+30 live slots are reusable. Release removes the registration; absence needs no
+publication. In-memory settlement state contains only unsettled bindings, and
+missing registrations reject delayed prepares. Release removes no kernel object
+and grants no execution or deletion authority. All in-process store calls wait
+for the short store lock. Caller deadlines stop waiting while the actor or
+blocking task retains ownership and completes; contention cannot consume run
+authority or abandon a post-install publication.
 
 ### Adopting against recovering after process loss
 

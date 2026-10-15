@@ -60,7 +60,7 @@ struct XfrmSettlementProvider {
 }
 
 impl XfrmSettlementProvider {
-    fn new(
+    async fn new(
         issuer: Arc<ProductionRosterAttestationIssuer>,
         width: u8,
         backend: LinuxXfrmBackend,
@@ -73,49 +73,56 @@ impl XfrmSettlementProvider {
                 XfrmObjectRosterRecoveryProofKey::new([0x81; 32]).expect("synthetic proof key"),
             )
             .expect("bind the production namespace actor and authenticated store");
-        let members = (0..width)
-            .map(|ordinal| {
-                // Group and store identity are chosen before the SDK descriptor,
-                // rather than derived from a commitment that includes it.
-                let group = XfrmObjectRosterGroupId::from_bytes([0xC1 + ordinal; 16]).unwrap();
-                let mut descriptor = vec![0xA1, ordinal];
-                descriptor.extend_from_slice(&store.settlement_identity().to_bytes());
-                descriptor.extend_from_slice(&[0xC1 + ordinal; 16]);
-                descriptor.extend_from_slice(&Self::generation().get().to_be_bytes());
-                let member = Member::new(
-                    ordinal,
-                    MemberOperationId::from_bytes([0x91 + ordinal; 16]).expect("stable member"),
-                    descriptor,
-                    101 + u64::from(ordinal),
-                )
-                .expect("immutable SDK member");
-                let request = XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
-                    parameters: PolicyParameters {
-                        selector: XfrmSelector::new(
-                            IpAddress::Ipv4([192, 0, 2, ordinal + 1]),
-                            IpAddress::Ipv4([198, 51, 100, ordinal + 1]),
-                            17,
-                        ),
-                        direction: XfrmDirection::Out,
-                        action: XfrmAction::Block,
-                        priority: 100 + u32::from(ordinal),
-                        templates: Vec::new(),
-                        mark: None,
-                        if_id: None,
-                    },
-                });
-                let roster =
-                    XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)
-                        .with_identity(*member.operation_id().as_bytes(), Self::generation())])
-                    .expect("retain the complete exact XFRM request")
-                    .with_settlement_identity(store.settlement_identity());
-                RetainedMember {
-                    member,
+        let mut members = Vec::new();
+        for ordinal in 0..width {
+            // Group and store identity are chosen before the SDK descriptor,
+            // rather than derived from a commitment that includes it.
+            let group = XfrmObjectRosterGroupId::from_bytes([0xC1 + ordinal; 16]).unwrap();
+            let request = XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
+                parameters: PolicyParameters {
+                    selector: XfrmSelector::new(
+                        IpAddress::Ipv4([192, 0, 2, ordinal + 1]),
+                        IpAddress::Ipv4([198, 51, 100, ordinal + 1]),
+                        17,
+                    ),
+                    direction: XfrmDirection::Out,
+                    action: XfrmAction::Block,
+                    priority: 100 + u32::from(ordinal),
+                    templates: Vec::new(),
+                    mark: None,
+                    if_id: None,
+                },
+            });
+            let roster =
+                XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)
+                    .with_identity([0x91 + ordinal; 16], Self::generation())])
+                .expect("retain the complete exact XFRM request");
+            let identity = actor
+                .register_durable_object_roster_settlement(
+                    &store,
                     group,
-                    roster,
-                }
-            })
-            .collect();
+                    Self::generation(),
+                    &roster,
+                )
+                .await
+                .expect("register exact provider binding before SDK admission");
+            let mut descriptor = vec![0xA1, ordinal];
+            descriptor.extend_from_slice(&identity.to_bytes());
+            descriptor.extend_from_slice(&[0xC1 + ordinal; 16]);
+            descriptor.extend_from_slice(&Self::generation().get().to_be_bytes());
+            let member = Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([0x91 + ordinal; 16]).expect("stable member"),
+                descriptor,
+                101 + u64::from(ordinal),
+            )
+            .expect("immutable SDK member");
+            members.push(RetainedMember {
+                member,
+                group,
+                roster: roster.with_settlement_identity(identity),
+            });
+        }
         Arc::new(Self {
             actor,
             store,
@@ -467,7 +474,7 @@ impl SettlementFixture {
             voter_authority,
         );
         let shutdown_client = persistent.clone();
-        let provider = XfrmSettlementProvider::new(issuer, width, backend, execution);
+        let provider = XfrmSettlementProvider::new(issuer, width, backend, execution).await;
         let adapter = persistent
             .into_fenced_mutation_roster_v2_provider_adapter(
                 Arc::clone(&provider),
