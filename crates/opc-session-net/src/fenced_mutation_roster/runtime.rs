@@ -1104,12 +1104,21 @@ impl LocalAuthorityRegistry {
                 .checked_add(1)
                 .ok_or(ExecutorError::ExecutorBusy)?;
         } else {
-            self.inner
-                .terminal_read_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    (count < MAX_PROVIDER_IN_FLIGHT).then_some(count + 1)
-                })
-                .map_err(|_| ExecutorError::ExecutorBusy)?;
+            let mut count = self.inner.terminal_read_count.load(Ordering::Acquire);
+            loop {
+                if count >= MAX_PROVIDER_IN_FLIGHT {
+                    return Err(ExecutorError::ExecutorBusy);
+                }
+                match self.inner.terminal_read_count.compare_exchange_weak(
+                    count,
+                    count + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => count = current,
+                }
+            }
             reads.insert(
                 identity.clone(),
                 TerminalReadEntry {
