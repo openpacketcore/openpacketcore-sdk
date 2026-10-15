@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-net`: the first fenced roster reconcile closes prepare and
+  execute for the entire admission, including older handles and equal-fence
+  readback. Providers must durably exclude the exact binding before signing
+  `NotApplied + Reconciled`; missing intent alone is insufficient. Terminal
+  receipts expose member commitments for verified settlement release.
+  `opc-ipsec-xfrm` adds store-bound closure and explicit retention release.
+  Its roster store format is now v2; crossing this change requires a fresh
+  install, and other formats are refused as malformed. (#1280)
+
 - `opc-mgmt-authz` and `opc-gnmi-server`: gNMI Subscribe requires the policy source to implement the new `PolicySource::watch_authorization`; the default refuses every subscription with `UNAVAILABLE`. Register live sources through `AuthorizationChangeHub` and install each policy or principal-context change with `activate`; use `AuthorizationWatch::immutable` only for a context that cannot change during a subscription. A stream that loses a previously allowed schema permission closes with `UNAVAILABLE` and no keyed delete. Denied operational events no longer write per-event `ACCESS_DENIED` audit records. `Debug` for path-bearing gNMI, path-resolver and operational-state types and for `GnmiError` now prints only the type name. (#1269)
 
 - `opc-yanggen`: `NumericRangeInterval` IR bounds are now `i128` to represent

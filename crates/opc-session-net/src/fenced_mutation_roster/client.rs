@@ -1088,6 +1088,15 @@ pub struct EstablishedTerminal {
 }
 
 impl EstablishedTerminal {
+    /// Exact member binding whose settlement retention may now be released.
+    ///
+    /// The trusted provider compares this with the original
+    /// `MemberCall::fence_binding_commitment` before release. This observation
+    /// grants no effect or deletion authority and is stable across readback.
+    pub fn settled_member_binding(&self, ordinal: MemberOrdinal) -> Option<[u8; 32]> {
+        self.receipt.settled_member_binding(ordinal.get())
+    }
+
     /// Return the byte-exact protected checkpoint bound to this publication capsule.
     pub fn protected_checkpoint(&self) -> &[u8] {
         self.receipt.protected_checkpoint()
@@ -1136,6 +1145,15 @@ pub struct AbortedTerminal {
 }
 
 impl AbortedTerminal {
+    /// Exact member binding whose settlement retention may now be released.
+    ///
+    /// The trusted provider compares this with the original
+    /// `MemberCall::fence_binding_commitment` before release. This observation
+    /// grants no effect or deletion authority and is stable across readback.
+    pub fn settled_member_binding(&self, ordinal: MemberOrdinal) -> Option<[u8; 32]> {
+        self.receipt.settled_member_binding(ordinal.get())
+    }
+
     /// Return the byte-exact protected checkpoint retained for recovery.
     pub fn protected_checkpoint(&self) -> &[u8] {
         self.receipt.protected_checkpoint()
@@ -1721,6 +1739,13 @@ impl FencedMutationRosterClient {
     /// Only a provider-signed conclusive reconciliation receipt can produce
     /// a terminal proof. `NotFound`, pending, and ambiguous observations stay
     /// non-exclusionary and cannot authorize Aborted.
+    /// The first call permanently closes prepare and execute for every local
+    /// handle of this admission, including handles issued before exact
+    /// readback. Unknown and NotTransmitted never reopen it. Status, adoption
+    /// and guarded compensation remain available; Established then requires
+    /// every member to have already applied. The caller stops waiting at the
+    /// original lease expiry while accepted provider work retains its fixed
+    /// provider deadline.
     pub async fn reconcile(
         &self,
         member: &mut RecoverableMember,

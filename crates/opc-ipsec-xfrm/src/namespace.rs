@@ -92,13 +92,15 @@ use crate::{
         cut_durable_object_roster_at_applied as cut_object_roster_at_applied,
         cut_durable_object_roster_at_compensating_member as cut_object_roster_at_compensating_member,
         cut_durable_object_roster_at_issuing_member as cut_object_roster_at_issuing_member,
-        durable_object_roster_phase, finalize_durable_object_roster as finalize_object_roster,
+        durable_object_roster_phase, fence_object_roster,
+        finalize_durable_object_roster as finalize_object_roster,
         finish_durable_object_roster_effect_quiesced as finish_object_roster_effect_quiesced,
         issue_durable_object_roster as run_object_roster,
         issue_durable_object_roster_effect_quiesced as run_object_roster_effect_quiesced,
         prepare_object_roster as prepare_object_roster_record,
-        recover_durable_object_roster as recover_object_roster, validate_object_roster_admission,
-        XfrmObjectRosterDurableOutcome, XfrmObjectRosterIssueError, XfrmObjectRosterRequest,
+        recover_durable_object_roster as recover_object_roster, release_object_roster_settlement,
+        validate_object_roster_admission, XfrmObjectRosterDurableOutcome,
+        XfrmObjectRosterFenceObservation, XfrmObjectRosterIssueError, XfrmObjectRosterRequest,
         XfrmObjectRosterRestartOutcome,
     },
     XfrmObjectInstallRequest,
@@ -1072,6 +1074,10 @@ struct NamespaceBoundLinuxXfrmBackendInner {
     // turning the bounded namespace command channel into another queue.
     #[cfg(unix)]
     retained_finish_runtime: Option<tokio::runtime::Handle>,
+    // Validate the exact open store without entering the actor queue. The
+    // store's compare-and-publish lock supplies the physical effect interlock.
+    #[cfg(unix)]
+    roster_recovery_store: Option<XfrmObjectRosterRecoveryStore>,
     #[cfg(test)]
     retained_finish_completed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1366,6 +1372,7 @@ fn bind_with_capacity_and_recovery(
                 sender,
                 actor_binding,
                 retained_finish_runtime: Some(retained_finish_runtime),
+                roster_recovery_store: roster_store.clone(),
                 #[cfg(test)]
                 retained_finish_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
@@ -3288,6 +3295,85 @@ impl NamespaceBoundLinuxXfrmBackend {
         .await
     }
 
+    /// Permanently close one exact retained execution binding without waiting
+    /// for the namespace actor. The request must carry the store identity
+    /// committed by the trusted adapter before admission.
+    ///
+    /// Absence or Prepared becomes durable Closed under the same store lock
+    /// used by Prepared -> Issuing. Accepted work is only observed: this call
+    /// never compensates, adopts, burns an epoch or submits a backend effect.
+    /// The caller may sign a non-execution receipt only when the observation
+    /// reports `closed_without_effect()`. Cancellation leaves the publication
+    /// owned by its blocking task; retry the identical retained binding.
+    ///
+    /// # Errors
+    /// Returns WrongBinding for another open store or descriptor identity, and
+    /// the store's authenticated inventory or publication error otherwise.
+    #[cfg(unix)]
+    pub async fn fence_durable_object_roster(
+        &self,
+        store: &XfrmObjectRosterRecoveryStore,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        roster: &XfrmObjectRosterRequest,
+    ) -> Result<XfrmObjectRosterFenceObservation, XfrmObjectRosterDurableError> {
+        self.require_bound_roster_store(store)?;
+        let store = store.clone();
+        let roster = roster.clone();
+        tokio::task::spawn_blocking(move || {
+            fence_object_roster(&store, group_id, generation, &roster)
+        })
+        .await
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+    }
+
+    /// Release retained settlement history after the trusted adapter verifies
+    /// the exact durable SDK terminal receipt, for Established or Aborted.
+    ///
+    /// An ambiguous terminal outcome cannot authorize this call. Finalize
+    /// Applied ownership normally before releasing; this operation removes
+    /// neither established objects nor cleanup responsibility. It is
+    /// idempotent and remains owned across cancellation. On restart, reopen
+    /// the original store and retry from the durable terminal receipt.
+    ///
+    /// # Errors
+    /// Returns WrongBinding for a substituted store or request, refuses
+    /// unresolved writer authority, and propagates storage failures.
+    #[cfg(unix)]
+    pub async fn release_durable_object_roster_settlement(
+        &self,
+        store: &XfrmObjectRosterRecoveryStore,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        roster: &XfrmObjectRosterRequest,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        self.require_bound_roster_store(store)?;
+        let store = store.clone();
+        let roster = roster.clone();
+        tokio::task::spawn_blocking(move || {
+            release_object_roster_settlement(&store, group_id, generation, &roster)
+        })
+        .await
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+    }
+
+    #[cfg(unix)]
+    fn require_bound_roster_store(
+        &self,
+        store: &XfrmObjectRosterRecoveryStore,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        if self
+            .inner
+            .roster_recovery_store
+            .as_ref()
+            .is_some_and(|bound| bound.is_same_instance(store))
+        {
+            Ok(())
+        } else {
+            Err(XfrmObjectRosterDurableError::WrongBinding)
+        }
+    }
+
     /// Reconcile one retained durable roster after process loss.
     ///
     /// # Contract
@@ -4133,7 +4219,8 @@ fn reject_roster_run(
 ///
 /// Store instance, then the authenticated current group phase, then the
 /// live-authority reconcile gate, then the cross-family fencing obligation the
-/// phase carries.
+/// phase carries. Closed records bypass the latter two gates: their durable
+/// exclusion already prevents a retained live seal from issuing effects.
 #[cfg(unix)]
 fn admit_object_roster_recovery(
     state: &mut NamespaceActorState,
@@ -4146,6 +4233,9 @@ fn admit_object_roster_recovery(
         operation.generation,
         &operation.roster,
     )?;
+    if phase == XfrmObjectRosterDurablePhase::Closed {
+        return Ok(());
+    }
     state.reconcile_object_roster_admission(operation.group_id, operation.generation)?;
     state.admit_durable_object_roster_recovery(phase)
 }
@@ -4159,9 +4249,9 @@ fn admit_object_roster_recovery(
 /// the object and relocation writer epochs and destroy any legitimately
 /// prepared install or relocation authority for a call that then publishes
 /// nothing. The store-instance check, the authenticated phase read, and the
-/// live-authority reconcile gate all still run first, so a refusal is never
-/// less validated than a recovery. Recovery keeps its fencing unchanged: it
-/// really can issue per-member cleanup.
+/// live-authority reconcile gate all still run first, with the same Closed
+/// exception as recovery. Recovery keeps its fencing unchanged for accepted
+/// work: it really can issue per-member cleanup.
 #[cfg(unix)]
 fn admit_object_roster_adoption(
     state: &mut NamespaceActorState,
@@ -4174,6 +4264,9 @@ fn admit_object_roster_adoption(
         operation.generation,
         &operation.roster,
     )?;
+    if phase == XfrmObjectRosterDurablePhase::Closed {
+        return Ok(());
+    }
     state.reconcile_object_roster_admission(operation.group_id, operation.generation)?;
     if matches!(
         phase,
@@ -7377,6 +7470,8 @@ mod tests {
                 local_lifecycle: None,
                 #[cfg(unix)]
                 retained_finish_runtime: None,
+                #[cfg(unix)]
+                roster_recovery_store: None,
                 retained_finish_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
         }
@@ -9269,6 +9364,8 @@ mod tests {
                 local_lifecycle: None,
                 #[cfg(unix)]
                 retained_finish_runtime: None,
+                #[cfg(unix)]
+                roster_recovery_store: None,
                 retained_finish_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
         };

@@ -315,14 +315,15 @@ pub use durable_roster::{
     XfrmObjectRosterAdjacentProof, XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase,
     XfrmObjectRosterGroupId, XfrmObjectRosterMemberPhase, XfrmObjectRosterOperationGeneration,
     XfrmObjectRosterRecoveryHandle, XfrmObjectRosterRecoveryProofKey,
-    XfrmObjectRosterRecoveryStore, XfrmObjectRosterSweepProof, XFRM_OBJECT_ROSTER_MAX_MEMBERS,
-    XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+    XfrmObjectRosterRecoveryStore, XfrmObjectRosterStoreIdentity, XfrmObjectRosterSweepProof,
+    XFRM_OBJECT_ROSTER_MAX_MEMBERS, XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
 };
 #[cfg(unix)]
 pub use durable_roster_flow::{
-    XfrmObjectRosterDurableOutcome, XfrmObjectRosterMemberDisposition,
-    XfrmObjectRosterMemberDispositions, XfrmObjectRosterMemberRequest, XfrmObjectRosterRequest,
-    XfrmObjectRosterRequestError, XfrmObjectRosterRestartOutcome,
+    XfrmObjectRosterDurableOutcome, XfrmObjectRosterFenceObservation,
+    XfrmObjectRosterMemberDisposition, XfrmObjectRosterMemberDispositions,
+    XfrmObjectRosterMemberRequest, XfrmObjectRosterRequest, XfrmObjectRosterRequestError,
+    XfrmObjectRosterRestartOutcome,
 };
 pub use error::XfrmError;
 pub use exclusive_reset::{ExclusiveNamespaceResetAcknowledgement, ExclusiveNamespaceResetReport};

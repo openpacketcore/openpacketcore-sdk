@@ -78,9 +78,9 @@ const MEMBER_SLOT_BYTES: usize = 96;
 const MEMBER_SLOTS_OFFSET: usize = 144;
 const RECORD_BODY_BYTES: usize =
     MEMBER_SLOTS_OFFSET + XFRM_OBJECT_ROSTER_MAX_MEMBERS * MEMBER_SLOT_BYTES;
-const RECORD_MAGIC: [u8; 8] = *b"OPCXROS1";
-const RECORD_VERSION: u16 = 1;
-const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-record-v1\0";
+const RECORD_MAGIC: [u8; 8] = *b"OPCXROS2";
+const RECORD_VERSION: u16 = 2;
+const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-record-v2\0";
 const MEMBERS_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-members-v1\0";
 const MEMBER_ID_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-member-id-v1\0";
 const INSTALL_REQUEST_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-install-request-v1\0";
@@ -90,8 +90,9 @@ const CONTROL_BYTES: usize = 128;
 const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
 // Family-distinct control/epoch magics: an open against another durable
 // family's root must fail control-record validation, never adopt it.
-const CONTROL_MAGIC: [u8; 8] = *b"OPCXRSC1";
-const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-control-v1\0";
+const CONTROL_MAGIC: [u8; 8] = *b"OPCXRSC2";
+const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-control-v2\0";
+const STORE_IDENTITY_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-store-identity-v2\0";
 const CONTROL_NAME: &str = "control";
 const MAX_STORE_ENTRIES: usize = 64;
 // One control record plus at most two consecutive epoch witnesses are reserved,
@@ -115,19 +116,23 @@ const JOURNAL_NAME: &str = "journal";
 // runs out of journal frames. This includes `RolledBack`, which remains
 // non-terminal until its final `Retired` publication.
 const MAX_JOURNAL_FRAMES_PER_ROSTER: usize = 3 * XFRM_OBJECT_ROSTER_MAX_MEMBERS + 5;
+// Retained settlements add one release frame without increasing the existing
+// journal envelope or the live-roster limit.
+const MAX_SETTLEMENT_FRAMES_PER_ROSTER: usize = MAX_JOURNAL_FRAMES_PER_ROSTER + 1;
 const MAX_JOURNAL_FRAMES_REQUIRED: usize = MAX_ACTIVE_RECORDS * MAX_JOURNAL_FRAMES_PER_ROSTER;
 // Keep the on-disk journal envelope a power of two while deriving it from the
 // complete active-store reservation rather than an operational guess.
 const MAX_JOURNAL_FRAMES: usize = MAX_JOURNAL_FRAMES_REQUIRED.next_power_of_two();
 const _: () = assert!(MAX_JOURNAL_FRAMES_REQUIRED <= MAX_JOURNAL_FRAMES);
+const _: () = assert!(MAX_ACTIVE_RECORDS * MAX_SETTLEMENT_FRAMES_PER_ROSTER <= MAX_JOURNAL_FRAMES);
 const JOURNAL_HEADER_BYTES: usize = EPOCH_BYTES;
 const MAX_JOURNAL_BYTES: usize =
     JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAMES * XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES;
 const TEMPORARY_PREFIX: &str = ".opc-xfrm-roster-pending-";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
-const EPOCH_MAGIC: [u8; 8] = *b"OPCXRSE1";
-const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-epoch-v1\0";
+const EPOCH_MAGIC: [u8; 8] = *b"OPCXRSE2";
+const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-epoch-v2\0";
 const MAX_STORE_PATH_BYTES: usize = 4096;
 const FILE_MODE: u32 = 0o600;
 const DIRECTORY_MODE: u32 = 0o700;
@@ -290,6 +295,9 @@ pub enum XfrmObjectRosterDurablePhase {
     /// no-mutation, so unlike an SA relocation it does not fence cooperating
     /// writers.
     Prepared,
+    /// Execution is durably excluded for this exact retained binding.
+    /// This grants no writer or cleanup authority.
+    Closed,
     /// The writer epoch was advanced and members are being applied in order.
     Issuing,
     /// Every member was acknowledged and the group awaits the consumer's
@@ -314,6 +322,7 @@ impl XfrmObjectRosterDurablePhase {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
+            Self::Closed => "closed",
             Self::Issuing => "issuing",
             Self::Applied => "applied",
             Self::Compensating => "compensating",
@@ -327,6 +336,7 @@ impl XfrmObjectRosterDurablePhase {
     const fn code(self) -> u8 {
         match self {
             Self::Prepared => 1,
+            Self::Closed => 9,
             Self::Issuing => 2,
             Self::Applied => 3,
             Self::Compensating => 4,
@@ -347,6 +357,7 @@ impl XfrmObjectRosterDurablePhase {
             6 => Ok(Self::RolledBack),
             7 => Ok(Self::Committed),
             8 => Ok(Self::Retired),
+            9 => Ok(Self::Closed),
             _ => Err(XfrmObjectRosterDurableError::Malformed),
         }
     }
@@ -368,6 +379,7 @@ impl XfrmObjectRosterDurablePhase {
         matches!(
             (self, next),
             (Self::Prepared, Self::Issuing)
+                | (Self::Prepared, Self::Closed)
                 | (Self::Prepared, Self::Retired)
                 | (Self::Issuing, Self::Issuing)
                 | (Self::Issuing, Self::Applied)
@@ -394,7 +406,7 @@ impl XfrmObjectRosterDurablePhase {
     }
 
     const fn is_terminal(self) -> bool {
-        matches!(self, Self::Retired | Self::Committed)
+        matches!(self, Self::Retired | Self::Committed | Self::Closed)
     }
 }
 
@@ -925,9 +937,40 @@ fn map_canonical_encode_error(error: CanonicalEncodeError) -> XfrmObjectRosterDu
     }
 }
 
+/// Settlement retention is independent of writer and cleanup authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettlementRetention {
+    Unbound,
+    Held,
+    Released,
+}
+
+impl SettlementRetention {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Unbound => 0,
+            Self::Held => 1,
+            Self::Released => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, XfrmObjectRosterDurableError> {
+        match code {
+            0 => Ok(Self::Unbound),
+            1 => Ok(Self::Held),
+            2 => Ok(Self::Released),
+            _ => Err(XfrmObjectRosterDurableError::Malformed),
+        }
+    }
+}
+
 /// One authenticated durable roster record.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableRosterRecord {
+    retention: SettlementRetention,
+    /// A verified namespace-empty reset surrendered all remaining authority.
+    /// Keep the original phase and members as immutable historical evidence.
+    namespace_cleared: bool,
     pub(crate) phase: XfrmObjectRosterDurablePhase,
     pub(crate) cursor: u8,
     pub(crate) publication_sequence: u16,
@@ -951,6 +994,29 @@ impl fmt::Debug for DurableRosterRecord {
 }
 
 impl DurableRosterRecord {
+    pub(crate) fn observation_phase(&self) -> XfrmObjectRosterDurablePhase {
+        if self.namespace_cleared {
+            XfrmObjectRosterDurablePhase::Retired
+        } else {
+            self.phase
+        }
+    }
+
+    pub(crate) const fn namespace_was_cleared(&self) -> bool {
+        self.namespace_cleared
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.namespace_cleared || self.phase.is_terminal()
+    }
+
+    fn is_unresolved_writer_authority(&self) -> bool {
+        !self.namespace_cleared && self.phase.is_unresolved_writer_authority()
+    }
+
+    fn is_prunable(&self) -> bool {
+        self.is_terminal() && self.retention != SettlementRetention::Held
+    }
     /// Number of populated member slots.
     ///
     /// # Errors
@@ -997,6 +1063,7 @@ impl DurableRosterRecord {
         encoded[11] = self.cursor;
         encoded[12] = u8::try_from(arity).map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
         encoded[13..15].copy_from_slice(&self.publication_sequence.to_be_bytes());
+        encoded[15] = self.retention.code() | if self.namespace_cleared { 0x80 } else { 0 };
         encoded[16..32].copy_from_slice(&self.store_incarnation);
         encoded[32..64].copy_from_slice(&self.namespace_seal);
         encoded[64..80].copy_from_slice(&self.actor_incarnation);
@@ -1037,12 +1104,10 @@ impl DurableRosterRecord {
         encoded: &[u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES],
         key: &XfrmObjectRosterRecoveryProofKey,
     ) -> Result<Self, XfrmObjectRosterDurableError> {
-        if encoded[0..8] != RECORD_MAGIC
-            || encoded[8..10] != RECORD_VERSION.to_be_bytes()
-            || encoded[15] != 0
-        {
+        if encoded[0..8] != RECORD_MAGIC || encoded[8..10] != RECORD_VERSION.to_be_bytes() {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
+        let retention = SettlementRetention::from_code(encoded[15] & 0x7f)?;
         if !verify_authentication_domain(
             key.canonical_mac_key(),
             RECORD_AUTH_DOMAIN,
@@ -1093,6 +1158,8 @@ impl DurableRosterRecord {
             });
         }
         let record = Self {
+            retention,
+            namespace_cleared: encoded[15] & 0x80 != 0,
             phase: XfrmObjectRosterDurablePhase::from_code(encoded[10])?,
             cursor: encoded[11],
             publication_sequence: u16::from_be_bytes(array_at(encoded, 13)),
@@ -1174,6 +1241,16 @@ fn validate_roster_record(
     record: &DurableRosterRecord,
 ) -> Result<usize, XfrmObjectRosterDurableError> {
     let arity = record.arity()?;
+    if (record.retention == SettlementRetention::Released && !record.is_terminal())
+        || (record.phase == XfrmObjectRosterDurablePhase::Closed
+            && record.retention == SettlementRetention::Unbound)
+        || (record.namespace_cleared
+            && (record.retention == SettlementRetention::Unbound
+                || record.phase.is_terminal()
+                || record.phase == XfrmObjectRosterDurablePhase::Prepared))
+    {
+        return Err(XfrmObjectRosterDurableError::Malformed);
+    }
     if record.publication_sequence == 0
         || record.store_incarnation.iter().all(|byte| *byte == 0)
         || record.namespace_seal.iter().all(|byte| *byte == 0)
@@ -1231,7 +1308,9 @@ fn validate_roster_record(
         return Err(XfrmObjectRosterDurableError::Malformed);
     }
     let legal = match record.phase {
-        XfrmObjectRosterDurablePhase::Prepared => prepared_body_is_legal(record, &active),
+        XfrmObjectRosterDurablePhase::Prepared | XfrmObjectRosterDurablePhase::Closed => {
+            prepared_body_is_legal(record, &active)
+        }
         XfrmObjectRosterDurablePhase::Issuing => issuing_body_is_legal(record, &active),
         XfrmObjectRosterDurablePhase::Applied | XfrmObjectRosterDurablePhase::Committed => {
             settled_body_is_legal(record, &active, arity)
@@ -1472,6 +1551,34 @@ pub struct XfrmObjectRosterRecoveryStore {
     inner: Arc<StoreInner>,
 }
 
+/// Opaque commitment to one authenticated store, actor incarnation and
+/// namespace. Retain these bytes in the admitted member descriptor, before
+/// any effect can start. They remain stable when that exact store is reopened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct XfrmObjectRosterStoreIdentity([u8; 32]);
+
+impl XfrmObjectRosterStoreIdentity {
+    /// Restore an identity from the descriptor's original commitment.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Encode the opaque commitment for an admitted member descriptor.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for XfrmObjectRosterStoreIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("XfrmObjectRosterStoreIdentity(<redacted>)")
+    }
+}
+
+type ReleasedBindings = BTreeMap<([u8; 16], u64), [u8; 32]>;
+
 struct StoreInner {
     visible_path: PathBuf,
     descriptor: OwnedFd,
@@ -1483,6 +1590,9 @@ struct StoreInner {
     control: ControlRecord,
     journal_enabled: bool,
     process_lock: Mutex<()>,
+    // Execution authority is process-local. Keep released bindings here so a
+    // delayed prepare cannot reuse a row removed by the next publication.
+    released: Mutex<ReleasedBindings>,
     #[cfg(test)]
     ledger: Mutex<Vec<XfrmObjectRosterPublication>>,
     #[cfg(test)]
@@ -1520,6 +1630,8 @@ pub(crate) enum XfrmObjectRosterPublicationClass {
     Transition,
     /// The publication that surrenders cleanup authority to the product.
     Finalize,
+    /// Settlement history released after a durable consumer terminal receipt.
+    Release,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1674,7 +1786,7 @@ impl Inventory {
     fn has_unresolved_writer_authority(&self) -> bool {
         self.records
             .iter()
-            .any(|(_, record)| record.phase.is_unresolved_writer_authority())
+            .any(|(_, record)| record.is_unresolved_writer_authority())
     }
 
     fn current_for(
@@ -1764,6 +1876,7 @@ impl XfrmObjectRosterRecoveryStore {
             },
             journal_enabled: false,
             process_lock: Mutex::new(()),
+            released: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             ledger: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1776,6 +1889,21 @@ impl XfrmObjectRosterRecoveryStore {
         };
         store.lease()?.inventory()?;
         Ok(store)
+    }
+
+    /// Commitment the trusted adapter includes in the admission descriptor.
+    #[must_use]
+    pub fn settlement_identity(&self) -> XfrmObjectRosterStoreIdentity {
+        let control = self.inner.control;
+        let mut bytes = [0; 64];
+        bytes[..16].copy_from_slice(&control.store_incarnation);
+        bytes[16..48].copy_from_slice(&control.namespace_seal);
+        bytes[48..].copy_from_slice(&control.actor_incarnation);
+        XfrmObjectRosterStoreIdentity(authenticate_domain(
+            self.inner.proof_key.canonical_mac_key(),
+            STORE_IDENTITY_AUTH_DOMAIN,
+            &bytes,
+        ))
     }
 
     /// Persist a prepared roster before any backend mutation is admitted.
@@ -1803,26 +1931,49 @@ impl XfrmObjectRosterRecoveryStore {
         generation: XfrmObjectRosterOperationGeneration,
         members: &[XfrmObjectRosterMemberMaterial],
     ) -> Result<XfrmObjectRosterRecoveryHandle, XfrmObjectRosterDurableError> {
+        self.prepare_with_retention(group_id, generation, members, false)
+    }
+
+    pub(crate) fn prepare_with_retention(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        members: &[XfrmObjectRosterMemberMaterial],
+        retain: bool,
+    ) -> Result<XfrmObjectRosterRecoveryHandle, XfrmObjectRosterDurableError> {
         if members.is_empty() || members.len() > XFRM_OBJECT_ROSTER_MAX_MEMBERS {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
         let lease = self.lease()?;
+        if lease.was_released(group_id, generation)?.is_some() {
+            return Err(XfrmObjectRosterDurableError::InvalidTransition);
+        }
         let mut inventory = lease.inventory()?;
+        if inventory.records.iter().any(|(_, record)| {
+            record.group_id == group_id
+                && record.group_generation == generation
+                && record.retention != SettlementRetention::Unbound
+        }) {
+            return Err(XfrmObjectRosterDurableError::Duplicate);
+        }
         if lease.prune_terminal_records(&inventory)? {
             inventory = lease.inventory()?;
         }
         if inventory.has_unresolved_writer_authority() {
             return Err(XfrmObjectRosterDurableError::InvalidTransition);
         }
-        if inventory.records.len() >= MAX_ACTIVE_RECORDS {
+        let retained_count = inventory
+            .records
+            .iter()
+            .filter(|(_, record)| record.retention != SettlementRetention::Released)
+            .count();
+        if retained_count >= MAX_ACTIVE_RECORDS {
             return Err(XfrmObjectRosterDurableError::CapacityExceeded);
         }
         if inventory.journal {
-            let reserved_frames = inventory
-                .records
-                .len()
+            let reserved_frames = retained_count
                 .checked_add(1)
-                .and_then(|groups| groups.checked_mul(MAX_JOURNAL_FRAMES_PER_ROSTER))
+                .and_then(|groups| groups.checked_mul(MAX_SETTLEMENT_FRAMES_PER_ROSTER))
                 .ok_or(XfrmObjectRosterDurableError::CapacityExceeded)?;
             if reserved_frames > MAX_JOURNAL_FRAMES {
                 return Err(XfrmObjectRosterDurableError::CapacityExceeded);
@@ -1837,7 +1988,7 @@ impl XfrmObjectRosterRecoveryStore {
         }
         if members.iter().any(|member| {
             inventory.records.iter().any(|(_, record)| {
-                !record.phase.is_terminal()
+                !record.is_terminal()
                     && record.members.iter().flatten().any(|slot| {
                         fingerprints_equal(
                             &slot.deletion_identity_fingerprint,
@@ -1855,6 +2006,12 @@ impl XfrmObjectRosterRecoveryStore {
         }
         let epoch = lease.current_epoch(&inventory)?;
         let mut record = DurableRosterRecord {
+            namespace_cleared: false,
+            retention: if retain {
+                SettlementRetention::Held
+            } else {
+                SettlementRetention::Unbound
+            },
             phase: XfrmObjectRosterDurablePhase::Prepared,
             cursor: 0,
             publication_sequence: 1,
@@ -1869,8 +2026,158 @@ impl XfrmObjectRosterRecoveryStore {
         };
         record.roster_fingerprint =
             roster_fingerprint(lease.store.proof_key.canonical_mac_key(), &record.active())?;
-        lease.publish_record(&record, PublicationClass::Prepare)?;
+        lease.publish_record_releasing(&record, PublicationClass::Prepare, &inventory)?;
         record.handle(&lease.store.proof_key)
+    }
+
+    /// Close absence or Prepared under the same lock as Prepared -> Issuing.
+    /// Accepted work is observed without modifying its epoch or authority.
+    pub(crate) fn fence(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        members: &[XfrmObjectRosterMemberMaterial],
+    ) -> Result<DurableRosterRecord, XfrmObjectRosterDurableError> {
+        if members.is_empty() || members.len() > XFRM_OBJECT_ROSTER_MAX_MEMBERS {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
+        let lease = self.lease()?;
+        if lease.was_released(group_id, generation)?.is_some() {
+            return Err(XfrmObjectRosterDurableError::Stale);
+        }
+        let mut inventory = lease.inventory()?;
+        let mut slots = [None; XFRM_OBJECT_ROSTER_MAX_MEMBERS];
+        for (slot, material) in slots.iter_mut().zip(members) {
+            *slot = Some(DurableRosterMemberSlot::from_material(*material));
+        }
+        let mut closed = DurableRosterRecord {
+            namespace_cleared: false,
+            retention: SettlementRetention::Held,
+            phase: XfrmObjectRosterDurablePhase::Closed,
+            cursor: 0,
+            publication_sequence: 1,
+            store_incarnation: lease.store.control.store_incarnation,
+            namespace_seal: lease.store.control.namespace_seal,
+            actor_incarnation: lease.store.control.actor_incarnation,
+            group_id,
+            group_generation: generation,
+            writer_epoch: lease.current_epoch(&inventory)?,
+            roster_fingerprint: [0; 32],
+            members: slots,
+        };
+        closed.roster_fingerprint =
+            roster_fingerprint(lease.store.proof_key.canonical_mac_key(), &closed.active())?;
+        match inventory.current_for(group_id, generation) {
+            Ok((old_name, current)) => {
+                lease.validate_record_binding(current)?;
+                if current.retention != SettlementRetention::Held
+                    || !fingerprints_equal(&current.roster_fingerprint, &closed.roster_fingerprint)
+                {
+                    return Err(XfrmObjectRosterDurableError::WrongBinding);
+                }
+                if current.phase != XfrmObjectRosterDurablePhase::Prepared {
+                    return Ok(current.clone());
+                }
+                closed = current.clone();
+                closed.phase = XfrmObjectRosterDurablePhase::Closed;
+                closed.publication_sequence = current
+                    .publication_sequence
+                    .checked_add(1)
+                    .ok_or(XfrmObjectRosterDurableError::CapacityExceeded)?;
+                if !is_exact_roster_publication_successor(current, &closed, current.writer_epoch) {
+                    return Err(XfrmObjectRosterDurableError::InvalidTransition);
+                }
+                lease.publish_record_releasing(
+                    &closed,
+                    PublicationClass::Transition,
+                    &inventory,
+                )?;
+                if !inventory.journal {
+                    lease.remove_record(old_name)?;
+                }
+            }
+            Err(XfrmObjectRosterDurableError::NotFound) => {
+                if lease.prune_terminal_records(&inventory)? {
+                    inventory = lease.inventory()?;
+                }
+                if inventory
+                    .records
+                    .iter()
+                    .filter(|(_, record)| record.retention != SettlementRetention::Released)
+                    .count()
+                    >= MAX_ACTIVE_RECORDS
+                {
+                    return Err(XfrmObjectRosterDurableError::CapacityExceeded);
+                }
+                lease.publish_record_releasing(&closed, PublicationClass::Prepare, &inventory)?;
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(closed)
+    }
+
+    /// Surrender only settlement retention. The caller owns the durable
+    /// terminal receipt and retries this exact release after cancellation or
+    /// restart. A missing row is already released; it is never non-execution
+    /// evidence. Applied writer authority must first be finalized normally.
+    pub(crate) fn release_settlement(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+        fingerprint: [u8; 32],
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        let lease = self.lease()?;
+        if let Some(released) = lease.was_released(group_id, generation)? {
+            return if fingerprints_equal(&released, &fingerprint) {
+                Ok(())
+            } else {
+                Err(XfrmObjectRosterDurableError::WrongBinding)
+            };
+        }
+        let inventory = lease.inventory()?;
+        match inventory.current_for(group_id, generation) {
+            Ok((old_name, current)) => {
+                lease.validate_record_binding(current)?;
+                if !fingerprints_equal(&current.roster_fingerprint, &fingerprint) {
+                    return Err(XfrmObjectRosterDurableError::WrongBinding);
+                }
+                if !current.is_terminal() || current.retention == SettlementRetention::Unbound {
+                    return Err(XfrmObjectRosterDurableError::InvalidTransition);
+                }
+                if current.retention == SettlementRetention::Held {
+                    let mut released = current.clone();
+                    released.retention = SettlementRetention::Released;
+                    released.publication_sequence = current
+                        .publication_sequence
+                        .checked_add(1)
+                        .ok_or(XfrmObjectRosterDurableError::CapacityExceeded)?;
+                    if !is_exact_roster_publication_successor(
+                        current,
+                        &released,
+                        current.writer_epoch,
+                    ) {
+                        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+                    }
+                    lease.publish_record_releasing(
+                        &released,
+                        PublicationClass::Release,
+                        &inventory,
+                    )?;
+                    if !inventory.journal {
+                        lease.remove_record(old_name)?;
+                    }
+                }
+            }
+            Err(XfrmObjectRosterDurableError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        lease
+            .store
+            .released
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+            .insert((group_id.0, generation.get()), fingerprint);
+        Ok(())
     }
 
     /// Publish one exact roster transition with atomic file and parent
@@ -1912,7 +2219,7 @@ impl XfrmObjectRosterRecoveryStore {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
         let (old_name, current) = lease.current_from_handle(&inventory, handle)?;
-        if current.phase != expected {
+        if current.namespace_cleared || current.phase != expected {
             return Err(XfrmObjectRosterDurableError::InvalidTransition);
         }
         let entering_issuing = expected == XfrmObjectRosterDurablePhase::Prepared
@@ -1925,7 +2232,7 @@ impl XfrmObjectRosterRecoveryStore {
         // the epoch underneath it. Reading such a record stays legal so
         // recovery can classify it for repair, but publishing any further
         // state from it, including one that would authorize a delete, does not.
-        if current.phase.is_unresolved_writer_authority() && current.writer_epoch != current_epoch {
+        if current.is_unresolved_writer_authority() && current.writer_epoch != current_epoch {
             return Err(XfrmObjectRosterDurableError::Stale);
         }
         let publication_sequence = current
@@ -1979,7 +2286,7 @@ impl XfrmObjectRosterRecoveryStore {
         } else {
             PublicationClass::Transition
         };
-        lease.publish_record(&next_record, class)?;
+        lease.publish_record_releasing(&next_record, class, &inventory)?;
         if !inventory.journal {
             lease.remove_record(old_name)?;
         }
@@ -2003,7 +2310,10 @@ impl XfrmObjectRosterRecoveryStore {
     ) -> Result<XfrmObjectRosterDurablePhase, XfrmObjectRosterDurableError> {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
-        Ok(lease.current_from_handle(&inventory, handle)?.1.phase)
+        Ok(lease
+            .current_from_handle(&inventory, handle)?
+            .1
+            .observation_phase())
     }
 
     /// Restore one exact authenticated roster record from durable correlation
@@ -2114,23 +2424,81 @@ impl XfrmObjectRosterRecoveryStore {
         lease.advance_epoch(&inventory)
     }
 
-    /// Forget all predecessor rosters after the actor proved the namespace
-    /// empty. The epoch witness is durable before journal replacement or any
-    /// legacy record unlink, so an interrupted reset never rewinds authority.
+    /// Surrender predecessor authority after the actor proved the namespace
+    /// empty, retaining SDK settlement history. The epoch witness precedes
+    /// replacement, so an interrupted reset never rewinds authority and the
+    /// owning startup reset can repeat it.
     pub(crate) fn reset_after_namespace_empty(&self) -> Result<(), XfrmObjectRosterDurableError> {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
+        let mut updates = Vec::new();
+        for (name, record) in &inventory.records {
+            if record.retention == SettlementRetention::Released {
+                lease
+                    .store
+                    .released
+                    .lock()
+                    .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+                    .insert(
+                        (record.group_id.0, record.group_generation.get()),
+                        record.roster_fingerprint,
+                    );
+            }
+            if record.retention != SettlementRetention::Held || record.is_terminal() {
+                continue;
+            }
+            let mut next = record.clone();
+            next.publication_sequence = next
+                .publication_sequence
+                .checked_add(1)
+                .ok_or(XfrmObjectRosterDurableError::CapacityExceeded)?;
+            if record.phase == XfrmObjectRosterDurablePhase::Prepared {
+                next.phase = XfrmObjectRosterDurablePhase::Closed;
+            } else {
+                next.namespace_cleared = true;
+            }
+            if !is_exact_roster_publication_successor(record, &next, record.writer_epoch) {
+                return Err(XfrmObjectRosterDurableError::InvalidTransition);
+            }
+            validate_roster_record(&next)?;
+            updates.push((name, next));
+        }
         let epoch = lease.advance_epoch(&inventory)?;
         #[cfg(not(target_os = "linux"))]
         let _ = epoch;
         if inventory.journal {
             #[cfg(target_os = "linux")]
-            compact_journal(lease.store, &[], epoch)?;
+            {
+                let retained_groups = inventory
+                    .records
+                    .iter()
+                    .filter(|(_, record)| record.retention == SettlementRetention::Held)
+                    .map(|(_, record)| (record.group_id, record.group_generation))
+                    .collect::<Vec<_>>();
+                let (_, history) = read_journal_records(lease.store)?;
+                let mut retained = history
+                    .into_iter()
+                    .filter(|record| {
+                        retained_groups.contains(&(record.group_id, record.group_generation))
+                    })
+                    .collect::<Vec<_>>();
+                retained.extend(updates.iter().map(|(_, record)| record.clone()));
+                compact_journal(lease.store, &retained, epoch)?;
+                for (_, record) in &updates {
+                    lease.record_publication(record, PublicationClass::Transition)?;
+                }
+            }
             #[cfg(not(target_os = "linux"))]
             return Err(XfrmObjectRosterDurableError::Storage);
         } else {
-            for (name, _) in &inventory.records {
-                lease.remove_record(name)?;
+            for (old_name, record) in &updates {
+                lease.publish_record(record, PublicationClass::Transition)?;
+                lease.remove_record(old_name)?;
+            }
+            for (name, record) in &inventory.records {
+                if record.retention != SettlementRetention::Held {
+                    lease.remove_record(name)?;
+                }
             }
         }
         Ok(())
@@ -2346,9 +2714,24 @@ enum PublicationClass {
     Prepare,
     Transition,
     Finalize,
+    Release,
 }
 
 impl StoreLease<'_> {
+    fn was_released(
+        &self,
+        group_id: XfrmObjectRosterGroupId,
+        generation: XfrmObjectRosterOperationGeneration,
+    ) -> Result<Option<[u8; 32]>, XfrmObjectRosterDurableError> {
+        Ok(self
+            .store
+            .released
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+            .get(&(group_id.0, generation.get()))
+            .copied())
+    }
+
     fn inventory(&self) -> Result<Inventory, XfrmObjectRosterDurableError> {
         verify_visible_identity(self.store)?;
         let mut control_count = 0_usize;
@@ -2528,7 +2911,9 @@ impl StoreLease<'_> {
         {
             return Err(XfrmObjectRosterDurableError::WrongBinding);
         }
-        if current.phase != correlation.phase
+        if current.namespace_cleared != correlation.namespace_cleared
+            || current.retention != correlation.retention
+            || current.phase != correlation.phase
             || current.cursor != correlation.cursor
             || current.publication_sequence != correlation.publication_sequence
             || current.writer_epoch != correlation.writer_epoch
@@ -2562,6 +2947,73 @@ impl StoreLease<'_> {
             let name = record_name(record);
             publish_new_file(self.store, &name, &bytes)?;
         }
+        self.record_publication(record, class)
+    }
+
+    /// Remove released histories in the same durable publication as the next
+    /// roster change. Capacity excludes them before that next admission.
+    fn publish_record_releasing(
+        &self,
+        record: &DurableRosterRecord,
+        class: PublicationClass,
+        inventory: &Inventory,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        let released = inventory
+            .records
+            .iter()
+            .filter(|(_, record)| record.retention == SettlementRetention::Released)
+            .collect::<Vec<_>>();
+        if released.is_empty() {
+            return self.publish_record(record, class);
+        }
+        self.validate_record_binding(record)?;
+        validate_roster_record(record)?;
+        {
+            let mut remembered = self
+                .store
+                .released
+                .lock()
+                .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+            for (_, old) in &released {
+                remembered.insert(
+                    (old.group_id.0, old.group_generation.get()),
+                    old.roster_fingerprint,
+                );
+            }
+        }
+        if inventory.journal {
+            #[cfg(target_os = "linux")]
+            {
+                let (_, mut history) = read_journal_records(self.store)?;
+                history.retain(|frame| {
+                    !released.iter().any(|(_, old)| {
+                        frame.group_id == old.group_id
+                            && frame.group_generation == old.group_generation
+                    })
+                });
+                history.push(record.clone());
+                compact_journal(
+                    self.store,
+                    &history,
+                    inventory.epoch.max(record.writer_epoch),
+                )?;
+                self.record_publication(record, class)
+            }
+            #[cfg(not(target_os = "linux"))]
+            Err(XfrmObjectRosterDurableError::Storage)
+        } else {
+            for (name, _) in released {
+                self.remove_record(name)?;
+            }
+            self.publish_record(record, class)
+        }
+    }
+
+    fn record_publication(
+        &self,
+        record: &DurableRosterRecord,
+        class: PublicationClass,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
         #[cfg(test)]
         {
             let mut ledger = self
@@ -2576,11 +3028,12 @@ impl StoreLease<'_> {
                     PublicationClass::Prepare => XfrmObjectRosterPublicationClass::Prepare,
                     PublicationClass::Transition => XfrmObjectRosterPublicationClass::Transition,
                     PublicationClass::Finalize => XfrmObjectRosterPublicationClass::Finalize,
+                    PublicationClass::Release => XfrmObjectRosterPublicationClass::Release,
                 },
             });
         }
         #[cfg(not(test))]
-        let _ = class;
+        let _ = (record, class);
         Ok(())
     }
 
@@ -2615,7 +3068,9 @@ impl StoreLease<'_> {
         let names = inventory
             .records
             .iter()
-            .filter(|(_, record)| record.phase.is_terminal())
+            .filter(|(_, record)| {
+                record.is_prunable() && record.retention != SettlementRetention::Released
+            })
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         if inventory.journal {
@@ -2634,7 +3089,7 @@ impl StoreLease<'_> {
                     let surviving_groups = inventory
                         .records
                         .iter()
-                        .filter(|(_, record)| !record.phase.is_terminal())
+                        .filter(|(name, _)| !names.contains(name))
                         .map(|(_, record)| (record.group_id, record.group_generation))
                         .collect::<Vec<_>>();
                     let (_, history) = read_journal_records(self.store)?;
@@ -2853,7 +3308,12 @@ fn classify_journal_roster_records(
             .first()
             .ok_or(XfrmObjectRosterDurableError::Malformed)?;
         if first.publication_sequence != 1
-            || first.phase != XfrmObjectRosterDurablePhase::Prepared
+            || !matches!(
+                first.phase,
+                XfrmObjectRosterDurablePhase::Prepared | XfrmObjectRosterDurablePhase::Closed
+            )
+            || first.retention == SettlementRetention::Released
+            || first.namespace_cleared
             || first.cursor != 0
         {
             return Err(XfrmObjectRosterDurableError::Duplicate);
@@ -2880,12 +3340,12 @@ fn validate_unique_active_deletion_identities(
     records: &[NamedRosterRecord],
 ) -> Result<(), XfrmObjectRosterDurableError> {
     for (index, (_, left)) in records.iter().enumerate() {
-        if left.phase.is_terminal() {
+        if left.is_terminal() {
             continue;
         }
         for slot in left.members.iter().flatten() {
             if records[index + 1..].iter().any(|(_, right)| {
-                !right.phase.is_terminal()
+                !right.is_terminal()
                     && right.members.iter().flatten().any(|other| {
                         fingerprints_equal(
                             &slot.deletion_identity_fingerprint,
@@ -2905,7 +3365,7 @@ fn validate_single_cleanup_authority(
 ) -> Result<(), XfrmObjectRosterDurableError> {
     if records
         .iter()
-        .filter(|(_, record)| record.phase.is_unresolved_writer_authority())
+        .filter(|(_, record)| record.is_unresolved_writer_authority())
         .take(2)
         .count()
         > 1
@@ -2947,7 +3407,28 @@ fn is_exact_roster_publication_successor(
     if old.publication_sequence.checked_add(1) != Some(next.publication_sequence) {
         return false;
     }
-    if !old.phase.permits(next.phase) {
+    if old.namespace_cleared != next.namespace_cleared {
+        return !old.namespace_cleared
+            && next.namespace_cleared
+            && old.retention == SettlementRetention::Held
+            && old.retention == next.retention
+            && !old.phase.is_terminal()
+            && old.phase != XfrmObjectRosterDurablePhase::Prepared
+            && old.phase == next.phase
+            && old.cursor == next.cursor
+            && old.members == next.members
+            && old.writer_epoch == next.writer_epoch;
+    }
+    if old.retention != next.retention {
+        return old.retention == SettlementRetention::Held
+            && next.retention == SettlementRetention::Released
+            && old.is_terminal()
+            && old.phase == next.phase
+            && old.cursor == next.cursor
+            && old.members == next.members
+            && old.writer_epoch == next.writer_epoch;
+    }
+    if old.namespace_cleared || !old.phase.permits(next.phase) {
         return false;
     }
     let slots_advance = old
@@ -3891,6 +4372,7 @@ fn parse_record_name(
     let group = decode_hex_16(components.next()?)?;
     let phase = match components.next()? {
         "prepared" => XfrmObjectRosterDurablePhase::Prepared,
+        "closed" => XfrmObjectRosterDurablePhase::Closed,
         "issuing" => XfrmObjectRosterDurablePhase::Issuing,
         "applied" => XfrmObjectRosterDurablePhase::Applied,
         "compensating" => XfrmObjectRosterDurablePhase::Compensating,
@@ -4061,6 +4543,8 @@ mod tests {
         slots: &[SlotSpec],
     ) -> DurableRosterRecord {
         let mut record = DurableRosterRecord {
+            retention: SettlementRetention::Unbound,
+            namespace_cleared: false,
             phase,
             cursor,
             publication_sequence: 1,
@@ -4497,9 +4981,9 @@ mod tests {
         assert_eq!(
             encoded[RECORD_BODY_BYTES..],
             [
-                0x3f, 0xe3, 0x96, 0x76, 0x5f, 0x4d, 0x48, 0x54, 0xeb, 0x9f, 0xa5, 0x18, 0xa9, 0x28,
-                0x63, 0xa9, 0xca, 0xcd, 0x44, 0x26, 0x64, 0xbd, 0xd4, 0x24, 0x5a, 0xba, 0xff, 0x49,
-                0xed, 0x6a, 0x40, 0xb2,
+                0x88, 0x6f, 0x09, 0xaf, 0xba, 0x40, 0xc1, 0x55, 0x68, 0x17, 0x80, 0xf6, 0x39, 0xec,
+                0xbf, 0x36, 0x1a, 0x25, 0x07, 0xe9, 0xdf, 0xeb, 0xcd, 0xb1, 0xbf, 0xe3, 0x26, 0x8f,
+                0xe4, 0xf9, 0x4c, 0x37,
             ],
             "record tag encoding changed"
         );
@@ -4764,7 +5248,7 @@ mod tests {
             ),
             (
                 "unknown_group_phase_code",
-                patched(&prepared_record(), &[(10, 9)]),
+                patched(&prepared_record(), &[(10, 10)]),
             ),
         ];
         for (label, encoded) in cases {
@@ -4820,9 +5304,9 @@ mod tests {
         ));
         let valid = prepared_record().encode(&key(9)).unwrap();
         for (label, index, value) in [
-            ("version_low", 9_usize, 2_u8),
+            ("version_low", 9_usize, 1_u8),
             ("version_high", 8, 1),
-            ("reserved", 15, 1),
+            ("reserved", 15, 4),
             ("magic", 0, b'X'),
         ] {
             let mut invalid = valid;
@@ -6801,6 +7285,289 @@ mod tests {
         const {
             assert!(MAX_ACTIVE_RECORDS * 2 + 3 <= MAX_STORE_ENTRIES);
         }
+    }
+
+    #[test]
+    fn settlement_release_reopens_idempotently_and_batches_removal_with_next_publication() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let identity = opened.settlement_identity();
+        let material = members(2);
+        let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+        let prepared = opened
+            .prepare_with_retention(group(0x51), generation(1), &material, true)
+            .unwrap();
+        let closed = opened.fence(group(0x51), generation(1), &material).unwrap();
+        assert_eq!(closed.phase, XfrmObjectRosterDurablePhase::Closed);
+        assert_eq!(closed.retention.code(), 1);
+        assert_eq!(
+            opened.inspect(&prepared),
+            Err(XfrmObjectRosterDurableError::Stale)
+        );
+        let before = opened.publication_ledger().unwrap().len();
+        opened
+            .release_settlement(group(0x51), generation(1), fingerprint)
+            .unwrap();
+        let ledger = opened.publication_ledger().unwrap();
+        assert_eq!(ledger.len(), before + 1);
+        assert_eq!(
+            ledger.last().unwrap().class,
+            XfrmObjectRosterPublicationClass::Release
+        );
+        let released = opened
+            .restore(group(0x51), generation(1), fingerprint)
+            .unwrap();
+        assert_eq!(released.members, closed.members);
+        assert_eq!(released.writer_epoch, closed.writer_epoch);
+        drop(opened);
+
+        let reopened = store(&root);
+        assert_eq!(reopened.settlement_identity(), identity);
+        reopened
+            .release_settlement(group(0x51), generation(1), fingerprint)
+            .unwrap();
+        assert!(reopened.publication_ledger().unwrap().is_empty());
+        reopened
+            .prepare(group(0x52), generation(1), &members(1))
+            .unwrap();
+        let (_, history) = read_journal_records(&reopened.inner).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].group_id, group(0x52));
+        assert_eq!(history[0].phase, XfrmObjectRosterDurablePhase::Prepared);
+        assert!(reopened
+            .prepare_with_retention(group(0x51), generation(1), &material, true)
+            .is_err());
+        assert_eq!(
+            reopened.release_settlement(group(0x51), generation(1), [0xFF; 32]),
+            Err(XfrmObjectRosterDurableError::WrongBinding)
+        );
+        drop(reopened);
+
+        // The terminal receipt remains the retry owner even after a prior
+        // process durably removed the already-released history.
+        let reopened = store(&root);
+        reopened
+            .release_settlement(group(0x51), generation(1), fingerprint)
+            .unwrap();
+        assert!(reopened.publication_ledger().unwrap().is_empty());
+        assert!(reopened
+            .prepare_with_retention(group(0x51), generation(1), &material, true)
+            .is_err());
+    }
+
+    #[test]
+    fn settlement_release_requires_finalized_writer_authority_and_preserves_member_history() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let material = members(2);
+        let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+        let prepared = opened
+            .prepare_with_retention(group(0x53), generation(1), &material, true)
+            .unwrap();
+        let applied = run_to_applied(&opened, &prepared, 2);
+        let before = opened.publication_ledger().unwrap();
+        assert_eq!(
+            opened.release_settlement(group(0x53), generation(1), fingerprint),
+            Err(XfrmObjectRosterDurableError::InvalidTransition)
+        );
+        assert_eq!(opened.publication_ledger().unwrap(), before);
+        assert!(opened.has_unresolved_writer_authority().unwrap());
+        advance(
+            &opened,
+            &applied,
+            XfrmObjectRosterDurablePhase::Applied,
+            XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Committed, 2),
+        );
+        assert!(!opened.has_unresolved_writer_authority().unwrap());
+        let committed = opened
+            .restore(group(0x53), generation(1), fingerprint)
+            .unwrap();
+        opened
+            .prepare(group(0x54), generation(1), &[distinct_material(20)])
+            .unwrap();
+        assert_eq!(
+            opened
+                .restore(group(0x53), generation(1), fingerprint)
+                .unwrap(),
+            committed
+        );
+        let before = opened.publication_ledger().unwrap().len();
+        opened
+            .release_settlement(group(0x53), generation(1), fingerprint)
+            .unwrap();
+        let released = opened
+            .restore(group(0x53), generation(1), fingerprint)
+            .unwrap();
+        assert_eq!(released.phase, XfrmObjectRosterDurablePhase::Committed);
+        assert_eq!(released.members, committed.members);
+        assert_eq!(released.writer_epoch, committed.writer_epoch);
+        assert_eq!(opened.publication_ledger().unwrap().len(), before + 1);
+        opened
+            .release_settlement(group(0x53), generation(1), fingerprint)
+            .unwrap();
+        assert_eq!(opened.publication_ledger().unwrap().len(), before + 1);
+    }
+
+    #[test]
+    fn settlement_release_frees_a_full_live_store_before_capacity_is_checked() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        for index in 0..MAX_ACTIVE_RECORDS {
+            opened
+                .fence(
+                    group(u8::try_from(index + 1).unwrap()),
+                    generation(1),
+                    &[distinct_material(index)],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            opened.fence(group(0x60), generation(1), &[distinct_material(50)]),
+            Err(XfrmObjectRosterDurableError::CapacityExceeded)
+        );
+        let fingerprint = opened
+            .roster_fingerprint_for(&[distinct_material(0)])
+            .unwrap();
+        opened
+            .release_settlement(group(1), generation(1), fingerprint)
+            .unwrap();
+        opened
+            .prepare_with_retention(group(0x60), generation(1), &[distinct_material(50)], true)
+            .unwrap();
+        assert_eq!(
+            opened.lease().unwrap().inventory().unwrap().records.len(),
+            MAX_ACTIVE_RECORDS
+        );
+        assert!(opened
+            .prepare_with_retention(group(1), generation(1), &[distinct_material(0)], true)
+            .is_err());
+    }
+
+    #[test]
+    fn settlement_namespace_reset_preserves_history_without_retaining_writer_authority() {
+        for phase in [
+            XfrmObjectRosterDurablePhase::Prepared,
+            XfrmObjectRosterDurablePhase::Issuing,
+            XfrmObjectRosterDurablePhase::Applied,
+            XfrmObjectRosterDurablePhase::Compensating,
+        ] {
+            let root = TestRoot::new();
+            let opened = store(&root);
+            let material = members(2);
+            let fingerprint = opened.roster_fingerprint_for(&material).unwrap();
+            let prepared = opened
+                .prepare_with_retention(group(0x61), generation(1), &material, true)
+                .unwrap();
+            let prior_handle = match phase {
+                XfrmObjectRosterDurablePhase::Prepared => prepared,
+                XfrmObjectRosterDurablePhase::Issuing => advance(
+                    &opened,
+                    &prepared,
+                    XfrmObjectRosterDurablePhase::Prepared,
+                    enter_issuing(2),
+                ),
+                XfrmObjectRosterDurablePhase::Applied => run_to_applied(&opened, &prepared, 2),
+                XfrmObjectRosterDurablePhase::Compensating => {
+                    let applied = run_to_applied(&opened, &prepared, 2);
+                    advance(
+                        &opened,
+                        &applied,
+                        XfrmObjectRosterDurablePhase::Applied,
+                        XfrmObjectRosterTransition::new(
+                            XfrmObjectRosterDurablePhase::Compensating,
+                            1,
+                        ),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let prior = opened
+                .restore(group(0x61), generation(1), fingerprint)
+                .unwrap();
+            opened.reset_after_namespace_empty().unwrap();
+            assert!(!opened.has_unresolved_writer_authority().unwrap());
+            assert_eq!(
+                opened.inspect(&prior_handle),
+                Err(XfrmObjectRosterDurableError::Stale)
+            );
+            let retained = opened
+                .restore(group(0x61), generation(1), fingerprint)
+                .unwrap();
+            assert_eq!(retained.members, prior.members);
+            assert_eq!(retained.writer_epoch, prior.writer_epoch);
+            if phase == XfrmObjectRosterDurablePhase::Prepared {
+                assert_eq!(
+                    retained.observation_phase(),
+                    XfrmObjectRosterDurablePhase::Closed
+                );
+                assert!(!retained.namespace_was_cleared());
+            } else {
+                assert_eq!(retained.phase, phase);
+                assert_eq!(
+                    retained.observation_phase(),
+                    XfrmObjectRosterDurablePhase::Retired
+                );
+                assert!(retained.namespace_was_cleared());
+                let mut revived = retained.clone();
+                revived.namespace_cleared = false;
+                revived.publication_sequence += 1;
+                assert!(!is_exact_roster_publication_successor(
+                    &retained,
+                    &revived,
+                    retained.writer_epoch
+                ));
+            }
+            // The verified empty namespace permits replacement of the same
+            // physical identities while old settlement evidence stays held.
+            opened
+                .prepare(group(0x62), generation(1), &material)
+                .unwrap();
+            assert_eq!(
+                opened
+                    .restore(group(0x61), generation(1), fingerprint)
+                    .unwrap(),
+                retained
+            );
+            drop(opened);
+            let reopened = store(&root);
+            assert_eq!(
+                reopened
+                    .restore(group(0x61), generation(1), fingerprint)
+                    .unwrap(),
+                retained
+            );
+            assert!(!reopened.has_unresolved_writer_authority().unwrap());
+            reopened
+                .release_settlement(group(0x61), generation(1), fingerprint)
+                .unwrap();
+            reopened
+                .release_settlement(group(0x61), generation(1), fingerprint)
+                .unwrap();
+            assert!(reopened
+                .prepare_with_retention(group(0x61), generation(1), &material, true)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn settlement_format_rejects_v1_control_with_a_stable_reason() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let mut old = opened.inner.control.encode(&key(9)).unwrap();
+        old[..8].copy_from_slice(b"OPCXRSC1");
+        old[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        let tag = authenticate_domain(
+            key(9).canonical_mac_key(),
+            b"opc-xfrm-roster-control-v1\0",
+            &old[..CONTROL_BODY_BYTES],
+        );
+        old[CONTROL_BODY_BYTES..].copy_from_slice(&tag);
+        fs::write(root.path().join(CONTROL_NAME), old).unwrap();
+        drop(opened);
+        assert_eq!(
+            XfrmObjectRosterRecoveryStore::open_bound(root.path(), key(9), [7; 40]).unwrap_err(),
+            XfrmObjectRosterDurableError::Malformed
+        );
     }
 
     #[test]

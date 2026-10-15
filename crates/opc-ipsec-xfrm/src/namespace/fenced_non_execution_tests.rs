@@ -2,34 +2,28 @@ mod fenced_non_execution {
     use super::*;
     use crate::XfrmObjectRosterMemberPhase;
 
-    // The approved descriptor binding is attached here during implementation.
-    // Baseline requests have no store-identity commitment; keep the actual
-    // ordinary request so the initial RED reaches the missing closure behavior.
+    // Commit the original store identity before admission or any preparation.
     fn settlement_roster(
-        _store: &XfrmObjectRosterRecoveryStore,
+        store: &XfrmObjectRosterRecoveryStore,
         roster: XfrmObjectRosterRequest,
     ) -> XfrmObjectRosterRequest {
-        roster
+        roster.with_settlement_identity(store.settlement_identity())
     }
 
-    // Baseline composition seam. During implementation this one call is wired
-    // to the proposed close-and-observe actor API. It must never synthesize
-    // intent, treat NotFound as a proof, or weaken the assertions below.
+    // Exercise the production publication outside the namespace actor queue.
     async fn close_generation(
         backend: &NamespaceBoundLinuxXfrmBackend,
         store: &XfrmObjectRosterRecoveryStore,
         group: XfrmObjectRosterGroupId,
         generation: XfrmObjectRosterOperationGeneration,
         roster: &XfrmObjectRosterRequest,
-    ) -> Result<XfrmObjectRosterRestartOutcome, XfrmObjectRosterDurableError> {
+    ) -> Result<XfrmObjectRosterFenceObservation, XfrmObjectRosterDurableError> {
         backend
-            .recover_durable_object_roster(store, group, generation, roster)
+            .fence_durable_object_roster(store, group, generation, roster)
             .await
     }
 
-    // Baseline release seam. Finalization already surrenders effect ownership,
-    // but does not implement SDK settlement release or remember late prepares.
-    // Implementation replaces this call with the explicit bound release API.
+    // The consumer has durably terminalized before surrendering retention.
     async fn release_settled(
         backend: &NamespaceBoundLinuxXfrmBackend,
         store: &XfrmObjectRosterRecoveryStore,
@@ -38,9 +32,8 @@ mod fenced_non_execution {
         roster: &XfrmObjectRosterRequest,
     ) -> Result<(), XfrmObjectRosterDurableError> {
         backend
-            .finalize_durable_object_roster(store, group, generation, roster)
+            .release_durable_object_roster_settlement(store, group, generation, roster)
             .await
-            .map(|_| ())
     }
 
     #[derive(Debug, Default)]
@@ -130,12 +123,49 @@ mod fenced_non_execution {
     }
 
     fn closed_without_effect(
-        result: &Result<XfrmObjectRosterRestartOutcome, XfrmObjectRosterDurableError>,
+        result: &Result<XfrmObjectRosterFenceObservation, XfrmObjectRosterDurableError>,
     ) -> bool {
-        matches!(
-            result,
-            Ok(XfrmObjectRosterRestartOutcome::NoMutation { .. })
-        )
+        result
+            .as_ref()
+            .is_ok_and(XfrmObjectRosterFenceObservation::closed_without_effect)
+    }
+
+    #[tokio::test]
+    async fn fenced_non_execution_preserves_ordinary_unstarted_recovery() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0xA1);
+        let group = roster_group(0xA2);
+        let generation = roster_generation(37);
+        let roster = settlement_roster(&store, sa_roster(2));
+        drop(
+            backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
+                .await
+                .unwrap(),
+        );
+        let retired = backend
+            .recover_durable_object_roster(&store, group, generation, &roster)
+            .await
+            .unwrap();
+        assert!(matches!(
+            retired,
+            XfrmObjectRosterRestartOutcome::NoMutation { .. }
+        ));
+        for _ in 0..2 {
+            let observed = close_generation(&backend, &store, group, generation, &roster)
+                .await
+                .unwrap();
+            assert!(observed.closed_without_effect());
+            assert_eq!(observed.phase(), XfrmObjectRosterDurablePhase::Retired);
+            assert_eq!(observed.members(), retired.members());
+            assert!(!observed.namespace_was_cleared());
+        }
+        assert!(backend
+            .prepare_durable_object_roster(&store, group, generation, roster)
+            .await
+            .is_err());
+        assert!(transport.operations().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -807,9 +837,15 @@ mod fenced_non_execution {
                 .unwrap(),
         );
         assert_eq!(
-            close_generation(&backend, &store, group, generation, &policy_roster(2))
-                .await
-                .unwrap_err(),
+            close_generation(
+                &backend,
+                &store,
+                group,
+                generation,
+                &settlement_roster(&store, policy_roster(2))
+            )
+            .await
+            .unwrap_err(),
             XfrmObjectRosterDurableError::WrongBinding
         );
         let other_root = DurableTestRoot::new();
@@ -827,7 +863,12 @@ mod fenced_non_execution {
         ));
         // A refused substituted request cannot poison an independent binding.
         let independent = other_actor
-            .prepare_durable_object_roster(&other_store, group, generation, roster.clone())
+            .prepare_durable_object_roster(
+                &other_store,
+                group,
+                generation,
+                settlement_roster(&other_store, roster.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(

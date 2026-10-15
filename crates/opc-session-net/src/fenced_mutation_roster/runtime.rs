@@ -59,7 +59,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -78,6 +78,27 @@ const MAX_LOCAL_AUTHORITY_ENTRIES: usize = super::canonical::MAX_RESERVED_AND_RE
 /// provider effects behind one process-wide lock. Keep this aligned with the
 /// fixed provider-work scheduler shard count.
 const LOCAL_AUTHORITY_SHARDS: usize = 16;
+// A removed entry must never lend its generation to a later readback, even
+// through a different registry in the same process. Exhaustion fails closed.
+static NEXT_LOCAL_AUTHORITY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_local_authority_generation() -> Result<u64, ExecutorError> {
+    let mut generation = NEXT_LOCAL_AUTHORITY_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let next = generation
+            .checked_add(1)
+            .ok_or(ExecutorError::AuthorityRejected)?;
+        match NEXT_LOCAL_AUTHORITY_GENERATION.compare_exchange_weak(
+            generation,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(generation),
+            Err(current) => generation = current,
+        }
+    }
+}
 
 fn store_roster_profile(profile: super::canonical::Profile) -> StoreRosterProfile {
     if profile == super::canonical::Profile::v1() {
@@ -640,9 +661,12 @@ struct LocalAuthorityEntry {
     /// success can always be recovered without a second remote mutation.
     registration: Option<BackendRegistration>,
     authority: AuthorityBinding,
-    /// This is incremented before replacing a lower-fence permit. It is a
-    /// process-local revocation generation and is never caller supplied.
+    /// Unique process-local revocation generation, never caller supplied or
+    /// reissued after removal of an entry.
     generation: u64,
+    /// Reconciliation closes every prepare/execute registration for this
+    /// admission, without revoking observation or compensation authority.
+    execution_closed: bool,
 }
 
 /// Exact process-local admission capacity reserved before PollAdmit.
@@ -712,16 +736,17 @@ impl LocalAuthorityRegistry {
                 Err(ExecutorError::AuthorityRejected)
             };
         }
+        let generation = next_local_authority_generation()?;
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
-        let generation = 1;
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: None,
                 authority: request.authority().clone(),
                 generation,
+                execution_closed: false,
             },
         );
         Ok(LocalAdmissionReservation {
@@ -799,16 +824,17 @@ impl LocalAuthorityRegistry {
                 generation: entry.generation,
             });
         }
+        let generation = next_local_authority_generation()?;
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
-        let generation = 1;
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: Some(registration),
                 authority: authority.clone(),
                 generation,
+                execution_closed: false,
             },
         );
         Ok(LocalAuthorityPermit {
@@ -862,10 +888,7 @@ impl LocalAuthorityRegistry {
                     });
                 }
                 std::cmp::Ordering::Greater => {
-                    entry.generation = entry
-                        .generation
-                        .checked_add(1)
-                        .ok_or(ExecutorError::AuthorityRejected)?;
+                    entry.generation = next_local_authority_generation()?;
                     entry.registration = Some(registration);
                     entry.authority = authority.clone();
                     return Ok(LocalAuthorityPermit {
@@ -877,16 +900,17 @@ impl LocalAuthorityRegistry {
                 }
             }
         }
+        let generation = next_local_authority_generation()?;
         if !self.reserve_entry() {
             return Err(ExecutorError::ExecutorBusy);
         }
-        let generation = 1;
         entries.insert(
             key,
             LocalAuthorityEntry {
                 registration: Some(registration),
                 authority: authority.clone(),
                 generation,
+                execution_closed: false,
             },
         );
         Ok(LocalAuthorityPermit {
@@ -898,16 +922,54 @@ impl LocalAuthorityRegistry {
     }
 
     fn check(&self, permit: &LocalAuthorityPermit) -> LocalAuthorityCheck {
+        self.check_operation(permit, None)
+    }
+
+    fn check_operation(
+        &self,
+        permit: &LocalAuthorityPermit,
+        operation: Option<ProviderOperation>,
+    ) -> LocalAuthorityCheck {
         let mut entries = match self.lock_entries(&permit.key) {
             Ok(entries) => entries,
             Err(_) => return LocalAuthorityCheck::RevokedOrExpired,
         };
         self.prune_expired_locked(&mut entries);
-        if self.is_current_locked(&entries, permit) {
+        if self.is_current_locked(&entries, permit)
+            && Self::permits_operation_locked(&entries, permit, operation)
+        {
             LocalAuthorityCheck::Current
         } else {
             LocalAuthorityCheck::RevokedOrExpired
         }
+    }
+
+    fn close_execution(&self, permit: &LocalAuthorityPermit) -> Result<(), ExecutorError> {
+        let mut entries = self
+            .lock_entries(&permit.key)
+            .map_err(|_| ExecutorError::AuthorityRejected)?;
+        self.prune_expired_locked(&mut entries);
+        if !self.is_current_locked(&entries, permit) {
+            return Err(ExecutorError::AuthorityRejected);
+        }
+        entries
+            .get_mut(&permit.key)
+            .ok_or(ExecutorError::AuthorityRejected)?
+            .execution_closed = true;
+        Ok(())
+    }
+
+    fn permits_operation_locked(
+        entries: &HashMap<LocalAuthorityKey, LocalAuthorityEntry>,
+        permit: &LocalAuthorityPermit,
+        operation: Option<ProviderOperation>,
+    ) -> bool {
+        !matches!(
+            operation,
+            Some(ProviderOperation::Prepare | ProviderOperation::Execute)
+        ) || entries
+            .get(&permit.key)
+            .is_some_and(|entry| !entry.execution_closed)
     }
 
     /// Hold the exact authority shard while committing the local post-provider
@@ -920,11 +982,22 @@ impl LocalAuthorityRegistry {
         permit: &LocalAuthorityPermit,
         complete: impl FnOnce() -> Result<T, ExecutorError>,
     ) -> Result<T, ExecutorError> {
+        self.linearize_operation(permit, None, complete)
+    }
+
+    fn linearize_operation<T>(
+        &self,
+        permit: &LocalAuthorityPermit,
+        operation: Option<ProviderOperation>,
+        complete: impl FnOnce() -> Result<T, ExecutorError>,
+    ) -> Result<T, ExecutorError> {
         let mut entries = self
             .lock_entries(&permit.key)
             .map_err(|_| ExecutorError::OutcomeUnknown)?;
         self.prune_expired_locked(&mut entries);
-        if !self.is_current_locked(&entries, permit) {
+        if !self.is_current_locked(&entries, permit)
+            || !Self::permits_operation_locked(&entries, permit, operation)
+        {
             return Err(ExecutorError::OutcomeUnknown);
         }
         complete()
@@ -2936,6 +3009,17 @@ impl CommittedTerminal {
             commit_metadata: self.commit_metadata,
         });
         let receipt = TerminalCommitReceipt {
+            settled_member_bindings: admission
+                .members()
+                .iter()
+                .map(|member| {
+                    super::canonical::member_fence_binding_commitment(
+                        admission.roster_id(),
+                        admission.body_commitment(),
+                        member,
+                    )
+                })
+                .collect(),
             phase: match self.materialization {
                 TerminalMaterialization::Established(_) => Phase::Established,
                 TerminalMaterialization::Aborted => Phase::Aborted,
@@ -2977,6 +3061,7 @@ impl fmt::Debug for CommittedTerminal {
 /// can never authorize publication.
 #[derive(PartialEq, Eq)]
 pub(crate) struct TerminalCommitReceipt {
+    settled_member_bindings: Vec<[u8; 32]>,
     phase: Phase,
     protected_checkpoint: Vec<u8>,
     protected_result: Vec<u8>,
@@ -2986,6 +3071,11 @@ pub(crate) struct TerminalCommitReceipt {
 }
 
 impl TerminalCommitReceipt {
+    pub(crate) fn settled_member_binding(&self, ordinal: u8) -> Option<[u8; 32]> {
+        self.settled_member_bindings
+            .get(usize::from(ordinal))
+            .copied()
+    }
     /// Irreversible terminal phase.
     pub(crate) const fn phase(&self) -> Phase {
         self.phase
@@ -4643,6 +4733,25 @@ where
         if member.ordinal() != ordinal {
             return Err(ExecutorError::InvalidMember);
         }
+        // Close before dispatch (including a busy or NotTransmitted result).
+        // Registrations reconstructed by readback share this admission entry.
+        if operation == ProviderOperation::Reconcile {
+            self.local_authority
+                .close_execution(&registration.authority_permit)?;
+        }
+        if self
+            .local_authority
+            .check_operation(&registration.authority_permit, Some(operation))
+            != LocalAuthorityCheck::Current
+        {
+            return Err(ExecutorError::AuthorityRejected);
+        }
+        let remaining = Duration::try_from(
+            *registration.authority().expires_at().as_offset_datetime()
+                - *self.local_authority.now().as_offset_datetime(),
+        )
+        .map_err(|_| ExecutorError::AuthorityRejected)?;
+        let caller_deadline = tokio::time::Instant::now() + remaining;
         // Both guards are acquired synchronously before spawn. The detached
         // child owns them through both local permit checks and the provider
         // operation, so dropping the caller future cannot cancel the
@@ -4753,7 +4862,13 @@ where
             })
             .await
         });
-        task.await.map_err(|_| ExecutorError::OutcomeUnknown)?
+        // Dropping the join handle at expiry detaches accepted provider work.
+        // Its fixed provider deadline and cancellation-resilient ownership are
+        // unchanged; the caller receives no proof after its original lease.
+        tokio::time::timeout_at(caller_deadline, task)
+            .await
+            .map_err(|_| ExecutorError::OutcomeUnknown)?
+            .map_err(|_| ExecutorError::OutcomeUnknown)?
     }
 }
 
@@ -4864,7 +4979,11 @@ where
         }
     };
 
-    if task.local_authority.check(&task.authority_permit) != LocalAuthorityCheck::Current {
+    if task
+        .local_authority
+        .check_operation(&task.authority_permit, Some(task.operation))
+        != LocalAuthorityCheck::Current
+    {
         return Err(ExecutorError::AuthorityRejected);
     }
     let provider_call = MemberCall::from_executor(
@@ -4920,9 +5039,10 @@ where
     // happen while the provider future is in flight. Linearize the exact
     // post-effect authority check with the local transition and proof
     // construction, so a successor cannot revoke the permit in between.
-    let proof = task
-        .local_authority
-        .linearize_current(&task.authority_permit, || {
+    let proof = task.local_authority.linearize_operation(
+        &task.authority_permit,
+        Some(task.operation),
+        || {
             let mut local = task
                 .local
                 .lock()
@@ -5203,7 +5323,8 @@ where
                 }),
                 _ => None,
             })
-        })?;
+        },
+    )?;
     if let Some(error) = response_error {
         return Err(error);
     }
@@ -6099,6 +6220,7 @@ mod local_authority_registry_tests {
                     registration: None,
                     authority: exemplar.authority().clone(),
                     generation: 1,
+                    execution_closed: false,
                 },
             );
         }
@@ -8261,6 +8383,16 @@ mod production_runtime_cut_matrix_tests {
         );
         let registration = executor.register(request).await.expect("registered");
 
+        // All effects precede reconciliation, which closes the entire admission.
+        assert!(matches!(
+            executor.prepare(&registration, 3).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 3).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+
         for ordinal in 0_u8..3 {
             assert!(matches!(
                 executor.prepare(&registration, ordinal).await,
@@ -8296,14 +8428,6 @@ mod production_runtime_cut_matrix_tests {
             Ok(CallResult::Conclusive(_))
         ));
 
-        assert!(matches!(
-            executor.prepare(&registration, 3).await,
-            Ok(CallResult::PreparedNotRun)
-        ));
-        assert!(matches!(
-            executor.execute(&registration, 3).await,
-            Ok(CallResult::Conclusive(_))
-        ));
         assert!(matches!(
             executor.compensate_member(&registration, 3).await,
             Ok(CallResult::NotTransmitted)

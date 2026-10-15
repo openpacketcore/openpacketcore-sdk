@@ -501,9 +501,11 @@ crash-recovery contract.
 
 `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
 is the recommended constructor: it authenticates and permanently leases one
-`XfrmObjectRosterRecoveryStore` (`OPCXROS1` records under family-distinct
-`OPCXRSC1`/`OPCXRSE1` control and epoch magics) on the namespace actor before
+`XfrmObjectRosterRecoveryStore` (`OPCXROS2` records under family-distinct
+`OPCXRSC2`/`OPCXRSE2` control and epoch magics) on the namespace actor before
 any mutation-capable handle is returned.
+Crossing the v2 stored-format change requires a fresh install; other formats
+are refused with `xfrm_object_roster_recovery_malformed`.
 `bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery`
 binds all three durable families for consumers that still run single-object
 installs or SA relocations; it is the opt-in migration form, not the default,
@@ -622,6 +624,39 @@ retained `XfrmObjectRosterRecoveryHandle` against this exact lease, group
 identity, generation, and member set before yielding the same descriptor; it
 publishes nothing and authorizes no deletion.
 
+### Fenced settlement after a lost admission reply
+
+For an SDK-bound roster, retain `store.settlement_identity()` in the admitted
+member descriptor along with the exact group, generation and ordered request,
+and attach it with `roster.with_settlement_identity(identity)`. Keep that
+original identity on restart. Ordinary rosters require no settlement retention.
+
+After exact SDK admission readback, the trusted provider calls
+`fence_durable_object_roster`. This publishes outside the actor queue under the
+store's compare-and-publish lock. Absent or Prepared becomes Closed; a delayed
+run then fails its Prepared handle or its Prepared-to-Issuing transition.
+`closed_without_effect()` is the only conclusive never-started observation.
+Issuing, Applied and Compensating retain their original dispositions and writer
+epoch. Observe or adopt accepted work normally; closure grants no compensation
+authority. Recover and adopt can read Closed even while an old affine handle
+remains live.
+
+The store retains begun bindings and their outcomes through ordinary pruning
+and namespace reset. A verified empty-namespace reset durably marks accepted
+history retired without changing its member outcomes, so it retains no writer
+or cleanup authority; `namespace_was_cleared()` identifies that observation.
+An unissued Prepared record instead becomes Closed. Finalize Applied normally so retention does not hold the
+writer gate. After either durable SDK terminal receipt, compare each
+`settled_member_binding` with the original call commitment, then invoke
+`release_durable_object_roster_settlement`. An ambiguous terminal result cannot
+release history. Release publishes one durable retention change, survives caller
+cancellation and is idempotent. The consumer retries it automatically after
+restart from the exact terminal receipt. Removal of released history is batched
+with the next roster publication, before live-record capacity is charged; the
+30 live slots are reusable. The open store remembers released bindings for its
+process lifetime to reject delayed prepares. Release removes no kernel object
+and grants no execution or deletion authority.
+
 ### Adopting against recovering after process loss
 
 | Situation | Call |
@@ -631,6 +666,7 @@ publishes nothing and authorizes no deletion.
 | Caller-side deadline expired while the actor converged | adopt first, recover if refused |
 | Record is `Prepared`, `Issuing`, `Compensating`, `NoMutation`, or `RolledBack` | recover; adoption refuses |
 | Record is `Committed` or `Retired` | either; both report it idempotently |
+| Record is `Closed` | either; both report durable non-execution without backend I/O |
 
 Adoption is additive and never deletes. It re-authenticates the binding,
 incarnations, member digest, and epoch currency, reads every member back

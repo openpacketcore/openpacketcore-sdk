@@ -2,7 +2,7 @@
 
 Design proposal v2 for [SDK #1280](https://github.com/openpacketcore/openpacketcore-sdk/issues/1280).
 Source baseline: `4b49fe5b39618af6f523e62f46fb62709212098b`.
-Status: needs-review; no implementation included.
+Status: v2 approved; implementation awaiting independent review.
 
 An admission that committed before its reply was lost must be settled using that
 exact admission. Non-execution becomes conclusive only after its execution
@@ -150,6 +150,13 @@ Retention is per unsettled admission and is never cumulative. Closed rows and SD
 
 A stored-format change uses a fresh install and rejects other
 formats with a stable reason, never interpreting legacy absence as non-execution.
+
+The implementation retains accepted history across a verified empty-namespace
+reset using an authenticated reset marker. Its original member outcomes remain
+unchanged, but observation reports retirement and it holds no writer or cleanup
+authority. This marker never establishes never-started execution. Prepared
+becomes Closed, while already-terminal outcomes stay immutable. Release can
+then surrender this retained history after the exact SDK terminal receipt.
 
 Every physical submission path must participate, including backend work surviving
 timeouts. Review this boundary and authority revocation before implementation;

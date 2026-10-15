@@ -10,12 +10,12 @@ mod accepted;
 use super::*;
 use opc_ipsec_xfrm::{
     InstallPolicyRequest, IpAddress, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
-    PolicyParameters, XfrmAction, XfrmDirection, XfrmObjectInstallRequest,
-    XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterDurableError, XfrmObjectRosterGroupId,
-    XfrmObjectRosterMemberPhase, XfrmObjectRosterMemberRequest,
-    XfrmObjectRosterOperationGeneration, XfrmObjectRosterRecoveryProofKey,
-    XfrmObjectRosterRecoveryStore, XfrmObjectRosterRequest, XfrmObjectRosterRestartOutcome,
-    XfrmSelector,
+    PolicyParameters, QueryPolicyRequest, XfrmAction, XfrmBackend, XfrmDirection,
+    XfrmObjectInstallRequest, XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterDurableError,
+    XfrmObjectRosterDurablePhase, XfrmObjectRosterGroupId, XfrmObjectRosterMemberPhase,
+    XfrmObjectRosterMemberRequest, XfrmObjectRosterOperationGeneration,
+    XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore, XfrmObjectRosterRequest,
+    XfrmObjectRosterRestartOutcome, XfrmSelector,
 };
 use opc_session_net::{
     FencedMutationRosterAdmissionInput as AdmissionInput, FencedMutationRosterClient,
@@ -29,6 +29,7 @@ const WIDTH: u8 = 3;
 
 struct RetainedMember {
     member: Member,
+    group: XfrmObjectRosterGroupId,
     roster: XfrmObjectRosterRequest,
 }
 
@@ -43,6 +44,7 @@ struct XfrmSettlementProvider {
     compensations: AtomicUsize,
     run_member: Option<u8>,
     ready: Mutex<std::collections::HashMap<u8, XfrmObjectRosterAdmissionAuthority>>,
+    bindings: Mutex<std::collections::HashMap<u8, [u8; 32]>>,
     observations: Mutex<Vec<(u8, &'static str)>>,
     _root: tempfile::TempDir,
 }
@@ -63,10 +65,17 @@ impl XfrmSettlementProvider {
             .expect("bind the production namespace actor and authenticated store");
         let members = (0..width)
             .map(|ordinal| {
+                // Group and store identity are chosen before the SDK descriptor,
+                // rather than derived from a commitment that includes it.
+                let group = XfrmObjectRosterGroupId::from_bytes([0xC1 + ordinal; 16]).unwrap();
+                let mut descriptor = vec![0xA1, ordinal];
+                descriptor.extend_from_slice(&store.settlement_identity().to_bytes());
+                descriptor.extend_from_slice(&[0xC1 + ordinal; 16]);
+                descriptor.extend_from_slice(&Self::generation().get().to_be_bytes());
                 let member = Member::new(
                     ordinal,
                     MemberOperationId::from_bytes([0x91 + ordinal; 16]).expect("stable member"),
-                    vec![0xA1, ordinal],
+                    descriptor,
                     101 + u64::from(ordinal),
                 )
                 .expect("immutable SDK member");
@@ -88,8 +97,13 @@ impl XfrmSettlementProvider {
                 let roster =
                     XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)
                         .with_identity(*member.operation_id().as_bytes(), Self::generation())])
-                    .expect("retain the complete exact XFRM request");
-                RetainedMember { member, roster }
+                    .expect("retain the complete exact XFRM request")
+                    .with_settlement_identity(store.settlement_identity());
+                RetainedMember {
+                    member,
+                    group,
+                    roster,
+                }
             })
             .collect();
         Arc::new(Self {
@@ -103,6 +117,7 @@ impl XfrmSettlementProvider {
             compensations: AtomicUsize::new(0),
             run_member,
             ready: Mutex::new(std::collections::HashMap::new()),
+            bindings: Mutex::new(std::collections::HashMap::new()),
             observations: Mutex::new(Vec::new()),
             _root: root,
         })
@@ -127,9 +142,11 @@ impl XfrmSettlementProvider {
             return Err(());
         }
         let binding = call.fence_binding_commitment();
-        let group = XfrmObjectRosterGroupId::from_bytes(binding[..16].try_into().map_err(|_| ())?)
-            .map_err(|_| ())?;
-        Ok((group, retained))
+        let mut bindings = self.bindings.lock().map_err(|_| ())?;
+        if *bindings.entry(call.ordinal()).or_insert(binding) != binding {
+            return Err(());
+        }
+        Ok((retained.group, retained))
     }
 
     async fn observe(
@@ -138,12 +155,11 @@ impl XfrmSettlementProvider {
         operation: RosterProviderOperationV1,
     ) -> Result<ProviderCallOutcome, ()> {
         let (group, retained) = self.binding(call)?;
-        // Baseline composition under test. The implementation must wire the
-        // proposed exact-generation fence here; ordinary recovery cannot
-        // supply that guarantee. Never promote its NotFound into a receipt.
+        // Closing an unstarted binding does not join accepted actor work or
+        // grant compensation. Missing storage is never a negative receipt.
         let observed = self
             .actor
-            .recover_durable_object_roster(&self.store, group, Self::generation(), &retained.roster)
+            .fence_durable_object_roster(&self.store, group, Self::generation(), &retained.roster)
             .await;
         let label = match &observed {
             Ok(outcome) => outcome.as_str(),
@@ -155,10 +171,10 @@ impl XfrmSettlementProvider {
             .map_err(|_| ())?
             .push((call.ordinal(), label));
         match observed {
-            Ok(XfrmObjectRosterRestartOutcome::NoMutation { members })
-            | Ok(XfrmObjectRosterRestartOutcome::Retired { members })
-                if members.arity() == retained.roster.arity()
-                    && members.iter().all(|member| {
+            Ok(observed)
+                if observed.closed_without_effect()
+                    && observed.members().arity() == retained.roster.arity()
+                    && observed.members().iter().all(|member| {
                         member.member_phase() == XfrmObjectRosterMemberPhase::Pending
                             && member.adjacent_proof_kind().is_none()
                     }) =>
@@ -172,8 +188,71 @@ impl XfrmSettlementProvider {
                     evidence,
                 )
             }
+            Ok(observed)
+                if observed.phase() == XfrmObjectRosterDurablePhase::Applied
+                    && operation != RosterProviderOperationV1::Reconcile =>
+            {
+                // Join the real actor through exact readback before signing
+                // Applied. Leave cleanup authority intact for guarded abort.
+                for ordinal in 0..retained.roster.arity() {
+                    let XfrmObjectInstallRequest::Policy(request) =
+                        retained.roster.member(ordinal).ok_or(())?.request()
+                    else {
+                        return Err(());
+                    };
+                    let parameters = &request.parameters;
+                    let observed = self
+                        .actor
+                        .query_policy(QueryPolicyRequest::new(
+                            parameters.selector.clone(),
+                            parameters.direction,
+                        ))
+                        .await
+                        .map_err(|_| ())?;
+                    if observed != *parameters {
+                        return Ok(ProviderCallOutcome::outcome_unknown());
+                    }
+                }
+                let mut evidence = vec![0xB3];
+                evidence.extend_from_slice(&call.fence_binding_commitment());
+                self.issuer.provider_receipt(
+                    call,
+                    operation,
+                    RosterProviderOutcomeV1::AppliedAdopted,
+                    evidence,
+                )
+            }
             Err(XfrmObjectRosterDurableError::NotFound) => Ok(ProviderCallOutcome::not_found()),
             _ => Ok(ProviderCallOutcome::outcome_unknown()),
+        }
+    }
+
+    async fn release_aborted(
+        &self,
+        receipt: &opc_session_net::FencedMutationRosterAbortedTerminal,
+    ) {
+        {
+            let bindings = self.bindings.lock().unwrap();
+            for retained in &self.members {
+                assert_eq!(
+                    receipt.settled_member_binding(
+                        MemberOrdinal::new(retained.member.ordinal()).unwrap()
+                    ),
+                    bindings.get(&retained.member.ordinal()).copied(),
+                    "release requires this exact admission/member terminal receipt",
+                );
+            }
+        }
+        for retained in &self.members {
+            self.actor
+                .release_durable_object_roster_settlement(
+                    &self.store,
+                    retained.group,
+                    Self::generation(),
+                    &retained.roster,
+                )
+                .await
+                .expect("terminal receipt releases settlement retention");
         }
     }
 }
@@ -462,6 +541,7 @@ impl SettlementFixture {
             TerminalStatus::Committed(TerminalReceipt::Aborted(receipt)) => {
                 assert_eq!(receipt.protected_checkpoint(), self.checkpoint);
                 assert_eq!(receipt.protected_result(), [0x86]);
+                self.provider.release_aborted(&receipt).await;
             }
             _ => panic!("lost terminal reply must read back the exact Aborted receipt"),
         }
