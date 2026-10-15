@@ -309,7 +309,7 @@ async fn assert_refused_without_writes(
 
 async fn close_engine(
     backend: SqliteSessionBackend,
-    raft: SessionRaft,
+    raft: native_log_retained_bound::NativeTestRaft,
     wal: Arc<crate::sqlite::consensus::wal::Wal>,
 ) -> Arc<crate::sqlite::consensus::wal::Wal> {
     raft.shutdown().await.unwrap();
@@ -647,5 +647,53 @@ async fn native_future_generation_public_reopen_refuses_before_backend_or_snapsh
         let (backend, raft, wal, _) =
             native_log_retained_bound::open_engine(&directory, mode).await;
         drop(close_engine(backend, raft, wal).await);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_reopen_fixture_close_waits_for_snapshot_storage_owner() {
+    for mode in [
+        SessionPersistenceMode::Durable,
+        SessionPersistenceMode::Async,
+    ] {
+        let directory = FixedRawReadStoreFixture::new();
+        let (backend, raft, wal, hook_directory) =
+            native_log_retained_bound::open_engine(&directory, mode).await;
+        select_command_and_snapshot(&raft).await;
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        let _gate = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
+        gate.arm();
+        raft.trigger().snapshot().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(300), gate.wait_started())
+            .await
+            .expect("real snapshot worker reaches its return boundary");
+        let mut closing = tokio::spawn(close_engine(backend, raft, wal));
+        tokio::select! {
+            result = &mut closing => {
+                drop(result.unwrap());
+                panic!("fixture close returned while a snapshot worker still owns SQLite");
+            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        gate.release();
+        drop(
+            tokio::time::timeout(Duration::from_secs(300), closing)
+                .await
+                .expect("fixture close completes after the real storage owner exits")
+                .unwrap(),
+        );
+        let before = (
+            namespace(directory.path()),
+            namespace(directory.snapshot_path()),
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            (
+                namespace(directory.path()),
+                namespace(directory.snapshot_path())
+            ),
+            before,
+            "the closed fixture is stable before a refusal-before-writes observation"
+        );
     }
 }

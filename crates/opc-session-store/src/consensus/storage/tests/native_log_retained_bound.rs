@@ -12,10 +12,35 @@ use std::time::Instant;
 
 const WAIT: Duration = Duration::from_secs(300);
 
+pub(super) struct NativeTestRaft {
+    raft: SessionRaft,
+    storage_shutdown: ConsensusStorageShutdownObserver,
+}
+
+impl std::ops::Deref for NativeTestRaft {
+    type Target = SessionRaft;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raft
+    }
+}
+
+impl NativeTestRaft {
+    pub(super) async fn shutdown(&self) -> io::Result<()> {
+        let result = self.raft.shutdown().await.map_err(io::Error::other);
+        // Raft joins its core, but snapshot and state-machine workers can
+        // still own SQLite. Use the public store's drain before observing
+        // closed namespaces or shutting down their native WAL.
+        self.storage_shutdown.stop_native_snapshot_exports();
+        self.storage_shutdown.wait().await;
+        result
+    }
+}
+
 pub(super) async fn open_engine(
     directory: &FixedRawReadStoreFixture,
     mode: SessionPersistenceMode,
-) -> (SqliteSessionBackend, SessionRaft, Arc<Wal>, PathBuf) {
+) -> (SqliteSessionBackend, NativeTestRaft, Arc<Wal>, PathBuf) {
     let backend = SqliteSessionBackend::open(directory.path().join("retained-bound.sqlite"))
         .expect("open ordinary fixed native backend");
     let local = SessionConsensusNodeId::new(8).unwrap();
@@ -66,10 +91,21 @@ pub(super) async fn open_engine(
         DURABLE_OPENRAFT_PROFILE.retained_logs
     );
     let hook_directory = snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease);
+    let storage_shutdown = machine
+        .shutdown_observer()
+        .expect("native fixture storage ownership is tracked");
     let raft = SessionRaft::new(local, Arc::new(config), network, log, machine)
         .await
         .expect("open actual Raft engine");
-    (backend, raft, wal, hook_directory)
+    (
+        backend,
+        NativeTestRaft {
+            raft,
+            storage_shutdown,
+        },
+        wal,
+        hook_directory,
+    )
 }
 
 fn append_request(start: u64, end: u64) -> AppendEntriesRequest<SessionRaftTypeConfig> {
