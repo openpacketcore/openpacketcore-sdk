@@ -40,6 +40,7 @@ async fn settled_prefix(store: &ConsensusSessionStore, minimum_snapshot: u64) {
 
 async fn leader_cycles(cycles: u64) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let run_started = Instant::now();
     let root =
         std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").expect("strict snapshot root required");
     let snapshots = tempfile::tempdir_in(root).unwrap();
@@ -120,6 +121,13 @@ async fn leader_cycles(cycles: u64) {
                 for voter in &fleet.stores {
                     settled_prefix(voter, minimum).await;
                 }
+                if (start + count).is_multiple_of(16 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot) {
+                    eprintln!(
+                        "NATIVE_LEADER_LOG_BOUND phase=proposals completed={} total={total} elapsed_s={:.3}",
+                        start + count,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
         }
         assert!(last.index >= total + first.log_id.index);
@@ -148,7 +156,15 @@ async fn leader_cycles(cycles: u64) {
     .await;
     fleet.close().await;
     let (command, response, last) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    eprintln!(
+        "NATIVE_LEADER_LOG_BOUND phase=reopen_start elapsed_s={:.3}",
+        run_started.elapsed().as_secs_f64()
+    );
     fleet.open().await;
+    eprintln!(
+        "NATIVE_LEADER_LOG_BOUND phase=reopen_complete elapsed_s={:.3}",
+        run_started.elapsed().as_secs_f64()
+    );
     let result = AssertUnwindSafe(async {
         let leader = fleet
             .stores
@@ -181,6 +197,10 @@ async fn leader_cycles(cycles: u64) {
     .await;
     fleet.close().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    eprintln!(
+        "NATIVE_LEADER_LOG_BOUND phase=complete elapsed_s={:.3}",
+        run_started.elapsed().as_secs_f64()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

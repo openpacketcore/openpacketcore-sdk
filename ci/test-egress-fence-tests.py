@@ -2,10 +2,12 @@
 """Coverage, profile and required-check regressions for the egress job split."""
 
 import copy
+import hashlib
 import importlib.util
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -197,6 +199,127 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
         ]})
         with self.assertRaisesRegex(ValueError, "unsupported Cargo test option"):
             FENCE.verify_plans(plans)
+
+
+class NativeLogBoundPhaseTests(unittest.TestCase):
+    NAMES = (
+        "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+        "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens",
+        "consensus::storage::tests::native_log_retained_bound::"
+        "native_log_retained_bound_survives_snapshot_purge_and_restart",
+        "consensus::storage::tests::native_log_retained_bound::"
+        "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
+    )
+    setUp = ScopePayloadSerialPhaseTests.setUp
+
+    def rows(self):
+        return [row for row in fixture() if row["name"] not in self.NAMES] + [
+            {"package": "opc-session-store", "target": "opc_session_store",
+             "kind": ["lib"], "name": name, "ignored": False,
+             "shard": int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % 3}
+            for name in self.NAMES
+        ]
+
+    def test_full_native_bounds_run_once_after_ordinary_tests_on_their_original_shards(self):
+        plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+        for name in self.NAMES:
+            owner = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % 3
+            selected = [(shard, index, command) for shard, commands in plans.items()
+                        for index, command in enumerate(commands) if command["name"] == name]
+            with self.subTest(name=name):
+                self.assertEqual(len(selected), 1)
+                shard, index, command = selected[0]
+                self.assertEqual(shard, owner)
+                self.assertGreater(index, plans[owner].index(ordinary(plans[owner])))
+                self.assertEqual(command["env"], {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"})
+                self.assertEqual(command["argv"], [
+                    "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
+                    "--test-threads=1", "--nocapture", "--exact", name,
+                ])
+                for shard in FENCE.ORDINARY_SHARDS:
+                    self.assertIn(name, skips(ordinary(plans[shard])))
+        FENCE.verify_plans(plans)
+
+    def test_full_native_inventory_requires_enabled_unique_library_tests(self):
+        for name in self.NAMES:
+            for mutation in ("missing", "ignored", "duplicate", "kind"):
+                rows = self.rows()
+                row = next(row for row in rows if row["name"] == name)
+                if mutation == "missing":
+                    rows.remove(row)
+                elif mutation == "ignored":
+                    row["ignored"] = True
+                elif mutation == "duplicate":
+                    rows.append(dict(row, package="another-package"))
+                else:
+                    row["kind"] = ["test"]
+                with self.subTest(name=name, mutation=mutation), self.assertRaises(ValueError):
+                    FENCE.verify(rows)
+
+    def test_full_native_precheck_rejects_missing_ambiguous_or_ignored_optimized_names(self):
+        plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+        name = self.NAMES[0]
+        command = {"name": name, "env": {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}, "argv": [
+            "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
+            "--test-threads=1", "--nocapture", "--exact", name,
+        ]}
+        for output in ("", f"{name}: test\n{name}: test\n", f"{name}_future: test\n"):
+            with self.subTest(output=output), patch.object(FENCE, "capture", return_value=output), \
+                    self.assertRaises(ValueError):
+                FENCE.precheck_native_log_bound([command])
+        with patch.object(FENCE, "capture", side_effect=[f"{name}: test\n", f"{name}: test\n"]), \
+                self.assertRaises(ValueError):
+            FENCE.precheck_native_log_bound([command])
+        with patch.object(FENCE, "capture", side_effect=[f"{name}: test\n", ""]) as capture:
+            FENCE.precheck_native_log_bound([command])
+        self.assertEqual(capture.call_count, 2)
+        for call in capture.call_args_list:
+            self.assertEqual(call.args[0][:len(command["argv"])], command["argv"])
+            self.assertIn("--list", call.args[0])
+            self.assertEqual(call.kwargs["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"], "1")
+        with patch.object(FENCE, "capture") as capture:
+            FENCE.precheck_native_log_bound([ordinary(plans[0])])
+            capture.assert_not_called()
+
+    def test_missing_optimized_name_stops_the_entrypoint_before_any_suite_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "test-map.json"
+            with (
+                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "2", "--output", str(output)]),
+                patch.object(FENCE, "inventory", return_value=self.rows()),
+                patch.object(FENCE, "capture", side_effect=lambda argv, **kwargs:
+                             "f" * 40 if argv[0] == "git" else ""),
+                patch.object(FENCE.subprocess, "run") as execute,
+                self.assertRaisesRegex(ValueError, "resolve exactly once at O1"),
+            ):
+                FENCE.main()
+            execute.assert_not_called()
+            self.assertTrue(output.is_file())
+
+    def test_full_native_plan_rejects_lost_duplicate_early_and_overlapping_execution(self):
+        for name in self.NAMES:
+            owner = FENCE.owner(name)
+            for mutation in ("missing", "duplicate", "early", "overlap", "threads", "profile"):
+                plans = {shard: FENCE.plans(self.rows(), shard) for shard in FENCE.SHARDS}
+                command = next((command for command in plans[owner] if command["name"] == name), None)
+                self.assertIsNotNone(command)
+                if mutation == "missing":
+                    plans[owner].remove(command)
+                elif mutation == "duplicate":
+                    plans[owner].append(copy.deepcopy(command))
+                elif mutation == "early":
+                    plans[owner].remove(command)
+                    plans[owner].insert(0, command)
+                elif mutation == "overlap":
+                    duplicate = copy.deepcopy(command)
+                    duplicate["name"] = "concealed-overlap"
+                    plans[owner].append(duplicate)
+                elif mutation == "threads":
+                    command["argv"][command["argv"].index("--test-threads=1")] = "--test-threads=4"
+                else:
+                    command["env"] = {}
+                with self.subTest(name=name, mutation=mutation), self.assertRaises(ValueError):
+                    FENCE.verify_plans(plans)
 
 
 class PartitionTests(unittest.TestCase):

@@ -122,6 +122,15 @@ Run the protected prepared-transition functional test alone with
 assertions and overflow checks remain enabled. The selector functional test
 retains its ordinary test profile.
 
+The three full-bound native log reclamation proofs also use
+`CARGO_PROFILE_TEST_OPT_LEVEL=1`, with debug assertions and overflow checks
+enabled. The core plan keeps them on `heavy-1`; the egress plan keeps their
+original test-name shards and runs them separately from the ordinary tests.
+Both plans preserve their package and feature selection and precheck the exact
+enabled names in the execution profile. The default three-cycle regressions
+retain the ordinary test profile. All entry counts, persistence operations,
+assertions, and job limits remain unchanged.
+
 The separate **Rust GTP-U unsupported-platform cfg** job in
 [ci.yml](.github/workflows/ci.yml) runs on Linux with
 `RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and

@@ -21,6 +21,7 @@ import subprocess
 import sys
 
 import cargo_test_selection
+import native_log_bound
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,7 +62,7 @@ SERIAL_LIB_TESTS = (
     "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
     "scope_child_read_three_large_children_refuse_the_whole_observation",
 )
-ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS)
+ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS, *native_log_bound.TESTS)
 
 
 def owner(name: str) -> int:
@@ -85,9 +86,9 @@ def listing(output: str) -> list[str]:
     return names
 
 
-def capture(command: list[str], cwd: Path = ROOT) -> str:
+def capture(command: list[str], cwd: Path = ROOT, *, env: dict | None = None) -> str:
     return subprocess.run(command, cwd=cwd, check=True, text=True,
-                          stdout=subprocess.PIPE).stdout
+                          stdout=subprocess.PIPE, env=env).stdout
 
 
 def inventory() -> list[dict]:
@@ -160,6 +161,26 @@ def serial_lib_command(name: str) -> dict:
     ]}
 
 
+def native_log_bound_command(name: str) -> dict:
+    command = serial_lib_command(name)
+    command["env"] = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}
+    return command
+
+
+def precheck_native_log_bound(commands: list[dict]) -> None:
+    """Prove each full-bound name resolves and stays enabled at test O1."""
+    for command in commands:
+        name = command["name"]
+        if name not in native_log_bound.TESTS:
+            continue
+        argv = [*command["argv"], "--list"]
+        env = dict(os.environ, **command["env"])
+        if listing(capture(argv, env=env)) != [name]:
+            raise ValueError("full native log proof must resolve exactly once at O1: " + name)
+        if listing(capture([*argv, "--ignored"], env=env)):
+            raise ValueError("full native log proof must remain enabled at O1: " + name)
+
+
 def plans(rows: list[dict], shard: int) -> list[dict]:
     if shard not in SHARDS:
         raise ValueError("unknown shard")
@@ -173,6 +194,8 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
             "cargo", "test", *SELECTION, "--quiet", "--tests", "--", "--test-threads=4",
             "--exact", *[arg for name in skipped for arg in ("--skip", name)],
         ]})
+        commands.extend(native_log_bound_command(name) for name in native_log_bound.TESTS
+                        if owner(name) == shard)
     if shard == PROOF_SHARD:
         for name in (*ISOLATED_INTEGRATION, *ISOLATED_LIB):
             target = ["--test", "consensus_openraft"] if name in ISOLATED_INTEGRATION else ["--lib"]
@@ -212,6 +235,13 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
     expected = [(1, index, serial_lib_command(name)) for index, name in enumerate(SERIAL_LIB_TESTS)]
     if isolated != expected:
         raise ValueError("serial library tests must each run exactly once, first on shard 1")
+    native_locations = {}
+    for shard in ORDINARY_SHARDS:
+        names = [name for name in native_log_bound.TESTS if owner(name) == shard]
+        start = (len(SERIAL_LIB_TESTS) if shard == 1 else 0) + 1
+        if planned[shard][start:start + len(names)] != [native_log_bound_command(name) for name in names]:
+            raise ValueError("full native log proofs must run separately at O1 on their original shards")
+        native_locations.update({name: (shard, start + index) for index, name in enumerate(names)})
     metadata = cargo_test_selection.workspace_metadata(ROOT)
     resolved = {
         (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
@@ -224,14 +254,21 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
         ]
         if selections != [(1, serial_index)]:
             raise ValueError("serial library test selections are missing or overlapping: " + name)
+    for name, expected_location in native_locations.items():
+        selections = [
+            location for location, selection in resolved.items()
+            if selection.selects("opc-session-store", "opc_session_store", ("lib",), name)
+        ]
+        if selections != [expected_location]:
+            raise ValueError("full native log proof selections are missing or overlapping: " + name)
     for shard in ORDINARY_SHARDS:
         ordinary = [c for c in planned[shard] if c["name"] == "ordinary"]
         if len(ordinary) != 1:
             raise ValueError("ordinary test command must run exactly once per shard")
         argv = ordinary[0]["argv"]
         skips = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--skip"]
-        if "--exact" not in argv or any(skips.count(name) != 1 for name in SERIAL_LIB_TESTS):
-            raise ValueError("ordinary tests must exclude exactly the serial library tests")
+        if "--exact" not in argv or any(skips.count(name) != 1 for name in (*SERIAL_LIB_TESTS, *native_log_bound.TESTS)):
+            raise ValueError("ordinary tests must exclude exactly the serial library and full native log tests")
 
 
 def require_jobs(needs: dict) -> None:
@@ -269,6 +306,7 @@ def main() -> int:
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print("Exact test-name partition:", dict(sorted(Counter(r["shard"] for r in rows).items())), flush=True)
     if not args.inventory_only:
+        precheck_native_log_bound(plan[str(args.shard)])
         for command in plan[str(args.shard)]:
             print("egress-fence:", command["name"], shlex.join(command["argv"]), flush=True)
             subprocess.run(command["argv"], cwd=ROOT, env=dict(os.environ, **command["env"]), check=True)

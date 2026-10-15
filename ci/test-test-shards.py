@@ -700,6 +700,15 @@ class QuiescentShardPlanTests(unittest.TestCase):
 
 
 class LibraryGroupPlanTests(unittest.TestCase):
+    NATIVE_FULL_BOUND = (
+        "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+        "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens",
+        "consensus::storage::tests::native_log_retained_bound::"
+        "native_log_retained_bound_survives_snapshot_purge_and_restart",
+        "consensus::storage::tests::native_log_retained_bound::"
+        "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
+    )
+
     def setUp(self) -> None:
         self.plan = TEST_SHARDS.load_plan()
         self.targets = [
@@ -740,6 +749,74 @@ class LibraryGroupPlanTests(unittest.TestCase):
         commands = TEST_SHARDS.commands(self.plan, "misc", self.targets)
         binary = [command for command in commands if "--bins" in command]
         self.assertEqual(binary, [TEST_SHARDS.SELECTION + ["--bins", "--", *TEST_SHARDS.HARNESS]])
+
+    def test_full_native_bounds_keep_heavy_ownership_and_optimized_serial_execution(self) -> None:
+        invocations = [(shard, command)
+                       for shard in TEST_SHARDS.shard_ids(self.plan)
+                       for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
+                       if "--lib" in command]
+        for name in self.NATIVE_FULL_BOUND:
+            selected = [(shard, command) for shard, command in invocations
+                        if self.selected(command, name)]
+            with self.subTest(name=name):
+                self.assertEqual(len(selected), 1)
+                shard, command = selected[0]
+                self.assertEqual(shard, "heavy-1")
+                self.assertEqual(command[:2], ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"])
+                self.assertEqual(command[2:2 + len(TEST_SHARDS.SELECTION)], TEST_SHARDS.SELECTION)
+                self.assertIn("--test-threads=1", command)
+                self.assertIn("--nocapture", command)
+                self.assertNotIn("--ignored", command)
+                siblings = [(owner, invocation) for owner, invocation in invocations
+                            if self.selected(invocation, name + "_future")]
+                self.assertEqual([owner for owner, _ in siblings], ["misc"])
+                self.assertNotIn("CARGO_PROFILE_TEST_OPT_LEVEL=1", siblings[0][1])
+
+    def test_full_native_bounds_cannot_disappear_move_or_change_an_ordinary_group_profile(self) -> None:
+        for mutation in ("missing", "owner", "mixed"):
+            plan = copy.deepcopy(self.plan)
+            group = next(group for group in plan["lib_groups"]
+                         if self.NATIVE_FULL_BOUND[0] in TEST_SHARDS.lib_group_names(group))
+            if mutation == "missing":
+                plan["lib_groups"].remove(group)
+            elif mutation == "owner":
+                group["shard"] = "it-1"
+            else:
+                group["tests"].append("an_ordinary_future_sibling")
+            with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
+                TEST_SHARDS.verify_lib_plan(plan)
+
+    def test_full_native_precheck_resolves_the_enabled_names_in_the_execution_profile(self) -> None:
+        calls = []
+
+        def listed(command, **kwargs):
+            calls.append(command)
+            names = command[command.index("--exact") + 1:]
+            if "--ignored" in command:
+                names = []
+            return subprocess.CompletedProcess(command, 0,
+                stdout="\n".join(f"{name}: test" for name in names))
+
+        with (
+            patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets),
+            patch.object(TEST_SHARDS, "verify"),
+            patch.object(TEST_SHARDS, "quiescent_lib_tests_for_shard", return_value=()),
+            patch.object(TEST_SHARDS, "list_heavy_tests", return_value=self.plan["heavy"]["shards"][1]),
+            patch.object(TEST_SHARDS.subprocess, "run", side_effect=listed),
+        ):
+            TEST_SHARDS.precheck(self.plan, "heavy-1")
+        for name in self.NATIVE_FULL_BOUND:
+            selected = [command for command in calls if name in command]
+            with self.subTest(name=name):
+                self.assertEqual(len(selected), 2)
+                self.assertTrue(all(command[:2] == ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+                                    for command in selected))
+                self.assertEqual(sum("--ignored" in command for command in selected), 1)
+        ordinary = [command for command in calls
+                    if not any(name in command for name in self.NATIVE_FULL_BOUND)]
+        self.assertTrue(ordinary)
+        self.assertTrue(all(command[:len(TEST_SHARDS.SELECTION)] == TEST_SHARDS.SELECTION
+                            for command in ordinary))
 
     def test_empty_duplicate_unknown_and_optimized_groups_are_rejected(self) -> None:
         invalid = []

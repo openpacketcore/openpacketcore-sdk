@@ -15,6 +15,17 @@ and profile. The tests retain their four Tokio workers, all assertions and the
 existing ten-second bounds. Successful runs print each measured write's elapsed
 time and decode/audit counts for hosted validation.
 
+The full-bound native log reclamation proofs listed in
+[`native_log_bound.py`](native_log_bound.py) retain their million-entry inputs
+and run at test O1 with debug assertions and overflow checks enabled. They stay
+on core `heavy-1` and their original egress shards. Each egress proof runs in its
+own serial process after the ordinary suite; core runs the two follower modes
+serially in one group and the leader in another. This keeps their CPU and disk
+work out of unrelated test runtimes. Live prechecks resolve the exact enabled
+names using the execution profile. Package selection, feature unification,
+default three-cycle coverage and job limits are preserved. The leader emits
+proposal progress and reopen phase timings under `--nocapture`.
+
 The required i686 matrix separates session-net library tests from executable
 unit tests, integration tests and doctests. The integration runner exercises the
 workflow selectors against a fixture with a newly discovered executable and a

@@ -39,6 +39,7 @@ from pathlib import Path
 
 import realtime_qualification
 import cargo_test_selection
+import native_log_bound
 
 ROOT = Path(__file__).resolve().parent.parent
 PLAN_PATH = ROOT / "ci" / "test-shards.json"
@@ -400,6 +401,10 @@ def serial_lib_command(name: str) -> list[str]:
 
 
 def lib_group_command(group: dict) -> list[str]:
+    if any(name in native_log_bound.TESTS for name in lib_group_names(group)):
+        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *SELECTION,
+                "--lib", "--", "--test-threads=1", "--nocapture", "--exact",
+                *lib_group_names(group)]
     return SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_group_names(group)]
 
 
@@ -747,10 +752,16 @@ def verify_lib_plan(plan: dict) -> None:
             not rust_path.fullmatch(name) for name in group["tests"]
         ):
             sys.exit("library groups require module-qualified Rust test names")
+        names = lib_group_names(group)
+        if any(name in native_log_bound.TESTS for name in names):
+            if group["shard"] != "heavy-1" or not set(names).issubset(native_log_bound.TESTS):
+                sys.exit("full native log proofs must remain separate heavy-1 groups")
         for name in lib_group_names(group):
             if name in claimed:
                 sys.exit(f"library test is claimed more than once: {name!r}")
             claimed.add(name)
+    if not set(native_log_bound.TESTS).issubset(claimed):
+        sys.exit("full native log proofs are missing from the heavy library groups")
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -887,25 +898,37 @@ def precheck(plan: dict, shard: str) -> None:
         verify_serial_lib_tests()
     groups = [group for group in plan.get("lib_groups", []) if group["shard"] == shard]
     if groups:
-        # Resolve all groups in one Cargo invocation. Keep a multiset: a
-        # duplicate full name in another library must not hide behind a set.
-        names = [name for group in groups for name in lib_group_names(group)]
-        command = SELECTION + ["--lib", "--", "--list", "--exact", *names]
-        output = subprocess.run(
-            command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
-        ).stdout
-        selected = Counter(
-            line.rsplit(":", 1)[0]
-            for line in output.splitlines()
-            if line.endswith(": test")
-        )
-        if selected != Counter(names):
-            sys.exit(
-                f"{shard} library groups do not resolve exactly once: "
-                f"missing {dict(Counter(names) - selected)}, "
-                f"unexpected {dict(selected - Counter(names))}"
+        # Resolve each profile independently. Keep multisets: a duplicate
+        # full name in another library must not hide behind a set.
+        by_profile: dict[tuple[str, ...], list[str]] = {}
+        for group in groups:
+            command = lib_group_command(group)
+            prefix = tuple(command[:command.index("--")])
+            by_profile.setdefault(prefix, []).extend(lib_group_names(group))
+        for prefix, names in by_profile.items():
+            command = [*prefix, "--", "--list", "--exact", *names]
+            output = subprocess.run(
+                command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+            ).stdout
+            selected = Counter(
+                line.rsplit(":", 1)[0]
+                for line in output.splitlines()
+                if line.endswith(": test")
             )
-        print(f"{shard} library groups resolve exactly once: {len(names)} tests")
+            if selected != Counter(names):
+                sys.exit(
+                    f"{shard} library groups do not resolve exactly once: "
+                    f"missing {dict(Counter(names) - selected)}, "
+                    f"unexpected {dict(selected - Counter(names))}"
+                )
+            if any(name in native_log_bound.TESTS for name in names):
+                output = subprocess.run(
+                    [*command, "--ignored"], cwd=ROOT, text=True,
+                    stdout=subprocess.PIPE, check=True
+                ).stdout
+                if any(line.endswith(": test") for line in output.splitlines()):
+                    sys.exit("full native log proofs must remain enabled in their execution profile")
+        print(f"{shard} library groups resolve exactly once: {sum(map(len, by_profile.values()))} tests")
     isolated_lib_tests = quiescent_lib_tests_for_shard(shard, plan)
     if isolated_lib_tests:
         for name in isolated_lib_tests:

@@ -77,6 +77,7 @@
   "_lib_groups_comment": [
     "Exact names keep moved groups disjoint from misc and from isolated timing contracts.",
     "New unlisted tests still run on misc. Precheck rejects missing or ambiguous names.",
+    "The three full-bound native log proofs keep heavy-1 ownership and use serial test O1 with debug checks enabled.",
     "The full-journal opt-in proof stays ignored; do not turn it into a hosted qualification."
   ],
   "lib_groups": [
