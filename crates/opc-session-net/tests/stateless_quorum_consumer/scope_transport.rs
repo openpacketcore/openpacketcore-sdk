@@ -160,6 +160,47 @@ fn native_scope_tls_admission_receipt_after_ticket_change_and_irreversible_close
 fn native_scope_tls_boot_binding_survives_snapshot_leader_loss_and_full_reopen() {
     run_native(true, "stateless_quorum_consumer::scope_transport::native_scope_tls_boot_binding_survives_snapshot_leader_loss_and_full_reopen");
 }
+
+fn occupy_unreserved_scope_addresses(addresses: [SocketAddr; 5]) -> Vec<std::net::TcpListener> {
+    addresses
+        .into_iter()
+        .filter_map(|address| match std::net::TcpListener::bind(address) {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+            Err(error) => panic!("competing scope listener bind at {address} failed: {error:?}"),
+        })
+        .collect()
+}
+
+// Retain only the listening sockets across endpoint shutdown. Each new endpoint
+// still owns fresh TLS/connection tasks and the reopened native store.
+struct ReservedScopeListeners([std::net::TcpListener; 5]);
+
+impl ReservedScopeListeners {
+    fn new() -> Self {
+        Self(std::array::from_fn(|index| {
+            let address = SocketAddr::from(([127, 0, 0, 1], 0));
+            let listener = std::net::TcpListener::bind(address).unwrap_or_else(|error| {
+                panic!("scope listener {index} reservation at {address} failed: {error:?}")
+            });
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking scope listener reservation");
+            listener
+        }))
+    }
+
+    fn serve(&self, server: Arc<ScopeServer>) -> ScopeServerHandle {
+        let listeners = std::array::from_fn(|index| {
+            let listener = self.0[index]
+                .try_clone()
+                .expect("clone scope listener reservation");
+            tokio::net::TcpListener::from_std(listener).expect("register reserved scope listener")
+        });
+        server.serve_reserved_for_test(listeners)
+    }
+}
+
 fn run_native(durable_recovery: bool, name: &str) {
     if std::env::var_os("OPC_SCOPE_NATIVE_TLS_TEST_CHILD").is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -202,7 +243,8 @@ fn run_native(durable_recovery: bool, name: &str) {
             let (server_material,server_updates)=rotating_server_tls(&pki,&three_voter_spiffe(follower),"scope-worker");
             let server_clock=Arc::new(SwitchClock::default());
             let server=Arc::new(ScopeServer::new(ScopeServerConfig{tls:server_material,clock:server_clock.clone(),policy:policy.clone(),store:Arc::new(fleet.stores[follower].clone()),scopes:vec![scope.clone()],boots:boots.clone(),closures:closures.clone(),scheduler:server_scheduler.scheduler(),proofs:ProofBudgets::default()}).unwrap());
-            let handle=server.clone().serve([SocketAddr::from(([127,0,0,1],0));5]).await.unwrap();
+            let reserved_listeners=ReservedScopeListeners::new();
+            let handle=reserved_listeners.serve(server.clone());
             let tls=client_tls(&pki,&worker,&follower.to_string());
             let clock=Arc::new(SwitchClock::default());
             let client=ScopeClient::new(ScopeClientConfig{process:process.clone(),scope:scope.clone(),ticket,tls:tls.clone(),server:opc_types::SpiffeId::new(three_voter_spiffe(follower)).unwrap(),addresses:handle.addresses(),clock:clock.clone(),scheduler:client_scheduler.scheduler(),local_closure:closures.clone()}).unwrap();
@@ -390,19 +432,23 @@ fn run_native(durable_recovery: bool, name: &str) {
                 // The authenticated scope endpoint is a facade over a native
                 // follower; its stable service identity survives voter failover.
                 let endpoint=Arc::new(ScopeServer::new(ScopeServerConfig{tls:server_tls(&pki,&three_voter_spiffe(follower),"scope-worker"),clock:Arc::new(ScopeClock),policy:policy.clone(),store:Arc::new(fleet.stores[survivor].clone()),scopes:vec![scope.clone()],boots:boots.clone(),closures:closures.clone(),scheduler:server_scheduler.scheduler(),proofs:ProofBudgets::default()}).unwrap());
-                let listener=endpoint.clone().serve(addresses).await.unwrap();
+                let listener=reserved_listeners.serve(endpoint.clone());
                 fleet.isolate(leader).await;
                 fleet.wait_for_new_leader(leader,leader_id,term,tokio::time::Instant::now()+THREE_VOTER_READY_TIMEOUT).await;
                 let after_loss=reconnect_current(&final_client).await;
                 assert_eq!(after_loss.stamp(),Some(last.stamp()));
                 listener.shutdown().await;drop(endpoint);
+                // Force the saved-address collision that an ephemeral consensus
+                // listener could cause. Hold every successful bind through reopen.
+                let competing_listeners=occupy_unreserved_scope_addresses(addresses);
                 let old=fleet_slot.take().unwrap();
                 fleet_slot=Some(old.restart_all().await);
                 let fleet=fleet_slot.as_mut().unwrap();
                 let (leader,_,_)=fleet.wait_for_admitted_quorum_leader(&[0,1,2],0).await;
                 let survivor=(leader+1)%3;
                 let endpoint=Arc::new(ScopeServer::new(ScopeServerConfig{tls:server_tls(&pki,&three_voter_spiffe(follower),"scope-worker"),clock:Arc::new(ScopeClock),policy:policy.clone(),store:Arc::new(fleet.stores[survivor].clone()),scopes:vec![scope.clone()],boots:boots.clone(),closures:closures.clone(),scheduler:server_scheduler.scheduler(),proofs:ProofBudgets::default()}).unwrap());
-                let listener=endpoint.clone().serve(addresses).await.unwrap();
+                let listener=reserved_listeners.serve(endpoint.clone());
+                assert!(competing_listeners.is_empty(),"scope listener addresses stay reserved across the full fleet restart");
                 let restored=reconnect_current(&final_client).await;
                 assert_eq!(restored,after_loss,"snapshot/reopen retains the exact nonce, public-key commitment, revision and generation floor");
                 assert_eq!(restored.admission_generation_floor(),130);
