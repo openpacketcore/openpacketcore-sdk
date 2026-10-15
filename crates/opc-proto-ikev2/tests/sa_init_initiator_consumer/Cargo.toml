@@ -1,0 +1,15 @@
+[package]
+name = "ikev2-initiator-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An isolated dependency graph is necessary: the parent crate's dev dependency
+# enables testkit for its integration tests through Cargo feature unification.
+[workspace]
+
+[dependencies]
+bytes = "1.8"
+opc-crypto-provider = { path = "../../../opc-crypto-provider" }
+opc-proto-ikev2 = { path = "../..", default-features = false }
+opc-protocol = { path = "../../../opc-protocol" }
