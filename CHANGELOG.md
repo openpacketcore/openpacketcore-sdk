@@ -63,8 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-value XSD patterns, and `invert-match` across load and generated writes,
   with fixed value-free errors. Pattern compilation is bounded and cached once
   through `opc-mgmt-schema` using `regex` (MIT OR Apache-2.0); XML-name and
-  Unicode-block escapes fail closed as unsupported. Models using none of these
-  new constructs retain byte-identical generated files. (#1006, #1263)
+  Unicode-block escapes fail closed as unsupported. (#1006, #1263)
   Source quoting preserves pattern characters and enforces RFC 7950 escapes,
   whitespace trimming, and quoted concatenation. Value-less list-entry patches
   assign and validate path keys, and integer defaults decode octal and
@@ -715,6 +714,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-yanggen`: apply generated-code lint fixes to models without expanded
+  scalars or keyed state lists. Check all warnings across 294 generated cases,
+  preserve runtime assertions, and regenerate output digest pins for shared
+  statement formatting and lint repairs. (#1274)
 
 - `opc-session-net` tests: reserve scope listener sockets across endpoint
   replacement and full fleet reopen so restarted ephemeral consensus listeners

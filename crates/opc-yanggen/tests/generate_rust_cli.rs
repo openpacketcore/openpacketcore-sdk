@@ -323,56 +323,56 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         (
             "gnmi_json.rs",
             // #1269 permits authorized sensitive keys; #1270 builds XPath literals.
-            "537d5deb527ae2d47434f6538ddf0c9768694ce9fc0e3d24388d97fbfa7b6b87",
+            "3bea71870064061446c6bfba4020ee0d8cab1da5b8fe6574596e2928d917027d",
         ),
         (
             "gnmi_set.rs",
-            "44d8054c5e0487ebbc45731b525a78d6f6f84363c652b63207362cafed0671f2",
+            "9f2418e8e05a608095bc3098acf46fad5ebce4805c635f1c92c4ed9a0b9552d3",
         ),
         (
             "metadata.rs",
-            "495fa1fed834545dae179353807296e6348b08407d4afc8d38e76525349042af",
+            "9544106a012448be2a6b578f5df0610c948fc280ba900640b7de0895ea51faea",
         ),
         (
             "mod.rs",
-            "3f775be9ce2a372626eb7b451b05a8eb0ae714f16c40a497d2e9d956b13ba2b8",
+            "b4d789081309c3200587bd286bf81e34ae13a6f91103f8f994a82d40483c0aa9",
         ),
         (
             "netconf_xml.rs",
             // #1270 native instance trees plus #1272 bounded content projection.
-            "1f9f22c7a9c4f169eb1787754fdd0f6a79e35c0608d94692c58fad4cf1825b7b",
+            "fec34e4c4d83bd9d25890258a7330ed78e30aa772daf958f1b1583ae2ab3004e",
         ),
         (
             "netconf_xml_edit.rs",
-            "8a074295566f9aba912957c936426c12eb4a09c22ba7f7742e7c09efe437e021",
+            "e897a288addd4e87351cd961a4925a2e9ebc47e4fbbf4574944834771a249785",
         ),
         (
             "patch.rs",
-            "2d08d6ffe3b0b30eb090009a39afeafe96e0ae75976b7f86880050f123a448ee",
+            "b19f37bf520e6b5769b2ecb96738a47897e12d4fd5728efb4f7760a8da8d20e2",
         ),
         (
             "paths.rs",
-            "b495af2bf7495054e5a0a3b76fd81c6ffc4b7158dd148d690297e333746fa66b",
+            "9b8b349eced70017e48ae41682f3082ab3706d8397c42babf8fc1bae194da142",
         ),
         (
             "redaction.rs",
-            "d65423aa71cb4165450848080d5b69c0f3e6a4e96d7979fa48a56fed90184f07",
+            "7b4b5a9c25392bdd000fa8e604a44084e366b7649c59bae556618fe6ca870ebc",
         ),
         (
             "schema_registry.rs",
-            "85f0f52bd04dfb2757edbfd8073f387079478089ec95eba805851cfd0d0b642b",
+            "97aaa959053dfc782a1f0c68751f67994d1efb474c4637a976dfec6e9fa28dfa",
         ),
         (
             "serde.rs",
-            "d21e3ad8d2e3b9f2739a49d75d1658fded7ff6b0adeb90fbbc0f257b46e8028a",
+            "cd49eb19d0474cb8686ca6fef81aee1928b039ed26c511a3a44b5ce953179e7e",
         ),
         (
             "types.rs",
-            "e0ad76b62b3e5eea0c0009c2d8762129ecfa3f9f5d840a460ee73a29871ac0f7",
+            "d42b5261f7586616a18c9a2b5ecd6cdbe614f2ecacf2b2b5c5a29b3c58b4c933",
         ),
         (
             "validate.rs",
-            "015d1dbfaf08e401371c27d5e20b738291f0fc6d5771969e0ae572545ec990c4",
+            "2032009b350a642dcbd99cb7c089435982a2693128af820d5200a81f82404a29",
         ),
     ];
     let dir = tempdir().expect("tempdir");

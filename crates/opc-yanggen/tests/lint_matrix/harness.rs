@@ -30,6 +30,20 @@ fn context<C: OpcConfig>() -> ValidationContext<C> {
 }
 "#;
 
+// Keep the previously qualified classes alongside every class identified by
+// the generated-code matrix. The command below also denies any new warning.
+const REGRESSION_LINTS: &[&str] = &[
+    "clippy::clone_on_copy",
+    "clippy::for_kv_map",
+    "clippy::collapsible_if",
+    "clippy::collapsible_match",
+    "clippy::derivable_impls",
+    "clippy::field_reassign_with_default",
+    "clippy::needless_return",
+    "clippy::possible_missing_else",
+    "clippy::single_match",
+];
+
 fn cargo(directory: &Path, target: &Path, args: &[&str], deny_warnings: bool) -> Output {
     let mut command = Command::new("cargo");
     command
@@ -133,17 +147,15 @@ time = "={}"
     .unwrap();
     let runtime_args = ["test", "--no-fail-fast", "--", "--test-threads=4"];
     let runtime_output = cargo(directory, &target, &runtime_args, true);
-    // Only the two lint classes under repair are errors. All other Clippy
-    // diagnostics remain enabled and are retained for the separate lint work.
+    // Every generated target must pass with warnings denied, including schemas
+    // without the expanded scalar or state-list profiles.
     let clippy_args = [
         "clippy",
         "--all-targets",
         "--message-format=json",
         "--",
         "-D",
-        "clippy::clone_on_copy",
-        "-D",
-        "clippy::for_kv_map",
+        "warnings",
     ];
     let clippy_output = cargo(directory, &target, &clippy_args, false);
     let diagnostics: Vec<Value> = String::from_utf8_lossy(&clippy_output.stdout)
@@ -155,19 +167,15 @@ time = "={}"
     let targeted: Vec<_> = diagnostics
         .iter()
         .filter(|message| {
-            matches!(
-                message["code"]["code"].as_str(),
-                Some("clippy::clone_on_copy" | "clippy::for_kv_map")
-            )
+            message["code"]["code"]
+                .as_str()
+                .is_some_and(|code| REGRESSION_LINTS.contains(&code))
         })
         .collect();
     let other_lints: std::collections::BTreeSet<_> = diagnostics
         .iter()
         .filter_map(|message| message["code"]["code"].as_str())
-        .filter(|code| {
-            code.starts_with("clippy::")
-                && !matches!(*code, "clippy::clone_on_copy" | "clippy::for_kv_map")
-        })
+        .filter(|code| code.starts_with("clippy::") && !REGRESSION_LINTS.contains(code))
         .collect();
     eprintln!(
         "matrix {batch}: {} cells, runtime={}, clippy={}, targeted={}, other={other_lints:?}",

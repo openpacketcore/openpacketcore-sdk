@@ -34,7 +34,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
     // 1. Generate must/when constraints
     for constraint in &input.constraints {
-        let block = generate_constraint_check(constraint, input, &nodes_by_path)?;
+        let block = generate_constraint_check(constraint, input)?;
         validation_checks.extend(block);
     }
 
@@ -244,10 +244,7 @@ fn generate_path_access(
 fn generate_constraint_check(
     constraint: &ConstraintBinding,
     input: &CanonicalInput,
-    nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let keep_legacy_output =
-        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     let target_node = input
         .nodes
         .iter()
@@ -302,25 +299,24 @@ fn generate_constraint_check(
         _ => quote! { false },
     };
 
-    let check_body_logic = if is_when {
-        quote! {
-            if !(#expr_ts) {
-                if #field_is_present {
-                    return Err(ValidationError::semantics(
-                        format!("Field must be absent when condition is unsatisfied: {}", #expr_str),
-                    ));
-                }
-            }
-        }
+    let failure_condition = if matches!(
+        target_node.kind,
+        SchemaNodeKind::Container | SchemaNodeKind::List | SchemaNodeKind::LeafList
+    ) {
+        quote! { !(#expr_ts) }
+    } else if is_when {
+        quote! { !(#expr_ts) && #field_is_present }
     } else {
-        quote! {
-            if #field_is_present {
-                if !(#expr_ts) {
-                    return Err(ValidationError::semantics(
-                        format!("Constraint failed: {}", #expr_str),
-                    ));
-                }
-            }
+        quote! { #field_is_present && !(#expr_ts) }
+    };
+    let error_message = if is_when {
+        "Field must be absent when condition is unsatisfied: {}"
+    } else {
+        "Constraint failed: {}"
+    };
+    let check_body_logic = quote! {
+        if #failure_condition {
+            return Err(ValidationError::semantics(format!(#error_message, #expr_str)));
         }
     };
 
@@ -358,15 +354,9 @@ fn generate_constraint_check(
                                 #body
                             }
                         }
-                    } else if !keep_legacy_output {
-                        quote! {
-                            for #next_ident in #current_ident.#field_ident.values() {
-                                #body
-                            }
-                        }
                     } else {
                         quote! {
-                            for (_, #next_ident) in &#current_ident.#field_ident {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }
@@ -400,8 +390,6 @@ fn generate_unique_check(
     input: &CanonicalInput,
     nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    let keep_legacy_output =
-        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     let mut checks = TokenStream::new();
     let parent_path = list_node
         .path
@@ -446,16 +434,15 @@ fn generate_unique_check(
                 tuple_exprs.push(quote! { #access.as_option().cloned() });
             } else {
                 presence_checks.push(quote! { #access.is_some() });
-                let value =
-                    if !keep_legacy_output && super::types::is_copy_type(child, nodes_by_path) {
-                        if is_sensitive {
-                            quote! { *#access }
-                        } else {
-                            quote! { #access }
-                        }
+                let value = if super::types::is_copy_type(child, nodes_by_path) {
+                    if is_sensitive {
+                        quote! { *#access }
                     } else {
-                        quote! { #access.clone() }
-                    };
+                        quote! { #access }
+                    }
+                } else {
+                    quote! { #access.clone() }
+                };
                 tuple_exprs.push(value);
             }
         }
@@ -503,15 +490,9 @@ fn generate_unique_check(
                                     #body
                                 }
                             }
-                        } else if !keep_legacy_output {
-                            quote! {
-                                for #next_ident in #current_ident.#field_ident.values() {
-                                    #body
-                                }
-                            }
                         } else {
                             quote! {
-                                for (_, #next_ident) in &#current_ident.#field_ident {
+                                for #next_ident in #current_ident.#field_ident.values() {
                                     #body
                                 }
                             }
@@ -532,17 +513,10 @@ fn generate_unique_check(
                     #loop_body
                 }
             }
-        } else if !keep_legacy_output {
-            quote! {
-                let mut #set_ident = std::collections::HashSet::new();
-                for entry in #current_ident.#list_ident.values() {
-                    #loop_body
-                }
-            }
         } else {
             quote! {
                 let mut #set_ident = std::collections::HashSet::new();
-                for (_, entry) in &#current_ident.#list_ident {
+                for entry in #current_ident.#list_ident.values() {
                     #loop_body
                 }
             }
@@ -564,10 +538,6 @@ fn generate_leafref_check(
     input: &CanonicalInput,
     nodes_by_path: &super::NodeIndex<'_>,
 ) -> Result<TokenStream, RustGenerationError> {
-    // Keep established output bytes for models outside the newer scalar and
-    // state-list profiles, just as the other emitters do.
-    let keep_legacy_output =
-        !nodes_by_path.expanded_profile && !super::has_state_keyed_lists(input);
     // Collect target values into set
     let target_parent_path = target_path
         .rsplit_once('/')
@@ -599,12 +569,11 @@ fn generate_leafref_check(
         quote! { entry.#target_field_ident }
     };
 
-    let target_value =
-        if !keep_legacy_output && super::types::is_copy_type(target_node, nodes_by_path) {
-            quote! { *v }
-        } else {
-            quote! { v.clone() }
-        };
+    let target_value = if super::types::is_copy_type(target_node, nodes_by_path) {
+        quote! { *v }
+    } else {
+        quote! { v.clone() }
+    };
     let insert_expr = if target_node.config {
         quote! {
             if let Some(v) = #target_access.as_option() {
@@ -649,15 +618,9 @@ fn generate_leafref_check(
                                 #body
                             }
                         }
-                    } else if !keep_legacy_output {
-                        quote! {
-                            for #next_ident in #current_ident.#field_ident.values() {
-                                #body
-                            }
-                        }
                     } else {
                         quote! {
-                            for (_, #next_ident) in &#current_ident.#field_ident {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }
@@ -712,18 +675,10 @@ fn generate_leafref_check(
                 }
             }
         }
-    } else if leaf_node.config && !keep_legacy_output {
+    } else if leaf_node.config {
         quote! {
             if let Some(v) = #leaf_access.as_option() {
                 if !#set_ident.contains(v) {
-                    return Err(ValidationError::semantics(format!("Value not found in target path {}", #target_path)));
-                }
-            }
-        }
-    } else if leaf_node.config {
-        quote! {
-            if let Some(ref v) = #leaf_access.as_option() {
-                if !#set_ident.contains(*v) {
                     return Err(ValidationError::semantics(format!("Value not found in target path {}", #target_path)));
                 }
             }
@@ -768,15 +723,9 @@ fn generate_leafref_check(
                                 #body
                             }
                         }
-                    } else if !keep_legacy_output {
-                        quote! {
-                            for #next_ident in #current_ident.#field_ident.values() {
-                                #body
-                            }
-                        }
                     } else {
                         quote! {
-                            for (_, #next_ident) in &#current_ident.#field_ident {
+                            for #next_ident in #current_ident.#field_ident.values() {
                                 #body
                             }
                         }

@@ -492,18 +492,15 @@ __ORDERED_REPLACEMENT_CHANGED_PATH__            }
         schema_registry::generate(&input)?,
     );
 
-    // These models previously emitted uncompilable Rust. Keep the established
-    // bytes of other supported models while giving state-list output proper
-    // statement boundaries without modifying string or character literals.
-    if has_state_keyed_lists(&input) {
-        for content in files.values_mut() {
-            let tokens = content.parse().map_err(|error| {
-                RustGenerationError::new(format!("invalid generated Rust tokens: {error}"))
-            })?;
-            let mut formatted = String::with_capacity(content.len());
-            write_rust_tokens(tokens, &mut formatted);
-            *content = formatted;
-        }
+    // Give every model proper statement boundaries without modifying string
+    // or character literals, including models without optional profiles.
+    for content in files.values_mut() {
+        let tokens = content.parse().map_err(|error| {
+            RustGenerationError::new(format!("invalid generated Rust tokens: {error}"))
+        })?;
+        let mut formatted = String::with_capacity(content.len());
+        write_rust_tokens(tokens, &mut formatted);
+        *content = formatted;
     }
 
     Ok(files)
