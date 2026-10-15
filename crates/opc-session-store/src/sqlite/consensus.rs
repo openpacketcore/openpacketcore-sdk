@@ -54921,6 +54921,93 @@ mod tests {
     }
 
     #[test]
+    fn protected_roster_v2_recovery_distinguishes_retired_history_from_missing_after_reopen() {
+        let directory = tempfile::tempdir().expect("retired recovery directory");
+        let path = directory.path().join("retired-recovery.sqlite");
+        let fixture = crate::consensus::types::roster_v2_persistence_fixture();
+        let identity = initialize_v2_retained_snapshot_fixture(&path);
+        let now = v2_persistence_logical_time();
+        let due = now.add_seconds(24 * 60 * 60).expect("retention boundary");
+        {
+            let backend = SqliteSessionBackend::open(&path).expect("open retained ledger");
+            let conn = backend.conn.blocking_lock();
+            reclaim_protected_rosters_sync(&conn, identity, due).unwrap();
+            assert!(retire_protected_rosters_sync(&conn, identity).unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM consensus_protected_roster_floors",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "retiring the last row releases its partition floor"
+            );
+        }
+        let backend = SqliteSessionBackend::open(&path).expect("reopen retired ledger");
+        let conn = backend.conn.blocking_lock();
+        assert!(
+            protected_roster_read_witness_sync(&conn, identity)
+                .unwrap()
+                .unwrap()
+                .retired_terminal_sequence()
+                > 0,
+            "the global retirement witness survives the empty partition and reopen"
+        );
+        // Install a current successor through the ordinary lease allocator.
+        ops::insert_or_replace_fence_sync(
+            &conn,
+            fixture.authority.key(),
+            fixture.authority.fence().get(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE lease_globals SET val=?1 WHERE key='next_credential_id'",
+            [checked_positive_i64(fixture.authority.credential_id() + 1).unwrap()],
+        )
+        .unwrap();
+        let guard = crate::sqlite::lease::acquire_sync(
+            &conn,
+            fixture.authority.key(),
+            OwnerId::new("retired-recovery-successor").unwrap(),
+            Duration::from_secs(60),
+            due,
+        )
+        .expect("acquire successor after original guard expiry");
+        let successor = AuthorityBinding::from_consensus_parts(
+            fixture.authority.scope().digest(),
+            guard.key().clone(),
+            guard.owner().clone(),
+            guard.fence(),
+            AuthorityLeaseMetadata::new(
+                guard.credential_id(),
+                Generation::new(1),
+                guard.acquired_at(),
+                guard.expires_at(),
+            ),
+        )
+        .unwrap();
+        let recovery = RecoveryRequest::new(
+            crate::fenced_mutation_roster_executor::RecoveryRequestInput::new(
+                crate::fenced_mutation_roster_executor::RecoveryLookup::new(
+                    fixture.admission.scope(),
+                    fixture.admission.roster_id(),
+                ),
+                fixture.authority.owner().clone(),
+                fixture.authority.fence(),
+                successor,
+            ),
+        )
+        .unwrap();
+        let read = read_protected_roster_v2_recovery_sync(&conn, identity, &recovery, due)
+            .expect("verified successor can read the retired namespace");
+        assert!(
+            !matches!(read, ProtectedRosterV2ReadResult::Missing),
+            "a retired committed admission must never be reported as verified missing"
+        );
+    }
+
+    #[test]
     fn protected_roster_retirement_retires_a_v2_tombstone_without_advancing_a_v1_lower_survivor() {
         let directory = tempfile::tempdir().expect("mixed retirement directory");
         let path = directory.path().join("mixed-v2-tombstone.sqlite");

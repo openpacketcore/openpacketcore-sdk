@@ -485,6 +485,115 @@ fn native_roster_indexes_preserve_alias_rejection_and_bounded_mixed_history_pref
 }
 
 #[test]
+fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
+    use crate::fenced_mutation_roster_executor::{
+        AuthorityBinding, AuthorityLeaseMetadata, RecoveryLookup, RecoveryRequest,
+        RecoveryRequestInput,
+    };
+    use crate::sqlite::consensus::{roster_reads, ProtectedRosterV2ReadResult};
+
+    let signed = crate::consensus::types::roster_v2_aborted_persistence_fixture();
+    let state = predecessor(&signed, None);
+    let delta = state.prepare(&[]).unwrap();
+    let now = signed.authority.acquired_at().add_seconds(1).unwrap();
+    let due = now.add_seconds(24 * 60 * 60).unwrap();
+    let mut store = Store::new(&delta, &Ledger::empty(), &signed.root).unwrap();
+    roster_engine::admit_v2(
+        &mut store,
+        signed.identity,
+        signed.identity,
+        1,
+        now,
+        &command(&signed),
+    )
+    .unwrap_or_else(|_| panic!("signed native Q1"));
+    roster_engine::terminal_v2(
+        &mut store,
+        signed.identity,
+        signed.identity,
+        2,
+        2,
+        now,
+        &signed.terminal_command,
+    )
+    .unwrap_or_else(|_| panic!("signed native Q2"));
+    assert!(store.maintain_due(due).unwrap());
+    assert!(store.maintain_due(due).unwrap());
+    assert!(store.ledger.rows.is_empty());
+    assert!(store.ledger.partitions.is_empty());
+    let retired = store.ledger.clone();
+    let mut successor_state = predecessor(&signed, None);
+    let guard = LeaseGuard::new(
+        signed.authority.key().clone(),
+        OwnerId::new("native-recovery-successor").unwrap(),
+        FenceToken::new(signed.authority.fence().get() + 1),
+        due,
+        due.add_seconds(60).unwrap(),
+        signed.authority.credential_id() + 1,
+    );
+    successor_state.keys.insert(
+        guard.key().clone(),
+        SharedRow::new(NativeKeyState {
+            record: None,
+            lease: Some(NativeLease::from_guard(&guard).unwrap()),
+            fence: guard.fence().get(),
+            reserved: false,
+        })
+        .unwrap(),
+    );
+    successor_state.frontiers.next_fence = guard.fence().get() + 1;
+    successor_state.frontiers.next_credential = guard.credential_id() + 1;
+    successor_state.frontiers.logical_time = Some(due);
+    successor_state.admit_business().unwrap();
+    let successor_delta = successor_state.prepare(&[]).unwrap();
+    let authority = AuthorityBinding::from_consensus_parts(
+        signed.authority.scope().digest(),
+        guard.key().clone(),
+        guard.owner().clone(),
+        guard.fence(),
+        AuthorityLeaseMetadata::new(
+            guard.credential_id(),
+            Generation::new(1),
+            guard.acquired_at(),
+            guard.expires_at(),
+        ),
+    )
+    .unwrap();
+    let recovery = RecoveryRequest::new(RecoveryRequestInput::new(
+        RecoveryLookup::new(signed.admission.scope(), signed.admission.roster_id()),
+        signed.authority.owner().clone(),
+        signed.authority.fence(),
+        authority,
+    ))
+    .unwrap();
+    let empty = Store::new(&successor_delta, &Ledger::empty(), &signed.root).unwrap();
+    assert!(matches!(
+        roster_reads::read_protected_roster_v2_recovery_sync(
+            &empty,
+            signed.identity,
+            &recovery,
+            due
+        )
+        .unwrap(),
+        ProtectedRosterV2ReadResult::Missing
+    ));
+    let retired_store = Store::new(&successor_delta, &retired, &signed.root).unwrap();
+    assert!(
+        !matches!(
+            roster_reads::read_protected_roster_v2_recovery_sync(
+                &retired_store,
+                signed.identity,
+                &recovery,
+                due
+            )
+            .unwrap(),
+            ProtectedRosterV2ReadResult::Missing
+        ),
+        "a retired committed native admission must never become verified missing"
+    );
+}
+
+#[test]
 fn native_roster_maintenance_matches_sql_at_retention_and_empty_partition_release() {
     use crate::sqlite::consensus::native_roster_maintenance_fixture;
     for established in [true, false] {

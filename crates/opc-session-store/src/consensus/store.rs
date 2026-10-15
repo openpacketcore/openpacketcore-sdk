@@ -24557,6 +24557,65 @@ mod membership_tests {
     }
 
     #[tokio::test]
+    async fn protected_roster_v2_verified_missing_is_distinct_from_original_status_and_barrier() {
+        use crate::sqlite::consensus::ProtectedRosterV2ReadResult;
+
+        let directory = tempfile::tempdir().expect("verified missing directory");
+        let database = directory.path().join("store.sqlite");
+        let topology = singleton_topology();
+        let identity = topology.consensus_identity().unwrap();
+        let store = ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(&database).unwrap(),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        store.initialize_cluster().await.unwrap();
+        let scope = store.consumer_scope().unwrap();
+        let missing =
+            store.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, true);
+        let original =
+            store.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, false);
+        assert!(matches!(
+            original,
+            SessionConsumerResponse::FencedMutationRosterAdmissionStatus(
+                SessionConsumerRosterAdmissionReadResponse::Rejected(
+                    SessionConsumerRosterRejection::RecoveryRequired
+                )
+            )
+        ));
+        ensure_operator_recovery_latch_sync(
+            &database,
+            OperatorRecoveryLatch {
+                identity,
+                recovery_epoch: 1,
+                plan_digest: [0xA8; 32],
+                audit_pending: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .linearizable_barrier_before(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(LinearizableBarrierFailure::RecoveryRequired)
+        ));
+        assert!(
+            matches!(
+                missing,
+                SessionConsumerResponse::FencedMutationRosterRecover(
+                    SessionConsumerRosterAdmissionReadResponse::Rejected(
+                        SessionConsumerRosterRejection::RecordMissing
+                    )
+                )
+            ),
+            "verified successor-fenced missing must not share the pre-authority barrier rejection"
+        );
+    }
+
+    #[tokio::test]
     async fn dynamic_active_recovery_latch_rejects_before_any_proposal() {
         let directory = tempfile::tempdir().expect("dynamic active-latch directory");
         let database = directory.path().join("store.sqlite");

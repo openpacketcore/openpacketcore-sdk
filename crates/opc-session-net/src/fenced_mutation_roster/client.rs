@@ -2138,6 +2138,45 @@ mod tests {
         }
     }
 
+    fn successor_for_other_key() -> LeaseGuard {
+        let mut wire = serde_json::to_value(lease()).expect("serialize original guard");
+        wire["key"]["stable_id"] = serde_json::json!([2]);
+        wire["fence"] = serde_json::json!(3);
+        wire["credential_id"] = serde_json::json!(2);
+        serde_json::from_value(wire).expect("syntactically valid guard for another key")
+    }
+
+    #[test]
+    fn absent_recovery_input_rejects_a_successor_for_another_business_key() {
+        let input =
+            AdmissionInput::new_absent(lease(), v2_proposal()).expect("original absent admission");
+        assert!(
+            matches!(
+                input.recovery_absent(successor_for_other_key()),
+                Err(ClientError::AuthorityRejected)
+            ),
+            "a different key must not turn an ambiguous admission into a vacuous missing read"
+        );
+    }
+
+    #[test]
+    fn absent_admission_unknown_rejects_a_successor_for_another_business_key() {
+        let original = lease();
+        let unknown = AdmissionUnknown {
+            profile: Profile::v2(),
+            roster_id: v2_proposal().roster_id(),
+            original_owner: original.owner().clone(),
+            original_admission_fence: original.fence(),
+        };
+        assert!(
+            matches!(
+                unknown.recover_absent(successor_for_other_key()),
+                Err(ClientError::AuthorityRejected)
+            ),
+            "the ambiguity handle must retain the original business key"
+        );
+    }
+
     #[tokio::test]
     async fn deserialized_v2_tag_four_cannot_cross_generic_public_boundaries() {
         let proposal = v2_proposal();
