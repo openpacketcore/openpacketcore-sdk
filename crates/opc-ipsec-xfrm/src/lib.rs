@@ -42,9 +42,10 @@
 //! every store family ever used in the namespace, then pass an explicit
 //! [`ExclusiveNamespaceResetAcknowledgement`] before any mutation, preparation,
 //! recovery or relocation command. The actor flushes all namespace policies,
-//! then all SAs, proves both tables empty by fresh dumps, and durably clears
-//! bound stores while advancing their writer epochs. Failure or an unobserved
-//! reply keeps mutations closed until a successful repeat. Larval SAs and block
+//! then all SAs, proves both tables empty by fresh dumps, and durably surrenders
+//! bound-store authority while advancing writer epochs. SDK settlement history
+//! remains retained until its terminal receipt authorizes release. Failure or
+//! an unobserved reply keeps mutations closed until a successful repeat. Larval SAs and block
 //! policies disappear too: stop plaintext sources first and reinstall protection
 //! before reopening them. Routes, devices, per-socket policies, default-policy
 //! settings, DSCP companion state and other namespaces are untouched. Callers

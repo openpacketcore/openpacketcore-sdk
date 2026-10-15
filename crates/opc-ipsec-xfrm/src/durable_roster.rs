@@ -3081,8 +3081,8 @@ impl StoreLease<'_> {
                     // frame for each group. That is enough for live authority
                     // checks, but not enough to rebuild a journal: reopening
                     // requires every surviving group to begin at its authenticated
-                    // `Prepared` frame and to retain each exact successor through
-                    // its current state. In particular, a later failed prepare may
+                    // `Prepared` or `Closed` frame and retain each exact successor
+                    // through its current state. A later failed prepare may
                     // prune a terminal sibling while another group is `Issuing`;
                     // compacting that sibling away must not turn the survivor's
                     // sequence-two `Issuing` frame into an unreopenable orphan.
@@ -3287,7 +3287,7 @@ fn classify_roster_records(
 /// Every retained frame is an independently authenticated durable record.  A
 /// journal may therefore contain more than the two adjacent files accepted by
 /// the legacy publish-then-unlink layout, but it accepts only a complete
-/// sequence beginning at `Prepared` and linked by the existing exact
+/// sequence beginning at `Prepared` or absent-binding `Closed`, linked by the exact
 /// successor validator.  This makes a crash after any logical transition
 /// recoverable from that transition without ever treating an arbitrary older
 /// record as current cleanup authority.
@@ -3383,7 +3383,8 @@ fn validate_single_cleanup_authority(
 ///    digest, and per-member durable identity;
 /// 2. `next.publication_sequence == old.publication_sequence + 1`, which is the
 ///    total order and the sole ordering authority;
-/// 3. `old.phase.permits(next.phase)`;
+/// 3. `old.phase.permits(next.phase)`, or one exact retention-release or
+///    verified namespace-reset marker edge with unchanged phase and members;
 /// 4. per-slot edge legality for phase and both proofs;
 /// 5. cursor monotonicity, non-decreasing while issuing and non-increasing
 ///    while compensating;

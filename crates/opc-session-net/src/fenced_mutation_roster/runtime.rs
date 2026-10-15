@@ -702,6 +702,7 @@ impl fmt::Debug for LocalAuthorityPermit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalAuthorityCheck {
     Current,
+    ExecutionClosed,
     RevokedOrExpired,
 }
 
@@ -935,12 +936,12 @@ impl LocalAuthorityRegistry {
             Err(_) => return LocalAuthorityCheck::RevokedOrExpired,
         };
         self.prune_expired_locked(&mut entries);
-        if self.is_current_locked(&entries, permit)
-            && Self::permits_operation_locked(&entries, permit, operation)
-        {
-            LocalAuthorityCheck::Current
-        } else {
+        if !self.is_current_locked(&entries, permit) {
             LocalAuthorityCheck::RevokedOrExpired
+        } else if !Self::permits_operation_locked(&entries, permit, operation) {
+            LocalAuthorityCheck::ExecutionClosed
+        } else {
+            LocalAuthorityCheck::Current
         }
     }
 
@@ -4739,12 +4740,13 @@ where
             self.local_authority
                 .close_execution(&registration.authority_permit)?;
         }
-        if self
+        match self
             .local_authority
             .check_operation(&registration.authority_permit, Some(operation))
-            != LocalAuthorityCheck::Current
         {
-            return Err(ExecutorError::AuthorityRejected);
+            LocalAuthorityCheck::Current => {}
+            LocalAuthorityCheck::ExecutionClosed => return Err(ExecutorError::RecoveryRequired),
+            LocalAuthorityCheck::RevokedOrExpired => return Err(ExecutorError::AuthorityRejected),
         }
         let remaining = Duration::try_from(
             *registration.authority().expires_at().as_offset_datetime()
@@ -4979,12 +4981,13 @@ where
         }
     };
 
-    if task
+    match task
         .local_authority
         .check_operation(&task.authority_permit, Some(task.operation))
-        != LocalAuthorityCheck::Current
     {
-        return Err(ExecutorError::AuthorityRejected);
+        LocalAuthorityCheck::Current => {}
+        LocalAuthorityCheck::ExecutionClosed => return Err(ExecutorError::RecoveryRequired),
+        LocalAuthorityCheck::RevokedOrExpired => return Err(ExecutorError::AuthorityRejected),
     }
     let provider_call = MemberCall::from_executor(
         &task.admission,

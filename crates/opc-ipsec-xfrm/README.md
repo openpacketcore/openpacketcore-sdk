@@ -645,9 +645,9 @@ The store retains begun bindings and their outcomes through ordinary pruning
 and namespace reset. A verified empty-namespace reset durably marks accepted
 history retired without changing its member outcomes, so it retains no writer
 or cleanup authority; `namespace_was_cleared()` identifies that observation.
-An unissued Prepared record instead becomes Closed. Finalize Applied normally so retention does not hold the
-writer gate. After either durable SDK terminal receipt, compare each
-`settled_member_binding` with the original call commitment, then invoke
+An unissued Prepared record instead becomes Closed. Finalize Applied normally
+so retention does not hold the writer gate. After either durable SDK terminal
+receipt, compare each `settled_member_binding` with the original call commitment, then invoke
 `release_durable_object_roster_settlement`. An ambiguous terminal result cannot
 release history. Release publishes one durable retention change, survives caller
 cancellation and is idempotent. The consumer retries it automatically after
