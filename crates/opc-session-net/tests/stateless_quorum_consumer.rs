@@ -12964,7 +12964,7 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     assert_eq!(active.members(), members.as_slice());
     assert_eq!(active.protected_plan(), protected_plan.as_slice());
 
-    let mut proofs = Vec::with_capacity(6);
+    let mut recoverable_members = Vec::with_capacity(6);
     for ordinal in 0_u8..6 {
         let mut member = active
             .member(MemberOrdinal::new(ordinal).expect("Aborted snapshot member ordinal"))
@@ -12983,9 +12983,16 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
                 .expect("execute Aborted snapshot member"),
             ExecuteOutcome::Ambiguous(MemberRecoveryStatus::OutcomeUnknown)
         ));
-        let mut member = member
-            .into_recoverable()
-            .expect("ambiguous Aborted snapshot member is recovery-only");
+        recoverable_members.push(
+            member
+                .into_recoverable()
+                .expect("ambiguous Aborted snapshot member is recovery-only"),
+        );
+    }
+    // Reconciliation closes execution for the complete admission, so all six
+    // ambiguous executions must precede the first member's reconciliation.
+    let mut proofs = Vec::with_capacity(6);
+    for mut member in recoverable_members {
         match initial_client
             .reconcile(&mut member)
             .await
