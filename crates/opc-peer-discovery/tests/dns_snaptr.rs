@@ -2663,3 +2663,303 @@ async fn bare_aaa_retains_semantic_refusals_and_traversal_bounds() {
         assert_eq!(dns.seen().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn compatibility_unrelated_roots_retain_not_advertised_and_negative_lifetime() {
+    for services in [
+        vec!["AAA+D2S"],
+        vec!["aaa+d2t"],
+        vec!["AAA+D2T", "aAa+D2s"],
+        vec!["E2U+sip"],
+        vec!["unrelated:!bad!"],
+        vec!["AAA+D2S", "unrelated:!bad!"],
+    ] {
+        let dns = FakeDns::new(move |q| {
+            assert_eq!(question(q).0, "realm.example.");
+            assert_eq!(question(q).1, 35);
+            let answers = services
+                .iter()
+                .map(|service| naptr("realm.example.", 1, 0, "u", service, "!ignored!", ".", 60))
+                .collect::<Vec<_>>();
+            Some(reply(q, 0, &answers, &[], &[]))
+        })
+        .await;
+        let q = compatibility_query(PeerTransport::Sctp, "diameter.sctp");
+        let response = DnsClient::new(config(dns.address))
+            .unwrap()
+            .resolve_with_seed(&q, now, 0)
+            .await;
+        assert_eq!(
+            response.snaptr_root().unwrap().kind,
+            SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::NotAdvertised)
+        );
+        let error = response.result.unwrap_err();
+        assert_eq!(
+            error,
+            DnsError::Snaptr {
+                reason: SnaptrFailure::NoMatchingService(SnaptrNoMatch::NotAdvertised),
+                expires_at: Some(time(61_000)),
+            }
+        );
+        let mut cache =
+            DnsCache::default().with_ttl_caps(Duration::from_secs(120), Duration::from_secs(20));
+        let token = start(&mut cache, &q, now());
+        assert!(cache.finish_refresh(token, Err(error), now()));
+        let cached = cache.lookup(&q.cache_key(), time(15_000));
+        assert_eq!(cached.result, DnsCachedResult::Negative(error));
+        assert_eq!(cached.retry_at, Some(time(21_000)));
+        assert!(matches!(
+            cache
+                .begin_refresh(&q, time(15_000), Duration::from_secs(1))
+                .unwrap(),
+            DnsRefresh::Suppressed
+        ));
+        assert_eq!(
+            cache.lookup(&q.cache_key(), time(21_000)).result,
+            DnsCachedResult::Miss
+        );
+        assert_eq!(dns.seen(), [("realm.example.".to_owned(), 35)]);
+    }
+}
+
+#[tokio::test]
+async fn compatibility_rfc3588_only_root_allows_caller_owned_srv_fallback() {
+    const FALLBACK: &str = "_diameter._sctp.realm.example.";
+    const PEER: &str = "peer.example.invalid.";
+    let dns = FakeDns::new(|q| {
+        let (owner, kind, _) = question(q);
+        let (answers, additional) = match (owner.as_str(), kind) {
+            ("realm.example.", 35) => (
+                vec![naptr(
+                    "realm.example.",
+                    1,
+                    0,
+                    "s",
+                    "AAA+D2S",
+                    "",
+                    "old.example.invalid.",
+                    30,
+                )],
+                vec![],
+            ),
+            (FALLBACK, 33) => (
+                vec![srv(FALLBACK, 0, 0, 7878, PEER, 60)],
+                vec![address(PEER, "192.0.2.60", 60)],
+            ),
+            _ => panic!("unexpected question"),
+        };
+        Some(reply(q, 0, &answers, &[], &additional))
+    })
+    .await;
+    let client = DnsClient::new(config(dns.address)).unwrap();
+    let application = client
+        .resolve_with_seed(
+            &query_for("realm.example.", "aaa+ap6", "diameter.sctp"),
+            now,
+            0,
+        )
+        .await;
+    assert_eq!(
+        application.snaptr_root().unwrap().kind,
+        SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::LegacyOnly)
+    );
+    assert_eq!(
+        application.result,
+        Err(DnsError::Snaptr {
+            reason: SnaptrFailure::NoMatchingService(SnaptrNoMatch::LegacyOnly),
+            expires_at: Some(time(31_000)),
+        })
+    );
+    assert_eq!(dns.seen(), [("realm.example.".to_owned(), 35)]);
+
+    let compatibility = client
+        .resolve_with_seed(
+            &compatibility_query(PeerTransport::Sctp, "diameter.sctp"),
+            now,
+            0,
+        )
+        .await;
+    assert_eq!(
+        compatibility.snaptr_root().unwrap().kind,
+        SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::NotAdvertised)
+    );
+    assert_eq!(
+        compatibility.result,
+        Err(DnsError::Snaptr {
+            reason: SnaptrFailure::NoMatchingService(SnaptrNoMatch::NotAdvertised),
+            expires_at: Some(time(31_000)),
+        })
+    );
+    assert_eq!(dns.seen().len(), 2);
+
+    let fallback = DnsQuery::new(ServiceDiscoveryInput::new(
+        PeerLabel::new("compatibility-test").unwrap(),
+        DiscoveryTarget::new(FALLBACK),
+        ServiceDiscoveryMode::Service,
+        PeerTransport::Sctp,
+        Some(3868),
+    ))
+    .unwrap()
+    .with_address_family(AddressFamilyPolicy::Ipv4Only);
+    let answer = client
+        .resolve_with_seed(&fallback, now, 0)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(answer.candidates().len(), 1);
+    assert_eq!(
+        answer.candidates()[0].peer().endpoint.to_string(),
+        "192.0.2.60:7878"
+    );
+    assert_eq!(answer.candidates()[0].peer().transport, PeerTransport::Sctp);
+    assert_eq!(
+        dns.seen(),
+        [
+            ("realm.example.".to_owned(), 35),
+            ("realm.example.".to_owned(), 35),
+            (FALLBACK.to_owned(), 33),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn compatibility_keeps_transport_and_extended_refusals_distinct_from_absence() {
+    for (service, protocol, advertisements, expected) in [
+        (
+            "aaa",
+            "diameter.sctp",
+            vec!["aaa:diameter.tcp"],
+            SnaptrNoMatch::ServiceNotOffered,
+        ),
+        (
+            "aaa",
+            "diameter.sctp",
+            vec!["AAA+D2S", "aaa:diameter.tcp"],
+            SnaptrNoMatch::ServiceNotOffered,
+        ),
+        (
+            "aaa",
+            "diameter.sctp",
+            vec!["AAA+D2S", "aaa+ap6:diameter.tcp"],
+            SnaptrNoMatch::ExtendedPresentNoMatch,
+        ),
+        (
+            "x-discovery",
+            "x-protocol",
+            vec!["AAA+D2S"],
+            SnaptrNoMatch::ServiceNotOffered,
+        ),
+    ] {
+        let dns = FakeDns::new(move |q| {
+            assert_eq!(question(q).1, 35);
+            let answers = advertisements
+                .iter()
+                .map(|advertised| {
+                    naptr(
+                        "realm.example.",
+                        1,
+                        0,
+                        "a",
+                        advertised,
+                        "",
+                        "peer.example.invalid.",
+                        90,
+                    )
+                })
+                .collect::<Vec<_>>();
+            Some(reply(q, 0, &answers, &[], &[]))
+        })
+        .await;
+        let response = DnsClient::new(config(dns.address))
+            .unwrap()
+            .resolve_with_seed(&query_for("realm.example.", service, protocol), now, 0)
+            .await;
+        assert_eq!(
+            response.snaptr_root().unwrap().kind,
+            SnaptrRootKind::PresentNoMatch(expected)
+        );
+        assert_eq!(
+            response.result,
+            Err(DnsError::Snaptr {
+                reason: SnaptrFailure::NoMatchingService(expected),
+                expires_at: Some(time(91_000)),
+            })
+        );
+        assert_eq!(dns.seen(), [("realm.example.".to_owned(), 35)]);
+    }
+}
+
+#[tokio::test]
+async fn compatibility_changed_rfc3588_root_with_extended_data_never_authorizes_fallback() {
+    let roots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = Arc::clone(&roots);
+    let dns = FakeDns::new(move |q| {
+        assert_eq!(question(q).0, "realm.example.");
+        assert_eq!(question(q).1, 35);
+        let mut answers = vec![naptr(
+            "realm.example.",
+            1,
+            0,
+            "s",
+            "AAA+D2S",
+            "",
+            "old.example.invalid.",
+            90,
+        )];
+        match served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => {}
+            1 => answers.push(naptr(
+                "realm.example.",
+                0,
+                0,
+                "a",
+                "aaa+ap6:diameter.sctp",
+                "",
+                "peer.example.invalid.",
+                90,
+            )),
+            _ => panic!("unexpected query after compatibility refusal"),
+        }
+        Some(reply(q, 0, &answers, &[], &[]))
+    })
+    .await;
+    let client = DnsClient::new(config(dns.address)).unwrap();
+    let application = client
+        .resolve_with_seed(
+            &query_for("realm.example.", "aaa+ap6", "diameter.sctp"),
+            now,
+            0,
+        )
+        .await;
+    assert_eq!(
+        application.snaptr_root().unwrap().kind,
+        SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::LegacyOnly)
+    );
+    assert!(application.result.is_err());
+    let compatibility = client
+        .resolve_with_seed(
+            &compatibility_query(PeerTransport::Sctp, "diameter.sctp"),
+            now,
+            0,
+        )
+        .await;
+    assert_eq!(
+        compatibility.snaptr_root().unwrap().kind,
+        SnaptrRootKind::PresentNoMatch(SnaptrNoMatch::ExtendedPresentNoMatch)
+    );
+    assert_eq!(
+        compatibility.result,
+        Err(DnsError::Snaptr {
+            reason: SnaptrFailure::NoMatchingService(SnaptrNoMatch::ExtendedPresentNoMatch),
+            expires_at: Some(time(91_000)),
+        })
+    );
+    assert_eq!(roots.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        dns.seen(),
+        [
+            ("realm.example.".to_owned(), 35),
+            ("realm.example.".to_owned(), 35),
+        ]
+    );
+}

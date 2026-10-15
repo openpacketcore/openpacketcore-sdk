@@ -730,6 +730,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compatibility filter using caller-selected transport, without inventing a
   protocol tag. Refuse compatibility when extended Diameter records appear,
   preserving the prohibition on downgrade after an extended mismatch. (#1287)
+- `opc-peer-discovery`: classify unrelated-only `aaa` compatibility answers as
+  `NotAdvertised`, including RFC 3588 `AAA+D2T`/`AAA+D2S` records, so the caller
+  can perform SRV fallback. Keep unsupported explicit protocols and extended
+  records distinct from absence. (#1287)
 
 - `opc-session-net` tests: reserve scope listener sockets across endpoint
   replacement and full fleet reopen so restarted ephemeral consensus listeners

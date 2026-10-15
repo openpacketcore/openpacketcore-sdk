@@ -93,6 +93,7 @@ fn prepare_naptr(
     let mut filtered = 0;
     let mut extended = false;
     let mut legacy = false;
+    let mut compatibility_present = false;
     let mut malformed = false;
     let mut matched = false;
     for record in answer.records {
@@ -104,6 +105,7 @@ fn prepare_naptr(
             .to_ascii_lowercase();
         extended |= first.starts_with(b"aaa+ap");
         legacy |= matches!(first.as_slice(), b"aaa" | b"aaa+d2t" | b"aaa+d2s");
+        compatibility_present |= first == b"aaa";
         let advertised = match matches_service(&record, filter) {
             Ok(Some(value)) => {
                 matched = true;
@@ -131,6 +133,8 @@ fn prepare_naptr(
     } else {
         SnaptrRootKind::PresentNoMatch(if malformed {
             SnaptrNoMatch::MalformedRequestedService
+        } else if filter.service() == "aaa" && !compatibility_present {
+            SnaptrNoMatch::NotAdvertised
         } else if !filter.diameter() {
             SnaptrNoMatch::ServiceNotOffered
         } else if extended {

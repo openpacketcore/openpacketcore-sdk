@@ -99,9 +99,11 @@ pub enum SnaptrNoMatch {
     ExtendedPresentNoMatch,
     /// Only legacy Diameter data exists; caller owns 5(d)/(e) compatibility.
     LegacyOnly,
-    /// Only unrelated applications exist; caller may use 5(f) SRV fallback.
+    /// Only unrelated services exist; caller may use 5(f) SRV fallback.
+    /// For an `aaa` compatibility filter, RFC 3588 `AAA+D2T`/`AAA+D2S`
+    /// are unrelated; extended `aaa+ap` data still prohibits fallback.
     NotAdvertised,
-    /// Non-Diameter application/protocol pair was not advertised.
+    /// A non-Diameter pair or explicit `aaa` protocol was not advertised.
     ServiceNotOffered,
     /// The requested service token occurred with malformed SERVICES syntax.
     MalformedRequestedService,

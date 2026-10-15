@@ -723,6 +723,10 @@ flags, loop, depth, work and malformed-service rules apply. A compatibility
 lookup that observes any extended `aaa+ap` data returns `ExtendedPresentNoMatch`,
 including when the root changes after an application-specific query. Reconsider
 extended discovery; legacy records in that reply cannot enable a downgrade.
+Without extended data or an `aaa` service entry, the compatibility result is
+`NotAdvertised`, allowing caller-owned SRV fallback. RFC 3588 `AAA+D2T` and
+`AAA+D2S` count as unrelated for this filter. An explicit `aaa:protocol` entry
+for an unsupported protocol remains `ServiceNotOffered`, not absence.
 
 The S-NAPTR DNS-derived retained payload is bounded conservatively by 2 MiB per
 answer, plus up to 16 copies of the caller-owned label; allocator bookkeeping

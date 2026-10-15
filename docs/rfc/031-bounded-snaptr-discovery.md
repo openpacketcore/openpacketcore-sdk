@@ -114,6 +114,13 @@ apply. A compatibility query that observes any `aaa+ap` family record refuses
 changed RRset between the caller's application query and compatibility query
 from turning extended data into a downgrade. Retry the application-specific
 query when reconsidering extended discovery.
+If neither extended data nor an `aaa` service entry exists, the compatibility
+result is `PresentNoMatch(NotAdvertised)` and permits caller-owned section 5(f)
+SRV fallback. RFC 3588 `AAA+D2T`/`AAA+D2S` records count as unrelated during
+this compatibility query; they still produce `LegacyOnly` for an application-ID
+query. An `aaa:protocol` entry with no supported protocol remains
+`PresentNoMatch(ServiceNotOffered)`. Malformed requested service syntax remains
+a refusal, never an absence signal.
 
 Defaults come from the requested service definition: GTP-C uses 2123
 ([TS 29.274 V8.0.0, clause 4.3.1.1](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/08.00.00_60/ts_129274v080000p.pdf));
@@ -156,7 +163,8 @@ A valid match takes precedence over non-matches. Without one, requested-field
 malformation takes precedence over extended presence, then legacy presence,
 then unrelated-only data. Conservatively treat an `aaa+ap` family marker as
 extended presence even if its ID is noncanonical; do not infer absence from
-it. Non-Diameter queries use `PresentNoMatch(ServiceNotOffered)` as needed.
+it. The explicit `aaa` compatibility query uses the rules above; other
+non-Diameter queries use `PresentNoMatch(ServiceNotOffered)` as needed.
 Root SERVFAIL, REFUSED, timeout, invalid query or unparseable response has
 **no classification**, preserving its typed error. None means unobserved,
 never `NoNaptr` or `NotAdvertised`.
