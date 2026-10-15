@@ -142,12 +142,7 @@ impl RetainedConfigOpen {
         if self.work.check().is_err() {
             return Err(RetainedConfigError::Indeterminate);
         }
-        let joined = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(self.work.deadline),
-            worker,
-        )
-        .await
-        {
+        let joined = match crate::deadline::timeout(self.work.deadline, worker).await {
             Ok(joined) => joined,
             Err(_) => return Err(RetainedConfigError::Indeterminate),
         };

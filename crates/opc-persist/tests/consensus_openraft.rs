@@ -1489,7 +1489,7 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
     .await
     .expect("actual production log compaction");
     drop(observers);
-    tokio::time::pause();
+    schedule.pause_after_follower_tick().await;
     let frozen_started = std::time::Instant::now();
     let replacement = scripted_election::schedule::with_frozen_time(async {
         schedule.settle(&ticks).await;

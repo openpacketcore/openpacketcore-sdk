@@ -407,10 +407,17 @@ retention replay. The election uses recorded ticker phases to compute the bound
 for one split vote and the following automatic campaign. Each clock advance waits
 for the affected cores to process every queued tick, including its sequence count;
 the test checks both denied votes, the successful vote, and the exact bound.
-Settling accounts for Tokio's millisecond timer grid. The unchanged 30-second wall-clock
-watchdog covers only this short frozen phase, whose duration is reported. Normal
-time resumes for the original history-floor, outcome-replay, and member
-snapshot-installation checks.
+Settling accounts for Tokio's millisecond timer grid and reports a clear error
+if a normal-time stall collapses both follower deadlines into the same slot.
+The unchanged 30-second wall-clock watchdog covers only this short frozen phase,
+whose duration is reported. The pause follows a follower ticker re-registration
+to exercise the largest settling advance. Resuming normal time preserves the
+offset: Tokio can lead the standard clock by about thirty seconds. The original
+history-floor, outcome-replay, and member snapshot-installation checks run with
+that lead. Retained admission and consumer-checkpoint waits use the remaining
+duration of their original standard-clock deadline, so this offset cannot consume
+their budget. Cancellation, blocking-worker deadline checks, and expiry outcomes
+remain unchanged.
 
 - Openraft config-store coverage:
   `cargo test --locked -p opc-persist --test consensus_openraft`

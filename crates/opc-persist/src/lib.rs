@@ -109,6 +109,7 @@ mod backend;
 pub mod break_glass;
 mod consensus;
 mod consumer_checkpoint;
+mod deadline;
 mod error;
 // Share the workspace's private fixture clock without a production dependency.
 #[cfg(test)]

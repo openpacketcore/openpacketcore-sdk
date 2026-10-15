@@ -127,6 +127,21 @@ impl RetentionElection {
             .expect("registered ticker")
     }
 
+    pub(super) async fn pause_after_follower_tick(&self) {
+        let mut sleeps = self.scripts[1].sleeps();
+        let before = sleeps.borrow().len();
+        tokio::time::timeout(
+            CLUSTER_TRANSITION_TIMEOUT,
+            sleeps.wait_for(|sleeps| sleeps.len() > before),
+        )
+        .await
+        .expect("follower ticker re-registers before the pause")
+        .expect("follower ticker remains live");
+        // This phase leaves nearly one whole tick to settle before election,
+        // maximizing the Tokio clock lead seen by the member-repair tail.
+        tokio::time::pause();
+    }
+
     async fn advance_to(&self, at: Instant, ticks: &ticks::ProcessedTicks) {
         // Tokio rounds deadlines up to milliseconds from runtime creation.
         // Setup used normal time, so its recorded deadlines need not lie on
@@ -169,6 +184,16 @@ impl RetentionElection {
         }
         // First make node 2's next tick precede node 3's. Deferring the
         // earlier wake by less than one tick then gives the desired spacing.
+        let slots = [1, 2].map(|index| {
+            (self.last_tick(index).1 - self.runtime_origin)
+                .as_nanos()
+                .div_ceil(1_000_000)
+        });
+        assert_ne!(
+            slots[0], slots[1],
+            "follower ticker deadlines collided in the same Tokio millisecond; \
+             a normal-time runtime stall collapsed their distinct phases"
+        );
         if self.last_tick(2).1 < self.last_tick(1).1 {
             self.advance_to(self.last_tick(2).1, ticks).await;
         }

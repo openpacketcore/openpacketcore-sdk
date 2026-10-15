@@ -730,6 +730,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: preserve the remaining standard-clock deadline budget when
+  waiting for retained configuration admission and consumer-checkpoint I/O or
+  encryption. An advanced Tokio clock no longer makes an unexpired operation
+  time out immediately. Keep the original deadline and cancellation semantics,
+  with advanced-clock unit tests and worst-phase member-repair coverage. (#1294)
+
 - `opc-persist` tests: make retained-history leader failover deterministic with
   scripted election samples and vote order. Assert the configured timer bound
   for one split round while preserving history retention and member snapshot
