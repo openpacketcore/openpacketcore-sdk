@@ -176,8 +176,8 @@ executions and cache overhead.
 | `oracles` | 4–8 minutes | Own setup, host compilation/tests, 34s privileged proofs, artifact/cache allowance |
 | `installer` | 4–8 minutes | Own setup and a cold small-package build; completed old step was 95s |
 | `host-tests (0)` | 20–28 minutes | Roughly one third of ordinary tests, 5m initial build, setup/cache allowance; six isolated proofs moved out |
-| `host-tests (1)` | Pending updated hosted measurement | Prior ordinary-only estimate: 23–30m, including examples/doctests/profile compilation. Add the six-package O1 library build and serial Durable follower full-bound proof. |
-| `host-tests (2)` | Pending updated hosted measurement | Prior ordinary-only estimate: 26–32m. Add the six-package O1 library build and serial leader and Async follower full-bound proofs. |
+| `host-tests (1)` | Pending updated hosted measurement | Prior ordinary-only estimate: 23–30m, including examples/doctests/profile compilation. Add the six-package O1 library build and three serial full-bound reclamation/admission proofs. |
+| `host-tests (2)` | Pending updated hosted measurement | Prior ordinary-only estimate: 26–32m. Add the six-package O1 library build and four serial full-bound reclamation/admission proofs. |
 | `host-proofs` | 27–35 minutes | 5m inventory build, 5m isolated-profile compilation, 6m21s isolated proofs, 11m O1 build/proofs, setup/cache allowance |
 | `root-cgroup-egress` | Under 1 minute | Checkout and aggregate result check |
 

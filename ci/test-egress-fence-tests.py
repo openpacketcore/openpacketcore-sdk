@@ -321,6 +321,22 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
             self.assertTrue(all(command["env"] == {} for command in execute.call_args.args[0]))
             self.assertFalse(any(command["name"] in self.NAMES for command in execute.call_args.args[0]))
 
+    def test_all_full_native_names_are_prechecked_at_the_execution_profile(self):
+        for name in self.NAMES:
+            command = {"name": name, "env": {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}, "argv": [
+                "cargo", "test", *FENCE.SELECTION, "--quiet", "--lib", "--",
+                "--test-threads=1", "--nocapture", "--exact", name,
+            ]}
+            with self.subTest(name=name):
+                with patch.object(FENCE, "capture", side_effect=[f"{name}: test\n", ""]) as capture:
+                    FENCE.precheck_native_log_bound([command])
+                self.assertEqual(capture.call_count, 2)
+                for call in capture.call_args_list:
+                    self.assertEqual(call.kwargs["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"], "1")
+                    self.assertIn("--list", call.args[0])
+                with patch.object(FENCE, "capture", return_value=""), self.assertRaises(ValueError):
+                    FENCE.precheck_native_log_bound([command])
+
     def test_full_native_plan_rejects_lost_duplicate_early_and_overlapping_execution(self):
         for name in self.NAMES:
             owner = FENCE.owner(name)

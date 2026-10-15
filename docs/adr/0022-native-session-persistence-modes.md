@@ -692,6 +692,9 @@ fixed K = 1,024 and N = 4,096, 262,144 rows allow approximately 654 seconds at
 admission and recovery correctness at the full window in both persistence
 modes; they do not measure whole-business-state snapshot cost or process RSS.
 The initial value remains provisional pending those workload measurements.
+The four full-window proofs run serially at test O1 in their named heavy shards,
+with debug assertions, overflow checks, row counts and recovery deadlines intact.
+The three-cycle build and transfer regressions retain the ordinary test profile.
 
 The log window does not change generation-file extent or business-table
 retention. Those resources retain their separate storage contracts.
