@@ -87,6 +87,45 @@ def validate_rows(rows: list[dict], isolated: tuple[str, ...] = ()) -> None:
             raise ValueError("isolated library test must resolve exactly once and stay enabled: " + name)
 
 
+def verify_named_owners(rows: list[dict], names: tuple[str, ...], child_parents: dict[str, str],
+                        planned: dict[str, list[list[str]]], metadata: dict) -> dict[str, str]:
+    """Require one enabled owner for each moved test, including child parents.
+
+    Ignored helpers are explicit exceptions, never inferred from their names.
+    Their enabled parent owns execution; its internal crash scenarios may spawn
+    the helper more than once. No CI command may also run ignored helpers.
+    """
+    if len(names) != len(set(names)) or not set(child_parents).issubset(names):
+        raise ValueError("duplicate named test or undeclared subprocess child")
+    if any(parent not in names or parent in child_parents for parent in child_parents.values()):
+        raise ValueError("subprocess child must name an enabled, non-child parent")
+    validate_rows(rows, tuple(name for name in names if name not in child_parents))
+    named_rows = {name: [row for row in rows if row["name"] == name] for name in names}
+    for child, parent in child_parents.items():
+        matches = named_rows[child]
+        if len(matches) != 1 or not matches[0]["ignored"]:
+            raise ValueError("subprocess child must resolve exactly once and remain ignored: " + child)
+        if any(matches[0][key] != named_rows[parent][0][key] for key in ("package", "target", "kind")):
+            raise ValueError("subprocess child and parent must use the same library harness: " + child)
+    selections = []
+    for shard, commands in planned.items():
+        for argv in commands:
+            selection = cargo_test_selection.resolve(argv, metadata)
+            harness = argv[argv.index("--") + 1:] if "--" in argv else []
+            if selection.has_library() and {"--ignored", "--include-ignored"}.intersection(harness):
+                raise ValueError("library plans must leave ignored subprocess execution to its parent")
+            selections.append((shard, selection))
+    owners = {}
+    for name in names:
+        row = named_rows[child_parents.get(name, name)][0]
+        identity = (row["package"], row["target"], tuple(row["kind"]), row["name"])
+        selected = [shard for shard, selection in selections if selection.selects(*identity)]
+        if len(selected) != 1:
+            raise ValueError(f"named library test must have exactly one enabled owner: {name}: {selected}")
+        owners[name] = selected[0]
+    return owners
+
+
 def commands(phase: list[list[str]], ordinary_index: int, rows: list[dict], shard: int) -> list[list[str]]:
     if shard not in SHARDS:
         raise ValueError("unknown library shard")

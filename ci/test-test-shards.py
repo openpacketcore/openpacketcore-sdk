@@ -837,6 +837,21 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     TEST_SHARDS.verify_lib_plan(plan)
 
+    def test_child_parent_declarations_must_name_distinct_members_of_one_group(self) -> None:
+        for mutation in ("unknown-child", "unknown-parent", "self-parent", "child-parent-chain", "not-a-map"):
+            plan = copy.deepcopy(self.plan)
+            group = plan["lib_groups"][0]
+            child, parent = group["tests"][:2]
+            group["child_parents"] = {
+                "unknown-child": {"missing": parent},
+                "unknown-parent": {child: "missing"},
+                "self-parent": {child: child},
+                "child-parent-chain": {child: parent, parent: child},
+                "not-a-map": [child],
+            }[mutation]
+            with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
+                TEST_SHARDS.verify_lib_plan(plan)
+
     def test_timing_contract_cannot_join_an_ordinary_group(self) -> None:
         self.plan["lib_groups"].append({
             "module": TEST_SHARDS.QUIESCENT_VOID_LIB_MODULE,
@@ -1030,9 +1045,14 @@ class HostedLibraryTransferTests(unittest.TestCase):
 
     def test_library_entrypoint_executes_the_verified_serial_and_ordinary_commands(self):
         metadata = TEST_SHARDS.cargo_test_selection.workspace_metadata(TEST_SHARDS.ROOT)
+        module = "fenced_transition_journal::recovery::void_ownership_tests"
+        children = {
+            f"{module}::owned_journal_creation_child": f"{module}::owned_journal_creation_is_crash_atomic",
+            f"{module}::owned_journal_process_child": f"{module}::owned_journal_void_excludes_another_process_and_recovers_after_crash",
+        }
         names = [*TEST_SHARDS.moved_lib_names(self.plan), *(f"new_module::future_{i}" for i in range(120))]
         rows = [{"package": "opc-session-store", "target": "opc_session_store", "kind": ["lib"],
-                 "name": name, "ignored": False} for name in names]
+                 "name": name, "ignored": name in children} for name in names]
         for shard in TEST_SHARDS.library_partition.SHARDS:
             with self.subTest(shard=shard), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "mapping.json"
@@ -1046,6 +1066,8 @@ class HostedLibraryTransferTests(unittest.TestCase):
                     TEST_SHARDS.run_libraries(self.plan, shard, output)
                 import json
                 report = json.loads(output.read_text())
+                self.assertEqual(report["child_parents"], children)
+                self.assertTrue(all(report["named_test_owners"][child] == "it-1" for child in children))
                 self.assertEqual([call.args[0] for call in execute.call_args_list], report["plans"][str(shard)])
                 self.assertEqual(execute.call_count, 3 if shard == 0 else 1)
                 if shard == 0:

@@ -396,6 +396,12 @@ def moved_lib_names(plan: dict) -> list[str]:
     ]
 
 
+def lib_child_parents(plan: dict) -> dict[str, str]:
+    return {f"{group['module']}::{child}": f"{group['module']}::{parent}"
+            for group in plan.get("lib_groups", [])
+            for child, parent in group.get("child_parents", {}).items()}
+
+
 def serial_lib_command(name: str) -> list[str]:
     return SELECTION + [
         "--lib", "--", "--test-threads=1", "--nocapture", "--exact", name,
@@ -551,14 +557,20 @@ def run_libraries(plan: dict, shard: int, output: Path) -> None:
     phase = [command for command in commands(plan, "misc", targets) if "--lib" in command]
     print("Compile and inventory the complete workspace library selection", flush=True)
     rows, metadata = library_partition.inventory(SELECTION, ROOT)
-    library_partition.validate_rows(rows, tuple(moved_lib_names(plan)))
     planned = {index: library_partition.commands(phase, len(SERIAL_LIB_TESTS), rows, index)
                for index in library_partition.SHARDS}
     library_partition.verify(phase, len(SERIAL_LIB_TESTS), rows, planned, metadata)
+    all_libraries = {f"library-{index}": invocations for index, invocations in planned.items()}
+    all_libraries.update({owner: [command for command in commands(plan, owner, targets) if "--lib" in command]
+                          for owner in shard_ids(plan) if owner != "misc"})
+    child_parents = lib_child_parents(plan)
+    named_owners = library_partition.verify_named_owners(
+        rows, tuple(moved_lib_names(plan)), child_parents, all_libraries, metadata)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "tests": rows, "logical_library_phase": phase, "plans": planned,
+        "child_parents": child_parents, "named_test_owners": named_owners,
     }, indent=2) + "\n")
     print(f"Exact library partition verified: {len(rows)} test identities; mapping: {output}", flush=True)
     for index, command in enumerate(planned[shard]):
@@ -810,6 +822,12 @@ def verify_lib_plan(plan: dict) -> None:
         ):
             sys.exit("library groups require module-qualified Rust test names")
         names = lib_group_names(group)
+        children = group.get("child_parents", {})
+        if not isinstance(children, dict) or any(
+            child not in group["tests"] or parent not in group["tests"] or parent in children
+            for child, parent in children.items()
+        ):
+            sys.exit("subprocess children require enabled parents in the same library group")
         if any(name in native_log_bound.TESTS for name in names):
             if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.TESTS.index(names[0])]:
                 sys.exit("full native log proofs must each own one dedicated parallel shard")

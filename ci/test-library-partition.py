@@ -2,6 +2,8 @@
 """Exercise the hosted library split against exact selections and real Cargo."""
 
 import copy
+import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -19,6 +21,9 @@ except ModuleNotFoundError:
     PARTITION = None
 
 ROOT = Path(__file__).resolve().parent.parent
+SPEC = importlib.util.spec_from_file_location("test_shards", ROOT / "ci/test-shards.py")
+SHARDS = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(SHARDS)
 
 
 class LibraryPartitionTests(unittest.TestCase):
@@ -112,6 +117,50 @@ class LibraryPartitionTests(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 PARTITION.validate_rows(rows, self.serial)
 
+    def test_declared_child_requires_one_enabled_parent_in_the_same_harness(self):
+        child = "module::process_child"
+        self.rows.append(dict(self.rows[0], name=child, ignored=True))
+        names = (*self.serial, self.moved, child)
+        children = {child: self.moved}
+        plans = {f"library-{shard}": commands for shard, commands in self.plans().items()}
+        plans["it-1"] = [self.base + ["--lib", "--", "--exact", self.moved, child]]
+        owners = PARTITION.verify_named_owners(self.rows, names, children, plans, self.metadata)
+        self.assertEqual(owners, {**{name: "library-0" for name in self.serial},
+                                  self.moved: "it-1", child: "it-1"})
+        for mutation in ("missing-child", "ambiguous-child", "enabled-child", "missing-parent",
+                         "ignored-parent", "other-harness-parent", "undeclared-child", "unknown-child",
+                         "child-as-parent", "missing-owner", "duplicate-owner", "direct-ignored",
+                         "include-ignored", "ignored-serial"):
+            rows, mapping, commands = copy.deepcopy((self.rows, children, plans))
+            if mutation == "missing-child":
+                rows.pop()
+            elif mutation == "ambiguous-child":
+                rows.append(dict(rows[-1], package="b", target="b"))
+            elif mutation == "enabled-child":
+                rows[-1]["ignored"] = False
+            elif mutation == "missing-parent":
+                rows = [row for row in rows if row["name"] != self.moved]
+            elif mutation == "ignored-parent":
+                rows[2]["ignored"] = True
+            elif mutation == "other-harness-parent":
+                rows[2].update(package="b", target="b")
+            elif mutation == "undeclared-child":
+                mapping.clear()
+            elif mutation == "unknown-child":
+                mapping["unknown::child"] = self.moved
+            elif mutation == "child-as-parent":
+                mapping[self.moved] = child
+            elif mutation == "missing-owner":
+                commands["it-1"].clear()
+            elif mutation == "duplicate-owner":
+                commands["it-1"] *= 2
+            elif mutation in ("direct-ignored", "include-ignored"):
+                commands["it-1"][0].append("--ignored" if mutation == "direct-ignored" else "--include-ignored")
+            else:
+                rows[0]["ignored"] = True
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                PARTITION.verify_named_owners(rows, names, mapping, commands, self.metadata)
+
 
 class CompiledInventoryTests(unittest.TestCase):
     def test_missing_duplicate_or_unexpected_library_cannot_make_a_green_partition(self):
@@ -137,6 +186,83 @@ class CompiledInventoryTests(unittest.TestCase):
 
 
 class RealCargoPartitionTests(unittest.TestCase):
+    def test_child_helper_runs_once_through_ordinary_isolated_and_moved_parents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "child-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+            (root / "src/lib.rs").write_text('''
+#[test] fn isolated() { println!("executed:isolated"); }
+#[test] fn ordinary() { println!("executed:ordinary"); }
+mod process {
+    #[test]
+    #[ignore = "only the parent supplies the child context"]
+    fn child() {
+        assert_eq!(std::env::var("FIXTURE_CHILD").unwrap(), "1");
+        let mut marker = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(std::env::var_os("FIXTURE_MARKER").unwrap()).unwrap();
+        std::io::Write::write_all(&mut marker, b"child ran once").unwrap();
+        println!("executed:child");
+    }
+    #[test]
+    fn parent() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "process::child", "--nocapture"])
+            .env("FIXTURE_CHILD", "1").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        print!("{}", String::from_utf8(output.stdout).unwrap());
+        println!("executed:parent");
+    }
+}
+''')
+            env = dict(os.environ, CARGO_TARGET_DIR=str(ROOT / "target/library-partition-fixture"))
+            subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, env=env, check=True, capture_output=True)
+            base = ["cargo", "test", "--locked", "--offline", "--workspace", "--all-features", "--quiet"]
+            rows, metadata = PARTITION.inventory(base, root, env=env)
+            self.assertEqual({row["name"] for row in rows if row["ignored"]}, {"process::child"})
+            group = {"module": "process", "shard": "it-1", "tests": ["parent", "child"],
+                     "child_parents": {"child": "parent"}}
+            execute = subprocess.run
+            for mode in ("moved", "ordinary", "isolated"):
+                with self.subTest(mode=mode):
+                    marker = root / (mode + ".marker")
+                    env["FIXTURE_MARKER"] = str(marker)
+                    plan = SHARDS.load_plan()
+                    plan["lib_groups"] = [group] if mode == "moved" else []
+                    plan["quiescent_lib_shards"] = {}
+                    observed = []
+
+                    def capture(argv, **kwargs):
+                        result = execute(argv, **kwargs, env=env, text=True, capture_output=True, check=True)
+                        observed.extend(line[line.index("executed:"):] for line in result.stdout.splitlines()
+                                        if "executed:" in line)
+                        return result
+
+                    with (
+                        patch.object(SHARDS, "ROOT", root),
+                        patch.object(SHARDS, "SELECTION", base),
+                        patch.object(SHARDS, "HARNESS", ["--test-threads=4", "--nocapture"]),
+                        patch.object(SHARDS, "SERIAL_LIB_TESTS", ("isolated", "process::parent") if mode == "isolated" else ("isolated",)),
+                        patch.object(SHARDS, "QUIESCENT_LIB_TESTS", ()),
+                        patch.object(SHARDS, "integration_targets", return_value=[
+                            plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]),
+                        patch.object(SHARDS, "verify"),  # The fixture has no hosted workflow.
+                        patch.object(PARTITION, "inventory", return_value=(rows, metadata)),
+                        patch.object(SHARDS.subprocess, "check_output", return_value="f" * 40),
+                        patch.object(SHARDS.subprocess, "run", side_effect=capture),
+                    ):
+                        for shard in PARTITION.SHARDS:
+                            output = root / f"{mode}-{shard}.json"
+                            SHARDS.run_libraries(plan, shard, output)
+                        if mode == "moved":
+                            capture(SHARDS.lib_group_command(group), cwd=root)
+                            report = json.loads(output.read_text())
+                            self.assertEqual(report["child_parents"], {"process::child": "process::parent"})
+                            self.assertEqual(report["named_test_owners"]["process::child"], "it-1")
+                    self.assertEqual(marker.read_bytes(), b"child ran once")
+                    self.assertCountEqual(observed, ["executed:" + name for name in ("isolated", "ordinary", "parent", "child")])
+
     def test_compiled_inventory_and_partition_run_every_new_test_once(self):
         self.assertIsNotNone(PARTITION, "ordinary library work needs a separate exact-name partition")
         with tempfile.TemporaryDirectory() as directory:
