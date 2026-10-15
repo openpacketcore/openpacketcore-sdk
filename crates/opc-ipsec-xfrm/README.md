@@ -631,8 +631,10 @@ Before submitting an SDK admission, call
 ordered request. That operation returns the store identity for the admitted
 member descriptor; attach it with `roster.with_settlement_identity(identity)`.
 Preparation requires the matching open registration. Retain the registration
-across ambiguous admission and cancellation. After definitive non-admission,
-`discard_unadmitted_durable_object_roster_settlement` removes it; an identical
+while `admit` may still return, including across caller cancellation. Once
+`admit` returns anything other than `Admitted`, including `OutcomeUnknown`,
+`discard_unadmitted_durable_object_roster_settlement` removes it; readback and
+recovery never issue prepare authority, so absence still settles without it. An identical
 `NotTransmitted` retry registers again before resubmission. Never reuse the
 group and generation for another admission. Keep the original store identity
 on restart; readback, recovery and release never register again. Ordinary

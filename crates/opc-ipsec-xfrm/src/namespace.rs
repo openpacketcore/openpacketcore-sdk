@@ -3300,8 +3300,9 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// the store identity to commit in the immutable member descriptor.
     ///
     /// The trusted adapter owns this registration across caller cancellation.
-    /// It must retain it while admission is ambiguous, discard it only after
-    /// definitive non-admission, or release it after a verified terminal receipt.
+    /// It retains it while `admit` may still return `Admitted`, discards it once
+    /// `admit` returns anything else (including `OutcomeUnknown`), and otherwise
+    /// releases it after a verified terminal receipt or compacted terminal result.
     /// An identical retry after `NotTransmitted` registers again before submission.
     /// Registration grants no execution authority. Never register during readback,
     /// recovery or release, or reuse a group and generation for another admission.
@@ -3327,11 +3328,13 @@ impl NamespaceBoundLinuxXfrmBackend {
         .map_err(|_| XfrmObjectRosterDurableError::Storage)?
     }
 
-    /// Discard an exact registration after definitive SDK non-admission.
+    /// Discard an exact registration once SDK `admit` has returned without `Admitted`.
     ///
-    /// The trusted adapter must prove the admission was never transmitted or
-    /// was definitively rejected; an ambiguous reply or cancellation cannot
-    /// authorize discard. No member provider call may exist. An identical
+    /// That covers `NotTransmitted`, a rejection and `OutcomeUnknown`: only a
+    /// returned `Admitted` issues prepare or execute authority, and readback or
+    /// recovery never does, so an admission that did commit still settles absence
+    /// without this registration. Never discard while an `admit` call for the
+    /// binding may still return. An identical
     /// `NotTransmitted` retry registers the same binding again before resubmission.
     /// This operation publishes nothing, is idempotent, and stays owned across
     /// cancellation. Any begun or closed binding must use terminal release instead.

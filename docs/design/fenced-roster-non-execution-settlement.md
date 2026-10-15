@@ -1,8 +1,8 @@
 # Fenced non-execution settlement after admission reply loss
 
-Design proposal v4 for [SDK #1280](https://github.com/openpacketcore/openpacketcore-sdk/issues/1280).
+Design v4 for [SDK #1280](https://github.com/openpacketcore/openpacketcore-sdk/issues/1280).
 Source baseline: `4b49fe5b39618af6f523e62f46fb62709212098b`.
-Status: v4 amendment awaiting review; v2 implemented.
+Status: v4, implemented.
 
 An admission that committed before its reply was lost must be settled using that
 exact admission. Non-execution becomes conclusive only after its execution
@@ -30,21 +30,26 @@ accepted work retains its existing disposition. Missing or unverifiable history
 remains unknown. All 30 durable slots may be held without preventing closure of
 absent members, terminal settlement or automatic release of those held rows.
 
-The registry contains at most one entry per binding awaiting a definitive
-admission outcome or terminal settlement. The adapter owns that lifecycle across
-caller cancellation. A definitive non-admission removes the registration. The
-identical retry that `NotTransmitted` permits registers the same binding again
-before resubmission; no provider call can exist for an admission that was never
-transmitted. An ambiguous admission retains its registration.
-After verifying either durable terminal receipt,
-release removes the registration and any retained row's settlement hold.
+The registry contains at most one entry per binding whose `admit` call may still
+return `Admitted`, or whose admitted roster awaits terminal settlement. The adapter
+owns that lifecycle across caller cancellation. Once `admit` returns anything
+other than `Admitted` (`NotTransmitted`, a rejection or `OutcomeUnknown`), the
+adapter discards the registration: only a returned `Admitted` issues prepare or
+execute authority, and readback or recovery never does, so a committed but
+unacknowledged admission settles its absent members without a registration, as
+after restart. The identical retry that `NotTransmitted` permits registers the
+same binding again before resubmission. Discard refuses a begun or closed binding;
+terminal release removes it instead.
+After verifying either durable terminal receipt or a compacted result as specified
+in step 6, release removes the registration and any retained row's settlement hold.
 Idempotent release allocates no entry. Delete the process-lifetime released map:
 no released binding or tombstone remains in the registry, so its size depends
 only on unsettled work, never the cumulative attach count. A delayed prepare
 fails because its registration is gone.
 
-After restart, an absent binding may have no registration. Fence may still
-report Closed: no execution authority survives restart, preparation requires a
+After restart, or once `admit` has returned without `Admitted`, an absent binding
+may have no registration. Fence may still report Closed: no execution authority
+survives restart or exists without a returned `Admitted`, preparation requires a
 live registration, and every begun binding remains durably retained until
 release. This recovery path creates no registration or execution authority.
 Before the SDK returns any terminal receipt or a verified compacted terminal-status

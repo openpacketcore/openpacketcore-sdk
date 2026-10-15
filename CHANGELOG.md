@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Verified compacted terminal results also authorize exact retained-roster
   release, so terminal payload expiry cannot strand settlement capacity.
   `opc-ipsec-xfrm` adds exact pre-admission registration, store-bound closure,
-  definitive non-admission discard and explicit retention release. Absence
+  discard after any admission result other than Admitted and explicit retention
+  release. Absence
   closure consumes no durable slot, released bindings retain no registry entry,
   and in-process store contention waits without abandoning accepted work.
   Its roster store format is now v2; crossing this change requires a fresh
