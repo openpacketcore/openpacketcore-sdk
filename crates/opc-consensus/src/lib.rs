@@ -18,6 +18,9 @@ pub mod profile;
 pub mod transport;
 pub mod voter_slots;
 
+#[cfg(feature = "dangerous-test-hooks")]
+pub mod test_runtime;
+
 /// The single consensus engine used by production-path SDK adapters.
 ///
 /// The machine-readable HA profile remains experimental until issue #143 is

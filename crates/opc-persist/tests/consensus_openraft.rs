@@ -3,6 +3,9 @@ mod management_audit_authority;
 #[path = "consensus_openraft/quorum_admission.rs"]
 mod quorum_admission;
 
+#[path = "consensus_openraft/scripted_election.rs"]
+mod scripted_election;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,9 +39,9 @@ const PLAINTEXT_CANARY: &[u8] = b"CONFIG-PLAINTEXT-MUST-NEVER-CROSS-RAFT";
 const PROVIDER_ENDPOINT_CANARY: &[u8] = b"hkms+unix:///must-not-cross-raft/provider.sock";
 const OPAQUE_HANDLE_CANARY: &[u8] = b"HKMS-OPAQUE-HANDLE-MUST-NOT-CROSS-RAFT";
 const RAW_KEY_MATERIAL_CANARY: &[u8] = &[0x55; 32];
-// Admit one complete resampled election after a split vote, followed by one
-// complete profiled operation. Cluster formation and survivor-election
-// evidence must follow the shared timing authority.
+// Existing functional fixture watchdog. Randomized elections do not have a
+// fixed maximum number of split rounds; scripted failover below derives its
+// protocol bound from the actual lease, RNG samples, and ticker phases.
 const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -66,6 +69,7 @@ struct LoopbackPeer {
     forward_response_ready: Arc<tokio::sync::Notify>,
     release_forward_response: Arc<tokio::sync::Notify>,
     captured_payloads: Arc<StdMutex<Vec<Vec<u8>>>>,
+    election_vote: Arc<StdMutex<Option<Arc<scripted_election::FirstVote>>>>,
 }
 
 impl LoopbackPeer {
@@ -82,6 +86,7 @@ impl LoopbackPeer {
             forward_response_ready: Arc::new(tokio::sync::Notify::new()),
             release_forward_response: Arc::new(tokio::sync::Notify::new()),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
+            election_vote: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -186,9 +191,24 @@ impl ConsensusPeer for LoopbackPeer {
         if required.is_some() && required != compatibility {
             return Err(ConsensusPeerError::ScopeMismatch);
         }
+        let election_vote = self
+            .election_vote
+            .lock()
+            .expect("election vote gate")
+            .clone();
+        if let Some(gate) = &election_vote {
+            if family == ConsensusRpcFamily::Vote {
+                gate.before_delivery(&request).await;
+            }
+        }
         let response = handler
             .handle_with_compatibility(sender, request, compatibility)
             .await;
+        if let Some(gate) = &election_vote {
+            if family == ConsensusRpcFamily::Vote {
+                gate.after_delivery(&response);
+            }
+        }
         if family == ConsensusRpcFamily::ForwardMutation
             && self.pause_forward_response.load(Ordering::SeqCst)
         {
@@ -251,6 +271,17 @@ impl ThreeNodeCluster {
         policy: Option<
             &dyn Fn() -> opc_persist::audit_authority::continuity::AuditContinuityPolicy,
         >,
+    ) -> Self {
+        Self::build_with_election_scripts(audit_key_material, lifecycle, policy, None).await
+    }
+
+    async fn build_with_election_scripts(
+        audit_key_material: [[u8; 32]; 3],
+        lifecycle: FixtureStorage,
+        policy: Option<
+            &dyn Fn() -> opc_persist::audit_authority::continuity::AuditContinuityPolicy,
+        >,
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
     ) -> Self {
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
@@ -317,24 +348,30 @@ impl ThreeNodeCluster {
                 })
                 .collect();
             let snapshots = directory.path().join(format!("snapshots-{index}"));
-            let store = if let Some(policy) = policy {
-                ConsensusConfigStore::open_with_audit_continuity(
-                    topology,
-                    backend,
-                    snapshots,
-                    peers,
-                    policy(),
-                )
-                .await
-            } else {
-                ConsensusConfigStore::open_with_operation_timeout(
-                    topology,
-                    backend,
-                    snapshots,
-                    peers,
-                    Duration::from_secs(3),
-                )
-                .await
+            let open = async {
+                if let Some(policy) = policy {
+                    ConsensusConfigStore::open_with_audit_continuity(
+                        topology,
+                        backend,
+                        snapshots,
+                        peers,
+                        policy(),
+                    )
+                    .await
+                } else {
+                    ConsensusConfigStore::open_with_operation_timeout(
+                        topology,
+                        backend,
+                        snapshots,
+                        peers,
+                        Duration::from_secs(3),
+                    )
+                    .await
+                }
+            };
+            let store = match scripts {
+                Some(scripts) => scripts[index].scope(open).await,
+                None => open.await,
             }
             .expect("store");
             stores.push(store);
@@ -2372,44 +2409,18 @@ async fn fresh_fleet_rejects_mismatched_audit_key_compatibility() {
     cluster.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
-    let cluster = ThreeNodeCluster::start().await;
-    let first_id = TxId::new();
-    cluster.stores[0]
-        .append_attested_commit(attested(commit(first_id, None, 1, 10), audit(first_id)))
-        .await
-        .expect("replicated first commit");
-
-    let old_leader = cluster.leader();
-    let old_leader_id = cluster.stores[old_leader].status().node_id;
-    let old_term = cluster.stores[old_leader].status().term;
-    cluster.isolate(old_leader);
-    let survivors = (0..3)
-        .filter(|index| *index != old_leader)
-        .collect::<Vec<_>>();
-    let (new_leader_id, new_term) = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-        loop {
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
-                let new_term = statuses.first().expect("survivor status").term;
-                if new_leader_id != old_leader_id
-                    && new_term > old_term
-                    && statuses.iter().all(|status| {
-                        status.leader_id == Some(new_leader_id) && status.term == new_term
-                    })
-                {
-                    return (new_leader_id, new_term);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("survivor leader election");
+    let scripted_election::ElectedCluster {
+        cluster,
+        first_id,
+        old_leader,
+        old_leader_id,
+        old_term,
+        survivors,
+        new_leader_id,
+        new_term,
+    } = scripted_election::schedule::with_frozen_time(scripted_election::elect_survivor()).await;
     assert_ne!(new_leader_id, old_leader_id);
     assert!(new_term > old_term);
 

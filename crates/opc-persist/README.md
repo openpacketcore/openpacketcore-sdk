@@ -391,6 +391,14 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
 
 ## Verification
 
+The lost-response failover scenario scripts election samples and first-round
+vote delivery. It advances every protocol tick to the bound derived from the
+configured lease and sampled election timeout, then checks both survivors agree
+on the higher-term leader. A separate wall-clock watchdog bounds real disk work
+while protocol time is frozen. Normal time resumes for the existing response
+replay, complete four-record history, and replica-convergence assertions. Other
+fixtures retain their existing deadlines and election behavior.
+
 - Openraft config-store coverage:
   `cargo test --locked -p opc-persist --test consensus_openraft`
 - Provider-backed application-encryption boundary:

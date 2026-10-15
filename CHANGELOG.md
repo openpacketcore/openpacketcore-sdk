@@ -756,6 +756,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can perform SRV fallback. Keep unsupported explicit protocols and extended
   records distinct from absence. (#1287)
 
+- `opc-persist` and `opc-consensus`: make the lost-response failover fixture
+  deterministic with scripted election samples, first-round vote delivery, and
+  bounds computed from the configured lease and tick schedule. Add a separate
+  automatic one-split regression preserving the complete replicated state;
+  production election behavior and uncontrolled deadlines are unchanged. (#1258)
+
+- CI: attribute new kernel lifecycle namespaces to their owning processes so
+  unrelated host services do not cause false cleanup failures. Keep leaked
+  qualification namespaces, orphaned descendants and host-visible residue
+  fatal, with process ownership evidence retained for review. Keep the owner
+  alive through bounded termination and reaping on command completion,
+  SIGTERM, SIGINT and SIGHUP, including privileged descendants; successful
+  disposal does not erase the original failure. Retry disappearing processes
+  during disposal and ignore inventory errors from exited tasks. (#1279)
+
 - `opc-session-net` tests: reserve scope listener sockets across endpoint
   replacement and full fleet reopen so restarted ephemeral consensus listeners
   cannot take their saved ports. Keep bind-error diagnostics and exercise

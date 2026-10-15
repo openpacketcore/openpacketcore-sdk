@@ -144,6 +144,18 @@ target is a consumer responsibility and must occur only after that success.
 Openraft still supplies every quorum, leadership, term, commit, and apply
 signal; these helpers are scheduling and gating, not a parallel authority.
 
+## Deterministic election fixtures
+
+Election regression tests control raw RNG samples and vote delivery while the
+unchanged engine performs each automatic campaign. Their protocol bounds include
+the committed-vote lease, sampled timeout, and heartbeat-derived tick rounding.
+The one-split schedule verifies both survivors retain `[41, 42]`; it is not a
+fixed failover guarantee for randomized elections, which can split repeatedly.
+The `dangerous-test-hooks` feature exposes a scoped Tokio runtime adapter for
+these fixtures. Outside a script it uses Tokio's ordinary RNG, and production
+dependencies do not enable this feature. It uses the engine's existing rand 0.8
+version so scripted samples pass through the same range sampler.
+
 ## Interim source-build gate
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
