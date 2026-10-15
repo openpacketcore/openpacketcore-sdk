@@ -207,7 +207,7 @@ async fn fenced_non_execution_established_release_discards_reconcile_held_before
     }
     let gate = Arc::new(SettlementObserveGate::default());
     *fixture.provider.reconcile_gate.lock().unwrap() = Some(Arc::clone(&gate));
-    let conclusive_before = fixture.client.diagnostics().member_conclusive;
+    assert_eq!(second.retained_member_proof_count_for_test().unwrap(), 0);
     let mut held_member = second.member(MemberOrdinal::new(0).unwrap()).unwrap();
     let pending = tokio::spawn({
         let client = fixture.client.clone();
@@ -308,8 +308,8 @@ async fn fenced_non_execution_established_release_discards_reconcile_held_before
         "the signed absence observed after release cannot become a member proof"
     );
     assert_eq!(
-        fixture.client.diagnostics().member_conclusive,
-        conclusive_before,
+        second.retained_member_proof_count_for_test().unwrap(),
+        0,
         "terminal invalidation retains no new NotApplied proof"
     );
     assert_eq!(installs.load(Ordering::SeqCst), 2);

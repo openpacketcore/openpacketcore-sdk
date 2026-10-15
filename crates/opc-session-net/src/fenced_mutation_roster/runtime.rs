@@ -1820,6 +1820,20 @@ impl RegistrationAdmissionProvenance {
 }
 
 impl Registration {
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+    pub(crate) fn retained_member_proof_count_for_test(&self) -> Result<usize, ExecutorError> {
+        self.local
+            .lock()
+            .map(|local| {
+                local
+                    .first_conclusive
+                    .iter()
+                    .filter(|proof| proof.is_some())
+                    .count()
+            })
+            .map_err(|_| ExecutorError::OutcomeUnknown)
+    }
+
     fn issue(
         request: RegistrationRequest,
         backend_registration: BackendRegistration,

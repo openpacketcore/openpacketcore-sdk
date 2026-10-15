@@ -489,6 +489,7 @@ async fn compacted_terminal_releases_full_store(status_readback: bool) {
         executor.prepare(&active, 0).await.unwrap(),
         CallResult::PreparedNotRun
     ));
+    let active = recovered(executor.admission_status(request.clone()).await.unwrap());
     let second = recovered(executor.admission_status(request).await.unwrap());
     let (next_request, next_provider) = capacity_case(&actor, &store, 30).await;
     let next = &next_provider.members[0];
