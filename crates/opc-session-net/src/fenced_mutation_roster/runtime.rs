@@ -1655,6 +1655,8 @@ impl RecoveryRequest {
     fn resolve_for_admission(mut self, admission: &Admission) -> Result<Self, ExecutorError> {
         if self.lookup.roster_id() != admission.roster_id()
             || self.authority.ingress_scope() != self.lookup.ingress_scope()
+            || self.original_owner != *admission.logical_owner()
+            || self.original_admission_fence != admission.admission_fence()
         {
             return Err(ExecutorError::InvalidRegistration);
         }
