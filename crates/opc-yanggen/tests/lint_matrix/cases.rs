@@ -202,7 +202,9 @@ impl Case {
         // A config-only expanded case deliberately has no state anchor. A state
         // row necessarily also enables the state profile; uint64 enables both.
         let anchor = match self.profile {
-            Profile::Legacy => "",
+            Profile::Legacy => {
+                "container settings { leaf enabled { type boolean; } } container status { config false; leaf uptime { type uint32; } }"
+            }
             Profile::Expanded => "leaf marker { type uint8; }",
             Profile::State => {
                 "container telemetry { config false; list sample { key name; leaf name { type string; } } }"

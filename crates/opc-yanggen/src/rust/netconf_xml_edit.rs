@@ -197,7 +197,6 @@ fn apply_children_fn(
     nodes_by_path: &NodeIndex<'_>,
     input: &CanonicalInput,
 ) -> Result<TokenStream, RustGenerationError> {
-    let has_state_lists = super::has_state_keyed_lists(input);
     let fn_ident = format_ident!("apply_children_{}", nodes_by_path.helper_name(&node.path));
     let type_ident = format_ident!("{}", nodes_by_path.type_name(node));
 
@@ -318,7 +317,7 @@ fn apply_children_fn(
                 } else {
                     quote! { #child_type_ident::default() }
                 };
-                let default_constructor = if has_state_lists && !is_boxed {
+                let default_constructor = if !is_boxed {
                     quote! { #child_type_ident::default }
                 } else {
                     quote! { || #new_expr }
@@ -456,12 +455,11 @@ fn apply_children_fn(
         }
     };
 
-    let rejects_every_child = has_state_lists
-        && node.child_paths.iter().all(|path| {
-            nodes_by_path
-                .get(path)
-                .is_some_and(|child| child.kind == SchemaNodeKind::Leaf && !child.config)
-        });
+    let rejects_every_child = node.child_paths.iter().all(|path| {
+        nodes_by_path
+            .get(path)
+            .is_some_and(|child| child.kind == SchemaNodeKind::Leaf && !child.config)
+    });
     let value_param = format_ident!(
         "{}",
         if !rejects_every_child
@@ -1070,11 +1068,7 @@ fn numeric_range_check_expr(
             let (min, max) = (interval.min as i64, interval.max as i64);
             (quote! { #min }, quote! { #max })
         };
-        if extended {
-            quote! { (#min..=#max).contains(&numeric_value) }
-        } else {
-            quote! { (#min <= numeric_value && numeric_value <= #max) }
-        }
+        quote! { (#min..=#max).contains(&numeric_value) }
     });
 
     let integer_type = if extended {

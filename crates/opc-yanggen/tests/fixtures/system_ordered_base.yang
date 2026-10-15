@@ -1,0 +1,50 @@
+
+module opc-test {
+  yang-version 1.1;
+  namespace "urn:opc:test";
+  prefix test;
+
+  import opc-annotations {
+    prefix opc;
+    revision-date 2026-01-01;
+  }
+
+  revision 2026-06-28 {
+    description "Initial test model.";
+  }
+
+  container system {
+    description "Config root.";
+
+    leaf enabled {
+      type boolean;
+      default "true";
+    }
+
+    leaf secret {
+      type string;
+      opc:data-class "security-secret";
+    }
+
+    list peer {
+      key "name";
+      unique "port";
+
+      leaf name {
+        type string;
+      }
+
+      leaf port {
+        type uint16;
+      }
+    }
+
+    container state {
+      config false;
+
+      leaf uptime {
+        type uint32;
+      }
+    }
+  }
+}

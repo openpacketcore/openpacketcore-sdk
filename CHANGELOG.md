@@ -507,8 +507,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves defaulted leaf presence. gNMI list reads emit one update per entry
   in configured order, with keys in each path; entry and leaf reads retain their
   keyed paths, and an empty list emits nothing. Duplicate keys and user-ordered
-  leaf-list values are rejected, including sensitive leaf-lists. Models without
-  user-ordered configuration collections generate byte-identical output.
+  leaf-list values are rejected, including sensitive leaf-lists.
   System-ordered keyed lists below a user-ordered keyed list now accept list
   arrays for Update and Merge, so merging a user-ordered row can retain its
   nested system-list entries. Other system-list paths retain their existing

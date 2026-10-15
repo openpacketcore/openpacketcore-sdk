@@ -319,6 +319,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     // The patch.rs pin retains #1268 safe diagnostics. Read renderer pins include
     // #1269 authorized projection and #1270 canonical gNMI key literals. Every
     // generated file remains covered by its complete-file assertion.
+    // All pins also include #1274 generated-lint repairs and shared statement formatting.
     let expected = [
         (
             "gnmi_json.rs",

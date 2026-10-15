@@ -156,14 +156,10 @@ impl<'a> NodeIndex<'a> {
                     .map(clean_segment)
                     .map(|s| {
                         let name = to_snake_case(s);
-                        if expanded_profile {
-                            name.split('_')
-                                .filter(|s| !s.is_empty())
-                                .collect::<Vec<_>>()
-                                .join("_")
-                        } else {
-                            name
-                        }
+                        name.split('_')
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("_")
                     })
                     .collect::<Vec<_>>()
                     .join("_")
@@ -313,12 +309,6 @@ fn has_user_ordered_collections(input: &CanonicalInput) -> bool {
         is_user_ordered(node)
             && (node.kind == SchemaNodeKind::LeafList
                 || (node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()))
-    })
-}
-
-fn has_state_keyed_lists(input: &CanonicalInput) -> bool {
-    input.nodes.iter().any(|node| {
-        !node.config && node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty()
     })
 }
 
