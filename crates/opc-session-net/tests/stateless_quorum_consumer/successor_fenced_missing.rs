@@ -167,6 +167,9 @@ async fn public_v2_verified_missing_excludes_delayed_original_admission_after_fu
         assert_eq!(publication.publish_calls.load(Ordering::SeqCst), 0);
         shutdown.shutdown().await;
         server.abort_and_wait().await;
+        // The wrapper owns the old consumer service and its storage handle.
+        // Release that owner before the fleet reopens the same durable files.
+        drop(transport);
         if !reopened {
             fleet = fleet.restart_all().await;
         }
