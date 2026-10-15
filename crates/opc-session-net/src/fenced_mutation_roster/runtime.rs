@@ -7307,7 +7307,7 @@ mod production_runtime_cut_matrix_tests {
             if let Some((history_epoch, tombstone)) = state.compacted_terminal.clone() {
                 return Ok(TerminalStatusDecision::Compacted {
                     history_epoch,
-                    tombstone,
+                    tombstone: Box::new(tombstone),
                 });
             }
             Ok(match state.committed.clone() {
