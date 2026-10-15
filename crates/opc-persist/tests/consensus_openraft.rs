@@ -322,7 +322,6 @@ impl ThreeNodeCluster {
         scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
         third_node_offset: Duration,
     ) -> Self {
-        let started = tokio::time::Instant::now();
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
         let members = nodes.into_iter().collect::<BTreeSet<_>>();
@@ -348,20 +347,7 @@ impl ThreeNodeCluster {
         let mut stores = Vec::new();
         for (index, topology) in topologies.iter().cloned().enumerate() {
             if index == 2 && !third_node_offset.is_zero() {
-                let config = opc_consensus::durable_openraft_config(
-                    opc_consensus::DurableOpenraftDomain::ConfigurationState,
-                )
-                .unwrap();
-                let tick = Duration::from_millis(config.heartbeat_interval * 3 / 2);
-                for script in &scripts.expect("offset needs election scripts")[..2] {
-                    scripted_election::schedule::tick_registered(
-                        &mut script.sleeps(),
-                        started,
-                        tick,
-                    )
-                    .await;
-                }
-                tokio::time::advance(third_node_offset).await;
+                tokio::time::sleep(third_node_offset).await;
             }
             let backend = if matches!(lifecycle, FixtureStorage::RetainedRepair) {
                 SqliteBackend::provision_config_member_repair(
@@ -1409,110 +1395,138 @@ async fn retained_history_floor_limits_and_outcomes_survive_explicit_reopen() {
 
 #[tokio::test(start_paused = true)]
 async fn history_retention_survives_natural_leader_change_and_member_snapshot_install() {
-    let (mut cluster, ids, decision, request, original_leader, replacement) =
-        scripted_election::schedule::with_frozen_time(async {
-            let schedule = retention_election::RetentionElection::new().await;
-            let cluster = ThreeNodeCluster::build_with_election_offset(
-                [[0x55; 32]; 3],
-                FixtureStorage::RetainedNew,
-                None,
-                Some(&schedule.scripts),
-                schedule.offset,
-            )
-            .await;
-            let (a, b, c) = tokio::join!(
-                cluster.stores[0].initialize_cluster(),
-                cluster.stores[1].initialize_cluster(),
-                cluster.stores[2].initialize_cluster()
-            );
-            a.expect("first");
-            b.expect("second");
-            c.expect("third");
-            while !cluster
-                .stores
-                .iter()
-                .all(|store| store.status().leader_id == Some(cluster.stores[0].status().node_id))
-            {
-                tokio::task::yield_now().await;
-            }
-            cluster.wait_ready().await;
-            let original_leader = cluster.leader();
-            let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
-            for index in 0..4 {
-                cluster.stores[original_leader]
-                    .append_attested_commit(attested(
-                        commit(
-                            ids[index],
-                            index.checked_sub(1).map(|previous| ids[previous]),
-                            index as u64 + 1,
-                            0x62,
-                        ),
-                        vec![],
-                    ))
-                    .await
-                    .expect("quorum configuration");
-            }
-            let decision = retention(ids[3], 4, 3, 3, 1_048_576);
-            let request = ConfigConsensusRequestId::from_bytes([0xEB; 16]);
-            cluster.stores[original_leader]
-                .retain_history_idempotent(request, decision.clone())
-                .await
-                .expect("quorum retention");
-            // Real replayed commands move Raft beyond its production retained-log
-            // window without inflating canonical history or weakening the profile.
-            for _ in 0..opc_consensus::DURABLE_OPENRAFT_PROFILE.retained_logs + 16 {
-                cluster.stores[original_leader]
-                    .retain_history_idempotent(request, decision.clone())
-                    .await
-                    .expect("stable retention outcome");
-            }
-            cluster.wait_ready().await;
-            for store in &cluster.stores {
-                store.trigger_snapshot().await.expect("production snapshot");
-            }
-            tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-                loop {
-                    let mut complete = true;
-                    for index in 0..3 {
-                        let observer = rusqlite::Connection::open(cluster.database_path(index))
-                            .expect("snapshot observation");
-                        let purged: bool = observer
+    // Capture Tokio's timer-grid origin, then run all setup on normal time.
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (ticks, _tick_observer) = retention_election::ticks::ProcessedTicks::install();
+    let mut schedule = retention_election::RetentionElection::new(runtime_origin).await;
+    let mut cluster = ThreeNodeCluster::build_with_election_offset(
+        [[0x55; 32]; 3],
+        FixtureStorage::RetainedNew,
+        None,
+        Some(&schedule.scripts),
+        schedule.offset,
+    )
+    .await;
+    let (a, b, c) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster()
+    );
+    a.expect("first");
+    b.expect("second");
+    c.expect("third");
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        while !cluster
+            .stores
+            .iter()
+            .all(|store| store.status().leader_id == Some(cluster.stores[0].status().node_id))
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial leader agreement");
+    cluster.wait_ready().await;
+    let original_leader = cluster.leader();
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..4 {
+        cluster.stores[original_leader]
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|previous| ids[previous]),
+                    index as u64 + 1,
+                    0x62,
+                ),
+                vec![],
+            ))
+            .await
+            .expect("quorum configuration");
+    }
+    let decision = retention(ids[3], 4, 3, 3, 1_048_576);
+    let request = ConfigConsensusRequestId::from_bytes([0xEB; 16]);
+    cluster.stores[original_leader]
+        .retain_history_idempotent(request, decision.clone())
+        .await
+        .expect("quorum retention");
+    // Real replayed commands move Raft beyond its production retained-log
+    // window without inflating canonical history or weakening the profile.
+    for _ in 0..opc_consensus::DURABLE_OPENRAFT_PROFILE.retained_logs + 16 {
+        cluster.stores[original_leader]
+            .retain_history_idempotent(request, decision.clone())
+            .await
+            .expect("stable retention outcome");
+    }
+    cluster.wait_ready().await;
+    for store in &cluster.stores {
+        store.trigger_snapshot().await.expect("production snapshot");
+    }
+    let observers: Vec<_> = (0..3)
+        .map(|index| {
+            rusqlite::Connection::open(cluster.database_path(index)).expect("snapshot observation")
+        })
+        .collect();
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            let mut complete = true;
+            for observer in &observers {
+                let purged: bool = observer
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM config_raft_purged WHERE log_index > 0)",
                         [],
                         |row| row.get(0),
                     )
                     .expect("purged prefix");
-                        complete &= purged;
-                    }
-                    if complete {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
+                complete &= purged;
+            }
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("actual production log compaction");
+    drop(observers);
+    tokio::time::pause();
+    let frozen_started = std::time::Instant::now();
+    let replacement = scripted_election::schedule::with_frozen_time(async {
+        schedule.settle(&ticks).await;
+        // One real replicated command renews both followers' committed votes
+        // at the paused instant, after setup and all engine-side purge work.
+        let before = cluster.stores[original_leader].status().applied_index;
+        cluster.stores[original_leader]
+            .retain_history_idempotent(request, decision.clone())
             .await
-            .expect("actual production log compaction");
-            let old_id = cluster.stores[original_leader].status().node_id;
-            let old_term = cluster.stores[original_leader].status().term;
-            cluster.isolate(original_leader);
-            cluster.stores[original_leader]
-                .shutdown()
-                .await
-                .expect("old leader stopped");
-            let replacement = schedule
-                .elect(&cluster, original_leader, old_id, old_term)
-                .await;
-            (
-                cluster,
-                ids,
-                decision,
-                request,
-                original_leader,
-                replacement,
-            )
-        })
-        .await;
+            .expect("retention replay anchors follower votes");
+        while cluster.stores[original_leader].status().applied_index <= before {
+            tokio::task::yield_now().await;
+        }
+        let anchor = cluster.stores[original_leader].status().applied_index;
+        while !cluster
+            .stores
+            .iter()
+            .all(|store| store.status().applied_index >= anchor)
+        {
+            tokio::task::yield_now().await;
+        }
+        let old_id = cluster.stores[original_leader].status().node_id;
+        let old_term = cluster.stores[original_leader].status().term;
+        cluster.isolate(original_leader);
+        cluster.stores[original_leader]
+            .shutdown()
+            .await
+            .expect("old leader stopped");
+        schedule
+            .elect(&cluster, original_leader, old_id, old_term, &ticks)
+            .await
+    })
+    .await;
+    eprintln!(
+        "retention election frozen phase wall time: {:?}",
+        frozen_started.elapsed()
+    );
     cluster.stores[replacement]
         .retain_history_idempotent(request, decision.clone())
         .await

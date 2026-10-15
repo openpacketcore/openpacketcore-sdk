@@ -733,7 +733,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-persist` tests: make retained-history leader failover deterministic with
   scripted election samples and vote order. Assert the configured timer bound
   for one split round while preserving history retention and member snapshot
-  installation checks. (#1294)
+  installation checks. Keep setup on normal time and freeze only the election,
+  observing processed engine ticks before advancing its clock. (#1294)
 
 - `opc-session-store` tests: isolate functional asynchronous snapshot install,
   rejoin, persistence drain, replacement quarantine, and certification calls

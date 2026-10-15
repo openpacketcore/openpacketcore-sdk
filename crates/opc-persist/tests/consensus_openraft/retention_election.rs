@@ -11,6 +11,9 @@ use scripted_election::schedule::{self, ElectionSchedule};
 use tokio::sync::{watch, Barrier};
 use tokio::time::Instant;
 
+#[path = "../../../opc-consensus/tests/reelection/ticks.rs"]
+pub(super) mod ticks;
+
 #[derive(Clone)]
 struct Exchange {
     source: ConfigConsensusNodeId,
@@ -82,11 +85,12 @@ pub(super) struct RetentionElection {
     pub scripts: [ElectionRngScript; 3],
     pub offset: Duration,
     started: Instant,
+    runtime_origin: Instant,
     schedule: ElectionSchedule,
 }
 
 impl RetentionElection {
-    pub(super) async fn new() -> Self {
+    pub(super) async fn new(runtime_origin: Instant) -> Self {
         let config = durable_openraft_config(DurableOpenraftDomain::ConfigurationState).unwrap();
         // The same raw sample and ticker offset as the sibling one-split test.
         let sample = 3_u64 << 62;
@@ -106,8 +110,85 @@ impl RetentionElection {
             ],
             offset: schedule.tick / 6,
             started: Instant::now(),
+            runtime_origin,
             schedule,
         }
+    }
+
+    fn last_tick(&self, index: usize) -> (Instant, Instant) {
+        // These are the two followers: they have no replication worker sleeps.
+        // On normal time, recording sleep_until occurs after its deadline was
+        // computed, so deadline - recorded_at is slightly less than one tick.
+        self.scripts[index]
+            .sleeps()
+            .borrow()
+            .last()
+            .copied()
+            .expect("registered ticker")
+    }
+
+    async fn advance_to(&self, at: Instant, ticks: &ticks::ProcessedTicks) {
+        // Tokio rounds deadlines up to milliseconds from runtime creation.
+        // Setup used normal time, so its recorded deadlines need not lie on
+        // that grid. Align the healthy ticker wakes before deriving phases.
+        let millis = (at - self.runtime_origin).as_nanos().div_ceil(1_000_000);
+        let at = self.runtime_origin
+            + Duration::from_millis(u64::try_from(millis).expect("finite fixture clock"));
+        let due: Vec<_> = (1..3)
+            .filter(|index| self.last_tick(*index).1 <= at)
+            .map(|index| (index, self.scripts[index].sleeps().borrow().len()))
+            .collect();
+        tokio::time::advance(at - Instant::now()).await;
+        for (index, sent_ticks) in due {
+            schedule::tick_registered(&mut self.scripts[index].sleeps(), at, self.schedule.tick)
+                .await;
+            ticks.wait(index as u64 + 1, at, sent_ticks).await;
+        }
+    }
+
+    /// Setup ran on real time. Drain any queued ticks, then legally delay one
+    /// ticker wake while the leader is healthy to retain the one-split phase
+    /// spacing. Every advance waits for the follower cores, not just tickers.
+    /// The command after this method anchors both follower leases at one time.
+    pub(super) async fn settle(&mut self, ticks: &ticks::ProcessedTicks) {
+        // A deadline just before the pause can still occupy the next wheel
+        // slot. Reach that slot before waiting for an overdue tick to drain.
+        self.advance_to(Instant::now(), ticks).await;
+        let now = Instant::now();
+        for index in 1..3 {
+            self.scripts[index]
+                .sleeps()
+                .wait_for(|sleeps| sleeps.last().is_some_and(|(_, deadline)| *deadline > now))
+                .await
+                .expect("ticker settled after pause");
+            let (at, _) = self.last_tick(index);
+            let registrations = self.scripts[index].sleeps().borrow().len();
+            if registrations > 1 {
+                ticks.wait(index as u64 + 1, at, registrations - 1).await;
+            }
+        }
+        // First make node 2's next tick precede node 3's. Deferring the
+        // earlier wake by less than one tick then gives the desired spacing.
+        if self.last_tick(2).1 < self.last_tick(1).1 {
+            self.advance_to(self.last_tick(2).1, ticks).await;
+        }
+        let first = self.last_tick(1).1;
+        let second = self.last_tick(2).1;
+        assert!(
+            first < second,
+            "independently registered normal-clock tickers"
+        );
+        if second - first >= self.offset {
+            self.advance_to(second - self.offset, ticks).await;
+            self.advance_to(second, ticks).await;
+        } else {
+            self.advance_to(first, ticks).await;
+            self.advance_to(first + self.offset, ticks).await;
+        }
+        // Derive phases from the real registrations, including any wake delay.
+        self.started = self.last_tick(1).0;
+        assert_eq!(self.last_tick(2).0 - self.started, self.offset);
+        assert_eq!(Instant::now(), self.last_tick(2).0);
     }
 
     pub(super) async fn elect(
@@ -116,16 +197,18 @@ impl RetentionElection {
         original_leader: usize,
         old_id: ConfigConsensusNodeId,
         old_term: u64,
+        ticks: &ticks::ProcessedTicks,
     ) -> usize {
         assert_eq!(original_leader, 0);
         let isolated = Instant::now();
         assert_eq!(isolated - self.started, self.offset);
-        let first = self.schedule.campaign(self.offset, Duration::ZERO, true);
-        let second = self.schedule.campaign(self.offset, self.offset, true);
-        let retry = self.schedule.campaign(first, Duration::ZERO, false);
+        let phases = [self.last_tick(1).0, self.last_tick(2).0].map(|at| at - self.started);
+        let first = self.schedule.campaign(self.offset, phases[0], true);
+        let second = self.schedule.campaign(self.offset, phases[1], true);
+        let retry = self.schedule.campaign(first, phases[0], false);
         let election_bound = retry - self.offset;
         assert!(election_bound > CLUSTER_TRANSITION_TIMEOUT);
-        assert!(retry < self.schedule.campaign(second, self.offset, false));
+        assert!(retry < self.schedule.campaign(second, phases[1], false));
         assert!(
             second - first < DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(ConsensusRpcFamily::Vote)
         );
@@ -141,17 +224,17 @@ impl RetentionElection {
         let drive = async {
             let mut instants = vec![(self.offset + CLUSTER_TRANSITION_TIMEOUT, None)];
             for index in 1..3 {
-                let phase = if index == 2 {
-                    self.offset
-                } else {
-                    Duration::ZERO
-                };
+                let phase = phases[index - 1];
                 schedule::tick_registered(
                     &mut self.scripts[index].sleeps(),
                     self.started + phase,
                     self.schedule.tick,
                 )
                 .await;
+                let sent_ticks = self.scripts[index].sleeps().borrow().len() - 1;
+                ticks
+                    .wait(index as u64 + 1, self.started + phase, sent_ticks)
+                    .await;
                 let mut tick = phase + self.schedule.tick;
                 while tick <= retry {
                     instants.push((tick, Some(index)));
@@ -160,6 +243,9 @@ impl RetentionElection {
             }
             instants.sort_unstable();
             for (tick, index) in instants {
+                // Count before the advance: the winning campaign can create
+                // replication-worker sleeps after this final follower tick.
+                let sent_ticks = index.map(|index| self.scripts[index].sleeps().borrow().len());
                 tokio::time::advance(self.started + tick - Instant::now()).await;
                 if let Some(index) = index {
                     schedule::tick_registered(
@@ -168,6 +254,9 @@ impl RetentionElection {
                         self.schedule.tick,
                     )
                     .await;
+                    ticks
+                        .wait(index as u64 + 1, self.started + tick, sent_ticks.unwrap())
+                        .await;
                 } else {
                     // The former aggregate wait expires before this legal
                     // schedule can win. Both real split votes remain denied.
@@ -199,7 +288,11 @@ impl RetentionElection {
                         .borrow()
                         .iter()
                         .all(|reply| !reply.response.vote_granted));
-                    eprintln!("retention election: real split at {:?}/{:?}; old guard {:?}; computed bound {:?}", first, second, CLUSTER_TRANSITION_TIMEOUT, election_bound);
+                    eprintln!(
+                        "retention election: real split at {first:?}/{second:?}; \
+                         old guard {CLUSTER_TRANSITION_TIMEOUT:?}; \
+                         computed bound {election_bound:?}"
+                    );
                 }
             }
         };

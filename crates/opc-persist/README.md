@@ -398,11 +398,19 @@ on the higher-term leader. A separate wall-clock watchdog bounds real disk work
 while protocol time is frozen. Normal time resumes for the existing response
 replay, complete four-record history, and replica-convergence assertions.
 
-The retained-history snapshot-repair scenario scripts one split vote and the
-following automatic campaign. It checks both denied votes, the successful vote,
-and the exact election bound computed from the configured timers and ticker
-phases. Normal time resumes for its original history-floor, outcome-replay, and
-member snapshot-installation checks.
+The retained-history snapshot-repair scenario runs formation, retention commands,
+snapshots, and compaction on normal time with their original operation and wait
+bounds. The runtime starts paused only to record its timer-grid origin and resumes
+before any setup. After compaction it pauses again, settles the tickers while the
+leader is healthy, and re-anchors both followers' votes with one replicated
+retention replay. The election uses recorded ticker phases to compute the bound
+for one split vote and the following automatic campaign. Each clock advance waits
+for the affected cores to process every queued tick, including its sequence count;
+the test checks both denied votes, the successful vote, and the exact bound.
+Settling accounts for Tokio's millisecond timer grid. The unchanged 30-second wall-clock
+watchdog covers only this short frozen phase, whose duration is reported. Normal
+time resumes for the original history-floor, outcome-replay, and member
+snapshot-installation checks.
 
 - Openraft config-store coverage:
   `cargo test --locked -p opc-persist --test consensus_openraft`
