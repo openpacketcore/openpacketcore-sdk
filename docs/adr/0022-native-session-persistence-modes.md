@@ -649,6 +649,53 @@ configuration cannot silently turn a durable-readiness declaration into a
 weaker persistence claim. Products select the storage mode and mode-aware
 traffic gate explicitly; they do not mint SDK authority from counters.
 
+## Live log admission
+
+The SDK holds ordinary new log growth at a live high-water window of 262,144
+rows. The retained gauge is the distance from the engine's published purge
+frontier to its current last log index, including index zero when no frontier
+exists. Queued and accepted growth reserves capacity until actual engine
+completion and a covering observation. A caller timeout or cancellation cannot
+recycle accepted work. A definite non-append rejection releases its reservation.
+Absolute log indices, completed-operation counts and elapsed service lifetime
+are never admission budgets; progress reuses the same window.
+
+A leader waits before taking an execution credit and keeps the original
+operation deadline. It returns the existing Unavailable outcome if live
+capacity does not recover in time. A follower refuses new ordinary entries
+before submitting them to the engine. Heartbeats, conflict repair, snapshot
+installation and authenticated recovery/membership control remain available.
+A mixed repair/growth append can acknowledge only its admitted prefix using the
+existing PartialSuccess response. Scheduling priority alone does not exempt
+ordinary growth.
+
+The engine owns snapshot construction, transfer and purge. If an old stalled
+build finishes after ordinary commits have stopped at the window, the SDK
+requests a successor while pressure remains and at least one snapshot interval
+has been applied since the selected snapshot. It retries at most once per
+second, because an active build can ignore a request. Quarantined Async voters
+do not start this admission maintenance; activation wakes the observer.
+Releasing a stalled build or transfer clears backpressure without an operator
+trigger or a restart.
+
+`ConsensusSessionStore::log_pressure_snapshot()` exposes `retained_rows`,
+`pending_entries`, `entries_since_snapshot` and `high_water_rows`, with independent
+typed retained and snapshot pressure levels. Levels are Normal below half W,
+Elevated at half W, High at three quarters W, and AtWindow at W. Transition
+warnings report these gauges, and a return to Normal clears the warning.
+
+The initial window reserves three quarters of the 1,048,576-row last defence.
+Workload sizing must satisfy W >= K + N + r * (build_time + transfer_time) with
+margin and W <= 786,432, subject to the retained-row memory budget. With the
+fixed K = 1,024 and N = 4,096, 262,144 rows allow approximately 654 seconds at
+393 entries per second after K + N. The idempotent stall regressions establish
+admission and recovery correctness at the full window in both persistence
+modes; they do not measure whole-business-state snapshot cost or process RSS.
+The initial value remains provisional pending those workload measurements.
+
+The log window does not change generation-file extent or business-table
+retention. Those resources retain their separate storage contracts.
+
 ## Verification and remaining qualification
 
 The regression matrix includes ordinary public writer delay and ENOSPC,

@@ -249,9 +249,30 @@ impl ConsensusSessionStore {
     pub(super) async fn start_proposal_before(
         &self,
         reservation: ScopeWorkReservation,
+        intent: &SessionMutationIntent,
         deadline: tokio::time::Instant,
     ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
-        match tokio::time::timeout_at(deadline, reservation.start()).await {
+        let start = async {
+            let mut reservation = reservation;
+            loop {
+                let control = is_log_progress_control(intent);
+                if !control {
+                    self.inner
+                        .raft_handler
+                        .log_admission
+                        .ready_before(deadline)
+                        .await?;
+                }
+                let permit = reservation.start().await.map_err(|_| ())?;
+                if control || self.inner.raft_handler.log_admission.has_capacity() {
+                    return Ok::<_, ()>(permit);
+                }
+                // Capacity may change while waiting for a class credit. Keep
+                // the resident reservation, but return the running credit.
+                reservation = permit.finish_unknown();
+            }
+        };
+        match tokio::time::timeout_at(deadline, start).await {
             Ok(Ok(permit)) => Ok(permit),
             Ok(Err(_)) | Err(_) => {
                 self.inner
@@ -323,6 +344,12 @@ impl ConsensusSessionStore {
             Ok(crate::sqlite::consensus::ConsumerRequestBindingLookup::Missing) => None,
             Err(_) => Some(ForwardMutationReply::Unavailable),
         }
+    }
+
+    /// Current retained-log and snapshot-lag gauges, including queued growth.
+    /// Pressure clears automatically as the engine publishes purge progress.
+    pub fn log_pressure_snapshot(&self) -> super::super::ConsensusLogPressureSnapshot {
+        self.inner.raft_handler.log_admission.snapshot()
     }
 
     /// Observational proposal counts by class. Accepted proposals retain their

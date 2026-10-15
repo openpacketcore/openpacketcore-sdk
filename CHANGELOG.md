@@ -1139,6 +1139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build triggers even when a maintenance build completes at the same cut,
   without polling snapshot contents on unrelated engine updates.
 
+- `opc-session-store`: apply backpressure to live retained log growth at leader
+  proposal and follower RPC admission, with typed pressure gauges and warnings.
+  Accepted work keeps its capacity through cancellation; repair and protocol
+  control remain available. Snapshot stalls recover automatically after progress
+  resumes, including after a build that predates the full window. (#1249)
+
 - `opc-session-store`: read V2 history through its existing fresh quorum
   read-index barrier without proposing an unused logical-time advance. History
   classification waits for local application and retains exact V2 capability,

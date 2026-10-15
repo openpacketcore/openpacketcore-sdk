@@ -4,6 +4,7 @@
 //! and state-machine boundaries. No Openraft type is part of the documented
 //! stable public session-store API or the authenticated session-net contract.
 
+mod log_admission;
 #[cfg(target_os = "linux")]
 pub(crate) mod native;
 pub mod network;
@@ -22,6 +23,9 @@ pub mod types;
 #[cfg(target_os = "linux")]
 pub(crate) mod verified_snapshot;
 
+pub use log_admission::{
+    ConsensusLogPressureLevel, ConsensusLogPressureSnapshot, SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS,
+};
 pub use persistence::{
     SessionAsyncPersistenceProgress, SessionAsyncRecoveryState, SessionPersistenceDrainError,
     SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,

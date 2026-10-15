@@ -936,6 +936,26 @@ enum ConsensusSubmissionEffect {
     Rejected(SessionConsensusResponse),
 }
 
+// Recovery and voter replacement must be able to retire blocked authority or
+// a lagging member at the growth window. Scheduling priority alone does not
+// confer this protocol exemption; all existing command validation still runs.
+pub(super) fn is_log_progress_control(intent: &SessionMutationIntent) -> bool {
+    match intent {
+        SessionMutationIntent::Authorized { mutation, .. } => is_log_progress_control(mutation),
+        SessionMutationIntent::VoterSlotControl(_)
+        | SessionMutationIntent::AsyncRecoveryBoundary { .. }
+        | SessionMutationIntent::PrepareTopologyTransition { .. }
+        | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+        | SessionMutationIntent::FenceTopologyAuthority { .. }
+        | SessionMutationIntent::AbortTopologyTransition { .. }
+        | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::CertifyScopeProfileContinuation(_)
+        | SessionMutationIntent::FinalizeOperatorRecovery { .. }
+        | SessionMutationIntent::FinalizeOperatorRecoveryV2(_) => true,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LocalProposalAuthority {
     origin: SessionConsensusNodeId,
@@ -3881,8 +3901,8 @@ impl ConsensusSessionStore {
             peer_directory.clone(),
             local_node_id,
             fixed_admission,
-        )
-        .with_persistence(persistence_protocol.clone());
+            persistence_protocol.clone(),
+        );
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         let read_barrier = LinearizableReadBarrier::new(
             local_node_id,
@@ -8667,7 +8687,7 @@ impl ConsensusSessionStore {
             ProposalAdmission::ActivationRead(proposal_reservation)
         } else {
             match self
-                .start_proposal_before(proposal_reservation, deadline)
+                .start_proposal_before(proposal_reservation, &request.intent, deadline)
                 .await
             {
                 Ok(permit) => ProposalAdmission::Running(permit),
@@ -9155,7 +9175,10 @@ impl ConsensusSessionStore {
             ProposalAdmission::ActivationRead(reservation) => {
                 let held_gate = operation_guard.is_some();
                 drop(operation_guard);
-                let permit = match self.start_proposal_before(reservation, deadline).await {
+                let permit = match self
+                    .start_proposal_before(reservation, &request.intent, deadline)
+                    .await
+                {
                     Ok(permit) => permit,
                     Err(reply) => return reply,
                 };
@@ -9542,6 +9565,14 @@ impl ConsensusSessionStore {
         } else {
             None
         };
+        let log_growth = if is_log_progress_control(&command.intent) {
+            None
+        } else {
+            match self.inner.raft_handler.log_admission.reserve_proposal() {
+                Ok(reservation) => Some(reservation),
+                Err(()) => return ForwardMutationReply::Unavailable,
+            }
+        };
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
@@ -9600,7 +9631,11 @@ impl ConsensusSessionStore {
                         // proposal-admission lifetime.
                         let injected_observation = roster_response_observation.clone();
                         tokio::spawn(async move {
-                            if matches!(response.await, Ok(Ok(_))) {
+                            let result = response.await;
+                            if let (Some(log_growth), Ok(Ok(response))) = (log_growth, &result) {
+                                log_growth.complete(response.log_id.index);
+                            }
+                            if matches!(result, Ok(Ok(_))) {
                                 if let Some((diagnostics, terminal, started)) = injected_observation
                                 {
                                     diagnostics
@@ -9626,7 +9661,11 @@ impl ConsensusSessionStore {
                     }
                 }
             }
-            let (reply, applied_observation) = match response.await {
+            let result = response.await;
+            if let (Some(log_growth), Ok(Ok(response))) = (log_growth, &result) {
+                log_growth.complete(response.log_id.index);
+            }
+            let (reply, applied_observation) = match result {
                 Err(_) => (ForwardMutationReply::OutcomeUnknown, None),
                 Ok(Ok(response)) => {
                     if let Some(completion) = cold_completion {
@@ -9673,22 +9712,27 @@ impl ConsensusSessionStore {
         if let Err(error) = validate_record_expiry_preflights_profile(&preflights) {
             return ForwardMutationReply::RecordExpiryPreflight(Err(error));
         }
-        let proposal_permit = match tokio::time::timeout_at(
+        let reservation = match tokio::time::timeout_at(
             deadline,
             self.inner
                 .proposal_admission
-                .acquire_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Maintenance),
+                .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Maintenance),
         )
         .await
         {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                self.inner
-                    .diagnostics
-                    .proposal_permit_deadline
-                    .fetch_add(1, Ordering::Relaxed);
-                return ForwardMutationReply::Unavailable;
-            }
+            Ok(Ok(reservation)) => reservation,
+            _ => return ForwardMutationReply::Unavailable,
+        };
+        let proposal_permit = match self
+            .start_proposal_before(
+                reservation,
+                &SessionMutationIntent::AdvanceLogicalTime,
+                deadline,
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(reply) => return reply,
         };
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let operation_guard =

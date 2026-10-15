@@ -21,7 +21,7 @@ use opc_consensus::engine::raft::{
 };
 use opc_consensus::engine::{LogId, Vote};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, Semaphore};
+use tokio::sync::{watch, Mutex, Notify, OwnedRwLockReadGuard, RwLock, Semaphore};
 use tokio::time::Instant;
 
 use super::{
@@ -215,6 +215,7 @@ pub(crate) struct PersistenceProtocol {
     incarnation: SessionConsensusRequestId,
     generation: Arc<std::sync::atomic::AtomicU64>,
     active: Arc<AtomicBool>,
+    active_changes: watch::Sender<()>,
     admission: Arc<RwLock<Admission>>,
     pub recovery_attempt: Arc<Mutex<()>>,
     #[cfg(target_os = "linux")]
@@ -247,6 +248,7 @@ impl PersistenceProtocol {
             incarnation: SessionConsensusRequestId::new(),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active: Arc::new(AtomicBool::new(active)),
+            active_changes: watch::channel(()).0,
             admission: Arc::new(RwLock::new(if active {
                 Admission::Active
             } else {
@@ -285,6 +287,15 @@ impl PersistenceProtocol {
 
     pub(super) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    pub(super) fn active_changes(&self) -> watch::Receiver<()> {
+        self.active_changes.subscribe()
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+        self.active_changes.send_replace(());
     }
 
     pub(super) fn recovery_state(&self) -> Option<SessionAsyncRecoveryState> {
@@ -356,7 +367,7 @@ impl PersistenceProtocol {
         ) {
             return Err(SessionConsensusPeerError::Rejected);
         }
-        self.active.store(false, Ordering::Release);
+        self.set_active(false);
         *state = Admission::Quarantined { request: None };
         let attempt = self
             .generation
@@ -475,7 +486,7 @@ impl PersistenceProtocol {
                 .map_err(|_| SessionConsensusPeerError::Timeout)?;
         }
         *state = Admission::Active;
-        self.active.store(true, Ordering::Release);
+        self.set_active(true);
         Ok(true)
     }
 }

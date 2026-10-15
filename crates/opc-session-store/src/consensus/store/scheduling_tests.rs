@@ -1,6 +1,108 @@
 //! Scheduling metadata protocol regressions.
 use super::*;
 
+#[tokio::test]
+async fn log_admission_leader_waits_without_running_credit() {
+    let directory = tempfile::tempdir().expect("log admission directory");
+    let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+        .expect("log admission backend");
+    let store = ConsensusSessionStore::open_with_clock(
+        membership_tests::singleton_topology(),
+        backend,
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+        Arc::new(SystemClock),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("log admission store");
+    let initializing_store = store.clone();
+    crate::formation_clock::run(async move { initializing_store.initialize_cluster().await })
+        .await
+        .expect("initialize log admission leader");
+    let retained = store
+        .inner
+        .raft
+        .metrics()
+        .borrow()
+        .last_log_index
+        .expect("initialized log")
+        + 1;
+    store
+        .inner
+        .raft_handler
+        .set_log_admission_window_for_test(retained);
+    let reservation = store
+        .inner
+        .proposal_admission
+        .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Normal)
+        .await
+        .expect("resident proposal reservation");
+    let mut waiting = Box::pin(store.start_proposal_before(
+        reservation,
+        &SessionMutationIntent::AdvanceLogicalTime,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    ));
+    assert!(
+        futures_util::poll!(&mut waiting).is_pending(),
+        "live retained-log pressure must hold a new leader proposal before execution"
+    );
+    assert_eq!(
+        store.inner.proposal_admission.available_permits(),
+        SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
+        "waiting on log reclamation must not consume an execution credit"
+    );
+    let priority = store
+        .inner
+        .proposal_admission
+        .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::SafetyControl)
+        .await
+        .expect("priority reservation");
+    let mut priority_waiting = Box::pin(store.start_proposal_before(
+        priority,
+        &SessionMutationIntent::PreflightScopeProfile,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    ));
+    assert!(
+        futures_util::poll!(&mut priority_waiting).is_pending(),
+        "scheduling priority does not exempt ordinary growth from log backpressure"
+    );
+    assert_eq!(
+        store.inner.proposal_admission.available_permits(),
+        SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
+        "priority growth also waits without consuming a running credit"
+    );
+    let control = store
+        .inner
+        .proposal_admission
+        .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::SafetyControl)
+        .await
+        .expect("control reservation");
+    let control = store
+        .start_proposal_before(
+            control,
+            &SessionMutationIntent::AbortTopologyTransition {
+                transition_id: [1; 16],
+                request_digest: [2; 32],
+            },
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("topology progress retains its reserved scheduler capacity");
+    drop(control);
+    drop(waiting);
+    drop(priority_waiting);
+    assert_eq!(
+        store.inner.proposal_admission.available_permits(),
+        SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
+        "cancelling the waiting proposal releases its reservation"
+    );
+    store
+        .shutdown()
+        .await
+        .expect("log admission leader shutdown");
+}
+
 #[test]
 fn scope_scheduler_reserved_credits_are_additional_to_eight_ordinary_slots() {
     let budgets = crate::scope_scheduler::ScopeSchedulerBudgets::default();

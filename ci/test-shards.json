@@ -506,6 +506,22 @@
       "tests": [
         "caller_deadline_accepts_in_time_and_rejects_late_valid_replies"
       ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests::log_admission",
+      "shard": "heavy-0",
+      "tests": [
+        "log_admission_full_window_blocked_build_durable",
+        "log_admission_full_window_blocked_build_async"
+      ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests::log_admission",
+      "shard": "heavy-1",
+      "tests": [
+        "log_admission_full_window_blocked_transfer_durable",
+        "log_admission_full_window_blocked_transfer_async"
+      ]
     }
   ]
 }

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Partition the egress host tests by exact libtest name, without narrowing features.
 
-Every ordinary shard retains the old six-package/all-features selection. Cargo still
-launches every harness with its original working directory and environment.
-Only exact test-name exclusions differ. Existing isolated proofs retain their
-package selection, single-test processes and (where prescribed) O1 profile.
+Every ordinary pass retains the six-package/all-features selection and uses exact
+test-name exclusions. Shards 1 and 2 also compile that six-package --lib selection
+at O1, then run their assigned full-bound native log proofs serially after the
+ordinary pass. Cargo retains its working-directory setup. Other isolated proofs
+retain their package selection, single-test processes and prescribed profiles.
 """
 
 from __future__ import annotations

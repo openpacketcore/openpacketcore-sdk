@@ -34,6 +34,7 @@ mod closed;
 mod failed_drain;
 mod history_read;
 mod initialization;
+mod log_admission;
 mod majority_authority;
 mod majority_protocol;
 mod protected;

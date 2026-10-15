@@ -1510,6 +1510,15 @@ pub(super) async fn handle(
                 SessionConsensusRpcFamily::AppendEntries => {
                     let mut rpc = append.ok_or(VoterReplacementError::UnauthorizedReplacement)?;
                     let original_last = rpc.entries.last().map(|entry| entry.log_id);
+                    let log_growth = match store
+                        .inner
+                        .raft_handler
+                        .log_admission
+                        .admit_append(&mut rpc)
+                    {
+                        Ok(growth) => growth,
+                        Err(error) => return Ok(rejected(error)),
+                    };
                     let before = rpc.entries.first().map_or(0, |entry| entry.log_id.index);
                     let AppendAdmissionState {
                         state,
@@ -1604,6 +1613,21 @@ pub(super) async fn handle(
                         .map(|entry| entry.log_id)
                         .or(rpc.prev_log_id);
                     let raft = store.inner.raft.clone();
+                    let append = async move {
+                        let response = raft.append_entries(rpc).await;
+                        if let Some(growth) = log_growth {
+                            match &response {
+                                Ok(AppendEntriesResponse::Success) => growth.complete(
+                                    accepted_last.expect("growth append has a last entry").index,
+                                ),
+                                Ok(AppendEntriesResponse::PartialSuccess(Some(last))) => {
+                                    growth.complete(last.index)
+                                }
+                                _ => drop(growth),
+                            }
+                        }
+                        response
+                    };
                     let mut response = if let Some(intent) = intent {
                         profile
                             .admission
@@ -1611,11 +1635,11 @@ pub(super) async fn handle(
                                 intent,
                                 VoterIntentOrigin::ReplicatedAppend,
                                 deadline,
-                                move || async move { Ok(raft.append_entries(rpc).await) },
+                                move || async move { Ok(append.await) },
                             )
                             .await?
                     } else {
-                        raft.append_entries(rpc).await
+                        append.await
                     };
                     profile
                         .wait_candidate_ack(&store.inner.raft, store.inner.local_node_id, deadline)
