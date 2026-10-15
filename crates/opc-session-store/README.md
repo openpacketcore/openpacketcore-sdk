@@ -2444,13 +2444,26 @@ by issue #143.
   confirmation.
 - Run with: `cargo test -p opc-session-store`.
 - The native void-receipt fixtures script election samples and delivery of
-  crossing votes through the real three-voter engine. They verify a forced
-  campaign denied by the leader lease, an automatic split vote, and the
-  designated successor's retry at a bound computed from the configured timers.
+  crossing votes through the real three-voter engine. Formation and the initial
+  receipt run on normal time with the original operation and readiness bounds.
+  The runtime starts paused only to record its timer-grid origin, then resumes
+  immediately. After the initial receipt, the clock pauses just after the
+  successor's ticker re-registers, then settles all three tickers while the
+  leader is healthy and replays the already-decided
+  operation through Raft. All three applied frontiers must include that new
+  entry, anchoring the follower votes at one instant. The clock advances only
+  after every affected core handles every sent tick; actual tick sequence
+  observations distinguish the leader's ticker from replication-worker sleeps.
+  The fixtures verify a forced campaign denied by the leader lease, an automatic
+  split vote, and the designated successor's retry at a bound computed from the
+  configured timers and recorded ticker phases.
   With the current profile, the split occurs at six seconds and the successor
   wins at twelve; the former ten-second wait is retained as a negative control.
-  A separate wall-clock watchdog bounds real I/O. Normal time resumes for the
-  original receipt, business-state, snapshot, and restart assertions.
+  The unchanged 30-second wall-clock watchdog covers only this short frozen
+  phase, whose duration is reported. Resuming normal time preserves the clock
+  offset: Tokio leads the standard clock by about fifteen seconds after ticker
+  settling and the election. The measured lead is reported before the original
+  receipt, business-state, snapshot, and restart assertions exercise that offset.
 - Fixed-quorum fault, snapshot, and election qualification requires the existing
   test controls: `cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority`.
   On Linux, live authority faults execute against both the selected native WAL

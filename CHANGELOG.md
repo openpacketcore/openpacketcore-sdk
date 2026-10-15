@@ -734,7 +734,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministic with real lease denials and split votes. Require the designated
   successor at the retry computed from the configured election timers, retain
   the former ten-second wait as a negative control, and preserve all receipt,
-  business-state, snapshot, and restart assertions. (#1301)
+  business-state, snapshot, and restart assertions. Keep setup on normal time
+  and freeze only the election, observing real tick sends and completed core
+  handlers before advancing the clock. Pause after the successor ticker
+  re-registers and verify the original tail with the resulting clock lead. (#1301)
 
 - `opc-persist`: preserve the remaining standard-clock deadline budget when
   waiting for retained configuration admission and consumer-checkpoint I/O or

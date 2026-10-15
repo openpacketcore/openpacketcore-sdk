@@ -372,12 +372,29 @@ async fn void_readiness_before_first_activation_needs_every_voters_proof() {
 }
 
 impl Fleet {
-    async fn change_void_leader(&self) {
-        self.void_election
-            .as_ref()
-            .expect("scripted successor election")
-            .change_leader(self)
-            .await;
+    async fn change_void_leader(&mut self, request: &FencedTransitionV2Request, void_first: bool) {
+        let mut election = self
+            .void_election
+            .take()
+            .expect("scripted successor election");
+        election.pause_after_follower_tick().await;
+        let frozen_started = std::time::Instant::now();
+        let result = void_election::schedule::with_frozen_time(Box::pin(
+            AssertUnwindSafe(election.change_leader(self, request, void_first)).catch_unwind(),
+        ))
+        .await;
+        self.void_election = Some(election);
+        eprintln!(
+            "void election frozen phase wall time: {:?}",
+            frozen_started.elapsed()
+        );
+        eprintln!(
+            "void election post-freeze Tokio clock lead: {:?}",
+            tokio::time::Instant::now()
+                .into_std()
+                .saturating_duration_since(std::time::Instant::now())
+        );
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 
     async fn snapshot_void_receipts(&self) {
@@ -450,7 +467,12 @@ impl Fleet {
                 ),
             );
             let result = if let Some(election) = &self.void_election {
-                election.scripts[index].scope(open).await
+                election.scripts[index]
+                    .scope(tracing::Instrument::instrument(
+                        open,
+                        void_election::ticks::node_span(self.peers[index].node.get()),
+                    ))
+                    .await
             } else {
                 open.await
             };
@@ -504,11 +526,7 @@ impl Fleet {
                 }) {
                     break;
                 }
-                if self.void_election.is_some() {
-                    tokio::task::yield_now().await;
-                } else {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await;
@@ -571,45 +589,41 @@ async fn recovery_inspection_accepts_real_void_profile_replicas() {
 
 #[tokio::test(start_paused = true)]
 async fn native_three_voter_void_decides_before_original_and_survives_restart() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (ticks, tick_observer) = void_election::ticks::TickDelivery::install();
     let mut fleet = Fleet::new_native("void-before-original");
     let profiles = [FencedTransitionV2Profile::V2WithVoid; 3];
     let result = AssertUnwindSafe(async {
-        let (request, expected) = void_election::schedule::with_frozen_time(Box::pin(
-            AssertUnwindSafe(async {
-                fleet.void_election = Some(void_election::VoidElection::new(&fleet).await);
-                fleet.open_void_profiles(profiles).await;
-                let request = v2_create_request(
-                    301,
-                    FencedTransitionV2HistoryEpoch::new(1).unwrap(),
-                    FenceToken::new(0),
-                    &provider(),
-                )
-                .await;
-                let expected = FencedTransitionV2Status::Recorded(Box::new(Err(
-                    StoreError::FencedTransitionVoided,
-                )));
-                assert_eq!(
-                    fleet.stores[0]
-                        .fenced_transition_v2_capability()
-                        .await
-                        .unwrap(),
-                    Some(FencedTransitionV2Capability::V2)
-                );
-                assert_eq!(
-                    fleet.stores[0]
-                        .fenced_transition_v2_void(&request)
-                        .await
-                        .unwrap(),
-                    expected
-                );
-                fleet.change_void_leader().await;
-                (request, expected)
-            })
-            .catch_unwind(),
-        ))
-        .await
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        fleet.void_election =
+            Some(void_election::VoidElection::new(&fleet, runtime_origin, ticks).await);
+        fleet.open_void_profiles(profiles).await;
+        let request = v2_create_request(
+            301,
+            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+            FenceToken::new(0),
+            &provider(),
+        )
+        .await;
+        let expected =
+            FencedTransitionV2Status::Recorded(Box::new(Err(StoreError::FencedTransitionVoided)));
+        assert_eq!(
+            fleet.stores[0]
+                .fenced_transition_v2_capability()
+                .await
+                .unwrap(),
+            Some(FencedTransitionV2Capability::V2)
+        );
+        assert_eq!(
+            fleet.stores[0]
+                .fenced_transition_v2_void(&request)
+                .await
+                .unwrap(),
+            expected
+        );
+        fleet.change_void_leader(&request, true).await;
         fleet.void_election = None;
+        drop(tick_observer);
         for store in &fleet.stores {
             assert_eq!(
                 store.fenced_transition_v2_status(&request).await.unwrap(),
@@ -644,34 +658,31 @@ async fn native_three_voter_void_decides_before_original_and_survives_restart() 
 
 #[tokio::test(start_paused = true)]
 async fn native_three_voter_original_receipt_wins_over_later_void() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (ticks, tick_observer) = void_election::ticks::TickDelivery::install();
     let mut fleet = Fleet::new_native("original-before-void");
     let result = AssertUnwindSafe(async {
-        let (request, expected) = void_election::schedule::with_frozen_time(Box::pin(
-            AssertUnwindSafe(async {
-                fleet.void_election = Some(void_election::VoidElection::new(&fleet).await);
-                fleet
-                    .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
-                    .await;
-                let request = v2_create_request(
-                    302,
-                    FencedTransitionV2HistoryEpoch::new(1).unwrap(),
-                    FenceToken::new(0),
-                    &provider(),
-                )
-                .await;
-                let outcome = fleet.stores[0]
-                    .fenced_transition_v2(request.clone())
-                    .await
-                    .unwrap();
-                let expected = FencedTransitionV2Status::Recorded(Box::new(Ok(outcome)));
-                fleet.change_void_leader().await;
-                (request, expected)
-            })
-            .catch_unwind(),
-        ))
-        .await
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        fleet.void_election =
+            Some(void_election::VoidElection::new(&fleet, runtime_origin, ticks).await);
+        fleet
+            .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
+            .await;
+        let request = v2_create_request(
+            302,
+            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+            FenceToken::new(0),
+            &provider(),
+        )
+        .await;
+        let outcome = fleet.stores[0]
+            .fenced_transition_v2(request.clone())
+            .await
+            .unwrap();
+        let expected = FencedTransitionV2Status::Recorded(Box::new(Ok(outcome)));
+        fleet.change_void_leader(&request, false).await;
         fleet.void_election = None;
+        drop(tick_observer);
         for store in &fleet.stores {
             assert_eq!(
                 store.fenced_transition_v2_void(&request).await.unwrap(),

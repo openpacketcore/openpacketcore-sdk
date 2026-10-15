@@ -17,6 +17,8 @@ use tokio::time::Instant;
 
 #[path = "../../../../../opc-consensus/tests/reelection/schedule.rs"]
 pub(super) mod schedule;
+#[path = "../../../../../opc-consensus/tests/reelection/delivery.rs"]
+pub(super) mod ticks;
 
 #[derive(Clone, Debug)]
 struct Exchange {
@@ -87,6 +89,8 @@ impl VoteGate {
 pub(super) struct VoidElection {
     pub scripts: Vec<ElectionRngScript>,
     started: Instant,
+    runtime_origin: Instant,
+    ticks: ticks::TickDelivery,
     old: usize,
     successor: usize,
     early: schedule::ElectionSchedule,
@@ -94,7 +98,11 @@ pub(super) struct VoidElection {
 }
 
 impl VoidElection {
-    pub(super) async fn new(fleet: &Fleet) -> Self {
+    pub(super) async fn new(
+        fleet: &Fleet,
+        runtime_origin: Instant,
+        ticks: ticks::TickDelivery,
+    ) -> Self {
         let config = durable_openraft_config(DurableOpenraftDomain::SessionState).unwrap();
         // Use the engine's own gen_range mapping and the unchanged SDK timers.
         let early_sample = 0;
@@ -138,6 +146,8 @@ impl VoidElection {
         Self {
             scripts,
             started: Instant::now(),
+            runtime_origin,
+            ticks,
             old,
             successor,
             early: schedule::ElectionSchedule::new(&config, early),
@@ -145,7 +155,96 @@ impl VoidElection {
         }
     }
 
-    pub(super) async fn change_leader(&self, fleet: &Fleet) {
+    pub(super) async fn pause_after_follower_tick(&self) {
+        let mut sleeps = self.scripts[self.successor].sleeps();
+        let before = sleeps.borrow().len();
+        let registered = tokio::time::timeout(
+            Duration::from_secs(30),
+            sleeps.wait_for(|sleeps| sleeps.len() > before),
+        )
+        .await
+        .expect("successor ticker re-registers before the pause")
+        .expect("successor ticker remains live")
+        .last()
+        .expect("registered successor ticker")
+        .0;
+        tokio::time::pause();
+        eprintln!(
+            "void election pause after successor ticker registration: {:?}",
+            Instant::now() - registered
+        );
+    }
+
+    /// Normal-time setup can leave different ticker phases and queued ticks.
+    /// Delay their next wake together while the leader is still healthy, then
+    /// observe every actual send and completed core handler before proceeding.
+    async fn settle(&mut self, fleet: &Fleet) -> Vec<Duration> {
+        let next = Instant::now() + self.early.tick;
+        let millis = (next - self.runtime_origin).as_nanos().div_ceil(1_000_000);
+        let at = self.runtime_origin
+            + Duration::from_millis(u64::try_from(millis).expect("finite fixture clock"));
+        tokio::time::advance(at - Instant::now()).await;
+        let mut registrations = Vec::new();
+        for (index, script) in self.scripts.iter().enumerate() {
+            schedule::tick_registered(&mut script.sleeps(), at, self.early.tick).await;
+            self.ticks
+                .wait(fleet.stores[index].status().node_id.get(), at)
+                .await;
+            registrations.push(
+                script
+                    .sleeps()
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(registered, deadline)| {
+                        *registered == at && *deadline == at + self.early.tick
+                    })
+                    .expect("actual aligned ticker registration")
+                    .0,
+            );
+        }
+        self.started = registrations[self.old];
+        let phases: Vec<_> = registrations
+            .into_iter()
+            .map(|registered| registered - self.started)
+            .collect();
+        assert!(phases.iter().all(|phase| *phase == Duration::ZERO));
+        phases
+    }
+
+    pub(super) async fn change_leader(
+        &mut self,
+        fleet: &Fleet,
+        request: &FencedTransitionV2Request,
+        void_first: bool,
+    ) {
+        let phases = self.settle(fleet).await;
+        // Replaying the already-decided operation still submits a real Raft
+        // command. All three applied frontiers must include that new entry,
+        // anchoring the committed follower votes at this one paused instant.
+        let before = fleet.stores[self.old].status().applied_index;
+        if void_first {
+            fleet.stores[self.old]
+                .fenced_transition_v2_void(request)
+                .await
+                .expect("VOID replay anchors follower votes");
+        } else {
+            fleet.stores[self.old]
+                .fenced_transition_v2(request.clone())
+                .await
+                .expect("original receipt replay anchors follower votes");
+        }
+        while fleet.stores[self.old].status().applied_index <= before {
+            tokio::task::yield_now().await;
+        }
+        let anchor = fleet.stores[self.old].status().applied_index;
+        while !fleet
+            .stores
+            .iter()
+            .all(|store| store.status().applied_index >= anchor)
+        {
+            tokio::task::yield_now().await;
+        }
         let old = &fleet.stores[self.old];
         let successor = &fleet.stores[self.successor];
         let old_id = old.status().node_id;
@@ -163,8 +262,13 @@ impl VoidElection {
             }
             assert_eq!(store.status().leader_id, Some(old_id));
         }
-        for script in &self.scripts {
-            schedule::tick_registered(&mut script.sleeps(), self.started, self.early.tick).await;
+        for (index, script) in self.scripts.iter().enumerate() {
+            schedule::tick_registered(
+                &mut script.sleeps(),
+                self.started + phases[index],
+                self.early.tick,
+            )
+            .await;
         }
         assert_eq!(Instant::now(), self.started);
         let gate = Arc::new(VoteGate {
@@ -204,10 +308,19 @@ impl VoidElection {
             "void election: old leader learned the higher term at {:?}",
             self.started.elapsed()
         );
-        let first = self.early.campaign(Duration::ZERO, Duration::ZERO, false);
-        let bound = self.early.campaign(first, Duration::ZERO, false);
-        assert!(bound < self.late.campaign(first, Duration::ZERO, false));
-        assert!(bound < self.late.campaign(Duration::ZERO, Duration::ZERO, true));
+        let first = self
+            .early
+            .campaign(Duration::ZERO, phases[self.successor], false);
+        assert_eq!(
+            first,
+            self.early.campaign(Duration::ZERO, phases[self.old], false)
+        );
+        let bound = self.early.campaign(first, phases[self.successor], false);
+        assert!(bound < self.late.campaign(first, phases[self.old], false));
+        let remaining = (0..fleet.stores.len())
+            .find(|index| *index != self.old && *index != self.successor)
+            .unwrap();
+        assert!(bound < self.late.campaign(Duration::ZERO, phases[remaining], true));
         let former_limit = Duration::from_secs(10);
         assert!(first < former_limit && former_limit < bound);
         let expired = watch::channel(false).0;
@@ -232,7 +345,7 @@ impl VoidElection {
             result
         };
         let drive = async {
-            let mut tick = self.early.tick;
+            let mut tick = phases[self.old] + self.early.tick;
             while tick <= bound {
                 if Instant::now() < self.started + former_limit
                     && self.started + former_limit < self.started + tick
@@ -243,16 +356,25 @@ impl VoidElection {
                         .stores
                         .iter()
                         .all(|store| store.status().leader_id != Some(successor_id)));
-                    eprintln!("void election: former deadline {former_limit:?} expired; computed successor campaign {bound:?}");
+                    eprintln!(
+                        "void election: former deadline {former_limit:?} expired; \
+                         computed successor campaign {bound:?}"
+                    );
                 }
                 tokio::time::advance(self.started + tick - Instant::now()).await;
-                for script in &self.scripts {
+                for (index, script) in self.scripts.iter().enumerate() {
                     schedule::tick_registered(
                         &mut script.sleeps(),
                         self.started + tick,
                         self.early.tick,
                     )
                     .await;
+                    self.ticks
+                        .wait(
+                            fleet.stores[index].status().node_id.get(),
+                            self.started + tick,
+                        )
+                        .await;
                 }
                 if tick == first {
                     let split = gate.observed(6).await;
@@ -305,7 +427,10 @@ impl VoidElection {
             for peer in &fleet.peers {
                 *peer.election_votes.lock().unwrap() = None;
             }
-            eprintln!("void election: all three voters agree on designated successor at {bound:?}; exchanges={exchanges:?}");
+            eprintln!(
+                "void election: all three voters agree on designated successor at {bound:?}; \
+                 exchanges={exchanges:?}"
+            );
         };
         let (result, ()) = tokio::join!(wait, drive);
         assert!(
