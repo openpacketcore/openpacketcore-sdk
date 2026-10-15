@@ -19,8 +19,8 @@ PREFIX = "opc.n3iwf.xfrm-roster.v1.lifecycle-"
 CONTRACT = "crates/opc-ipsec-xfrm/README.md"
 START = "## Durable grouped object roster restart recovery\n"
 END = "## Opaque outbound-SA binding\n"
-# Filled from the independently reviewed, unchanged contract section.
-CONTRACT_DIGEST = "fa4a43b1605dc427b5e4de5310b8247df4b6317b73616240fa1199fd621ead05"
+# Pin the reviewed contract section; ordinary-roster schedules remain unchanged.
+CONTRACT_DIGEST = "478309fe1e968f8f382e9b589bdc4a7572940c68be94d055d6d5cf14a332ce07"
 FAMILIES = (
     "finalize", "adopt", "recover-applied", "recover-prepared",
     "sweep-failure", "foreign-conflict", "install-failure",

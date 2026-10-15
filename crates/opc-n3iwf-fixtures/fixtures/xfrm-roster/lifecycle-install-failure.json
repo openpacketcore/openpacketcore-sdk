@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/roster-lifecycle.json",
-      "sha256": "4aa403e1afd7f4449f35a2d3cbafb90b75eab84917f34ec74c0242e0b95f09f2",
+      "sha256": "b42f56fffe05534c50a768e6002062a709c83ec56a3322d82561c5f519af9b98",
       "case": "install-failure"
     },
     "schedules": 108,

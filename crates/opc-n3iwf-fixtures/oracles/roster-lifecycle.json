@@ -6,7 +6,7 @@
     "path": "crates/opc-ipsec-xfrm/README.md",
     "start": "## Durable grouped object roster restart recovery",
     "end": "## Opaque outbound-SA binding",
-    "sha256": "fa4a43b1605dc427b5e4de5310b8247df4b6317b73616240fa1199fd621ead05"
+    "sha256": "478309fe1e968f8f382e9b589bdc4a7572940c68be94d055d6d5cf14a332ce07"
   },
   "limitations": [
     "scripted backend and real authenticated store",
