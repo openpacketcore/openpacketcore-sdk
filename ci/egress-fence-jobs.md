@@ -11,11 +11,11 @@ All workload definitions retain the original fail-closed changes
 condition. Both test matrices have `fail-fast: false`, so one failing shard does
 not cancel the others. No branch-protection context needs renaming: each new
 workload blocks the same existing required check. Existing workloads retain their
-45-minute limit. The full-bound leader proof on shard 4 has a 120-minute
-compilation/run budget; the Durable and Async proofs on shards 5 and 6 retain
-75 minutes. The eleven receipt-history proofs use that same 75-minute budget
-on dedicated shards 7 through 17. The decision and aggregate jobs retain their
-10-minute limits.
+45-minute limit. The full-bound leader proof has a 120-minute compilation/run
+budget; the remaining full-bound and full-window proofs retain 75 minutes.
+The native matrix selects exact proof names, so registry reordering moves the
+leader's shard without moving its budget to another proof. The decision and
+aggregate jobs retain their 10-minute limits.
 
 ## Original step ownership
 
@@ -179,6 +179,7 @@ executions and cache overhead.
 | `host-tests (1)` | Pending updated hosted measurement | Prior ordinary-only estimate: 23–30m, including examples/doctests/profile compilation. Add the six-package O1 library build and three serial full-bound reclamation/admission proofs. |
 | `host-tests (2)` | Pending updated hosted measurement | Prior ordinary-only estimate: 26–32m. Add the six-package O1 library build and four serial full-bound reclamation/admission proofs. |
 | `host-proofs` | 27–35 minutes | 5m inventory build, 5m isolated-profile compilation, 6m21s isolated proofs, 11m O1 build/proofs, setup/cache allowance |
+| `host-native-log-proofs` | Pending hosted measurement | One exact O1 proof per runner; the leader has 120 minutes and other proofs have 75 minutes, including compilation. Budgets follow proof identity. See [CI sizing](README.md). |
 | `root-cgroup-egress` | Under 1 minute | Checkout and aggregate result check |
 
 These estimates include repeated compilation on separate runners and assume

@@ -63,8 +63,10 @@ inputs, persistence operations and assertions remain intact; the default
 three-cycle regressions stay in the ordinary library partition.
 
 Core proof runners retain their 90-minute job budget. The egress leader proof
-on shard 4 has 120 minutes; the Durable and Async proofs on shards 5 and 6 retain
-75 minutes. In [egress run 38801737477](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38801737477/job/116652422946),
+has 120 minutes; the remaining full-bound and full-window proofs retain
+75 minutes. The egress matrix selects each proof by its exact name and derives
+its shard from the registry, keeping the budget attached to the leader across
+registry reordering. In [egress run 38801737477](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38801737477/job/116652422946),
 the leader reached 917,504 of 1,056,768 proposals in 3,465.5 seconds before its
 75-minute job budget expired. The slowest measured 65,536-proposal interval took
 298.48 seconds, projecting 80.2 minutes for all proposals. Adding the observed

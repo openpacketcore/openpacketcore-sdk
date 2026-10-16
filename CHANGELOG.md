@@ -1139,6 +1139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build triggers even when a maintenance build completes at the same cut,
   without polling snapshot contents on unrelated engine updates.
 
+- `opc-session-store` tests: bound native fixture coordination by the existing
+  consensus operation budget, observe early operation completion and writer
+  failure, and release held writers before fixture shutdown. Check closed
+  namespaces after runtime quiescence. The leader proof's CI budget now follows
+  its exact identity across proof-registry reordering. (#1249)
+
 - `opc-session-store`: apply backpressure to live retained log growth at leader
   proposal and follower RPC admission, with typed pressure gauges and warnings.
   Accepted work keeps its capacity through cancellation; repair and protocol

@@ -3,6 +3,7 @@
 
 import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -515,7 +516,10 @@ class RequiredCheckTests(unittest.TestCase):
 
 class WorkflowTests(unittest.TestCase):
     def assert_native_proof_matrix(self, native):
-        self.assertIn(f"shard: {list(FENCE.native_log_bound.EGRESS_SHARDS)}\n", native)
+        proofs = re.findall(r"^          - ([a-zA-Z0-9_:]+)$", native, flags=re.MULTILINE)
+        self.assertCountEqual(proofs, FENCE.native_log_bound.TESTS)
+        self.assertIn("--native-log-proof '${{ matrix.proof }}'", native)
+        return proofs
 
     def test_new_registered_proof_requires_a_matching_workflow_shard(self):
         workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
@@ -527,9 +531,47 @@ class WorkflowTests(unittest.TestCase):
                 patch.object(FENCE.native_log_bound, "EGRESS_SHARDS", shards):
             with self.assertRaises(AssertionError):
                 self.assert_native_proof_matrix(native)
-            native = native.replace(f"shard: {list(old_shards)}\n",
-                                    f"shard: {list(shards)}\n", 1)
+            native = native.replace("        proof:\n",
+                                    "        proof:\n          - " + proofs[-1] + "\n", 1)
             self.assert_native_proof_matrix(native)
+
+    def test_leader_budget_and_execution_follow_proof_identity_after_registry_reorder(self):
+        leader = ("consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+                  "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens")
+        workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
+        native = workflow.split("\n  host-native-log-proofs:\n", 1)[1].split("\n  host-proofs:\n", 1)[0]
+        budget = re.search(
+            r"timeout-minutes: \$\{\{ matrix\.proof == '([^']+)' && (\d+) \|\| (\d+) \}\}", native)
+        self.assertIsNotNone(budget)
+        self.assertEqual(budget.groups(), (leader, "120", "75"))
+        registered = FENCE.native_log_bound.TESTS
+        # The workflow remains unchanged while the leader moves to another
+        # shard. Its budget and the actual exact-name command must move together.
+        reordered = (*registered[1:], registered[0])
+        for proofs in (registered, reordered):
+            with patch.object(FENCE.native_log_bound, "TESTS", proofs):
+                matrix = self.assert_native_proof_matrix(native)
+                extended = []
+                for name in matrix:
+                    shard = FENCE.native_log_bound.EGRESS_SHARDS[proofs.index(name)]
+                    minutes = int(budget[2] if name == budget[1] else budget[3])
+                    if minutes == 120:
+                        extended.append(shard)
+                    with self.subTest(proof=name, shard=shard), tempfile.TemporaryDirectory() as directory:
+                        output = Path(directory) / "mapping.json"
+                        with (
+                            patch.object(sys, "argv", ["egress-fence-tests.py", "--native-log-proof", name,
+                                                       "--output", str(output)]),
+                            patch.object(FENCE, "inventory", side_effect=AssertionError("ordinary profile must not compile")),
+                            patch.object(FENCE, "capture", side_effect=["f" * 40, f"{name}: test\n", ""]),
+                            patch.object(FENCE, "run_commands") as execute,
+                        ):
+                            self.assertEqual(FENCE.main(), 0)
+                        command = FENCE.native_log_bound_command(name)
+                        execute.assert_called_once_with([command])
+                        self.assertEqual(json.loads(output.read_text())["plans"], {str(shard): [command]})
+                self.assertEqual(extended, [FENCE.native_log_bound.EGRESS_SHARDS[proofs.index(leader)]])
+        self.assertNotEqual(registered.index(leader), reordered.index(leader))
 
     def test_cache_targets_match_each_jobs_actual_compilation_directories(self):
         workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
@@ -590,7 +632,8 @@ class WorkflowTests(unittest.TestCase):
         for name in FENCE.REQUIRED_JOBS:
             with self.subTest(job=name):
                 self.assertIn(condition, jobs[name])
-                timeout = ("${{ matrix.shard == 4 && 120 || 75 }}"
+                timeout = ("${{ matrix.proof == 'consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+                           "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens' && 120 || 75 }}"
                            if name == "host-native-log-proofs" else "45")
                 self.assertIn(f"timeout-minutes: {timeout}\n", jobs[name])
                 self.assertRegex(jobs[name], r"needs: (changes|\[changes, sources\])\n")
@@ -612,7 +655,8 @@ class WorkflowTests(unittest.TestCase):
         self.assert_native_proof_matrix(native)
         self.assertIn("fail-fast: false\n", native)
         self.assertIn("shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", native)
-        self.assertIn("--shard '${{ matrix.shard }}'", native)
+        self.assertIn("--native-log-proof '${{ matrix.proof }}'", native)
+        self.assertIn("name: egress-fence-native-log-map-${{ strategy.job-index }}\n", native)
         proofs = jobs["host-proofs"]
         self.assertIn("shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", proofs)
         self.assertIn(f"--shard {FENCE.PROOF_SHARD} \\\n", proofs)

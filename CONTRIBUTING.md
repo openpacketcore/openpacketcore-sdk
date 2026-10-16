@@ -198,9 +198,10 @@ Both plans preserve their package and feature selection and precheck the exact
 enabled names in the execution profile. The default three-cycle regressions
 retain the ordinary test profile. All entry counts, persistence operations,
 assertions and test deadlines remain unchanged. Core proof jobs have 90-minute
-budgets. The egress leader proof on shard 4 has a 120-minute budget; the Durable
-and Async proofs on shards 5 and 6 and the receipt-history proofs on shards
-7 through 17 have 75 minutes, including compilation.
+budgets. The egress leader proof has a 120-minute budget; the remaining
+full-bound and full-window proofs retain 75 minutes, including compilation.
+The egress matrix selects exact proof names, so the leader's budget follows its
+identity when the registry's shard ordering changes.
 See the [CI layout](ci/README.md) for the hosted sizing evidence and the ordinary
 library partition.
 
