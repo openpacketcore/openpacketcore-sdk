@@ -2,7 +2,6 @@
 
 use super::*;
 
-use futures_util::FutureExt;
 use opc_consensus::engine::{
     error::RaftError,
     raft::{VoteRequest, VoteResponse},
@@ -11,7 +10,7 @@ use opc_consensus::engine::{
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
 use opc_consensus::{durable_openraft_config, DurableOpenraftDomain};
 use scripted_election::schedule::{self, ElectionSchedule};
-use tokio::sync::{watch, Barrier};
+use tokio::sync::{oneshot, watch, Barrier};
 use tokio::time::Instant;
 use tracing::Instrument;
 
@@ -263,8 +262,8 @@ impl RollingElection {
         }
     }
 
-    // A legal split retry can exceed one operation's deadline. Observe the
-    // real successor at its computed bound before the caller issues its write.
+    // Start the original write when its leader stops. A legal two-split retry
+    // outlasts that call's deadline; recover with the same commit after election.
     pub(super) async fn stop_and_elect(
         &mut self,
         fleet: &mut RetainedFleet,
@@ -275,6 +274,7 @@ impl RollingElection {
         if state.leader_id != Some(state.node_id) {
             fleet.stop(index).await;
             self.scripts[index].take().unwrap().finish();
+            fleet.append(live[0]).await;
             return;
         }
         self.leader_stops += 1;
@@ -330,8 +330,59 @@ impl RollingElection {
                 .iter()
                 .map(|&node| fleet.store(node).clone())
                 .collect::<Vec<_>>();
-            self.elect_survivors(&stores, live, old_term, split_rounds, &gate)
-                .await;
+            assert!(stores
+                .iter()
+                .all(|store| store.status().leader_id == Some(state.node_id)));
+            let started = Instant::now();
+            if split_rounds == 1 {
+                let append = async {
+                    assert_eq!(Instant::now(), started, "write starts at the leader stop");
+                    fleet.append(live[0]).await;
+                    eprintln!("rolling write: in-flight append committed at {:?}", started.elapsed());
+                };
+                tokio::join!(biased;
+                    append,
+                    self.elect_survivors(&stores, live, old_term, split_rounds, &gate, None),
+                );
+            } else {
+                let next = TxId::new();
+                let record = commit(next, Some(fleet.head), fleet.version + 1, 2);
+                let records_audit = audit(next);
+                let (expired, observed_expiry) = oneshot::channel();
+                let append = async {
+                    assert_eq!(Instant::now(), started, "write starts at the leader stop");
+                    let error = fleet
+                        .store(live[0])
+                        .append_attested_commit(attested(record.clone(), records_audit.clone()))
+                        .await
+                        .expect_err("two real split votes outlast the unchanged write deadline");
+                    assert!(matches!(error.kind(), PersistErrorKind::OutcomeUnknown));
+                    assert_eq!(Instant::now(), started + CLUSTER_TRANSITION_TIMEOUT);
+                    assert_eq!(gate.replies.borrow().len(), 2);
+                    for store in &stores {
+                        assert_eq!(store.status().leader_id, None);
+                        assert_eq!(store.status().term, old_term + 1);
+                    }
+                    eprintln!("rolling write: OutcomeUnknown at {CLUSTER_TRANSITION_TIMEOUT:?} with both survivors leaderless");
+                    expired.send(()).expect("election awaits the actual write result");
+                };
+                tokio::join!(biased;
+                    append,
+                    self.elect_survivors(
+                        &stores, live, old_term, split_rounds, &gate, Some(observed_expiry)
+                    ),
+                );
+                // Attestation claims are one-shot, but these exact retained
+                // record/audit inputs reproduce the same deterministic request ID.
+                fleet
+                    .store(live[0])
+                    .append_attested_commit(attested(record, records_audit))
+                    .await
+                    .expect("same-ID write recovers after the real successor is observed");
+                fleet.head = next;
+                fleet.version += 1;
+                eprintln!("rolling write: same-ID recovery committed after the two-split successor");
+            }
             for path in paths {
                 *fleet.paths[&path].rolling_vote.lock().unwrap() = None;
             }
@@ -346,8 +397,10 @@ impl RollingElection {
         old_term: u64,
         split_rounds: u64,
         gate: &VoteGate,
+        mut observed_expiry: Option<oneshot::Receiver<()>>,
     ) {
         let started = Instant::now();
+        assert_eq!(observed_expiry.is_some(), split_rounds == 2);
         let mut splits = vec![self.late.campaign(Duration::ZERO, Duration::ZERO, true)];
         for _ in 1..split_rounds {
             splits.push(
@@ -359,11 +412,6 @@ impl RollingElection {
         let bound = self.early.campaign(last_split, Duration::ZERO, false);
         assert!(bound < self.late.campaign(last_split, Duration::ZERO, false));
         let expected = stores[0].status().node_id;
-        let mut original_wait = Box::pin(tokio::time::timeout(
-            CLUSTER_TRANSITION_TIMEOUT,
-            wait_for_leader(stores, expected, old_term + split_rounds + 1),
-        ));
-        assert!(original_wait.as_mut().now_or_never().is_none());
         let mut instants = Vec::new();
         let mut tick = self.late.tick;
         while tick <= bound {
@@ -383,16 +431,12 @@ impl RollingElection {
                 self.advance(started + at, live).await;
             } else {
                 tokio::time::advance(started + at - Instant::now()).await;
-                original_wait
-                    .as_mut()
+                observed_expiry
+                    .take()
+                    .expect("two-split write deadline observation")
                     .await
-                    .expect_err("original guard expires before a legal retry");
-                assert_eq!(gate.replies.borrow().len(), 2);
-                for store in stores {
-                    assert_eq!(store.status().leader_id, None);
-                    assert_eq!(store.status().term, old_term + 1);
-                }
-                eprintln!("rolling election: original {CLUSTER_TRANSITION_TIMEOUT:?} guard expired with two real split votes");
+                    .expect("actual write expires before advancing to the next split");
+                assert_eq!(Instant::now(), started + CLUSTER_TRANSITION_TIMEOUT);
             }
             if let Some(round) = splits.iter().position(|&split| split == at) {
                 let replies = gate.observed(2 * (round + 1)).await;
@@ -429,11 +473,6 @@ impl RollingElection {
         assert_eq!(won.response.vote, won.request.vote);
         wait_for_leader(stores, expected, old_term + split_rounds + 1).await;
         assert_eq!(started.elapsed(), bound);
-        if split_rounds == 1 {
-            original_wait
-                .await
-                .expect("single-split control fits the original guard");
-        }
         for &node in live {
             self.script(node).assert_exhausted();
         }
