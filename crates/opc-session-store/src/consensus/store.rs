@@ -3739,24 +3739,28 @@ impl ConsensusSessionStore {
             config.enable_heartbeat = false;
         }
         let config = Arc::new(config);
+        let admitted = Arc::new(AtomicBool::new(false));
+        // Allocate the authority wait resource before starting an engine that
+        // could receive traffic. No contended RPC may create a timer or worker.
+        let fixed_admission = FixedQuorumEngineAdmission::new(
+            backend.clone(),
+            storage_identity,
+            members.clone(),
+            bindings.clone(),
+            placement_policy,
+            Arc::clone(&admitted),
+            operation_timeout,
+        )
+        .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
         storage_shutdown.enable_runtime_write_handoff();
-        let admitted = Arc::new(AtomicBool::new(false));
         let raft_handler = SessionRaftRpcHandler::new_fixed_durable_quorum(
             raft.clone(),
             peer_directory.clone(),
             local_node_id,
-            FixedQuorumEngineAdmission::new(
-                backend.clone(),
-                storage_identity,
-                members.clone(),
-                bindings.clone(),
-                placement_policy,
-                Arc::clone(&admitted),
-                operation_timeout,
-            ),
+            fixed_admission,
         )
         .with_persistence(persistence_protocol.clone());
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());

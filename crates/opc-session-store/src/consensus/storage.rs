@@ -13697,6 +13697,7 @@ mod tests {
                                 &bindings,
                                 placement,
                                 false,
+                                None,
                             )
                             .await
                     }

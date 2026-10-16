@@ -46,6 +46,8 @@ pub mod audit;
 pub(crate) mod consensus;
 #[cfg(target_os = "linux")]
 mod native;
+#[cfg(target_os = "linux")]
+pub(crate) use native::AuthorityBackoff;
 
 /// Non-production consensus timing hooks for deterministic integration tests.
 #[cfg(feature = "test-control")]
@@ -2387,14 +2389,13 @@ impl SqliteSessionBackend {
         >,
         expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
         allow_pristine_membership: bool,
+        #[cfg(target_os = "linux")] native_backoff: Option<&AuthorityBackoff>,
     ) -> bool {
         #[cfg(test)]
         self.fixed_quorum_durable_check_count
             .fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
         self.test_progress.send_replace(());
-        #[cfg(target_os = "linux")]
-        let mut native_backoff = None;
         #[cfg(target_os = "linux")]
         while let Some(result) = self.native_read(|wal| {
             wal.native_fixed_try_read(
@@ -2419,9 +2420,7 @@ impl SqliteSessionBackend {
                     // An OS thread releases the owner lock independently of
                     // protocol time. Await a real monotonic backoff without
                     // spinning or resetting the enclosing RPC's deadline.
-                    let Ok(backoff) =
-                        native_backoff.get_or_insert_with(native::AuthorityBackoff::new)
-                    else {
+                    let Some(backoff) = native_backoff else {
                         return false;
                     };
                     if backoff.wait().await.is_err() {

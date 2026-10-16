@@ -2483,11 +2483,24 @@ by issue #143.
   voter's real native owner lock until authority contention is observed, then
   for another 200 ms of wall time. Contended authority reads await a one-millisecond
   real monotonic timer through the I/O reactor, retaining the original absolute
-  RPC deadline. Cancellation closes the timer without a detached retry task.
+  RPC deadline. The native handler creates and registers its timer once, before
+  starting Raft; cloned handlers share that resource. Each wait acquires async
+  admission and rearms the existing descriptor through the I/O reactor, without
+  creating a descriptor or a thread. The same RPC deadline includes this
+  admission wait. Cancellation releases admission without detached work or
+  authority retries; dropping the last handler owner closes the timer. Failure
+  to create the resource rejects engine startup before Raft is started.
+  A protocol-clock sleep cannot provide this real-time delay while Tokio time
+  is frozen, so the shared timer retains the independent monotonic clock.
   Releasing the lock therefore needs no protocol-clock advance, and both real
   denials must still arrive at the exact initial instant. Focused authority tests
-  bound retry counts while the owner is held and cover paused-time release,
-  cancellation, and fail-closed deadline rejection.
+  bound both retry counts and wake-ups while the owner is held. The wake-up bound
+  also rejects spins that gate actual lock attempts on the standard clock.
+  Isolated resource tests exhaust `RLIMIT_NOFILE` after startup and prove a new
+  timer cannot be created, while preserving paused-time release, cancellation
+  and the complete-operation deadline. They also cover a saturated blocking
+  pool and require no new worker when all startup blocking threads have retired.
+  Cancelling a queued shared-timer wait must leave the next waiter able to finish.
   The unchanged 30-second wall-clock watchdog covers only this short frozen
   phase, whose duration is reported. Resuming normal time preserves the clock
   offset from ticker settling, lease renewal, and the election. The measured

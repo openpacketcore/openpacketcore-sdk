@@ -74705,6 +74705,8 @@ BEGIN IMMEDIATE;
                     &bindings,
                     placement_policy,
                     false,
+                    #[cfg(target_os = "linux")]
+                    None,
                 )
                 .await
         );

@@ -5,12 +5,16 @@ use super::*;
 use consensus::wal::Wal;
 use std::io;
 
-/// A caller-owned, real-monotonic delay for contended authority reads.
+/// A startup-owned, real-monotonic delay for contended authority reads.
 ///
 /// A timer descriptor wakes the reactor even when Tokio time is paused. The
 /// caller's existing absolute RPC deadline still bounds the enclosing future;
-/// dropping it closes this descriptor without leaving a worker or retry task.
-pub(super) struct AuthorityBackoff(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
+/// cancelling a wait releases admission without leaving a worker or retry task.
+/// Handler clones share the descriptor created before their engine starts.
+pub(crate) struct AuthorityBackoff {
+    timer: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    waiter: tokio::sync::Mutex<()>,
+}
 
 impl AuthorityBackoff {
     pub(super) fn new() -> io::Result<Self> {
@@ -18,14 +22,19 @@ impl AuthorityBackoff {
             rustix::time::TimerfdClockId::Monotonic,
             rustix::time::TimerfdFlags::NONBLOCK | rustix::time::TimerfdFlags::CLOEXEC,
         )?;
-        tokio::io::unix::AsyncFd::with_interest(timer, tokio::io::Interest::READABLE).map(Self)
+        Ok(Self {
+            timer: tokio::io::unix::AsyncFd::with_interest(timer, tokio::io::Interest::READABLE)?,
+            waiter: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub(super) async fn wait(&self) -> io::Result<()> {
+        let _waiter = self.waiter.lock().await;
         // Rearm a one-shot after each failed acquisition; accumulated timer
-        // intervals must never allow a burst of immediate retries.
+        // intervals or a cancelled wait must never allow immediate retries.
+        // Neither admission nor rearming creates a descriptor or a thread.
         rustix::time::timerfd_settime(
-            self.0.get_ref(),
+            self.timer.get_ref(),
             rustix::time::TimerfdTimerFlags::empty(),
             &rustix::time::Itimerspec {
                 it_interval: rustix::time::Timespec::default(),
@@ -36,7 +45,7 @@ impl AuthorityBackoff {
             },
         )?;
         loop {
-            let mut ready = self.0.readable().await?;
+            let mut ready = self.timer.readable().await?;
             match ready.try_io(|timer| {
                 let mut expirations = [0_u8; 8];
                 rustix::io::read(timer.get_ref(), &mut expirations).map_err(io::Error::from)
@@ -59,6 +68,13 @@ pub(super) fn unavailable() -> StoreError {
 }
 
 impl SqliteSessionBackend {
+    /// Create the native handler's real-time wait resource during startup.
+    pub(crate) fn new_authority_backoff(&self) -> io::Result<Option<Arc<AuthorityBackoff>>> {
+        self.native_enabled()
+            .then(|| AuthorityBackoff::new().map(Arc::new))
+            .transpose()
+    }
+
     pub(super) fn native_enabled(&self) -> bool {
         #[cfg(test)]
         if self
@@ -299,5 +315,30 @@ impl SqliteSessionBackend {
             )
         })
         .map(|result| result.map_err(|_| unavailable())?)
+    }
+}
+
+#[cfg(test)]
+mod authority_backoff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_a_queued_authority_wait_preserves_the_next_waiter() {
+        let backoff = AuthorityBackoff::new().expect("startup timer");
+        let occupied = backoff.waiter.lock().await;
+        let mut cancelled = Box::pin(backoff.wait());
+        let mut next = Box::pin(backoff.wait());
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        assert!(futures_util::poll!(next.as_mut()).is_pending());
+        drop(cancelled);
+        drop(occupied);
+        tokio::time::timeout(Duration::from_millis(40), &mut next)
+            .await
+            .expect("cancellation cannot strand another caller")
+            .expect("remaining caller receives its real timer wake");
+        assert!(
+            backoff.waiter.try_lock().is_ok(),
+            "completed wait releases admission"
+        );
     }
 }
