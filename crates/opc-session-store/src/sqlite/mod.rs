@@ -683,6 +683,8 @@ pub struct SqliteSessionBackend {
     pub(crate) test_progress: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fixed_quorum_native_contention: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     pub(crate) fenced_transition_v2_activation_lookup_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -1490,6 +1492,8 @@ impl SqliteSessionBackend {
             test_progress: tokio::sync::watch::Sender::default(),
             #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(all(test, target_os = "linux"))]
+            fixed_quorum_native_contention: tokio::sync::watch::Sender::default(),
             #[cfg(test)]
             fenced_transition_v2_activation_lookup_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -2275,7 +2279,14 @@ impl SqliteSessionBackend {
             match result {
                 Ok(Some(exact)) => return exact,
                 Err(_) => return false,
-                Ok(None) => tokio::time::sleep(Duration::from_millis(1)).await,
+                Ok(None) => {
+                    #[cfg(test)]
+                    self.fixed_quorum_native_contention.send_replace(());
+                    // An OS thread releases the owner lock independently of
+                    // protocol time. Keep this retry cancellable by the RPC's
+                    // original deadline without requiring a clock advance.
+                    tokio::task::yield_now().await;
+                }
             }
         }
         let conn = self.conn.lock().await;

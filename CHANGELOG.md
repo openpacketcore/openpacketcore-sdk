@@ -730,6 +730,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: retry contended native fixed-quorum authority reads with
+  a cooperative yield instead of a protocol-clock sleep. A released owner lock
+  can unblock inbound engine traffic while protocol time is paused; the
+  original RPC deadline and fail-closed authority checks remain unchanged.
+  Both void-receipt election tests require real owner contention followed by a
+  200 ms wall-time hold without advancing their election clock. (#1301)
+
 - `opc-session-store` tests: make native void-receipt successor elections
   deterministic with real lease denials and split votes. Require the designated
   successor at the retry computed from the configured election timers, retain
@@ -739,7 +746,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handlers before advancing the clock. Pause after the successor ticker
   re-registers and verify the original tail with the resulting clock lead.
   Keep tick observations valid when unrelated tests register tracing callsites
-  first. (#1301)
+  first. Establish a fresh committed leader lease inside frozen time, exercising
+  the expired bootstrap lease, and keep automatic campaigns out of normal-time
+  setup before restoring every voter's original split and retry. Paused time
+  requires current-thread runtimes for these two tests; their native writes run
+  inline, so they no longer exercise the four-worker write hand-off path. (#1301)
 
 - `opc-persist` tests: use a thirty-second budget for the remaining-deadline
   regression to tolerate short host stalls while preserving its expiration,

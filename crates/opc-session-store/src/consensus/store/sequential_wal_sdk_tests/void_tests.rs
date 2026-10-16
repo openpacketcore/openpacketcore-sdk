@@ -477,7 +477,15 @@ impl Fleet {
                 open.await
             };
             match result {
-                Ok(store) => self.stores.push(store),
+                Ok(store) => {
+                    if self.void_election.is_some() {
+                        // Bootstrap is explicit. Setup on normal time must
+                        // not consume the finite automatic-campaign script
+                        // when the host stalls before the clock is frozen.
+                        store.inner.raft.runtime_config().elect(false);
+                    }
+                    self.stores.push(store);
+                }
                 Err(error) => {
                     self.close().await;
                     panic!("private WAL SDK node {index} open failed: {error:?}");
