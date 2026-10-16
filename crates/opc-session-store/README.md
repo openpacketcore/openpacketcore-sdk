@@ -2454,6 +2454,9 @@ by issue #143.
   entry, anchoring the follower votes at one instant. The clock advances only
   after every affected core handles every sent tick; actual tick sequence
   observations distinguish the leader's ticker from replication-worker sleeps.
+  A separate `void_tick_observer` test process checks that first use of a tracing
+  callsite on an unobserved test thread cannot disable this observation. It also
+  requires a new core-handler completion for each successive tick.
   The fixtures verify a forced campaign denied by the leader lease, an automatic
   split vote, and the designated successor's retry at a bound computed from the
   configured timers and recorded ticker phases.

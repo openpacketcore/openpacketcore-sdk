@@ -38,6 +38,12 @@ struct Progress {
 pub struct TickDelivery {
     spans: Arc<Mutex<Spans>>,
     progress: watch::Sender<HashMap<u64, Progress>>,
+    // With one registered dispatcher, tracing derives a new callsite's global
+    // interest from the registering thread alone. A parallel test without a
+    // subscriber can then disable our long-lived tick span. Keep two registered
+    // dispatchers so registration consults both, while delivery stays local to
+    // each thread's subscriber. This dispatcher is never installed as a default.
+    _callsite_registration: tracing::Dispatch,
 }
 
 impl TickDelivery {
@@ -46,6 +52,9 @@ impl TickDelivery {
         let observer = Self {
             spans: Arc::default(),
             progress: watch::channel(HashMap::new()).0,
+            _callsite_registration: tracing::Dispatch::new(
+                tracing::subscriber::NoSubscriber::default(),
+            ),
         };
         let guard = tracing::subscriber::set_default(observer.clone());
         (observer, guard)

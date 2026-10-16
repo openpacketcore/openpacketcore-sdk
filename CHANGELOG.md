@@ -737,7 +737,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   business-state, snapshot, and restart assertions. Keep setup on normal time
   and freeze only the election, observing real tick sends and completed core
   handlers before advancing the clock. Pause after the successor ticker
-  re-registers and verify the original tail with the resulting clock lead. (#1301)
+  re-registers and verify the original tail with the resulting clock lead.
+  Keep tick observations valid when unrelated tests register tracing callsites
+  first. (#1301)
+
+- `opc-persist` tests: use a thirty-second budget for the remaining-deadline
+  regression to tolerate short host stalls while preserving its expiration,
+  upper-bound, and positive elapsed-time assertions.
 
 - `opc-persist`: preserve the remaining standard-clock deadline budget when
   waiting for retained configuration admission and consumer-checkpoint I/O or
