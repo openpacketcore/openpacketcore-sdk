@@ -377,6 +377,43 @@ impl VoidElection {
             self.advance_all(fleet, self.started + tick).await;
             tick += self.early.tick;
         }
+        // Core tick completion does not imply that the remaining voter has
+        // handled the resulting heartbeat. A replay must reach every applied
+        // frontier before this election relies on that voter's renewed lease.
+        self.anchor_followers(fleet, request, void_first).await;
+        let remaining = (0..fleet.stores.len())
+            .find(|index| *index != self.old && *index != self.successor)
+            .unwrap();
+        let remaining_vote = fleet.stores[remaining]
+            .inner
+            .raft
+            .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining_vote,
+            (
+                Vote::new_committed(old_term + 1, successor_id),
+                Some(self.started + renewal)
+            ),
+            "the remaining voter has the observed fresh denial lease"
+        );
+        let temporary_leader_vote = successor
+            .inner
+            .raft
+            .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
+            .await
+            .unwrap();
+        assert_eq!(
+            temporary_leader_vote,
+            (
+                Vote::new_committed(old_term + 1, successor_id),
+                Some(successor_updated)
+            ),
+            "the replay leaves the temporary leader's expired lease unchanged"
+        );
+        assert!(self.started + renewal > successor_updated + self.early.lease);
+        assert_eq!(Instant::now(), self.started + renewal);
         old.inner.raft.trigger().elect().await.unwrap();
         let renewed = gate.observed(4).await;
         assert_eq!(renewed.len(), 4);

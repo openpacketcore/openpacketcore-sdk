@@ -60,7 +60,7 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 libc = "0.2"
 nix = { workspace = true, features = ["fs", "socket", "user"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 aes-gcm-siv = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"

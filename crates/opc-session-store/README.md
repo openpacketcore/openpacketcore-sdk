@@ -2453,6 +2453,10 @@ by issue #143.
   re-registers, then settles all three tickers while the leader is healthy.
   The fixture observes the leader's own committed-vote timestamp and exercises
   its expired lease before electing away and back through real Vote RPCs.
+  Before the return election, another replay reaches every applied frontier;
+  the remaining voter's committed-vote timestamp must equal that frozen
+  instant while the temporary leader's expired timestamp remains unchanged.
+  Completed tick handlers alone do not establish heartbeat delivery.
   The resulting committed vote must have the current frozen timestamp.
   Replaying the already-decided operation through Raft anchors the follower
   votes at that same instant; all three applied frontiers must include the new
@@ -2470,10 +2474,13 @@ by issue #143.
   wins at twelve; the former ten-second wait is retained as a negative control.
   Before the first forced campaign, a blocking worker holds the remaining
   voter's real native owner lock until authority contention is observed, then
-  for another 200 ms of wall time. The authority check yields cooperatively on
-  contention while retaining the original RPC deadline. Releasing the lock
-  therefore needs no protocol-clock advance, and both real denials must still
-  arrive at the exact initial instant.
+  for another 200 ms of wall time. Contended authority reads await a one-millisecond
+  real monotonic timer through the I/O reactor, retaining the original absolute
+  RPC deadline. Cancellation closes the timer without a detached retry task.
+  Releasing the lock therefore needs no protocol-clock advance, and both real
+  denials must still arrive at the exact initial instant. Focused authority tests
+  bound retry counts while the owner is held and cover paused-time release,
+  cancellation, and fail-closed deadline rejection.
   The unchanged 30-second wall-clock watchdog covers only this short frozen
   phase, whose duration is reported. Resuming normal time preserves the clock
   offset from ticker settling, lease renewal, and the election. The measured

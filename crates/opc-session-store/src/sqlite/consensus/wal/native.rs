@@ -1704,7 +1704,7 @@ impl Wal {
     }
 
     /// A nonblocking attempt at the same live-owner authority check. An async
-    /// caller can yield on contention without blocking its original deadline.
+    /// caller can await backoff without blocking its original deadline.
     pub(crate) fn native_fixed_try_read<T>(
         &self,
         expectation: FixedReadExpectation<'_>,

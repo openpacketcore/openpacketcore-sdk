@@ -3078,9 +3078,11 @@ mod tests {
             encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
         )
         .expect("valid Vote envelope");
+        let polls_before = *fixture.backend.fixed_quorum_native_contention.borrow();
         let started = Instant::now();
         let response = fixture.handler.handle(fixture.leader, request).await;
         let elapsed = started.elapsed();
+        let polls = *fixture.backend.fixed_quorum_native_contention.borrow() - polls_before;
         holder
             .join()
             .expect("join finite fault")
@@ -3093,7 +3095,10 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown fixed test Raft");
-        eprintln!("native raw authority elapsed_us={}", elapsed.as_micros());
+        eprintln!(
+            "native raw authority elapsed_us={} retries={polls}",
+            elapsed.as_micros()
+        );
         assert_eq!(
             response.result,
             Err(SessionConsensusPeerError::ScopeMismatch),
@@ -3104,10 +3109,173 @@ mod tests {
             elapsed < Duration::from_millis(250),
             "native authority consumes the unchanged 40 ms operation deadline"
         );
+        assert!(polls > 0, "the real native authority lock was contended");
+        assert!(
+            polls as u128 <= elapsed.as_micros() / 500 + 2,
+            "held-owner retries must stay below 2,000 per second: {polls} in {elapsed:?}"
+        );
         assert_eq!(
             after, before,
             "timed-out authority cannot mutate vote/log/application"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_contention_backoff_progresses_with_paused_time() {
+        let fixture = fixed_follower_fixture(
+            Duration::from_millis(40),
+            true,
+            FixedAuthorityBackend::Native,
+        )
+        .await;
+        fixture.raft.runtime_config().elect(false);
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native owner selected")
+            .current()
+            .expect("live native owner");
+        let attempts = fixture.backend.fixed_quorum_native_contention.clone();
+        let mut contended = attempts.subscribe();
+        let (entered, holding) = tokio::sync::oneshot::channel();
+        let (release, releasing) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let observation = wal
+                .with_native_owner_held_for_test(|| {
+                    entered.send(()).expect("real lock acquisition awaited");
+                    releasing
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("authority contention observed");
+                    let polls_before = *attempts.borrow();
+                    let started = Instant::now();
+                    std::thread::sleep(Duration::from_millis(200));
+                    (*attempts.borrow() - polls_before, started.elapsed())
+                })
+                .expect("held native owner");
+            // Keep Tokio's automatic clock advance inhibited after unlocking
+            // until the real RPC completes. This worker sleeps, never spins.
+            finishing
+                .recv_timeout(Duration::from_secs(30))
+                .expect("released authority RPC completed");
+            observation
+        });
+        holding.await.expect("real native owner held");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let mut response = Box::pin(fixture.handler.handle(fixture.leader, request));
+        tokio::select! {
+            biased;
+            unexpected = &mut response => panic!("held authority unexpectedly completed: {unexpected:?}"),
+            observed = contended.changed() => observed.expect("actual authority contention"),
+        }
+        release.send(()).expect("start the measured owner hold");
+        let response = response.await;
+        let completed = tokio::time::Instant::now();
+        tokio::time::resume();
+        finished.send(()).expect("release the clock hold");
+        let (polls, elapsed) = holder.await.expect("join finite owner hold");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        eprintln!("paused native authority retries={polls} held_for={elapsed:?}");
+        assert_eq!(
+            completed, frozen,
+            "owner release needs no Tokio time advance"
+        );
+        assert!(
+            response.result.is_ok(),
+            "the exact authority admits the RPC after the real owner releases: {response:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(200));
+        assert!(
+            polls as u128 <= elapsed.as_micros() / 500 + 2,
+            "held-owner retries must stay below 2,000 per second: {polls} in {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_contention_cancellation_stops_retrying() {
+        let fixture = fixed_follower_fixture(
+            Duration::from_millis(40),
+            true,
+            FixedAuthorityBackend::Native,
+        )
+        .await;
+        fixture.raft.runtime_config().elect(false);
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native owner selected")
+            .current()
+            .expect("live native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw owner before");
+        let held_wal = Arc::clone(&wal);
+        let mut contended = fixture.backend.fixed_quorum_native_contention.subscribe();
+        let (entered, holding) = tokio::sync::oneshot::channel();
+        let (release, releasing) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            held_wal
+                .with_native_owner_held_for_test(|| {
+                    entered.send(()).expect("real lock acquisition awaited");
+                    releasing
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("contended caller cancelled");
+                    std::thread::sleep(Duration::from_millis(200));
+                })
+                .expect("held native owner");
+        });
+        holding.await.expect("real native owner held");
+        tokio::time::pause();
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let mut response = Box::pin(fixture.handler.handle(fixture.leader, request));
+        tokio::select! {
+            biased;
+            unexpected = &mut response => panic!("held authority unexpectedly completed: {unexpected:?}"),
+            observed = contended.changed() => observed.expect("actual authority contention"),
+        }
+        drop(response);
+        tokio::time::resume();
+        let cancelled_at = *fixture.backend.fixed_quorum_native_contention.borrow();
+        release
+            .send(())
+            .expect("observe cancellation while still held");
+        holder.await.expect("join finite owner hold");
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw owner after cancellation");
+        assert_eq!(
+            *fixture.backend.fixed_quorum_native_contention.borrow(),
+            cancelled_at,
+            "dropping the caller leaves no detached authority retries"
+        );
+        assert_eq!(after, before, "cancelled authority never enters the engine");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
     }
 
     #[cfg(target_os = "linux")]
