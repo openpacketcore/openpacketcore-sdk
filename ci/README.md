@@ -39,17 +39,19 @@ Live prechecks resolve the exact enabled name in that profile. All million-entry
 inputs, persistence operations and assertions remain intact; the default
 three-cycle regressions stay in the ordinary library partition.
 
-Core proof runners have a new 90-minute job budget; egress proof runners have
-75 minutes. These account for the hosted observations in
-[CI run 38771278536](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38771278536)
-and [egress run 38771278326](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38771278326):
-heavy-1 spent 38.3 minutes in its mixed ordinary/O1 precheck before testing, and
-the leader's measured proposal progress projects about 27 minutes for all inputs,
-before reopen. Egress's additional O1 precheck cost about 15 minutes per runner.
-These are sizing inputs, not completed timing qualifications. Existing job limits
-and every test deadline remain unchanged. The new required matrices compile only
-their proof profile; neither ordinary heavy-1 nor ordinary egress shards pay for
-that compilation. A hosted run must confirm the resulting margin.
+Core proof runners retain their 90-minute job budget. The egress leader proof
+on shard 4 has 120 minutes; the Durable and Async proofs on shards 5 and 6 retain
+75 minutes. In [egress run 38801737477](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38801737477/job/116652422946),
+the leader reached 917,504 of 1,056,768 proposals in 3,465.5 seconds before its
+75-minute job budget expired. The slowest measured 65,536-proposal interval took
+298.48 seconds, projecting 80.2 minutes for all proposals. Adding the observed
+12.8-minute precheck gives about 93 minutes before setup and reopen. A 120-minute
+budget leaves about 27 minutes for those steps and runner variation.
+
+This changes only the leader's job budget. The whole proof, reopen, test deadlines
+and assertions remain intact. A hosted run must confirm the resulting margin.
+The dedicated matrices compile only their proof profile; ordinary heavy-1 and
+egress shards do not pay for that compilation.
 
 The required i686 matrix separates session-net library tests from executable
 unit tests, integration tests and doctests. The integration runner exercises the

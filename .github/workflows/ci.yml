@@ -381,7 +381,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: opc-rust-native-log-${{ matrix.shard }}
+          shared-key: opc-rust-native-log
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Precheck shard selection
@@ -433,7 +433,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: opc-rust-libraries-${{ matrix.shard }}
+          shared-key: opc-rust-libraries
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run exact library partition

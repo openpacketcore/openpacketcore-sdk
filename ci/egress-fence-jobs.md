@@ -11,8 +11,9 @@ All workload definitions retain the original fail-closed changes
 condition. Both test matrices have `fail-fast: false`, so one failing shard does
 not cancel the others. No branch-protection context needs renaming: each new
 workload blocks the same existing required check. Existing workloads retain their
-45-minute limit. Each new full-bound proof job has a 75-minute compilation/run
-budget; the decision and aggregate jobs retain their 10-minute limits.
+45-minute limit. The full-bound leader proof on shard 4 has a 120-minute
+compilation/run budget; the Durable and Async proofs on shards 5 and 6 retain
+75 minutes. The decision and aggregate jobs retain their 10-minute limits.
 
 ## Original step ownership
 
@@ -53,8 +54,9 @@ downloads the five outputs from the same workflow run. Cache mappings name the
 actual build directories, relative to each workspace. Each ordinary test shard
 has its own `egress-fence-tests-N` cache key; `host-proofs` uses the separate
 `egress-fence-proofs` key and target directory. Full-bound proof runners use
-`egress-fence-native-log-N` keys and the `egress-fence-native-log` target directory. Source and installer compilation
-retains the `egress-fence-host` key. Each hosted runner has its own writable
+the shared `egress-fence-native-log` key and the `egress-fence-native-log` target
+directory because their compilation profiles and selections are identical.
+Source and installer compilation retains the `egress-fence-host` key. Each hosted runner has its own writable
 copy. The eBPF Clippy and oracle profiles have separate cache keys. Independent
 object reproducibility builds retain their separate clean target directories.
 All artifact uploads set `overwrite: true` so reruns replace their artifacts.

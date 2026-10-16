@@ -78,7 +78,7 @@
     "Exact names keep moved groups disjoint from misc and from isolated timing contracts.",
     "New unlisted tests still run on misc. Precheck rejects missing or ambiguous names.",
     "Ignored subprocess helpers declare one enabled parent in their group; the parent owns their crash scenarios.",
-    "The three full-bound native log proofs keep heavy-1 ownership and use serial test O1 with debug checks enabled.",
+    "Each full-bound native log proof has a dedicated native-log shard and uses serial test O1 with debug checks enabled.",
     "The full-journal opt-in proof stays ignored; do not turn it into a hosted qualification."
   ],
   "lib_groups": [

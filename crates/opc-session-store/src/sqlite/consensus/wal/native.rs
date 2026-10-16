@@ -2411,6 +2411,8 @@ impl Wal {
                         drop(state);
                         drop(permit);
                         let mut waiting = lock_state(&self.shared)?;
+                        #[cfg(test)]
+                        let first_wait = pressure_progress.is_none();
                         let (last_progress, lowest_shortfall, lowest_journal) = pressure_progress
                             .get_or_insert_with(|| {
                                 waiting.application_costs.retirement_waits += 1;
@@ -2424,6 +2426,10 @@ impl Wal {
                                     }),
                                 )
                             });
+                        #[cfg(test)]
+                        if first_wait {
+                            (self.control.hook)(Point::NativeRetirementWaitStarted)?;
+                        }
                         let mut just_failed_admission = true;
                         loop {
                             ensure_native_application_owner(&waiting)?;

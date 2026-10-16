@@ -412,15 +412,15 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
-  # The old O1 precheck cost 15 minutes before any ordinary tests ran. Each
-  # full-bound proof now gets its own runner and 75-minute compilation/run
-  # budget; ordinary host jobs retain their original 45-minute budgets.
+  # Each full-bound proof runs whole on its own runner. The leader's build
+  # plus conservative proposal projection is 93 minutes; its 120-minute
+  # budget includes setup, reopen and variation. Other proof jobs retain 75.
   host-native-log-proofs:
     name: Egress fence full native log proof (${{ matrix.shard }})
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: ${{ matrix.shard == 4 && 120 || 75 }}
     strategy:
       fail-fast: false
       matrix:
@@ -437,7 +437,7 @@ jobs:
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: egress-fence-native-log-${{ matrix.shard }}
+          shared-key: egress-fence-native-log
           workspaces: . -> target/egress-fence-native-log
 
       - name: Install kernel inspection tools

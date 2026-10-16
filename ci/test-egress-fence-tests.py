@@ -203,14 +203,7 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
 
 
 class NativeLogBoundPhaseTests(unittest.TestCase):
-    NAMES = (
-        "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
-        "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens",
-        "consensus::storage::tests::native_log_retained_bound::"
-        "native_log_retained_bound_survives_snapshot_purge_and_restart",
-        "consensus::storage::tests::native_log_retained_bound::"
-        "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
-    )
+    NAMES = FENCE.native_log_bound.TESTS
     setUp = ScopePayloadSerialPhaseTests.setUp
 
     def rows(self):
@@ -506,6 +499,23 @@ class RequiredCheckTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def assert_native_proof_matrix(self, native):
+        self.assertIn(f"shard: {list(FENCE.native_log_bound.EGRESS_SHARDS)}\n", native)
+
+    def test_new_registered_proof_requires_a_matching_workflow_shard(self):
+        workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
+        native = workflow.split("\n  host-native-log-proofs:\n", 1)[1]
+        old_shards = FENCE.native_log_bound.EGRESS_SHARDS
+        proofs = (*FENCE.native_log_bound.TESTS, "fixture::additional_full_native_proof")
+        shards = tuple(range(old_shards[0], old_shards[0] + len(proofs)))
+        with patch.object(FENCE.native_log_bound, "TESTS", proofs), \
+                patch.object(FENCE.native_log_bound, "EGRESS_SHARDS", shards):
+            with self.assertRaises(AssertionError):
+                self.assert_native_proof_matrix(native)
+            native = native.replace(f"shard: {list(old_shards)}\n",
+                                    f"shard: {list(shards)}\n", 1)
+            self.assert_native_proof_matrix(native)
+
     def test_cache_targets_match_each_jobs_actual_compilation_directories(self):
         workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
         parts = re.split(r"^  ([a-z][a-z-]+):\n", workflow.split("\njobs:\n", 1)[1],
@@ -565,7 +575,9 @@ class WorkflowTests(unittest.TestCase):
         for name in FENCE.REQUIRED_JOBS:
             with self.subTest(job=name):
                 self.assertIn(condition, jobs[name])
-                self.assertIn(f"timeout-minutes: {75 if name == 'host-native-log-proofs' else 45}\n", jobs[name])
+                timeout = ("${{ matrix.shard == 4 && 120 || 75 }}"
+                           if name == "host-native-log-proofs" else "45")
+                self.assertIn(f"timeout-minutes: {timeout}\n", jobs[name])
                 self.assertRegex(jobs[name], r"needs: (changes|\[changes, sources\])\n")
                 self.assertIn("if: always()\n        run: bash ci/egress-fence-cleanup.sh", jobs[name])
         aggregate = jobs["root-cgroup-egress"]
@@ -582,7 +594,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("run: ci/setup-fsverity-tmp.sh\n", host)
         self.assertIn("--shard '${{ matrix.shard }}'", host)
         native = jobs["host-native-log-proofs"]
-        self.assertIn("shard: [4, 5, 6]\n", native)
+        self.assert_native_proof_matrix(native)
         self.assertIn("fail-fast: false\n", native)
         self.assertIn("run: ci/setup-fsverity-tmp.sh\n", native)
         self.assertIn("--shard '${{ matrix.shard }}'", native)

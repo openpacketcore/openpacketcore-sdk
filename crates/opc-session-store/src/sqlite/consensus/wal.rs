@@ -323,6 +323,8 @@ pub(crate) enum Point {
     BeforeNativeApplyPrepare,
     #[cfg(test)]
     BeforeNativeRetirementPlan,
+    #[cfg(test)]
+    NativeRetirementWaitStarted,
     BeforeNativeApplyPublish,
     BeforeNativeReceiptRead,
     BeforeNativeLogRead,

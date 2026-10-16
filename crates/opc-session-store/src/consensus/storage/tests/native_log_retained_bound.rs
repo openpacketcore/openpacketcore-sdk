@@ -26,6 +26,10 @@ impl std::ops::Deref for NativeTestRaft {
 }
 
 impl NativeTestRaft {
+    pub(super) fn shutdown_observer(&self) -> ConsensusStorageShutdownObserver {
+        self.storage_shutdown.clone()
+    }
+
     pub(super) async fn shutdown(&self) -> io::Result<()> {
         let result = self.raft.shutdown().await.map_err(io::Error::other);
         // Raft joins its core, but snapshot and state-machine workers can
@@ -329,8 +333,8 @@ async fn native_log_three_cycles_reclaim_and_reopen_async() {
     bounded_cycles(SessionPersistenceMode::Async, 3).await;
 }
 
-// Required heavy-shard tests: deliberately not ignored. The shard manifest
-// removes these exact names from the ordinary misc run and executes both.
+// Required native-log proofs: deliberately not ignored. Each exact name runs
+// on its own dedicated shard, outside the ordinary library partitions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_log_retained_bound_survives_snapshot_purge_and_restart() {
     bounded_cycles(SessionPersistenceMode::Durable, 258).await;

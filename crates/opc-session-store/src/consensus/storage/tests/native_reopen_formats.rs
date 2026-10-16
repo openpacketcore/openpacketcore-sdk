@@ -5,7 +5,9 @@ use crate::consensus::SessionRaft;
 use opc_consensus::engine::raft::{AppendEntriesRequest, AppendEntriesResponse};
 use opc_consensus::engine::Vote;
 use sha2::{Digest, Sha256};
+use std::future::{poll_fn, Future};
 use std::os::unix::fs::MetadataExt;
+use std::task::Poll;
 
 const DATABASE: &str = "retained-bound.sqlite";
 const ROOT_SELECTION: &str = "user.opc.native-root-v1";
@@ -667,26 +669,36 @@ async fn native_reopen_fixture_close_waits_for_snapshot_storage_owner() {
         tokio::time::timeout(Duration::from_secs(300), gate.wait_started())
             .await
             .expect("real snapshot worker reaches its return boundary");
-        let mut closing = tokio::spawn(close_engine(backend, raft, wal));
-        tokio::select! {
-            result = &mut closing => {
-                drop(result.unwrap());
-                panic!("fixture close returned while a snapshot worker still owns SQLite");
-            }
-            () = tokio::time::sleep(Duration::from_secs(1)) => {}
-        }
-        gate.release();
-        drop(
-            tokio::time::timeout(Duration::from_secs(300), closing)
-                .await
-                .expect("fixture close completes after the real storage owner exits")
-                .unwrap(),
+        let storage_shutdown = raft.shutdown_observer();
+        let waits_for_owner = tokio::time::timeout(Duration::from_secs(300), async {
+            // Join the core first so its shutdown cannot explain a pending
+            // close. Disable cooperative yields during this explicit poll:
+            // only the held storage owner can keep the close future pending.
+            SessionRaft::shutdown(&raft).await.unwrap();
+            let closing = tokio::task::unconstrained(close_engine(backend, raft, wal));
+            tokio::pin!(closing);
+            let polled = poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx))).await;
+            let waits_for_owner = polled.is_pending();
+            // Release and drain even when the assertion will fail, so the
+            // real worker never outlives the fixture used by the regression.
+            gate.release();
+            drop(match polled {
+                Poll::Ready(wal) => wal,
+                Poll::Pending => closing.await,
+            });
+            storage_shutdown.wait().await;
+            waits_for_owner
+        })
+        .await
+        .expect("fixture close completes after the real storage owner exits");
+        assert!(
+            waits_for_owner,
+            "fixture close returned while a snapshot worker still owns SQLite"
         );
         let before = (
             namespace(directory.path()),
             namespace(directory.snapshot_path()),
         );
-        tokio::task::yield_now().await;
         assert_eq!(
             (
                 namespace(directory.path()),

@@ -572,11 +572,15 @@ fn native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked() 
 fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
     let armed = Arc::new(AtomicBool::new(false));
     let gate = Gate::new(Point::BeforeGroup, 1);
+    let (wait_started_tx, wait_started_rx) = mpsc::sync_channel(1);
     let (fixture, entry) = waiting_fixture_with(IoControl {
         hook: Arc::new({
             let armed = Arc::clone(&armed);
             let gate = Arc::clone(&gate);
             move |point| {
+                if point == Point::NativeRetirementWaitStarted {
+                    wait_started_tx.send(()).map_err(io::Error::other)?;
+                }
                 if armed.load(Ordering::Acquire) {
                     gate.hook(point)
                 } else {
@@ -590,7 +594,15 @@ fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
         crate::consensus::verified_snapshot::VerificationMemory::reserve(80 * 1024 * 1024).unwrap();
     std::thread::scope(|scope| {
         let apply = scope.spawn(|| fixture.wal.native_apply_committed(&[entry]));
-        until(|| fixture.wal.retirement_wait_state_for_test().unwrap().0 > 0);
+        wait_started_rx
+            .recv()
+            .expect("committed apply entered the retirement wait");
+        let (waits, operations, _) = fixture.wal.retirement_wait_state_for_test().unwrap();
+        assert!(waits > 0);
+        assert_eq!(
+            operations, 0,
+            "retirement wait releases its operation permit"
+        );
         armed.store(true, Ordering::Release);
         let primer = block_writer_first.then(|| {
             let pending = fixture.wal.submit(Operation::Barrier).unwrap();

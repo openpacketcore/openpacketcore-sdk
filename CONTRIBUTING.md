@@ -129,10 +129,11 @@ enabled. Each proof has a dedicated parallel core shard (`native-log-0` through
 Both plans preserve their package and feature selection and precheck the exact
 enabled names in the execution profile. The default three-cycle regressions
 retain the ordinary test profile. All entry counts, persistence operations,
-assertions, test deadlines and existing job limits remain unchanged. The new
-core proof jobs have 90-minute budgets and the new egress proof jobs have
-75-minute budgets, including compilation. See the [CI layout](ci/README.md) for
-the hosted sizing evidence and the ordinary library partition.
+assertions and test deadlines remain unchanged. Core proof jobs have 90-minute
+budgets. The egress leader proof on shard 4 has a 120-minute budget; the Durable
+and Async proofs on shards 5 and 6 retain 75 minutes, including compilation.
+See the [CI layout](ci/README.md) for the hosted sizing evidence and the ordinary
+library partition.
 
 The separate **Rust GTP-U unsupported-platform cfg** job in
 [ci.yml](.github/workflows/ci.yml) runs on Linux with
