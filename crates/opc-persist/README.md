@@ -396,8 +396,28 @@ vote delivery. It advances every protocol tick to the bound derived from the
 configured lease and sampled election timeout, then checks both survivors agree
 on the higher-term leader. A separate wall-clock watchdog bounds real disk work
 while protocol time is frozen. Normal time resumes for the existing response
-replay, complete four-record history, and replica-convergence assertions. Other
-fixtures retain their existing deadlines and election behavior.
+replay, complete four-record history, and replica-convergence assertions.
+
+The retained-history snapshot-repair scenario runs formation, retention commands,
+snapshots, and compaction on normal time with their original operation and wait
+bounds. The runtime starts paused only to record its timer-grid origin and resumes
+before any setup. After compaction it pauses again, settles the tickers while the
+leader is healthy, and re-anchors both followers' votes with one replicated
+retention replay. The election uses recorded ticker phases to compute the bound
+for one split vote and the following automatic campaign. Each clock advance waits
+for the affected cores to process every queued tick, including its sequence count;
+the test checks both denied votes, the successful vote, and the exact bound.
+Settling accounts for Tokio's millisecond timer grid and reports a clear error
+if a normal-time stall collapses both follower deadlines into the same slot.
+The unchanged 30-second wall-clock watchdog covers only this short frozen phase,
+whose duration is reported. The pause follows a follower ticker re-registration
+to exercise the largest settling advance. Resuming normal time preserves the
+offset: Tokio can lead the standard clock by about thirty seconds. The original
+history-floor, outcome-replay, and member snapshot-installation checks run with
+that lead. Retained admission and consumer-checkpoint waits use the remaining
+duration of their original standard-clock deadline, so this offset cannot consume
+their budget. Cancellation, blocking-worker deadline checks, and expiry outcomes
+remain unchanged.
 
 - Openraft config-store coverage:
   `cargo test --locked -p opc-persist --test consensus_openraft`

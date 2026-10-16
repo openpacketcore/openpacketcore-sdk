@@ -6,6 +6,9 @@ mod quorum_admission;
 #[path = "consensus_openraft/scripted_election.rs"]
 mod scripted_election;
 
+#[path = "consensus_openraft/retention_election.rs"]
+mod retention_election;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -70,6 +73,7 @@ struct LoopbackPeer {
     release_forward_response: Arc<tokio::sync::Notify>,
     captured_payloads: Arc<StdMutex<Vec<Vec<u8>>>>,
     election_vote: Arc<StdMutex<Option<Arc<scripted_election::FirstVote>>>>,
+    retention_vote: Arc<StdMutex<Option<Arc<retention_election::SplitVote>>>>,
 }
 
 impl LoopbackPeer {
@@ -87,6 +91,7 @@ impl LoopbackPeer {
             release_forward_response: Arc::new(tokio::sync::Notify::new()),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
             election_vote: Arc::new(StdMutex::new(None)),
+            retention_vote: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -201,9 +206,24 @@ impl ConsensusPeer for LoopbackPeer {
                 gate.before_delivery(&request).await;
             }
         }
+        let retention_vote = self
+            .retention_vote
+            .lock()
+            .expect("retention vote gate")
+            .clone();
+        if let Some(gate) = &retention_vote {
+            if family == ConsensusRpcFamily::Vote {
+                gate.before_delivery(&request).await;
+            }
+        }
         let response = handler
             .handle_with_compatibility(sender, request, compatibility)
             .await;
+        if let Some(gate) = &retention_vote {
+            if family == ConsensusRpcFamily::Vote {
+                gate.after_delivery(sender, &response);
+            }
+        }
         if let Some(gate) = &election_vote {
             if family == ConsensusRpcFamily::Vote {
                 gate.after_delivery(&response);
@@ -283,6 +303,25 @@ impl ThreeNodeCluster {
         >,
         scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
     ) -> Self {
+        Self::build_with_election_offset(
+            audit_key_material,
+            lifecycle,
+            policy,
+            scripts,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn build_with_election_offset(
+        audit_key_material: [[u8; 32]; 3],
+        lifecycle: FixtureStorage,
+        policy: Option<
+            &dyn Fn() -> opc_persist::audit_authority::continuity::AuditContinuityPolicy,
+        >,
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+        third_node_offset: Duration,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
         let members = nodes.into_iter().collect::<BTreeSet<_>>();
@@ -307,6 +346,9 @@ impl ThreeNodeCluster {
         }
         let mut stores = Vec::new();
         for (index, topology) in topologies.iter().cloned().enumerate() {
+            if index == 2 && !third_node_offset.is_zero() {
+                tokio::time::sleep(third_node_offset).await;
+            }
             let backend = if matches!(lifecycle, FixtureStorage::RetainedRepair) {
                 SqliteBackend::provision_config_member_repair(
                     retained_options(
@@ -1351,10 +1393,21 @@ async fn retained_history_floor_limits_and_outcomes_survive_explicit_reopen() {
     store.shutdown().await.expect("shutdown restored");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn history_retention_survives_natural_leader_change_and_member_snapshot_install() {
-    let mut cluster =
-        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+    // Capture Tokio's timer-grid origin, then run all setup on normal time.
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (ticks, _tick_observer) = retention_election::ticks::ProcessedTicks::install();
+    let mut schedule = retention_election::RetentionElection::new(runtime_origin).await;
+    let mut cluster = ThreeNodeCluster::build_with_election_offset(
+        [[0x55; 32]; 3],
+        FixtureStorage::RetainedNew,
+        None,
+        Some(&schedule.scripts),
+        schedule.offset,
+    )
+    .await;
     let (a, b, c) = tokio::join!(
         cluster.stores[0].initialize_cluster(),
         cluster.stores[1].initialize_cluster(),
@@ -1363,6 +1416,17 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
     a.expect("first");
     b.expect("second");
     c.expect("third");
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        while !cluster
+            .stores
+            .iter()
+            .all(|store| store.status().leader_id == Some(cluster.stores[0].status().node_id))
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial leader agreement");
     cluster.wait_ready().await;
     let original_leader = cluster.leader();
     let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
@@ -1398,12 +1462,15 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
     for store in &cluster.stores {
         store.trigger_snapshot().await.expect("production snapshot");
     }
+    let observers: Vec<_> = (0..3)
+        .map(|index| {
+            rusqlite::Connection::open(cluster.database_path(index)).expect("snapshot observation")
+        })
+        .collect();
     tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
         loop {
             let mut complete = true;
-            for index in 0..3 {
-                let observer = rusqlite::Connection::open(cluster.database_path(index))
-                    .expect("snapshot observation");
+            for observer in &observers {
                 let purged: bool = observer
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM config_raft_purged WHERE log_index > 0)",
@@ -1421,32 +1488,45 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
     })
     .await
     .expect("actual production log compaction");
-    let old_id = cluster.stores[original_leader].status().node_id;
-    let old_term = cluster.stores[original_leader].status().term;
-    cluster.isolate(original_leader);
-    cluster.stores[original_leader]
-        .shutdown()
-        .await
-        .expect("old leader stopped");
-    let replacement = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-        loop {
-            for index in 0..3 {
-                if index == original_leader {
-                    continue;
-                }
-                let state = cluster.stores[index].status();
-                if state.term > old_term
-                    && state.leader_id == Some(state.node_id)
-                    && state.node_id != old_id
-                {
-                    return index;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+    drop(observers);
+    schedule.pause_after_follower_tick().await;
+    let frozen_started = std::time::Instant::now();
+    let replacement = scripted_election::schedule::with_frozen_time(async {
+        schedule.settle(&ticks).await;
+        // One real replicated command renews both followers' committed votes
+        // at the paused instant, after setup and all engine-side purge work.
+        let before = cluster.stores[original_leader].status().applied_index;
+        cluster.stores[original_leader]
+            .retain_history_idempotent(request, decision.clone())
+            .await
+            .expect("retention replay anchors follower votes");
+        while cluster.stores[original_leader].status().applied_index <= before {
+            tokio::task::yield_now().await;
         }
+        let anchor = cluster.stores[original_leader].status().applied_index;
+        while !cluster
+            .stores
+            .iter()
+            .all(|store| store.status().applied_index >= anchor)
+        {
+            tokio::task::yield_now().await;
+        }
+        let old_id = cluster.stores[original_leader].status().node_id;
+        let old_term = cluster.stores[original_leader].status().term;
+        cluster.isolate(original_leader);
+        cluster.stores[original_leader]
+            .shutdown()
+            .await
+            .expect("old leader stopped");
+        schedule
+            .elect(&cluster, original_leader, old_id, old_term, &ticks)
+            .await
     })
-    .await
-    .expect("natural surviving-quorum election");
+    .await;
+    eprintln!(
+        "retention election frozen phase wall time: {:?}",
+        frozen_started.elapsed()
+    );
     cluster.stores[replacement]
         .retain_history_idempotent(request, decision.clone())
         .await

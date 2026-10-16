@@ -608,8 +608,8 @@ impl ConsumerCheckpointStore {
                     1,
                     metadata.clone(),
                 );
-                let envelope = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(work.deadline),
+                let envelope = crate::deadline::timeout(
+                    work.deadline,
                     encrypt_envelope(provider.as_ref(), &aad, &[]),
                 )
                 .await
@@ -629,8 +629,8 @@ impl ConsumerCheckpointStore {
                     row.generation,
                     metadata.clone(),
                 );
-                let payload = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(work.deadline),
+                let payload = crate::deadline::timeout(
+                    work.deadline,
                     decrypt_envelope(provider.as_ref(), &aad, &row.envelope),
                 )
                 .await
@@ -687,7 +687,7 @@ async fn run_open_io<T: Send + 'static>(
         work.check()?;
         operation(&work)
     });
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
+    crate::deadline::timeout(deadline, &mut task)
         .await
         .map_err(|_| ConsumerCheckpointError::Indeterminate)?
         .map_err(|_| ConsumerCheckpointError::Indeterminate)?
