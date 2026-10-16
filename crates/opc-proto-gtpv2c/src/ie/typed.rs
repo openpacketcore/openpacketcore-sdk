@@ -1141,6 +1141,32 @@ impl fmt::Debug for IpAddress {
     }
 }
 
+/// Named N1-mode interworking flags from TS 29.274 §8.12.
+///
+/// These expose independent wire facts. They do not infer support, subscription,
+/// or permission from one another; procedure-specific interpretation is the
+/// caller's responsibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicationFlag {
+    /// 5GSIWKI: 5GS interworking indication, IE octet 11 bit 6.
+    FiveGsInterworking,
+    /// 5GCNRS: 5GC not restricted support, IE octet 12 bit 4.
+    FiveGcNotRestrictedSupport,
+    /// 5GCNRI: 5GC not restricted indication, IE octet 12 bit 3.
+    FiveGcNotRestricted,
+}
+
+impl IndicationFlag {
+    const fn location(self) -> (usize, u8) {
+        // flags[0] is IE octet 5, after the four-octet TLIV header.
+        match self {
+            Self::FiveGsInterworking => (6, 0x20),
+            Self::FiveGcNotRestrictedSupport => (7, 0x08),
+            Self::FiveGcNotRestricted => (7, 0x04),
+        }
+    }
+}
+
 /// Indication IE (type 77).
 ///
 /// The Release 18 indication bitset is extension-friendly and varies in
@@ -1156,6 +1182,29 @@ pub struct Indication {
 }
 
 impl Indication {
+    /// Read one flag; omitted extension octets have all flags clear.
+    #[must_use]
+    pub fn flag(&self, flag: IndicationFlag) -> bool {
+        let (index, mask) = flag.location();
+        self.flags.get(index).is_some_and(|octet| octet & mask != 0)
+    }
+
+    /// Set or clear one flag, preserving every other bit and extension octet.
+    ///
+    /// Setting an absent flag extends with zeroes only as far as needed.
+    /// Clearing an absent flag leaves the original length unchanged.
+    pub fn set_flag(&mut self, flag: IndicationFlag, value: bool) {
+        let (index, mask) = flag.location();
+        if value {
+            if self.flags.len() <= index {
+                self.flags.resize(index + 1, 0);
+            }
+            self.flags[index] |= mask;
+        } else if let Some(octet) = self.flags.get_mut(index) {
+            *octet &= !mask;
+        }
+    }
+
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
         require_min_len(value, 1, offset, "Indication IE must contain flag octets")?;
         Ok(Self {
@@ -3790,7 +3839,7 @@ fn put_twan_len(length: usize, dst: &mut BytesMut) -> Result<(), EncodeError> {
 /// PCO, this typed view keeps nested protocol identifiers opaque and
 /// byte-exact.
 ///
-/// @spec 3GPP TS29274 R18 8.104
+/// @spec 3GPP TS29274 R18 8.94
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-APCO-001
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdditionalProtocolConfigurationOptions {

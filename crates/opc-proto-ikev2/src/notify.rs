@@ -203,6 +203,15 @@ pub const IKEV2_NOTIFY_SIGNATURE_HASH_ALGORITHMS: u16 = 16_431;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_DEVICE_IDENTITY: u16 = 41_101;
 
+/// N1-mode capability carrying a PDU session identity (TS 24.302 §8.2.9.15).
+pub const IKEV2_NOTIFY_N1_MODE_CAPABILITY: u16 = 51_015;
+
+/// N1-mode information carrying an S-NSSAI value (TS 24.302 §8.2.9.16).
+pub const IKEV2_NOTIFY_N1_MODE_INFORMATION: u16 = 51_115;
+
+/// PLMN associated with the N1-mode S-NSSAI (TS 24.302 §8.2.9.17).
+pub const IKEV2_NOTIFY_N1_MODE_S_NSSAI_PLMN_ID: u16 = 52_216;
+
 /// IKEv2 Notify Message Type for 3GPP P_CSCF_RESELECTION_SUPPORT.
 ///
 /// A UE includes this status Notify in an IKE_AUTH request to indicate support

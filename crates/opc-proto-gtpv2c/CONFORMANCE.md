@@ -4,7 +4,8 @@
 
 - **Specification family:** 3GPP TS 29.274 (GTPv2-C), Release 18 naming.
 - **Referenced specification:** 3GPP TS 24.008 V20.0.0, clause 10.5.6.3 only,
-  for the PCO inner codec. Every 10.5.6.3 reference in this document is to that
+  for the address/IPCP PCO inner codec. Unless explicitly versioned otherwise,
+  every 10.5.6.3 reference in this document is to that
   version, and the clause text this crate relies on is unchanged from V13.7.0
   through V20.0.0. The bare TS 24.008 TFT references below (clause 10.5.6.12
   format, cited without a clause or version number) are `opc-proto-tft`'s
@@ -29,6 +30,46 @@
   separate zero-allocation fixed-header inspector and bounded typed response
   planner cover the Release 18 protocol-error response boundary without
   retaining packet bodies or transaction state.
+
+## N1-mode APCO value boundary
+
+`src/n1_mode.rs` implements the ordinary APCO value format from TS 24.008
+**V18.8.0** §10.5.6.3 and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
+The request direction recognizes only container `0x001a` (PDU session identity);
+the response direction recognizes only `0x001b` (complete S-NSSAI followed by
+three PLMN octets). S-NSSAI has no nested NAS IEI/length. Shared checked values
+preserve all five S-NSSAI forms and mapped-HPLMN fields.
+
+The parser checks the complete contents region, including unknown units and
+the pinned specification's direction-dependent two-octet length fields. It
+accepts receiver-ignored spare bits and configuration-protocol fallback values;
+builders emit `0x80`. Unknown and opposite-direction identifiers are ignored as
+N1 data, and append preserves their original bytes. The ordinary contents limit
+is 251 octets; the local work bound is 64 protocol/container units. Large APCO
+and standalone ePCO are excluded.
+
+Identical and conflicting repeated N1 containers are rejected under an explicit
+SDK ambiguity rule. Top-level IE duplicate handling remains the existing
+procedure-aware first-occurrence rule. S2b projections check message type,
+procedure and direction, and read only top-level APCO type 163 instance 0;
+PCO, grouped APCO and other instances cannot supply N1 data. Absence, a malformed
+recognized value and a valid value remain distinct. An optional-value error
+does not change the peer's Cause or establish a whole-session rejection.
+
+`IndicationFlag` covers 5GSIWKI (IE octet 11 bit 6), 5GCNRS (octet 12 bit 4)
+and 5GCNRI (octet 12 bit 3), per TS 29.274 §8.12. Missing octets read clear;
+setting extends only as needed and preserves all other bits.
+
+`tests/n1_mode.rs` supplies independent literal values, round trips, direction,
+length/digit/duplicate/bounds negatives, unknown-unit preservation, diagnostic
+redaction and all flag combinations. `tests/n1_mode_s2b.rs` exercises existing
+spec-authored Create Session fixtures and placement/direction/Cause boundaries.
+`tests/n1_mode_corpus.rs` verifies exact fuzz mirrors of the textual APCO
+fixtures; `fuzz/fuzz_targets/n1_mode.rs` checks round trips and append invariants.
+`examples/n1_mode.rs` demonstrates these additive codecs and independent flags.
+This is a codec claim only; negotiation, authentication, subscription, slice
+authorization and session correlation remain with the consumer. See
+[ADR 0033](../../docs/adr/0033-n1-mode-codecs.md).
 
 ## S2b Production Profile v1 — Experimental Target Boundary
 

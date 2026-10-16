@@ -12,6 +12,11 @@ pass raw strings at trust boundaries.
 
 - Identifier types: `TenantId`, `InstanceId`, `RegionId`, `SpiffeId`, `PlmnId`,
   `Snssai`, and redaction-safe `Imei`/`Imei15`/`Imeisv` device identities.
+- Shared N1-mode wire values in `n1_mode`: `PduSessionId`, `SnssaiValue`, and
+  `PlmnIdentity`, used by both IKEv2 and GTPv2-C. These preserve the five complete
+  S-NSSAI forms, mapped HPLMN fields and two-/three-digit MNC coding. They redact
+  `Debug`/`Display` and require explicit methods to expose values. PDU session
+  identity zero means unassigned; it does not mean N1 mode is disabled.
 - Network-function types: `NfKind`, plus compatibility aliases
   `NetworkFunctionKind`, `NfType`, and `NfInstanceId`.
 - Versioning/time types: `ConfigVersion`, `SchemaDigest`, `Timestamp`, and

@@ -82,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-types`, `opc-proto-ikev2` and `opc-proto-gtpv2c`: add shared checked
+  N1-mode wire values, the three TS 24.302 N1 Notify codecs, directional
+  ordinary APCO PDU-session/S-NSSAI containers at S2b Create Session top level,
+  and named 5GSIWKI/5GCNRS/5GCNRI Indication flags. Decode keeps unrelated or
+  absent data distinct from malformed recognized values. Diagnostics redact
+  identities; bounded collection codecs document their duplicate rules.
+
 - `opc-peer-discovery`: add `DnsAnswer::filter_snaptr_paths` to apply consumer
   path policy while preserving the original seeded S-NAPTR traversal order.
   Surviving paths determine endpoint order and primary provenance; original

@@ -759,6 +759,7 @@ dependencies = [
  "sha2 0.11.0",
  "spki 0.8.0",
  "subtle",
+ "thiserror",
  "x509-parser",
  "zeroize",
 ]

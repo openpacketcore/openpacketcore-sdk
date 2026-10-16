@@ -30,7 +30,20 @@ Clause abbreviations used in the tables: IMSI §8.3.2, Cause §8.4, Recovery
 §8.5, APN §8.6, APN-AMBR §8.7, EBI §8.8, Indication §8.12, PCO §8.13, PAA §8.14, Bearer QoS
 §8.15, RAT Type §8.17, Serving Network/PLMN §8.18, F-TEID §8.22, Bearer Context
 §8.28, Charging ID §8.29, PDN Type §8.34, Selection Mode §8.58, Bearer TFT
-§8.28 plus TS 24.008 §10.5.6.12, and APCO §8.104.
+§8.28 plus TS 24.008 §10.5.6.12, and APCO §8.94.
+
+### N1-mode APCO contents
+
+`n1_mode_apco_request.hex` and `n1_mode_apco_response.hex` are ordinary APCO
+contents, excluding the GTP TLIV header. They are authored from TS 24.008
+V18.8.0 §10.5.6.3 and TS 29.274 V18.8.0 §8.94. They contain synthetic values
+and are not captures. `tests/n1_mode_corpus.rs` checks the exact mirrors in
+`fuzz/corpus/n1_mode/`; the `n1_mode` fuzz target consumes raw APCO contents.
+
+| File | Octets | Meaning |
+| --- | --- | --- |
+| Request | `80 00 1a 01 07` | Ordinary configuration header; MS-to-network PDU session identity container; one-octet value length; identity 7. |
+| Response | `80 00 1b 07 01 12 34 56 00 f1 10` | Ordinary header; network-to-MS S-NSSAI container; seven-octet value; SST 1 and SD `123456`; associated PLMN `001/01`. The slice contains no NAS IEI or nested length. |
 
 The two header-only `.hex` fixtures below are decoded directly by
 `tests/header.rs`; each whitespace-separated octet is a counted conformance

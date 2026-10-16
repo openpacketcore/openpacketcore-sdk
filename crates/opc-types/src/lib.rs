@@ -9,6 +9,7 @@
 
 mod error;
 mod identity;
+pub mod n1_mode;
 mod network;
 mod nf;
 mod redaction;
