@@ -660,10 +660,16 @@ recycle accepted work. A definite non-append rejection releases its reservation.
 Absolute log indices, completed-operation counts and elapsed service lifetime
 are never admission budgets; progress reuses the same window.
 
-A leader waits before taking an execution credit and keeps the original
-operation deadline. It returns the existing Unavailable outcome if live
-capacity does not recover in time. Losing leadership wakes queued proposals
-with NotLeader so that they can reroute within that same deadline. Followers
+A leader checks capacity before taking an execution credit. Its authenticated
+pressure acknowledgement means the request was definitely not proposed. The
+supported write surface retains the immutable request in a bounded SDK owner
+and retries with a fresh per-attempt deadline and fresh authority checks. This
+includes direct ScopeBatch execute/cancel and V2 calls; cancelling an admitted
+pressure retry's result observer does not cancel its work. No running proposal
+or forwarding credit is retained between attempts. Pressure does not convert
+authority failures or possible delivery into a retryable non-proposal result.
+Losing leadership wakes queued proposals with NotLeader so that they can reroute
+within the current attempt's original deadline. Followers
 deliver complete authenticated AppendEntries batches to Raft regardless of
 their retained window. Data appends carry heartbeats, and controls behind data
 must remain reachable. Follower accounting observes pressure and retains
@@ -677,14 +683,33 @@ SafetyControl application growth remain gated. The single-voter Async
 cold-rejoin barrier receives its exemption only after authentication through
 the private cold-cut path; ordinary AdvanceLogicalTime is still gated.
 
-The engine owns snapshot construction, transfer and purge. If an old stalled
-build finishes after ordinary commits have stopped at the window, the SDK
-requests a successor while pressure remains and at least one snapshot interval
-has been applied since the selected snapshot. It retries at most once per
+The engine owns snapshot selection, transfer and purge. SDK snapshot construction
+has a 60-second prepublication attempt deadline, cancellation fencing immediately
+before publication, and an automatic retry after one second. An expired native
+export observes cancellation cooperatively. Blocking I/O retains the actual
+worker gate, descriptors, namespace and shutdown owner until it really exits;
+expiry cannot start a second worker or publish a stale attempt. Once metadata
+publication commits, its owner finishes delivering that exact cut to Raft rather
+than discarding committed progress at the deadline. Shutdown also retains this
+completion owner; its existing public deadline bounds the caller while the
+shared background drain joins the actual work. Genuine storage errors are not
+treated as attempt expiry.
+
+An active leader that remains full for five seconds without snapshot or purge
+progress starts an authenticated live leadership transfer. Each transfer attempt
+is bounded and failed attempts retain the same target and transfer request. The
+source continues replication, voting and snapshot recovery; it does not retire
+the store or stop emergency sessions. This also bounds leadership held by an
+uncancellable snapshot worker. Heartbeats and new appends cannot reset the
+no-progress timer. No restart or operator action is needed.
+
+If an old stalled build finishes after ordinary commits have stopped at the
+window, the SDK requests a successor while pressure remains and at least one
+snapshot interval has been applied since the selected snapshot. It retries at most once per
 second, because an active build can ignore a request. Quarantined Async voters
 do not start this admission maintenance; activation wakes the observer.
-Releasing a stalled build or transfer clears backpressure without an operator
-trigger or a restart.
+Releasing a stalled build or transfer clears the affected node's backpressure
+without an operator trigger or a restart.
 
 `ConsensusSessionStore::log_pressure_snapshot()` exposes `retained_rows`,
 `pending_entries`, `entries_since_snapshot` and `high_water_rows`, with independent

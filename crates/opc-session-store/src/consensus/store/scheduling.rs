@@ -253,7 +253,7 @@ impl ConsensusSessionStore {
         intent: &SessionMutationIntent,
         deadline: tokio::time::Instant,
     ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
-        self.start_proposal_with_headroom_before(reservation, intent, deadline, false)
+        self.start_proposal_with_headroom_before(reservation, intent, deadline, false, true)
             .await
     }
 
@@ -263,6 +263,7 @@ impl ConsensusSessionStore {
         intent: &SessionMutationIntent,
         deadline: tokio::time::Instant,
         authenticated_cold_barrier: bool,
+        wait_for_log: bool,
     ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
         let start = async {
             let mut reservation = reservation;
@@ -271,11 +272,16 @@ impl ConsensusSessionStore {
                 || reservation.class() == ScopeWorkClass::Emergency;
             loop {
                 if !reserved_headroom {
-                    self.inner
-                        .raft_handler
-                        .log_admission
-                        .ready_before(deadline)
-                        .await?;
+                    if !wait_for_log && !self.inner.raft_handler.log_admission.has_capacity() {
+                        return Err(LogAdmissionError::Pressure);
+                    }
+                    if wait_for_log {
+                        self.inner
+                            .raft_handler
+                            .log_admission
+                            .ready_before(deadline)
+                            .await?;
+                    }
                 }
                 let permit = reservation
                     .start()
@@ -287,6 +293,9 @@ impl ConsensusSessionStore {
                 // Capacity may change while waiting for a class credit. Keep
                 // the resident reservation, but return the running credit.
                 reservation = permit.finish_unknown();
+                if !wait_for_log {
+                    return Err(LogAdmissionError::Pressure);
+                }
             }
         };
         match tokio::time::timeout_at(
@@ -299,6 +308,9 @@ impl ConsensusSessionStore {
             Ok(Err(LogAdmissionError::NotLeader(leader)))
             | Ok(Ok(Err(LogAdmissionError::NotLeader(leader)))) => {
                 Err(ForwardMutationReply::NotLeader { leader })
+            }
+            Ok(Err(LogAdmissionError::Pressure)) | Ok(Ok(Err(LogAdmissionError::Pressure))) => {
+                Err(ForwardMutationReply::LogPressure)
             }
             Ok(Err(LogAdmissionError::Unavailable))
             | Ok(Ok(Err(LogAdmissionError::Unavailable)))
@@ -443,12 +455,12 @@ impl ConsensusSessionStore {
         intent: SessionMutationIntent,
         required_scope: SessionConsensusIdentity,
         class: ScopeWorkClass,
-    ) -> Result<SessionConsensusResponse, StoreError> {
+    ) -> Result<Option<SessionConsensusResponse>, StoreError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let unavailable = consensus_outcome_unavailable(&intent);
-        match self
+        let Some(effect) = self
             .submit_request_effect_classified_before(
                 request_id,
                 intent,
@@ -457,10 +469,13 @@ impl ConsensusSessionStore {
                 ForwardWorkClass::Declared(class),
             )
             .await
-        {
+        else {
+            return Ok(None);
+        };
+        match effect {
             ConsensusSubmissionEffect::NotTransmitted(error) => Err(error),
             ConsensusSubmissionEffect::OutcomeUnknown => Err(unavailable),
-            ConsensusSubmissionEffect::Committed(response) => Ok(response),
+            ConsensusSubmissionEffect::Committed(response) => Ok(Some(response)),
             ConsensusSubmissionEffect::Rejected(response) => {
                 response.result?;
                 Err(unavailable)

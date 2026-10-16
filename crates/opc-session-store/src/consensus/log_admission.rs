@@ -73,6 +73,7 @@ pub(super) struct LogAdmission {
 pub(super) enum LogAdmissionError {
     NotLeader(Option<SessionConsensusNodeId>),
     Unavailable,
+    Pressure,
 }
 
 impl LogAdmission {
@@ -232,6 +233,10 @@ impl LogAdmission {
             < snapshot.high_water_rows
     }
 
+    pub(super) fn changes(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+
     /// Finish queued admission on a leadership change, including while waiting
     /// for a scheduler credit. No caller deadline or resident reservation is
     /// renewed by a redirect.
@@ -301,7 +306,7 @@ impl LogAdmission {
         if !reserved_headroom
             && snapshot.retained_rows.saturating_add(state.pending) >= snapshot.high_water_rows
         {
-            return Err(LogAdmissionError::Unavailable);
+            return Err(LogAdmissionError::Pressure);
         }
         state.pending += 1;
         self.changed.send_replace(());

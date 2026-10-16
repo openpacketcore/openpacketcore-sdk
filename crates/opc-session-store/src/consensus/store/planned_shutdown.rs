@@ -76,6 +76,82 @@ impl ConsensusRetirementCoordinator {
 }
 
 impl ConsensusSessionStore {
+    /// Relinquish one pressured vote without retiring the store incarnation.
+    /// Replication, snapshot retry, voting and later leadership remain live.
+    pub(super) async fn transfer_pressure_leadership_before(
+        &self,
+        target: &mut Option<SessionConsensusNodeId>,
+        handoff: &mut Option<TransferLeaderRequest<SessionConsensusNodeId>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        let _scope_guard = tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .topology_coordinator
+                .operation_gate()
+                .read_owned(),
+        )
+        .await
+        .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let _active = self
+            .inner
+            .persistence_protocol
+            .submission_before(self.inner.persistence_protocol.operation_stamp(), deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        let scope = self.current_scope()?;
+        if self.inner.retirement.is_started() || scope.1.len() < 2 {
+            return Err(consensus_unavailable());
+        }
+        let successor = match *target {
+            Some(target) if scope.1.contains(&target) => target,
+            Some(_) => return Err(consensus_unavailable()),
+            None => {
+                let metrics = self.inner.raft.metrics();
+                let current = metrics.borrow();
+                let successor = scope
+                    .1
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != self.inner.local_node_id)
+                    .max_by_key(|node| {
+                        current
+                            .replication
+                            .as_ref()
+                            .and_then(|replication| replication.get(node))
+                            .copied()
+                            .flatten()
+                    })
+                    .ok_or_else(consensus_unavailable)?;
+                *target = Some(successor);
+                successor
+            }
+        };
+        if handoff.is_none() {
+            self.inner.raw_v2_read_barrier.disable_lease_reuse();
+            self.inner.read_barrier.disable_lease_reuse();
+            *handoff = Some(
+                self.inner
+                    .raft
+                    .begin_leadership_transfer(successor)
+                    .await
+                    .map_err(|_| consensus_unavailable())?,
+            );
+        }
+        let request = handoff.as_ref().ok_or_else(consensus_unavailable)?;
+        // This live source remains a voter. Source plus successor count toward
+        // the majority; planned removal deliberately requires surviving peers.
+        let quorum = scope.1.len() / 2 + 1;
+        self.release_surviving_vote_leases(&scope, request, quorum - 1, deadline)
+            .await?;
+        self.start_successor_election(&scope, request, deadline)
+            .await?;
+        self.confirm_surviving_leader(&scope, Some(request), deadline)
+            .await
+    }
+
     /// Prepare one planned voter retirement while its authenticated replication
     /// listener and storage remain alive.
     ///
@@ -231,6 +307,9 @@ impl ConsensusSessionStore {
         quorum: usize,
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
+        if quorum <= 1 {
+            return Ok(());
+        }
         let mut calls = scope
             .1
             .iter()

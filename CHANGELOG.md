@@ -1155,7 +1155,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to Raft, preserving heartbeats and trailing control entries. Emergency work
   and authenticated recovery controls use reserved headroom; demotion wakes
   queued proposals to reroute within their original deadline. Accepted work
-  retains its accounting and authority through cancellation. (#1249)
+  retains its accounting and authority through cancellation. Direct writes
+  retain the exact request across pressure-only attempts and recheck authority
+  on retry. Snapshot attempts expire before publication and retry automatically;
+  a leader with a full window and no snapshot or purge progress transfers
+  leadership while retaining actual blocking-worker ownership. (#1249)
 
 - `opc-session-store`: read V2 history through its existing fresh quorum
   read-index barrier without proposing an unused logical-time advance. History

@@ -2,8 +2,11 @@
 
 use super::*;
 use crate::consensus::snapshot::SnapshotArtifactGate;
-#[cfg(feature = "test-control")]
 use opc_consensus::DURABLE_OPENRAFT_PROFILE;
+
+#[cfg(feature = "test-control")]
+#[path = "write_retention.rs"]
+mod write_retention;
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -33,7 +36,7 @@ async fn log_admission_review_full_follower_keeps_heartbeats_and_leadership() {
         // Keep real elections enabled beyond the full leader lease plus the
         // maximum election timeout (8 + 8 seconds). Data appends carry the
         // heartbeats throughout this interval; no synthetic empty RPC helps.
-        while started.elapsed() < Duration::from_secs(17) {
+        while started.elapsed() < Duration::from_secs(35) {
             let reply = propose(
                 source,
                 &command,
@@ -45,6 +48,14 @@ async fn log_admission_review_full_follower_keeps_heartbeats_and_leadership() {
                 if response.result.is_ok()),
                 "live write must commit: {reply:?}"
             );
+            let observed = follower.inner.raft.metrics().borrow().clone();
+            if observed.vote != vote {
+                eprintln!(
+                    "follower_election_probe elapsed_ms={} follower={observed} leader={}",
+                    started.elapsed().as_millis(),
+                    source.inner.raft.metrics().borrow().clone()
+                );
+            }
             assert_eq!(source.inner.raft.metrics().borrow().vote, vote);
             assert_eq!(
                 follower.inner.raft.metrics().borrow().vote,
@@ -356,7 +367,6 @@ async fn log_admission_review_demoted_requests_reroute_with_original_deadline() 
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-#[cfg(feature = "test-control")]
 async fn seed_to(store: &ConsensusSessionStore, command: &SessionConsensusCommand, target: u64) {
     let mut last = store.inner.raft.metrics().borrow().last_log_index.unwrap();
     while last < target {
@@ -381,6 +391,235 @@ async fn seed_to(store: &ConsensusSessionStore, command: &SessionConsensusComman
         .applied_index_at_least(Some(target), "seeded log applied")
         .await
         .unwrap();
+}
+
+async fn expired_snapshot_attempt(mode: SessionPersistenceMode) {
+    let mut fleet = fleet(mode).await;
+    let held = ReleaseIo(vec![Arc::new(SnapshotArtifactGate::new())]);
+    let result = AssertUnwindSafe(async {
+        let store = fleet.store(fleet.leader());
+        store
+            .inner
+            .storage_shutdown
+            .set_snapshot_limits_for_test(Duration::from_millis(500), Duration::from_secs(5));
+        let gate = held.0[0].clone();
+        gate.arm();
+        store
+            .inner
+            .storage_shutdown
+            .pause_next_snapshot_publication_for_test(gate.clone());
+        let before = store.inner.raft.metrics().borrow().last_applied.unwrap();
+        store.inner.raft.trigger().snapshot().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .unwrap();
+        assert_eq!(store.inner.raft.metrics().borrow().snapshot, None);
+        assert!(store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .snapshot_worker_is_active_for_test());
+        let reply = propose(
+            store,
+            &repeated_command(store),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            matches!(reply, ForwardMutationReply::Applied(ref response)
+            if response.result.is_ok()),
+            "primary work progresses during the held build: {reply:?}"
+        );
+        // Never release the first attempt. Only cancellation and an automatic
+        // fresh attempt can publish this newer cut.
+        store
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| metrics.snapshot.is_some_and(|cut| cut.index > before.index),
+                "expired snapshot retries without releasing the original stall",
+            )
+            .await
+            .unwrap();
+        assert!(store.inner.storage_shutdown.snapshot_retries_for_test() >= 1);
+        assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
+        assert_eq!(
+            store.inner.raft.metrics().borrow().current_leader,
+            Some(store.inner.local_node_id)
+        );
+    })
+    .catch_unwind()
+    .await;
+    drop(held);
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_snapshot_attempt_expires_and_retries_durable() {
+    expired_snapshot_attempt(SessionPersistenceMode::Durable).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_snapshot_attempt_expires_and_retries_async() {
+    expired_snapshot_attempt(SessionPersistenceMode::Async).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_blocked_snapshot_owner_cannot_hold_leadership() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet.leader();
+        let store = fleet.store(leader);
+        store
+            .inner
+            .storage_shutdown
+            .set_snapshot_limits_for_test(Duration::from_millis(500), Duration::from_secs(1));
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let held = store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .pause_snapshot_verification_for_test(gate.clone());
+        store.inner.raft.trigger().snapshot().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .unwrap();
+        let owner = store.inner.storage_shutdown.snapshot_owner_for_test();
+        assert!(owner.is_retained());
+        let command = repeated_command(store);
+        seed_to(
+            store,
+            &command,
+            DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+                + DURABLE_OPENRAFT_PROFILE.retained_logs
+                + 64,
+        )
+        .await;
+        let window = store.log_pressure_snapshot().retained_rows;
+        store
+            .inner
+            .raft_handler
+            .set_log_admission_window_for_test(window);
+        let original = store.inner.raft.metrics().borrow().vote;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut waiting = Box::pin(propose(store, &command, deadline));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let reply = waiting.await;
+        assert!(
+            matches!(reply, ForwardMutationReply::NotLeader { .. }),
+            "snapshot no-progress bound must redirect the waiting proposal: {reply:?}"
+        );
+        let elected = store
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics.vote.is_committed()
+                        && metrics.vote.leader_id.term > original.leader_id.term
+                        && metrics
+                            .current_leader
+                            .is_some_and(|node| node != store.inner.local_node_id)
+                },
+                "automatic snapshot-progress handoff",
+            )
+            .await
+            .unwrap();
+        let successor = fleet
+            .stores
+            .iter()
+            .flatten()
+            .find(|candidate| Some(candidate.inner.local_node_id) == elected.current_leader)
+            .unwrap();
+        let reply = propose(successor, &command, deadline).await;
+        assert!(
+            matches!(reply, ForwardMutationReply::Applied(ref response)
+            if response.result.is_ok()),
+            "new leader commits while the old worker remains held: {reply:?}"
+        );
+        assert!(store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .snapshot_worker_is_active_for_test());
+        assert!(
+            owner.is_retained(),
+            "expiry cannot retire the actual held snapshot owner"
+        );
+        assert!(
+            owner.is_same_owner(&store.inner.storage_shutdown.snapshot_owner_for_test()),
+            "no replacement snapshot worker starts while the original worker holds the gate"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().snapshot,
+            None,
+            "the cancelled generation must not publish its old cut"
+        );
+        assert!(store.inner.storage_shutdown.snapshot_retries_for_test() >= 1);
+        // Only cleanup releases the noncancellable worker. Its late result may
+        // retire its resources, but cannot publish. The queued retry must take
+        // a new cut and reclaim this node's retained log as a follower.
+        let through = successor
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .unwrap();
+        store
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(through.index), "held owner does not block replication")
+            .await
+            .unwrap();
+        drop(held);
+        store
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .is_some_and(|cut| cut.index >= through.index)
+                        && metrics
+                            .last_log_index
+                            .map_or(0, |index| index + 1)
+                            .saturating_sub(metrics.purged.map_or(0, |cut| cut.index + 1))
+                            < window
+                },
+                "automatic fresh snapshot and purge after old owner retirement",
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error:?}; retries={}; phase={}; held_owner_retained={}; same_owner={}",
+                    store.inner.storage_shutdown.snapshot_retries_for_test(),
+                    {
+                        #[cfg(feature = "test-control")]
+                        {
+                            store.inner.backend.snapshot_observation().phase_for_test()
+                        }
+                        #[cfg(not(feature = "test-control"))]
+                        {
+                            "not instrumented"
+                        }
+                    },
+                    owner.is_retained(),
+                    owner.is_same_owner(&store.inner.storage_shutdown.snapshot_owner_for_test())
+                )
+            });
+        assert!(
+            !owner.is_retained(),
+            "the released cancelled worker must actually retire"
+        );
+        assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -761,7 +1000,6 @@ async fn log_admission_cold_recovery_keeps_quarantine_and_commits_at_full_window
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-#[cfg(feature = "test-control")]
 async fn select_snapshot(store: &ConsensusSessionStore) {
     let applied = store.inner.raft.metrics().borrow().last_applied.unwrap();
     let mut metrics = store.inner.raft.metrics();
@@ -929,4 +1167,134 @@ async fn log_admission_full_window_blocked_transfer_async() {
         1,
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_expired_directory_scan_retains_snapshot_owner() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let store = fleet.store(fleet.leader());
+        select_snapshot(store).await;
+        let previous = store.inner.raft.metrics().borrow().snapshot.unwrap();
+        let reply = propose(
+            store,
+            &repeated_command(store),
+            tokio::time::Instant::now() + WAIT,
+        )
+        .await;
+        assert!(
+            matches!(reply, ForwardMutationReply::Applied(ref response) if response.result.is_ok())
+        );
+        store
+            .inner
+            .storage_shutdown
+            .set_snapshot_limits_for_test(Duration::from_millis(500), Duration::from_secs(5));
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let held = store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .pause_snapshot_verification_for_test(gate.clone());
+        store.inner.raft.trigger().snapshot().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .unwrap();
+        let owner = store.inner.storage_shutdown.snapshot_owner_for_test();
+        assert!(
+            owner.is_retained(),
+            "the current-artifact scan owns this attempt"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.inner.storage_shutdown.snapshot_retries_for_test() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            owner.is_retained(),
+            "expiry must retain the real directory-validation worker owner"
+        );
+        assert!(owner.is_same_owner(&store.inner.storage_shutdown.snapshot_owner_for_test()));
+        assert!(store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .snapshot_worker_is_active_for_test());
+        assert_eq!(store.inner.raft.metrics().borrow().snapshot, Some(previous));
+        drop(held);
+        store
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .is_some_and(|cut| cut.index > previous.index)
+                },
+                "fresh cut after expired directory worker actually retires",
+            )
+            .await
+            .unwrap();
+        assert!(!owner.is_retained());
+        assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_shutdown_retains_published_snapshot_completion() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let store = fleet.store(fleet.leader());
+        store
+            .inner
+            .storage_shutdown
+            .set_snapshot_limits_for_test(Duration::from_millis(500), Duration::from_secs(5));
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let held = store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .pause_snapshot_completion_for_test(gate.clone());
+        store.inner.raft.trigger().snapshot().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .expect("snapshot reaches committed completion");
+        let owner = store.inner.storage_shutdown.snapshot_owner_for_test();
+        assert!(
+            owner.is_retained(),
+            "committed completion retains its owner"
+        );
+        assert!(store.inner.raft.metrics().borrow().snapshot.is_none());
+        let shutdown = store.shutdown().await;
+        assert!(
+            shutdown.is_err(),
+            "shutdown must remain pending until committed completion retires: {shutdown:?}"
+        );
+        assert!(
+            owner.is_retained(),
+            "stopping snapshot attempts cannot abandon a committed completion owner"
+        );
+        assert!(owner.is_same_owner(&store.inner.storage_shutdown.snapshot_owner_for_test()));
+        assert!(store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .snapshot_worker_is_active_for_test());
+        drop(held);
+        store.shutdown().await.expect("released completion drains");
+        assert!(!owner.is_retained());
+        assert!(!store
+            .inner
+            .terminal_recovery_handoff_consumer
+            .snapshot_worker_is_active_for_test());
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

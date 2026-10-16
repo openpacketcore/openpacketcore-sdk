@@ -163,12 +163,14 @@ pub fn validate_consensus_physical_fenced_transition_request(
 }
 
 mod async_persistence;
+mod log_recovery;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
 mod scheduling;
 mod scope_authority;
 mod transport_class;
+mod write_pressure;
 pub use transport_class::session_consensus_work_class;
 mod scope_batch;
 pub(crate) mod scope_child_read;
@@ -197,6 +199,8 @@ pub use membership::{
 
 /// Default complete client-operation deadline, including leader discovery,
 /// forwarding, quorum confirmation, commit, and local apply.
+/// Definite pre-proposal log pressure retains the request across attempts;
+/// each retry receives this deadline and rechecks current authority.
 pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
@@ -817,6 +821,9 @@ enum ForwardMutationReply {
     // NotLeader or Unavailable would turn an ordinary mixed-version rejection
     // into a misinterpreted successful control response.
     FencedTransitionActivation(Result<FencedTransitionActivationReply, StoreError>),
+    /// Authenticated acknowledgement that log pressure prevented proposal.
+    /// Append-only wire discriminant; this is never a possible-delivery result.
+    LogPressure,
 }
 
 /// Private forwarding acknowledgement for the state-voter-only V1 startup
@@ -934,6 +941,11 @@ enum ConsensusSubmissionEffect {
     Committed(SessionConsensusResponse),
     /// A deterministic rejection was authenticated before any proposal.
     Rejected(SessionConsensusResponse),
+}
+
+pub(crate) enum PressureRetryFailure {
+    NotTransmitted,
+    OutcomeUnknown,
 }
 
 // Recovery and voter replacement must be able to retire blocked authority or
@@ -2133,6 +2145,7 @@ struct ConsensusSessionStoreInner {
     fenced_transition_v2_status_batch: FencedTransitionV2StatusBatchSupervisor,
     proposal_admission: Arc<StoreWorkAdmission>,
     forward_admission: Arc<StoreWorkAdmission>,
+    write_retry_admission: Arc<StoreWorkAdmission>,
     // The created profile cannot change during this process's exact voter
     // scope. A later command persists a fresh unanimous admission certificate;
     // a certificate read from storage also seeds this readiness proof cache.
@@ -2291,6 +2304,7 @@ async fn shutdown_consensus_session_store(
         .shutdown()
         .await
         .map_err(|_| consensus_unavailable())?;
+    inner.storage_shutdown.stop_snapshot_builds();
     inner.storage_shutdown.wait().await;
     Ok(())
 }
@@ -3625,7 +3639,9 @@ impl ConsensusSessionStore {
     /// This has the same admission and acknowledgement semantics as
     /// [`Self::open_fixed_quorum_with_persistence`]. The supplied deadline
     /// covers each complete operation, including routing, quorum and apply;
-    /// it does not change the background persistence schedule.
+    /// definite pre-proposal log pressure retains the request across attempts,
+    /// each with a fresh deadline and authority checks. This does not change
+    /// the background persistence schedule.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_fixed_quorum_with_clock_and_persistence(
         topology: ValidatedQuorumTopology,
@@ -4013,6 +4029,7 @@ impl ConsensusSessionStore {
             fenced_transition_profile_admission: Mutex::new(None),
             proposal_admission: Arc::new(StoreWorkAdmission::new()),
             forward_admission: Arc::new(StoreWorkAdmission::new()),
+            write_retry_admission: Arc::new(StoreWorkAdmission::new()),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
@@ -4033,6 +4050,7 @@ impl ConsensusSessionStore {
             Arc::downgrade(&inner),
         );
         let store = Self { inner };
+        log_recovery::start(&store.inner);
         voter_slots::start_coordinator(&store);
         Ok(store)
     }
@@ -4042,6 +4060,8 @@ impl ConsensusSessionStore {
     ///
     /// The deadline covers leader discovery/forwarding, quorum confirmation,
     /// commit, and local apply for writes and linearizable readiness/reads.
+    /// A write blocked only by definite pre-proposal log pressure retains its
+    /// retry owner, with a fresh deadline and authority checks per attempt.
     pub async fn open_with_operation_timeout(
         topology: ValidatedQuorumTopology,
         backend: SqliteSessionBackend,
@@ -4260,6 +4280,7 @@ impl ConsensusSessionStore {
             fenced_transition_profile_admission: Mutex::new(None),
             proposal_admission: Arc::new(StoreWorkAdmission::new()),
             forward_admission: Arc::new(StoreWorkAdmission::new()),
+            write_retry_admission: Arc::new(StoreWorkAdmission::new()),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
@@ -4279,6 +4300,7 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_batch_receiver,
             Arc::downgrade(&inner),
         );
+        log_recovery::start(&inner);
         Ok(Self { inner })
     }
 
@@ -6379,6 +6401,7 @@ impl ConsensusSessionStore {
             ForwardMutationReply::NotLeader { .. }
             | ForwardMutationReply::OutcomeUnknown
             | ForwardMutationReply::Unavailable
+            | ForwardMutationReply::LogPressure
             | ForwardMutationReply::RecordExpiryPreflight(_)
             | ForwardMutationReply::FencedTransitionActivation(_) => Err(consensus_unavailable()),
         }
@@ -7996,14 +8019,42 @@ impl ConsensusSessionStore {
         required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> ConsensusSubmissionEffect {
-        self.submit_request_effect_classified_before(
+        if let Err(error) = validate_consensus_intent(&intent) {
+            return ConsensusSubmissionEffect::NotTransmitted(error);
+        }
+        let request = ForwardMutationRequest {
             request_id,
             intent,
-            required_consumer_scope,
-            deadline,
-            ForwardWorkClass::Inferred,
-        )
+            required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
+            work_class: ForwardWorkClass::Inferred,
+        };
+        let (key, class) = match request.scheduling() {
+            Ok(scheduling) => scheduling,
+            Err(error) => return ConsensusSubmissionEffect::NotTransmitted(error),
+        };
+        let store = self.clone();
+        self.own_pressure_retries(key, class, deadline, move |deadline| {
+            let store = store.clone();
+            let request = request.clone();
+            async move {
+                store
+                    .submit_request_effect_classified_before(
+                        request.request_id,
+                        request.intent,
+                        required_consumer_scope,
+                        deadline,
+                        request.work_class,
+                    )
+                    .await
+            }
+        })
         .await
+        .unwrap_or_else(|failure| match failure {
+            PressureRetryFailure::NotTransmitted => {
+                ConsensusSubmissionEffect::NotTransmitted(consensus_unavailable())
+            }
+            PressureRetryFailure::OutcomeUnknown => ConsensusSubmissionEffect::OutcomeUnknown,
+        })
     }
 
     async fn submit_request_effect_classified_before(
@@ -8013,22 +8064,22 @@ impl ConsensusSessionStore {
         required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
         work_class: ForwardWorkClass,
-    ) -> ConsensusSubmissionEffect {
+    ) -> Option<ConsensusSubmissionEffect> {
         if let Err(error) = validate_consensus_intent(&intent) {
-            return ConsensusSubmissionEffect::NotTransmitted(error);
+            return Some(ConsensusSubmissionEffect::NotTransmitted(error));
         }
         let fixed_raw_v2_consumer_warm_route = self
             .fixed_raw_v2_consumer_warm_route_for_intent(&intent, required_consumer_scope.as_ref());
         if scope_profile::is_scope_command(&intent) {
             if let Err(error) = self.require_scope_traffic_authority_before(deadline).await {
-                return ConsensusSubmissionEffect::NotTransmitted(error);
+                return Some(ConsensusSubmissionEffect::NotTransmitted(error));
             }
         } else if !fixed_raw_v2_consumer_warm_route {
             if let Err(error) = self
                 .require_application_traffic_authority_before(deadline)
                 .await
             {
-                return ConsensusSubmissionEffect::NotTransmitted(error);
+                return Some(ConsensusSubmissionEffect::NotTransmitted(error));
             }
         }
         let request = ForwardMutationRequest {
@@ -8038,7 +8089,7 @@ impl ConsensusSessionStore {
             required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
         };
         if let Err(error) = request.scheduling() {
-            return ConsensusSubmissionEffect::NotTransmitted(error);
+            return Some(ConsensusSubmissionEffect::NotTransmitted(error));
         }
         let mut preferred = None;
         let mut outcome_may_be_unavailable = false;
@@ -8049,9 +8100,9 @@ impl ConsensusSessionStore {
                 None => match self.wait_for_known_leader(deadline).await {
                     Ok(leader) => leader,
                     Err(_) if outcome_may_be_unavailable => {
-                        return ConsensusSubmissionEffect::OutcomeUnknown;
+                        return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                     }
-                    Err(error) => return ConsensusSubmissionEffect::NotTransmitted(error),
+                    Err(error) => return Some(ConsensusSubmissionEffect::NotTransmitted(error)),
                 },
             };
             // Fixed recovery is replica-local durable authority. Re-read it
@@ -8070,9 +8121,9 @@ impl ConsensusSessionStore {
                     .await
                 {
                     return if outcome_may_be_unavailable {
-                        ConsensusSubmissionEffect::OutcomeUnknown
+                        Some(ConsensusSubmissionEffect::OutcomeUnknown)
                     } else {
-                        ConsensusSubmissionEffect::NotTransmitted(error)
+                        Some(ConsensusSubmissionEffect::NotTransmitted(error))
                     };
                 }
             }
@@ -8098,7 +8149,7 @@ impl ConsensusSessionStore {
                         // the first possibly delivered transmission; only a
                         // proven pre-transmission failure may reroute it.
                         if mutation_requires_exact_status_resolution(&request) {
-                            return ConsensusSubmissionEffect::OutcomeUnknown;
+                            return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                         }
                         if request.required_consumer_scope.is_consumer_scoped()
                             || matches!(
@@ -8108,19 +8159,19 @@ impl ConsensusSessionStore {
                                     | SessionMutationIntent::RosterTerminal(_)
                             )
                         {
-                            return ConsensusSubmissionEffect::OutcomeUnknown;
+                            return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                         }
                         if self.wait_for_route_refresh(leader, deadline).await.is_err() {
-                            return ConsensusSubmissionEffect::OutcomeUnknown;
+                            return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                         }
                         continue;
                     }
                     Err(ConsensusPeerCallFailure::BeforeTransmission) => {
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             return if outcome_may_be_unavailable {
-                                ConsensusSubmissionEffect::OutcomeUnknown
+                                Some(ConsensusSubmissionEffect::OutcomeUnknown)
                             } else {
-                                ConsensusSubmissionEffect::NotTransmitted(error)
+                                Some(ConsensusSubmissionEffect::NotTransmitted(error))
                             };
                         }
                         continue;
@@ -8130,14 +8181,14 @@ impl ConsensusSessionStore {
             match reply {
                 ForwardMutationReply::Applied(response) => {
                     if committed_response_matches_intent(&request.intent, &response) {
-                        return ConsensusSubmissionEffect::Committed(*response);
+                        return Some(ConsensusSubmissionEffect::Committed(*response));
                     }
                     if !outcome_may_be_unavailable
                         && rejected_response_matches_intent(&request.intent, &response)
                     {
-                        return ConsensusSubmissionEffect::Rejected(*response);
+                        return Some(ConsensusSubmissionEffect::Rejected(*response));
                     }
-                    return ConsensusSubmissionEffect::OutcomeUnknown;
+                    return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                 }
                 ForwardMutationReply::NotLeader {
                     leader: next_leader,
@@ -8148,9 +8199,9 @@ impl ConsensusSessionStore {
                     if preferred.is_none() {
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             return if outcome_may_be_unavailable {
-                                ConsensusSubmissionEffect::OutcomeUnknown
+                                Some(ConsensusSubmissionEffect::OutcomeUnknown)
                             } else {
-                                ConsensusSubmissionEffect::NotTransmitted(error)
+                                Some(ConsensusSubmissionEffect::NotTransmitted(error))
                             };
                         }
                     }
@@ -8158,22 +8209,29 @@ impl ConsensusSessionStore {
                 // The request may already have reached a forwarding peer or
                 // Raft append. Only exact status may resolve this boundary.
                 ForwardMutationReply::OutcomeUnknown => {
-                    return accepted_client_write_receiver_failure_effect();
+                    return Some(accepted_client_write_receiver_failure_effect());
+                }
+                ForwardMutationReply::LogPressure => {
+                    // A later pressure acknowledgement cannot erase an earlier
+                    // possibly delivered attempt. Only definite non-proposal
+                    // retains this exact request for another bounded attempt.
+                    return outcome_may_be_unavailable
+                        .then_some(ConsensusSubmissionEffect::OutcomeUnknown);
                 }
                 ForwardMutationReply::Unavailable => {
                     if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                         return if outcome_may_be_unavailable {
-                            ConsensusSubmissionEffect::OutcomeUnknown
+                            Some(ConsensusSubmissionEffect::OutcomeUnknown)
                         } else {
-                            ConsensusSubmissionEffect::NotTransmitted(error)
+                            Some(ConsensusSubmissionEffect::NotTransmitted(error))
                         };
                     }
                 }
                 ForwardMutationReply::RecordExpiryPreflight(_) => {
-                    return ConsensusSubmissionEffect::OutcomeUnknown;
+                    return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                 }
                 ForwardMutationReply::FencedTransitionActivation(_) => {
-                    return ConsensusSubmissionEffect::OutcomeUnknown;
+                    return Some(ConsensusSubmissionEffect::OutcomeUnknown);
                 }
             }
         }
@@ -8400,7 +8458,7 @@ impl ConsensusSessionStore {
                         )?;
                     }
                 }
-                ForwardMutationReply::Unavailable => {
+                ForwardMutationReply::Unavailable | ForwardMutationReply::LogPressure => {
                     observe_activation_result!(
                         RouteRefresh,
                         deadline,
@@ -8525,7 +8583,7 @@ impl ConsensusSessionStore {
                         self.wait_for_route_refresh(leader, deadline).await?;
                     }
                 }
-                ForwardMutationReply::Unavailable => {
+                ForwardMutationReply::Unavailable | ForwardMutationReply::LogPressure => {
                     self.wait_for_route_refresh(leader, deadline).await?;
                 }
                 ForwardMutationReply::OutcomeUnknown => {
@@ -8595,6 +8653,7 @@ impl ConsensusSessionStore {
             }
             ForwardMutationReply::OutcomeUnknown
             | ForwardMutationReply::Unavailable
+            | ForwardMutationReply::LogPressure
             | ForwardMutationReply::RecordExpiryPreflight(_)
             | ForwardMutationReply::FencedTransitionActivation(_) => {
                 FencedTransitionV2StatusLogicalTimeTicketReply::Unavailable
@@ -8692,6 +8751,7 @@ impl ConsensusSessionStore {
                     &request.intent,
                     deadline,
                     cold_completion.is_some(),
+                    false,
                 )
                 .await
             {
@@ -9181,7 +9241,13 @@ impl ConsensusSessionStore {
                 let held_gate = operation_guard.is_some();
                 drop(operation_guard);
                 let permit = match self
-                    .start_proposal_before(reservation, &request.intent, deadline)
+                    .start_proposal_with_headroom_before(
+                        reservation,
+                        &request.intent,
+                        deadline,
+                        false,
+                        false,
+                    )
                     .await
                 {
                     Ok(permit) => permit,
@@ -9385,6 +9451,7 @@ impl ConsensusSessionStore {
                     ForwardMutationReply::NotLeader { leader }
                 }
                 ForwardMutationReply::Unavailable => ForwardMutationReply::Unavailable,
+                ForwardMutationReply::LogPressure => ForwardMutationReply::LogPressure,
                 ForwardMutationReply::OutcomeUnknown => ForwardMutationReply::OutcomeUnknown,
                 ForwardMutationReply::RecordExpiryPreflight(_)
                 | ForwardMutationReply::FencedTransitionActivation(_) => {
@@ -9585,6 +9652,9 @@ impl ConsensusSessionStore {
             Ok(reservation) => Some(reservation),
             Err(super::log_admission::LogAdmissionError::NotLeader(leader)) => {
                 return ForwardMutationReply::NotLeader { leader };
+            }
+            Err(super::log_admission::LogAdmissionError::Pressure) => {
+                return ForwardMutationReply::LogPressure;
             }
             Err(super::log_admission::LogAdmissionError::Unavailable) => {
                 return ForwardMutationReply::Unavailable;
@@ -9942,6 +10012,7 @@ impl ConsensusSessionStore {
             }
             ForwardMutationReply::OutcomeUnknown
             | ForwardMutationReply::Unavailable
+            | ForwardMutationReply::LogPressure
             | ForwardMutationReply::RecordExpiryPreflight(_)
             | ForwardMutationReply::FencedTransitionActivation(_) => {
                 Err(OperatorRecoveryCommitError::Unavailable)
