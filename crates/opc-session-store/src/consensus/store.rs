@@ -13627,7 +13627,17 @@ impl ConsensusSessionConsumerService {
             ProtectedRosterV2ReadResult::Missing => {
                 return roster_admission_read_rejected(
                     recovery,
-                    SessionConsumerRosterRejection::RecoveryRequired,
+                    if recovery {
+                        SessionConsumerRosterRejection::RecordMissing
+                    } else {
+                        SessionConsumerRosterRejection::RecoveryRequired
+                    },
+                );
+            }
+            ProtectedRosterV2ReadResult::HistoryUnavailable => {
+                return roster_admission_read_rejected(
+                    recovery,
+                    SessionConsumerRosterRejection::HistoryUnavailable,
                 );
             }
             ProtectedRosterV2ReadResult::Admitted(live) => {
@@ -15999,7 +16009,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 // V2's status response has the same externally retained terminal bytes,
                 // but its backend selection and evidence are profile-isolated.
                 match read {
-                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Missing => reject(SessionConsumerRosterRejection::RecoveryRequired),
+                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Missing | crate::sqlite::consensus::ProtectedRosterV2ReadResult::HistoryUnavailable => reject(SessionConsumerRosterRejection::RecoveryRequired),
                     crate::sqlite::consensus::ProtectedRosterV2ReadResult::Admitted(live) => match decoded.into_terminal_request(&live.admission).and_then(|_| encode_terminal_admitted_response_v2(request.scope()).map_err(|_| crate::fenced_mutation_roster_transport::ProtectedRosterTransportError)) {
                         Ok(capsule) => SessionConsumerResponse::FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse::Recorded(capsule)),
                         Err(_) => reject(SessionConsumerRosterRejection::Malformed),
@@ -24553,6 +24563,78 @@ mod membership_tests {
         assert_eq!(
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_roster_v2_verified_missing_is_distinct_from_original_status_and_barrier() {
+        use crate::sqlite::consensus::ProtectedRosterV2ReadResult;
+
+        let directory = tempfile::tempdir().expect("verified missing directory");
+        let database = directory.path().join("store.sqlite");
+        let topology = singleton_topology();
+        let identity = topology.consensus_identity().unwrap();
+        let store = ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(&database).unwrap(),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        store.initialize_cluster().await.unwrap();
+        let scope = store.consumer_scope().unwrap();
+        let service = store.consumer_service();
+        let missing =
+            service.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, true);
+        let original =
+            service.roster_read_response_v2(scope, ProtectedRosterV2ReadResult::Missing, false);
+        assert!(matches!(
+            service.roster_read_response_v2(
+                scope,
+                ProtectedRosterV2ReadResult::HistoryUnavailable,
+                true,
+            ),
+            SessionConsumerResponse::FencedMutationRosterRecover(
+                SessionConsumerRosterAdmissionReadResponse::Rejected(
+                    SessionConsumerRosterRejection::HistoryUnavailable
+                )
+            )
+        ));
+        assert!(matches!(
+            original,
+            SessionConsumerResponse::FencedMutationRosterAdmissionStatus(
+                SessionConsumerRosterAdmissionReadResponse::Rejected(
+                    SessionConsumerRosterRejection::RecoveryRequired
+                )
+            )
+        ));
+        ensure_operator_recovery_latch_sync(
+            &database,
+            OperatorRecoveryLatch {
+                identity,
+                recovery_epoch: 1,
+                plan_digest: [0xA8; 32],
+                audit_pending: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .linearizable_barrier_before(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(LinearizableBarrierFailure::RecoveryRequired)
+        ));
+        assert!(
+            matches!(
+                missing,
+                SessionConsumerResponse::FencedMutationRosterRecover(
+                    SessionConsumerRosterAdmissionReadResponse::Rejected(
+                        SessionConsumerRosterRejection::RecordMissing
+                    )
+                )
+            ),
+            "verified successor-fenced missing must not share the pre-authority barrier rejection"
         );
     }
 

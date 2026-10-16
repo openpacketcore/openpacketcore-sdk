@@ -57,11 +57,11 @@ const TERMINAL_RESPONSE_V2_DOMAIN: &[u8] =
 const PROTECTED_ROSTER_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/profile-v2/transport-carriers/v1\0";
 const PROTECTED_ROSTER_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR: &[u8] = concat!(
-    "admission-request-v2=postcard-frame,magic:OPCRPA2\\0,domain:admission-port/profile-v2/request/v1,wire:AdmissionRequestWire(register:scope,admission,authority|recover:scope,roster-id,original-owner,original-admission-fence,authority)\n",
+    "admission-request-v2=postcard-frame,magic:OPCRPA2\\0,domain:admission-port/profile-v2/request/v1,wire:AdmissionRequestWireV2(register@0:scope,admission,authority|legacy-unbound-recover@1:refused|recover@2:scope,roster-id,original-key,original-owner,original-admission-fence,authority)\n",
     "admission-response-v2=postcard-frame,magic:OPCRPS2\\0,domain:admission-port/profile-v2/response/v1,wire:AdmissionResponseWireV2(fresh:scope,registration,profile-v2-admission-provenance|replayed:scope|poll-admitted:scope,registration,admission,profile-v2-admission-provenance|terminal:scope,registration,admission,committed,profile-v2-admission-provenance|compacted:scope,history-epoch,profile-v2-terminal-conflict-tombstone|reject:scope,rejection)\n",
     "terminal-request-v2=postcard-frame,magic:OPCRPT2\\0,domain:terminal-port/profile-v2/request/v1,wire:TerminalRequestWireV2(scope,binding,registration,authority,record,profile-v2-admission-provenance,generic-compact-terminal-evidence),no-v1-bundle-or-voter-ingress\n",
     "terminal-response-v2=postcard-frame,magic:OPCRPU2\\0,domain:terminal-port/profile-v2/response/v1,wire:TerminalResponseWireV2(terminalized:scope,committed|replayed:scope,committed|admitted:scope|compacted:scope,history-epoch,profile-v2-terminal-conflict-tombstone|reject:scope,rejection),no-v1-tombstone\n",
-    "bounds=admission-capsule,terminal-v2-capsule,terminal-v2-hello-frame,port-envelope-overhead;response=profile-v2-frames-only,no-v1-frame-probe\n"
+    "bounds=admission-capsule,terminal-v2-capsule,terminal-v2-hello-frame,port-envelope-overhead;response=profile-v2-frames-only,no-v1-frame-probe;rejection=history-unavailable@15\n"
 ).as_bytes();
 const SCOPE_DOMAIN: &[u8] = b"openpacketcore/protected-roster/consumer-scope/v1\0";
 
@@ -170,6 +170,7 @@ impl From<SessionConsumerRosterRejection> for BackendRejection {
             SessionConsumerRosterRejection::Authority => Self::Authority,
             SessionConsumerRosterRejection::RecoveryRequired => Self::RecoveryRequired,
             SessionConsumerRosterRejection::RecordMissing => Self::RecordMissing,
+            SessionConsumerRosterRejection::HistoryUnavailable => Self::HistoryUnavailable,
             SessionConsumerRosterRejection::GenerationConflict => Self::GenerationConflict,
             SessionConsumerRosterRejection::GenerationExhausted => Self::GenerationExhausted,
             SessionConsumerRosterRejection::BusinessKeyReserved => Self::BusinessKeyReserved,
@@ -283,6 +284,33 @@ enum AdmissionRequestWire {
     Recover {
         scope: [u8; 32],
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
+        authority: AuthorityWire,
+    },
+}
+
+/// V2 keeps registration at ordinal zero and refuses the old unbound
+/// recovery ordinal. Bound recovery carries the immutable original key inside
+/// the authenticated capsule; it cannot be decoded as a frozen V1 request.
+#[derive(Serialize, Deserialize)]
+enum AdmissionRequestWireV2 {
+    Register {
+        scope: [u8; 32],
+        admission: Vec<u8>,
+        authority: AuthorityWire,
+    },
+    LegacyUnboundRecover {
+        scope: [u8; 32],
+        roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
+        authority: AuthorityWire,
+    },
+    Recover {
+        scope: [u8; 32],
+        roster_id: RosterId,
+        original_key: SessionKey,
         original_owner: OwnerId,
         original_admission_fence: FenceToken,
         authority: AuthorityWire,
@@ -468,7 +496,7 @@ pub(crate) fn roster_poll_admit_ingress_capsule_commitment_v2(
     if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
         return Err(());
     }
-    let wire = AdmissionRequestWire::Register {
+    let wire = AdmissionRequestWireV2::Register {
         scope: authority.ingress_scope().digest(),
         admission: admission.to_canonical_bytes().map_err(|_| ())?,
         authority: authority.into(),
@@ -548,7 +576,7 @@ fn encode_terminal_request(wire: &TerminalRequestWire) -> Result<Vec<u8>, ()> {
     .map_err(|_| ())
 }
 
-fn encode_admission_request_v2(wire: &AdmissionRequestWire) -> Result<Vec<u8>, ()> {
+fn encode_admission_request_v2(wire: &AdmissionRequestWireV2) -> Result<Vec<u8>, ()> {
     encode_frame(
         ADMISSION_REQUEST_V2_MAGIC,
         ADMISSION_REQUEST_V2_DOMAIN,
@@ -1099,7 +1127,7 @@ pub(crate) fn decode_admission_request_for_scope_v2(
     consumer_scope: SessionConsumerScope,
 ) -> Result<DecodedAdmissionRequest, ProtectedRosterTransportError> {
     let scope = protected_roster_scope_from_consumer_scope(consumer_scope);
-    let wire: AdmissionRequestWire = decode_frame(
+    let wire: AdmissionRequestWireV2 = decode_frame(
         capsule.canonical_bytes(),
         ADMISSION_REQUEST_V2_MAGIC,
         ADMISSION_REQUEST_V2_DOMAIN,
@@ -1110,7 +1138,8 @@ pub(crate) fn decode_admission_request_for_scope_v2(
         return Err(ProtectedRosterTransportError);
     }
     match wire {
-        AdmissionRequestWire::Register {
+        AdmissionRequestWireV2::LegacyUnboundRecover { .. } => Err(ProtectedRosterTransportError),
+        AdmissionRequestWireV2::Register {
             scope: actual,
             admission,
             authority,
@@ -1139,9 +1168,10 @@ pub(crate) fn decode_admission_request_for_scope_v2(
             }
             Ok(DecodedAdmissionRequest::Register(request))
         }
-        AdmissionRequestWire::Recover {
+        AdmissionRequestWireV2::Recover {
             scope: actual,
             roster_id,
+            original_key,
             original_owner,
             original_admission_fence,
             authority,
@@ -1156,6 +1186,7 @@ pub(crate) fn decode_admission_request_for_scope_v2(
                 original_admission_fence,
                 authority,
             ))
+            .and_then(|request| request.bind_original_key(original_key))
             .map_err(|_| ProtectedRosterTransportError)?;
             Ok(DecodedAdmissionRequest::Recover(request))
         }
@@ -1581,6 +1612,112 @@ mod tests {
         assert!(
             decode_admission_request_for_scope(&capsule, consumer_scope).is_err(),
             "an equal current fence is rejected before any durable lookup"
+        );
+    }
+
+    #[test]
+    fn profile_v2_recovery_wire_requires_the_original_key_and_rejects_unbound_recovery() {
+        let consumer_scope = consumer_scope(0xB6, 10);
+        let scope = protected_roster_scope_from_consumer_scope(consumer_scope);
+        let key = SessionKey {
+            tenant: TenantId::from_static("recovery-wire-tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"recovery-wire-key")).unwrap(),
+        };
+        let acquired_at = Timestamp::now_utc();
+        let authority = || AuthorityWire {
+            key: key.clone(),
+            owner: OwnerId::new("recovery-successor").unwrap(),
+            fence: FenceToken::new(8),
+            credential_id: 11,
+            generation: Generation::new(1),
+            acquired_at,
+            expires_at: acquired_at.add_seconds(60).unwrap(),
+        };
+        let roster_id = RosterId::from_bytes([0xB7; 16]).unwrap();
+        let owner = OwnerId::new("recovery-original").unwrap();
+        let fence = FenceToken::new(7);
+        let make_wire = |original_key| AdmissionRequestWireV2::Recover {
+            scope: scope.digest(),
+            roster_id,
+            original_key,
+            original_owner: owner.clone(),
+            original_admission_fence: fence,
+            authority: authority(),
+        };
+        let capsule = |wire| {
+            SessionConsumerRosterAdmissionCapsule::new(encode_admission_request_v2(&wire).unwrap())
+                .unwrap()
+        };
+        let bound = capsule(make_wire(key.clone()));
+        let DecodedAdmissionRequest::Recover(decoded) =
+            decode_admission_request_for_scope_v2(&bound, consumer_scope).unwrap()
+        else {
+            panic!("bound V2 recovery");
+        };
+        assert_eq!(decoded.original_key(), Some(&key));
+        assert_eq!(decoded.original_owner(), &owner);
+        assert_eq!(decoded.original_admission_fence(), fence);
+        assert_eq!(postcard_variant_tag(&make_wire(key.clone())), 2);
+        assert!(decode_admission_request_for_scope(&bound, consumer_scope).is_err());
+        assert!(
+            decode_admission_request_for_scope_v2(&bound, self::consumer_scope(0xB8, 10)).is_err()
+        );
+
+        let mut wrong_key = key.clone();
+        wrong_key.stable_id = StableId::new(Bytes::from_static(b"another-key")).unwrap();
+        assert!(decode_admission_request_for_scope_v2(
+            &capsule(make_wire(wrong_key)),
+            consumer_scope
+        )
+        .is_err());
+
+        let legacy = AdmissionRequestWire::Recover {
+            scope: scope.digest(),
+            roster_id,
+            original_owner: owner,
+            original_admission_fence: fence,
+            authority: authority(),
+        };
+        assert_eq!(postcard_variant_tag(&legacy), 1);
+        let legacy_v2 = SessionConsumerRosterAdmissionCapsule::new(
+            encode_frame(
+                ADMISSION_REQUEST_V2_MAGIC,
+                ADMISSION_REQUEST_V2_DOMAIN,
+                &legacy,
+                MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(decode_admission_request_for_scope_v2(&legacy_v2, consumer_scope).is_err());
+        let frozen_v1 =
+            SessionConsumerRosterAdmissionCapsule::new(encode_admission_request(&legacy).unwrap())
+                .unwrap();
+        assert!(decode_admission_request_for_scope(&frozen_v1, consumer_scope).is_ok());
+
+        let old_register = AdmissionRequestWire::Register {
+            scope: scope.digest(),
+            admission: vec![1, 2, 3],
+            authority: authority(),
+        };
+        let new_register = AdmissionRequestWireV2::Register {
+            scope: scope.digest(),
+            admission: vec![1, 2, 3],
+            authority: authority(),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&old_register).unwrap(),
+            postcard::to_allocvec(&new_register).unwrap()
+        );
+        assert_eq!(
+            postcard_variant_tag(&SessionConsumerRosterRejection::RecordAlreadyExists),
+            14
+        );
+        assert_eq!(
+            postcard_variant_tag(&SessionConsumerRosterRejection::HistoryUnavailable),
+            15
         );
     }
 

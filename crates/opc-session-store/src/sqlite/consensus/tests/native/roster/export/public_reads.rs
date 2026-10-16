@@ -6,10 +6,11 @@ use crate::fenced_mutation_roster_executor::{
 use crate::sqlite::consensus::roster_reads;
 
 macro_rules! fingerprint {
-    ($name:ident, $result:ident) => {
+    ($name:ident, $result:ident $(, $variant:path => $value:expr)*) => {
         fn $name(result: Result<$result, StoreError>) -> Result<Vec<Vec<u8>>, StoreError> {
             Ok(match result? {
                 $result::Missing => vec![vec![0]],
+                $($variant => $value,)*
                 $result::Admitted(value) => {
                     let (handle, id, slot) = value.registration.consensus_parts();
                     vec![
@@ -53,7 +54,8 @@ macro_rules! fingerprint {
     };
 }
 fingerprint!(v1_bytes, ProtectedRosterReadResult);
-fingerprint!(v2_bytes, ProtectedRosterV2ReadResult);
+fingerprint!(v2_bytes, ProtectedRosterV2ReadResult,
+    ProtectedRosterV2ReadResult::HistoryUnavailable => vec![vec![4]]);
 
 fn native<T>(
     wal: &Wal,
@@ -466,6 +468,11 @@ fn native_public_signed_roster_status_and_publication_match_original_sql_across_
                 authority.clone(),
             ))
             .unwrap();
+            let recovery = if v2 {
+                recovery.bind_original_key(admission.key().clone()).unwrap()
+            } else {
+                recovery
+            };
             let now = guard.acquired_at();
             let actual = if v2 {
                 v2_bytes(native(&wal, &signed, |store, now| {

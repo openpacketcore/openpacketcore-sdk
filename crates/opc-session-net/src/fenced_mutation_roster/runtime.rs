@@ -161,8 +161,11 @@ pub enum ExecutorError {
     TerminalizeNotTransmitted,
     /// The exact terminal payload aged out; only nonpublishing conflict status remains.
     TerminalPayloadCompacted,
-    /// Admission's required present session record was not available.
+    /// A required present record is unavailable, or V2 successor recovery
+    /// verified absence without retired history.
     AdmissionRecordMissing,
+    /// A missing V2 recovery slot cannot exclude retired terminal history.
+    RecoveryHistoryUnavailable,
     /// Admission's required absent session record was already present.
     AdmissionRecordAlreadyExists,
     /// Admission's required present session generation differed.
@@ -203,6 +206,7 @@ impl fmt::Display for ExecutorError {
             Self::TerminalizeNotTransmitted => "roster executor terminalization not transmitted",
             Self::TerminalPayloadCompacted => "roster terminal payload compacted",
             Self::AdmissionRecordMissing => "roster admission record missing",
+            Self::RecoveryHistoryUnavailable => "roster recovery history unavailable",
             Self::AdmissionRecordAlreadyExists => "roster admission record already exists",
             Self::AdmissionGenerationConflict => "roster admission generation conflict",
             Self::AdmissionGenerationExhausted => "roster admission generation exhausted",
@@ -1517,6 +1521,7 @@ impl fmt::Debug for RecoveryLookup {
 #[derive(Clone)]
 pub(crate) struct RecoveryRequest {
     lookup: RecoveryLookup,
+    original_key: Option<SessionKey>,
     original_owner: OwnerId,
     original_admission_fence: FenceToken,
     authority: AuthorityBinding,
@@ -1606,6 +1611,7 @@ impl RecoveryRequest {
         }
         Ok(Self {
             lookup: input.lookup,
+            original_key: None,
             original_owner: input.original_owner,
             original_admission_fence: input.original_admission_fence,
             authority: input.authority,
@@ -1626,6 +1632,21 @@ impl RecoveryRequest {
             original_admission_fence,
             authority,
         ))
+    }
+
+    /// Bind the original business key before a V2 recovery lookup can prove
+    /// absence. V1 recovery retains its frozen unbound request representation.
+    pub(crate) fn bind_original_key(mut self, key: SessionKey) -> Result<Self, ExecutorError> {
+        if &key != self.authority.key() {
+            return Err(ExecutorError::AuthorityRejected);
+        }
+        self.original_key = Some(key);
+        Ok(self)
+    }
+
+    /// Return the original key binding required by V2 recovery.
+    pub(crate) fn original_key(&self) -> Option<&SessionKey> {
+        self.original_key.as_ref()
     }
 
     /// Current-ingress lookup; no prior in-memory capability is required.
@@ -2128,6 +2149,8 @@ pub(crate) enum BackendRejection {
     TerminalConflict,
     /// Admission found no exact present protected business record.
     RecordMissing,
+    /// A missing V2 recovery slot may belong to retired terminal history.
+    HistoryUnavailable,
     /// Admission found an already-present protected business record.
     RecordAlreadyExists,
     /// Admission found a different protected business generation.
@@ -2154,6 +2177,7 @@ impl From<BackendRejection> for ExecutorError {
             BackendRejection::RecoveryRequired => Self::RecoveryRequired,
             BackendRejection::TerminalConflict => Self::TerminalConflict,
             BackendRejection::RecordMissing => Self::AdmissionRecordMissing,
+            BackendRejection::HistoryUnavailable => Self::RecoveryHistoryUnavailable,
             BackendRejection::RecordAlreadyExists => Self::AdmissionRecordAlreadyExists,
             BackendRejection::GenerationConflict => Self::AdmissionGenerationConflict,
             BackendRejection::GenerationExhausted => Self::AdmissionGenerationExhausted,

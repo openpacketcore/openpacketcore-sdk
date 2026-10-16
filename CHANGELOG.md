@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Its roster store format is now v2; crossing this change requires a fresh
   install, and other formats are refused as malformed. (#1280)
 
+- `opc-session-net`: V2 `recover_absent` now returns `AdmissionRecordMissing`
+  only after a linearizable read verifies the current successor lease for the
+  exact scope and retained original business key, and the durable global witness
+  excludes retired history. The higher fence excludes delayed original admission
+  across restart. After any terminal history retires, every absent recovery slot
+  instead returns `RecoveryHistoryUnavailable`, including unrelated absent
+  rosters; retained and compacted results remain readable. Neither history
+  unavailable nor barrier/original-authority `RecoveryRequired` proves absence.
+  Verified missing grants no member authority or non-execution proof.
+  `AbsentRecoveryInput::new` now requires the original key; the authenticated V2
+  carrier carries it and refuses the former unbound recovery encoding. The V2
+  activation compatibility digest changes, so crossing this change requires a
+  fresh install. Frozen V1 carriers are unchanged. (#1299)
+
 - `opc-mgmt-authz` and `opc-gnmi-server`: gNMI Subscribe requires the policy source to implement the new `PolicySource::watch_authorization`; the default refuses every subscription with `UNAVAILABLE`. Register live sources through `AuthorizationChangeHub` and install each policy or principal-context change with `activate`; use `AuthorizationWatch::immutable` only for a context that cannot change during a subscription. A stream that loses a previously allowed schema permission closes with `UNAVAILABLE` and no keyed delete. Denied operational events no longer write per-event `ACCESS_DENIED` audit records. `Debug` for path-bearing gNMI, path-resolver and operational-state types and for `GnmiError` now prints only the type name. (#1269)
 
 - `opc-yanggen`: `NumericRangeInterval` IR bounds are now `i128` to represent

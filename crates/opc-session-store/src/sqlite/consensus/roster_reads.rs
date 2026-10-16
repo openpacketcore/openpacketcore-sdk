@@ -323,7 +323,8 @@ pub(crate) fn read_protected_roster_v2_recovery_sync(
     logical_time: Timestamp,
 ) -> Result<ProtectedRosterV2ReadResult, StoreError> {
     let current = recovery.authority();
-    if current.ingress_scope() != recovery.lookup().scope()
+    if recovery.original_key() != Some(current.key())
+        || current.ingress_scope() != recovery.lookup().scope()
         || current.fence() <= recovery.original_admission_fence()
     {
         return Err(ProtectedRosterApplyError::Rejected.store_error());
@@ -340,7 +341,19 @@ pub(crate) fn read_protected_roster_v2_recovery_sync(
         .stable_slot_v2(slot)
         .map_err(ProtectedRosterApplyError::store_error)?
     else {
-        return Ok(ProtectedRosterV2ReadResult::Missing);
+        // Retirement deletes stable slots, including the last partition floor.
+        // The bounded global witness survives that deletion and restart. Once
+        // any terminal has retired it cannot identify which missing roster was
+        // removed, so this negative read must remain explicitly inconclusive.
+        let retired = store
+            .witness(identity)
+            .map_err(ProtectedRosterApplyError::store_error)?
+            .is_some_and(|witness| witness.retired_terminal_sequence() != 0);
+        return Ok(if retired {
+            ProtectedRosterV2ReadResult::HistoryUnavailable
+        } else {
+            ProtectedRosterV2ReadResult::Missing
+        });
     };
     let record = store
         .record_v2(identity, binding)
