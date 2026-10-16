@@ -69,6 +69,21 @@ impl ElectionRngScript {
         );
     }
 
+    /// Plan another finite phase after every preceding sample was consumed.
+    ///
+    /// This supplies future draws only; the engine keeps its already-selected
+    /// timeout. Unexpected draws between phases still fail instead of using
+    /// ordinary randomness, and a finished script cannot be restarted.
+    pub fn plan_next(&self, samples: impl IntoIterator<Item = u64>) {
+        assert!(
+            self.0.active.load(Ordering::SeqCst),
+            "script already finished"
+        );
+        let mut pending = self.0.samples.lock().expect("election samples");
+        assert!(pending.is_empty(), "preceding election phase is incomplete");
+        pending.extend(samples);
+    }
+
     /// Finish the controlled phase, returning later campaigns to Tokio's RNG.
     pub fn finish(&self) {
         self.assert_exhausted();

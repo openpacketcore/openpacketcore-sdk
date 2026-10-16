@@ -744,6 +744,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist` tests: script real one- and two-split elections during mixed-voter
+  rolls while keeping writes in flight across leader loss. Require one-split
+  writes to succeed; use the two-split write's exact 26-second `OutcomeUnknown`
+  as the negative control, then require same-ID recovery after the 33-second
+  successor. Force recovery by two current voters while the committed legacy
+  last leader is absent. Preserve every upgrade, downgrade, legacy admission,
+  retained recovery, and linearizable read/write assertion. Production timers
+  and operation budgets are unchanged. (#1302)
+
 - `opc-session-store`: retry contended native fixed-quorum authority reads with
   an awaited one-millisecond real monotonic backoff instead of a busy yield or
   protocol-clock sleep. A released owner lock can unblock inbound engine traffic

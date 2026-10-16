@@ -60,6 +60,25 @@ impl TickDelivery {
         (observer, guard)
     }
 
+    /// Begin a new incarnation only after the previous node's tasks joined.
+    /// A restarted ticker begins at sequence one and must not inherit any
+    /// completion from the preceding incarnation.
+    #[allow(dead_code, reason = "Only rolling fixtures restart observed nodes.")]
+    pub fn reset_after_shutdown(&self, node: u64) {
+        assert!(
+            self.spans
+                .lock()
+                .unwrap()
+                .live
+                .values()
+                .all(|span| span.node != node),
+            "the preceding node incarnation still owns observed spans"
+        );
+        self.progress.send_modify(|nodes| {
+            nodes.remove(&node);
+        });
+    }
+
     pub async fn wait(&self, node: u64, at: Instant) {
         self.progress
             .subscribe()

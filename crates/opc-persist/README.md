@@ -398,6 +398,23 @@ on the higher-term leader. A separate wall-clock watchdog bounds real disk work
 while protocol time is frozen. Normal time resumes for the existing response
 replay, complete four-record history, and replica-convergence assertions.
 
+The mixed-voter rolling scenario scripts finite election phases across all six
+upgrade and downgrade steps. Real crossing vote requests create one split round
+for each leader stop except the second, which has two. The configured lease,
+sampled timeout, and observed ticks put their successors at 24 and 33 seconds.
+Each leader-stop write starts at the stop instant, concurrently with the election.
+One-split writes must succeed within their unchanged operation budget. The
+two-split write must return `OutcomeUnknown` at exactly 26 seconds with both
+survivors leaderless; after the 33-second successor, the exact same record and
+audit data must replay successfully through the deterministic request ID.
+The final retained-majority recovery and current-voter stop use the same clock
+and vote observations. A separate forced case commits under legacy voter 3,
+reopens only current voters 1 and 2, and requires their real higher-term successor,
+write/read recovery, legacy rejoin, and continued service after a current voter
+stops. Normal time resumes for the remaining writes, reads, and legacy admission
+refusals. A 30-second wall-clock watchdog bounds each frozen phase; production
+election behavior and compatibility rules are unchanged.
+
 The retained-history snapshot-repair scenario runs formation, retention commands,
 snapshots, and compaction on normal time with their original operation and wait
 bounds. The runtime starts paused only to record its timer-grid origin and resumes
